@@ -14,6 +14,7 @@
 //! * `/api/v1/system/config`       web UI fetches before login
 //! * `/api/v1/banners`             active maintenance banners (#2155)
 //! * `/api/v1/webhooks/jwks`       public keys webhook receivers verify with
+//! * `/device` and `/device/app.js` device authorization approval page
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)
@@ -139,6 +140,9 @@ fn is_allowlisted(path: &str) -> bool {
             | "/api/v1/webhooks/jwks"
             | "/v2/token"
             | "/.well-known/terraform.json"
+            | "/device"
+            | "/device/"
+            | "/device/app.js"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
         || path.starts_with("/api/v1/setup/")
