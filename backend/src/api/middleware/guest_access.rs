@@ -15,8 +15,7 @@
 //! * `/api/v1/banners`             active maintenance banners (#2155)
 //! * `/api/v1/webhooks/jwks`       public keys webhook receivers verify with
 //! * `/device`, `/device/app.js`,
-//!   `/device/app.css`             device authorization approval page (#3461);
-//!                                 the approval itself requires a session
+//!   `/device/app.css`             device authorization page (#3461)
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)
