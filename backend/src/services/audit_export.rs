@@ -75,9 +75,12 @@ impl AuditAction {
     /// outcome decision at compile time.
     pub fn outcome(&self) -> Outcome {
         match self {
-            AuditAction::LoginFailed | AuditAction::BackupFailed | AuditAction::RestoreFailed => {
-                Outcome::Failure
-            }
+            AuditAction::LoginFailed
+            | AuditAction::BackupFailed
+            | AuditAction::RestoreFailed
+            | AuditAction::DeviceAuthorizationFailed
+            | AuditAction::DeviceTokenRejected
+            | AuditAction::DeviceAuthorizationExpired => Outcome::Failure,
             AuditAction::PermissionDenied | AuditAction::AgeGateRejected => Outcome::Denied,
             // #4710: a promotion the gate / policy / rules refused, and a
             // promotion request a reviewer turned down, are refusals of the
@@ -87,6 +90,8 @@ impl AuditAction {
             // the emitter overrides to `Failure` when the operator opt-out
             // stored it anyway.
             AuditAction::AttestationRejected => Outcome::Denied,
+            // The user refused the device: a deliberate denial, not a failure.
+            AuditAction::DeviceAuthorizationDenied => Outcome::Denied,
             // #2805: the password was correct, but the 2FA enforcement policy
             // withheld the session pending enrollment. Not a success (no session
             // was issued) and not a credential failure — it is a policy denial,
@@ -179,7 +184,9 @@ impl AuditAction {
             | AuditAction::AttestationVerified
             | AuditAction::EnvironmentRegistered
             | AuditAction::EnvironmentDeleted
-            | AuditAction::ExternalFindingsIngested => Outcome::Success,
+            | AuditAction::ExternalFindingsIngested
+            | AuditAction::DeviceCodeIssued
+            | AuditAction::DeviceAuthorizationApproved => Outcome::Success,
         }
     }
 }

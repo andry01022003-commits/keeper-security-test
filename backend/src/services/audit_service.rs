@@ -232,6 +232,26 @@ pub enum AuditAction {
     /// that every gate and the repository score read, including any `MAL-*`
     /// finding classed `malicious`.
     ExternalFindingsIngested,
+    // Device Authorization Grant (RFC 8628, #3461). Token issuance itself is
+    // recorded as `Login` (auth_method `device_flow`), like every other path
+    // that starts a new session family; these cover the rest of the flow. No
+    // variant ever carries the device code or the user code. Appended at the
+    // END of the enum to keep the additive change conflict-free with in-flight
+    // taxonomy work.
+    /// An unauthenticated client started a device authorization.
+    DeviceCodeIssued,
+    /// A signed-in user approved a device authorization.
+    DeviceAuthorizationApproved,
+    /// A signed-in user denied a device authorization.
+    DeviceAuthorizationDenied,
+    /// A verify/approve/deny attempt was refused: wrong or expired user code,
+    /// a non-interactive credential, or the failed-attempt throttle.
+    DeviceAuthorizationFailed,
+    /// A token request presented a device code that was already redeemed
+    /// (replay) or whose approver can no longer be issued tokens.
+    DeviceTokenRejected,
+    /// An approved device authorization expired without being redeemed.
+    DeviceAuthorizationExpired,
 }
 
 impl AuditAction {
@@ -332,6 +352,12 @@ impl AuditAction {
             AuditAction::EnvironmentDeleted => "ENVIRONMENT_DELETED",
             AuditAction::LoginRateLimited => "LOGIN_RATE_LIMITED",
             AuditAction::ExternalFindingsIngested => "EXTERNAL_FINDINGS_INGESTED",
+            AuditAction::DeviceCodeIssued => "DEVICE_CODE_ISSUED",
+            AuditAction::DeviceAuthorizationApproved => "DEVICE_AUTHORIZATION_APPROVED",
+            AuditAction::DeviceAuthorizationDenied => "DEVICE_AUTHORIZATION_DENIED",
+            AuditAction::DeviceAuthorizationFailed => "DEVICE_AUTHORIZATION_FAILED",
+            AuditAction::DeviceTokenRejected => "DEVICE_TOKEN_REJECTED",
+            AuditAction::DeviceAuthorizationExpired => "DEVICE_AUTHORIZATION_EXPIRED",
         }
     }
 }
