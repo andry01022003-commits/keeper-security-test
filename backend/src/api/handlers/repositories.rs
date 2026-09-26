@@ -4371,6 +4371,7 @@ pub async fn create_repository(
                 project_change: None,
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
                 upstream_auth_change: None,
+                age_gate_change: None,
             }),
     )
     .await;
@@ -5514,6 +5515,7 @@ pub async fn update_repository(
                 project_change: project_change_audit(existing.project_id, project_change),
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
                 upstream_auth_change: None,
+                age_gate_change: None,
             }),
     )
     .await;
@@ -6236,6 +6238,7 @@ pub async fn delete_repository(
                 project_change: None,
                 allow_public_with_upstream_credentials: None,
                 upstream_auth_change: None,
+                age_gate_change: None,
             }),
     )
     .await;

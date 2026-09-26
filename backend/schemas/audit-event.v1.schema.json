@@ -184,7 +184,20 @@
         "scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
         "previous_scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
         "scan_config_changed": { "type": "array", "items": { "type": "string" } },
-        "project_change": { "$ref": "#/$defs/ProjectChangeAudit" }
+        "project_change": { "$ref": "#/$defs/ProjectChangeAudit" },
+        "age_gate_change": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["previous_enabled", "previous_min_age_days", "previous_mode", "actor_tier", "relaxed"],
+          "description": "Present on an age-gate policy change: the policy it replaced, the tier of administrator who made it, and whether it weakened the gate (disabled it, lowered the minimum age, or switched the age source).",
+          "properties": {
+            "previous_enabled": { "type": "boolean" },
+            "previous_min_age_days": { "type": "integer", "minimum": 0 },
+            "previous_mode": { "type": "string", "enum": ["upstream_publish_time", "first_seen"] },
+            "actor_tier": { "type": "string", "enum": ["instance_admin", "repository_admin"] },
+            "relaxed": { "type": "boolean" }
+          }
+        }
       }
     },
     "ProjectChangeAudit": {
