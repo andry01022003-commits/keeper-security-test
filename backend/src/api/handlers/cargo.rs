@@ -271,9 +271,10 @@ async fn index_cksum_at(
 /// URL builder has no access to (and the Virtual path never resolves one), so
 /// that marker — which no known registry uses in practice — is left literal
 /// rather than half-substituted, the same failure shape it had before.
-/// `{prefix}` is computed from the name as passed (both callers hand over the
-/// lowercased name, so `{prefix}` and `{lowerprefix}` coincide here; the
-/// distinct expansions stay for spec fidelity).
+/// `{crate}` and `{prefix}` use the name as passed, which both callers hand
+/// over in the CANONICAL spelling the client requested (#4339): crates.io
+/// serves a `.crate` only under its canonical name (`Inflector`, not
+/// `inflector`), so a mixed-case crate's prefix differs from `{lowerprefix}`.
 fn build_download_url(dl_url: &str, name: &str, version: &str) -> String {
     let is_template = [
         "{crate}",
@@ -333,8 +334,9 @@ fn split_url(url: &str) -> Option<(String, String)> {
 }
 
 /// Resolve each Remote member's `dl` download template for the Virtual
-/// download path (#3952), returning `member.id -> absolute download URL` for
-/// the requested `{name_lower}@{version}`.
+/// download path (#3952), returning `member.id -> download URL` for the
+/// requested `{name}@{version}`. `name` is the canonical spelling the client
+/// requested, which is the only spelling crates.io serves (#4339).
 ///
 /// Every step degrades to "no entry", which hands the member the canonical
 /// `api/v1/crates/{name}/{version}/download` path against its own
@@ -344,6 +346,11 @@ fn split_url(url: &str) -> Option<(String, String)> {
 /// * a member that is not Remote, or has no `upstream_url`, or whose
 ///   `config.json` cannot be fetched/parsed, gets no entry;
 /// * a member whose `config.json` carries no `dl` gets no entry.
+///
+/// Except for a mixed-case name (#4339): the canonical path the resolver would
+/// fall back to is the LOWERCASE cache key, which crates.io 404s, so such a
+/// member gets the canonical-name path relative to its own `upstream_url`
+/// instead (`build_upstream_url` joins a relative fetch path onto it).
 ///
 /// The one deliberate member-scoped failure is SSRF: a hostile or
 /// misconfigured `config.json` could set `dl` to a cloud-metadata or internal
@@ -356,7 +363,7 @@ fn split_url(url: &str) -> Option<(String, String)> {
 async fn resolve_virtual_member_dl_urls(
     state: &SharedState,
     members: &[crate::models::repository::Repository],
-    name_lower: &str,
+    name: &str,
     version: &str,
 ) -> HashMap<uuid::Uuid, String> {
     let mut urls = HashMap::new();
@@ -365,6 +372,9 @@ async fn resolve_virtual_member_dl_urls(
     }
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
     let index_url_overrides = fetch_index_upstream_overrides(&state.db, &member_ids).await;
+    // #4339: the resolver's own fallback is the lowercase cache key.
+    let canonical_fallback =
+        (name != name.to_ascii_lowercase()).then(|| canonical_crate_download_path(name, version));
     for member in members {
         if member.repo_type != RepositoryType::Remote {
             continue;
@@ -373,23 +383,38 @@ async fn resolve_virtual_member_dl_urls(
             continue;
         };
         let base_url = resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
-        let Some(dl_url) = fetch_dl_template(state, member.id, &member.key, &base_url).await else {
-            continue;
+        let resolved = match fetch_dl_template(state, member.id, &member.key, &base_url).await {
+            Some(dl_url) => {
+                let full = build_download_url(&dl_url, name, version);
+                match validate_outbound_url(&full, "Cargo upstream download URL") {
+                    Ok(()) => Some(full),
+                    Err(e) => {
+                        tracing::warn!(
+                            member_key = %member.key,
+                            crate_name = %name,
+                            error = %e,
+                            "virtual member's config.json `dl` failed SSRF validation; \
+                             falling back to its index host for this download"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
         };
-        let full = build_download_url(&dl_url, name_lower, version);
-        if let Err(e) = validate_outbound_url(&full, "Cargo upstream download URL") {
-            tracing::warn!(
-                member_key = %member.key,
-                crate_name = %name_lower,
-                error = %e,
-                "virtual member's config.json `dl` failed SSRF validation; \
-                 falling back to its index host for this download"
-            );
-            continue;
+        if let Some(url) = resolved.or_else(|| canonical_fallback.clone()) {
+            urls.insert(member.id, url);
         }
-        urls.insert(member.id, full);
     }
     urls
+}
+
+/// The `api/v1/crates/{name}/{version}/download` path under the crate's
+/// canonical (as-requested) name: what a registry without a `dl` template is
+/// asked for. The proxy cache key stays [`crate_serve_key`] on the lowercase
+/// name, so every spelling shares one cache entry (#4339).
+fn canonical_crate_download_path(name: &str, version: &str) -> String {
+    format!("api/v1/crates/{}/{}/download", name, version)
 }
 
 // ---------------------------------------------------------------------------
@@ -2001,13 +2026,16 @@ async fn download(
                     // This handles split-host registries like crates.io where
                     // the index lives at index.crates.io but downloads come
                     // from crates.io/api/v1/crates.
-                    let fallback_path =
-                        format!("api/v1/crates/{}/{}/download", name_lower, version);
+                    // #4339: the upstream is asked for the CANONICAL name the
+                    // client requested (cargo always sends the spelling the
+                    // index carries); crates.io 404s any other spelling. Only
+                    // the cache key and the catalog use the lowercase name.
+                    let fallback_path = canonical_crate_download_path(&name, &version);
                     let (dl_base, dl_path) = match resolve_upstream_dl_url(&state, &repo, &repo_key)
                         .await
                     {
                         Some(dl_url) => {
-                            let full = build_download_url(&dl_url, &name_lower, &version);
+                            let full = build_download_url(&dl_url, &name, &version);
                             // Validate the resolved download URL against SSRF.
                             // A malicious upstream config.json could set `dl` to
                             // a cloud metadata endpoint or internal service URL.
@@ -2266,7 +2294,7 @@ async fn download(
                 // guard suppressed the proxy: Remote members cannot serve
                 // then, so no `config.json` round-trip is owed to them.
                 let member_fetch_urls = if proxy_for_virtual.is_some() {
-                    resolve_virtual_member_dl_urls(&state, &members, &name_lower, &version).await
+                    resolve_virtual_member_dl_urls(&state, &members, &name, &version).await
                 } else {
                     HashMap::new()
                 };
@@ -8716,6 +8744,74 @@ mod age_gate_tests {
         );
         assert_eq!(&served[..], &dl_body[..]);
 
+        rig.teardown().await;
+    }
+
+    /// #4339: crates.io serves a `.crate` only under the crate's CANONICAL
+    /// name (non-canonical downloads 404 since 2023-12-18), and cargo always
+    /// requests that spelling, so `Inflector` must reach the upstream as
+    /// `Inflector`. The Remote arm used to build the upstream path from the
+    /// lowercased name and 404ed every crate with an uppercase letter. The
+    /// mock serves only the canonical path, as crates.io does.
+    #[tokio::test]
+    async fn test_remote_download_keeps_canonical_mixed_case_crate_name_4339() {
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let body = b"the Inflector crate".repeat(8);
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/crates/Inflector/0.11.4/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/crates/inflector/0.11.4/download"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let (status, served) = tdh::send(
+            tdh::router_anon(mounted_router(), state),
+            tdh::get(format!(
+                "/cargo/{}/api/v1/crates/Inflector/0.11.4/download",
+                fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a mixed-case crate must be fetched under its canonical name; got {}",
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(&served[..], &body[..]);
+    }
+
+    /// #4339 on the Virtual walk: a Remote member with no `dl` template falls
+    /// back to the canonical `api/v1/crates/{name}/{version}/download` path
+    /// against its own upstream, and that path must carry the canonical name
+    /// too. The proxy cache stays keyed on the lowercase name.
+    #[tokio::test]
+    async fn test_virtual_download_keeps_canonical_mixed_case_crate_name_4339() {
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let member = rig.add_remote(1, false, true).await;
+        let body = b"the Inflector crate via a virtual".repeat(8);
+        rig.mount_download(member, "Inflector", "0.11.4", &body, 1)
+            .await;
+        let (status, served, _) = rig.get(rig.download_uri("Inflector", "0.11.4")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a mixed-case crate must be fetched under its canonical name; got {}",
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(&served[..], &body[..]);
         rig.teardown().await;
     }
 
