@@ -1466,6 +1466,14 @@ impl CacheMetadata {
 /// (legacy sidecar, or policy disabled at write time) allows it. The error
 /// MUST propagate to the handler — never be degraded to a cache `Miss`, which
 /// would refetch upstream and loop.
+/// How a cache entry point names the Remote whose origin policy it applies
+/// (#4506): by key or by id, when it holds no [`Repository`].
+#[derive(Clone, Copy)]
+enum RemoteRef<'a> {
+    Key(&'a str),
+    Id(Uuid),
+}
+
 fn check_quarantine_until(quarantine_until: Option<DateTime<Utc>>) -> Result<()> {
     match quarantine_until {
         Some(until) => {
@@ -4194,6 +4202,11 @@ pub struct ProxyService {
     /// it would be listed as a cached 0-byte object. Bounded and short-lived;
     /// a later serve of the path that does tee clears its entry.
     uncached_serves: Cache<(Uuid, String), ()>,
+    /// Whether the origin-policy gate (#4506) runs. Always `true` outside
+    /// tests; only `without_origin_policy_gate`, which exists only
+    /// under `cfg(test)`, clears it, for the cache-mechanics unit tests that
+    /// run without a database.
+    origin_policy_gate: bool,
 }
 
 /// How long a [`ProxyService::uncached_serves`] entry is kept. The recorder
@@ -4308,7 +4321,17 @@ impl ProxyService {
                 .max_capacity(TtlPolicyCache::CAPACITY)
                 .time_to_live(UNCACHED_SERVE_TTL)
                 .build(),
+            origin_policy_gate: true,
         }
+    }
+
+    /// A service that skips the origin-policy gate (#4506), for unit tests of
+    /// the cache mechanics that run against a never-connecting pool. Test-only:
+    /// production code cannot construct a service without the gate.
+    #[cfg(test)]
+    pub(crate) fn without_origin_policy_gate(mut self) -> Self {
+        self.origin_policy_gate = false;
+        self
     }
 
     /// This deployment's proxy-cache key scope (#3454). Handlers that derive a
@@ -4379,6 +4402,8 @@ impl ProxyService {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         Self::validate_relative_post_endpoint(path)?;
         let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
@@ -4526,6 +4551,9 @@ impl ProxyService {
         repo_key: &str,
         path: &str,
     ) -> Result<Option<CachedBody>> {
+        // #4506: the Remote's origin policy applies to its cached content too.
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, repo_key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
         let mutability = self.effective_mutability_by_key(repo_key, path).await;
@@ -4634,6 +4662,16 @@ impl ProxyService {
         // revalidate.
         let mutability = self.effective_mutability_by_key(repo_key, path).await;
         self.cache_store.is_fresh(&keys, mutability).await
+    }
+
+    /// Gate a presigned-redirect fast path on the Remote's origin policy
+    /// (#4506), the sibling of [`Self::cache_quarantine_gate`]. A redirect
+    /// hands out the cached object without the body passing through the
+    /// gated fetch paths, so every fast path asks this after its freshness
+    /// probe and before signing. A refusal is the fetch paths' 403.
+    pub async fn cache_origin_policy_gate(&self, repo_key: &str) -> Result<()> {
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await
     }
 
     /// Gate a presigned-redirect fast path on a Package Age Policy hold (#2075).
@@ -4826,6 +4864,8 @@ impl ProxyService {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
 
         // Cache keys use the caller-supplied cache_path
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -5289,6 +5329,8 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<StreamingFetchResult> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -5347,6 +5389,8 @@ impl ProxyService {
         repo: &Repository,
         cache_path: &str,
     ) -> Result<Option<StreamingFetchResult>> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
         self.try_streaming_cache_hit(repo, cache_path, cache_path, &cache_key, &metadata_key)
@@ -5999,6 +6043,8 @@ impl ProxyService {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
 
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
@@ -6043,6 +6089,8 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>, String)> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let full_url = self.gated_upstream_url(repo, path).await?;
         // #2192 / #1608 Phase 4c: use the 16 MiB LARGE ceiling, not the 8 MiB
         // DEFAULT. The sole caller is the PyPI download-URL-resolution simple-
@@ -6080,6 +6128,8 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<DirectUpstreamBody> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
             .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
@@ -6105,6 +6155,8 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<UpstreamModuleLocation> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
             .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
@@ -6270,6 +6322,8 @@ impl ProxyService {
         distribution: &str,
         dists_ttl_secs: i64,
     ) -> Result<(Bytes, Option<String>, bool)> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
@@ -6738,6 +6792,9 @@ impl ProxyService {
         repo_key: &str,
         cache_path: &str,
     ) -> Result<Option<(BoxStream<'static, Result<Bytes>>, i64)>> {
+        // #4506: the Remote's origin policy applies to its cached content too.
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await?;
         let keys = CacheKeys::derive(&self.cache_scope, repo_key, cache_path)?;
         let Some(meta) = self.load_cache_metadata(&keys.metadata).await? else {
             return Ok(None);
@@ -7238,6 +7295,88 @@ impl ProxyService {
             fetch_path,
         )
         .await
+    }
+
+    /// The origin-policy gate for content a Remote serves (#4506): refuse,
+    /// with the same 403 the hosted download gate answers, when an applicable
+    /// scan policy's origin predicates (`allowed_upstreams`,
+    /// `denied_upstreams`, `allowed_repositories`, `denied_repositories`,
+    /// `allowed_kinds`) reject the Remote's proxied content.
+    ///
+    /// Proxy fetches record a `proxy_cache_artifacts` row, not an `artifacts`
+    /// row, so the hosted download gate never saw an origin for them and an
+    /// upstream deny policy did not gate a Remote at all. The origin is a
+    /// property of the Remote (kind `proxy`, its key, its configured
+    /// upstream), not of the path, so the gate runs once at each public entry
+    /// that serves a Remote's cache or upstream, before the cache is read and
+    /// before the upstream is contacted. A cache entry written before the
+    /// policy was attached is refused like a miss.
+    ///
+    /// A policy lookup error fails closed (the error propagates).
+    async fn ensure_origin_policy_allows(&self, repo: &Repository) -> Result<()> {
+        if !self.origin_policy_gate {
+            return Ok(());
+        }
+        self.origin_policy_gate(repo.id, &repo.key, repo.upstream_url.as_deref())
+            .await
+    }
+
+    async fn origin_policy_gate(
+        &self,
+        repo_id: Uuid,
+        repo_key: &str,
+        upstream_url: Option<&str>,
+    ) -> Result<()> {
+        let violations = crate::services::policy_service::PolicyService::new(self.db.clone())
+            .evaluate_proxy_origin(repo_id, repo_key, upstream_url)
+            .await?;
+        if violations.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            repository_id = %repo_id,
+            repo_key = %repo_key,
+            violations = ?violations,
+            "proxied download refused by the repository's origin policy"
+        );
+        Err(AppError::Authorization(
+            "Artifact download is blocked by the repository's scan policy".to_string(),
+        ))
+    }
+
+    /// [`Self::ensure_origin_policy_allows`] for the cache entry points that
+    /// are keyed by repository key (or id) alone. A key that names no Remote
+    /// has no proxied content to gate.
+    async fn ensure_origin_policy_allows_for(&self, repo_ref: RemoteRef<'_>) -> Result<()> {
+        if !self.origin_policy_gate {
+            return Ok(());
+        }
+        let row: Option<(Uuid, String, Option<String>)> = match repo_ref {
+            RemoteRef::Key(key) => {
+                sqlx::query_as(
+                    "SELECT id, key, upstream_url FROM repositories \
+                 WHERE key = $1 AND repo_type = 'remote'",
+                )
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await
+            }
+            RemoteRef::Id(id) => {
+                sqlx::query_as(
+                    "SELECT id, key, upstream_url FROM repositories \
+                 WHERE id = $1 AND repo_type = 'remote'",
+                )
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await
+            }
+        }
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let Some((id, key, upstream_url)) = row else {
+            return Ok(());
+        };
+        self.origin_policy_gate(id, &key, upstream_url.as_deref())
+            .await
     }
 
     /// Build full upstream URL for an artifact path.
@@ -8028,6 +8167,9 @@ impl ProxyService {
         repo_id: Uuid,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
+        // #4506: the Remote's origin policy, before the upstream is contacted.
+        self.ensure_origin_policy_allows_for(RemoteRef::Id(repo_id))
+            .await?;
         // #4399: the off-host URL is matched as a full absolute URL (there is
         // no configured-upstream prefix to strip on another host).
         crate::services::upstream_filter::ensure_upstream_allowed(
@@ -16564,7 +16706,8 @@ mod tests {
         // Build the service with a `lazy` PgPool: we never call any
         // code path that touches the DB on this test.
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
-        let proxy = ProxyService::new(pool, storage, ProxyCacheScope::unscoped());
+        let proxy = ProxyService::new(pool, storage, ProxyCacheScope::unscoped())
+            .without_origin_policy_gate();
 
         let repo_key = "npm-proxy";
         let cache_path = "abbrev/-/abbrev-1.1.1.tgz";
@@ -17539,7 +17682,7 @@ mod tests {
             entries,
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage.clone());
+        let svc = build_proxy_service_with_storage(storage.clone()).without_origin_policy_gate();
         let repo = pypi_remote_repo("pypi-remote");
 
         let result = svc
@@ -17566,7 +17709,7 @@ mod tests {
             entries: std::collections::HashMap::new(),
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage);
+        let svc = build_proxy_service_with_storage(storage).without_origin_policy_gate();
         let repo = pypi_remote_repo("pypi-remote");
 
         let probe = svc
@@ -17729,7 +17872,7 @@ mod tests {
             entries,
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage.clone());
+        let svc = build_proxy_service_with_storage(storage.clone()).without_origin_policy_gate();
         let repo = pypi_remote_repo(&repo_key);
 
         let (content, _ct, _enc) = svc
@@ -23303,6 +23446,7 @@ mod tests {
         /// A deployment addressing this bucket under `scope`.
         fn deployment(&self, scope: ProxyCacheScope) -> ProxyService {
             ProxyService::new(test_catalog_pool(), self.storage(), scope)
+                .without_origin_policy_gate()
         }
     }
 

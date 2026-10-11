@@ -3786,6 +3786,11 @@ async fn pypi_proxy_cache_redirect(
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
         return None;
     }
+    // #4506: a Remote whose origin policy refuses its content gets no
+    // redirect; the gated fetch below answers the 403.
+    if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
+        return None;
+    }
     let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
         proxy.cache_scope(),
         repo_key,

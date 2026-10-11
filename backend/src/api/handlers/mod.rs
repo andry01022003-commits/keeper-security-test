@@ -319,6 +319,12 @@ mod repo_read_existence_tests;
 #[cfg(test)]
 mod gitlfs_download_auth_tests;
 
+/// #4506: router-level tests that origin policies gate proxy-cache-only
+/// content of Remote repositories.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod proxy_origin_policy_tests;
+
 pub mod admin;
 pub mod admin_security;
 pub mod age_gate;

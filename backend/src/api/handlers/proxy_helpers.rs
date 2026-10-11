@@ -1595,6 +1595,11 @@ async fn try_member_cache_redirect(
     {
         return None;
     }
+    // #4506: likewise the member's origin policy; the fall-through fetch
+    // surfaces the refusal.
+    if proxy.cache_origin_policy_gate(&member.key).await.is_err() {
+        return None;
+    }
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     try_proxy_cache_redirect(
         storage.as_ref(),
@@ -1761,6 +1766,11 @@ pub async fn proxy_fetch_or_redirect(
             // a 302 on redirect-capable backends. Gate BEFORE signing; a hold
             // surfaces as the same 409/403 (no redirect, no upstream refetch).
             if let Err(e) = proxy_service.cache_quarantine_gate(repo_key, path).await {
+                return Err(map_proxy_error(repo_key, path, e));
+            }
+            // #4506: and on the Remote's origin policy, which the fetch paths
+            // enforce the same way.
+            if let Err(e) = proxy_service.cache_origin_policy_gate(repo_key).await {
                 return Err(map_proxy_error(repo_key, path, e));
             }
             // proxy-cache content is stored without the global key prefix,
@@ -17845,6 +17855,8 @@ mod tests {
     fn build_proxy_with_cache_backend(backend: StdArc<QuarantineRedirectStorage>) -> ProxyService {
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not fail");
+        // The never-connecting pool cannot answer the origin-policy gate
+        // (#4506); these tests pin the quarantine half of the redirect gate.
         ProxyService::new(
             pool,
             StdArc::new(crate::services::storage_service::StorageService::new(
@@ -17852,6 +17864,7 @@ mod tests {
             )),
             crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
+        .without_origin_policy_gate()
     }
 
     /// #2075: a fresh proxy-cache entry that is still inside its Package Age
@@ -17937,6 +17950,93 @@ mod tests {
             fresh.presign_calls.load(Ordering::SeqCst),
             1,
             "the non-held fast path must sign exactly once"
+        );
+    }
+
+    /// #4506: the presigned-redirect fast path must not hand out a fresh
+    /// cache entry of a Remote whose origin policy denies its upstream. The
+    /// refusal is the fetch paths' 403, and nothing is signed. The control
+    /// (no policy) still redirects.
+    #[tokio::test]
+    async fn test_proxy_fetch_or_redirect_refuses_origin_denied_remote_4506() {
+        use crate::models::security::{OriginPolicyPredicates, PolicyPredicates};
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        let fresh = StdArc::new(QuarantineRedirectStorage::new(/* quarantine = */ None));
+        let proxy = ProxyService::new(
+            pool.clone(),
+            StdArc::new(crate::services::storage_service::StorageService::new(
+                fresh.clone(),
+            )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        );
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let state =
+            db_helpers::build_state_presigned(pool.clone(), "s3-test", registry_storage.clone());
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let fetch = || {
+            super::proxy_fetch_or_redirect(
+                &proxy,
+                &state,
+                repo_id,
+                &repo_key,
+                "https://upstream.example.test",
+                "lodash",
+                &ctx,
+            )
+        };
+
+        let control = fetch().await.map_or_else(|e| e.status(), |r| r.status());
+        assert_eq!(
+            control,
+            StatusCode::FOUND,
+            "no policy: the fast path redirects"
+        );
+
+        crate::services::policy_service::PolicyService::new(pool.clone())
+            .create_policy(
+                &format!("4506-presign-{repo_id}"),
+                Some(repo_id),
+                "critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+                Some(PolicyPredicates {
+                    origin: OriginPolicyPredicates {
+                        denied_upstreams: vec!["https://upstream.example.test".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create origin policy");
+        let presigned_before = fresh.presign_calls.load(Ordering::SeqCst);
+        let denied = fetch().await.map_or_else(|e| e.status(), |r| r.status());
+
+        sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        assert_eq!(
+            denied,
+            StatusCode::FORBIDDEN,
+            "a denied upstream must not be handed out as a presigned redirect"
+        );
+        assert_eq!(
+            fresh.presign_calls.load(Ordering::SeqCst),
+            presigned_before,
+            "a refused entry must never be signed"
         );
     }
 

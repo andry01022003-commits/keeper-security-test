@@ -718,6 +718,43 @@ fn evaluate_origin_predicates(
     violations
 }
 
+/// The origin facts of content a Remote repository serves from its proxy cache
+/// or its upstream (#4506): see [`PolicyService::evaluate_proxy_origin`].
+fn proxy_origin_facts(repository_key: &str, upstream_url: Option<&str>) -> OriginFacts {
+    OriginFacts {
+        kind: Some("proxy".to_string()),
+        repository_key: Some(repository_key.to_string()),
+        upstream_url: upstream_url
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(crate::services::artifact_origin::normalize_upstream_url),
+    }
+}
+
+/// The DB-free half of [`PolicyService::evaluate_proxy_origin`]: every
+/// enabled policy's origin violations for proxied content of one Remote.
+fn proxy_origin_violations(
+    policies: &[ScanPolicy],
+    repository_key: &str,
+    upstream_url: Option<&str>,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut facts: Option<OriginFacts> = None;
+    for policy in policies.iter().filter(|p| p.is_enabled) {
+        let predicates = parse_policy_predicates(&policy.predicates);
+        if predicates.origin.is_inert() {
+            continue;
+        }
+        let facts = facts.get_or_insert_with(|| proxy_origin_facts(repository_key, upstream_url));
+        violations.extend(evaluate_origin_predicates(
+            &policy.name,
+            &predicates.origin,
+            facts,
+        ));
+    }
+    violations
+}
+
 /// The complement of [`evaluate_origin_predicates`]: one pass reason per
 /// configured origin predicate that did not fire.
 fn origin_predicate_passes(
@@ -845,6 +882,40 @@ impl PolicyService {
             .evaluate_predicates_with_passes(artifact_id, repository_id)
             .await?
             .violations)
+    }
+
+    /// Evaluate the origin predicates of `repository_id`'s applicable policies
+    /// against content a Remote repository serves from its proxy cache or its
+    /// upstream (#4506), returning the violation messages.
+    ///
+    /// Proxy fetches write a `proxy_cache_artifacts` row and no `artifacts`
+    /// row (#1280), so there is no recorded origin for
+    /// [`Self::evaluate_predicates`] to read. The origin of such content is
+    /// the Remote itself: kind `proxy`, the Remote's key as the recording
+    /// repository, and its configured upstream, normalized like every stored
+    /// origin. That is what the origin-fill trigger records for an
+    /// `artifacts` row in a Remote, so a policy decides the same way for
+    /// both. The configured upstream is used rather than
+    /// `proxy_cache_artifacts.upstream_url`, which the scanned (buffered)
+    /// proxy path leaves NULL and which a routing rule or an absolute index
+    /// URL can point elsewhere on the same upstream.
+    ///
+    /// Only the origin block is evaluated: the conda block reads facts of an
+    /// `artifacts` row, and the CVE / scan-state columns of the policy apply
+    /// to proxied content through scan-on-proxy, not here. One query for the
+    /// applicable policies; no fact load.
+    pub async fn evaluate_proxy_origin(
+        &self,
+        repository_id: Uuid,
+        repository_key: &str,
+        upstream_url: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let policies = self.load_applicable_policies(repository_id).await?;
+        Ok(proxy_origin_violations(
+            &policies,
+            repository_key,
+            upstream_url,
+        ))
     }
 
     /// [`Self::evaluate_predicates`] plus the pass reason of every configured
