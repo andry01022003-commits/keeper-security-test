@@ -664,11 +664,23 @@ fn classify_cargo(lower: &str) -> Mutability {
 ///   `.debian.tar.*`.
 /// - **dists/**: Release, InRelease, Packages, Sources, Translation, Contents,
 ///   dep11, etc. are rewritten in place by upstream on each publish.
+/// - **flat repositories** (#4619, `deb <uri> /`): there is no `pool/` or
+///   `dists/` tree; the binary packages sit wherever the `Packages`
+///   `Filename:` says (`amd64/kubectl_1.34.0-1.1_amd64.deb` on pkgs.k8s.io).
+///   They are version-pinned by the same rule as `pool/`, so a binary package
+///   outside `dists/` is immutable. Under `dists/` (#3596 vendor layouts) the
+///   classification is unchanged.
 fn classify_debian(lower: &str) -> Mutability {
-    if lower.contains("/by-hash/") {
+    if lower.contains("/by-hash/") || lower.starts_with("by-hash/") {
         return Mutability::Immutable;
     }
     if lower.starts_with("pool/") || lower.contains("/pool/") {
+        return Mutability::Immutable;
+    }
+    let leaf = leaf(lower);
+    let is_binary_package =
+        leaf.ends_with(".deb") || leaf.ends_with(".udeb") || leaf.ends_with(".ddeb");
+    if is_binary_package && !lower.starts_with("dists/") {
         return Mutability::Immutable;
     }
     Mutability::mutable_default()
@@ -1218,6 +1230,14 @@ mod tests {
             (Debian, "dists/bookworm/i18n/Translation-en.bz2", false),
             (Debian, "dists/bookworm/main/source/Sources.xz", false),
             (Debian, "dists/bookworm/main/Contents-amd64.gz", false),
+            // #4619 flat repository (`deb <uri> /`): the indices at the root
+            // are rewritten in place, the packages next to them are pinned.
+            (Debian, "InRelease", false),
+            (Debian, "Release.gpg", false),
+            (Debian, "Packages.gz", false),
+            (Debian, "amd64/kubectl_1.34.0-1.1_amd64.deb", true),
+            (Debian, "foo_1.0_all.deb", true),
+            (Debian, "by-hash/SHA256/abc123def456", true),
             // GitHub-shaped paths must not change generic write permissions.
             (
                 Generic,

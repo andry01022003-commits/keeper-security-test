@@ -399,9 +399,10 @@ pub(crate) fn validate_remote_upstream(
                 if *format == RepositoryFormat::Debian && is_debian_flat_or_mirrorlist(url) {
                     return Err(AppError::Validation(
                         "Debian remote upstream must be a concrete archive root (apt expands \
-                         `dists/<suite>/...` beneath it), not a flat repository, mirrorlist, or \
-                         `mirror://` URL. Point it at the archive root (e.g. \
-                         http://deb.debian.org/debian)."
+                         `dists/<suite>/...` beneath it, e.g. http://deb.debian.org/debian) or \
+                         the directory of a flat repository (the URI of a `deb <uri> /` line, \
+                         e.g. https://pkgs.k8s.io/core:/stable:/v1.34/deb/), not an index file, \
+                         a `./` component, a mirrorlist, or a `mirror://` URL."
                             .to_string(),
                     ));
                 }
@@ -461,9 +462,10 @@ fn is_mirrorlist_or_metalink(url: &str) -> bool {
     lower.contains("mirrorlist") || lower.contains("metalink")
 }
 
-/// Heuristic: a Debian remote upstream that is a flat repository, a
-/// mirrorlist, or the apt `mirror://` method rather than a concrete archive
-/// root. apt expands `dists/<suite>/...` beneath a proper archive root
+/// Heuristic: a Debian remote upstream aimed at a flat repository's index
+/// file or `./` component, a mirrorlist, or the apt `mirror://` method rather
+/// than a concrete archive root or flat-repository directory (#4619 serves
+/// the flat layout from the directory itself). apt expands `dists/<suite>/...` beneath a proper archive root
 /// (e.g. `http://deb.debian.org/debian`), which this must NOT reject; it
 /// rejects the shapes the remote-proxy trust model cannot verify against a
 /// signed Release:
@@ -4156,6 +4158,14 @@ mod tests {
         let flat_component = Some("http://apt.example.com/flat/ ./".to_string());
         // A well-formed archive root (apt expands `dists/<suite>/...` beneath).
         let base = Some("http://deb.debian.org/debian".to_string());
+        // #4619: a flat repository's directory (`deb <uri> /`) is accepted.
+        let flat_dir = Some("https://pkgs.k8s.io/core:/stable:/v1.34/deb/".to_string());
+        assert!(validate_remote_upstream(
+            &RepositoryType::Remote,
+            &flat_dir,
+            &RepositoryFormat::Debian
+        )
+        .is_ok());
         let ubuntu = Some("http://archive.ubuntu.com/ubuntu".to_string());
 
         for bad in [&mirror, &mirrorlist, &flat_index, &flat_component] {

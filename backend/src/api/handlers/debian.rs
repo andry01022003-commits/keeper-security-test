@@ -16,6 +16,8 @@
 //!   GET  /debian/{repo_key}/pool/{component}/*path                                  - Download .deb
 //!   PUT  /debian/{repo_key}/pool/{component}/*path                                  - Upload .deb
 //!   POST /debian/{repo_key}/upload                                                  - Upload .deb (raw body)
+//!   GET  /debian/{repo_key}/{InRelease,Release,Release.gpg,Packages*}                - Flat repository (#4619)
+//!   GET  /debian/{repo_key}/{dir}/*path                                             - Flat repository suite dir / package
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -98,6 +100,12 @@ pub fn router() -> Router<SharedState> {
         )
         // Alternative upload endpoint
         .route("/:repo_key/upload", post(upload_raw))
+        // Flat repositories (#4619, `deb <uri> /`): release documents,
+        // indices and packages addressed relative to the repository root.
+        // The static `dists`/`pool`/`upload`/`gpg-key.asc` segments above
+        // take precedence over these parameters.
+        .route("/:repo_key/:flat", get(flat_root_file))
+        .route("/:repo_key/:flat/*flat_rest", get(flat_nested_file))
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,14 +1624,36 @@ async fn load_release_checksums(
     upstream_url: &str,
     distribution: &str,
 ) -> Option<HashMap<String, (String, u64)>> {
+    load_release_checksums_at(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &format!("dists/{distribution}"),
+        distribution,
+    )
+    .await
+}
+
+/// [`load_release_checksums`] for a release document in `release_dir`
+/// (`dists/<suite>` for the suite layout, the suite directory of a flat
+/// repository, #4619), revalidated under `epoch_distribution`'s release epoch.
+async fn load_release_checksums_at(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    release_dir: &str,
+    epoch_distribution: &str,
+) -> Option<HashMap<String, (String, u64)>> {
     let pseudo_repo = proxy_helpers::build_remote_repo(repo_id, repo_key, upstream_url);
     for name in ["InRelease", "Release"] {
-        let path = format!("dists/{}/{}", distribution, name);
+        let path = flat_release_path(release_dir, name);
         if let Ok((bytes, _ct, _changed)) = proxy
             .fetch_dists_with_revalidation(
                 &pseudo_repo,
                 &path,
-                distribution,
+                epoch_distribution,
                 DEFAULT_DISTS_INDEX_TTL_SECS,
             )
             .await
@@ -1658,7 +1688,28 @@ async fn enforce_dists_integrity(
     else {
         return Ok(());
     };
-    if verify_index_against_release(&table, dist_relative_path, content)
+    reject_unverified_index(
+        proxy,
+        repo_key,
+        upstream_path,
+        &table,
+        dist_relative_path,
+        content,
+    )
+    .await
+}
+
+/// Shared Tier A verdict: on a checksum/size mismatch against the signed
+/// `Release` table, evict the cached `upstream_path` and answer 502.
+async fn reject_unverified_index(
+    proxy: &ProxyService,
+    repo_key: &str,
+    upstream_path: &str,
+    table: &HashMap<String, (String, u64)>,
+    release_relative_path: &str,
+    content: &[u8],
+) -> Result<(), Response> {
+    if verify_index_against_release(table, release_relative_path, content)
         == IndexVerification::Mismatch
     {
         // Evict the poisoned entry so a later read cannot serve it.
@@ -2305,10 +2356,16 @@ async fn release_file(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "Release")?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
     }
-    proxy
+    // #4619: a failure against an upstream that turns out to be a flat
+    // repository answers with the flat sources line instead.
+    if let Err(resp) = proxy
         .dists_detecting_change("Release", "text/plain; charset=utf-8", &repo)
-        .await?;
+        .await
+    {
+        return Err(suggest_flat_layout_on_failure(&state, &repo, &repo_key, resp).await);
+    }
 
     let (release, _) = local_release_content(&state, &repo_key, &distribution).await?;
 
@@ -2335,10 +2392,16 @@ async fn in_release_file(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "InRelease")?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
     }
-    proxy
+    // #4619: a failure against an upstream that turns out to be a flat
+    // repository answers with the flat sources line instead.
+    if let Err(resp) = proxy
         .dists_detecting_change("InRelease", "text/plain; charset=utf-8", &repo)
-        .await?;
+        .await
+    {
+        return Err(suggest_flat_layout_on_failure(&state, &repo, &repo_key, resp).await);
+    }
 
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
@@ -2397,6 +2460,7 @@ async fn release_gpg(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "Release.gpg")?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
     }
     // Release.gpg is the detached signature of Release. We do not need
     // revalidation here because the matching Release fetch (called
@@ -2676,6 +2740,7 @@ async fn dists_dispatch(
         if let Some(base) = repo_remote_upstream(&repo) {
             let filter = load_debian_filter(&state.0.db, repo.id).await?;
             gate_debian_dists(&filter, base, &distribution, &dists_path)?;
+            refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
         }
 
         let path = Path((repo_key, distribution, req.component, req.binary_arch));
@@ -2715,6 +2780,7 @@ async fn dists_proxy_catchall(
     if let Some(base) = repo_remote_upstream(&repo) {
         let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, &dists_path)?;
+        refuse_dists_on_flat_repository(&filter, &repo, &repo_key)?;
         if let Some(proxy) = state.proxy_service.as_deref() {
             enforce_by_hash_arch(
                 proxy,
@@ -2892,6 +2958,581 @@ fn xz_compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
     encoder.write_all(data)?;
     encoder.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Flat repositories (#4619): `deb <uri> /`
+//
+// A flat repository has no `dists/<suite>/` tree: `InRelease`, `Release`,
+// `Release.gpg` and `Packages{,.gz,.xz}` sit at the URI apt is given (or under
+// an exact-path suite directory, `deb <uri> sub/`), and each package is
+// fetched from `<uri>/<Filename>`. pkgs.k8s.io and the openSUSE Build Service
+// publish this way, so a remote that only spoke `dists/<suite>` could not
+// mirror them: `GET /debian/<repo>/InRelease` was a 404 and
+// `/dists/stable/InRelease` a 502 (the CDN 403s a `dists/` path).
+//
+// The flat routes give these upstreams the same treatment as the suite layout:
+// the upstream `InRelease`/`Release`/`Release.gpg` are served byte-for-byte
+// (apt keeps verifying against the publisher's key), the release documents
+// revalidate on the 5-minute TTL with conditional requests and drive the
+// release epoch that lazily invalidates the indices next to them, every index
+// is checked against the signed `Release` before it is served (#2459 Tier A),
+// and a package is cached only when its body matches the SHA-256 the cached
+// `Packages` records for it (Tier B).
+//
+// Which layout a repository speaks is the client's choice, made in its
+// sources line, so no probe decides it up front. `debian.flat_repository =
+// true` declares the repository flat explicitly: its `dists/` routes then
+// answer 404 with the sources line to use instead of contacting upstream.
+// Left false (the default), both layouts are served, and a `dists/` request
+// that fails against an upstream which turns out to be flat answers 404 with
+// the same hint. Either decision is logged once per repository.
+// ---------------------------------------------------------------------------
+
+/// Pseudo distribution under which a flat repository's release epoch (#1147)
+/// is recorded. A flat upstream has no `dists/` tree, so this cannot collide
+/// with a real suite's epoch sidecar.
+const FLAT_EPOCH_DISTRIBUTION: &str = "__flat__";
+
+/// What a flat-layout request names. Anything else is refused before the
+/// upstream is contacted, so the flat routes do not turn the remote into a
+/// general-purpose proxy of the upstream host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlatRequestKind {
+    /// `InRelease` or `Release`: revalidated, drives the release epoch.
+    ReleaseDocument,
+    /// `Release.gpg`: the detached signature, served as fetched.
+    ReleaseSignature,
+    /// An index apt reads from a flat repository (`Packages*`, `Sources*`,
+    /// `Translation-*`, or a `by-hash/` entry): verified against `Release`.
+    Index,
+    /// A binary package (`.deb`, `.udeb`, `.ddeb`): streamed, Tier B gated.
+    Package,
+}
+
+/// Classify a (normalised) flat-layout path, or `None` for a path that is not
+/// part of an APT flat repository.
+fn classify_flat_path(path: &str) -> Option<FlatRequestKind> {
+    if path.is_empty() || path.starts_with("dists/") {
+        return None;
+    }
+    if by_hash_sha256(path).is_some() {
+        return Some(FlatRequestKind::Index);
+    }
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    match leaf {
+        "InRelease" | "Release" => return Some(FlatRequestKind::ReleaseDocument),
+        "Release.gpg" => return Some(FlatRequestKind::ReleaseSignature),
+        _ => {}
+    }
+    if dists_path_is_package_content(path) {
+        return Some(FlatRequestKind::Package);
+    }
+    let base = strip_index_compression_suffix(leaf);
+    let base = base.strip_suffix(".lzma").unwrap_or(base);
+    if base == "Packages" || base == "Sources" || base.starts_with("Translation-") {
+        return Some(FlatRequestKind::Index);
+    }
+    None
+}
+
+/// The exact-path suite directory a flat index or release document belongs
+/// to: `""` for `deb <uri> /`, `sub` for `deb <uri> sub/`. A `by-hash/` entry
+/// belongs to the directory holding the `by-hash` tree.
+fn flat_suite_dir(path: &str) -> &str {
+    if let Some(idx) = path.find("by-hash/") {
+        return path[..idx].trim_end_matches('/');
+    }
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+/// `path` relative to its suite directory: the name the suite's signed
+/// `Release` lists it under.
+fn flat_release_relative<'p>(path: &'p str, suite_dir: &str) -> &'p str {
+    if suite_dir.is_empty() {
+        return path;
+    }
+    path.strip_prefix(suite_dir)
+        .map(|rest| rest.trim_start_matches('/'))
+        .unwrap_or(path)
+}
+
+/// The path of a release document in a flat suite directory.
+fn flat_release_path(suite_dir: &str, name: &str) -> String {
+    if suite_dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{suite_dir}/{name}")
+    }
+}
+
+/// Gate a flat-layout request on the repository's #2460 filter and return the
+/// reqwest-normalised path that will be fetched, with its kind.
+///
+/// A flat repository has no distribution or component. Its suite is `/` in
+/// apt's terms, so a distribution allowlist that does not name `/` (or `*`)
+/// keeps it out, and the component allowlist has nothing to apply to. A
+/// package is gated on the architecture in its filename, failing closed under
+/// an architecture allowlist when the filename does not yield one, exactly as
+/// the `pool/` route does.
+#[allow(clippy::result_large_err)]
+fn gate_flat_request(
+    filter: &DebianRepositoryConfig,
+    base_url: &str,
+    raw_path: &str,
+) -> Result<(String, FlatRequestKind), Response> {
+    let path = normalized_debian_relpath(base_url, raw_path, filter.allow_encoded_separators)?;
+    let kind = classify_flat_path(&path).ok_or_else(|| debian_filter_denied("path", &path))?;
+    debian_filter_decision(filter, Some("/"), None, None)?;
+    if kind == FlatRequestKind::Package && !filter.architectures.is_empty() {
+        let filename = path.rsplit('/').next().unwrap_or(&path);
+        let decoded = decode_to_fixpoint(filename).unwrap_or_else(|| filename.to_string());
+        match parse_deb_filename(&decoded).map(|d| d.arch) {
+            Some(arch) => debian_filter_decision(filter, None, None, Some(&arch))?,
+            None => return Err(debian_filter_denied("architecture", filename)),
+        }
+    }
+    Ok((path, kind))
+}
+
+/// Repositories whose layout decision has already been logged by this
+/// process, keyed by (repository, decision).
+fn flat_layout_logged(
+) -> &'static std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, &'static str)>> {
+    static LOGGED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, &'static str)>>,
+    > = std::sync::OnceLock::new();
+    LOGGED.get_or_init(Default::default)
+}
+
+/// Whether `decision` is logged for the first time for this repository.
+fn first_flat_layout_decision(repo_id: uuid::Uuid, decision: &'static str) -> bool {
+    flat_layout_logged()
+        .lock()
+        .map(|mut seen| seen.insert((repo_id, decision)))
+        .unwrap_or(false)
+}
+
+/// Why a repository is answering in the flat layout, for the decision log.
+fn flat_layout_reason(filter: &DebianRepositoryConfig) -> &'static str {
+    if filter.flat_repository {
+        "configured: debian.flat_repository = true"
+    } else {
+        "auto-detected: apt requested the flat (exact-path suite) layout"
+    }
+}
+
+/// The 404 body that tells an operator which sources line a flat upstream
+/// needs.
+fn flat_layout_hint(repo_key: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Repository '{repo_key}' mirrors a flat APT repository (no dists/ tree). \
+             Use the flat sources form, e.g. \
+             `deb [signed-by=<publisher key>] <base URL>/debian/{repo_key}/ /`"
+        ),
+    )
+        .into_response()
+}
+
+/// `debian.flat_repository = true`: refuse a `dists/` request before any
+/// upstream fetch, with the sources line to use instead.
+#[allow(clippy::result_large_err)]
+fn refuse_dists_on_flat_repository(
+    filter: &DebianRepositoryConfig,
+    repo: &RepoInfo,
+    repo_key: &str,
+) -> Result<(), Response> {
+    if !filter.flat_repository {
+        return Ok(());
+    }
+    if first_flat_layout_decision(repo.id, "dists-refused") {
+        tracing::info!(
+            repo_key = %repo_key,
+            "debian remote is configured flat (debian.flat_repository = true); \
+             answering dists/ requests with 404 and the flat sources line (#4619)"
+        );
+    }
+    Err(flat_layout_hint(repo_key))
+}
+
+/// Auto-detection for a `dists/` release request that failed upstream: when
+/// the upstream serves a flat repository at its root instead, log that
+/// decision and answer 404 with the flat sources line rather than the bare
+/// 404/502. Any other response, including a success, is returned unchanged.
+async fn suggest_flat_layout_on_failure(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    response: Response,
+) -> Response {
+    let status = response.status();
+    if repo.repo_type != RepositoryType::Remote
+        || !(status == StatusCode::NOT_FOUND || status == StatusCode::BAD_GATEWAY)
+    {
+        return response;
+    }
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) else {
+        return response;
+    };
+    let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, repo_key, upstream_url);
+    for name in ["InRelease", "Release"] {
+        if proxy
+            .fetch_dists_with_revalidation(
+                &pseudo_repo,
+                name,
+                FLAT_EPOCH_DISTRIBUTION,
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .is_ok()
+        {
+            if first_flat_layout_decision(repo.id, "dists-on-flat-upstream") {
+                tracing::warn!(
+                    repo_key = %repo_key,
+                    upstream = %crate::services::proxy_service::redact_url_for_diagnostics(upstream_url),
+                    "debian remote: upstream has no dists/<suite> tree but serves a flat \
+                     repository ({name} at its root); apt must use the flat sources form \
+                     `deb <url>/debian/{repo_key}/ /` (#4619)"
+                );
+            }
+            return flat_layout_hint(repo_key);
+        }
+    }
+    response
+}
+
+/// Tier A for a flat index: verify `content` against the SHA-256 table of the
+/// signed `Release` in the index's suite directory and, on a mismatch, evict
+/// the cached copy and answer 502. Best-effort like the suite layout: no
+/// loadable `Release` (or a path it does not list) serves the fetch unchanged.
+async fn enforce_flat_integrity(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    content: &[u8],
+) -> Result<(), Response> {
+    let suite_dir = flat_suite_dir(path);
+    let Some(table) = load_release_checksums_at(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        suite_dir,
+        FLAT_EPOCH_DISTRIBUTION,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    reject_unverified_index(
+        proxy,
+        repo_key,
+        path,
+        &table,
+        flat_release_relative(path, suite_dir),
+        content,
+    )
+    .await
+}
+
+/// The cached flat `Packages` indices that can describe `package_path`: the
+/// ones in the repository root and in each directory above the package (the
+/// `Filename:` of a flat index is relative to the repository URI, and the
+/// index normally sits at or above the package).
+fn flat_packages_index_candidates(package_path: &str) -> Vec<String> {
+    let mut dirs = vec![String::new()];
+    let mut prefix = String::new();
+    let mut segments: Vec<&str> = package_path.split('/').collect();
+    segments.pop();
+    for seg in segments {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(seg);
+        dirs.push(prefix.clone());
+    }
+    let mut out = Vec::with_capacity(dirs.len() * 3);
+    for dir in &dirs {
+        for leaf in ["Packages", "Packages.gz", "Packages.xz"] {
+            out.push(flat_release_path(dir, leaf));
+        }
+    }
+    out
+}
+
+/// Tier B for a flat package: the SHA-256 a cached flat `Packages` index
+/// records for `package_path`, or `None` when no cached index covers it (the
+/// download then keeps the Content-Length-gated cache commit, as for `pool/`).
+async fn resolve_flat_expected_checksum(
+    proxy: &ProxyService,
+    repo_key: &str,
+    package_path: &str,
+) -> crate::error::Result<Option<String>> {
+    let dotted = format!("./{package_path}");
+    for cache_path in flat_packages_index_candidates(package_path) {
+        let Ok(Some((bytes, _, _))) = proxy
+            .get_cached_artifact_by_path(repo_key, &cache_path)
+            .await
+        else {
+            continue;
+        };
+        // #2561: permit-scoped decode, same as the pool resolver.
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+            decompress_packages_index(&cache_path, &bytes)
+        })?
+        else {
+            continue;
+        };
+        let map = crate::formats::debian::parse_packages_index(&text);
+        if let Some(sha) = resolve_pool_deb_checksum(&map, package_path)
+            .or_else(|| resolve_pool_deb_checksum(&map, &dotted))
+        {
+            return Ok(Some(sha));
+        }
+    }
+    Ok(None)
+}
+
+/// Default Content-Type for a flat-layout response.
+fn flat_content_type(kind: FlatRequestKind, path: &str) -> String {
+    match kind {
+        FlatRequestKind::ReleaseDocument => "text/plain; charset=utf-8".to_string(),
+        FlatRequestKind::ReleaseSignature => "application/pgp-signature".to_string(),
+        FlatRequestKind::Package => DEBIAN_BINARY_CONTENT_TYPE.to_string(),
+        FlatRequestKind::Index => content_type_for_dists_path(path),
+    }
+}
+
+/// `GET /debian/{repo_key}/{file}`: a file at the root of a flat repository.
+async fn flat_root_file(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, file)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    flat_dispatch(&state, auth.as_ref(), &repo_key, &file, &ctx).await
+}
+
+/// `GET /debian/{repo_key}/{dir}/{*rest}`: a file below the root of a flat
+/// repository (an exact-path suite's indices, or a package such as
+/// `amd64/kubectl_1.34.0-1.1_amd64.deb`).
+async fn flat_nested_file(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, dir, rest)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let path = format!("{dir}/{rest}");
+    flat_dispatch(&state, auth.as_ref(), &repo_key, &path, &ctx).await
+}
+
+async fn flat_dispatch(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    raw_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let repo = resolve_debian_repo(&state.db, repo_key).await?;
+    if repo.repo_type == RepositoryType::Remote {
+        flat_remote(state, &repo, repo_key, raw_path, ctx).await
+    } else if repo.repo_type == RepositoryType::Virtual {
+        flat_virtual(state, auth, &repo, raw_path, ctx).await
+    } else {
+        // A hosted repository publishes the suite layout only.
+        Err((StatusCode::NOT_FOUND, "Not found").into_response())
+    }
+}
+
+async fn flat_remote(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    raw_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, state.proxy_service.as_deref())
+    else {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    };
+    let filter = load_debian_filter(&state.db, repo.id).await?;
+    let (path, kind) = gate_flat_request(&filter, upstream_url, raw_path)?;
+    if first_flat_layout_decision(repo.id, "flat-served") {
+        tracing::info!(
+            repo_key = %repo_key,
+            reason = flat_layout_reason(&filter),
+            "debian remote: serving the flat repository layout (#4619)"
+        );
+    }
+    let (content, upstream_ct) = match kind {
+        FlatRequestKind::Package => {
+            let expected = resolve_flat_expected_checksum(proxy, repo_key, &path)
+                .await
+                .map_err(|e| e.into_response())?;
+            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                &path,
+                &path,
+                expected,
+                RepositoryFormat::Debian,
+            )
+            .await?;
+            proxy_helpers::record_proxy_download(state, repo.id, repo_key, &path, ctx).await;
+            return proxy_helpers::stream_fetch_result(result, DEBIAN_BINARY_CONTENT_TYPE, None);
+        }
+        FlatRequestKind::ReleaseDocument => {
+            let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, repo_key, upstream_url);
+            let _budget_permit = proxy_helpers::proxy_metadata_budget()
+                .reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await;
+            let (content, ct, changed) = proxy
+                .fetch_dists_with_revalidation(
+                    &pseudo_repo,
+                    &path,
+                    FLAT_EPOCH_DISTRIBUTION,
+                    DEFAULT_DISTS_INDEX_TTL_SECS,
+                )
+                .await
+                .map_err(map_proxy_err)?;
+            if changed {
+                signed_release_cache_invalidate(state, repo_key, FLAT_EPOCH_DISTRIBUTION).await;
+            }
+            (content, ct)
+        }
+        FlatRequestKind::ReleaseSignature | FlatRequestKind::Index => {
+            maybe_invalidate_by_epoch(proxy, repo_key, FLAT_EPOCH_DISTRIBUTION, &path).await;
+            let proxy_repo = proxy_helpers::build_remote_repo_with_format(
+                repo.id,
+                repo_key,
+                upstream_url,
+                RepositoryFormat::Debian,
+            );
+            // #2684: buffered index, bounded by the shared metadata budget.
+            let _budget_permit = proxy_helpers::proxy_metadata_budget()
+                .reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await;
+            let (content, ct) = proxy
+                .fetch_artifact_capped(&proxy_repo, &path, proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await
+                .map_err(map_proxy_err)?;
+            if kind == FlatRequestKind::Index {
+                enforce_flat_integrity(proxy, repo.id, repo_key, upstream_url, &path, &content)
+                    .await?;
+            }
+            (content, ct)
+        }
+    };
+    Ok(build_dists_response(
+        content,
+        upstream_ct,
+        &flat_content_type(kind, &path),
+    ))
+}
+
+/// A virtual repository answers a flat request from its Remote members in
+/// priority order, each gated on its own filter (#2727) and narrowed to the
+/// members the caller may read (#3323), like the suite layout.
+async fn flat_virtual(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    raw_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    };
+    let mut allowed = Vec::new();
+    for member in members {
+        let Some(base) = remote_member_upstream(&member) else {
+            continue;
+        };
+        let Ok(filter) = load_debian_filter(&state.db, member.id).await else {
+            continue;
+        };
+        if let Ok((path, kind)) = gate_flat_request(&filter, base, raw_path) {
+            allowed.push((member, path, kind));
+        }
+    }
+    let Some((_, path, kind)) = allowed.first().cloned() else {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    };
+
+    if kind == FlatRequestKind::Package {
+        let members = allowed.into_iter().map(|(m, _, _)| m).collect();
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
+            Some(proxy),
+            &path,
+            Some(ctx),
+            |_member_id, _location| async {
+                Err((StatusCode::NOT_FOUND, "Not found").into_response())
+            },
+        )
+        .await?;
+        let filename = path.rsplit('/').next().unwrap_or(&path).to_string();
+        return proxy_helpers::stream_fetch_result(
+            result,
+            DEBIAN_BINARY_CONTENT_TYPE,
+            Some(&filename),
+        );
+    }
+
+    let mut first_err: Option<Response> = None;
+    for (member, path, kind) in &allowed {
+        let Some(upstream_url) = remote_member_upstream(member) else {
+            continue;
+        };
+        let fetched = if *kind == FlatRequestKind::ReleaseDocument {
+            let pseudo_repo =
+                proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
+            proxy
+                .fetch_dists_with_revalidation(
+                    &pseudo_repo,
+                    path,
+                    FLAT_EPOCH_DISTRIBUTION,
+                    DEFAULT_DISTS_INDEX_TTL_SECS,
+                )
+                .await
+                .map(|(content, ct, _changed)| (content, ct))
+        } else {
+            maybe_invalidate_by_epoch(proxy, &member.key, FLAT_EPOCH_DISTRIBUTION, path).await;
+            let proxy_repo = proxy_helpers::build_remote_repo_with_format(
+                member.id,
+                &member.key,
+                upstream_url,
+                RepositoryFormat::Debian,
+            );
+            proxy
+                .fetch_artifact_capped(&proxy_repo, path, proxy_helpers::LARGE_METADATA_MAX_BYTES)
+                .await
+        };
+        match fetched {
+            Ok((content, ct)) => {
+                return Ok(build_dists_response(
+                    content,
+                    ct,
+                    &flat_content_type(*kind, path),
+                ));
+            }
+            Err(crate::error::AppError::NotFound(_)) => continue,
+            Err(e) => {
+                first_err.get_or_insert(map_proxy_err(e));
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response()))
 }
 
 // ---------------------------------------------------------------------------
@@ -8090,5 +8731,348 @@ mod maintainer_script_tests {
             "/usr/bin/env python3"
         ));
         assert!(!super::super::rpm::is_shell_interpreter("<lua>"));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod flat_repository_tests {
+    //! #4619: flat APT repositories (`deb <uri> /`), shaped like pkgs.k8s.io.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The path the Kubernetes CDN serves its v1.34 flat repository under,
+    /// colons and all.
+    const BASE: &str = "/repositories/isv:/kubernetes:/core:/stable:/v1.34/deb";
+    const DEB: &str = "amd64/kubectl_1.34.0-1.1_amd64.deb";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    struct FlatUpstream {
+        server: MockServer,
+        in_release: Vec<u8>,
+        packages_gz: Vec<u8>,
+        deb: Vec<u8>,
+    }
+
+    /// A flat upstream: signed `InRelease` listing `Packages` and
+    /// `Packages.gz` at the root, a `.deb` under `amd64/`, no `dists/` tree
+    /// (the CDN answers 403 there), and a `Packages` that does NOT match the
+    /// signed `Release` so Tier A can be observed.
+    async fn flat_upstream() -> FlatUpstream {
+        let deb = b"!<arch>\nnot a real kubectl, but stable bytes".repeat(8);
+        let packages = format!(
+            "Package: kubectl\nVersion: 1.34.0-1.1\nArchitecture: amd64\n\
+             Filename: {DEB}\nSize: {}\nSHA256: {}\n\n",
+            deb.len(),
+            sha256_hex(&deb)
+        );
+        let packages_gz = gzip_compress(packages.as_bytes()).expect("gzip");
+        let in_release = format!(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nArchive: deb\nCodename: deb\n\
+             SHA256:\n {} {} Packages\n {} {} Packages.gz\n\
+             -----BEGIN PGP SIGNATURE-----\n\nc2lnbmF0dXJl\n-----END PGP SIGNATURE-----\n",
+            sha256_hex(packages.as_bytes()),
+            packages.len(),
+            sha256_hex(&packages_gz),
+            packages_gz.len()
+        )
+        .into_bytes();
+
+        let server = MockServer::start().await;
+        let ok = |p: String, body: Vec<u8>| {
+            Mock::given(method("GET"))
+                .and(wm_path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        };
+        ok(format!("{BASE}/InRelease"), in_release.clone())
+            .mount(&server)
+            .await;
+        ok(format!("{BASE}/Packages.gz"), packages_gz.clone())
+            .mount(&server)
+            .await;
+        ok(
+            format!("{BASE}/Packages"),
+            b"Package: tampered\n\n".to_vec(),
+        )
+        .mount(&server)
+        .await;
+        ok(format!("{BASE}/{DEB}"), deb.clone())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("{BASE}/dists/stable/InRelease")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        // Not part of an APT flat repository: must never be fetched.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("{BASE}/robots.txt")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("nope"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        FlatUpstream {
+            server,
+            in_release,
+            packages_gz,
+            deb,
+        }
+    }
+
+    #[test]
+    fn classify_flat_path_accepts_only_apt_flat_shapes() {
+        use FlatRequestKind::*;
+        for (path, kind) in [
+            ("InRelease", Some(ReleaseDocument)),
+            ("Release", Some(ReleaseDocument)),
+            ("sub/InRelease", Some(ReleaseDocument)),
+            ("Release.gpg", Some(ReleaseSignature)),
+            ("Packages", Some(Index)),
+            ("Packages.gz", Some(Index)),
+            ("Packages.xz", Some(Index)),
+            ("Packages.lzma", Some(Index)),
+            ("Sources.xz", Some(Index)),
+            ("Translation-en", Some(Index)),
+            ("by-hash/SHA256/abc", Some(Index)),
+            (DEB, Some(Package)),
+            ("foo_1.0_all.udeb", Some(Package)),
+            ("robots.txt", None),
+            ("index.html", None),
+            ("Release.key", None),
+            ("dists/stable/InRelease", None),
+            ("", None),
+        ] {
+            assert_eq!(classify_flat_path(path), kind, "{path}");
+        }
+    }
+
+    #[test]
+    fn flat_suite_dir_and_release_relative_path() {
+        assert_eq!(flat_suite_dir("Packages.gz"), "");
+        assert_eq!(flat_suite_dir("sub/Packages.gz"), "sub");
+        assert_eq!(flat_suite_dir("by-hash/SHA256/abc"), "");
+        assert_eq!(flat_suite_dir("sub/by-hash/SHA256/abc"), "sub");
+        assert_eq!(
+            flat_release_relative("sub/Packages.gz", "sub"),
+            "Packages.gz"
+        );
+        assert_eq!(flat_release_relative("Packages.gz", ""), "Packages.gz");
+        assert_eq!(flat_release_path("", "InRelease"), "InRelease");
+        assert_eq!(
+            flat_release_path("dists/trixie", "InRelease"),
+            "dists/trixie/InRelease"
+        );
+        assert_eq!(
+            flat_packages_index_candidates(DEB),
+            vec![
+                "Packages",
+                "Packages.gz",
+                "Packages.xz",
+                "amd64/Packages",
+                "amd64/Packages.gz",
+                "amd64/Packages.xz"
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_flat_request_applies_dist_and_arch_allowlists() {
+        let base = format!("https://prod-cdn.packages.k8s.io{BASE}");
+        let open = DebianRepositoryConfig::default();
+        assert_eq!(
+            gate_flat_request(&open, &base, "InRelease").unwrap(),
+            ("InRelease".to_string(), FlatRequestKind::ReleaseDocument)
+        );
+        assert!(gate_flat_request(&open, &base, "robots.txt").is_err());
+        assert!(gate_flat_request(&open, &base, "amd64/../../../etc/passwd").is_err());
+
+        // A distribution allowlist names suites; the flat suite is `/`.
+        let suites = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".into()],
+            ..Default::default()
+        };
+        assert!(gate_flat_request(&suites, &base, "InRelease").is_err());
+        let flat_listed = DebianRepositoryConfig {
+            distribution_paths: vec!["/".into()],
+            ..Default::default()
+        };
+        assert!(gate_flat_request(&flat_listed, &base, "InRelease").is_ok());
+
+        // Architecture allowlist: gated on the package filename, fail closed.
+        let arm_only = DebianRepositoryConfig {
+            architectures: vec!["arm64".into()],
+            ..Default::default()
+        };
+        assert!(gate_flat_request(&arm_only, &base, DEB).is_err());
+        assert!(gate_flat_request(&arm_only, &base, "arm64/kubectl_1.34.0-1.1_arm64.deb").is_ok());
+        assert!(gate_flat_request(&arm_only, &base, "amd64/not-a-deb-name.deb").is_err());
+        // Indices are not arch-scoped in a flat repository.
+        assert!(gate_flat_request(&arm_only, &base, "Packages.gz").is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_serves_flat_repository_like_pkgs_k8s_io_4619() {
+        let Some(fx) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let up = flat_upstream().await;
+        let upstream = format!("{}{BASE}/", up.server.uri());
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream).await;
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let get = |p: &str| tdh::get(format!("/{}/{}", fx.repo_key, p));
+
+        let (status, body) = tdh::send(app(), get("InRelease")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            &body[..],
+            &up.in_release[..],
+            "InRelease is served byte-for-byte"
+        );
+
+        let (status, body) = tdh::send(app(), get("Packages.gz")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &up.packages_gz[..]);
+
+        // Tier A: an index the signed Release does not vouch for is refused.
+        let (status, _) = tdh::send(app(), get("Packages")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let (status, body) = tdh::send(app(), get(DEB)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &up.deb[..]);
+        // Tier B: the body matches the SHA-256 the cached Packages records,
+        // so the tee writer commits it (asynchronously, after the stream).
+        let proxy = state.proxy_service.as_deref().expect("proxy");
+        assert_eq!(
+            resolve_flat_expected_checksum(proxy, &fx.repo_key, DEB)
+                .await
+                .expect("resolve"),
+            Some(sha256_hex(&up.deb)),
+            "the cached flat Packages index vouches for the package"
+        );
+        let mut cached = false;
+        for _ in 0..50 {
+            if proxy
+                .get_cached_artifact_by_path(&fx.repo_key, DEB)
+                .await
+                .expect("cache read")
+                .is_some()
+            {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            cached,
+            "a package matching the cached Packages SHA-256 is committed to the cache"
+        );
+
+        let (status, _) = tdh::send(app(), get("robots.txt")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "not an APT path: never proxied"
+        );
+
+        // The suite form against a flat upstream: 404 naming the flat form,
+        // instead of the 502 the CDN's 403 used to produce.
+        let (status, body) = tdh::send(app(), get("dists/stable/InRelease")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("flat") && text.contains(" /`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn flat_repository_setting_refuses_dists_without_contacting_upstream_4619() {
+        let Some(fx) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let up = flat_upstream().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("{BASE}/dists/stable/Release")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Suite: stable\n"))
+            .expect(0)
+            .mount(&up.server)
+            .await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(DEBIAN_CONFIG_KEY)
+        .bind(r#"{"flat_repository": true}"#)
+        .execute(&fx.pool)
+        .await
+        .expect("set debian config");
+        let upstream = format!("{}{BASE}", up.server.uri());
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream).await;
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let (status, body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/dists/stable/Release", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&body).contains("flat"));
+
+        let (status, _) = tdh::send(app(), tdh::get(format!("/{}/InRelease", fx.repo_key))).await;
+        assert_eq!(status, StatusCode::OK, "the flat form is still served");
+    }
+
+    #[tokio::test]
+    async fn virtual_repository_serves_flat_member_4619() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let up = flat_upstream().await;
+        let tmp = std::env::temp_dir().join(format!("flat-virt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let (member_id, member_key, _) = tdh::create_repo(&pool, "remote", "debian").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}{BASE}", up.server.uri()))
+            .bind(member_id)
+            .execute(&pool)
+            .await
+            .expect("member upstream");
+        tdh::publish_repo(&pool, member_id).await;
+        let (virtual_id, virtual_key, _) = tdh::create_repo(&pool, "virtual", "debian").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(&pool)
+        .await
+        .expect("enrol member");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let (status, body) = tdh::send(app(), tdh::get(format!("/{virtual_key}/InRelease"))).await;
+        let (deb_status, deb) = tdh::send(app(), tdh::get(format!("/{virtual_key}/{DEB}"))).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![virtual_id, member_id])
+            .execute(&pool)
+            .await;
+        let _ = member_key;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &up.in_release[..]);
+        assert_eq!(deb_status, StatusCode::OK);
+        assert_eq!(&deb[..], &up.deb[..]);
     }
 }
