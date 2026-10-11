@@ -66,13 +66,15 @@ async fn live_bytes_at(db: &PgPool, repo_id: Uuid, at: PublishAt<'_>) -> sqlx::R
         PublishAt::Path(path) => (
             "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM artifacts \
               WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
-                AND storage_key NOT LIKE 'proxy-cache/%'",
+                AND storage_key NOT LIKE 'proxy-cache/%' \
+                AND storage_key NOT LIKE 'oci-manifests/%'",
             path,
         ),
         PublishAt::StorageKey(storage_key) => (
             "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM artifacts \
               WHERE repository_id = $1 AND storage_key = $2 AND is_deleted = false \
-                AND storage_key NOT LIKE 'proxy-cache/%'",
+                AND storage_key NOT LIKE 'proxy-cache/%' \
+                AND storage_key NOT LIKE 'oci-manifests/%'",
             storage_key,
         ),
     };

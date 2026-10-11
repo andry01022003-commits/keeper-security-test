@@ -21952,7 +21952,7 @@ mod scan_on_upload_coverage_tests {
     /// The only sites allowed to opt out of quota admission with a
     /// `NO-QUOTA-ADMISSION:` reason (#4422 review): promotion copies, the
     /// generated Protobuf label index, proxy-cache fills, and OCI manifest rows
-    /// (charged 0 until #4545). A new exemption is a review conversation: it
+    /// (not counted by the usage ledger, #4545). A new exemption is a review conversation: it
     /// fails here until it is added to this list.
     const ISSUE_4422_EXEMPT_SITES: &[(&str, &str)] = &[
         ("approval.rs", "approve_promotion"),

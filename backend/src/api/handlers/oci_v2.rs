@@ -11145,9 +11145,9 @@ async fn commit_pushed_manifest(
     .map_err(|e| internal(&e))?;
     // No storage-quota admission for the manifest row (#4422): it records the
     // IMAGE size (#3601), whose config and layer bytes were already admitted
-    // blob by blob, so charging it again would fill a capped repository at
-    // half its real bytes. It is charged 0 until the ledger stops counting it
-    // (#4545); see the marker on `upsert_manifest_artifact`.
+    // blob by blob. The usage ledger does not count `oci-manifests/%` rows
+    // either (#4545, migration 288), so admitting it at 0 is exactly what it
+    // adds; see the marker on `upsert_manifest_artifact`.
     let artifact_id = upsert_manifest_artifact(
         &mut *tx,
         m.repo_id,
@@ -11228,8 +11228,9 @@ where
     let artifact_name = format!("{}:{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
     // NO-QUOTA-ADMISSION: a manifest row records the image size, whose bytes
-    // are admitted blob by blob; it is charged 0 until #4545 re-stamps the
-    // ledger (a push, a migration import and a reindex all land here).
+    // are admitted blob by blob; the usage ledger excludes `oci-manifests/%`
+    // rows (#4545, migration 288), so the row adds 0 (a push, a migration
+    // import and a reindex all land here).
     sqlx::query_scalar(
         r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by, origin)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)

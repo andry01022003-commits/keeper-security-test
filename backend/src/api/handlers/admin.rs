@@ -1600,9 +1600,11 @@ pub struct LedgerBackfillResponse {
 /// The blobs are present and served correctly; only the accounting is wrong.
 /// Run this once after a restore.
 ///
-/// **What it recomputes**, mirroring the migration-182 trigger rules exactly:
-/// `hosted_bytes` = `artifacts` with `is_deleted = false` and
-/// `storage_key NOT LIKE 'proxy-cache/%'`; `proxy_bytes` = every
+/// **What it recomputes**, mirroring the ledger trigger rules exactly
+/// (migration 182, amended by 288): `hosted_bytes` = `artifacts` with
+/// `is_deleted = false`, `storage_key NOT LIKE 'proxy-cache/%'` and
+/// `storage_key NOT LIKE 'oci-manifests/%'` (an OCI manifest row records the
+/// image size, whose bytes `oci_bytes` already counts, #4483); `proxy_bytes` = every
 /// `proxy_cache_artifacts` row; `oci_bytes` = every `oci_blobs` row. It is an
 /// absolute recompute per repository, so it is idempotent: on a consistent
 /// instance every row is rewritten with the value it already held and
@@ -3744,7 +3746,9 @@ mod tests {
                  VALUES ($1, $2, 'app', 'v1', $3, 'cafe', 'application/octet-stream', $2)",
             )
             .bind(repo)
-            .bind(format!("oci-manifests/sha256:{uid}{uid}"))
+            // A hosted (non-manifest) key: `oci-manifests/%` rows are not
+            // charged to `hosted_bytes` (#4483).
+            .bind(format!("cas/ledger-3650/{uid}"))
             .bind(HOSTED)
             .execute(&fx.pool)
             .await

@@ -2391,14 +2391,22 @@ impl RepositoryService {
         // repos counts in each of them; physical-footprint dedup on shared
         // cloud backends is the refresher's `DedupScope` concern, not this
         // SUM's.
-        let usage = sqlx::query_scalar!(
+        //
+        // #4483 / #4545: OCI manifest rows (`oci-manifests/%` keys) are NOT
+        // counted. Their `size_bytes` is the IMAGE size (#3601), whose config
+        // and layer bytes the `oci_blobs` branch already counts, so including
+        // them counted every image twice and once more per extra tag. Same
+        // rule as the stats refresher (#3286) and the ledger (migration 288).
+        // Runtime-checked: the predicate is shared with the ledger SQL.
+        let usage: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
+            SELECT COALESCE(SUM(bytes), 0)::BIGINT
             FROM (
                 SELECT size_bytes AS bytes
                   FROM artifacts
                  WHERE repository_id = $1 AND is_deleted = false
                    AND storage_key NOT LIKE 'proxy-cache/%'
+                   AND storage_key NOT LIKE 'oci-manifests/%'
                 UNION ALL
                 SELECT size_bytes AS bytes
                   FROM proxy_cache_artifacts
@@ -2409,8 +2417,8 @@ impl RepositoryService {
                  WHERE repository_id = $1
             ) t
             "#,
-            repo_id
         )
+        .bind(repo_id)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2527,6 +2535,7 @@ impl RepositoryService {
                  WHERE repository_id IN (SELECT id FROM leaves)
                    AND is_deleted = false
                    AND storage_key NOT LIKE 'proxy-cache/%'
+                   AND storage_key NOT LIKE 'oci-manifests/%'
                 UNION ALL
                 SELECT size_bytes AS bytes
                   FROM proxy_cache_artifacts
@@ -3031,16 +3040,19 @@ impl RepositoryService {
 
         // Net-delta accounting for overwrites: subtract the bytes already
         // charged for the (repository_id, path) row we are about to replace.
-        let existing_at_path: i64 = sqlx::query_scalar!(
+        // Same hosted predicate as the ledger (#4483: OCI manifest rows are
+        // not charged).
+        let existing_at_path: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
               FROM artifacts
              WHERE repository_id = $1 AND path = $2 AND is_deleted = false
                AND storage_key NOT LIKE 'proxy-cache/%'
+               AND storage_key NOT LIKE 'oci-manifests/%'
             "#,
-            repo_id,
-            path
         )
+        .bind(repo_id)
+        .bind(path)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -3151,15 +3163,18 @@ impl RepositoryService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let hosted: i64 = sqlx::query_scalar!(
+        // Migration 288's trigger rule (#4483 / #4545): OCI manifest rows
+        // record the image size, whose bytes `oci_bytes` already carries.
+        let hosted: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
               FROM artifacts
              WHERE repository_id = $1 AND is_deleted = false
                AND storage_key NOT LIKE 'proxy-cache/%'
+               AND storage_key NOT LIKE 'oci-manifests/%'
             "#,
-            repo_id
         )
+        .bind(repo_id)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -3264,8 +3279,9 @@ impl RepositoryService {
     ///
     /// Same recompute as [`Self::reconcile_usage_ledger`] — deliberately, so
     /// there is ONE definition of what the ledger should contain. It mirrors
-    /// migration 182's trigger rules exactly: `artifacts` counted iff
-    /// `is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`, every
+    /// the ledger trigger rules exactly (migration 182, amended by 288):
+    /// `artifacts` counted iff `is_deleted = false AND storage_key NOT LIKE
+    /// 'proxy-cache/%' AND storage_key NOT LIKE 'oci-manifests/%'`, every
     /// `proxy_cache_artifacts` row, every `oci_blobs` row (the
     /// `pending_delete_at` marker is not a deletion and does not change the
     /// count).
@@ -6560,7 +6576,8 @@ mod tests {
         /// layer/config blobs live in `oci_blobs`, not `artifacts` (only
         /// manifests land there), so the live usage SUM behind
         /// `storage_used_bytes` must include them. On unfixed code this
-        /// returns 700 (manifest only).
+        /// returns 700 (manifest only). The manifest row itself is not
+        /// counted (#4483): it records the image size those blobs make up.
         #[tokio::test]
         async fn test_get_storage_usage_counts_oci_blobs() {
             let Some(pool) = tdh::try_pool().await else {
@@ -6591,7 +6608,85 @@ mod tests {
                 .get_storage_usage(repo.id)
                 .await
                 .expect("storage usage");
-            assert_eq!(usage, 750_700, "manifest (700) + layers (500k + 250k)");
+            assert_eq!(
+                usage, 750_000,
+                "layers (500k + 250k); the manifest row is not counted (#4483)"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #4483 / #4545: an OCI manifest's `artifacts` row records the IMAGE
+        /// size (config + layers, #3601), and those bytes are already counted
+        /// once through `oci_blobs`. Neither the live usage SUM nor the
+        /// trigger-maintained ledger (and so quota) may count them again:
+        /// `oci-manifests/%` rows are excluded, the #3286 rule the storage
+        /// stats refresher already applies. Two tags of the same image add
+        /// nothing. A non-manifest `artifacts` row in the same repository
+        /// still counts.
+        #[tokio::test]
+        async fn test_oci_manifest_rows_do_not_double_count_image_bytes_4483() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            // One image: a 37-byte config and a 17-byte layer (54 bytes),
+            // tagged twice; each tag row records the 54-byte image size.
+            let config = format!("sha256:{}", Uuid::new_v4().simple());
+            let layer = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &config, 37).await;
+            insert_oci_blob(&pool, repo.id, &layer, 17).await;
+            for tag in ["v1", "latest"] {
+                insert_artifact(
+                    &pool,
+                    repo.id,
+                    &format!("v2/img/manifests/{tag}"),
+                    "oci-manifests/sha256:4483",
+                    54,
+                )
+                .await;
+            }
+            // A non-manifest row (e.g. a generic file) still counts.
+            insert_artifact(&pool, repo.id, "notes/readme.txt", "cas/48/83", 100).await;
+
+            assert_eq!(
+                service.get_storage_usage(repo.id).await.expect("usage"),
+                154,
+                "live usage: blobs once (54) + the generic row (100)"
+            );
+            let (hosted, proxy, oci) = ledger_row(&pool, repo.id).await;
+            assert_eq!(
+                (hosted, proxy, oci),
+                (100, 0, 54),
+                "trigger-maintained ledger must not charge manifest rows"
+            );
+            assert_eq!(
+                service
+                    .reconcile_usage_ledger(repo.id)
+                    .await
+                    .expect("reconcile"),
+                154,
+                "the reconciler's recompute agrees with the triggers"
+            );
+            assert_eq!(ledger_row(&pool, repo.id).await, (100, 0, 54));
+
+            // Soft-deleting a manifest row moves nothing either.
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true \
+                 WHERE repository_id = $1 AND path = 'v2/img/manifests/latest'",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("soft delete tag row");
+            assert_eq!(ledger_row(&pool, repo.id).await, (100, 0, 54));
 
             cleanup_repo(&pool, repo.id).await;
         }
@@ -6726,7 +6821,8 @@ mod tests {
                 .await
                 .expect("create m2");
 
-            // m1: a manifest artifact (700) + a 500k layer. m2: a 250k layer.
+            // m1: a manifest artifact (700, not counted: it records the image
+            // size its blobs make up, #4483) + a 500k layer. m2: a 250k layer.
             insert_artifact(
                 &pool,
                 m1.id,
@@ -6761,12 +6857,12 @@ mod tests {
 
             let m1_usage = service.get_storage_usage(m1.id).await.expect("m1 usage");
             let m2_usage = service.get_storage_usage(m2.id).await.expect("m2 usage");
-            assert_eq!(m1_usage, 500_700);
+            assert_eq!(m1_usage, 500_000);
             assert_eq!(m2_usage, 250_000);
 
             // Pre-fix behaviour the customer saw: the virtual owns no artifact
             // rows, so the plain per-repo figure is 0 despite the members
-            // holding 750,700 bytes of resolvable content.
+            // holding 750,000 bytes of resolvable content.
             assert_eq!(
                 service.get_storage_usage(virt.id).await.expect("virt own"),
                 0,

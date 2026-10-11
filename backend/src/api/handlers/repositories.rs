@@ -3270,9 +3270,10 @@ pub async fn list_repositories(
             // every listing request — the live SUM's cost scales with total
             // artifact count, not page size. The ledger is byte-for-byte
             // equivalent to that SUM: 182's row-level AFTER triggers charge
-            // `hosted_bytes` under the identical predicate the old query used
+            // `hosted_bytes` under the identical predicate the live SUM uses
             // (`is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`,
-            // the #2218 rules), `proxy_bytes`/`oci_bytes` count their tables
+            // the #2218 rules, and `NOT LIKE 'oci-manifests/%'` since #4483,
+            // migration 288), `proxy_bytes`/`oci_bytes` count their tables
             // whole, and the `pending_delete_at` mark-and-sweep marker is a
             // deliberate zero-delta no-op. `RepositoryService::get_storage_usage`
             // stays the live-SUM oracle (reconciler / quota fallback).
