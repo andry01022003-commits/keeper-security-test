@@ -78,8 +78,14 @@ pub(crate) use reindex_manifest_path_shape_sql;
 /// was also pushed (or imported) by digest. A by-digest delete made before the
 /// fix, or served by an older replica during the rollout, of an image pushed
 /// only by tag (`skopeo copy --all` pushes an index that way) leaves no marker
-/// at all, so its tag row is still a candidate. Gating the repair to rows the
-/// migration worker imported is tracked in #4465.
+/// at all. So the scan is also gated to rows the migration worker imported
+/// (#4465): `artifacts.origin` records `kind = migration` for every import
+/// (stamped by the worker since #4050, and re-stamped for older imports
+/// matched to their `migration_items` by migration 270), and is immutable. A
+/// row the native push path wrote carries the `hosted` origin and is never a
+/// repair candidate, whatever happened to its index rows. The residual case is
+/// a MIGRATED image pushed only by tag and deleted by digest on an older
+/// release, which still looks like a never-indexed import.
 ///
 /// A REST/UI delete of a by-digest row (`delete_artifact`, one-row semantics)
 /// leaves the same marker. That is accepted: its sibling tag rows keep their
@@ -107,6 +113,7 @@ const SELECT_UNREGISTERED_MANIFESTS_SQL: &str = concat!(
         JOIN repositories r ON r.id = a.repository_id
         WHERE lower(r.format::text) IN ('docker', 'oci')
           AND a.is_deleted = false
+          AND a.origin ->> 'kind' = 'migration'
           AND "#,
     reindex_manifest_path_shape_sql!(),
     r#"
@@ -361,7 +368,8 @@ struct RepairCandidate {
     storage_path: String,
 }
 
-/// Select docker/oci `artifacts` rows whose paths look like source-layout
+/// Select docker/oci `artifacts` rows the migration worker imported
+/// (`origin.kind = migration`, #4465) whose paths look like source-layout
 /// manifests and that have no `oci_tags` row for their content digest in
 /// the same repository. Rows written before #3533 carry the source-relative
 /// path under a `<repo_key>/` prefix, because docker fell into the
@@ -856,9 +864,16 @@ mod tests {
         storage_key: &str,
         size: i64,
     ) {
+        // #4465: the repair only considers rows the migration worker
+        // imported, which it stamps with the migration origin.
+        let origin = crate::services::artifact_origin::ArtifactOrigin::migration(
+            "seeded-by-test",
+            Some("https://source.example.test"),
+        )
+        .to_json();
         sqlx::query(
-            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, storage_key, content_type) \
-             VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream')",
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, storage_key, content_type, origin) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream', $7)",
         )
         .bind(repo_id)
         .bind(path)
@@ -866,6 +881,7 @@ mod tests {
         .bind(size)
         .bind(checksum)
         .bind(storage_key)
+        .bind(origin)
         .execute(pool)
         .await
         .expect("insert pre-fix artifact row");
@@ -1415,6 +1431,37 @@ mod tests {
         /// (`persist_tag_and_refs`) and the `artifacts` row
         /// (`upsert_manifest_artifact`). Returns the digest.
         async fn push(&self, image: &str, reference: &str, body: &[u8], ct: &str) -> String {
+            self.push_with_origin(image, reference, body, ct, None)
+                .await
+        }
+
+        /// [`Self::push`] as the migration worker writes it (#2457: index rows
+        /// and `artifacts` row in one go), with the migration origin the
+        /// reindex requires of a repair candidate (#4465).
+        async fn push_migrated(
+            &self,
+            image: &str,
+            reference: &str,
+            body: &[u8],
+            ct: &str,
+        ) -> String {
+            let origin = crate::services::artifact_origin::ArtifactOrigin::migration(
+                &self.repo_key,
+                Some("https://source.example.test"),
+            )
+            .to_json();
+            self.push_with_origin(image, reference, body, ct, Some(&origin))
+                .await
+        }
+
+        async fn push_with_origin(
+            &self,
+            image: &str,
+            reference: &str,
+            body: &[u8],
+            ct: &str,
+            origin: Option<&serde_json::Value>,
+        ) -> String {
             use crate::api::handlers::oci_v2 as v2;
             use crate::storage::StorageBackend;
             let digest = crate::api::handlers::oci_digest::compute_sha256(body);
@@ -1446,10 +1493,50 @@ mod tests {
                 &key,
                 body.len() as i64,
                 None,
-                None,
+                origin,
             )
             .await
             .expect("upsert manifest artifact");
+            digest
+        }
+
+        /// What a migration import that was never indexed leaves behind: the
+        /// body at `oci-manifests/<digest>` and an `artifacts` row stamped
+        /// with the migration origin, but no index rows. Returns the digest.
+        async fn push_migrated_unindexed(
+            &self,
+            image: &str,
+            reference: &str,
+            body: &[u8],
+            ct: &str,
+        ) -> String {
+            use crate::api::handlers::oci_v2 as v2;
+            use crate::storage::StorageBackend;
+            let digest = crate::api::handlers::oci_digest::compute_sha256(body);
+            let key = v2::manifest_storage_key(&digest);
+            self.storage
+                .put(&key, bytes::Bytes::copy_from_slice(body))
+                .await
+                .expect("store manifest body");
+            let origin = crate::services::artifact_origin::ArtifactOrigin::migration(
+                &self.repo_key,
+                Some("https://source.example.test"),
+            )
+            .to_json();
+            v2::upsert_manifest_artifact(
+                &self.pool,
+                self.repo_id,
+                image,
+                reference,
+                &digest,
+                ct,
+                &key,
+                body.len() as i64,
+                None,
+                Some(&origin),
+            )
+            .await
+            .expect("upsert migrated manifest artifact");
             digest
         }
 
@@ -1732,9 +1819,11 @@ mod tests {
         let _serial = tdh::oci_reindex_serial_lock().await;
         let rig = Rig4450::setup(pool, "reidx4450grd").await;
 
+        // A migrated image (#4465: only imports are repair candidates).
         let body = image_manifest_4450("guard");
-        let digest = rig.push("app", "v1", &body, OCI_MANIFEST_CT).await;
-        rig.push("app", &digest, &body, OCI_MANIFEST_CT).await;
+        let digest = rig.push_migrated("app", "v1", &body, OCI_MANIFEST_CT).await;
+        rig.push_migrated("app", &digest, &body, OCI_MANIFEST_CT)
+            .await;
         // The pre-fix delete: index unwound, only the digest-path row tombstoned.
         let mut tx = rig.pool.begin().await.unwrap();
         crate::api::handlers::oci_v2::delete_oci_manifest_content_in_tx(
@@ -1788,6 +1877,65 @@ mod tests {
         .unwrap();
         rig.restart().await;
         assert_eq!(rig.tag("app", "v1").await.as_deref(), Some(&*digest));
+
+        rig.teardown().await;
+    }
+
+    /// #4465, the acceptance case: an image pushed ONLY by tag and deleted by
+    /// digest on a release before #4450 (or by a not-yet-upgraded replica
+    /// during the rollout). That delete unwound the index but left the live
+    /// tag row (`v2/<image>/manifests/<tag>`) and wrote no by-digest marker.
+    /// The row was written by the native push path (hosted origin), so it is
+    /// not a migration import awaiting repair, and the upgrade restart must
+    /// leave the image deleted. A genuinely migrated, never-indexed manifest
+    /// is still repaired by the same pass.
+    #[tokio::test]
+    async fn reindex_ignores_natively_pushed_rows_of_a_pre_fix_digest_delete_4465_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let rig = Rig4450::setup(pool, "reidx4465").await;
+
+        let body = image_manifest_4450("tag-only-4465");
+        let digest = rig.push("app", "v1", &body, OCI_MANIFEST_CT).await;
+        // The pre-#4450 by-digest delete: index unwound, no row tombstoned
+        // (a tag-only push has no by-digest row to tombstone).
+        let mut tx = rig.pool.begin().await.unwrap();
+        crate::api::handlers::oci_v2::delete_oci_manifest_content_in_tx(
+            &mut tx,
+            rig.repo_id,
+            "app",
+            &digest,
+            &digest,
+            crate::api::handlers::oci_v2::OciIndexDeleteScope::ContentAddressed,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(rig.tag("app", "v1").await, None, "precondition: tag gone");
+        assert_eq!(rig.live_artifacts_for(&digest).await, 1, "the live tag row");
+
+        // A migrated image the importer stored but never indexed.
+        let migrated = image_manifest_4450("migrated-4465");
+        let migrated_digest = rig
+            .push_migrated_unindexed("imported", "v1", &migrated, OCI_MANIFEST_CT)
+            .await;
+        assert_eq!(rig.tag("imported", "v1").await, None, "precondition");
+
+        rig.restart().await;
+        assert_eq!(
+            rig.tag("app", "v1").await,
+            None,
+            "a natively pushed tag-only image deleted by digest must stay deleted"
+        );
+        assert_eq!(rig.manifest_record(&digest).await, 0);
+        assert_eq!(
+            rig.tag("imported", "v1").await.as_deref(),
+            Some(&*migrated_digest),
+            "a migrated, never-indexed manifest is still repaired"
+        );
 
         rig.teardown().await;
     }
@@ -1952,8 +2100,11 @@ mod tests {
         let body = image_manifest_4450("shared-4466");
         let digest = rig.push("xa", "v1", &body, OCI_MANIFEST_CT).await;
         rig.push("xa", &digest, &body, OCI_MANIFEST_CT).await;
-        rig.push("xb", "v1", &body, OCI_MANIFEST_CT).await;
-        rig.push("xb", &digest, &body, OCI_MANIFEST_CT).await;
+        // xb is a migration import, so it is a repair candidate (#4465) once
+        // it loses its index rows below.
+        rig.push_migrated("xb", "v1", &body, OCI_MANIFEST_CT).await;
+        rig.push_migrated("xb", &digest, &body, OCI_MANIFEST_CT)
+            .await;
         let blob_refs = "SELECT COUNT(*) FROM manifest_blob_refs \
                          WHERE repository_id = $1 AND manifest_digest = $2";
         let refs_before = rig.count(blob_refs, &digest).await;

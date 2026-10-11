@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4465]
+---
+- **The OCI migration reindex only repairs manifests the migration worker imported, so an image pushed by tag and deleted by digest before 1.11.0 stays deleted after the upgrade** (#4465). The startup repair treated any live manifest row without a tag as a never-indexed migrated manifest. An image pushed only by tag (`skopeo copy --all` pushes an index that way) and deleted by digest on an older release, or by a not-yet-upgraded replica during the rollout, leaves exactly that, so the upgrade restart re-registered it (#4450). The candidate scan now also requires `artifacts.origin` to record a migration import (`kind = migration`: stamped by the worker since #4050 and by migration 270 for older imports matched to their migration items). A row written by `docker push` carries the hosted origin and is never repaired. Migrated, never-indexed images are still repaired as before. One case remains: a migrated image pushed only by tag and deleted by digest on an older release still looks like an unindexed import and is re-registered; delete it again after the upgrade.
