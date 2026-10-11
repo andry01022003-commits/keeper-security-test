@@ -49,7 +49,8 @@ fn split_leading_digits(s: &str) -> (Option<&str>, &str) {
 }
 
 /// Compare two non-empty runs of ASCII digits by value, ignoring leading zeros.
-fn compare_digit_runs(a: &str, b: &str) -> Ordering {
+/// The run is compared without parsing, so it never overflows.
+pub(crate) fn compare_digit_runs(a: &str, b: &str) -> Ordering {
     let a = a.trim_start_matches('0');
     let b = b.trim_start_matches('0');
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
