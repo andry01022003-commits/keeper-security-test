@@ -5528,8 +5528,15 @@ async fn store_npm_version(
     )
     .await?;
 
-    // Store the tarball
-    let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);
+    // Store the tarball. On a shared cloud namespace the key is repo-scoped
+    // (#4293), so the guard below only ever refuses a key another repository
+    // could own on the legacy flat scheme (`STORAGE_KEY_SCHEME=flat`).
+    let storage_key = build_npm_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &location.backend,
+        repo_id,
+        &artifact_path,
+    );
     proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
     let storage = state.storage_for_repo_or_500(location)?;
     storage
@@ -6170,9 +6177,25 @@ fn build_npm_artifact_path(package_name: &str, version: &str, tarball_filename: 
     format!("{}/{}/{}", package_name, version, tarball_filename)
 }
 
-/// Build the storage key for an npm tarball.
-fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
-    format!("npm/{}/{}/{}", package_name, version, tarball_filename)
+/// Build the storage key a new npm tarball is written to, from its artifact
+/// path (`{package}/{version}/{file}`).
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `npm/{repository_id}/{path}` of the #2624 scheme, so two repositories
+/// holding the same package version write two objects. The flat
+/// `npm/{path}` key every repository used to share made the second
+/// repository's publish fail the cross-repository write guard with 409
+/// "already owned by another repository" (#4293). Filesystem backends (one
+/// directory per repository) and `STORAGE_KEY_SCHEME=flat` keep the flat key.
+/// Existing tarballs are untouched: every npm read resolves the object
+/// through the `storage_key` its artifact row recorded.
+fn build_npm_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> String {
+    scheme.write_key(storage_backend, "npm", repo_id, artifact_path)
 }
 
 /// Build a scoped package name from scope and package.
@@ -9478,10 +9501,18 @@ mod tests {
     // build_npm_storage_key
     // -----------------------------------------------------------------------
 
+    fn npm_key(scheme: crate::storage::StorageKeyScheme, backend: &str, path: &str) -> String {
+        build_npm_storage_key(scheme, backend, uuid::Uuid::nil(), path)
+    }
+
     #[test]
     fn test_build_npm_storage_key_unscoped() {
         assert_eq!(
-            build_npm_storage_key("express", "4.18.2", "express-4.18.2.tgz"),
+            npm_key(
+                crate::storage::StorageKeyScheme::RepoScoped,
+                "filesystem",
+                &build_npm_artifact_path("express", "4.18.2", "express-4.18.2.tgz")
+            ),
             "npm/express/4.18.2/express-4.18.2.tgz"
         );
     }
@@ -9489,9 +9520,33 @@ mod tests {
     #[test]
     fn test_build_npm_storage_key_scoped() {
         assert_eq!(
-            build_npm_storage_key("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz"),
+            npm_key(
+                crate::storage::StorageKeyScheme::RepoScoped,
+                "filesystem",
+                &build_npm_artifact_path("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz")
+            ),
             "npm/@vue/compiler-core/3.4.0/compiler-core-3.4.0.tgz"
         );
+    }
+
+    /// #4293: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn test_build_npm_storage_key_is_repo_scoped_on_cloud_4293() {
+        use crate::storage::StorageKeyScheme;
+        let path = "@company/lib-name/1.2.0/lib-name-1.2.0.tgz";
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                npm_key(StorageKeyScheme::RepoScoped, backend, path),
+                format!("npm/{}/{path}", uuid::Uuid::nil()),
+                "{backend}"
+            );
+            assert_eq!(
+                npm_key(StorageKeyScheme::Flat, backend, path),
+                format!("npm/{path}"),
+                "{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -13506,6 +13561,110 @@ mod tests {
             member_ledger,
             Some(3),
             "the member is charged the tarball once"
+        );
+    }
+
+    /// #4293: on a shared cloud namespace (S3/GCS/Azure) the same package
+    /// version must be publishable into two independent npm repositories. The
+    /// tarball key was the flat `npm/{package}/{version}/{file}`, so the second
+    /// repository's publish hit the cross-repository write guard and answered
+    /// 409 "already owned by another repository". New tarballs are written
+    /// under the repo-scoped key (`npm/{repository_id}/...`, the #2624 scheme
+    /// Maven already uses), and each repository serves its own copy.
+    #[tokio::test]
+    async fn test_same_package_publishes_to_two_cloud_repositories_4293() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "npm").await;
+            sqlx::query(
+                "UPDATE repositories SET storage_backend = 's3', storage_path = key \
+                 WHERE id = $1",
+            )
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set cloud backend");
+            tdh::grant_repo_access(&pool, repo_id, user_id).await;
+            repos.push((repo_id, repo_key, dir));
+        }
+
+        let tarball = b"same tarball bytes in both repositories";
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(tarball);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@company/lib-name",
+                "versions": { "1.2.0": { "name": "@company/lib-name", "version": "1.2.0" } },
+                "_attachments": { "lib-name-1.2.0.tgz": { "data": tarball_b64 } },
+            }))
+            .expect("serialize publish body"),
+        );
+
+        let mut outcomes = Vec::new();
+        for (repo_id, repo_key, _) in &repos {
+            let published = super::publish_package(
+                &state,
+                Some(tdh::make_auth(user_id, &username)),
+                repo_key,
+                "@company/lib-name",
+                &HeaderMap::new(),
+                body.clone(),
+            )
+            .await
+            .map(|r| r.status())
+            .map_err(|r| r.status());
+            let row_key: Option<String> = sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 \
+                 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("artifact row");
+            let router = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(user_id, &username),
+            );
+            let (dl_status, dl_body) = tdh::send(
+                router,
+                tdh::get(format!(
+                    "/{repo_key}/@company/lib-name/-/lib-name-1.2.0.tgz"
+                )),
+            )
+            .await;
+            outcomes.push((*repo_id, published, row_key, dl_status, dl_body));
+        }
+        let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+
+        for (repo_id, _, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *repo_id, dir).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (repo_id, published, _, _, _) in &outcomes {
+            assert!(
+                published.is_ok(),
+                "publishing the same version into repository {repo_id} must \
+                 succeed, got {published:?}"
+            );
+        }
+        for (repo_id, _, row_key, dl_status, dl_body) in outcomes {
+            let expected = format!("npm/{repo_id}/@company/lib-name/1.2.0/lib-name-1.2.0.tgz");
+            assert_eq!(row_key.as_deref(), Some(expected.as_str()));
+            assert!(objects.contains(&expected), "{expected} must be written");
+            assert_eq!(dl_status, StatusCode::OK);
+            assert_eq!(&dl_body[..], &tarball[..]);
+        }
+        assert!(
+            !objects.iter().any(|k| k.starts_with("npm/@company/")),
+            "the legacy flat key must not be written on a cloud backend: {objects:?}"
         );
     }
 
