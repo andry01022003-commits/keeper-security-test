@@ -881,6 +881,101 @@ New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR;
 
 - **A remote repository's upstream credentials are now sent only to its configured upstream's origin, not to hosts named by index metadata** (#4588, GHSA-24rf-2gv2-j47c). Package index metadata can name download locations by absolute URL: a PyPI simple-index `href`, a Helm `index.yaml` `urls` entry, the Cargo `config.json` `dl` template, a Composer `dist.url`, a Terraform `download_url`. The shared upstream fetchers attached the remote's configured Basic or Bearer credentials to whatever URL they were given. An upstream index that is compromised, or that serves content an attacker controls, could therefore point a download at a host of its choosing and receive the credentials, over plain HTTP if it named an `http://` URL. Any client that could trigger the download could cause this, including an anonymous one on a public remote. The buffered, streaming, conditional-revalidation and ETag-probe fetchers and the JSON POST path now attach credentials only when the request URL has the same scheme, host and port as the remote's `upstream_url` or its `index_upstream_url` override. Any other URL is still fetched, but without credentials, and a sampled `security` warning is logged. OCI bearer-realm handling (GHSA-78h6-3wp8-2542, `oci_trusted_bearer_realms`) is unchanged. **A credentialed remote whose upstream serves files from a different host than its index, and needs the same credentials there, will now get 401/403 from that host.** For a Cargo registry with split index and download hosts, set `index_upstream_url` to the index and `upstream_url` to the download host, so that both are configured origins.
 
+### Sponsors
+
+Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
+
+**Backers**
+
+- Ash A. ([@dragonpaw](https://github.com/dragonpaw))
+- Gabriel Rodriguez ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Thank You
+
+Huge thanks to the external contributors and issue reporters who shaped this release:
+
+**Contributed code**
+
+- **[@vbartusevicius](https://github.com/vbartusevicius)**: the VS Code gallery protocol for hosted and virtual repositories and VSIX-based publish (#3958, #3959, #3960), and NuGet serving both protocol surfaces across all members (#4126), and keeping a virtual's V2 member when its V3 probe errors (#4328).
+- **[@mymarche](https://github.com/mymarche)**: `internal` repository visibility (#3813), the quality gate and policy on bulk promotion (#3979), CI OIDC service accounts keyed on the identity mapping and bound to groups (#4032, #4235), and the Kubernetes CI OIDC provider with static JWKS and JSON Pointer claim filters (#4314).
+- **[@damjanek](https://github.com/damjanek)**: explicit lifecycle policy assignments (#3943) and hosted RPM repodata depth (#4230).
+- **[@knowinglyAnonymous](https://github.com/knowinglyAnonymous)**: inbound W3C trace context and the configurable sampler (#4030), and concurrent npm virtual member walks (#4241).
+- **[@ThaSami](https://github.com/ThaSami)**: `413` for oversized multipart envelopes (#3936), the write action on artifact label writes (#4200), and the scan gate on the generic download route (#4492).
+- **[@vvs9896](https://github.com/vvs9896)**: the admin quarantine-hold queues (#4273) and RubyGems gzip Marshal specs (#4272).
+- **[@Spenhouet](https://github.com/Spenhouet)**: copying the whole Docker/OCI image on promotion so the promoted image is pullable from the target (#4584, #4578).
+- **[@gilesw](https://github.com/gilesw)** (GitHub release mirroring with mise and aqua, #3656), **[@diogoalfa](https://github.com/diogoalfa)** (quality checks on object storage, #4090), **[@garrettKelleyCyOne](https://github.com/garrettKelleyCyOne)** (catalog backfill, #3816), **[@irizzant](https://github.com/irizzant)** (atomic Maven snapshot upserts, #3814), **[@der-eismann](https://github.com/der-eismann)** (Maven virtual download counts, #4268), **[@nikitatsym](https://github.com/nikitatsym)** (Maven `prefixes.txt`, #4368), **[@inspired-geek](https://github.com/inspired-geek)** (Go module caching, #4318), **[@luko0610](https://github.com/luko0610)** (NuGet remote version discovery, #3871), **[@oba11](https://github.com/oba11)** (OTLP `http/protobuf`, #3834), **[@vkhilin-top](https://github.com/vkhilin-top)** (Debian pool checksum paths, #4316), **[@D13410N3](https://github.com/D13410N3)** (Debian local repository payloads, #4257), **[@bandwith](https://github.com/bandwith)** (SAML AuthnRequest DEFLATE, #4493), **[@Quantum-Sicarius](https://github.com/Quantum-Sicarius)** (npm packument sort panic and prerelease `latest`, #4454) and **[@kibidouil](https://github.com/kibidouil)** (Dependency-Track `VIEW_POLICY_VIOLATION`, #4347).
+
+**Reported the defects this release closes**
+
+- **[@aajimal](https://github.com/aajimal)**: Cargo crates with an uppercase letter in their name failing to download through a Remote (#4339).
+- **[@ahsanashraf918](https://github.com/ahsanashraf918)**: Go module files that were never cached (#4120).
+- **[@AkulovNV](https://github.com/AkulovNV)**: proxy-cache publishes failing on GCS's S3-compatible API (#3737).
+- **[@allen0099](https://github.com/allen0099)**: repository-management token scopes and cache TTL lowering that did not apply to cached entries (#3831, #3832).
+- **[@azeek](https://github.com/azeek)**: three Conan defects: `conan remove` answering `404`, binaries missing from an OS-filtered search, and a `/latest` time that changed for an unchanged revision (#4333, #4334, #4335).
+- **[@bandit420](https://github.com/bandit420)**: virtual Ansible repositories serving bytes but not resolving installs (#4379).
+- **[@bandwith](https://github.com/bandwith)**: the SAML AuthnRequest Entra ID refused (#4475).
+- **[@BonjeBongo](https://github.com/BonjeBongo)**: CRAN repository migration from Nexus and Artifactory (#2525).
+- **[@BoyanYK](https://github.com/BoyanYK)**: eleven storage, upload and migration defects: local-disk spooling, the missing `storage_backend` field, chunked uploads behind several replicas and their leftovers, corrupt blobs served as `200`, identical concurrent uploads on Azure, startup with an object-storage default, the immutable-path check on chunked completion, and Artifactory migration of format repositories, large artifacts and Maven metadata (#3916 to #3920, #3922 to #3927).
+- **[@cazlo](https://github.com/cazlo)**: audit events losing the request correlation ID (#2414).
+- **[@Chris-sentbe](https://github.com/Chris-sentbe)**: proxy scan findings attached to the wrong artifact (#3868).
+- **[@ChrisPortman](https://github.com/ChrisPortman)**: CVE severity counts that disagreed from page to page (#4338).
+- **[@coloraven](https://github.com/coloraven)**: the air-gap transfer request behind the bulk missing-artifacts check (#3427).
+- **[@D13410N3](https://github.com/D13410N3)**: local APT repositories that could not be created from the web UI (#4258).
+- **[@damjanek](https://github.com/damjanek)**: lifecycle policy assignment and RPM repodata depth (#3794, #4216).
+- **[@danatri](https://github.com/danatri)**: GitHub Packages tarball URLs on npm Remotes, lifecycle policies ignoring `enabled: false`, and PyPI PEP 658 metadata (#3785, #3869, #3886).
+- **[@dani](https://github.com/dani)**: listen IPs for the gRPC and metrics ports (#2161).
+- **[@der-eismann](https://github.com/der-eismann)**: Maven virtual downloads missing from statistics (#4267).
+- **[@diogoalfa](https://github.com/diogoalfa)**: quality checks failing on GCS (#3736).
+- **[@Dofamin](https://github.com/Dofamin)**: multi-condition lifecycle policies and Galaxy pagination links (#2024, #3873).
+- **[@dragonpaw](https://github.com/dragonpaw)**: promotion state on staging artifacts and one finalize path for chunked and single-shot uploads (#1758, #1846).
+- **[@garrettKelleyCyOne](https://github.com/garrettKelleyCyOne)**: the packages catalog backfill (#4168, #4169).
+- **[@gilesw](https://github.com/gilesw)**: GitHub release caching for mise and aqua (#3657, #3658).
+- **[@groboclown](https://github.com/groboclown)**: the same npm package refused by a second repository on S3 (#4293).
+- **[@Henrik-Henkel](https://github.com/Henrik-Henkel)**: the quickstart starting without a usable admin password (#4313).
+- **[@Ilansos](https://github.com/Ilansos)**: image pulls from Kubernetes without stored passwords (#1246).
+- **[@inspired-geek](https://github.com/inspired-geek)**: OCI coverage on object storage and the `oci_manifests` table (#1529, #1683).
+- **[@Jauchi](https://github.com/Jauchi)**: flat APT repositories such as Kubernetes' that could not be mirrored (#4619).
+- **[@jinxiao](https://github.com/jinxiao)**: IP conditions on permissions (#1849).
+- **[@josepbasil](https://github.com/josepbasil)**: Bazel module registries (#2858).
+- **[@JounQin](https://github.com/JounQin)**: publishing through a virtual repository (#968).
+- **[@kibidouil](https://github.com/kibidouil)**: the missing Dependency-Track `VIEW_POLICY_VIOLATION` permission (#4430).
+- **[@knowinglyAnonymous](https://github.com/knowinglyAnonymous)**: the record-only proxy scan mode, npm and Cargo virtual repository defects, and inbound trace context and spans (#3645, #3951, #3952, #3953, #3954, #3955, #4029, #4240).
+- **[@lHDHRl](https://github.com/lHDHRl)**: a cache TTL that effectively never expires (#2667).
+- **[@lucaserafiniION](https://github.com/lucaserafiniION)**: duplicate artifacts under upload pressure, and the `409` on a redeployed unique snapshot (#3587, #4476).
+- **[@luko0610](https://github.com/luko0610)**: NuGet version discovery on paginated registrations (#3870).
+- **[@marcispauls](https://github.com/marcispauls)**: a blocked image's shared layer refusing every clean image on an OCI Remote, the p0 of this release (#4380).
+- **[@muchaniesiada](https://github.com/muchaniesiada)**: Conan answering an empty list instead of `404`, and a Conan package corrupted by an interrupted upload (#3887, #4329).
+- **[@mymarche](https://github.com/mymarche)**: `internal` visibility, public repositories with guest access disabled, quality gates on bulk promotion, and CI OIDC mappings, grants, scopes and audiences (#3812, #3855, #3977, #4031, #4117, #4132, #4133).
+- **[@nikitatsym](https://github.com/nikitatsym)**: Maven `prefixes.txt` and Resolver 2.x (#4367).
+- **[@oba11](https://github.com/oba11)**: OTLP `http/protobuf` export (#3833).
+- **[@oliverisaac](https://github.com/oliverisaac)**: Terraform modules that `terraform init` could not install (#3838, fixed as #4590).
+- **[@perpective2410](https://github.com/perpective2410)**: two sequential proxy-cache round-trips per Maven GET (#3982).
+- **[@programuotojasgf](https://github.com/programuotojasgf)**: NuGet push lowercasing the package id (#3835).
+- **[@Psalmir](https://github.com/Psalmir)**: Hugging Face proxy repositories (#3135).
+- **[@Quantum-Sicarius](https://github.com/Quantum-Sicarius)**: the npm packument panic and the age gate's prerelease `latest` (#4431, #4432).
+- **[@ReneBeszon](https://github.com/ReneBeszon)**: limiting what a Remote requests upstream (#840).
+- **[@skroll](https://github.com/skroll)**: presigned URLs for OCI blobs (#2894).
+- **[@Spenhouet](https://github.com/Spenhouet)**: an anonymous OCI manifest `PUT` answering `500`, `git lfs pull` hanging on a private repository, and promoted images that could not be pulled (#4568, #4570, #4578).
+- **[@strxone](https://github.com/strxone)**: a Maven virtual answering `404` on a database pool timeout, which Gradle then cached as missing (#4308).
+- **[@syorito-hatsuki](https://github.com/syorito-hatsuki)**: Arch Linux pacman repositories (#3343).
+- **[@takelley1](https://github.com/takelley1)**: keeping garbage-collected artifacts restorable (#2072).
+- **[@ThaSami](https://github.com/ThaSami)**: oversized multipart publishes answering `400` (#4023).
+- **[@TheBr00m](https://github.com/TheBr00m)**: NuGet Remote failures without useful logging (#3899).
+- **[@vbartusevicius](https://github.com/vbartusevicius)**: hosted and virtual VS Code galleries, VSIX publish, and NuGet virtual federation and protocol surfaces (#3956, #3961, #3962, #3980, #4122, #4327).
+- **[@verdel](https://github.com/verdel)**: lifecycle policies for proxy caches and the client IP in authentication audit logs (#3734, #3888).
+- **[@vespersio](https://github.com/vespersio)**: trusted cross-origin OCI token realms (#3591).
+- **[@vivekdsr](https://github.com/vivekdsr)**: maintenance and downtime banners (#2155).
+- **[@vkhilin-top](https://github.com/vkhilin-top)**: remote Debian pool downloads listing the whole cache (#4315).
+- **[@vvs9896](https://github.com/vvs9896)**: empty RubyGems remote specs and admin queues for quarantine holds (#4280, #4281).
+- **[@working-max](https://github.com/working-max)**: synchronous database work on Maven proxy cache hits (#3778).
+- **[@yesid-bocanegra](https://github.com/yesid-bocanegra)**: CycloneDX licence expressions Dependency-Track could not evaluate (#3866).
+- **[@ysolomon-plat](https://github.com/ysolomon-plat)**: recovering artifacts stored without a database row, and the duplicate request span (#1570, #2308).
+- **[@zacisco](https://github.com/zacisco)**: SMTP against an internal-CA Exchange server, raised in discussion #4244 and fixed as #4591.
+- **[@zombig](https://github.com/zombig)**: missing RPM dependency metadata (#3801).
+- **[@ZVilusinsky](https://github.com/ZVilusinsky)**: LDAP group and account reconciliation (#3830).
+
 ## [1.10.0] - 2026-09-20
 
 ### Added
