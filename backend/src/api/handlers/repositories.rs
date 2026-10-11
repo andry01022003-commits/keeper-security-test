@@ -3896,9 +3896,23 @@ pub async fn create_repository(
     let repo_id = repo.id;
     let repo_type_out = repo.repo_type.clone();
     let repo_format_out = repo.format.clone();
-    // A new repository stores nothing yet; a new virtual reports a member
-    // figure of 0 like every other virtual response (#4423).
-    let mut response = repo_to_display_response(repo, new_repository_storage(&repo_type_out));
+    // A new repository stores nothing of its own yet. A new virtual created
+    // with members that already hold content reports their total, scoped to
+    // the members the caller can see, exactly as the next GET does (#4505);
+    // without members it reports 0 like every other virtual (#4423).
+    let created_with_members = repo_type_out == RepositoryType::Virtual
+        && payload
+            .member_repos
+            .as_deref()
+            .is_some_and(|members| !members.is_empty());
+    let storage = if created_with_members {
+        service
+            .get_display_storage_usage(&repo, &member_read_visibility(Some(&auth)))
+            .await?
+    } else {
+        new_repository_storage(&repo_type_out)
+    };
+    let mut response = repo_to_display_response(repo, storage);
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -30941,6 +30955,93 @@ mod apt_validation_tests {
     // paths are covered: the per-repo walk behind `GET /{key}` and the
     // ledger-backed batch behind the listing (#3079).
     // -----------------------------------------------------------------------
+
+    /// #4505: the response to creating a virtual repository whose members
+    /// already hold content reports the members' total, the same figure the
+    /// next `GET` reports, rather than 0.
+    #[tokio::test]
+    async fn test_create_virtual_reports_existing_member_storage_4505() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let prefix = format!("vs4505{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let member = seeded_repo_3078(&pool, &prefix, "member", "local").await;
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $3, 9692, repeat('c', 64), 'application/octet-stream', $4, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(member)
+        .bind(format!("p/{prefix}"))
+        .bind(format!("cas/00/{}", Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .expect("seed member artifact");
+
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let admin = tdh::admin_auth(admin_id, &admin_name);
+        let storage = std::env::temp_dir().join(format!("{prefix}-storage"));
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let virt_key = format!("{prefix}-virt");
+        let body = serde_json::json!({
+            "key": virt_key,
+            "name": virt_key,
+            "format": "generic",
+            "repo_type": "virtual",
+            "member_repos": [{"repo_key": format!("{prefix}-member"), "priority": 1}],
+        });
+        let router = tdh::router_with_auth(super::router(), state, admin.clone());
+        let (status, resp) = tdh::send(
+            router,
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                bytes::Bytes::from(body.to_string()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "create failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let created: serde_json::Value = serde_json::from_slice(&resp).expect("create json");
+        let from_create = virtual_member_figure_4423(&created);
+        let from_get = virtual_total_from_detail_3081(&pool, &virt_key, admin).await;
+        assert_eq!(from_get, 9692, "GET reports the member total");
+        assert_eq!(
+            from_create, from_get,
+            "the create response must report the same member total as GET"
+        );
+        let virt_id: Uuid = sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
+            .bind(&virt_key)
+            .fetch_one(&pool)
+            .await
+            .expect("virtual id");
+        sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await
+            .ok();
+        for id in [virt_id, member] {
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        tdh::cleanup_user(&pool, admin_id).await;
+        let _ = std::fs::remove_dir_all(&storage);
+    }
 
     /// Read `storage_used_bytes` for `key` from `GET /{key}` — the DETAIL
     /// path, whose aggregate is the live per-repo walk
