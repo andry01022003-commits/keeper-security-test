@@ -501,11 +501,14 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 /// (`repositories::upload_artifact` generic PUT, `maven::upload`, and
 /// `terraform::upload_module` + `upload_provider`), removing them from this
 /// list. The remainder are the long-tail format handlers (tracked for later
-/// PF-005 phases) plus two intentional small-body sinks that stay:
-///   * `oci_v2::handle_put_manifest` — an OCI *manifest* is a small bounded JSON
-///     document (blobs upload via the streamed `/blobs/uploads` path), and
+/// PF-005 phases) plus one intentional small-body sink that stays:
 ///   * `proxy_helpers::put_artifact_bytes` — the shared buffered helper the
 ///     long-tail light-format handlers still call; it goes away when they do.
+///
+/// #4568: `oci_v2::handle_put_manifest` now takes `body: Body` and reads the
+/// (small, bounded) manifest only after authentication and authorization, so
+/// an anonymous client can no longer make the server buffer it. The oci_v2.rs
+/// row is removed.
 ///
 /// Phase progress (#3595): the Swift publish route streamed. Fixing the SE-0292
 /// multipart bug there required parsing the envelope anyway, so the handler was
@@ -534,7 +537,6 @@ const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/conan.rs", 2),
     ("src/api/handlers/debian.rs", 1),
     ("src/api/handlers/goproxy.rs", 2),
-    ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/proxy_helpers.rs", 1),
     ("src/api/handlers/sbt.rs", 1),
     ("src/api/handlers/vscode.rs", 1),

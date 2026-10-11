@@ -11183,7 +11183,7 @@ async fn handle_put_manifest(
     base_url: &str,
     image_name: &str,
     reference: &str,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
@@ -11234,6 +11234,18 @@ async fn handle_put_manifest(
     }
     let repo_id = repo.id;
     let image = repo.image;
+
+    // #4568: the body is read only now, after authentication, the push scope,
+    // repository write authorization and the repository-type and
+    // promotion-only gates. Reading it first meant an anonymous client could
+    // make the server buffer up to `max_upload_size_bytes` before the refusal,
+    // and a retried request with a spent body (crane's bearer retry announces
+    // `Content-Length` and sends 0 bytes) answered 500 instead of the 401
+    // challenge. The blob upload handlers already work in this order.
+    let body = match collect_request_body(body, state.config.max_upload_size_bytes as usize).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
 
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -13167,12 +13179,8 @@ async fn catch_all(
         }
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            let body = match collect_request_body(body, state.config.max_upload_size_bytes as usize)
-                .await
-            {
-                Ok(b) => b,
-                Err(resp) => return resp,
-            };
+            // #4568: the handler authenticates and authorizes BEFORE it reads
+            // the body, so the raw body is passed through.
             handle_put_manifest(&state, &headers, base_url, &image_name, &r, body).await
         }
         ("DELETE", "manifests") => {
@@ -28353,6 +28361,66 @@ mod cross_repo_session_regression_tests {
             .execute(&pool)
             .await;
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #4568: an anonymous manifest PUT is refused with 401 and the push
+    /// challenge BEFORE the body is read. crane's bearer retry resends the
+    /// request with a spent body (`Content-Length` set, 0 bytes written), so
+    /// reading the body first turned the expected 401 into a 500
+    /// `BLOB_UPLOAD_UNKNOWN`, and it let any anonymous client make the server
+    /// buffer up to `max_upload_size_bytes` before the refusal. The body here
+    /// fails on first read and records that it was polled.
+    #[tokio::test]
+    async fn anonymous_manifest_put_is_challenged_before_body_read_4568() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) =
+            create_typed_oci_repo(&pool, "local", "anon4568").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = polled.clone();
+        let stream = futures::stream::once(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err::<Bytes, _>(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "request declared a Content-Length of 948 but only wrote 0 bytes",
+            ))
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/hello/manifests/v2", repo_key))
+            .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+            .header(CONTENT_LENGTH, "948")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = router(None).with_state(state).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an anonymous manifest PUT must get the 401 challenge, not a body-read error"
+        );
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            challenge.contains(&format!("repository:{}/hello:pull,push", repo_key)),
+            "challenge must carry the push scope, got {challenge:?}"
+        );
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::SeqCst),
+            "the body of an unauthenticated manifest PUT must not be read"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     /// #3601 regression guard on the PUSH path, whose semantics must not
