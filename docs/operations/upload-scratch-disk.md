@@ -83,6 +83,11 @@ concurrent large uploads are shed instead of getting the replica OOM-killed.
 Size the replica's memory limit at roughly twice the largest package you expect
 on these routes, plus the concurrency you want to admit.
 
+Conan recipe and package files are received the same way (#4329), so a
+`conan_package.tgz` cut short is refused with `408` and nothing is stored.
+Conan file transfers (`/conan/.../files/<name>`) are also exempt from the
+request timeout described below.
+
 ## When an upload cannot be received
 
 The server only parses a package after it has received the whole body. When it

@@ -38,6 +38,7 @@ use tracing::info;
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::handlers::upload_body::UploadBody;
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
@@ -512,25 +513,35 @@ async fn search_recipes_for_repo(
     repository_id: uuid::Uuid,
     like_pattern: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query!(
+    // Rows of a revision still being uploaded (`pending`, #4329) are not
+    // published yet, so a recipe that has only those is not found.
+    type Row = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
         r#"
         SELECT DISTINCT
             a.name,
-            a.version as "version?",
-            am.metadata->>'version' as "meta_version?",
-            am.metadata->>'user' as "meta_user?",
-            am.metadata->>'channel' as "meta_channel?"
+            a.version,
+            am.metadata->>'version',
+            am.metadata->>'user',
+            am.metadata->>'channel'
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND am.format = 'conan'
+          AND am.metadata->>'pending' IS NULL
           AND a.name LIKE $2
         ORDER BY a.name, a.version
         "#,
-        repository_id,
-        like_pattern,
     )
+    .bind(repository_id)
+    .bind(like_pattern)
     .fetch_all(db)
     .await?;
 
@@ -543,15 +554,14 @@ async fn search_recipes_for_repo(
     // sentinel for "no user / no channel", `0.0.0` is the fallback version).
     Ok(rows
         .iter()
-        .map(|r| {
-            let version = r
-                .meta_version
+        .map(|(name, a_version, meta_version, meta_user, meta_channel)| {
+            let version = meta_version
                 .as_deref()
-                .or(r.version.as_deref())
+                .or(a_version.as_deref())
                 .unwrap_or("0.0.0");
-            let user = r.meta_user.as_deref().unwrap_or("_");
-            let channel = r.meta_channel.as_deref().unwrap_or("_");
-            build_conan_reference(&r.name, version, user, channel)
+            let user = meta_user.as_deref().unwrap_or("_");
+            let channel = meta_channel.as_deref().unwrap_or("_");
+            build_conan_reference(name, version, user, channel)
         })
         .collect())
 }
@@ -1315,6 +1325,7 @@ async fn recipe_revisions_for_repo(
     // Newest first; revisions stored at the same instant are ordered by
     // their newest row id, so `/latest` (the first entry, #4335) is
     // deterministic.
+    // A revision still being uploaded (`pending`, #4329) is not listed.
     let rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         r#"
         SELECT am.metadata->>'revision' AS revision,
@@ -1324,6 +1335,7 @@ async fn recipe_revisions_for_repo(
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND am.format = 'conan'
+          AND am.metadata->>'pending' IS NULL
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'user' = $4
@@ -1470,14 +1482,17 @@ async fn package_ids_for_recipe_revision(
     channel: &str,
     revision: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query!(
+    // A package revision still being uploaded (`pending`, #4329) does not
+    // make its package id appear.
+    sqlx::query_scalar::<_, String>(
         r#"
-        SELECT DISTINCT am.metadata->>'packageId' as "package_id?"
+        SELECT DISTINCT am.metadata->>'packageId'
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND am.format = 'conan'
+          AND am.metadata->>'pending' IS NULL
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'user' = $4
@@ -1486,17 +1501,15 @@ async fn package_ids_for_recipe_revision(
           AND am.metadata->>'type' = 'package'
           AND am.metadata->>'packageId' IS NOT NULL
         "#,
-        repository_id,
-        name,
-        version,
-        normalize_user(user),
-        normalize_channel(channel),
-        revision,
     )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .bind(normalize_user(user))
+    .bind(normalize_channel(channel))
+    .bind(revision)
     .fetch_all(db)
-    .await?;
-
-    Ok(rows.into_iter().filter_map(|r| r.package_id).collect())
+    .await
 }
 
 /// Whether the repository holds any artifact of the given recipe revision
@@ -1523,6 +1536,7 @@ async fn recipe_revision_exists_for_repo(
             WHERE a.repository_id = $1
               AND a.is_deleted = false
               AND am.format = 'conan'
+              AND am.metadata->>'pending' IS NULL
               AND a.name = $2
               AND a.version = $3
               AND am.metadata->>'user' = $4
@@ -1570,6 +1584,7 @@ async fn conaninfo_keys_for_recipe_revision(
           AND am.metadata->>'revision' = $6
           AND am.metadata->>'type' = 'package'
           AND am.metadata->>'file' = 'conaninfo.txt'
+          AND am.metadata->>'pending' IS NULL
           AND am.metadata->>'packageId' IS NOT NULL
         ORDER BY am.metadata->>'packageId', a.created_at DESC, a.id DESC
         "#,
@@ -1853,32 +1868,33 @@ async fn recipe_files_list_for_repo(
     channel: &str,
     revision: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query!(
+    // A revision still being uploaded (`pending`, #4329) has no files yet.
+    sqlx::query_scalar::<_, String>(
         r#"
-        SELECT am.metadata->>'file' as "file?"
+        SELECT am.metadata->>'file'
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND am.format = 'conan'
+          AND am.metadata->>'pending' IS NULL
           AND am.metadata->>'type' = 'recipe'
+          AND am.metadata->>'file' IS NOT NULL
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'user' = $4
           AND am.metadata->>'channel' = $5
           AND am.metadata->>'revision' = $6
         "#,
-        repository_id,
-        name,
-        version,
-        normalize_user(user),
-        normalize_channel(channel),
-        revision,
     )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .bind(normalize_user(user))
+    .bind(normalize_channel(channel))
+    .bind(revision)
     .fetch_all(db)
-    .await?;
-
-    Ok(rows.into_iter().filter_map(|r| r.file).collect())
+    .await
 }
 
 async fn recipe_files_list(
@@ -2143,7 +2159,7 @@ async fn recipe_file_upload(
         String,
         String,
     )>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Reject path segments that exceed the filesystem NAME_MAX before any
     // DB, auth, or storage-backend call, so deeply-nested or fuzzing-style
@@ -2183,6 +2199,18 @@ async fn recipe_file_upload(
 
     let size_bytes = body.len() as i64;
     let ct = content_type_for_conan_file(&file_path);
+
+    // #4329: a recipe revision is published by its manifest.
+    let rev = ConanRevisionRef {
+        name: &name,
+        version: &version,
+        user: &user,
+        channel: &channel,
+        revision: &revision,
+        package: None,
+    };
+    let is_manifest = file_path.trim_start_matches('/') == CONAN_MANIFEST_FILE;
+    let pending = conan_upload_admission(&state.db, repo.id, &rev, &file_path, &body).await?;
 
     // Refuse an over-quota upload before the previous file at this path is
     // retired or any bytes are written (#4422).
@@ -2240,40 +2268,24 @@ async fn recipe_file_upload(
         .await
         .map_err(map_storage_err)?;
 
-    // Build metadata JSON
+    // Insert the artifact record and its metadata together; the manifest
+    // publishes the revision (#4329).
     let metadata = build_recipe_metadata(&name, &version, &user, &channel, &revision, &file_path);
-
-    // Insert artifact record
-    let mut tx = super::publish_quota::begin_admitted_publish(
-        &state.db,
+    let artifact_id = insert_conan_artifact(
+        &state,
         repo.id,
+        &rev,
         &artifact_path,
         size_bytes,
+        &checksum_sha256,
+        ct,
+        &storage_key,
+        user_id,
+        metadata,
+        pending,
+        is_manifest,
     )
     .await?;
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        name,
-        version,
-        size_bytes,
-        checksum_sha256,
-        ct,
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(map_db_err)?;
-    tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -2283,19 +2295,6 @@ async fn recipe_file_upload(
         repo.id,
         artifact_id,
     )
-    .await;
-
-    // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'conan', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
     .await;
 
     // Update repository timestamp
@@ -2312,24 +2311,27 @@ async fn recipe_file_upload(
     // `name@user/channel`, collapsing to bare `name` for the default
     // `_/_` — so recipe revisions and the multiple physical recipe files
     // upsert into one catalog row per reference. Fire-and-forget so a
-    // packages-table failure never blocks the upload.
-    crate::services::package_service::register_published_package_with_metadata(
-        &state.db,
-        &state.event_bus,
-        repo.id,
-        &conan_catalog_name(&name, &user, &channel),
-        &version,
-        size_bytes,
-        &checksum_sha256,
-        None,
-        Some(serde_json::json!({
-            "format": "conan",
-            "user": normalize_user(&user),
-            "channel": normalize_channel(&channel),
-            "reference": build_conan_reference(&name, &version, &user, &channel),
-        })),
-    )
-    .await;
+    // packages-table failure never blocks the upload. A file of a revision
+    // that is not published yet (#4329) is not catalogued; its manifest is.
+    if !pending {
+        crate::services::package_service::register_published_package_with_metadata(
+            &state.db,
+            &state.event_bus,
+            repo.id,
+            &conan_catalog_name(&name, &user, &channel),
+            &version,
+            size_bytes,
+            &checksum_sha256,
+            None,
+            Some(serde_json::json!({
+                "format": "conan",
+                "user": normalize_user(&user),
+                "channel": normalize_channel(&channel),
+                "reference": build_conan_reference(&name, &version, &user, &channel),
+            })),
+        )
+        .await;
+    }
 
     info!(
         "Conan recipe upload: {}/{} rev={} file={} to repo {}",
@@ -2344,6 +2346,339 @@ async fn recipe_file_upload(
         .status(StatusCode::CREATED)
         .body(Body::from("Created"))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Publishing a revision atomically (#4329)
+// ---------------------------------------------------------------------------
+//
+// The Conan client uploads a revision's files one PUT at a time, in sorted
+// order: the archives (`conan_export.tgz`, `conan_package.tgz`, ...) first and
+// `conanmanifest.txt` last, and it carries on with the remaining files when
+// one fails. A failed archive therefore used to leave the small files behind
+// as a listed revision without its archive: consumers got "corrupted in the
+// server, it doesn't contain a conan_package.t file", and re-running the
+// upload skipped the revision as "already in server".
+//
+// So a revision is only published by its manifest:
+//
+// * A file uploaded to a revision that has no published manifest yet is stored
+//   with `"pending": true` in its metadata. Every listing (`/latest`,
+//   `/revisions`, `/search`, `/files`, recipe search) skips pending rows.
+// * `conanmanifest.txt` is accepted only when the files the client's own
+//   integrity checks need are stored (see `required_companions`); otherwise it
+//   is refused with 409 and nothing is stored. Accepting it publishes the
+//   whole revision in the same transaction that stores it.
+//
+// A failed upload thus leaves nothing visible, and the retry, which re-sends
+// every file because the server does not list the revision, publishes it.
+
+/// The manifest that publishes a Conan revision.
+const CONAN_MANIFEST_FILE: &str = "conanmanifest.txt";
+
+/// The revision an uploaded Conan file belongs to.
+struct ConanRevisionRef<'a> {
+    name: &'a str,
+    version: &'a str,
+    user: &'a str,
+    channel: &'a str,
+    revision: &'a str,
+    /// `(package_id, package_revision)` for a binary package's file.
+    package: Option<(&'a str, &'a str)>,
+}
+
+impl ConanRevisionRef<'_> {
+    fn kind(&self) -> &'static str {
+        if self.package.is_some() {
+            "package"
+        } else {
+            "recipe"
+        }
+    }
+
+    fn display(&self) -> String {
+        let rref = conan_ref_display(
+            self.name,
+            self.version,
+            self.user,
+            self.channel,
+            Some(self.revision),
+        );
+        match self.package {
+            Some((pid, prev)) => format!("{rref}:{pid}#{prev}"),
+            None => rref,
+        }
+    }
+}
+
+/// A file a manifest needs stored before it publishes the revision: an exact
+/// name, or a name prefix for the compressed archives (`conan_package.t`
+/// matches `.tgz` and the other compression formats, as the client does).
+#[derive(Debug, PartialEq, Eq)]
+enum Companion {
+    Exact(&'static str),
+    Prefix(&'static str),
+}
+
+impl Companion {
+    fn matches(&self, file: &str) -> bool {
+        match self {
+            Self::Exact(name) => file == *name,
+            Self::Prefix(prefix) => file.starts_with(prefix),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Exact(name) => (*name).to_string(),
+            Self::Prefix(prefix) => format!("{prefix}gz"),
+        }
+    }
+}
+
+/// The files a revision's `conanmanifest.txt` needs alongside it.
+///
+/// A package needs `conaninfo.txt` and its `conan_package.t*` archive, the
+/// files the client's download refuses a package without. A recipe needs
+/// `conanfile.py`, plus `conan_export.t*` when the manifest names exported
+/// files and `conan_sources.t*` when it names `export_source/` files: the
+/// manifest lists every file of the recipe (`path: md5`, after a timestamp
+/// line), and the client packs exports and export sources into those two
+/// archives.
+fn required_companions(kind: &str, manifest: &[u8]) -> Vec<Companion> {
+    if kind == "package" {
+        return vec![
+            Companion::Exact("conaninfo.txt"),
+            Companion::Prefix("conan_package.t"),
+        ];
+    }
+    let mut required = vec![Companion::Exact("conanfile.py")];
+    let text = String::from_utf8_lossy(manifest);
+    let mut exports = false;
+    let mut sources = false;
+    for line in text.lines().skip(1) {
+        let Some((path, _)) = line.rsplit_once(": ") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.starts_with("export_source/") {
+            sources = true;
+        } else if !path.is_empty() && path != "conanfile.py" {
+            exports = true;
+        }
+    }
+    if exports {
+        required.push(Companion::Prefix("conan_export.t"));
+    }
+    if sources {
+        required.push(Companion::Prefix("conan_sources.t"));
+    }
+    required
+}
+
+/// The files currently stored for `rev`, each with whether it is pending.
+async fn stored_revision_files(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    rev: &ConanRevisionRef<'_>,
+) -> Result<Vec<(String, bool)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, bool)>(
+        r#"
+        SELECT am.metadata->>'file', am.metadata->>'pending' IS NOT NULL
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND am.metadata->>'file' IS NOT NULL
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+          AND am.metadata->>'type' = $7
+          AND ($8::text IS NULL OR am.metadata->>'packageId' = $8)
+          AND ($9::text IS NULL OR am.metadata->>'packageRevision' = $9)
+        "#,
+    )
+    .bind(repository_id)
+    .bind(rev.name)
+    .bind(rev.version)
+    .bind(normalize_user(rev.user))
+    .bind(normalize_channel(rev.channel))
+    .bind(rev.revision)
+    .bind(rev.kind())
+    .bind(rev.package.map(|(pid, _)| pid))
+    .bind(rev.package.map(|(_, prev)| prev))
+    .fetch_all(db)
+    .await
+}
+
+/// Decide how an uploaded file joins its revision: `Ok(true)` when it is
+/// stored pending (the revision has no published manifest yet), `Ok(false)`
+/// when it is published at once, or a `409` refusing a manifest whose
+/// companions are missing.
+#[allow(clippy::result_large_err)]
+async fn conan_upload_admission(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    rev: &ConanRevisionRef<'_>,
+    file_path: &str,
+    body: &[u8],
+) -> Result<bool, Response> {
+    let stored = stored_revision_files(db, repository_id, rev)
+        .await
+        .map_err(map_db_err)?;
+    if file_path.trim_start_matches('/') != CONAN_MANIFEST_FILE {
+        let published = stored
+            .iter()
+            .any(|(file, pending)| file == CONAN_MANIFEST_FILE && !pending);
+        return Ok(!published);
+    }
+    let missing: Vec<String> = required_companions(rev.kind(), body)
+        .into_iter()
+        .filter(|c| !stored.iter().any(|(file, _)| c.matches(file)))
+        .map(|c| c.label())
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    tracing::warn!(
+        "Conan upload: refusing {} for {} {}: missing {}",
+        CONAN_MANIFEST_FILE,
+        rev.kind(),
+        rev.display(),
+        missing.join(", ")
+    );
+    Err((
+        StatusCode::CONFLICT,
+        format!(
+            "{} for {} '{}' refused: {} not uploaded. The revision is not published; \
+             run the upload again to send its files",
+            CONAN_MANIFEST_FILE,
+            rev.kind(),
+            rev.display(),
+            missing.join(", ")
+        ),
+    )
+        .into_response())
+}
+
+/// Publish every pending file of `rev`, inside the transaction that stores
+/// its manifest.
+async fn publish_conan_revision(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repository_id: uuid::Uuid,
+    rev: &ConanRevisionRef<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE artifact_metadata SET metadata = metadata - 'pending'
+        WHERE artifact_id IN (
+            SELECT a.id
+            FROM artifacts a
+            JOIN artifact_metadata am ON am.artifact_id = a.id
+            WHERE a.repository_id = $1
+              AND a.is_deleted = false
+              AND am.format = 'conan'
+              AND am.metadata->>'pending' IS NOT NULL
+              AND a.name = $2
+              AND a.version = $3
+              AND am.metadata->>'user' = $4
+              AND am.metadata->>'channel' = $5
+              AND am.metadata->>'revision' = $6
+              AND am.metadata->>'type' = $7
+              AND ($8::text IS NULL OR am.metadata->>'packageId' = $8)
+              AND ($9::text IS NULL OR am.metadata->>'packageRevision' = $9)
+        )
+        "#,
+    )
+    .bind(repository_id)
+    .bind(rev.name)
+    .bind(rev.version)
+    .bind(normalize_user(rev.user))
+    .bind(normalize_channel(rev.channel))
+    .bind(rev.revision)
+    .bind(rev.kind())
+    .bind(rev.package.map(|(pid, _)| pid))
+    .bind(rev.package.map(|(_, prev)| prev))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Store an uploaded Conan file's artifact row and metadata in one
+/// transaction, publishing the revision when the file is its manifest
+/// (#4329). Returns the artifact id.
+#[allow(clippy::too_many_arguments)]
+async fn insert_conan_artifact(
+    state: &SharedState,
+    repository_id: uuid::Uuid,
+    rev: &ConanRevisionRef<'_>,
+    artifact_path: &str,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    content_type: &str,
+    storage_key: &str,
+    user_id: uuid::Uuid,
+    mut metadata: serde_json::Value,
+    pending: bool,
+    is_manifest: bool,
+) -> Result<uuid::Uuid, Response> {
+    if pending {
+        metadata["pending"] = serde_json::Value::Bool(true);
+    }
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repository_id,
+        artifact_path,
+        size_bytes,
+    )
+    .await?;
+    let artifact_id: uuid::Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        "#,
+    )
+    .bind(repository_id)
+    .bind(artifact_path)
+    .bind(rev.name)
+    .bind(rev.version)
+    .bind(size_bytes)
+    .bind(checksum_sha256)
+    .bind(content_type)
+    .bind(storage_key)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(map_db_err)?;
+    // The metadata is what every Conan listing reads, so it is written with
+    // the row rather than after it: a request dropped in between used to leave
+    // a row no listing could see but that still occupied its path.
+    sqlx::query(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'conan', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(&metadata)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_err)?;
+    if is_manifest {
+        publish_conan_revision(&mut tx, repository_id, rev)
+            .await
+            .map_err(map_db_err)?;
+    }
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(artifact_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -2496,6 +2831,8 @@ async fn package_revisions_for_repo(
     package_id: &str,
 ) -> Result<Vec<PackageRevisionRow>, sqlx::Error> {
     // Newest first, ties broken by the newest row id, as for recipes.
+    // A package revision still being uploaded (`pending`, #4329) is not
+    // listed, so `conan upload` re-sends it instead of skipping it.
     let rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         r#"
         SELECT am.metadata->>'packageRevision' AS pkg_revision,
@@ -2505,6 +2842,7 @@ async fn package_revisions_for_repo(
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND am.format = 'conan'
+          AND am.metadata->>'pending' IS NULL
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'revision' = $4
@@ -2665,15 +3003,19 @@ async fn package_files_list_for_repo(
     package_id: &str,
     pkg_revision: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query!(
+    // A package revision still being uploaded (`pending`, #4329) has no files
+    // yet: the client would otherwise download it as "corrupted".
+    sqlx::query_scalar::<_, String>(
         r#"
-        SELECT am.metadata->>'file' as "file?"
+        SELECT am.metadata->>'file'
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND am.format = 'conan'
+          AND am.metadata->>'pending' IS NULL
           AND am.metadata->>'type' = 'package'
+          AND am.metadata->>'file' IS NOT NULL
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'user' = $4
@@ -2682,19 +3024,17 @@ async fn package_files_list_for_repo(
           AND am.metadata->>'packageId' = $7
           AND am.metadata->>'packageRevision' = $8
         "#,
-        repository_id,
-        name,
-        version,
-        normalize_user(user),
-        normalize_channel(channel),
-        revision,
-        package_id,
-        pkg_revision,
     )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .bind(normalize_user(user))
+    .bind(normalize_channel(channel))
+    .bind(revision)
+    .bind(package_id)
+    .bind(pkg_revision)
     .fetch_all(db)
-    .await?;
-
-    Ok(rows.into_iter().filter_map(|r| r.file).collect())
+    .await
 }
 
 #[allow(clippy::type_complexity)]
@@ -3036,7 +3376,7 @@ async fn package_file_upload(
         String,
         String,
     )>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Reject excessively long path segments up front (before any DB, auth,
     // or storage-backend call) so the storage backend and DB never see paths
@@ -3089,6 +3429,19 @@ async fn package_file_upload(
 
     let size_bytes = body.len() as i64;
     let ct = content_type_for_conan_file(&file_path);
+
+    // #4329: a package revision is published by its manifest, which needs
+    // the package archive and conaninfo.txt stored first.
+    let rev = ConanRevisionRef {
+        name: &name,
+        version: &version,
+        user: &user,
+        channel: &channel,
+        revision: &revision,
+        package: Some((&package_id, &pkg_revision)),
+    };
+    let is_manifest = file_path.trim_start_matches('/') == CONAN_MANIFEST_FILE;
+    let pending = conan_upload_admission(&state.db, repo.id, &rev, &file_path, &body).await?;
 
     // Refuse an over-quota upload before the previous file at this path is
     // retired or any bytes are written (#4422).
@@ -3145,7 +3498,6 @@ async fn package_file_upload(
         .await
         .map_err(map_storage_err)?;
 
-    // Build metadata JSON
     let metadata = build_package_metadata(
         &name,
         &version,
@@ -3157,37 +3509,23 @@ async fn package_file_upload(
         &file_path,
     );
 
-    // Insert artifact record
-    let mut tx = super::publish_quota::begin_admitted_publish(
-        &state.db,
+    // Insert the artifact record and its metadata together; the manifest
+    // publishes the revision (#4329).
+    let artifact_id = insert_conan_artifact(
+        &state,
         repo.id,
+        &rev,
         &artifact_path,
         size_bytes,
+        &checksum_sha256,
+        ct,
+        &storage_key,
+        user_id,
+        metadata,
+        pending,
+        is_manifest,
     )
     .await?;
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        name,
-        version,
-        size_bytes,
-        checksum_sha256,
-        ct,
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(map_db_err)?;
-    tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -3197,19 +3535,6 @@ async fn package_file_upload(
         repo.id,
         artifact_id,
     )
-    .await;
-
-    // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'conan', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
     .await;
 
     // Update repository timestamp
@@ -6382,20 +6707,27 @@ mod tests {
                 return;
             };
 
-            let status = upload_recipe_file(
-                &f.state,
-                &f.auth,
-                &f.repo_key,
-                "zlib",
-                "1.3.1",
-                "_",
-                "_",
-                "rev1",
-                "conanmanifest.txt",
-                b"1 0\nconanfile.py: abc\n",
-            )
-            .await;
-            assert_eq!(status, StatusCode::CREATED);
+            // The client's order: conanfile.py, then the manifest that
+            // publishes the revision (#4329).
+            for (file_name, body) in [
+                ("conanfile.py", &b"class ZlibConan: pass\n"[..]),
+                ("conanmanifest.txt", &b"1 0\nconanfile.py: abc\n"[..]),
+            ] {
+                let status = upload_recipe_file(
+                    &f.state,
+                    &f.auth,
+                    &f.repo_key,
+                    "zlib",
+                    "1.3.1",
+                    "_",
+                    "_",
+                    "rev1",
+                    file_name,
+                    body,
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED);
+            }
 
             let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
                 "SELECT version, metadata FROM packages \
@@ -6441,9 +6773,11 @@ mod tests {
             };
 
             for (revision, file_name, body) in [
+                ("rev1", "conanfile.py", &b"class ZlibConan: pass\n"[..]),
                 ("rev1", "conanmanifest.txt", &b"1 0\nfirst\n"[..]),
                 ("rev1", "conanmanifest.txt", &b"1 0\nsecond bytes\n"[..]),
                 ("rev1", "conanfile.py", &b"class ZlibConan: pass\n"[..]),
+                ("rev2", "conanfile.py", &b"class ZlibConan: pass  # 2\n"[..]),
                 ("rev2", "conanmanifest.txt", &b"1 0\nthird\n"[..]),
             ] {
                 let status = upload_recipe_file(
@@ -6488,20 +6822,25 @@ mod tests {
             };
 
             for (user, channel) in [("_", "_"), ("myuser", "stable"), ("myuser", "testing")] {
-                let status = upload_recipe_file(
-                    &f.state,
-                    &f.auth,
-                    &f.repo_key,
-                    "zlib",
-                    "1.3.1",
-                    user,
-                    channel,
-                    "rev1",
-                    "conanmanifest.txt",
-                    b"1 0\nmanifest\n",
-                )
-                .await;
-                assert_eq!(status, StatusCode::CREATED, "upload {user}/{channel}");
+                for (file_name, body) in [
+                    ("conanfile.py", &b"class ZlibConan: pass\n"[..]),
+                    ("conanmanifest.txt", &b"1 0\nmanifest\n"[..]),
+                ] {
+                    let status = upload_recipe_file(
+                        &f.state,
+                        &f.auth,
+                        &f.repo_key,
+                        "zlib",
+                        "1.3.1",
+                        user,
+                        channel,
+                        "rev1",
+                        file_name,
+                        body,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "upload {user}/{channel}");
+                }
             }
 
             let mut names: Vec<String> =
@@ -7247,10 +7586,11 @@ mod tests {
             let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
             let auth = make_auth(user_id, &username);
 
+            // The client's order: archive first, manifest last (#4329).
             for (file, bytes) in [
-                ("conanmanifest.txt", sample_conanmanifest_txt().to_vec()),
-                ("conaninfo.txt", sample_conaninfo_txt().to_vec()),
                 ("conan_package.tgz", sample_conan_package_tgz()),
+                ("conaninfo.txt", sample_conaninfo_txt().to_vec()),
+                ("conanmanifest.txt", sample_conanmanifest_txt().to_vec()),
             ] {
                 let status = upload_package_file(
                     &state, &auth, &repo_key, "boost", "1.80", "_", "_", "rec1", "pid", "prev",
@@ -8576,6 +8916,25 @@ mod agent2_recipe_reads {
         )
         .await;
         assert!(put_status.is_success(), "upload failed: {}", put_status);
+        // The manifest publishes the revision (#4329).
+        let manifest_status = upload_recipe_file(
+            &state,
+            &auth,
+            &repo_key,
+            "advurl",
+            "1.0",
+            "_",
+            "_",
+            "rev_adv",
+            "conanmanifest.txt",
+            sample_conanmanifest_txt(),
+        )
+        .await;
+        assert!(
+            manifest_status.is_success(),
+            "manifest: {}",
+            manifest_status
+        );
 
         // Read the file the `/files` listing advertises for this revision.
         let files_base = format!(
@@ -10982,5 +11341,352 @@ mod remove_4333 {
         assert_eq!(scoped, StatusCode::FORBIDDEN);
         assert_eq!(remote, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(rows, 5, "nothing removed");
+    }
+}
+
+/// #4329: an interrupted Conan upload leaves no partial revision visible, and
+/// re-running the upload completes it.
+///
+/// The Conan client uploads a revision's files in sorted order, archives
+/// first and `conanmanifest.txt` last, and keeps going after a file fails. So
+/// a failed `conan_package.tgz` used to leave `conaninfo.txt` and
+/// `conanmanifest.txt` behind as a listed package revision without its
+/// archive: consumers got "corrupted in the server" and a re-run of the upload
+/// was skipped as "already in server".
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod atomic_upload_4329 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+
+    const PKG_MANIFEST: &[u8] = b"1700000000\nlib/a.txt: 00\n";
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_pkg(
+        state: &crate::api::SharedState,
+        auth: &crate::api::middleware::auth::AuthExtension,
+        repo_key: &str,
+        prev: &str,
+        file: &str,
+        body: &[u8],
+    ) -> StatusCode {
+        upload_package_file(
+            state, auth, repo_key, "big", "1.0", "_", "_", "rr1", "pid1", prev, file, body,
+        )
+        .await
+    }
+
+    async fn put_recipe(
+        state: &crate::api::SharedState,
+        auth: &crate::api::middleware::auth::AuthExtension,
+        repo_key: &str,
+        rrev: &str,
+        file: &str,
+        body: &[u8],
+    ) -> StatusCode {
+        upload_recipe_file(
+            state, auth, repo_key, "big", "1.0", "_", "_", rrev, file, body,
+        )
+        .await
+    }
+
+    /// The client's view of the package: (revisions, latest, search, files).
+    async fn package_views(app: &axum::Router, repo_key: &str, prev: &str) -> [StatusCode; 4] {
+        let base = format!("/{repo_key}/v2/conans/big/1.0/_/_/revisions/rr1");
+        let (revs, _) = send(
+            app.clone(),
+            tdh::get(format!("{base}/packages/pid1/revisions")),
+        )
+        .await;
+        let (latest, _) = send(
+            app.clone(),
+            tdh::get(format!("{base}/packages/pid1/latest")),
+        )
+        .await;
+        let (search, search_body) = send(app.clone(), tdh::get(format!("{base}/search"))).await;
+        let search_has_pid = search == StatusCode::OK
+            && serde_json::from_slice::<serde_json::Value>(&search_body)
+                .ok()
+                .and_then(|v| v.get("pid1").cloned())
+                .is_some();
+        let (files, _) = send(
+            app.clone(),
+            tdh::get(format!("{base}/packages/pid1/revisions/{prev}/files")),
+        )
+        .await;
+        [
+            revs,
+            latest,
+            if search_has_pid {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            files,
+        ]
+    }
+
+    #[tokio::test]
+    async fn package_missing_its_archive_stays_invisible_and_a_retry_completes_it() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        for (file, body) in [
+            ("conanfile.py", sample_conanfile_py()),
+            ("conanmanifest.txt", sample_conanmanifest_txt()),
+        ] {
+            assert_eq!(
+                put_recipe(&state, &auth, &repo_key, "rr1", file, body).await,
+                StatusCode::CREATED
+            );
+        }
+
+        // First attempt: conan_package.tgz never arrives (the proxy 502'd),
+        // the client carries on with the two small files.
+        let info = put_pkg(
+            &state,
+            &auth,
+            &repo_key,
+            "prev1",
+            "conaninfo.txt",
+            sample_conaninfo_txt(),
+        )
+        .await;
+        let manifest = put_pkg(
+            &state,
+            &auth,
+            &repo_key,
+            "prev1",
+            "conanmanifest.txt",
+            PKG_MANIFEST,
+        )
+        .await;
+        let app = router_with_auth(state.clone(), auth.clone());
+        let after_failure = package_views(&app, &repo_key, "prev1").await;
+
+        // Retry: the whole package again, archive first.
+        let retry = [
+            put_pkg(
+                &state,
+                &auth,
+                &repo_key,
+                "prev1",
+                "conan_package.tgz",
+                &sample_conan_package_tgz(),
+            )
+            .await,
+            put_pkg(
+                &state,
+                &auth,
+                &repo_key,
+                "prev1",
+                "conaninfo.txt",
+                sample_conaninfo_txt(),
+            )
+            .await,
+            put_pkg(
+                &state,
+                &auth,
+                &repo_key,
+                "prev1",
+                "conanmanifest.txt",
+                PKG_MANIFEST,
+            )
+            .await,
+        ];
+        let after_retry = package_views(&app, &repo_key, "prev1").await;
+        let (_, files_body) = send(
+            app,
+            tdh::get(format!(
+                "/{repo_key}/v2/conans/big/1.0/_/_/revisions/rr1/packages/pid1/revisions/prev1/files"
+            )),
+        )
+        .await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(info, StatusCode::CREATED);
+        assert_eq!(
+            manifest,
+            StatusCode::CONFLICT,
+            "a package manifest without its archive must be refused"
+        );
+        assert_eq!(
+            after_failure,
+            [StatusCode::NOT_FOUND; 4],
+            "[revisions, latest, search, files] after the failed upload"
+        );
+        assert_eq!(retry, [StatusCode::CREATED; 3]);
+        assert_eq!(after_retry, [StatusCode::OK; 4]);
+        let files: serde_json::Value = serde_json::from_slice(&files_body).unwrap();
+        for f in ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"] {
+            assert!(files["files"].get(f).is_some(), "{f} missing: {files}");
+        }
+    }
+
+    /// A recipe whose manifest names exported files needs `conan_export.tgz`
+    /// before the manifest is accepted; until then the revision is not listed.
+    #[tokio::test]
+    async fn recipe_missing_its_export_archive_stays_invisible() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        let manifest: &[u8] =
+            b"1700000000\nLICENSE.txt: 00\nconanfile.py: 11\nexport_source/src/a.c: 22\n";
+
+        let first = [
+            put_recipe(
+                &state,
+                &auth,
+                &repo_key,
+                "rrX",
+                "conan_sources.tgz",
+                &sample_conan_package_tgz(),
+            )
+            .await,
+            put_recipe(
+                &state,
+                &auth,
+                &repo_key,
+                "rrX",
+                "conanfile.py",
+                sample_conanfile_py(),
+            )
+            .await,
+            put_recipe(
+                &state,
+                &auth,
+                &repo_key,
+                "rrX",
+                "conanmanifest.txt",
+                manifest,
+            )
+            .await,
+        ];
+        let app = router_with_auth(state.clone(), auth.clone());
+        let base = format!("/{repo_key}/v2/conans/big/1.0/_/_");
+        let (revs_failed, _) = send(app.clone(), tdh::get(format!("{base}/revisions"))).await;
+        let (latest_failed, _) = send(app.clone(), tdh::get(format!("{base}/latest"))).await;
+        let (files_failed, _) =
+            send(app.clone(), tdh::get(format!("{base}/revisions/rrX/files"))).await;
+
+        let retry = [
+            put_recipe(
+                &state,
+                &auth,
+                &repo_key,
+                "rrX",
+                "conan_export.tgz",
+                &sample_conan_package_tgz(),
+            )
+            .await,
+            put_recipe(
+                &state,
+                &auth,
+                &repo_key,
+                "rrX",
+                "conan_sources.tgz",
+                &sample_conan_package_tgz(),
+            )
+            .await,
+            put_recipe(
+                &state,
+                &auth,
+                &repo_key,
+                "rrX",
+                "conanfile.py",
+                sample_conanfile_py(),
+            )
+            .await,
+            put_recipe(
+                &state,
+                &auth,
+                &repo_key,
+                "rrX",
+                "conanmanifest.txt",
+                manifest,
+            )
+            .await,
+        ];
+        let (latest_ok, latest_body) = send(app.clone(), tdh::get(format!("{base}/latest"))).await;
+        let (files_ok, _) = send(app, tdh::get(format!("{base}/revisions/rrX/files"))).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(first[..2], [StatusCode::CREATED; 2]);
+        assert_eq!(first[2], StatusCode::CONFLICT);
+        assert_eq!(revs_failed, StatusCode::NOT_FOUND);
+        assert_eq!(latest_failed, StatusCode::NOT_FOUND);
+        assert_eq!(files_failed, StatusCode::NOT_FOUND);
+        assert_eq!(retry, [StatusCode::CREATED; 4]);
+        assert_eq!(latest_ok, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&latest_body).unwrap();
+        assert_eq!(v["revision"], "rrX");
+        assert_eq!(files_ok, StatusCode::OK);
+    }
+
+    /// A body shorter than its `Content-Length` is refused as incomplete
+    /// (408) and nothing is stored, instead of being stored truncated.
+    #[tokio::test]
+    async fn truncated_body_is_refused_and_not_stored() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{repo_key}/v2/conans/big/1.0/_/_/revisions/rr1/packages/pid1/revisions/prev1/files/conan_package.tgz"
+            ))
+            .header("Authorization", basic_auth("u", "irrelevant"))
+            .header("Content-Length", "1048576")
+            .body(Body::from(vec![0x1f, 0x8b, 0x08, 0x00]))
+            .unwrap();
+        let (status, _) = send(router_with_auth(state, auth), req).await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(rows, 0);
+    }
+
+    /// Conan file transfers are byte transfers: the global request timeout
+    /// (120 s by default) must not cut a multi-GB `conan_package.tgz` upload
+    /// off mid-body, which is what turned into the reporter's 502s.
+    #[test]
+    fn conan_file_transfers_are_exempt_from_the_request_timeout() {
+        use crate::api::routes::is_byte_transfer_path;
+        for path in [
+            "/conan/k/v2/conans/qt/6.8/_/_/revisions/r/packages/p/revisions/pr/files/conan_package.tgz",
+            "/conan/k/v2/conans/qt/6.8/_/_/revisions/r/files/conan_export.tgz",
+        ] {
+            assert!(is_byte_transfer_path(path), "{path}");
+        }
+        for path in [
+            "/conan/k/v2/conans/qt/6.8/_/_/revisions",
+            "/conan/k/v2/conans/qt/6.8/_/_/revisions/r/files",
+            "/conan/k/v2/conans/search",
+        ] {
+            assert!(!is_byte_transfer_path(path), "{path}");
+        }
     }
 }

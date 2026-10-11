@@ -419,6 +419,13 @@ pub(crate) fn is_byte_transfer_path(path: &str) -> bool {
         return true;
     }
 
+    // Conan recipe and package files (`.../files/<name>`), uploaded and
+    // downloaded whole: a multi-GB `conan_package.tgz` was cut off at the
+    // timeout mid-body (#4329). The `.../files` listings stay bounded.
+    if path.starts_with("/conan/") && path.contains("/files/") {
+        return true;
+    }
+
     // Repo-scoped artifact bytes:
     //   PUT/POST/GET/DELETE /api/v1/repositories/{key}/artifacts[/{path}]
     //   GET                 /api/v1/repositories/{key}/download/{path}
