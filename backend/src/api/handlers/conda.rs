@@ -2500,12 +2500,22 @@ const SHARDS_BASE_URL: &str = "./shards/";
 /// means by its `""`.
 const PACKAGES_BASE_URL: &str = "./";
 
-/// Ceiling on an upstream CEP-16 shard index, as served. conda-forge's
-/// largest subdir index is about 1 MiB; the 8 MiB default metadata tier keeps
-/// the reservation against the shared buffered-metadata budget (#2684) small,
-/// which matters because every shard request through a remote or virtual
-/// channel reads the (proxy-cached) index too.
+/// First-try ceiling on an upstream CEP-16 shard index, as served.
+/// conda-forge's largest subdir index is about 1 MiB; the 8 MiB default
+/// metadata tier keeps the reservation against the shared buffered-metadata
+/// budget (#2684) small, which matters because every shard request through a
+/// remote or virtual channel reads the (proxy-cached) index too. An index past
+/// it is read again under [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`].
 const CEP16_UPSTREAM_INDEX_MAX_BYTES: usize = proxy_helpers::DEFAULT_METADATA_MAX_BYTES;
+
+/// Ceiling on an upstream CEP-16 shard index that does not fit the first try
+/// (#4612). conda-pypi's noarch index, 701,089 names, is 28.6 MB compressed;
+/// 64 MiB leaves more than twice that. Only an index past the first-try tier
+/// reserves this much of the budget, so channels with ordinary indexes keep
+/// the small reservation. An index past this ceiling is treated as the
+/// upstream publishing no usable shard index: the reason is logged and the
+/// client is sent to `repodata.json`, never a 502.
+const CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Ceiling on one upstream CEP-16 shard, as served (#4607). Measured
 /// 2026-10-10: the largest conda-forge shards are `linux-64/awscli` (848,228
@@ -2522,8 +2532,11 @@ const CEP16_UPSTREAM_SHARD_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Ceiling on an upstream CEP-16 shard index after undoing the zstd frame
 /// (and any transfer coding), so a crafted frame stops at the cap instead of
 /// at the allocator. conda-forge's largest subdir index decodes to a few MiB;
-/// conda-pypi's noarch index, 701,089 names, to 34 MB.
-const CEP16_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+/// conda-pypi's noarch index, 701,089 names, to 34 MB (1.2 times its
+/// compressed size, since the 32-byte addresses do not compress). Twice
+/// [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`], so an index the fetch admits is
+/// not refused for decoding to a little more (#4612).
+const CEP16_MAX_DECODED_BYTES: usize = 2 * CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES;
 
 /// How far the record-name check on a shard served through a virtual
 /// ([`shard_record_names`]) reads into the decoded shard before giving up.
@@ -2638,10 +2651,11 @@ struct UpstreamShardIndexInfo {
 /// Fetch and decode `{subdir}/repodata_shards.msgpack.zst` from a remote
 /// repository's upstream through the proxy cache (capped and budgeted, like a
 /// virtual member's repodata). `Ok(None)`: the upstream answers 404, i.e. it
-/// does not publish CEP-16 for this subdir (negative-cached by the proxy). Any
-/// other failure is reported as that repository's
-/// [`virtual_merge::MemberFailure`], so the virtual merge can apply its
-/// member-failure policy to it.
+/// does not publish CEP-16 for this subdir (negative-cached by the proxy), or
+/// its index is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`] (#4612, logged);
+/// either way the client uses `repodata.json`. Any other failure is reported
+/// as that repository's [`virtual_merge::MemberFailure`], so the virtual merge
+/// can apply its member-failure policy to it.
 async fn fetch_upstream_shard_document<T>(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -2658,15 +2672,22 @@ where
         reason,
     };
     let path = format!("{subdir}/{SHARD_INDEX_FILE}");
-    let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        &path,
-        CEP16_UPSTREAM_INDEX_MAX_BYTES,
-    )
-    .await;
+    // Most indexes fit the small first-try reservation; only one past it is
+    // read again under the large ceiling (#4612).
+    let fetch = |cap| {
+        proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &path,
+            cap,
+        )
+    };
+    let mut fetched = fetch(CEP16_UPSTREAM_INDEX_MAX_BYTES).await;
+    if matches!(fetched, Ok(proxy_helpers::CappedMetadataGet::OverCap)) {
+        fetched = fetch(CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES).await;
+    }
     let (content, content_encoding, budget_permit) = match fetched {
         Ok(proxy_helpers::CappedMetadataGet::Buffered {
             content,
@@ -2675,10 +2696,17 @@ where
             ..
         }) => (content, content_encoding, budget_permit),
         Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
-            return Err(fail(
-                "cap",
-                format!("{path} exceeds the {CEP16_UPSTREAM_INDEX_MAX_BYTES}-byte ceiling"),
-            ));
+            // Not a member failure: the upstream publishes an index too large
+            // to buffer, so it publishes no index this channel can use, and
+            // the client falls back to `repodata.json` like for a 404 (#4612).
+            tracing::warn!(
+                repo = %repo_key,
+                document = %path,
+                ceiling = CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES,
+                "upstream CEP-16 shard index exceeds the shard-index ceiling; serving no \
+                 shard index for it so clients use repodata.json"
+            );
+            return Ok(None);
         }
         Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
         Err(response) => {
@@ -21180,6 +21208,87 @@ mod cep16_proxy_tests {
             super::virtual_channel_tests::listed(&repodata),
             vec!["acme-core-1.0-0.conda", "rich-13.0-pyh_0.conda"]
         );
+    }
+
+    /// #4612: an upstream shard index past the 8 MiB metadata tier but under
+    /// the shard-index ceiling is served. conda-pypi's noarch index is 28.6 MB
+    /// compressed; this one is about 11 MB, with incompressible addresses so
+    /// the compressed size really is past the tier.
+    #[tokio::test]
+    async fn remote_serves_a_shard_index_past_the_metadata_tier_4612() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const NAMES: u32 = 300_000;
+        let shards: Vec<(String, String)> = (0..NAMES)
+            .map(|i| {
+                (
+                    format!("pkg-{i:06}"),
+                    hex::encode(Sha256::digest(i.to_le_bytes())),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = shards
+            .iter()
+            .map(|(n, h)| (n.as_str(), h.as_str()))
+            .collect();
+        let index = upstream_index("noarch", "./shards/", &refs);
+        assert!(
+            index.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && index.len() < 64 * 1024 * 1024,
+            "fixture index is {} bytes",
+            index.len()
+        );
+        let server = MockServer::start().await;
+        mount_bytes(&server, INDEX, index).await;
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(router(), state),
+            tdh::get(format!("/{repo_key}{INDEX}")),
+        )
+        .await;
+        cleanup_conda_repo(&pool, repo_id).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body[..body.len().min(512)])
+        );
+        assert_eq!(decode_index(&body).shards.len(), NAMES as usize);
+    }
+
+    /// #4612: an upstream shard index past the shard-index ceiling is not a
+    /// 502. The member is treated as publishing no usable index (the reason
+    /// is logged), so the remote answers 404 and a virtual over it answers
+    /// 404 too, and clients fall back to `repodata.json`.
+    #[tokio::test]
+    async fn shard_index_over_the_ceiling_falls_back_to_repodata_4612() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount_bytes(&server, INDEX, vec![0x5a; 65 * 1024 * 1024]).await;
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let (remote_status, remote_body) = tdh::send(
+            tdh::router_anon(router(), state),
+            tdh::get(format!("/{repo_key}{INDEX}")),
+        )
+        .await;
+        cleanup_conda_repo(&pool, repo_id).await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let (virtual_status, virtual_body, _) =
+            rig.get(format!("/{}{INDEX}", rig.virtual_key)).await;
+        rig.cleanup().await;
+
+        let remote_body = String::from_utf8_lossy(&remote_body);
+        assert_eq!(remote_status, StatusCode::NOT_FOUND, "{remote_body}");
+        assert!(remote_body.contains("repodata.json"), "{remote_body}");
+        let virtual_body = String::from_utf8_lossy(&virtual_body);
+        assert_eq!(virtual_status, StatusCode::NOT_FOUND, "{virtual_body}");
+        assert!(virtual_body.contains("repodata.json"), "{virtual_body}");
     }
 
     /// A member whose index FETCH fails is handled like a failed repodata
