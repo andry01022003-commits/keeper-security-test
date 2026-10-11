@@ -69,6 +69,7 @@ pub mod oci_referenced_content;
 pub mod oci_trusted_realms;
 pub mod oidc_env_bootstrap;
 pub mod oidc_service;
+pub mod open_findings;
 pub mod openscap_scanner;
 pub mod opensearch_service;
 pub mod package_analysis_service;

@@ -2176,7 +2176,35 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
 
+        self.refresh_score_for_artifact(finding.artifact_id).await;
         Ok(finding)
+    }
+
+    /// Recompute the security score of the repository holding `artifact_id`
+    /// after its findings changed outside a scan (an acknowledgement or its
+    /// revocation). Without it the per-repository row kept counting a finding
+    /// the dashboard tiles had already dropped (#4338). Best-effort: the
+    /// triage change is committed either way, so a failed recompute is
+    /// logged, not returned, and the next scan of the repository repairs it.
+    pub async fn refresh_score_for_artifact(&self, artifact_id: Uuid) {
+        let repository_id: Option<Uuid> = match sqlx::query_scalar(
+            "SELECT repository_id FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&self.db)
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(%artifact_id, error = %e, "security score refresh: repository lookup failed");
+                return;
+            }
+        };
+        if let Some(repository_id) = repository_id {
+            if let Err(e) = self.recalculate_score(repository_id).await {
+                tracing::warn!(%repository_id, error = %e, "security score refresh failed");
+            }
+        }
     }
 
     /// Revoke acknowledgment of a finding.
@@ -2200,6 +2228,7 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
 
+        self.refresh_score_for_artifact(finding.artifact_id).await;
         Ok(finding)
     }
 
@@ -2231,52 +2260,26 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Count non-acknowledged findings by severity, but only from the
-        // LATEST completed scan per (artifact_id, scan_type) within the
-        // repository (#962). Without this restriction, rescanning the
-        // same artifact N times multiplied the repo's finding counts by
-        // N because every scan_results row owns its own set of
-        // scan_findings rows. See #1126 for the matching fix applied
-        // to get_dashboard_summary; #1127 forward-ports it here.
-        //
-        // Note: the `legacy_unverified = false` filter present on
-        // release/1.1.x is omitted because main lacks that column
-        // (migration 075 on main is the unrelated `075_quarantine_period.sql`).
-        // Re-add when migration 080 lands.
-        let counts = sqlx::query!(
-            r#"
-            WITH latest_scans AS (
-                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-                FROM scan_results sr
-                JOIN artifacts a ON a.id = sr.artifact_id
-                WHERE a.repository_id = $1
-                  AND NOT a.is_deleted
-                  AND sr.status = 'completed'
-                ORDER BY sr.artifact_id, sr.scan_type,
-                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
-            )
-            SELECT
-                COUNT(*) FILTER (WHERE severity = 'critical' AND NOT is_acknowledged) as "critical!",
-                COUNT(*) FILTER (WHERE severity = 'high' AND NOT is_acknowledged) as "high!",
-                COUNT(*) FILTER (WHERE severity = 'medium' AND NOT is_acknowledged) as "medium!",
-                COUNT(*) FILTER (WHERE severity = 'low' AND NOT is_acknowledged) as "low!",
-                COUNT(*) FILTER (WHERE is_acknowledged) as "acknowledged!",
-                COUNT(*) as "total!"
-            FROM scan_findings
-            WHERE scan_result_id IN (SELECT id FROM latest_scans)
-            "#,
-            repository_id,
+        // #4338: the shared definition of open vulnerabilities by severity
+        // (latest completed scan per (artifact, scan type), one per
+        // (artifact, advisory) at its highest reported severity), the same
+        // one the dashboard tiles and the Overview summary count, read inside
+        // this transaction's snapshot. #962 / #1127 windowed this query to the
+        // latest scans; the shared definition keeps that.
+        let counts = crate::services::open_findings::severity_counts(
+            &mut *tx,
+            crate::services::open_findings::FindingScope::Repository(repository_id),
         )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .await?;
 
         let critical = counts.critical as i32;
         let high = counts.high as i32;
         let medium = counts.medium as i32;
         let low = counts.low as i32;
         let acknowledged = counts.acknowledged as i32;
-        let total = counts.total as i32;
+        // Open vulnerabilities of every severity: what the dashboard's
+        // "Open Findings" tile counts across all repositories.
+        let total = counts.open as i32;
 
         let (score, grade) = compute_security_score(critical, high, medium, low);
 
@@ -2488,62 +2491,41 @@ impl ScanResultService {
 
     /// Get aggregate dashboard summary across all repositories.
     ///
-    /// #962: the finding totals are restricted to the LATEST completed scan
-    /// per (artifact_id, scan_type) tuple. Without this windowing, scanning
-    /// the same Docker image ten times multiplied the dashboard's
-    /// vulnerability count tenfold ("150 vulns" instead of the actual 15)
-    /// because every scan_results row owns its own `scan_findings`.
-    ///
-    /// Soft-deleted artifacts are excluded so users do not see deleted-
-    /// artifact CVE counts mixed into the live dashboard; this matches the
-    /// per-repo score recompute query.
-    ///
-    /// FILTER aggregates collapse the three finding subqueries into one
-    /// scan of the `latest_findings` CTE.
+    /// The finding totals (`total_findings` = open vulnerabilities of every
+    /// severity, `critical_findings`, `high_findings`) use the shared
+    /// definition in [`crate::services::open_findings`] (#4338), which keeps
+    /// #962's restriction to the latest completed scan per (artifact, scan
+    /// type) and the exclusion of soft-deleted artifacts.
     pub async fn get_dashboard_summary(&self) -> Result<DashboardSummary> {
-        let summary = sqlx::query!(
-            r#"
-            WITH latest_scans AS (
-                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-                FROM scan_results sr
-                JOIN artifacts a ON a.id = sr.artifact_id
-                WHERE sr.status = 'completed'
-                  AND NOT a.is_deleted
-                ORDER BY sr.artifact_id, sr.scan_type,
-                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
-            ),
-            latest_findings AS (
-                SELECT sf.severity, sf.is_acknowledged
-                FROM scan_findings sf
-                JOIN latest_scans ls ON ls.id = sf.scan_result_id
-            )
-            SELECT
-                (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true) as "repos_with_scanning!",
-                (SELECT COUNT(*) FROM scan_results) as "total_scans!",
-                COUNT(*) FILTER (WHERE NOT is_acknowledged) as "total_findings!",
-                COUNT(*) FILTER (
-                    WHERE severity = 'critical' AND NOT is_acknowledged
-                ) as "critical_findings!",
-                COUNT(*) FILTER (
-                    WHERE severity = 'high' AND NOT is_acknowledged
-                ) as "high_findings!",
-                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A') as "repos_grade_a!",
-                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F') as "repos_grade_f!"
-            FROM latest_findings
-            "#,
+        // #4338: finding totals come from the shared definition, so the tiles
+        // equal the sum of the per-repository rows and the Overview summary.
+        let counts = crate::services::open_findings::severity_counts(
+            &self.db,
+            crate::services::open_findings::FindingScope::All,
         )
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .await?;
+        let (repos_with_scanning, total_scans, repos_grade_a, repos_grade_f): (i64, i64, i64, i64) =
+            sqlx::query_as(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true),
+                    (SELECT COUNT(*) FROM scan_results),
+                    (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A'),
+                    (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F')
+                "#,
+            )
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut out = build_dashboard_summary(
-            summary.repos_with_scanning,
-            summary.total_scans,
-            summary.total_findings,
-            summary.critical_findings,
-            summary.high_findings,
-            summary.repos_grade_a,
-            summary.repos_grade_f,
+            repos_with_scanning,
+            total_scans,
+            counts.open,
+            counts.critical,
+            counts.high,
+            repos_grade_a,
+            repos_grade_f,
         );
         out.policy_violations_blocked = self.count_policy_violations_blocked().await?;
         Ok(out)
@@ -3746,6 +3728,236 @@ mod tests {
                 .bind(repo_id)
                 .execute(pool)
                 .await;
+        }
+
+        /// One completed scan of `scan_type` carrying `findings`
+        /// (`(severity, cve_id, title, component)`), for the #4338 pin.
+        async fn seed_scan_4338(
+            svc: &ScanResultService,
+            artifact_id: Uuid,
+            repo_id: Uuid,
+            scan_type: &str,
+            findings: &[(Severity, Option<&str>, &str, &str)],
+        ) -> Uuid {
+            let scan = svc
+                .create_scan_result(artifact_id, repo_id, scan_type)
+                .await
+                .expect("create scan");
+            let raw: Vec<RawFinding> = findings
+                .iter()
+                .map(|(severity, cve, title, component)| RawFinding {
+                    severity: *severity,
+                    title: title.to_string(),
+                    description: None,
+                    cve_id: cve.map(str::to_string),
+                    affected_component: Some(component.to_string()),
+                    affected_version: Some("1.0".to_string()),
+                    fixed_version: None,
+                    source: Some(scan_type.to_string()),
+                    source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
+                })
+                .collect();
+            svc.create_findings(scan.id, artifact_id, &raw)
+                .await
+                .expect("create findings");
+            svc.complete_scan(
+                scan.id,
+                raw.len() as i32,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("test"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan");
+            scan.id
+        }
+
+        /// #4338: the security dashboard tiles, the per-repository score row
+        /// and the Overview CVE summary report the same open counts for the
+        /// same data, under the definition in `services::open_findings`.
+        ///
+        /// The data is the reported shape: one CVE found in two packages of
+        /// an image (and, in a different case, by a second scanner at a lower
+        /// severity), a second CVE, a GHSA-only advisory with no CVE id, an
+        /// informational finding; then an acknowledgement, then a rescan that
+        /// no longer reports some of them. Before #4338 the three views read
+        /// 3 / 3 / 2 criticals on the first scan, 2 / 3 / 2 after the
+        /// acknowledgement, and 1 / 1 / 2 after the rescan.
+        ///
+        /// Own database: the dashboard and the all-repository summary count
+        /// every repository, so other tests' rows would move the totals.
+        #[tokio::test]
+        async fn severity_counts_agree_across_dashboard_repo_and_overview_4338() {
+            let Some(iso) = crate::testing::try_isolated_pool().await else {
+                return;
+            };
+            let pool = iso.pool.clone();
+            let svc = ScanResultService::new(pool.clone());
+            let sbom = crate::services::sbom_service::SbomService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (artifact_id, _) = insert_test_artifact(&pool, repo_id, "image").await;
+
+            // (dashboard tiles, repository row as stored, Overview for all
+            // repositories, Overview for the repository)
+            let views = || async {
+                let dash = svc.get_dashboard_summary().await.expect("dashboard");
+                let repo = svc
+                    .get_score(repo_id)
+                    .await
+                    .expect("score")
+                    .expect("score row");
+                let all = sbom.get_cve_trends(None).await.expect("trends");
+                let one = sbom
+                    .get_cve_trends(Some(repo_id))
+                    .await
+                    .expect("repo trends");
+                (dash, repo, all, one)
+            };
+            let assert_agree = |label: &str,
+                                v: &(
+                DashboardSummary,
+                RepoSecurityScore,
+                crate::models::sbom::CveTrends,
+                crate::models::sbom::CveTrends,
+            ),
+                                critical: i64,
+                                high: i64,
+                                open: i64,
+                                acknowledged: i64| {
+                let (dash, repo, all, one) = v;
+                for (view, got) in [
+                    ("dashboard tiles", dash.critical_findings),
+                    ("repository row", repo.critical_count as i64),
+                    ("overview (all)", all.critical_count),
+                    ("overview (repo)", one.critical_count),
+                ] {
+                    assert_eq!(got, critical, "{label}: {view} critical");
+                }
+                for (view, got) in [
+                    ("dashboard tiles", dash.high_findings),
+                    ("repository row", repo.high_count as i64),
+                    ("overview (all)", all.high_count),
+                    ("overview (repo)", one.high_count),
+                ] {
+                    assert_eq!(got, high, "{label}: {view} high");
+                }
+                for (view, got) in [
+                    ("dashboard tiles", dash.total_findings),
+                    ("repository row", repo.total_findings as i64),
+                    ("overview (all)", all.open_cves),
+                    ("overview (repo)", one.open_cves),
+                ] {
+                    assert_eq!(got, open, "{label}: {view} open");
+                }
+                assert_eq!(
+                    repo.acknowledged_count as i64, acknowledged,
+                    "{label}: repo ack"
+                );
+                assert_eq!(all.acknowledged_cves, acknowledged, "{label}: overview ack");
+            };
+
+            seed_scan_4338(
+                &svc,
+                artifact_id,
+                repo_id,
+                "grype",
+                &[
+                    (
+                        Severity::Critical,
+                        Some("CVE-2026-0001"),
+                        "CVE-2026-0001 in openssl",
+                        "openssl",
+                    ),
+                    (
+                        Severity::Critical,
+                        Some("cve-2026-0001"),
+                        "CVE-2026-0001 in libssl3",
+                        "libssl3",
+                    ),
+                    (
+                        Severity::Critical,
+                        Some("CVE-2026-0002"),
+                        "CVE-2026-0002 in zlib",
+                        "zlib",
+                    ),
+                    (Severity::High, None, "GHSA-aaaa-bbbb-cccc", "left-pad"),
+                    (Severity::Info, None, "informational note", "base"),
+                ],
+            )
+            .await;
+            seed_scan_4338(
+                &svc,
+                artifact_id,
+                repo_id,
+                "image",
+                &[(
+                    Severity::High,
+                    Some("CVE-2026-0001"),
+                    "CVE-2026-0001",
+                    "openssl",
+                )],
+            )
+            .await;
+            svc.recalculate_score(repo_id)
+                .await
+                .expect("score after scans");
+            // CVE-2026-0001 (two packages, two scanners: one, at critical),
+            // CVE-2026-0002, the GHSA advisory, the info finding.
+            assert_agree("after the scans", &views().await, 2, 1, 4, 0);
+
+            // Acknowledge CVE-2026-0002. No rescan, no explicit recompute:
+            // the repository row must follow the triage change on its own.
+            let finding_id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM scan_findings WHERE artifact_id = $1 AND cve_id = 'CVE-2026-0002'",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("finding");
+            let admin = crate::api::handlers::test_db_helpers::create_user(&pool)
+                .await
+                .0;
+            svc.acknowledge_finding(finding_id, admin, "not reachable")
+                .await
+                .expect("acknowledge");
+            assert_agree(
+                "after acknowledging CVE-2026-0002",
+                &views().await,
+                1,
+                1,
+                3,
+                1,
+            );
+
+            // grype rescans and now reports only CVE-2026-0002 (a new,
+            // unacknowledged row). CVE-2026-0001 is still reported by the
+            // image scanner, at high.
+            seed_scan_4338(
+                &svc,
+                artifact_id,
+                repo_id,
+                "grype",
+                &[(
+                    Severity::Critical,
+                    Some("CVE-2026-0002"),
+                    "CVE-2026-0002 in zlib",
+                    "zlib",
+                )],
+            )
+            .await;
+            svc.recalculate_score(repo_id)
+                .await
+                .expect("score after rescan");
+            assert_agree("after the rescan", &views().await, 1, 1, 2, 0);
         }
 
         /// Build a completed source scan with one High finding.
