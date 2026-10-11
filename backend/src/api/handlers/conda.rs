@@ -4690,8 +4690,10 @@ async fn build_virtual_repodata(
 
 /// Build merged channeldata.json for a virtual repository: hosted members
 /// first, then remote members (fetched capped, one at a time), with remote
-/// entries for hosted-owned names excluded. Shared and kept like repodata
-/// ([`merge_gate`], #4608).
+/// entries for hosted-owned names excluded. A remote member whose upstream
+/// publishes no channeldata.json (404) contributes no entries (#4601); any
+/// other member failure goes through the member-failure policy. Shared and
+/// kept like repodata ([`merge_gate`], #4608).
 async fn build_virtual_channeldata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -4757,12 +4759,15 @@ async fn build_virtual_channeldata(
             Some(format!("{virtual_repo_id}/channeldata.json")),
             move |doc| merge_validators_fresh(validate_proxy, doc),
             move |mut account| async move {
+                // A member whose upstream publishes no channeldata.json (404)
+                // contributes no entries; only a real failure (5xx, timeout,
+                // cap, parse) fails the merge (#4601).
                 let (documents, mut failed) = virtual_merge::fetch_remote_members(
                     proxy.as_deref(),
                     &members,
                     &virtual_merge::channeldata_candidates(),
                     virtual_merge::MemberLimits::from_env(),
-                    false,
+                    true,
                     &mut account,
                 )
                 .await;
@@ -18490,6 +18495,66 @@ mod virtual_channel_tests {
             Some("no-store")
         );
         assert!(headers.get("warning").is_some());
+    }
+
+    /// #4601: a remote member whose upstream publishes no `channeldata.json`
+    /// (404) contributes no entries instead of failing the virtual's
+    /// channeldata with 502. `repodata.json` for the same virtual merged fine
+    /// before the fix too.
+    #[tokio::test]
+    async fn member_without_channeldata_contributes_nothing_4601() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_repodata("noarch", &["rich-13.0-pyh_0.conda"])),
+            )
+            .mount(&server)
+            .await;
+        // No channeldata.json mounted: the upstream answers 404 for it.
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let (status, body, _) = rig
+            .get(format!("/{}/channeldata.json", rig.virtual_key))
+            .await;
+        let (repodata_status, _) = rig.repodata("noarch").await;
+        rig.cleanup().await;
+
+        assert_eq!(repodata_status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(doc["packages"].get("acme-core").is_some(), "{doc}");
+    }
+
+    /// #4601 acceptance: a hosted member with no packages and a remote member
+    /// that publishes channeldata merge to the remote's entries.
+    #[tokio::test]
+    async fn empty_hosted_member_and_remote_channeldata_merge_4601() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "channeldata_version": 1,
+                "packages": {"rich": {"version": "13.0", "subdirs": ["noarch"]}},
+            })))
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let (status, body, _) = rig
+            .get(format!("/{}/channeldata.json", rig.virtual_key))
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc["packages"]["rich"]["version"], "13.0", "{doc}");
     }
 
     #[test]

@@ -401,9 +401,16 @@ pub(super) async fn fetch_member_document(
     }
     if missing_is_empty && last_status == Some(StatusCode::NOT_FOUND) {
         // Every candidate answered 404: the upstream does not publish this
-        // subdir at all (conda-forge has no `unknown/`, most channels lack
-        // most platforms). A conda client treats a missing subdir as empty, so
-        // the member contributes nothing rather than failing the merge.
+        // document at all (conda-forge has no `unknown/`, most channels lack
+        // most platforms, many publish no channeldata.json). A conda client
+        // treats a missing subdir as empty, so the member contributes nothing
+        // rather than failing the merge (#4601 for channeldata).
+        tracing::info!(
+            member = %member.key,
+            document = candidates.first().map(|(p, _)| p.as_str()).unwrap_or_default(),
+            "conda virtual member's upstream does not publish this document; it contributes \
+             no entries"
+        );
         return Ok(MemberDocument {
             member: member.key.clone(),
             json: b"{}".to_vec(),
