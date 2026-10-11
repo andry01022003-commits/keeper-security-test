@@ -225,31 +225,51 @@ async fn service_discovery(Path(repo_key): Path<String>) -> Result<Response, Res
 
 async fn list_module_versions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, provider)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let module_name = build_module_name(&namespace, &name, &provider);
+    let upstream_path = format!("v1/modules/{namespace}/{name}/{provider}/versions");
 
-    let versions: Vec<Option<String>> = sqlx::query_scalar!(
-        r#"
-        SELECT DISTINCT version
-        FROM artifacts
-        WHERE repository_id = $1
-          AND name = $2
-          AND is_deleted = false
-          AND version IS NOT NULL
-        ORDER BY version
-        "#,
-        repo.id,
-        module_name
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(crate::api::handlers::db_err)?;
-
-    let versions: Vec<String> = versions.into_iter().flatten().collect();
+    // #4598: `terraform init` / `tofu init` list a module's versions before
+    // they ask for `/download`, so a remote (its upstream's versions) and a
+    // virtual (the union over the members the caller may read) must answer
+    // here too, not only a hosted repository.
+    let mut upstream_err: Option<Response> = None;
+    let versions: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
+        let mut all = std::collections::BTreeSet::new();
+        for member in &members {
+            if member.repo_type.is_hosted() {
+                all.extend(hosted_module_versions(&state.db, member.id, &module_name).await?);
+            } else if member.repo_type == RepositoryType::Remote {
+                let info = proxy_helpers::repo_info_from_member(member);
+                match remote_module_versions(&state, &info, &upstream_path).await {
+                    Ok(v) => all.extend(v),
+                    Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+                    Err(resp) => {
+                        upstream_err.get_or_insert(resp);
+                    }
+                }
+            }
+        }
+        all.into_iter().collect()
+    } else if repo.repo_type == RepositoryType::Remote {
+        match remote_module_versions(&state, &repo, &upstream_path).await {
+            Ok(v) => v,
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => Vec::new(),
+            Err(resp) => return Err(resp),
+        }
+    } else {
+        hosted_module_versions(&state.db, repo.id, &module_name).await?
+    };
 
     if versions.is_empty() {
+        if let Some(resp) = upstream_err {
+            return Err(resp);
+        }
         return Err((
             StatusCode::NOT_FOUND,
             format!("Module {} not found", module_name),
@@ -264,6 +284,77 @@ async fn list_module_versions(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
         .unwrap())
+}
+
+/// The versions a hosted repository holds of a module.
+async fn hosted_module_versions(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    module_name: &str,
+) -> Result<Vec<String>, Response> {
+    let versions: Vec<Option<String>> = sqlx::query_scalar!(
+        r#"
+        SELECT DISTINCT version
+        FROM artifacts
+        WHERE repository_id = $1
+          AND name = $2
+          AND is_deleted = false
+          AND version IS NOT NULL
+        ORDER BY version
+        "#,
+        repository_id,
+        module_name
+    )
+    .fetch_all(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+    Ok(versions.into_iter().flatten().collect())
+}
+
+/// The versions a remote repository's upstream registry lists for a module
+/// (`{"modules":[{"versions":[{"version":"..."}]}]}`), through the proxy.
+/// A remote without an upstream or proxy lists none.
+async fn remote_module_versions(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_path: &str,
+) -> Result<Vec<String>, Response> {
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+    else {
+        return Ok(Vec::new());
+    };
+    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Invalid upstream registry response: {}", e),
+        )
+            .into_response()
+    })?;
+    Ok(module_versions_from_registry(&value))
+}
+
+/// The version strings of a module registry `versions` document.
+fn module_versions_from_registry(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("versions").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|v| v.get("version").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -342,42 +433,12 @@ async fn download_module(
                     return remote_module_download(&remote, &coords).await;
                 }
             }
-            // Virtual repo: try each member in priority order
+            // Virtual repo (#4598): answer the way the resolving member does,
+            // a `204` whose `X-Terraform-Get` points at this virtual's own
+            // `/archive`. This used to stream the member's archive back as a
+            // `200`, which no client can use.
             if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
-                let upstream_path = format!(
-                    "v1/modules/{}/{}/{}/{}/download",
-                    namespace, name, provider, version
-                );
-                let vname = module_name.clone();
-                let vversion = version.clone();
-                let result = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    auth.as_ref(),
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    Some(&ctx),
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let vname = vname.clone();
-                        let vversion = vversion.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_name_version(
-                                &db, &state, member_id, &location, &vname, &vversion,
-                            )
-                            .await
-                        }
-                    },
-                )
-                .await?;
-
-                return proxy_helpers::stream_fetch_result(
-                    result,
-                    "application/octet-stream",
-                    None,
-                );
+                return virtual_module_download(&state, auth.as_ref(), &repo, &coords, &ctx).await;
             }
             return Err(not_found);
         }
@@ -448,6 +509,7 @@ fn build_module_archive_url(
 /// file's name and `Content-Type` follow the bytes themselves.
 async fn download_module_archive(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, provider, version)): Path<(
         String,
         String,
@@ -476,6 +538,9 @@ async fn download_module_archive(
             };
             return remote_module_archive(&state, &remote, &coords, &ctx).await;
         }
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        return virtual_module_archive(&state, auth.as_ref(), &repo, &coords, &ctx).await;
     }
 
     let result = proxy_helpers::local_fetch_by_path(
@@ -1090,6 +1155,28 @@ async fn remote_module_download(
     remote: &RemoteModuleUpstream<'_>,
     coords: &ModuleCoords<'_>,
 ) -> Result<Response, Response> {
+    let location = remote_module_location(remote, coords, &remote.repo.key).await?;
+    Ok(module_location_response(location))
+}
+
+/// The `204` + `X-Terraform-Get` answer to a module `/download`.
+fn module_location_response(location: String) -> Response {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("X-Terraform-Get", location)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Where a remote's module version is to be fetched from: `advertise_key`'s
+/// own `/archive` with the archive hint when the upstream archive is one we
+/// serve, or the upstream's own location when it is not. `advertise_key` is
+/// the remote itself, or the virtual a client reached it through (#4598).
+async fn remote_module_location(
+    remote: &RemoteModuleUpstream<'_>,
+    coords: &ModuleCoords<'_>,
+    advertise_key: &str,
+) -> Result<String, Response> {
     let location = match resolve_upstream_module_source(remote, coords).await? {
         UpstreamModuleSource::Passthrough(location) => location,
         UpstreamModuleSource::Http {
@@ -1104,18 +1191,13 @@ async fn remote_module_download(
             };
             match archive {
                 Some(archive) if archive != ModuleArchiveType::Tar => {
-                    coords.archive_url(&remote.repo.key, archive, subdir.as_deref())
+                    coords.archive_url(advertise_key, archive, subdir.as_deref())
                 }
                 _ => absolute,
             }
         }
     };
-
-    Ok(Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .header("X-Terraform-Get", location)
-        .body(Body::empty())
-        .unwrap())
+    Ok(location)
 }
 
 /// `GET .../archive` on a remote repository: stream the upstream archive
@@ -1147,6 +1229,164 @@ async fn remote_module_archive(
     )
     .await;
     serve_module_archive(result, coords).await
+}
+
+// ---------------------------------------------------------------------------
+// Virtual modules (#4598)
+// ---------------------------------------------------------------------------
+
+/// A hosted repository's artifact id for a module version, if it holds one.
+async fn hosted_module_artifact_id(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    coords: &ModuleCoords<'_>,
+) -> Result<Option<uuid::Uuid>, Response> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM artifacts
+        WHERE repository_id = $1
+          AND name = $2
+          AND version = $3
+          AND is_deleted = false
+        LIMIT 1
+        "#,
+    )
+    .bind(repository_id)
+    .bind(build_module_name(
+        coords.namespace,
+        coords.name,
+        coords.provider,
+    ))
+    .bind(coords.version)
+    .fetch_optional(db)
+    .await
+    .map_err(crate::api::handlers::db_err)
+}
+
+/// The `404` a virtual answers when no member holds the module version. The
+/// member walks below move past a member's `404`, keep its first other
+/// failure, and surface that failure instead of this one, so an upstream
+/// outage is not reported as "not found".
+fn virtual_module_not_found(coords: &ModuleCoords<'_>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Module {}/{}/{} version {} not found",
+            coords.namespace, coords.name, coords.provider, coords.version
+        ),
+    )
+        .into_response()
+}
+
+/// `GET .../download` on a virtual repository (#4598): resolve the member in
+/// priority order and answer as that member would, a `204` whose
+/// `X-Terraform-Get` points at this virtual's own `/archive` with the
+/// member's archive hint. A remote member's source this server does not
+/// proxy (`git::`, `s3::`, ...) is handed through unchanged, as by the remote
+/// itself.
+async fn virtual_module_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    coords: &ModuleCoords<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let mut upstream_err: Option<Response> = None;
+    for member in &members {
+        let info = proxy_helpers::repo_info_from_member(member);
+        if member.repo_type.is_hosted() {
+            let Some(artifact_id) = hosted_module_artifact_id(&state.db, member.id, coords).await?
+            else {
+                continue;
+            };
+            crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
+            let archive = hosted_module_archive_type(state, &info, artifact_id, coords).await;
+            return Ok(module_location_response(
+                coords.archive_url(&repo.key, archive, None),
+            ));
+        }
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let (Some(upstream_url), Some(proxy)) =
+            (info.upstream_url.as_deref(), state.proxy_service.as_deref())
+        else {
+            continue;
+        };
+        let remote = RemoteModuleUpstream {
+            repo: &info,
+            upstream_url,
+            proxy,
+        };
+        match remote_module_location(&remote, coords, &repo.key).await {
+            Ok(location) => return Ok(module_location_response(location)),
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            Err(resp) => {
+                upstream_err.get_or_insert(resp);
+            }
+        }
+    }
+    Err(upstream_err.unwrap_or_else(|| virtual_module_not_found(coords)))
+}
+
+/// `GET .../archive` on a virtual repository (#4598): the archive
+/// [`virtual_module_download`] advertised, from the same member, found by the
+/// same priority walk: a hosted member's stored bytes (quarantine and scan
+/// policy enforced), or a remote member's upstream archive through its proxy
+/// cache.
+async fn virtual_module_archive(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    coords: &ModuleCoords<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let mut upstream_err: Option<Response> = None;
+    for member in &members {
+        let info = proxy_helpers::repo_info_from_member(member);
+        if member.repo_type.is_hosted() {
+            let result = match proxy_helpers::local_fetch_by_path(
+                &state.db,
+                state,
+                member.id,
+                &info.storage_location(),
+                &coords.artifact_path(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(resp) if resp.status() == StatusCode::NOT_FOUND => continue,
+                Err(resp) => return Err(resp),
+            };
+            proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, ctx)
+                .await?;
+            return serve_module_archive(result, coords).await;
+        }
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let (Some(upstream_url), Some(proxy)) =
+            (info.upstream_url.as_deref(), state.proxy_service.as_deref())
+        else {
+            continue;
+        };
+        let remote = RemoteModuleUpstream {
+            repo: &info,
+            upstream_url,
+            proxy,
+        };
+        match remote_module_archive(state, &remote, coords, ctx).await {
+            Ok(response) => return Ok(response),
+            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+            Err(resp) => {
+                upstream_err.get_or_insert(resp);
+            }
+        }
+    }
+    Err(upstream_err.unwrap_or_else(|| virtual_module_not_found(coords)))
 }
 
 // ---------------------------------------------------------------------------
@@ -6154,5 +6394,241 @@ mod catalog_registration_tests {
         let row = row.expect("a terraform provider upload must write a packages row (#3659)");
         assert_eq!(row.version, "2.0.0");
         assert_eq!(row.versions, vec!["2.0.0".to_string()]);
+    }
+}
+
+/// #4598: a virtual Terraform repository answers module `/download` the way
+/// its resolving member does, `204` + `X-Terraform-Get` pointing at the
+/// virtual's own `/archive` with the archive hint, and that `/archive`
+/// streams the member's archive (hosted bytes, or the remote's upstream file).
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod virtual_module_download_4598 {
+    use super::MOUNT_PREFIX;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::SharedState;
+    use axum::http::StatusCode;
+    use axum::Router;
+    use bytes::Bytes;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest(MOUNT_PREFIX, super::router())
+    }
+
+    fn zip_module() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file("main.tf", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"output \"x\" { value = \"hosted\" }\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// `.../download` then the advertised location, as `tofu init` walks it.
+    async fn walk(
+        state: &SharedState,
+        repo_key: &str,
+        coord: &str,
+    ) -> (StatusCode, String, StatusCode, Bytes, axum::http::HeaderMap) {
+        let doc_path = format!("{MOUNT_PREFIX}/{repo_key}/v1/modules/{coord}/download");
+        let (doc_status, doc_body, doc_headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(doc_path.clone()),
+        )
+        .await;
+        let advertised = doc_headers
+            .get("X-Terraform-Get")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if advertised.is_empty() {
+            return (
+                doc_status,
+                format!("<no X-Terraform-Get; body {} bytes>", doc_body.len()),
+                StatusCode::NOT_FOUND,
+                Bytes::new(),
+                axum::http::HeaderMap::new(),
+            );
+        }
+        let base = reqwest::Url::parse(&format!("http://ak.test{doc_path}")).unwrap();
+        let joined = base.join(&advertised).unwrap();
+        let archive_path = joined[url::Position::BeforePath..].to_string();
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(archive_path),
+        )
+        .await;
+        (doc_status, advertised, status, body, headers)
+    }
+
+    #[tokio::test]
+    async fn virtual_answers_204_with_hint_and_streams_hosted_and_remote_archives() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "terraform").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        // Upstream registry for the remote member: relative location, no
+        // archive type named, so the bytes decide the hint.
+        let server = MockServer::start().await;
+        let remote_blob = {
+            let mut b = Vec::new();
+            let mut gz = flate2::write::GzEncoder::new(&mut b, flate2::Compression::default());
+            std::io::Write::write_all(&mut gz, b"not really a tar, gzip is enough").unwrap();
+            gz.finish().unwrap();
+            b
+        };
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/proxied/aws/2.0.0/download"))
+            .respond_with(
+                ResponseTemplate::new(204).insert_header("X-Terraform-Get", "/files/proxied-2.0.0"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/proxied/aws/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "modules": [{"versions": [{"version": "2.0.0"}]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/proxied-2.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(remote_blob.clone()))
+            .mount(&server)
+            .await;
+
+        let (hosted_id, hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "terraform").await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        tdh::publish_repo(&fx.pool, hosted_id).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "terraform", &server.uri(), 2).await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), hosted_dir.to_str().unwrap(), proxy);
+
+        let zip = zip_module();
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (published, _) = tdh::send(
+            tdh::router_with_auth(mounted_router(), state.clone(), auth),
+            tdh::put(
+                format!("{MOUNT_PREFIX}/{hosted_key}/v1/modules/acme/hosted/aws/1.0.0"),
+                Bytes::from(zip.clone()),
+            ),
+        )
+        .await;
+
+        // `tofu init` lists versions before it downloads.
+        let mut listed = Vec::new();
+        for module in ["acme/hosted/aws", "acme/proxied/aws"] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(format!(
+                    "{MOUNT_PREFIX}/{}/v1/modules/{module}/versions",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            listed.push((status, String::from_utf8_lossy(&body).into_owned()));
+        }
+        let hosted = walk(&state, &fx.repo_key, "acme/hosted/aws/1.0.0").await;
+        let proxied = walk(&state, &fx.repo_key, "acme/proxied/aws/2.0.0").await;
+        let missing = walk(&state, &fx.repo_key, "acme/nothere/aws/9.9.9").await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(published, StatusCode::CREATED);
+        assert_eq!(listed[0].0, StatusCode::OK, "{}", listed[0].1);
+        assert!(listed[0].1.contains("\"1.0.0\""), "{}", listed[0].1);
+        assert_eq!(listed[1].0, StatusCode::OK, "{}", listed[1].1);
+        assert!(listed[1].1.contains("\"2.0.0\""), "{}", listed[1].1);
+
+        let (doc, advertised, status, body, headers) = hosted;
+        assert_eq!(
+            doc,
+            StatusCode::NO_CONTENT,
+            "hosted member via virtual: {advertised}"
+        );
+        assert_eq!(
+            advertised,
+            format!(
+                "/terraform/{}/v1/modules/acme/hosted/aws/1.0.0/archive?archive=zip",
+                fx.repo_key
+            )
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &zip[..]);
+        assert_eq!(headers["content-type"], "application/zip");
+
+        let (doc, advertised, status, body, headers) = proxied;
+        assert_eq!(
+            doc,
+            StatusCode::NO_CONTENT,
+            "remote member via virtual: {advertised}"
+        );
+        assert_eq!(
+            advertised,
+            format!(
+                "/terraform/{}/v1/modules/acme/proxied/aws/2.0.0/archive?archive=tar.gz",
+                fx.repo_key
+            )
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &remote_blob[..]);
+        assert_eq!(headers["content-type"], "application/gzip");
+
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    /// A source the proxy does not fetch (`git::`) is handed through unchanged
+    /// by a virtual, exactly as by the remote itself.
+    #[tokio::test]
+    async fn virtual_passes_a_git_source_through() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "terraform").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let server = MockServer::start().await;
+        let git = "git::https://example.com/acme/vpc.git?ref=v3.0.0";
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/vpc/aws/3.0.0/download"))
+            .respond_with(ResponseTemplate::new(204).insert_header("X-Terraform-Get", git))
+            .mount(&server)
+            .await;
+        let (remote_id, _k, remote_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "terraform", &server.uri(), 1).await;
+        let cache = tempfile::tempdir().unwrap();
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), cache.path().to_str().unwrap(), proxy);
+
+        let (status, _, headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state),
+            tdh::get(format!(
+                "{MOUNT_PREFIX}/{}/v1/modules/acme/vpc/aws/3.0.0/download",
+                fx.repo_key
+            )),
+        )
+        .await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(headers["x-terraform-get"], git);
     }
 }

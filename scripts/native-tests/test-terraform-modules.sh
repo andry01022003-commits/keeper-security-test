@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Terraform/OpenTofu hosted module install regression test (#4590).
+# Terraform/OpenTofu module install regression test: hosted (#4590) and
+# virtual (#4598).
 #
 # Hosted modules could not be installed by `tofu init` / `terraform init`:
 # `.../download` answered `204` with an `X-Terraform-Get` location that carried
@@ -10,6 +11,17 @@
 # This test publishes a ZIP module and a tar.gz module to a hosted repo, checks
 # the protocol answers over HTTP, then runs the real CLI against each module
 # source `<host>/<namespace>/<name>/<provider>`.
+#
+# Virtual case (#4598): a virtual repo whose members are the hosted repo and a
+# remote repo proxying a second hosted repo (the "upstream") must answer
+# `.../download` exactly as its members do, `204` + `X-Terraform-Get` pointing
+# at the virtual's own `/archive` with the archive hint, and the CLI must
+# install both a hosted and a proxied module through it. The remote reaches the
+# upstream at TF_UPSTREAM_REGISTRY_URL (default: REGISTRY_URL), which the
+# backend must be allowed to fetch: a loopback address is always refused, a
+# private one needs UPSTREAM_ALLOW_PRIVATE_IPS or AK_SSRF_ALLOW_PRIVATE_CIDRS
+# (the e2e stack's `http://backend:8080` qualifies). TF_VIRTUAL=0 skips the
+# virtual case.
 #
 # Module source addresses have no room for a path prefix, and the client only
 # probes `https://<host>/.well-known/terraform.json`, so the CLI phase puts a
@@ -24,6 +36,9 @@
 # Usage against any backend with a token:
 #   REGISTRY_URL=http://127.0.0.1:8080 AK_TOKEN=... \
 #     ./scripts/native-tests/test-terraform-modules.sh
+#
+# When the backend runs in a container and reaches itself at another address:
+#   TF_UPSTREAM_REGISTRY_URL=http://backend:8080 ./scripts/native-tests/test-terraform-modules.sh
 #
 # The CLI phase runs when a client (`tofu`, else `terraform`; override with
 # TF_CLI_BIN) and `caddy` (CADDY_BIN) are present, and is skipped cleanly
@@ -55,6 +70,10 @@ TF_PROVIDER="${TF_PROVIDER:-aws}"
 TF_VERSION="${TF_VERSION:-1.0.0}"
 MODULE_HOST="${MODULE_HOST:-tfmod.localhost}"
 PROXY_PORT="${PROXY_PORT:-18443}"
+VIRTUAL_PROXY_PORT="${VIRTUAL_PROXY_PORT:-$((PROXY_PORT + 1))}"
+TF_VIRTUAL="${TF_VIRTUAL:-1}"
+TF_UPSTREAM_REGISTRY_URL="${TF_UPSTREAM_REGISTRY_URL:-$REGISTRY_URL}"
+TF_UPSTREAM_REGISTRY_URL="${TF_UPSTREAM_REGISTRY_URL%/}"
 CURL_MAX_TIME="${CURL_MAX_TIME:-60}"
 RUN_TF_CLI="${RUN_TF_CLI:-auto}"
 CADDY_BIN="${CADDY_BIN:-caddy}"
@@ -67,8 +86,13 @@ if [ -z "${TF_CLI_BIN:-}" ]; then
 fi
 
 REPO_KEY="${TF_REPO_KEY:-tf-modules-4590-$(date +%s)-$$}"
+UPSTREAM_KEY="${REPO_KEY}-upstream"
+REMOTE_KEY="${REPO_KEY}-remote"
+VIRTUAL_KEY="${REPO_KEY}-virtual"
 KEEP_TF_REPO="${KEEP_TF_REPO:-0}"
 CREATED_REPO=0
+# Extra repositories the virtual case creates, deleted in reverse order.
+CREATED_EXTRA=()
 CADDY_PID=""
 
 RED='\033[0;31m'
@@ -93,6 +117,13 @@ cleanup() {
     fi
     rm -rf "$TMPDIR_TEST"
 
+    if [ "$KEEP_TF_REPO" != "1" ]; then
+        local i
+        for ((i = ${#CREATED_EXTRA[@]} - 1; i >= 0; i--)); do
+            curl -sS -o /dev/null -X DELETE "$API_URL/repositories/${CREATED_EXTRA[$i]}" \
+                "${AUTH_ARGS[@]}" 2>/dev/null || true
+        done
+    fi
     if [ "$CREATED_REPO" = "1" ] && [ "$KEEP_TF_REPO" != "1" ]; then
         curl -sS -o /dev/null -X DELETE "$API_URL/repositories/$REPO_KEY" \
             "${AUTH_ARGS[@]}" 2>/dev/null || true
@@ -203,6 +234,74 @@ create_hosted_repo() {
     echo ""
 }
 
+# create_repo <key> <repo_type> [extra JSON fields]
+create_repo() {
+    local key="$1"
+    local type="$2"
+    local extra="${3:-}"
+    local out="$TMPDIR_TEST/create-$key.json"
+    local payload code
+    payload=$(jq -n --arg key "$key" --arg type "$type" '{
+        key: $key,
+        name: $key,
+        format: "terraform",
+        repo_type: $type,
+        is_public: true
+    }')
+    if [ -n "$extra" ]; then
+        payload=$(jq -n --argjson a "$payload" --argjson b "$extra" '$a + $b')
+    fi
+    if ! code=$(curl -sS --max-time "$CURL_MAX_TIME" -o "$out" -w "%{http_code}" \
+        -X POST "$API_URL/repositories" "${AUTH_ARGS[@]}" \
+        -H 'Content-Type: application/json' -d "$payload"); then
+        code="000"
+    fi
+    case "$code" in
+        200|201)
+            CREATED_EXTRA+=("$key")
+            pass "created $type repo '$key'"
+            ;;
+        *)
+            fail "creating $type repo '$key' returned HTTP $code: $(body_preview "$out")"
+            return 1
+            ;;
+    esac
+}
+
+add_member() {
+    local virtual="$1"
+    local member="$2"
+    local priority="$3"
+    local out="$TMPDIR_TEST/member-$member.json"
+    local code
+    if ! code=$(curl -sS --max-time "$CURL_MAX_TIME" -o "$out" -w "%{http_code}" \
+        -X POST "$API_URL/repositories/$virtual/members" "${AUTH_ARGS[@]}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"member_key\":\"$member\",\"priority\":$priority}"); then
+        code="000"
+    fi
+    case "$code" in
+        200|201) pass "added '$member' to '$virtual' at priority $priority" ;;
+        *) fail "adding '$member' to '$virtual' returned HTTP $code: $(body_preview "$out")"; return 1 ;;
+    esac
+}
+
+# The virtual case (#4598): virtual = [hosted REPO_KEY, remote -> upstream].
+setup_virtual() {
+    echo "==> Creating the virtual case (#4598)..."
+    create_repo "$UPSTREAM_KEY" local || return 1
+    create_repo "$REMOTE_KEY" remote \
+        "$(jq -n --arg u "$TF_UPSTREAM_REGISTRY_URL/terraform/$UPSTREAM_KEY" '{upstream_url: $u}')" \
+        || return 1
+    create_repo "$VIRTUAL_KEY" virtual || return 1
+    add_member "$VIRTUAL_KEY" "$REPO_KEY" 1 || return 1
+    add_member "$VIRTUAL_KEY" "$REMOTE_KEY" 2 || return 1
+    make_module_dir "$TMPDIR_TEST/src/proxmod" proxmod
+    tar -C "$TMPDIR_TEST/src/proxmod" -czf "$TMPDIR_TEST/proxmod.tar.gz" main.tf
+    upload_module proxmod "$TMPDIR_TEST/proxmod.tar.gz" 201 "$UPSTREAM_KEY"
+    echo ""
+}
+
 # Build one module directory with a single output, so `init` has something to
 # install and the installed copy can be checked for it.
 make_module_dir() {
@@ -236,54 +335,59 @@ build_modules() {
     echo ""
 }
 
+# module_url <name> [repo key, default REPO_KEY]
 module_url() {
     printf '%s/terraform/%s/v1/modules/%s/%s/%s/%s' \
-        "$REGISTRY_URL" "$REPO_KEY" "$TF_NAMESPACE" "$1" "$TF_PROVIDER" "$TF_VERSION"
+        "$REGISTRY_URL" "${2:-$REPO_KEY}" "$TF_NAMESPACE" "$1" "$TF_PROVIDER" "$TF_VERSION"
 }
 
+# upload_module <name> <file> <expected status> [repo key]
 upload_module() {
     local name="$1"
     local file="$2"
     local expect="$3"
+    local repo="${4:-$REPO_KEY}"
     local out="$TMPDIR_TEST/upload-$name.json"
     local code
 
     if ! code=$(curl -sS --max-time "$CURL_MAX_TIME" -o "$out" -w "%{http_code}" \
-        -X PUT "${AUTH_ARGS[@]}" --data-binary "@$file" "$(module_url "$name")"); then
+        -X PUT "${AUTH_ARGS[@]}" --data-binary "@$file" "$(module_url "$name" "$repo")"); then
         code="000"
     fi
 
     if [ "$code" = "$expect" ]; then
-        pass "upload $name returned HTTP $code"
+        pass "upload $name to $repo returned HTTP $code"
     else
-        fail "upload $name returned HTTP $code (expected $expect): $(body_preview "$out")"
+        fail "upload $name to $repo returned HTTP $code (expected $expect): $(body_preview "$out")"
     fi
 }
 
 # The protocol chain the CLI walks, over plain HTTP: `.../download` must answer
 # 204 with an `X-Terraform-Get` carrying the archive hint, and that location
 # must serve the archive with the matching type.
+# check_download_chain <name> <hint> <content type> <magic prefix> [repo key]
 check_download_chain() {
     local name="$1"
     local hint="$2"
     local content_type="$3"
     local magic_prefix="$4"
-    local headers="$TMPDIR_TEST/download-$name.headers"
+    local repo="${5:-$REPO_KEY}"
+    local headers="$TMPDIR_TEST/download-$repo-$name.headers"
     local code location archive_code archive_ct archive_out
 
     if ! code=$(curl -sS --max-time "$CURL_MAX_TIME" -D "$headers" -o /dev/null \
-        -w "%{http_code}" "$(module_url "$name")/download"); then
+        -w "%{http_code}" "$(module_url "$name" "$repo")/download"); then
         code="000"
     fi
     location=$(grep -i '^x-terraform-get:' "$headers" | head -1 | cut -d' ' -f2- | tr -d '\r')
 
     if [ "$code" != "204" ]; then
-        fail "$name download returned HTTP $code (expected 204)"
+        fail "$name download from $repo returned HTTP $code (expected 204; #4598 for a virtual)"
         return
     fi
     case "$location" in
-        *"/archive?archive=$hint")
-            pass "$name X-Terraform-Get carries archive=$hint ($location)"
+        "/terraform/$repo/"*"/archive?archive=$hint")
+            pass "$name X-Terraform-Get from $repo carries archive=$hint ($location)"
             ;;
         *)
             fail "$name X-Terraform-Get lacks the archive=$hint hint: '$location' (#4590)"
@@ -291,7 +395,7 @@ check_download_chain() {
             ;;
     esac
 
-    archive_out="$TMPDIR_TEST/archive-$name"
+    archive_out="$TMPDIR_TEST/archive-$repo-$name"
     if ! archive_code=$(curl -sS --max-time "$CURL_MAX_TIME" -o "$archive_out" \
         -w "%{http_code} %{content_type}" "$REGISTRY_URL$location"); then
         archive_code="000"
@@ -369,6 +473,14 @@ https://$MODULE_HOST:$PROXY_PORT {
 	rewrite /.well-known/terraform.json /terraform/$REPO_KEY/.well-known/terraform.json
 	reverse_proxy /terraform/* $backend
 }
+
+# The same, for the virtual repository (#4598).
+https://$MODULE_HOST:$VIRTUAL_PROXY_PORT {
+	bind 127.0.0.1
+	tls internal
+	rewrite /.well-known/terraform.json /terraform/$VIRTUAL_KEY/.well-known/terraform.json
+	reverse_proxy /terraform/* $backend
+}
 EOF
 
     XDG_DATA_HOME="$caddy_dir/data" XDG_CONFIG_HOME="$caddy_dir" \
@@ -403,11 +515,14 @@ EOF
     fi
 }
 
+# run_cli_init <name> [proxy port, default PROXY_PORT] [label]
 run_cli_init() {
     local name="$1"
-    local work="$TMPDIR_TEST/cli-$name"
-    local out="$TMPDIR_TEST/cli-$name.out"
-    local source_addr="$MODULE_HOST:$PROXY_PORT/$TF_NAMESPACE/$name/$TF_PROVIDER"
+    local port="${2:-$PROXY_PORT}"
+    local label="${3:-}"
+    local work="$TMPDIR_TEST/cli-$name-$port"
+    local out="$TMPDIR_TEST/cli-$name-$port.out"
+    local source_addr="$MODULE_HOST:$port/$TF_NAMESPACE/$name/$TF_PROVIDER"
 
     mkdir -p "$work"
     cat > "$work/main.tf" <<EOF
@@ -417,7 +532,7 @@ module "subject" {
 }
 EOF
     cat > "$work/cli.tfrc" <<EOF
-credentials "$MODULE_HOST:$PROXY_PORT" {
+credentials "$MODULE_HOST:$port" {
   token = "$TOKEN"
 }
 EOF
@@ -428,7 +543,7 @@ EOF
         CHECKPOINT_DISABLE=1 \
         "$TF_CLI_BIN" -chdir="$work" init -input=false -no-color >"$out" 2>&1 \
         && grep -q "\"$name\"" "$work/.terraform/modules/subject/main.tf" 2>/dev/null; then
-        pass "$TF_CLI_BIN init installed $source_addr $TF_VERSION"
+        pass "$TF_CLI_BIN init installed $source_addr $TF_VERSION${label:+ ($label)}"
         return
     fi
 
@@ -440,11 +555,12 @@ EOF
 }
 
 echo "=============================================="
-echo "Terraform/OpenTofu Hosted Module Install (#4590)"
+echo "Terraform/OpenTofu Module Install: hosted (#4590) and virtual (#4598)"
 echo "=============================================="
 echo "Registry:     $REGISTRY_URL"
 echo "Repo key:     $REPO_KEY"
-echo "Module host:  $MODULE_HOST:$PROXY_PORT"
+echo "Module host:  $MODULE_HOST:$PROXY_PORT (virtual: $VIRTUAL_PROXY_PORT)"
+echo "Virtual case: $TF_VIRTUAL (upstream: $TF_UPSTREAM_REGISTRY_URL)"
 echo "CLI:          $RUN_TF_CLI ($TF_CLI_BIN, proxy: $CADDY_BIN)"
 echo ""
 
@@ -463,12 +579,27 @@ check_download_chain zipmod zip application/zip 504b0304
 check_download_chain tgzmod tar.gz application/gzip 1f8b
 echo ""
 
+VIRTUAL_READY=0
+if [ "$TF_VIRTUAL" = "0" ]; then
+    skip "virtual case disabled by TF_VIRTUAL=0"
+elif setup_virtual; then
+    VIRTUAL_READY=1
+    echo "==> Exercising the protocol through the virtual repo (#4598)..."
+    check_download_chain zipmod zip application/zip 504b0304 "$VIRTUAL_KEY"
+    check_download_chain proxmod tar.gz application/gzip 1f8b "$VIRTUAL_KEY"
+    echo ""
+fi
+
 if cli_phase_enabled; then
     echo "==> Running $TF_CLI_BIN init through host-level discovery..."
     ensure_module_host_resolves
     if start_discovery_proxy; then
         run_cli_init zipmod
         run_cli_init tgzmod
+        if [ "$VIRTUAL_READY" = "1" ]; then
+            run_cli_init zipmod "$VIRTUAL_PROXY_PORT" "hosted member, through virtual $VIRTUAL_KEY"
+            run_cli_init proxmod "$VIRTUAL_PROXY_PORT" "proxied member, through virtual $VIRTUAL_KEY"
+        fi
     fi
 fi
 echo ""
