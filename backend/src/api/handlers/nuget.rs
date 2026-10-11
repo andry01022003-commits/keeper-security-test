@@ -1998,10 +1998,22 @@ fn flatcontainer_cache_path(sub_path: &str) -> String {
 }
 
 /// The `{id}/{version}/{file}` flat-container sub-path of one package file,
-/// with the id lowercased as the flat container requires (and as every
-/// NuGet cache key is spelled), whatever case the client asked in.
+/// spelled all-lowercase whatever case the client asked in.
+///
+/// The NuGet V3 flat container defines every segment of a package path as
+/// lowercase (the id, the normalized version and the `{id}.{version}.nupkg`
+/// file name), and nuget.org serves no other spelling. Lowercasing only the
+/// id sent a mixed-case file name upstream verbatim, which 404ed (#4528), and
+/// keyed the cache differently from the lowercase spelling of the same file.
+/// Every spelling now maps to one upstream URL and one cache entry; real
+/// clients already send lowercase, so their paths and keys are unchanged.
 fn flatcontainer_package_sub_path(id: &str, version: &str, filename: &str) -> String {
-    format!("{}/{}/{}", id.to_lowercase(), version, filename)
+    format!(
+        "{}/{}/{}",
+        id.to_lowercase(),
+        version.to_lowercase(),
+        filename.to_lowercase()
+    )
 }
 
 /// Proxy-cache path for a package fetched from a V2 feed's
@@ -2357,11 +2369,12 @@ async fn proxy_v2_download(
             // values they have always used, so an ordinary package's key, and
             // the body a V3 client already cached, are unchanged.
             Ok(UpstreamProtocol::V3(resources)) => {
+                // The flat container is all-lowercase (#4528).
                 let encoded = format!(
                     "{}/{}/{}",
                     urlencoding::encode(&id_lower),
-                    urlencoding::encode(version),
-                    urlencoding::encode(&filename)
+                    urlencoding::encode(&version.to_lowercase()),
+                    urlencoding::encode(&filename.to_lowercase())
                 );
                 let (url, _) = v3_flatcontainer_target(&resources, upstream_url, &encoded)?;
                 (
@@ -7833,6 +7846,75 @@ mod read_db_tests {
             nupkg.as_ref(),
             "streamed .nupkg must match upstream"
         );
+    }
+
+    /// #4528: a flat-container download whose id, version and file name
+    /// arrive in mixed case must reach the all-lowercase upstream path the
+    /// NuGet V3 flat-container protocol defines (nuget.org serves nothing
+    /// else), and the same cache entry as the lowercase spelling. Only the
+    /// id segment used to be lowercased, so the upstream answered 404.
+    #[tokio::test]
+    async fn test_remote_v3_flatcontainer_download_mixed_case_file_name_4528() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        mount_v3_index(&upstream).await;
+
+        let nupkg = b"PK\x03\x04-mock-nupkg-bytes-4528";
+        Mock::given(method("GET"))
+            .and(path(
+                "/flat/newtonsoft.json/13.0.3-beta1/newtonsoft.json.13.0.3-beta1.nupkg",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(nupkg.as_ref()),
+            )
+            .mount(&upstream)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+
+        let resp = super::flatcontainer_download(
+            axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "Newtonsoft.Json".to_string(),
+                "13.0.3-Beta1".to_string(),
+                "Newtonsoft.Json.13.0.3-Beta1.nupkg".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+        let status = match &resp {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+        let body = match resp {
+            Ok(r) | Err(r) => to_bytes(r.into_body(), 1 << 20).await.unwrap(),
+        };
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "mixed-case flat-container download must reach the lowercase upstream path: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], nupkg.as_ref());
     }
 
     // -----------------------------------------------------------------------
