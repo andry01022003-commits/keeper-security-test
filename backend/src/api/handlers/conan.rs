@@ -17,13 +17,17 @@
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev}/files                - List package files
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev}/files/{path} - Download package file
 //!   PUT  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev}/files/{path} - Upload package file
+//!   DELETE /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}                                  - Remove a recipe (every revision) and its binaries
+//!   DELETE /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}                  - Remove a recipe revision and its binaries
+//!   DELETE /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages         - Remove every binary of a recipe revision
+//!   DELETE /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev} - Remove a package revision
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::Extension;
 use axum::Router;
 use base64::Engine;
@@ -62,6 +66,25 @@ pub fn router() -> Router<SharedState> {
         )
         // Search
         .route("/:repo_key/v2/conans/search", get(search))
+        // `conan remove` (#4333): a whole recipe, one recipe revision, every
+        // binary of a recipe revision, or one package revision. These are the
+        // URLs `conan/internal/rest/client_routes.py` deletes.
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel",
+            delete(remove_recipe),
+        )
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision",
+            delete(remove_recipe_revision),
+        )
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/packages",
+            delete(remove_all_packages),
+        )
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/packages/:package_id/revisions/:pkg_revision",
+            delete(remove_package_revision),
+        )
         // Recipe latest revision
         .route(
             "/:repo_key/v2/conans/:name/:version/:user/:channel/latest",
@@ -3212,6 +3235,270 @@ async fn package_file_upload(
         .status(StatusCode::CREATED)
         .body(Body::from("Created"))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// DELETE — `conan remove` (#4333)
+// ---------------------------------------------------------------------------
+
+/// What one `conan remove` request covers. `None` fields match anything; the
+/// recipe coordinate is always exact.
+struct RemoveTarget<'a> {
+    name: &'a str,
+    version: &'a str,
+    user: &'a str,
+    channel: &'a str,
+    revision: Option<&'a str>,
+    /// Binaries only: the recipe files of the revision stay.
+    packages_only: bool,
+    package_id: Option<&'a str>,
+    pkg_revision: Option<&'a str>,
+}
+
+impl RemoveTarget<'_> {
+    /// The client's "not found" for this target: `conan remove` reports a 404
+    /// as `Recipe not found` / `Binary package not found`.
+    fn not_found(&self) -> Response {
+        match (self.revision, self.package_id) {
+            (Some(rrev), Some(pid)) => conan_package_not_found(
+                self.name,
+                self.version,
+                self.user,
+                self.channel,
+                rrev,
+                pid,
+                self.pkg_revision,
+            ),
+            (Some(rrev), None) if self.packages_only => (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No binary packages found for '{}'",
+                    conan_ref_display(self.name, self.version, self.user, self.channel, Some(rrev))
+                ),
+            )
+                .into_response(),
+            (rrev, _) => {
+                conan_recipe_not_found(self.name, self.version, self.user, self.channel, rrev)
+            }
+        }
+    }
+}
+
+/// Soft-delete every artifact `target` covers in one statement, returning how
+/// many were removed. The rows go the way every other delete path sends them
+/// (`is_deleted = true`), so storage GC reclaims their bytes.
+async fn soft_delete_conan_artifacts(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    target: &RemoveTarget<'_>,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE artifacts SET is_deleted = true, updated_at = NOW()
+        WHERE id IN (
+            SELECT a.id
+            FROM artifacts a
+            JOIN artifact_metadata am ON am.artifact_id = a.id
+            WHERE a.repository_id = $1
+              AND a.is_deleted = false
+              AND am.format = 'conan'
+              AND a.name = $2
+              AND a.version = $3
+              AND am.metadata->>'user' = $4
+              AND am.metadata->>'channel' = $5
+              AND ($6::text IS NULL OR am.metadata->>'revision' = $6)
+              AND (NOT $7::bool OR am.metadata->>'type' = 'package')
+              AND ($8::text IS NULL OR am.metadata->>'packageId' = $8)
+              AND ($9::text IS NULL OR am.metadata->>'packageRevision' = $9)
+        )
+        "#,
+    )
+    .bind(repository_id)
+    .bind(target.name)
+    .bind(target.version)
+    .bind(normalize_user(target.user))
+    .bind(normalize_channel(target.channel))
+    .bind(target.revision)
+    .bind(target.packages_only || target.package_id.is_some())
+    .bind(target.package_id)
+    .bind(target.pkg_revision)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Shared body of the `conan remove` routes: authenticate with the
+/// `delete:artifacts` scope (the repository's `delete` permission is enforced
+/// by `repo_visibility_middleware` for the DELETE method), refuse anything but
+/// a hosted repository, and remove what `target` covers. `200` with an empty
+/// body on success, which is what the client expects; `404` when nothing
+/// matched, which it reports as not found.
+async fn conan_remove(
+    state: &SharedState,
+    auth: Option<Extension<Option<AuthExtension>>>,
+    repo_key: &str,
+    target: RemoveTarget<'_>,
+) -> Result<Response, Response> {
+    let optional = [
+        ("revision", target.revision),
+        ("package_id", target.package_id),
+        ("pkg_revision", target.pkg_revision),
+    ];
+    let mut segments = vec![
+        ("name", target.name),
+        ("version", target.version),
+        ("user", target.user),
+        ("channel", target.channel),
+    ];
+    segments.extend(optional.into_iter().filter_map(|(l, v)| v.map(|v| (l, v))));
+    validate_conan_segments(&segments)?;
+    // Resolve before auth so an unknown repository is a 404, as on upload.
+    let repo = resolve_conan_repo(&state.db, repo_key).await?;
+    let auth_ext = auth.and_then(|Extension(a)| a);
+    let ext = require_auth_basic_scope(auth_ext, "conan", "delete:artifacts")?;
+    if repo.repo_type == RepositoryType::Remote {
+        return Err((
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Cannot remove from a remote (proxy) repository",
+        )
+            .into_response());
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Cannot remove from a virtual repository; remove from its member",
+        )
+            .into_response());
+    }
+
+    let removed = soft_delete_conan_artifacts(&state.db, repo.id, &target)
+        .await
+        .map_err(map_db_err)?;
+    if removed == 0 {
+        return Err(target.not_found());
+    }
+
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo.id)
+        .execute(&state.db)
+        .await;
+
+    info!(
+        "Conan remove: {} rev={:?} packages_only={} pkg={:?} pkg_rev={:?} from repo {} by {} ({} artifact(s))",
+        conan_ref_display(target.name, target.version, target.user, target.channel, None),
+        target.revision,
+        target.packages_only,
+        target.package_id,
+        target.pkg_revision,
+        repo_key,
+        ext.username,
+        removed
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap())
+}
+
+/// `DELETE .../{channel}`: every revision of the recipe, with its binaries.
+async fn remove_recipe(
+    State(state): State<SharedState>,
+    auth: Option<Extension<Option<AuthExtension>>>,
+    Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
+) -> Result<Response, Response> {
+    let target = RemoveTarget {
+        name: &name,
+        version: &version,
+        user: &user,
+        channel: &channel,
+        revision: None,
+        packages_only: false,
+        package_id: None,
+        pkg_revision: None,
+    };
+    conan_remove(&state, auth, &repo_key, target).await
+}
+
+/// `DELETE .../revisions/{rev}`: one recipe revision, with its binaries.
+async fn remove_recipe_revision(
+    State(state): State<SharedState>,
+    auth: Option<Extension<Option<AuthExtension>>>,
+    Path((repo_key, name, version, user, channel, revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let target = RemoveTarget {
+        name: &name,
+        version: &version,
+        user: &user,
+        channel: &channel,
+        revision: Some(&revision),
+        packages_only: false,
+        package_id: None,
+        pkg_revision: None,
+    };
+    conan_remove(&state, auth, &repo_key, target).await
+}
+
+/// `DELETE .../revisions/{rev}/packages`: every binary of a recipe revision.
+async fn remove_all_packages(
+    State(state): State<SharedState>,
+    auth: Option<Extension<Option<AuthExtension>>>,
+    Path((repo_key, name, version, user, channel, revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let target = RemoveTarget {
+        name: &name,
+        version: &version,
+        user: &user,
+        channel: &channel,
+        revision: Some(&revision),
+        packages_only: true,
+        package_id: None,
+        pkg_revision: None,
+    };
+    conan_remove(&state, auth, &repo_key, target).await
+}
+
+/// `DELETE .../packages/{pkg_id}/revisions/{pkg_rev}`: one package revision.
+#[allow(clippy::type_complexity)]
+async fn remove_package_revision(
+    State(state): State<SharedState>,
+    auth: Option<Extension<Option<AuthExtension>>>,
+    Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let target = RemoveTarget {
+        name: &name,
+        version: &version,
+        user: &user,
+        channel: &channel,
+        revision: Some(&revision),
+        packages_only: true,
+        package_id: Some(&package_id),
+        pkg_revision: Some(&pkg_revision),
+    };
+    conan_remove(&state, auth, &repo_key, target).await
 }
 
 // ---------------------------------------------------------------------------
@@ -10457,5 +10744,243 @@ mod package_search_settings_4334 {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let content = v["pid_linux"]["content"].as_str().unwrap_or_default();
         assert!(content.contains("os=Linux"), "virtual search: {v}");
+    }
+}
+
+/// #4333: `conan remove` deletes recipe revisions, all of a recipe revision's
+/// binaries, and single package revisions through the Conan v2 DELETE routes.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod remove_4333 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+
+    fn delete(uri: String) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn publish(
+        state: &crate::api::SharedState,
+        auth: &crate::api::middleware::auth::AuthExtension,
+        repo_key: &str,
+        rrev: &str,
+        pids: &[&str],
+    ) {
+        for (file, body) in [
+            ("conanfile.py", sample_conanfile_py().to_vec()),
+            ("conanmanifest.txt", sample_conanmanifest_txt().to_vec()),
+        ] {
+            let s = upload_recipe_file(
+                state, auth, repo_key, "rmme", "1.0", "_", "_", rrev, file, &body,
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "recipe {file}");
+        }
+        for pid in pids {
+            for (file, body) in [
+                ("conan_package.tgz", sample_conan_package_tgz()),
+                ("conaninfo.txt", sample_conaninfo_txt().to_vec()),
+                ("conanmanifest.txt", b"1700000000\nlib/a.txt: 00\n".to_vec()),
+            ] {
+                let s = upload_package_file(
+                    state, auth, repo_key, "rmme", "1.0", "_", "_", rrev, pid, "prev1", file, &body,
+                )
+                .await;
+                assert_eq!(s, StatusCode::CREATED, "{pid} {file}");
+            }
+        }
+    }
+
+    async fn live_rows(pool: &sqlx::PgPool, repo_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remove_package_revision_then_recipe_revision() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        publish(&state, &auth, &repo_key, "rrA", &["pidA", "pidB"]).await;
+        publish(&state, &auth, &repo_key, "rrB", &["pidA"]).await;
+
+        let app = router_with_auth(state, auth);
+        let base = format!("/{repo_key}/v2/conans/rmme/1.0/_/_");
+        // One package revision.
+        let (rm_prev, rm_prev_body) = send(
+            app.clone(),
+            delete(format!(
+                "{base}/revisions/rrA/packages/pidA/revisions/prev1"
+            )),
+        )
+        .await;
+        let (pid_a_after, _) = send(
+            app.clone(),
+            tdh::get(format!("{base}/revisions/rrA/packages/pidA/revisions")),
+        )
+        .await;
+        let (pid_b_after, _) = send(
+            app.clone(),
+            tdh::get(format!("{base}/revisions/rrA/packages/pidB/revisions")),
+        )
+        .await;
+        // Removing it again is the client's "not found".
+        let (rm_prev_again, _) = send(
+            app.clone(),
+            delete(format!(
+                "{base}/revisions/rrA/packages/pidA/revisions/prev1"
+            )),
+        )
+        .await;
+        // A whole recipe revision takes its binaries with it, and leaves the
+        // other revision alone.
+        let (rm_rrev, rm_rrev_body) =
+            send(app.clone(), delete(format!("{base}/revisions/rrA"))).await;
+        let (revs_after, revs_body) =
+            send(app.clone(), tdh::get(format!("{base}/revisions"))).await;
+        let (search_after, _) = send(
+            app.clone(),
+            tdh::get(format!("{base}/revisions/rrA/search")),
+        )
+        .await;
+        let (rm_missing, rm_missing_body) =
+            send(app.clone(), delete(format!("{base}/revisions/nope"))).await;
+        let rows = live_rows(&pool, repo_id).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rm_prev,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&rm_prev_body)
+        );
+        assert_eq!(pid_a_after, StatusCode::NOT_FOUND);
+        assert_eq!(pid_b_after, StatusCode::OK);
+        assert_eq!(rm_prev_again, StatusCode::NOT_FOUND);
+        assert_eq!(
+            rm_rrev,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&rm_rrev_body)
+        );
+        assert_eq!(revs_after, StatusCode::OK);
+        let revs: serde_json::Value = serde_json::from_slice(&revs_body).unwrap();
+        let names: Vec<_> = revs["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["revision"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["rrB"]);
+        assert_eq!(search_after, StatusCode::NOT_FOUND);
+        assert_eq!(rm_missing, StatusCode::NOT_FOUND);
+        assert_eq!(
+            String::from_utf8_lossy(&rm_missing_body),
+            "Recipe not found: 'rmme/1.0#nope'"
+        );
+        // rrB: two recipe files + one binary's three files.
+        assert_eq!(rows, 5);
+    }
+
+    #[tokio::test]
+    async fn remove_all_packages_and_whole_recipe() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        publish(&state, &auth, &repo_key, "rrA", &["pidA", "pidB"]).await;
+        publish(&state, &auth, &repo_key, "rrB", &[]).await;
+
+        let app = router_with_auth(state, auth);
+        let base = format!("/{repo_key}/v2/conans/rmme/1.0/_/_");
+        let (rm_pkgs, _) = send(
+            app.clone(),
+            delete(format!("{base}/revisions/rrA/packages")),
+        )
+        .await;
+        let (search, search_body) = send(
+            app.clone(),
+            tdh::get(format!("{base}/revisions/rrA/search")),
+        )
+        .await;
+        let (rm_pkgs_none, _) = send(
+            app.clone(),
+            delete(format!("{base}/revisions/rrA/packages")),
+        )
+        .await;
+        let (rm_all, _) = send(app.clone(), delete(base.clone())).await;
+        let (revs, _) = send(app.clone(), tdh::get(format!("{base}/revisions"))).await;
+        let rows = live_rows(&pool, repo_id).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(rm_pkgs, StatusCode::OK);
+        // The recipe revision survives without binaries: `200 {}`.
+        assert_eq!(search, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&search_body).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(rm_pkgs_none, StatusCode::NOT_FOUND);
+        assert_eq!(rm_all, StatusCode::OK);
+        assert_eq!(revs, StatusCode::NOT_FOUND);
+        assert_eq!(rows, 0);
+    }
+
+    /// Removal needs the `delete:artifacts` scope, and is refused on a remote.
+    #[tokio::test]
+    async fn remove_requires_delete_scope_and_a_hosted_repo() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let (remote_id, remote_key, rdir) = create_conan_repo(&pool, "remote").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        publish(&state, &auth, &repo_key, "rrA", &["pidA"]).await;
+
+        let mut write_only = auth.clone();
+        write_only.scopes = Some(vec!["read:artifacts".into(), "write:artifacts".into()]);
+        let (scoped, _) = send(
+            router_with_auth(state.clone(), write_only),
+            delete(format!("/{repo_key}/v2/conans/rmme/1.0/_/_/revisions/rrA")),
+        )
+        .await;
+        let (remote, _) = send(
+            router_with_auth(state, auth),
+            delete(format!(
+                "/{remote_key}/v2/conans/rmme/1.0/_/_/revisions/rrA"
+            )),
+        )
+        .await;
+        let rows = live_rows(&pool, repo_id).await;
+        cleanup(&pool, remote_id, user_id).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&rdir);
+
+        assert_eq!(scoped, StatusCode::FORBIDDEN);
+        assert_eq!(remote, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(rows, 5, "nothing removed");
     }
 }
