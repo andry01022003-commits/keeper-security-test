@@ -3053,7 +3053,10 @@ where
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let had_members = !members.is_empty();
-    let members = authorize_virtual_members(db, auth, virtual_repo_id, members).await;
+    // Fallible (#4308): a DB failure while authorizing is a retryable 503, not
+    // the empty set, which would answer the definitive 404 below and let a
+    // client cache a miss for an artifact that exists.
+    let members = try_authorize_virtual_members(db, auth, virtual_repo_id, members).await?;
     if had_members && members.is_empty() {
         // Do NOT fall through to a DIFFERENT message: that would distinguish
         // "this virtual is empty" from "this virtual has members you may not
@@ -3415,7 +3418,8 @@ where
     // #3178: narrow to the members this caller may read BEFORE any member is
     // probed. The collapsed message is deliberate — see `resolve_virtual_
     // download` for why it must not be distinguishable from a genuine miss.
-    let members = authorize_virtual_members(&state.db, auth, virtual_repo_id, members).await;
+    // Fallible (#4308): an authorization query failure answers 503, not 404.
+    let members = try_authorize_virtual_members(&state.db, auth, virtual_repo_id, members).await?;
     if members.is_empty() {
         return Err(no_accessible_members_response());
     }
@@ -4856,13 +4860,14 @@ pub async fn authorize_virtual_members(
     virtual_repo_id: Uuid,
     members: Vec<Repository>,
 ) -> Vec<Repository> {
-    // Flattening Err into the empty set is correct for the WALKING callers
-    // (manifest/blob resolution): they probe members one by one and a missing
-    // member reads as "artifact not found here", so the deny direction is
-    // safe. Callers that AGGREGATE the filtered set into a response (OCI
-    // tags/list, #3320) must use [`try_authorize_virtual_members`] instead:
-    // for them an empty set is indistinguishable from "nothing exists" and a
-    // transient DB error would surface as 404 NAME_UNKNOWN.
+    // Flattening Err into the empty set fails CLOSED, but it also turns a
+    // transient DB error into "no member has it". Callers that AGGREGATE the
+    // filtered set into a response (OCI tags/list, #3320) must use
+    // [`try_authorize_virtual_members`]: for them an empty set is
+    // indistinguishable from "nothing exists". So must a walk that answers a
+    // package client: "not found" is a definitive answer that Gradle and
+    // Maven cache, so the shared download resolvers and the Maven virtual
+    // checksum walk use the fallible form too (#4308).
     try_authorize_virtual_members(db, auth, virtual_repo_id, members)
         .await
         .unwrap_or_default()
@@ -18030,6 +18035,80 @@ mod tests {
             1,
             "the HEAD must never reach the signer: still exactly one presign, the GET's"
         );
+    }
+
+    /// #4308: both shared virtual download resolvers must surface a failed
+    /// member-AUTHORIZATION query as a retryable server error. They used the
+    /// flattening `authorize_virtual_members`, so the failure became an empty
+    /// member set and the client got the definitive 404 "Virtual repository
+    /// has no accessible members", which Gradle caches as a missing artifact.
+    /// The member fetch itself succeeds here; only the visibility query an
+    /// authenticated non-admin caller runs is made to fail.
+    #[tokio::test]
+    async fn test_virtual_download_resolvers_do_not_404_on_authz_db_failure_4308() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _, vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let (member_id, _, mdir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::link_virtual_member(&pool, virtual_id, member_id, 1).await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, member_id, user_id).await;
+        let auth = tdh::make_auth(user_id, &username);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        let no_local = |_id: Uuid, _loc: StorageLocation| async {
+            Err::<StreamingFetchResult, Response>(StatusCode::NOT_FOUND.into_response())
+        };
+
+        let outage = tdh::AuthzQueryOutage::start(&pool)
+            .await
+            .expect("database configured");
+        let state = tdh::build_state(outage.pool.clone(), vdir.to_str().unwrap());
+        let buffered = resolve_virtual_download(
+            &outage.pool,
+            Some(&auth),
+            None,
+            virtual_id,
+            "a/b/1.0/b-1.0.jar",
+            None,
+            no_local,
+        )
+        .await
+        .map(|_| StatusCode::OK)
+        .unwrap_or_else(|r| r.status());
+        let streaming = resolve_virtual_download_streaming(
+            &state,
+            Some(&auth),
+            None,
+            virtual_id,
+            "a/b/1.0/b-1.0.jar",
+            "application/java-archive",
+            None,
+            &ctx,
+            no_local,
+        )
+        .await
+        .map(|r| r.status())
+        .unwrap_or_else(|r| r.status());
+        outage.end().await;
+
+        tdh::cleanup_member_repo(&pool, member_id, &mdir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&vdir);
+
+        for (label, status) in [("buffered", buffered), ("streaming", streaming)] {
+            assert!(
+                status.is_server_error(),
+                "{label}: an authorization query failure must be a retryable \
+                 server error, not the cacheable 404; got {status}"
+            );
+        }
     }
 
     /// #2075: the virtual-member redirect fast path (`try_member_cache_redirect`

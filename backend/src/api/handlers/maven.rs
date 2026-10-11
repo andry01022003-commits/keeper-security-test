@@ -1924,14 +1924,13 @@ async fn download(
             // checksum. A private member's checksum reveals the existence and
             // exact content hash of its artifact, so it must be gated the same
             // way the artifact bytes are.
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-            let members = proxy_helpers::authorize_virtual_members(
-                &state.db,
-                auth.as_ref(),
-                repo.id,
-                members,
-            )
-            .await;
+            //
+            // The fallible form (#4308): a failed authorization query is a
+            // retryable 503, never an empty member set that answers the
+            // definitive 404 Gradle caches as "this checksum does not exist".
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await?;
 
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
@@ -5441,6 +5440,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #4308: a database failure while authorizing a Maven virtual's members
+    /// must answer a retryable server error (503 for a pool timeout), never
+    /// the definitive 404 "Virtual
+    /// repository has no accessible members" that Gradle records as a missing
+    /// artifact and stops asking for. The checksum route still went through
+    /// the flattening `authorize_virtual_members`, which turned the error into
+    /// an empty member set; the artifact route is the control (it already
+    /// used the fallible form). A real denial still answers the 404, checked
+    /// after the outage ends.
+    #[tokio::test]
+    async fn test_maven_virtual_authz_db_failure_is_503_not_404_4308() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "maven").await;
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, 1).await;
+        let path = "com/example/k/1.0/k-1.0.jar";
+        let member_info = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_info,
+            &format!("maven/{path}"),
+            path,
+            "k",
+            "1.0",
+            "application/java-archive",
+            bytes::Bytes::from_static(b"k jar"),
+            fx.user_id,
+        )
+        .await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let outage = tdh::AuthzQueryOutage::start(&fx.pool)
+            .await
+            .expect("database configured");
+        let state = tdh::build_state(outage.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let mut during = Vec::new();
+        for leaf in [path.to_string(), format!("{path}.sha1")] {
+            let app = tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, leaf))).await;
+            during.push((leaf, status, String::from_utf8_lossy(&body).into_owned()));
+        }
+        outage.end().await;
+
+        // Control: with the database healthy, a caller holding no grant on
+        // the member still gets the shared 404 (#3452 is unchanged).
+        let (stranger_id, stranger_name) = tdh::create_user(&fx.pool).await;
+        let app = tdh::router_with_auth(
+            super::router(),
+            fx.state.clone(),
+            tdh::make_auth(stranger_id, &stranger_name),
+        );
+        let (denied, _) = tdh::send(app, tdh::get(format!("/{}/{}.sha1", fx.repo_key, path))).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, stranger_id).await;
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        // The injected failure is a lock timeout, which `map_db_err` answers
+        // 500; a pool timeout (the reported trigger) goes through the same
+        // `Err` and answers 503 + POOL_EXHAUSTED. Either is retryable; the
+        // bug was the definitive 404.
+        for (leaf, status, body) in during {
+            assert!(
+                status.is_server_error(),
+                "{leaf}: an authorization query failure must be a retryable \
+                 server error, not a cacheable miss; got {status}, body={body}"
+            );
+        }
+        assert_eq!(denied, StatusCode::NOT_FOUND);
     }
 
     /// #4476: a Maven build that deploys the same attached snapshot artifact

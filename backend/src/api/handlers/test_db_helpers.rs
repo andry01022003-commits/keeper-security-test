@@ -3289,3 +3289,53 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
         self.clone()
     }
 }
+
+/// A transient failure of the virtual-member AUTHORIZATION query alone, for
+/// the #4308 regressions: the member fetch (`virtual_repo_members` +
+/// `repositories`) still succeeds, but the grant predicate an authenticated
+/// non-admin caller's visibility filter evaluates (`role_assignments`) cannot
+/// be read.
+///
+/// Holds an `ACCESS EXCLUSIVE` lock on `role_assignments` from its own
+/// connection, and returns a separate small pool whose sessions run with a
+/// short `lock_timeout`, so a query through that pool that touches the table
+/// fails with a database error (the same `AppError::Database` shape as a pool
+/// timeout) instead of waiting. Other tests touching the table only wait for
+/// the guard to drop. Returns `None` without a database.
+pub struct AuthzQueryOutage {
+    pub pool: PgPool,
+    lock: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl AuthzQueryOutage {
+    pub async fn start(lock_pool: &PgPool) -> Option<Self> {
+        use std::str::FromStr;
+        let url = crate::testing::require_db_url()?;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .options([("lock_timeout", "300")]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_with(opts)
+            .await
+            .expect("connect lock-timeout pool");
+        let mut tx = lock_pool.begin().await.expect("begin lock transaction");
+        sqlx::query("LOCK TABLE role_assignments IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("lock role_assignments");
+        Some(Self {
+            pool,
+            lock: Some(tx),
+        })
+    }
+
+    /// Release the lock (rolls the holding transaction back).
+    pub async fn end(mut self) {
+        if let Some(tx) = self.lock.take() {
+            let _ = tx.rollback().await;
+        }
+        self.pool.close().await;
+    }
+}
