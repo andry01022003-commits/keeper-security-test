@@ -4355,4 +4355,40 @@ mod virtual_member_failure_tests {
         assert!(body.contains("alpha"), "{body}");
         assert!(headers.get("x-ak-partial-members").is_none());
     }
+
+    /// #4508: a member that does not answer within the member deadline fails
+    /// the merged index with 502 naming it, promptly, instead of holding the
+    /// request for the upstream's full timeout (which outlasts a reverse
+    /// proxy's and turns into a 504).
+    #[tokio::test]
+    async fn stalled_member_fails_within_the_deadline_4508() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let stalled = upstream(
+            ResponseTemplate::new(200)
+                .set_body_string(GOOD_INDEX)
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .await;
+        let rig = Rig::new(pool, &[good.uri(), stalled.uri()]).await;
+        let started = std::time::Instant::now();
+        let (status, body, _) = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+            std::time::Duration::from_millis(300),
+            rig.index(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let stalled_key = rig.member_keys[1].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body.contains(&stalled_key), "{body}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the deadline must bound the wait: took {elapsed:?}"
+        );
+    }
 }

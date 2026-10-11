@@ -1989,8 +1989,14 @@ async fn download(
 }
 
 /// Fetch a single Remote virtual member's Maven metadata document at `path`
-/// from upstream (via the proxy cache), as a UTF-8 string. Returns `None` for a
-/// non-Remote member or any miss.
+/// from upstream (via the proxy cache), as a UTF-8 string. Returns `Ok(None)`
+/// for a non-Remote member or any miss.
+///
+/// Bounded by the virtual member deadline (#4508): a member whose upstream is
+/// down used to hold every metadata miss for the upstream client's full
+/// timeout, longer than a reverse proxy waits, so clients saw 504 and builds
+/// crawled. A member that misses the deadline is `Err`, a 502 naming it,
+/// which the merge returns instead of waiting.
 ///
 /// Extracted so the Maven virtual metadata-merge loops can fan out across remote
 /// members CONCURRENTLY (#2069): a cold metadata merge then costs the slowest
@@ -2001,13 +2007,16 @@ async fn fetch_remote_member_metadata(
     state: &SharedState,
     member: &crate::models::repository::Repository,
     path: &str,
-) -> Option<String> {
+) -> Result<Option<String>, Response> {
     if member.repo_type != RepositoryType::Remote {
-        return None;
+        return Ok(None);
     }
-    let upstream_url = member.upstream_url.as_deref()?;
-    let proxy = state.proxy_service.as_ref()?;
-    let (content, _, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+    let (Some(upstream_url), Some(proxy)) =
+        (member.upstream_url.as_deref(), state.proxy_service.as_ref())
+    else {
+        return Ok(None);
+    };
+    let fetched = proxy_helpers::member_metadata_fetch_capped_budgeted(
         proxy,
         member.id,
         &member.key,
@@ -2017,8 +2026,13 @@ async fn fetch_remote_member_metadata(
         RepositoryFormat::Maven,
     )
     .await
-    .ok()?;
-    std::str::from_utf8(&content).ok().map(|s| s.to_string())
+    .map_err(|deadline| {
+        proxy_helpers::virtual_member_deadline_response(&member.key, path, deadline)
+    })?;
+    let Ok((content, _, _budget_permit)) = fetched else {
+        return Ok(None);
+    };
+    Ok(std::str::from_utf8(&content).ok().map(|s| s.to_string()))
 }
 
 /// Read a Local/Staging virtual member's stored metadata document at `path`.
@@ -2136,17 +2150,20 @@ async fn fetch_maven_metadata_bytes(
                                 if member.repo_type == RepositoryType::Remote {
                                     fetch_remote_member_metadata(state, member, path).await
                                 } else {
-                                    generate_metadata_for_artifact(
+                                    Ok(generate_metadata_for_artifact(
                                         &state.db,
                                         member.id,
                                         &group_id,
                                         &artifact_id,
                                     )
                                     .await
-                                    .ok()
+                                    .ok())
                                 }
                             }))
                             .await;
+                        // A member that missed the deadline fails the merge
+                        // (#4508); nothing is cached for it.
+                        let member_docs = member_docs.into_iter().collect::<Result<Vec<_>, _>>()?;
                         for xml in member_docs.into_iter().flatten() {
                             if let Some(ts) =
                                 crate::formats::maven::parse_metadata_last_updated(&xml)
@@ -2224,11 +2241,13 @@ async fn fetch_maven_metadata_bytes(
                     if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
                     } else {
-                        read_member_stored_metadata(state, member, path).await
+                        Ok(read_member_stored_metadata(state, member, path).await)
                     }
                 }))
                 .await;
-                member_docs.extend(batch.into_iter().flatten());
+                for doc in batch {
+                    member_docs.extend(doc?);
+                }
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
@@ -2251,7 +2270,7 @@ async fn fetch_maven_metadata_bytes(
                     let mut entries: Vec<SnapshotEntry> = Vec::new();
                     if member.repo_type == RepositoryType::Remote {
                         if let Some(xml_str) =
-                            fetch_remote_member_metadata(state, member, path).await
+                            fetch_remote_member_metadata(state, member, path).await?
                         {
                             entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
@@ -2276,11 +2295,11 @@ async fn fetch_maven_metadata_bytes(
                             .await,
                         );
                     }
-                    entries
+                    Ok::<_, Response>(entries)
                 }))
                 .await;
                 for entries in per_member {
-                    all_entries.extend(entries);
+                    all_entries.extend(entries?);
                 }
             }
 
@@ -2381,7 +2400,8 @@ async fn fetch_remote_member_prefixes(
         || AppError::NotFound("Prefix file not available".to_string()).into_response();
     let upstream_url = member.upstream_url.as_deref().ok_or_else(unavailable)?;
     let proxy = state.proxy_service.as_ref().ok_or_else(unavailable)?;
-    match proxy_helpers::proxy_fetch_capped_budgeted(
+    // Bounded by the virtual member deadline like the metadata merge (#4508).
+    let fetched = proxy_helpers::member_metadata_fetch_capped_budgeted(
         proxy,
         member.id,
         &member.key,
@@ -2391,7 +2411,10 @@ async fn fetch_remote_member_prefixes(
         RepositoryFormat::Maven,
     )
     .await
-    {
+    .map_err(|deadline| {
+        proxy_helpers::virtual_member_deadline_response(&member.key, MAVEN_PREFIXES_PATH, deadline)
+    })?;
+    match fetched {
         Ok((content, _, _permit)) => {
             let text = std::str::from_utf8(&content).map_err(|_| unavailable())?;
             parse_member_prefixes_body(text)
@@ -9168,6 +9191,93 @@ mod tests {
             body_str.contains("1.0.0") && body_str.contains("3.0.0"),
             "virtual maven metadata must merge LOCAL (1.0.0) + REMOTE (3.0.0) \
              versions via the concurrent fan-out (#2069); got: {body_str}"
+        );
+    }
+
+    /// #4508: a virtual's Remote member whose upstream stalls must not hold
+    /// every `maven-metadata.xml` miss for the upstream's full timeout. The
+    /// member fetch is bounded by the member deadline, and a member that
+    /// misses it fails the request with a 502 naming the member.
+    #[tokio::test]
+    async fn test_virtual_metadata_stalled_member_fails_within_the_deadline_4508() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let meta_path = "com/example/stall4508/lib/maven-metadata.xml".to_string();
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*maven-metadata\.xml$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<metadata/>")
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&mock)
+            .await;
+
+        let (local_id, _lk, dir_l) = tdh::create_repo(&pool, "local", "maven").await;
+        let (remote_id, remote_key, dir_r) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        let (virtual_id, virtual_key, dir_v) = tdh::create_repo(&pool, "virtual", "maven").await;
+        for id in [local_id, remote_id, virtual_id] {
+            tdh::publish_repo(&pool, id).await;
+        }
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 1).await;
+        tdh::link_virtual_member(&pool, virtual_id, remote_id, 2).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir_r.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir_r.to_str().unwrap(), proxy);
+
+        let started = std::time::Instant::now();
+        let result = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+            Duration::from_millis(300),
+            download(
+                State(state.clone()),
+                Extension(None),
+                Path((virtual_key.clone(), meta_path.clone())),
+                HeaderMap::new(),
+                Default::default(),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        for (id, dir) in [
+            (local_id, &dir_l),
+            (remote_id, &dir_r),
+            (virtual_id, &dir_v),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => r,
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body.contains(&remote_key),
+            "the 502 must name the member: {body}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the deadline must bound the wait: took {elapsed:?}"
         );
     }
 

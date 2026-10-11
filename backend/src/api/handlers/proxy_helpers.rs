@@ -3650,17 +3650,30 @@ where
             // The cache-keyed fetch is `proxy_fetch` with `fetch_path ==
             // cache_path`, widened to also report the upstream
             // `Content-Encoding` (#3260) and `Content-Type` (#3281) so the
-            // transform can re-declare them.
-            match proxy_fetch_with_cache_key(
+            // transform can re-declare them. Bounded by the member deadline
+            // (#4508): a member that misses it ends the walk with a 502
+            // naming it rather than holding every miss for the upstream's
+            // own timeout or silently answering from a lower-priority member.
+            let fetched = within_virtual_member_deadline(proxy_fetch_with_cache_key(
                 proxy,
                 member.id,
                 &member.key,
                 upstream_url,
                 path,
                 path,
-            )
-            .await
-            {
+            ))
+            .await;
+            let fetched = match fetched {
+                Ok(fetched) => fetched,
+                Err(deadline) => {
+                    return MemberResolveOutcome::Quarantine(virtual_member_deadline_response(
+                        &member.key,
+                        path,
+                        deadline,
+                    ));
+                }
+            };
+            match fetched {
                 Ok((bytes, ct, enc)) => match transform(bytes, ct, enc, member.key.clone()).await {
                     Ok(response) => MemberResolveOutcome::Hit(response),
                     Err(_) => {
@@ -3699,6 +3712,126 @@ where
         )
             .into_response()),
     }
+}
+
+/// Environment variable bounding, in seconds, how long one Remote member of a
+/// virtual repository may take to answer a metadata fetch (#4508).
+pub const VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV: &str = "AK_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS";
+
+/// Default member deadline. The upstream client's connect and read timeouts
+/// are 60 s each, which is also what most reverse proxies allow a whole
+/// request, so a member whose upstream is down (connections blackholed, not
+/// refused) used to hold every miss past the proxy's timeout and the client
+/// saw 504. 20 s is far above a healthy metadata fetch and well under that.
+pub const DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS: u64 = 20;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only override of [`virtual_member_metadata_timeout`] for the
+    /// requests a test drives (see [`with_virtual_member_deadline`]).
+    static VIRTUAL_MEMBER_DEADLINE_OVERRIDE: std::time::Duration;
+}
+
+/// The member deadline: [`VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV`], or
+/// [`DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS`] when it is unset, not a
+/// number or zero (zero would fail every member, never disable the bound).
+pub fn virtual_member_metadata_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(deadline) = VIRTUAL_MEMBER_DEADLINE_OVERRIDE.try_with(|d| *d) {
+        return deadline;
+    }
+    static DEADLINE: OnceLock<std::time::Duration> = OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        let secs = std::env::var(VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS);
+        std::time::Duration::from_secs(secs)
+    })
+}
+
+/// Run `fut` with the member deadline set to `deadline` for every member
+/// fetch it makes on this task. Test-only.
+#[cfg(test)]
+pub(crate) async fn with_virtual_member_deadline<F: std::future::Future>(
+    deadline: std::time::Duration,
+    fut: F,
+) -> F::Output {
+    VIRTUAL_MEMBER_DEADLINE_OVERRIDE.scope(deadline, fut).await
+}
+
+/// Run one virtual member's metadata fetch under the member deadline
+/// (#4508). `Err` carries the deadline it missed.
+pub async fn within_virtual_member_deadline<F: std::future::Future>(
+    fut: F,
+) -> Result<F::Output, std::time::Duration> {
+    let deadline = virtual_member_metadata_timeout();
+    tokio::time::timeout(deadline, fut)
+        .await
+        .map_err(|_| deadline)
+}
+
+/// [`proxy_fetch_capped_budgeted`] for one virtual member's metadata, bounded
+/// by the member deadline (#4508). The budget reservation is waited for
+/// first and only the upstream fetch is timed, so a saturated buffered-metadata
+/// budget is never reported as the member being down. `Err` carries the
+/// deadline the fetch missed.
+pub async fn member_metadata_fetch_capped_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response>, std::time::Duration> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let fetched =
+        within_virtual_member_deadline(proxy_service.fetch_artifact_capped(&repo, path, max))
+            .await?;
+    Ok(fetched
+        .map(|(content, content_type)| (content, content_type, permit))
+        .map_err(|e| map_proxy_error(repo_key, path, e)))
+}
+
+/// Why a member that missed the deadline contributed nothing, for a 502 body.
+pub fn virtual_member_deadline_reason(path: &str, deadline: std::time::Duration) -> String {
+    format!(
+        "{path}: no answer within {}s ({VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV}); the upstream \
+         may be down",
+        deadline.as_secs_f64()
+    )
+}
+
+/// The 502 a virtual metadata request answers when `member` misses the
+/// member deadline (#4508): fail promptly and name the member, instead of
+/// holding the request for the upstream's own timeout.
+pub fn virtual_member_deadline_response(
+    member: &str,
+    path: &str,
+    deadline: std::time::Duration,
+) -> Response {
+    metrics::counter!(
+        "ak_virtual_member_metadata_timeouts_total",
+        "member" => member.to_string(),
+    )
+    .increment(1);
+    tracing::warn!(
+        member = %member,
+        path = %path,
+        deadline_secs = deadline.as_secs_f64(),
+        "virtual member did not answer a metadata fetch within the member deadline"
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "Virtual repository member '{member}' failed: {}",
+            virtual_member_deadline_reason(path, deadline)
+        ),
+    )
+        .into_response()
 }
 
 /// `repository_config` key on a VIRTUAL repository that opts it into degraded
@@ -3763,7 +3896,7 @@ pub struct VirtualMemberFailure {
     /// The member repository's key.
     pub member: String,
     /// Stable, low-cardinality class for the failure metric: `fetch`,
-    /// `parse` or `timeout`.
+    /// `parse` or `timeout` (the member deadline, #4508).
     pub kind: &'static str,
     /// What went wrong, phrased for an operator reading a 502 body.
     pub reason: String,
@@ -3924,7 +4057,7 @@ where
         .collect();
     let format = remote_members
         .first()
-        .map(|m| m.format.as_str())
+        .map(|m| m.format.as_key())
         .unwrap_or("unknown");
     let mut documents: Vec<(String, T)> = Vec::new();
     let mut failed: Vec<VirtualMemberFailure> = Vec::new();
@@ -3943,7 +4076,23 @@ where
             let Some(upstream_url) = member.upstream_url.as_deref() else {
                 return fail("fetch", "remote member has no upstream URL".to_string());
             };
-            match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
+            // Bounded by the member deadline (#4508): a member whose upstream
+            // is down must not hold the merge for the upstream's own timeout.
+            let fetched = match within_virtual_member_deadline(proxy_fetch(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                path,
+            ))
+            .await
+            {
+                Ok(fetched) => fetched,
+                Err(deadline) => {
+                    return fail("timeout", virtual_member_deadline_reason(path, deadline));
+                }
+            };
+            match fetched {
                 Ok((bytes, _ct)) => match extract(bytes, member.key.clone()).await {
                     Ok(data) => Some(Ok((member.key.clone(), data))),
                     Err(response) => fail(
