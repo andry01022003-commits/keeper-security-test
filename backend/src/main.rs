@@ -2084,6 +2084,12 @@ async fn provision_admin_user(
         .await
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
+        // #4313: say so when ADMIN_PASSWORD no longer matches the account.
+        // It only seeds the admin on first boot, so editing it afterwards (a
+        // quickstart user trying to "set" the password in .env) used to
+        // change nothing and leave no trace of why the login kept failing.
+        admin_password_env_ignored(&mut tx, std::env::var("ADMIN_PASSWORD").ok()).await?;
+
         if !must_change && !demo_mode {
             if let Ok(env_pw) = std::env::var("ADMIN_PASSWORD") {
                 if is_insecure_default_password(&env_pw) {
@@ -2315,6 +2321,50 @@ async fn provision_admin_user(
         tracing::info!("Admin user created with password from ADMIN_PASSWORD env var");
         Ok(false)
     }
+}
+
+/// Whether `ADMIN_PASSWORD` is set but no longer matches the built-in admin
+/// account that already exists, logging a warning when it does not (#4313).
+///
+/// `ADMIN_PASSWORD` is applied only when the admin account is created; a
+/// restart never resets an existing password (#2803). An operator who edits
+/// the variable after the first boot therefore logs in with a password the
+/// account never had, and nothing said why. The value is compared, never
+/// logged.
+async fn admin_password_env_ignored(
+    tx: &mut sqlx::PgConnection,
+    admin_password: Option<String>,
+) -> Result<bool> {
+    let Some(env_pw) = admin_password.filter(|p| !p.is_empty()) else {
+        return Ok(false);
+    };
+    let hash: Option<String> = sqlx::query_scalar(
+        "SELECT password_hash FROM users \
+         WHERE username = 'admin' AND is_admin = true AND external_id IS NULL \
+           AND auth_provider = 'local'",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?
+    .flatten();
+    let Some(hash) = hash else {
+        return Ok(false);
+    };
+    if AuthService::verify_password(&env_pw, &hash)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    tracing::warn!(
+        "ADMIN_PASSWORD is set but does not match the existing 'admin' account, so it is \
+         being ignored: it only sets the password when the account is first created, and a \
+         restart never resets it. Log in with the password from the first boot (an \
+         installer-generated .env records it; otherwise see admin.password in the storage \
+         volume) and change it in the UI. For a fresh evaluation stack, remove the volumes \
+         (docker compose down -v) and start again."
+    );
+    Ok(true)
 }
 
 /// Generate a random 20-character password for the admin user.
@@ -3048,6 +3098,50 @@ mod tests {
             &strict,
         )
         .is_err());
+    }
+
+    /// #4313: an ADMIN_PASSWORD edited after the first boot is reported as
+    /// ignored instead of silently doing nothing; the first-boot value, an
+    /// unset or empty variable, and a missing account are not.
+    #[tokio::test]
+    async fn changed_admin_password_env_is_reported_as_ignored_4313() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = iso.pool.clone();
+        let mut conn = pool.acquire().await.expect("conn");
+        assert!(
+            !admin_password_env_ignored(&mut conn, Some("Anything-4313!".into()))
+                .await
+                .expect("no admin yet"),
+            "no account yet: nothing to compare"
+        );
+        let hash = AuthService::hash_password("First-Boot-4313!")
+            .await
+            .expect("hash");
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, is_admin, must_change_password, \
+             auth_provider) VALUES ('admin', 'admin@localhost', $1, true, false, 'local')",
+        )
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("seed admin");
+
+        for (value, ignored) in [
+            (Some("Edited-Later-4313!"), true),
+            (Some("First-Boot-4313!"), false),
+            (Some(""), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                admin_password_env_ignored(&mut conn, value.map(str::to_string))
+                    .await
+                    .expect("compare"),
+                ignored,
+                "{value:?}"
+            );
+        }
     }
 
     /// End-to-end over the real provisioning path: first boot installs the

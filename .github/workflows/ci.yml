@@ -1461,6 +1461,13 @@ jobs:
       - name: Check the stock compose ships no secret the backend rejects
         run: bash scripts/ci/check-compose-secret-defaults.sh
 
+      # Quickstart installer (#4313): the generated .env must use the compose
+      # file's ports, set Dependency-Track's flag only with its profile, keep
+      # AK_ADMIN_PASSWORD, and fall back to Podman when the docker daemon is
+      # unreachable. Runs the installer against stubs, ~1s.
+      - name: Check the quickstart installer matches the compose defaults
+        run: bash scripts/ci/check-installer-quickstart.sh
+
       # The cache-correctness E2E reads its verdict off the mock upstream's
       # counters, so a wrong mock reports a product bug that is not there. It
       # did: the backend revalidates an expired TTL with a CONDITIONAL HEAD

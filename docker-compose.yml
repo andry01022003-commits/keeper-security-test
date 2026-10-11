@@ -242,8 +242,11 @@ services:
       JWT_SECRET: ${JWT_SECRET:-}
       # ADMIN_PASSWORD: set this to skip first-boot setup lock.
       # If unset, a random password is generated and written to
-      # /data/storage/admin.password on each boot until it is changed.
+      # /data/storage/admin.password, and regenerated on boot while that file
+      # is missing and the password has not been changed.
       # Read it with: docker exec artifact-keeper-backend cat /data/storage/admin.password
+      # Applied only when the admin account is FIRST created (#4313): editing
+      # it afterwards changes nothing (the backend logs that it is ignored).
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # INITIAL_ADMIN_PASSWORD / INITIAL_ADMIN_PASSWORD_FILE: preset the
       # first-boot admin password instead of reading a generated one out of
