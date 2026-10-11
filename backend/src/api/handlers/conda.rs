@@ -4826,7 +4826,7 @@ async fn build_virtual_channeldata(
 /// Serve a virtual merge under the repository's member-failure policy
 /// (#4192): strict by default (502 naming the failed members), or a degraded
 /// document marked partial and uncacheable when the virtual opts in through
-/// `repository_config` key [`virtual_merge::PARTIAL_CONFIG_KEY`].
+/// `repository_config` key [`proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`].
 ///
 /// The body, its ETag and (for JSON) its gzip rendering come from the shared
 /// merged document, so every request a merge answers gets the same bytes and
@@ -18470,7 +18470,7 @@ mod virtual_channel_tests {
             "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true')",
         )
         .bind(rig.virtual_id)
-        .bind(virtual_merge::PARTIAL_CONFIG_KEY)
+        .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
         .execute(&rig.pool)
         .await
         .unwrap();
@@ -18489,7 +18489,7 @@ mod virtual_channel_tests {
         assert_eq!(listed(&doc), vec!["acme-core-1.0-0.conda"]);
         assert_eq!(
             headers
-                .get(virtual_merge::PARTIAL_MEMBERS_HEADER)
+                .get(proxy_helpers::PARTIAL_MEMBERS_HEADER)
                 .and_then(|v| v.to_str().ok()),
             Some(remote_key.as_str())
         );
@@ -21424,7 +21424,7 @@ mod cep16_proxy_tests {
             "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true')",
         )
         .bind(rig.virtual_id)
-        .bind(virtual_merge::PARTIAL_CONFIG_KEY)
+        .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
         .execute(&rig.pool)
         .await
         .unwrap();
@@ -21448,7 +21448,7 @@ mod cep16_proxy_tests {
         assert_eq!(partial_status, StatusCode::OK);
         assert_eq!(
             partial_headers
-                .get(virtual_merge::PARTIAL_MEMBERS_HEADER)
+                .get(proxy_helpers::PARTIAL_MEMBERS_HEADER)
                 .and_then(|h| h.to_str().ok()),
             Some(remote_key.as_str())
         );

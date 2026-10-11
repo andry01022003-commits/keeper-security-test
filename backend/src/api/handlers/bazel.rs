@@ -414,14 +414,19 @@ async fn get_file(
             Ok(super::json_response(&serde_json::json!({ "mirrors": [] })))
         }
         BazelRequest::ModuleMetadata { name } => {
-            let doc = if is_virtual {
+            let (doc, partial) = if is_virtual {
                 virtual_metadata(&state, auth.as_ref(), &repo, name).await?
             } else {
                 let versions = hosted_versions(&state.db, &[repo.id], name).await?;
-                (!versions.is_empty()).then(|| build_metadata(versions))
+                (
+                    (!versions.is_empty()).then(|| build_metadata(versions)),
+                    proxy_helpers::PartialMerge::default(),
+                )
             };
             let doc = doc.ok_or_else(|| not_found("Module"))?;
-            Ok(super::json_response(&doc))
+            let mut response = super::json_response(&doc);
+            partial.mark(&mut response);
+            Ok(response)
         }
         BazelRequest::ModuleFile { name, .. } => {
             let rel = request.path();
@@ -510,11 +515,14 @@ async fn virtual_metadata(
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     name: &str,
-) -> Result<Option<serde_json::Value>, Response> {
+) -> Result<(Option<serde_json::Value>, proxy_helpers::PartialMerge), Response> {
     let hosted = hosted_ownership(state, auth, repo.id, name).await?;
     if hosted.owned {
         let versions = hosted.visible_versions;
-        return Ok((!versions.is_empty()).then(|| build_metadata(versions)));
+        return Ok((
+            (!versions.is_empty()).then(|| build_metadata(versions)),
+            proxy_helpers::PartialMerge::default(),
+        ));
     }
     let docs = proxy_helpers::collect_virtual_metadata(
         &state.db,
@@ -522,15 +530,18 @@ async fn virtual_metadata(
         state.proxy_service.as_deref(),
         repo.id,
         &format!("modules/{}/metadata.json", name),
-        // A member whose document does not parse is logged and skipped by
-        // `collect_virtual_metadata`; the error value itself is discarded.
+        // A member whose document does not parse fails the merge naming the
+        // member (#4192); the error value itself is discarded.
         |bytes, _member| async move {
             serde_json::from_slice::<serde_json::Value>(&bytes)
                 .map_err(|_| StatusCode::BAD_GATEWAY.into_response())
         },
     )
     .await?;
-    Ok(merge_metadata(docs.into_iter().map(|(_, d)| d).collect()))
+    Ok((
+        merge_metadata(docs.documents.into_iter().map(|(_, d)| d).collect()),
+        docs.partial,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,12 +1225,6 @@ mod tests {
         let (remote_id, _, rdir) =
             tdh::attach_remote_member(&f.pool, virtual_id, "bazel", &server.uri(), 0).await;
         tdh::link_virtual_member(&f.pool, virtual_id, f.repo_id, 1).await;
-        // A lower-priority member whose metadata.json is not JSON is skipped
-        // by the merge rather than failing it.
-        let junk = MockServer::start().await;
-        mount_upstream(&junk, &[("/modules/rules_cc/metadata.json", "not json")]).await;
-        let (junk_id, _jkey, jdir) =
-            tdh::attach_remote_member(&f.pool, virtual_id, "bazel", &junk.uri(), 2).await;
 
         let cache = tempfile::tempdir().expect("tempdir");
         let proxy =
@@ -1299,6 +1304,21 @@ mod tests {
         assert_eq!(
             json(&body)["versions"],
             serde_json::json!(["0.1.1", "0.2.0"])
+        );
+
+        // A lower-priority member whose metadata.json is not JSON fails the
+        // merge with 502 naming it (#4192), instead of being skipped so that
+        // the merged versions silently lack that member.
+        let junk = MockServer::start().await;
+        mount_upstream(&junk, &[("/modules/rules_cc/metadata.json", "not json")]).await;
+        let (junk_id, junk_key, jdir) =
+            tdh::attach_remote_member(&f.pool, virtual_id, "bazel", &junk.uri(), 2).await;
+        let (status, body) =
+            fetch(app.clone(), format!("/{vk}/modules/rules_cc/metadata.json")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert!(
+            String::from_utf8_lossy(&body).contains(&junk_key),
+            "{body:?}"
         );
 
         tdh::cleanup_member_repo(&f.pool, junk_id, &jdir).await;

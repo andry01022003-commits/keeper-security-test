@@ -116,13 +116,6 @@ pub(super) struct MemberFailure {
     pub reason: String,
 }
 
-/// `repository_config` key on a VIRTUAL repository that opts it into
-/// degraded merges (#4192). Absent or anything but `true`: strict.
-pub(super) const PARTIAL_CONFIG_KEY: &str = "virtual_metadata_partial";
-
-/// Response header naming the members a degraded merge left out.
-pub(super) const PARTIAL_MEMBERS_HEADER: &str = "x-ak-partial-members";
-
 /// What a virtual merge does when a member fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailurePolicy {
@@ -137,30 +130,23 @@ pub(super) enum FailurePolicy {
 }
 
 impl FailurePolicy {
+    #[cfg(test)]
     pub(super) fn from_config(value: Option<&str>) -> Self {
-        match value.map(str::trim) {
-            Some(v) if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("allow") => {
-                Self::AllowPartial
-            }
-            _ => Self::Strict,
+        if proxy_helpers::virtual_metadata_partial_opted_in(value) {
+            Self::AllowPartial
+        } else {
+            Self::Strict
         }
     }
 
     /// Read the policy for `virtual_repo_id`. A failed read is strict: the
     /// lookup failing must not loosen the guarantee.
     pub(super) async fn load(db: &sqlx::PgPool, virtual_repo_id: uuid::Uuid) -> Self {
-        let value: Option<String> = sqlx::query_scalar(
-            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
-        )
-        .bind(virtual_repo_id)
-        .bind(PARTIAL_CONFIG_KEY)
-        .fetch_optional(db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "reading {PARTIAL_CONFIG_KEY} failed; using strict");
-            None
-        });
-        Self::from_config(value.as_deref())
+        if proxy_helpers::virtual_metadata_partial_allowed(db, virtual_repo_id).await {
+            Self::AllowPartial
+        } else {
+            Self::Strict
+        }
     }
 }
 
@@ -224,19 +210,7 @@ pub(super) fn apply_failure_policy(
 /// partial document must never be cached as the complete one) and add a
 /// `Warning: 199`.
 pub(super) fn mark_partial(response: &mut Response, missing: &str) {
-    use axum::http::header::{CACHE_CONTROL, ETAG, WARNING};
-    use axum::http::HeaderValue;
-    let headers = response.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(missing) {
-        headers.insert(PARTIAL_MEMBERS_HEADER, v);
-    }
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.remove(ETAG);
-    if let Ok(v) = HeaderValue::from_str(&format!(
-        "199 - \"partial merge: members {missing} are missing\""
-    )) {
-        headers.insert(WARNING, v);
-    }
+    proxy_helpers::mark_partial_metadata_response(response, missing);
 }
 
 /// A remote member's document, decoded to JSON bytes.

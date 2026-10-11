@@ -1230,9 +1230,10 @@ pub struct UpdateRepositoryRequest {
     /// Virtual repositories only: when a member's metadata cannot be fetched
     /// or parsed, serve the merge of the members that succeeded (marked with
     /// `X-AK-Partial-Members` and `Cache-Control: no-store`) instead of
-    /// failing with 502. Defaults to `false` (strict). Honoured by conda
-    /// virtual channels. Stored in `repository_config` under
-    /// `virtual_metadata_partial`.
+    /// failing with 502. Defaults to `false` (strict). Honoured by every
+    /// virtual metadata merge: conda channels and the merged indexes of Helm,
+    /// CRAN, Hex and Bazel virtuals (#4192). Stored in `repository_config`
+    /// under `virtual_metadata_partial`.
     pub virtual_metadata_partial: Option<bool>,
     /// Assign this repository to a project (#2472). P1 is set-only: omitting
     /// the field leaves the assignment unchanged (unassignment ships with the

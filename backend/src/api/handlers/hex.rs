@@ -1178,18 +1178,20 @@ async fn list_names(
             |bytes, _member_key| async move { parse_upstream_names(&bytes) },
         )
         .await?;
-        for (_key, remote_names) in remote_results {
+        for (_key, remote_names) in remote_results.documents {
             merged.extend(remote_names);
         }
 
         let deduped = merge_and_sort_names(merged);
         let json = serde_json::json!(deduped);
 
-        return Ok(Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap());
+            .unwrap();
+        remote_results.partial.mark(&mut response);
+        return Ok(response);
     }
 
     let json = serde_json::json!(names);
@@ -1338,18 +1340,20 @@ async fn list_versions(
             |bytes, _member_key| async move { parse_upstream_versions(&bytes) },
         )
         .await?;
-        for (_key, remote_versions) in remote_results {
+        for (_key, remote_versions) in remote_results.documents {
             for (name, versions) in remote_versions {
                 merged.entry(name).or_default().extend(versions);
             }
         }
 
         let result = build_versions_response(merged);
-        return Ok(Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&result).unwrap()))
-            .unwrap());
+            .unwrap();
+        remote_results.partial.mark(&mut response);
+        return Ok(response);
     }
 
     let result: Vec<serde_json::Value> = packages
@@ -1561,7 +1565,8 @@ async fn query_local_member_versions(
 ///
 /// Artifact Keeper hex repos return a JSON array of strings: `["phoenix", "ecto"]`.
 /// If the upstream returns non-JSON (e.g. hex.pm's signed protobuf), parsing
-/// fails gracefully and the member is skipped by `collect_virtual_metadata`.
+/// fails and `collect_virtual_metadata` fails the merge naming that member
+/// (#4192), or reports it as missing when the virtual allows partial merges.
 #[allow(clippy::result_large_err)]
 fn parse_upstream_names(bytes: &[u8]) -> Result<Vec<String>, Response> {
     serde_json::from_slice::<Vec<String>>(bytes).map_err(|_| {

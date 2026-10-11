@@ -3701,13 +3701,191 @@ where
     }
 }
 
+/// `repository_config` key on a VIRTUAL repository that opts it into degraded
+/// metadata merges (#4192): `true` serves the merge of the members that
+/// succeeded, marked partial and uncacheable. Absent or anything else:
+/// strict, i.e. any member failure fails the request with 502. Shared by
+/// [`collect_virtual_metadata`] and the conda virtual merge.
+pub const VIRTUAL_METADATA_PARTIAL_CONFIG_KEY: &str = "virtual_metadata_partial";
+
+/// Response header naming the members a degraded merge left out (#4192).
+pub const PARTIAL_MEMBERS_HEADER: &str = "x-ak-partial-members";
+
+/// Whether `value` (the stored [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`]) opts
+/// a virtual into partial merges.
+pub fn virtual_metadata_partial_opted_in(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some(v) if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("allow")
+    )
+}
+
+/// Read whether `virtual_repo_id` opted into partial merges. A failed read is
+/// strict: the lookup failing must not loosen the guarantee.
+pub async fn virtual_metadata_partial_allowed(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(virtual_repo_id)
+    .bind(VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "reading {VIRTUAL_METADATA_PARTIAL_CONFIG_KEY} failed; using strict");
+        None
+    });
+    virtual_metadata_partial_opted_in(value.as_deref())
+}
+
+/// Mark a degraded merged response: name the missing members, forbid caching
+/// (a partial document must never be cached as the complete one) and add a
+/// `Warning: 199`.
+pub fn mark_partial_metadata_response(response: &mut Response, missing: &str) {
+    use axum::http::header::{CACHE_CONTROL, ETAG, WARNING};
+    use axum::http::HeaderValue;
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(missing) {
+        headers.insert(PARTIAL_MEMBERS_HEADER, v);
+    }
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.remove(ETAG);
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "199 - \"partial merge: members {missing} are missing\""
+    )) {
+        headers.insert(WARNING, v);
+    }
+}
+
+/// Why one Remote member of a virtual contributed nothing to a merged
+/// metadata document (#4192).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualMemberFailure {
+    /// The member repository's key.
+    pub member: String,
+    /// Stable, low-cardinality class for the failure metric: `fetch`,
+    /// `parse` or `timeout`.
+    pub kind: &'static str,
+    /// What went wrong, phrased for an operator reading a 502 body.
+    pub reason: String,
+}
+
+/// The members a merged metadata document left out, when the virtual opted
+/// into partial merges (#4192). Empty for a complete merge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use = "a partial merge must be marked on the response it is served as"]
+pub struct PartialMerge(Option<String>);
+
+impl PartialMerge {
+    /// The comma-separated member keys left out, if any.
+    pub fn missing(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Mark `response` as partial and uncacheable when members are missing.
+    pub fn mark(&self, response: &mut Response) {
+        if let Some(missing) = &self.0 {
+            mark_partial_metadata_response(response, missing);
+        }
+    }
+
+    /// [`Self::mark`] on a handler result's success arm.
+    pub fn apply(&self, result: Result<Response, Response>) -> Result<Response, Response> {
+        result.map(|mut response| {
+            self.mark(&mut response);
+            response
+        })
+    }
+}
+
+/// What [`collect_virtual_metadata`] gathered: each contributing member's
+/// extracted document in member order, and the members a degraded merge left
+/// out, which the caller marks on the response it builds.
+#[derive(Debug)]
+pub struct VirtualMetadata<T> {
+    pub documents: Vec<(String, T)>,
+    pub partial: PartialMerge,
+}
+
+/// Count every member failure and turn the outcome into what the virtual's
+/// policy calls for (#4192): nothing missing, a partial merge naming the
+/// members (opted in), or the strict 502 naming each member and its cause.
+async fn apply_virtual_member_failures(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    format: &str,
+    path: &str,
+    failed: &[VirtualMemberFailure],
+) -> Result<PartialMerge, Response> {
+    if failed.is_empty() {
+        return Ok(PartialMerge::default());
+    }
+    let virtual_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+        .bind(virtual_repo_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| virtual_repo_id.to_string());
+    let allow_partial = virtual_metadata_partial_allowed(db, virtual_repo_id).await;
+    for f in failed {
+        metrics::counter!(
+            "ak_virtual_member_metadata_failures_total",
+            "format" => format.to_string(),
+            "virtual_repo" => virtual_key.clone(),
+            "member" => f.member.clone(),
+            "reason" => f.kind,
+        )
+        .increment(1);
+        tracing::warn!(
+            virtual_repo = %virtual_key,
+            member = %f.member,
+            path = %path,
+            kind = f.kind,
+            reason = %f.reason,
+            allow_partial,
+            "virtual member could not contribute to the merged metadata document"
+        );
+    }
+    if allow_partial {
+        return Ok(PartialMerge(Some(
+            failed
+                .iter()
+                .map(|f| f.member.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )));
+    }
+    let detail = failed
+        .iter()
+        .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("Virtual repository '{virtual_key}' cannot serve {path}: {detail}"),
+    )
+        .into_response())
+}
+
 /// Collect metadata from ALL remote members of a virtual repository.
 /// Each member's response is extracted via the `extract` closure and
-/// gathered into a `Vec<(repo_key, T)>`. The caller is responsible for
-/// merging the collected results.
+/// gathered, in member order, for the caller to merge.
 ///
 /// Suitable for metadata endpoints where responses from every upstream
-/// must be combined (conda repodata, cran PACKAGES, helm index, rubygems specs).
+/// must be combined (cran PACKAGES, helm index, hex names/versions, bazel
+/// module metadata).
+///
+/// A member that fails to fetch or whose document does not extract fails the
+/// merge loudly (#4192): by default the request is a 502 naming each failed
+/// member and the cause, because a merged index that silently lacks a member
+/// makes the client conclude its packages do not exist (or resolve a name
+/// present in two members to the lower-priority one). A virtual that opted in
+/// through [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`] gets the merge of the
+/// members that succeeded and a [`PartialMerge`] the caller marks on its
+/// response. Either way each failure counts in
+/// `ak_virtual_member_metadata_failures_total`. A member that answers 404
+/// publishes no such document: it contributes nothing and is not a failure.
+/// Members the caller may not read are not members here at all (#3323).
 ///
 /// Deliberately DROPS the upstream `Content-Encoding` (#3260): every `extract`
 /// closure PARSES the member body and the caller serves a merged document it
@@ -3726,7 +3904,7 @@ pub async fn collect_virtual_metadata<T, F, Fut>(
     virtual_repo_id: Uuid,
     path: &str,
     extract: F,
-) -> Result<Vec<(String, T)>, Response>
+) -> Result<VirtualMetadata<T>, Response>
 where
     F: Fn(Bytes, String) -> Fut,
     Fut: std::future::Future<Output = Result<T, Response>>,
@@ -3744,40 +3922,58 @@ where
         .iter()
         .filter(|m| m.repo_type == RepositoryType::Remote)
         .collect();
-    let mut results: Vec<(String, T)> = Vec::new();
+    let format = remote_members
+        .first()
+        .map(|m| m.format.as_str())
+        .unwrap_or("unknown");
+    let mut documents: Vec<(String, T)> = Vec::new();
+    let mut failed: Vec<VirtualMemberFailure> = Vec::new();
     for chunk in remote_members.chunks(MAX_VIRTUAL_FANOUT) {
         let batch = futures::future::join_all(chunk.iter().copied().map(|member| async move {
-            let (Some(proxy), Some(upstream_url)) = (proxy_service, member.upstream_url.as_deref())
-            else {
-                return None;
+            let fail = |kind: &'static str, reason: String| {
+                Some(Err(VirtualMemberFailure {
+                    member: member.key.clone(),
+                    kind,
+                    reason,
+                }))
+            };
+            let Some(proxy) = proxy_service else {
+                return fail("fetch", "the proxy service is not available".to_string());
+            };
+            let Some(upstream_url) = member.upstream_url.as_deref() else {
+                return fail("fetch", "remote member has no upstream URL".to_string());
             };
             match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
                 Ok((bytes, _ct)) => match extract(bytes, member.key.clone()).await {
-                    Ok(data) => Some((member.key.clone(), data)),
-                    Err(_) => {
-                        tracing::warn!(
-                            member = %member.key,
-                            path = %path,
-                            "virtual metadata extract failed for member response"
-                        );
-                        None
-                    }
+                    Ok(data) => Some(Ok((member.key.clone(), data))),
+                    Err(response) => fail(
+                        "parse",
+                        format!(
+                            "{path}: the upstream document could not be read ({})",
+                            response.status()
+                        ),
+                    ),
                 },
-                Err(_) => {
-                    tracing::warn!(
-                        member = %member.key,
-                        path = %path,
-                        "virtual metadata proxy fetch failed for member"
-                    );
-                    None
-                }
+                // The member publishes no such document: nothing to merge,
+                // and nothing missing from the merge either.
+                Err(response) if response.status() == StatusCode::NOT_FOUND => None,
+                Err(response) => fail(
+                    "fetch",
+                    format!("{path}: upstream fetch failed with {}", response.status()),
+                ),
             }
         }))
         .await;
-        results.extend(batch.into_iter().flatten());
+        for outcome in batch.into_iter().flatten() {
+            match outcome {
+                Ok(document) => documents.push(document),
+                Err(failure) => failed.push(failure),
+            }
+        }
     }
 
-    Ok(results)
+    let partial = apply_virtual_member_failures(db, virtual_repo_id, format, path, &failed).await?;
+    Ok(VirtualMetadata { documents, partial })
 }
 
 /// Adapt a virtual-repo member [`Repository`] (as returned by
