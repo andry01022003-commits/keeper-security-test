@@ -313,6 +313,12 @@ mod virtual_token_scope_tests;
 #[cfg(test)]
 mod repo_read_existence_tests;
 
+/// #4570: router-level tests that a Git LFS batch download action can be
+/// followed on a private repository.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod gitlfs_download_auth_tests;
+
 pub mod admin;
 pub mod admin_security;
 pub mod age_gate;

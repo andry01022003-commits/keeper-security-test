@@ -308,7 +308,7 @@ async fn batch(
     // deny-by-default action choke-point (#2603 G1) shared with the artifact
     // write handlers; the subsequent object `PUT` is independently write-gated
     // by the same middleware.
-    let auth_header = if request.operation == "upload" {
+    if request.operation == "upload" {
         let ext = require_auth_basic(auth, "git-lfs")?;
         require_repo_action(&ext, repo.id, "write", &state.permission_service)
             .await
@@ -324,14 +324,19 @@ async fn batch(
                     "You do not have permission to upload to this repository",
                 )
             })?;
-        // Pass auth header through to action hrefs
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string())
-    } else {
-        None
-    };
+    }
+
+    // The caller's own `Authorization` header, handed back in every action
+    // (#4570). git-lfs follows an action marked `authenticated: true` with the
+    // action's headers ONLY; it does not add its own credentials. The object
+    // GET and PUT on a private repository need them, so a download action
+    // with an empty header made `git lfs pull` retry a 401 forever, while the
+    // upload actions, which always carried the header, worked. An action is
+    // marked authenticated only when it carries the credential.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
 
     let base_url = build_base_url(request_base_url.as_str(), &repo_key);
     let mut response_objects = Vec::with_capacity(request.objects.len());
@@ -384,7 +389,7 @@ async fn batch(
                     BatchResponseObject {
                         oid: obj.oid.clone(),
                         size: obj.size,
-                        authenticated: Some(true),
+                        authenticated: auth_header.as_ref().map(|_| true),
                         actions: Some(BatchActions {
                             download: Some(BatchAction {
                                 href: format!("{}/objects/{}", base_url, obj.oid),
@@ -452,7 +457,14 @@ async fn batch(
         objects: response_objects,
     };
 
-    Ok(lfs_json_response(StatusCode::OK, &response))
+    // The actions can carry the caller's credential: never let a shared
+    // cache keep the response.
+    let mut response = lfs_json_response(StatusCode::OK, &response);
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 fn build_base_url(request_base_url: &str, repo_key: &str) -> String {
