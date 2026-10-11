@@ -446,6 +446,11 @@ pub(crate) fn member_passes_token_scope(
     }
 }
 
+/// The 404 message for a repository that does not exist, and for one the
+/// caller may not read (#4498). The two must be indistinguishable, so this is
+/// exactly what `RepositoryService::get_by_key` answers for a missing key.
+pub(crate) const REPOSITORY_NOT_FOUND: &str = "Repository not found";
+
 /// Ensure a repository is READABLE by the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
@@ -455,7 +460,8 @@ pub(crate) fn member_passes_token_scope(
 /// repository-scoped API tokens.
 ///
 /// Denials on private repos return `NotFound` (not `Forbidden`) to avoid
-/// leaking the existence of repositories the caller may not see.
+/// leaking the existence of repositories the caller may not see, with the
+/// same message a missing key gets ([`REPOSITORY_NOT_FOUND`], #4498).
 ///
 /// # Why the action is `read` and is fixed here (#3331)
 ///
@@ -501,7 +507,11 @@ pub(crate) async fn require_visible(
     if repo.visibility.allows_anonymous_read() {
         return Ok(());
     }
-    let not_found = || AppError::NotFound(format!("Repository '{}' not found", repo.key));
+    // #4498: the SAME body `RepositoryService::get_by_key` answers for a key
+    // that names no repository. Naming the key here made the two 404s
+    // distinguishable, so a caller who may not read a repository could still
+    // learn that it exists.
+    let not_found = || AppError::NotFound(REPOSITORY_NOT_FOUND.to_string());
     match auth {
         Some(a) => {
             // Repository-scoped API tokens must still allow this repo.
@@ -21240,7 +21250,8 @@ mod tests {
         let result = require_visible(&repo, &None, &svc).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
+            // #4498: the same body a missing key gets, not the key.
+            AppError::NotFound(msg) => assert_eq!(msg, REPOSITORY_NOT_FOUND),
             other => panic!("Expected NotFound error, got: {:?}", other),
         }
     }
@@ -21256,7 +21267,8 @@ mod tests {
         let result = require_visible(&repo, &auth, &svc).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
+            // #4498: the same body a missing key gets, not the key.
+            AppError::NotFound(msg) => assert_eq!(msg, REPOSITORY_NOT_FOUND),
             other => panic!("Expected NotFound error, got: {:?}", other),
         }
     }
