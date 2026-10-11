@@ -1,9 +1,0 @@
----
-section: Fixed
-issues: [#4329]
----
-- **An interrupted Conan upload no longer leaves a corrupted package on the server, and re-running the upload completes it** (#4329). The Conan client uploads a revision's files one at a time, archives first and `conanmanifest.txt` last, and carries on after a file fails. When `conan_package.tgz` failed (here because the router-wide request timeout, 120 s by default, cut a 3.5 GB upload off mid-body and the reverse proxy reported a 502), `conaninfo.txt` and `conanmanifest.txt` still landed and the package revision was listed without its archive: consumers got `corrupted in the server, it doesn't contain a conan_package.t file`, and re-running the upload skipped it as already in the server. Three changes:
-
-  - A revision is now published by its manifest. Files uploaded before the manifest are stored but not listed by `/latest`, `/revisions`, `/search`, `/files` or recipe search; `conanmanifest.txt` is accepted only once the files the client's own integrity checks need are stored (`conaninfo.txt` and `conan_package.t*` for a binary; `conanfile.py`, plus `conan_export.t*` / `conan_sources.t*` when the manifest names exported or export-source files, for a recipe), and is otherwise refused with `409` and nothing stored. The manifest and the publication of the revision are one transaction, and each file's artifact row and metadata are now written together.
-  - Conan file transfers (`.../files/<name>`) are byte-transfer routes, exempt from `GLOBAL_REQUEST_TIMEOUT_SECS` like OCI blobs and LFS objects; a stalled body is still bounded by the upload progress deadline.
-  - Conan uploads receive their body through the same complete-body extractor as the archive-parsing formats (#4609): a body shorter than its `Content-Length` is `408` and nothing is stored, and the buffer is charged to `UPLOAD_MEMORY_BUDGET_BYTES`.

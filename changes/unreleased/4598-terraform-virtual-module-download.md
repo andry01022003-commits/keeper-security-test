@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4598]
----
-- **`terraform init` / `tofu init` install modules through a virtual Terraform repository** (#4598). A virtual answered a module `/download` by streaming the resolving member's archive as a `200`, which no client can use, and listed no versions for a module, so the client stopped at "Module not found". A virtual now answers `/download` the way its member does: a `204` whose `X-Terraform-Get` points at the virtual's own `/archive` with the archive hint (`?archive=zip` / `?archive=tar.gz`), or a remote member's `git::` / `s3::` source handed through unchanged; the virtual's `/archive` streams the same member's archive (a hosted member's stored bytes, with quarantine and scan policy enforced, or a remote member's upstream archive through its proxy cache). `/versions` on a virtual lists the union of its members' versions, and on a remote repository the upstream's versions, which it did not list before either. `scripts/native-tests/test-terraform-modules.sh` now installs a hosted and a proxied module through a virtual.

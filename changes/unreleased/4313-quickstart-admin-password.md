@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4313]
----
-- **The quickstart no longer leaves a first-time user without a working admin password** (#4313). `ADMIN_PASSWORD` only sets the password when the admin account is created, and the backend creates it on the first boot even when a later startup check stops it, so editing the variable afterwards changed nothing and every login failed with no explanation. The backend now logs a warning when `ADMIN_PASSWORD` is set but does not match the existing account, saying it is ignored and how to recover. The installer (`scripts/install.sh`) now defaults to the compose file's ports 30080/30443 (port 80 cannot be published by rootless Podman, and the docs used 30080), falls back to Podman when the docker CLI cannot reach a daemon, sets `DEPENDENCY_TRACK_ENABLED=true` only together with `COMPOSE_PROFILES=dtrack` (opt-in with `AK_DTRACK=1`), documents that its options go on the `bash` side of `curl ... | bash`, and says where the password is and that it applies on the first start only; `docker-compose.yml` and `.env.example` say the same. `scripts/ci/check-installer-quickstart.sh` pins the installer's output. Closes #4313.
