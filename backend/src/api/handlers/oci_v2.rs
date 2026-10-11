@@ -8562,10 +8562,11 @@ pub(crate) fn resolve_manifest_content_type(stored: Option<&str>, body: &[u8]) -
 /// was never uploaded to this repo.
 async fn manifest_known_to_repo(
     state: &SharedState,
-    repository_id: Uuid,
+    repo: &OciRepoInfo,
     digest: &str,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
+    let repository_id = repo.id;
+    let known = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT (
           EXISTS (
@@ -8586,11 +8587,84 @@ async fn manifest_known_to_repo(
     .bind(repository_id)
     .bind(digest)
     .fetch_one(&state.db)
-    .await
+    .await?;
+    if !known {
+        return Ok(false);
+    }
+    Ok(!digest_deleted_under_image(state, repo, digest).await?)
 }
+
+/// Live and trashed manifest-shaped `artifacts` rows of a repository whose
+/// bytes are one digest (`$1` repository id, `$2` sha256 hex), with the
+/// repository key so each path can be attributed to an image name. The path
+/// shape is the one the by-digest delete tombstones
+/// ([`SELECT_DIGEST_MANIFEST_ROWS_SQL`]).
+const SELECT_DIGEST_MANIFEST_ROW_STATES_SQL: &str = concat!(
+    r#"
+    SELECT a.path::text AS path, a.is_deleted, r.key AS repo_key
+    FROM artifacts a
+    JOIN repositories r ON r.id = a.repository_id
+    WHERE a.repository_id = $1
+      AND a.checksum_sha256 = $2
+      AND "#,
+    crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+);
+
+/// Whether `digest` was deleted under `repo.image` (#4525): the image has
+/// manifest rows for those bytes, every one of them in the trash. A by-digest
+/// delete (#4466) and the last tag-name delete of the image leave exactly
+/// that, while another image name in the repository may still hold the same
+/// manifest, so the repository-wide evidence in [`manifest_known_to_repo`]
+/// alone would keep serving it under the deleted name. An image with no rows
+/// for the digest at all (a tag overwritten since, #1681) is not "deleted".
+/// The trashed rows outlive the delete for as long as anything else in the
+/// repository holds the manifest: the storage GC reaps a trashed row only once
+/// no live row or tag protects its `oci-manifests/<digest>` key.
+fn image_rows_all_deleted(rows: &[(String, bool, String)], image: &str) -> bool {
+    let mut any = false;
+    for (path, is_deleted, repo_key) in rows {
+        if crate::services::oci_migration_reindex::manifest_row_image(path, repo_key).as_deref()
+            == Some(image)
+        {
+            if !*is_deleted {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
+}
+
+async fn digest_deleted_under_image(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<bool, sqlx::Error> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Ok(false);
+    };
+    let rows: Vec<(String, bool, String)> = sqlx::query_as(SELECT_DIGEST_MANIFEST_ROW_STATES_SQL)
+        .bind(repo.id)
+        .bind(hex)
+        .fetch_all(&state.db)
+        .await?;
+    Ok(image_rows_all_deleted(&rows, &repo.image))
+}
+
+/// `oci_tags` lookup of a digest reference under ONE image name (#4525),
+/// runtime-checked so the offline query cache needs no entry.
+const SELECT_IMAGE_DIGEST_TAG_ROW_SQL: &str = "SELECT manifest_digest, manifest_content_type \
+     FROM oci_tags WHERE repository_id = $1 AND name = $2 AND manifest_digest = $3 LIMIT 1";
 
 /// Look up the `oci_tags` row for a manifest reference (digest or tag name)
 /// within a repository, returning `(manifest_digest, manifest_content_type)`.
+///
+/// On a repository that stores its own manifests (Local/Staging) a digest
+/// reference resolves only through a tag of the requested image name (#4525):
+/// in the distribution spec `<name>` is `<repo>/<image>`, and a by-digest
+/// delete is scoped to the image (#4466), so another image's tag of the same
+/// digest must not answer for it. Remote and Virtual repositories keep the
+/// repository-wide lookup, their rows being a cache of the upstream.
 async fn lookup_manifest_tag_row(
     state: &SharedState,
     repo: &OciRepoInfo,
@@ -8598,7 +8672,14 @@ async fn lookup_manifest_tag_row(
 ) -> Result<Option<(String, String)>, sqlx::Error> {
     // Each `sqlx::query!` produces its own anonymous record type, so map to a
     // tuple inside each branch before merging.
-    if is_digest_reference(reference) {
+    if is_digest_reference(reference) && stores_own_manifests(&repo.repo_type) {
+        sqlx::query_as::<_, (String, String)>(SELECT_IMAGE_DIGEST_TAG_ROW_SQL)
+            .bind(repo.id)
+            .bind(&repo.image)
+            .bind(reference)
+            .fetch_optional(&state.db)
+            .await
+    } else if is_digest_reference(reference) {
         let row = sqlx::query!(
             "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
             repo.id, reference
@@ -8793,7 +8874,7 @@ async fn resolve_manifest_delete_target(
     match tag_digest {
         Some(digest) => Ok(Some(digest)),
         None if is_digest_reference(reference) && stores_own_manifests(&repo.repo_type) => {
-            Ok(manifest_known_to_repo(state, repo.id, reference)
+            Ok(manifest_known_to_repo(state, repo, reference)
                 .await?
                 .then(|| reference.to_string()))
         }
@@ -8960,7 +9041,7 @@ async fn handle_head_manifest(
         && is_digest_reference(reference)
         && stores_own_manifests(&repo.repo_type)
     {
-        match manifest_known_to_repo(state, repo.id, reference).await {
+        match manifest_known_to_repo(state, &repo, reference).await {
             Ok(known) => known,
             Err(e) => {
                 return oci_error(
@@ -10489,7 +10570,7 @@ async fn handle_get_manifest(
         && is_digest_reference(reference)
         && stores_own_manifests(&repo.repo_type)
     {
-        match manifest_known_to_repo(state, repo.id, reference).await {
+        match manifest_known_to_repo(state, &repo, reference).await {
             Ok(known) => known,
             Err(e) => {
                 return oci_error(
@@ -12638,24 +12719,13 @@ async fn handle_delete_manifest(
     // client treats 404 as "already deleted" and stops retrying, so masking a
     // transient DB outage as MANIFEST_UNKNOWN would silently abandon the
     // delete and hide the outage in the logs as not-founds.
-    let tag_digest: Result<Option<String>, sqlx::Error> = if is_digest_reference(reference) {
-        sqlx::query_scalar!(
-            "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
-            repo.id,
-            reference
-        )
-        .fetch_optional(&state.db)
-        .await
-    } else {
-        sqlx::query_scalar!(
-            "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
-            repo.id,
-            repo.image,
-            reference
-        )
-        .fetch_optional(&state.db)
-        .await
-    };
+    //
+    // #4525: the same resolution GET/HEAD use, so a digest that no longer
+    // resolves under this image name is not deletable under it either.
+    let tag_digest: Result<Option<String>, sqlx::Error> =
+        lookup_manifest_tag_row(state, &repo, reference)
+            .await
+            .map(|row| row.map(|(digest, _)| digest));
 
     let digest = match tag_digest {
         Ok(maybe_digest) => {
@@ -20047,6 +20117,118 @@ mod manifest_digest_db_tests {
             st,
             StatusCode::NOT_FOUND,
             "GET A by digest after delete -> 404"
+        );
+
+        cleanup(&fx).await;
+    }
+
+    /// #4525: `GET`/`HEAD /v2/<name>/manifests/<digest>` resolve the digest
+    /// under `<name>`, not repository-wide. The same manifest is pushed by
+    /// tag only as `xa:v1` and `xb:v1`; after `DELETE xa@<digest>` (scoped to
+    /// `xa`, #4466) the digest must 404 under `xa` while it still resolves
+    /// under `xb`, and a repeated delete under `xa` must 404 too.
+    /// Positive control: an overwritten tag's old manifest stays pullable by
+    /// digest under its own name (#1681).
+    #[tokio::test]
+    async fn digest_get_is_scoped_to_image_name_after_scoped_delete_4525() {
+        if std::env::var("DATABASE_URL").is_err() {
+            if require_db_under_coverage() {
+                panic!("DATABASE_URL must be set for OCI manifest digest tests");
+            }
+            return;
+        }
+        let fx = tdh::Fixture::setup("local", "docker")
+            .await
+            .expect("fixture setup");
+        tdh::grant_repo_actions(
+            &fx.pool,
+            fx.repo_id,
+            fx.user_id,
+            &["read", "write", "delete"],
+        )
+        .await;
+        let auth = bearer(&fx).await;
+        let ct = "application/vnd.oci.image.manifest.v1+json";
+        let uri = |image: &str, reference: &str| {
+            format!("/{}/{}/manifests/{}", fx.repo_key, image, reference)
+        };
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4525452545254525452545254525452545254525452545254525452545254525","size":1},"layers":[],"annotations":{"issue":"4525"}}"#,
+        );
+        let app = || router(None).with_state(fx.state.clone());
+
+        let mut digest = String::new();
+        for image in ["xa", "xb"] {
+            let (st, h, _) = send(
+                app(),
+                req(Method::PUT, uri(image, "v1"), &auth, Some(ct), body.clone()),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CREATED, "PUT {image}:v1");
+            digest = h["Docker-Content-Digest"].to_str().unwrap().to_string();
+        }
+
+        let (st, _, _) = send(
+            app(),
+            req(
+                Method::DELETE,
+                uri("xa", &digest),
+                &auth,
+                None,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "DELETE xa@digest");
+
+        let get = |image: &'static str, method: Method, reference: String| {
+            let request = req(method, uri(image, &reference), &auth, None, Bytes::new());
+            send(app(), request)
+        };
+        assert_eq!(
+            get("xa", Method::GET, "v1".into()).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(get("xb", Method::GET, "v1".into()).await.0, StatusCode::OK);
+        let (st, _, b) = get("xb", Method::GET, digest.clone()).await;
+        assert_eq!(st, StatusCode::OK, "xb@digest still resolves");
+        assert_eq!(b, body);
+        assert_eq!(
+            get("xa", Method::GET, digest.clone()).await.0,
+            StatusCode::NOT_FOUND,
+            "xa@digest must not be served after xa's delete by digest"
+        );
+        assert_eq!(
+            get("xa", Method::HEAD, digest.clone()).await.0,
+            StatusCode::NOT_FOUND,
+            "HEAD xa@digest agrees with GET"
+        );
+        assert_eq!(
+            get("xa", Method::DELETE, digest.clone()).await.0,
+            StatusCode::NOT_FOUND,
+            "a second delete under xa finds nothing to delete"
+        );
+        assert_eq!(
+            get("xb", Method::GET, "v1".into()).await.0,
+            StatusCode::OK,
+            "xb:v1 is untouched by xa's deletes"
+        );
+
+        // Positive control (#1681): overwrite xb:v1, the old digest stays
+        // pullable by digest under xb.
+        let body_b = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:4525452545254525452545254525452545254525452545254525452545254526","size":1},"layers":[],"annotations":{"issue":"4525-b"}}"#,
+        );
+        let (st, _, _) = send(
+            app(),
+            req(Method::PUT, uri("xb", "v1"), &auth, Some(ct), body_b),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "overwrite xb:v1");
+        assert_eq!(
+            get("xb", Method::GET, digest.clone()).await.0,
+            StatusCode::OK,
+            "an overwritten tag's manifest stays pullable by digest under its name"
         );
 
         cleanup(&fx).await;
