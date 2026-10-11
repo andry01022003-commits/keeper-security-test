@@ -642,6 +642,46 @@ pub async fn record_proxy_download(
     Ok(res.rows_affected())
 }
 
+/// Record one proxy-served download of an object that was NOT written to the
+/// proxy cache (#4551): one larger than the repository quota is streamed to
+/// the client with no cache write, so no tee will ever refine a catalog
+/// placeholder for it, and [`record_proxy_download`]'s placeholder would stay
+/// behind as a cached 0-byte entry. The statistics row carries the history
+/// key `(repository_id, path)` (#4539) and links to the catalog row only when
+/// one already exists (whose `last_accessed_at` is bumped, as on a hit);
+/// otherwise `proxy_cache_id` stays NULL. Runtime-checked so the offline
+/// `.sqlx` cache is untouched.
+pub async fn record_uncached_proxy_download(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    user_id: Option<Uuid>,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        WITH touched AS (
+            UPDATE proxy_cache_artifacts SET last_accessed_at = now()
+             WHERE repository_id = $1 AND path = $2
+            RETURNING id
+        )
+        INSERT INTO proxy_download_statistics
+            (proxy_cache_id, repository_id, path, user_id, ip_address, user_agent)
+        SELECT (SELECT id FROM touched), $1, $2, $3, $4, $5
+        "#,
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(user_id)
+    .bind(ip_address)
+    .bind(user_agent)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(res.rows_affected())
+}
+
 /// Recorded proxy-download counts for the given cached `paths`, keyed by path
 /// (#3265). Paths with no recorded serve are absent from the map; the caller
 /// substitutes zero. Keyed on `(repository_id, path)` (#4539), so the count

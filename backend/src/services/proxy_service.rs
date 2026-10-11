@@ -4184,7 +4184,22 @@ pub struct ProxyService {
     /// Per-process memo of the repository facts the TTL policy needs on the
     /// read path (#3832). See [`TtlPolicyCache`].
     ttl_policy_cache: TtlPolicyCache,
+    /// `(repository_id, cache_path)` of objects this process just served
+    /// WITHOUT any proxy-cache write because they exceed the repository's
+    /// quota (#4551). The serve's download recorder
+    /// ([`crate::api::handlers::proxy_helpers::record_proxy_download_via`])
+    /// runs in this same process for the same request and reads it, so it
+    /// records the download without inserting the `proxy_cache_artifacts`
+    /// placeholder a cache miss gets: no tee will ever refine that row, and
+    /// it would be listed as a cached 0-byte object. Bounded and short-lived;
+    /// a later serve of the path that does tee clears its entry.
+    uncached_serves: Cache<(Uuid, String), ()>,
 }
+
+/// How long a [`ProxyService::uncached_serves`] entry is kept. The recorder
+/// reads it right after the serve (or from its deferred task moments later),
+/// so this only has to outlive that window.
+const UNCACHED_SERVE_TTL: Duration = Duration::from_secs(300);
 
 /// How long [`TtlPolicyCache`] trusts a looked-up value. Bounds how long a TTL
 /// change made on another replica takes to reach this one; the replica that
@@ -4219,6 +4234,22 @@ impl TtlPolicyCache {
 }
 
 impl ProxyService {
+    /// Remember that `path` of `repo_id` was just served without any cache
+    /// write because it exceeds the repository quota (#4551).
+    async fn note_served_without_cache(&self, repo_id: Uuid, path: &str) {
+        self.uncached_serves
+            .insert((repo_id, path.to_string()), ())
+            .await;
+    }
+
+    /// Whether this process just served `path` of `repo_id` without writing
+    /// it to the proxy cache (#4551), so recording that serve must not insert
+    /// a catalog placeholder.
+    pub(crate) fn served_without_cache(&self, repo_id: Uuid, path: &str) -> bool {
+        self.uncached_serves
+            .contains_key(&(repo_id, path.to_string()))
+    }
+
     /// Drop this process's cached egress client for `repo_id` so an
     /// egress-proxy change made through the API takes effect on the next
     /// upstream fetch instead of after the cache TTL (#2469, #2811).
@@ -4273,6 +4304,10 @@ impl ProxyService {
             backfill_limiter,
             cache_scope,
             ttl_policy_cache: TtlPolicyCache::new(),
+            uncached_serves: Cache::builder()
+                .max_capacity(TtlPolicyCache::CAPACITY)
+                .time_to_live(UNCACHED_SERVE_TTL)
+                .build(),
         }
     }
 
@@ -4989,6 +5024,7 @@ impl ProxyService {
                             crate::services::metrics_service::record_proxy_cache_quota_exceeded(
                                 &repo.key,
                             );
+                            self.note_served_without_cache(repo.id, cache_path).await;
                         }
 
                         // B6 (coalescing 502 leak, remaining path): the upstream fetch
@@ -5724,6 +5760,9 @@ impl ProxyService {
                      streaming it to the client without any proxy-cache write"
                 );
                 crate::services::metrics_service::record_proxy_cache_quota_exceeded(&repo.key);
+                // #4551: the recorder of this serve must not leave a catalog
+                // placeholder for an object that is never cached.
+                self.note_served_without_cache(repo.id, cache_path).await;
                 if hold_active {
                     return Err(AppError::Conflict(
                         "Artifact is quarantined and pending security review".to_string(),
@@ -5736,6 +5775,12 @@ impl ProxyService {
                 });
             }
         }
+
+        // This serve tees into the cache, so its recorder takes the normal
+        // placeholder path again (#4551).
+        self.uncached_serves
+            .invalidate(&(repo.id, cache_path.to_string()))
+            .await;
 
         // #4013: the cross-replica coordinator releases its lock on the tee
         // writer's completion, so capture that signal before the key moves.
@@ -16790,6 +16835,95 @@ mod tests {
              refused from the cache (Phase-1 interim single-object guard, \
              bug artifact-keeper-x70), not silently cached over quota"
         );
+    }
+
+    /// #4551: an object larger than a Remote repository's quota is streamed to
+    /// the client without any cache write, so recording that serve must not
+    /// leave a `proxy_cache_artifacts` placeholder (`size_bytes = 0`) that
+    /// listings present as a cached 0-byte object. The download is still
+    /// recorded, keyed on `(repository_id, path)` (#4539), with no catalog row.
+    #[tokio::test]
+    async fn test_over_quota_stream_through_leaves_no_catalog_placeholder_4551() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar_path = "junit/junit/4.13.2/junit-4.13.2.jar";
+        let jar = vec![b'j'; 4096];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{jar_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+        let tmp = std::env::temp_dir().join(format!("ak-4551-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let mut repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
+        repo.id = repo_id;
+
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        for _ in 0..2 {
+            let handle = proxy
+                .fetch_artifact_streaming(&repo, jar_path)
+                .await
+                .expect("an over-quota object is still streamed to the client");
+            assert_eq!(drain_stream(handle.body).await.len(), jar.len());
+            crate::api::handlers::proxy_helpers::record_proxy_download_via(
+                &pool, &proxy, repo_id, &repo_key, jar_path, &ctx,
+            )
+            .await;
+        }
+
+        let catalog_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(jar_path)
+        .fetch_one(&pool)
+        .await
+        .expect("count catalog rows");
+        let downloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_download_statistics WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(jar_path)
+        .fetch_one(&pool)
+        .await
+        .expect("count downloads");
+
+        let _ = sqlx::query("DELETE FROM proxy_download_statistics WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+
+        assert_eq!(
+            catalog_rows, 0,
+            "an object streamed through without a cache write must not get a catalog row"
+        );
+        assert_eq!(downloads, 2, "both serves are still recorded");
     }
 
     #[test]
