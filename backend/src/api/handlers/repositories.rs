@@ -6321,11 +6321,14 @@ async fn list_remote_cached_artifacts(
     // longer pre-excluded from the count — an acceptable approximation in
     // exchange for O(page) reads.
     let proxy = state.proxy_service.as_deref();
-    let paths = match proxy {
+    let mut paths = match proxy {
         Some(proxy) => proxy.list_cached_paths(&repo.key).await,
         // No proxy service configured (e.g. proxying disabled): nothing cached.
         None => Vec::new(),
     };
+    // Cached npm packuments are metadata, not packages (#4305); index pages
+    // are dropped inside `filter_and_paginate_paths` for every format.
+    paths.retain(|p| !crate::services::proxy_catalog::is_cached_metadata_path(&repo.format, p));
 
     let (page_paths, total) = filter_and_paginate_paths(paths, path_prefix, q, page, per_page);
     let total_pages = cached_total_pages(total, per_page);
@@ -6411,6 +6414,7 @@ async fn list_remote_cached_from_catalog(
     let mut rows = proxy_catalog::browse_page(
         &state.db,
         repo.id,
+        &repo.format,
         prefix_like.as_deref(),
         q_like.as_deref(),
         after_path,
@@ -6431,6 +6435,7 @@ async fn list_remote_cached_from_catalog(
             proxy_catalog::browse_count(
                 &state.db,
                 repo.id,
+                &repo.format,
                 prefix_like.as_deref(),
                 q_like.as_deref(),
             )
@@ -33578,5 +33583,80 @@ mod conda_allowlist_endpoint_tests {
 
         assert_eq!(audits, 2, "the PUT and the DELETE are audited");
         assert_eq!(remote_status, StatusCode::BAD_REQUEST);
+    }
+}
+
+/// #4305: an npm Remote caches each packument in the proxy-cache catalog
+/// under the bare package name (`@scope/name`, `name`) next to the tarballs
+/// (`@scope/name/-/name-1.0.0.tgz`). A packument is metadata, like a PyPI
+/// index page: the cached-artifact listing must not offer it as a package
+/// that can be downloaded, invalidated and deleted.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod npm_cached_packument_listing_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use uuid::Uuid;
+
+    async fn seed_catalog_row(pool: &sqlx::PgPool, repo_id: Uuid, path: &str, ct: &str) {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (id, repository_id, path, storage_key, \
+             metadata_key, size_bytes, checksum_sha256, content_type) \
+             VALUES ($1, $2, $3, $4, $5, 1900, repeat('c', 64), $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("proxy-cache/{repo_id}/{path}/__content__"))
+        .bind(format!("proxy-cache/{repo_id}/{path}/__cache_meta__.json"))
+        .bind(ct)
+        .execute(pool)
+        .await
+        .expect("insert proxy cache row");
+    }
+
+    #[tokio::test]
+    async fn npm_remote_listing_omits_cached_packuments_4305() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        const TARBALL: &str = "@example-org/example-package/-/example-package-1.0.0.tgz";
+        for (path, ct) in [
+            (
+                "@example-org/example-package",
+                "application/json; charset=utf-8",
+            ),
+            ("left-pad", "application/json"),
+            (TARBALL, "application/gzip"),
+        ] {
+            seed_catalog_row(&fx.pool, fx.repo_id, path, ct).await;
+        }
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::admin_auth(fx.user_id, "admin-4305"),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/artifacts?count=exact", fx.repo_key)),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+        let paths: Vec<&str> = json["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| i["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(paths, vec![TARBALL], "{json}");
+        assert_eq!(json["pagination"]["total"], 1, "{json}");
     }
 }

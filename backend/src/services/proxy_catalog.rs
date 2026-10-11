@@ -21,6 +21,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::models::repository::RepositoryFormat;
 
 /// One catalog row's browsable fields (visibility seam for #2270 / PF-002).
 #[derive(Debug, Clone)]
@@ -326,6 +327,35 @@ pub fn not_cached_index_sql(path_column: &str) -> String {
     format!("NOT {}", cached_index_sql(path_column))
 }
 
+/// Whether a repository of `format` caches package metadata under the bare
+/// package name (#4305). The npm handler (npm, yarn, pnpm, bower) caches each
+/// packument at `name` or `@scope/name` and every tarball at
+/// `<name>/-/<file>`, the registry's tarball layout, so for these formats a
+/// cached path with no `/-/` segment is a packument, not a package.
+fn caches_packuments(format: &RepositoryFormat) -> bool {
+    format.handler_key() == "npm"
+}
+
+/// [`is_cached_index_path`] for a repository of `format`: also true for a
+/// cached npm packument (#4305). A packument listed as an artifact could be
+/// downloaded and invalidated like a package, while deleting it answered
+/// "Artifact not found".
+pub fn is_cached_metadata_path(format: &RepositoryFormat, path: &str) -> bool {
+    is_cached_index_path(path) || (caches_packuments(format) && !path.contains("/-/"))
+}
+
+/// The SQL form of "this row is a real artifact" for a repository of
+/// `format`: [`not_cached_index_sql`], and for the npm family also a tarball
+/// path (`/-/` segment, #4305). `-` and `/` are not `LIKE` metacharacters.
+pub fn not_cached_metadata_sql(format: &RepositoryFormat, path_column: &str) -> String {
+    let not_index = not_cached_index_sql(path_column);
+    if caches_packuments(format) {
+        format!("({not_index} AND {path_column} LIKE '%/-/%')")
+    } else {
+        not_index
+    }
+}
+
 /// One catalog row as surfaced by the remote-repository browse listing
 /// (PF-002 / #2519). Unlike [`ProxyCacheEntry`] this carries `cached_at`, so
 /// the listing can render the cache timestamp without reading the storage
@@ -372,12 +402,16 @@ pub async fn has_rows(db: &PgPool, repository_id: Uuid) -> Result<bool> {
 /// cursor). The caller passes `limit = per_page + 1` and uses the extra row
 /// as the authoritative `has_more` signal (#2520 pattern).
 ///
-/// Cached index responses ([`is_cached_index_path`]) are excluded: they are
-/// cache entries, not artifacts, and listing them produced rows with an empty
-/// name. They remain in the table and in storage accounting.
+/// Cached index responses ([`is_cached_metadata_path`]: index pages, and for
+/// the npm family packuments, #4305) are excluded: they are cache entries,
+/// not artifacts, and listing them produced rows with an empty name (or, for
+/// a packument, a "package" that could not be deleted). They remain in the
+/// table and in storage accounting.
+#[allow(clippy::too_many_arguments)]
 pub async fn browse_page(
     db: &PgPool,
     repository_id: Uuid,
+    format: &RepositoryFormat,
     prefix_like: Option<&str>,
     q_like: Option<&str>,
     after_path: Option<&str>,
@@ -398,7 +432,7 @@ pub async fn browse_page(
         ORDER BY path
         LIMIT $5 OFFSET $6
         "#,
-        not_index = not_cached_index_sql("path"),
+        not_index = not_cached_metadata_sql(format, "path"),
     )))
     .bind(repository_id)
     .bind(prefix_like)
@@ -422,6 +456,7 @@ pub async fn browse_page(
 pub async fn browse_count(
     db: &PgPool,
     repository_id: Uuid,
+    format: &RepositoryFormat,
     prefix_like: Option<&str>,
     q_like: Option<&str>,
 ) -> Result<i64> {
@@ -434,7 +469,7 @@ pub async fn browse_count(
           AND ($3::TEXT IS NULL OR path ILIKE $3 ESCAPE '\')
           AND {not_index}
         "#,
-        not_index = not_cached_index_sql("path"),
+        not_index = not_cached_metadata_sql(format, "path"),
     )))
     .bind(repository_id)
     .bind(prefix_like)
@@ -953,6 +988,70 @@ mod tests {
         }
     }
 
+    /// #4305: for the npm family a cached path without a `/-/` segment is a
+    /// packument, and the SQL form agrees with the Rust form on every sample,
+    /// for an npm-family and a generic repository alike.
+    #[tokio::test]
+    async fn cached_metadata_sql_and_rust_agree_for_npm_packuments() {
+        let samples = [
+            ("@example-org/example-package", true),
+            ("left-pad", true),
+            ("-/v1/search", true),
+            (
+                "@example-org/example-package/-/example-package-1.0.0.tgz",
+                false,
+            ),
+            ("left-pad/-/left-pad-1.3.0.tgz", false),
+            ("simple/idna/", true),
+        ];
+        for format in [
+            RepositoryFormat::Npm,
+            RepositoryFormat::Yarn,
+            RepositoryFormat::Pnpm,
+        ] {
+            for (path, metadata) in samples {
+                assert_eq!(
+                    is_cached_metadata_path(&format, path),
+                    metadata,
+                    "{format:?} {path}"
+                );
+            }
+        }
+        // Other formats keep the index-only rule.
+        assert!(!is_cached_metadata_path(
+            &RepositoryFormat::Generic,
+            "left-pad"
+        ));
+        assert!(is_cached_metadata_path(
+            &RepositoryFormat::Generic,
+            "simple/idna/"
+        ));
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let paths: Vec<String> = samples.iter().map(|(p, _)| (*p).to_string()).collect();
+        for format in [RepositoryFormat::Npm, RepositoryFormat::Generic] {
+            let sql = format!(
+                "SELECT s.path, {} AS is_artifact FROM UNNEST($1::TEXT[]) AS s(path)",
+                not_cached_metadata_sql(&format, "s.path")
+            );
+            let rows: Vec<(String, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+                .bind(&paths)
+                .fetch_all(&pool)
+                .await
+                .expect("evaluate not_cached_metadata_sql in postgres");
+            assert_eq!(rows.len(), samples.len());
+            for (path, is_artifact) in rows {
+                assert_eq!(
+                    is_artifact,
+                    !is_cached_metadata_path(&format, &path),
+                    "{format:?}: SQL and Rust disagree about {path:?}"
+                );
+            }
+        }
+    }
+
     /// The artifact listing must not surface cached index responses -- they
     /// rendered with an empty Name column -- while storage accounting must
     /// still count their bytes. Both halves in one test so a "fix" that simply
@@ -988,9 +1087,18 @@ mod tests {
         // Near-miss artifact: must survive the filter.
         seed("simple/index/index-1.0.tar.gz", 20).await;
 
-        let rows = browse_page(&pool, repo, None, None, None, 0, 50)
-            .await
-            .expect("browse");
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            None,
+            None,
+            None,
+            0,
+            50,
+        )
+        .await
+        .expect("browse");
         let listed: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             listed,
@@ -1005,7 +1113,9 @@ mod tests {
             "no empty-name rows"
         );
         assert_eq!(
-            browse_count(&pool, repo, None, None).await.expect("count"),
+            browse_count(&pool, repo, &RepositoryFormat::Generic, None, None)
+                .await
+                .expect("count"),
             2,
             "the exact count must match the rows the listing returns"
         );
@@ -1438,6 +1548,7 @@ mod tests {
             let rows = browse_page(
                 &pool,
                 repo,
+                &RepositoryFormat::Generic,
                 None,
                 None,
                 after.as_deref(),
@@ -1463,7 +1574,12 @@ mod tests {
 
         let expected: Vec<String> = (0..total).map(|i| format!("pkg/obj-{i:03}.bin")).collect();
         assert_eq!(walked, expected, "full walk yields every row exactly once");
-        assert_eq!(browse_count(&pool, repo, None, None).await.unwrap(), 25);
+        assert_eq!(
+            browse_count(&pool, repo, &RepositoryFormat::Generic, None, None)
+                .await
+                .unwrap(),
+            25
+        );
         cleanup_repo(&pool, repo).await;
     }
 
@@ -1507,9 +1623,18 @@ mod tests {
         };
 
         // Prefix filter: starts_with semantics.
-        let rows = browse_page(&pool, repo, Some("a/%"), None, None, 0, 10)
-            .await
-            .unwrap();
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            Some("a/%"),
+            None,
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             ["a/one.whl", "a/two.whl"]
@@ -1518,9 +1643,18 @@ mod tests {
         // Substring filter is case-insensitive, like the legacy
         // `to_lowercase().contains()` filter: an upper-cased needle still
         // matches the lower-cased stored path.
-        let rows = browse_page(&pool, repo, None, Some("%TWO%"), None, 0, 10)
-            .await
-            .unwrap();
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            None,
+            Some("%TWO%"),
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             ["a/two.whl"]
@@ -1529,15 +1663,26 @@ mod tests {
         // `%` / `_` in user input match literally once escaped: `100%_`
         // must match only the literal path, not wildcard onto `100xy`.
         let q = format!("%{}%", escape("100%_"));
-        let rows = browse_page(&pool, repo, None, Some(&q), None, 0, 10)
-            .await
-            .unwrap();
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            None,
+            Some(&q),
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             ["b/100%_done.whl"]
         );
         assert_eq!(
-            browse_count(&pool, repo, None, Some(&q)).await.unwrap(),
+            browse_count(&pool, repo, &RepositoryFormat::Generic, None, Some(&q))
+                .await
+                .unwrap(),
             1,
             "count applies the same escaped filters as the page"
         );

@@ -2054,11 +2054,11 @@ const MAX_PROXY_FINDINGS: i64 = 200;
 /// scanner writes verdicts.
 ///
 /// Cached upstream index responses are excluded through the shared
-/// [`proxy_catalog::not_cached_index_sql`] predicate -- the same one the
+/// [`proxy_catalog::not_cached_metadata_sql`] predicate -- the same one the
 /// artifact listing uses, so the two views cannot disagree. An HTML index page
-/// has no package inventory, so counting it as `not_scanned` is a permanent
-/// false positive with no available remedy.
-fn proxy_scan_select() -> String {
+/// (or an npm packument, #4305) has no package inventory, so counting it as
+/// `not_scanned` is a permanent false positive with no available remedy.
+fn proxy_scan_select(format: &crate::models::repository::RepositoryFormat) -> String {
     format!(
         r#"
     SELECT pca.path, pca.checksum_sha256, pca.size_bytes, pca.cached_at,
@@ -2072,7 +2072,7 @@ fn proxy_scan_select() -> String {
      WHERE pca.repository_id = $1
        AND {not_index}
 "#,
-        not_index = proxy_catalog::not_cached_index_sql("pca.path"),
+        not_index = proxy_catalog::not_cached_metadata_sql(format, "pca.path"),
     )
 }
 
@@ -2280,7 +2280,11 @@ impl ProxyScanEntry {
 }
 
 /// Per-state counts over distinct digests for one repository.
-async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxyScanSummary> {
+async fn fetch_proxy_scan_summary(
+    db: &PgPool,
+    repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
+) -> Result<ProxyScanSummary> {
     sqlx::query_as::<_, ProxyScanSummary>(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT
@@ -2301,7 +2305,7 @@ async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxySca
          WHERE pca.repository_id = $1
            AND {not_index}
         "#,
-        not_index = proxy_catalog::not_cached_index_sql("pca.path"),
+        not_index = proxy_catalog::not_cached_metadata_sql(format, "pca.path"),
     )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
@@ -2315,11 +2319,12 @@ async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxySca
 async fn fetch_proxy_scan_path(
     db: &PgPool,
     repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
     path: &str,
 ) -> Result<Option<ProxyScanRow>> {
     sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
         "{} AND pca.path = $3",
-        proxy_scan_select()
+        proxy_scan_select(format)
     )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
@@ -2333,13 +2338,14 @@ async fn fetch_proxy_scan_path(
 async fn fetch_proxy_scan_page(
     db: &PgPool,
     repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ProxyScanRow>> {
     sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
         "{} AND pca.checksum_sha256 IS NOT NULL \
          ORDER BY pca.cached_at DESC, pca.path ASC LIMIT $3 OFFSET $4",
-        proxy_scan_select()
+        proxy_scan_select(format)
     )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
@@ -2352,11 +2358,15 @@ async fn fetch_proxy_scan_page(
 
 /// Paths eligible for the paged list (NULL-checksum placeholders excluded, to
 /// match the rows the page actually returns).
-async fn count_proxy_scan_paths(db: &PgPool, repo_id: Uuid) -> Result<i64> {
+async fn count_proxy_scan_paths(
+    db: &PgPool,
+    repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
+) -> Result<i64> {
     sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*format!(
         "SELECT COUNT(*) FROM proxy_cache_artifacts \
          WHERE repository_id = $1 AND checksum_sha256 IS NOT NULL AND {not_index}",
-        not_index = proxy_catalog::not_cached_index_sql("path"),
+        not_index = proxy_catalog::not_cached_metadata_sql(format, "path"),
     )))
     .bind(repo_id)
     .fetch_one(db)
@@ -2412,7 +2422,7 @@ async fn get_repo_proxy_scans(
 
     let (summary, items, total, page, per_page) = match query.path.as_deref() {
         Some(path) => {
-            let row = fetch_proxy_scan_path(&state.db, repo_id, path)
+            let row = fetch_proxy_scan_path(&state.db, repo_id, &repo.format, path)
                 .await?
                 .ok_or_else(|| AppError::NotFound(PROXY_PATH_NOT_FOUND_MSG.to_string()))?;
             let digest = row.checksum_sha256.clone();
@@ -2437,9 +2447,9 @@ async fn get_repo_proxy_scans(
         }
         None => {
             let (page, per_page, offset) = proxy_scan_paging(query.page, query.per_page);
-            let summary = fetch_proxy_scan_summary(&state.db, repo_id).await?;
-            let total = count_proxy_scan_paths(&state.db, repo_id).await?;
-            let items = fetch_proxy_scan_page(&state.db, repo_id, per_page, offset)
+            let summary = fetch_proxy_scan_summary(&state.db, repo_id, &repo.format).await?;
+            let total = count_proxy_scan_paths(&state.db, repo_id, &repo.format).await?;
+            let items = fetch_proxy_scan_page(&state.db, repo_id, &repo.format, per_page, offset)
                 .await?
                 .into_iter()
                 .map(|r| ProxyScanEntry::from_row(r, scan_on_proxy))
@@ -3123,7 +3133,8 @@ mod tests {
     #[test]
     fn proxy_scan_queries_filter_on_scan_type_constant() {
         assert!(
-            proxy_scan_select().contains("psr.scan_type = $2"),
+            proxy_scan_select(&crate::models::repository::RepositoryFormat::Generic)
+                .contains("psr.scan_type = $2"),
             "the shared projection must filter the join on scan_type"
         );
         let source = include_str!("security.rs");
@@ -3154,7 +3165,7 @@ mod tests {
     /// types.
     #[test]
     fn proxy_scan_projection_never_selects_repository_id() {
-        let select = proxy_scan_select();
+        let select = proxy_scan_select(&crate::models::repository::RepositoryFormat::Generic);
         let (projection, _) = select
             .split_once("FROM proxy_cache_artifacts")
             .expect("projection must read from the cache catalog");
