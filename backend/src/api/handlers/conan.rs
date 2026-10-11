@@ -691,11 +691,45 @@ fn parse_revisions_value(
         .unwrap_or_default()
 }
 
-/// Parse an upstream Conan v2 `.../latest` response body into the single
-/// revision id. Shape: `{"revision":"...","time":"..."}`. Returns `None` on a
-/// missing/unparseable body so a Remote `/latest` falls through to 404 only
-/// when the upstream genuinely has nothing.
-fn parse_latest_revision_json(bytes: &[u8]) -> Option<String> {
+/// A `.../latest` answer: the revision and the time to report for it.
+#[derive(Debug, PartialEq, Eq)]
+struct LatestRevision {
+    revision: String,
+    /// The revision's time as the source reported it (RFC 3339, or Conan
+    /// Center's `+0000` form). `None` only when an upstream sent none.
+    time: Option<String>,
+}
+
+impl LatestRevision {
+    /// The `.../latest` JSON body. The time is the revision's own (#4335),
+    /// never the time of the request, so repeated reads agree with each other
+    /// and with the revision's entry in `/revisions`. Request time is only a
+    /// last resort for an upstream that reported no time at all.
+    fn into_response(self) -> Response {
+        let json = serde_json::json!({
+            "revision": self.revision,
+            "time": self.time.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&json).unwrap()))
+            .unwrap()
+    }
+
+    fn stored(revision: String, created_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            revision,
+            time: Some(created_at.to_rfc3339()),
+        }
+    }
+}
+
+/// Parse an upstream Conan v2 `.../latest` response body. Shape:
+/// `{"revision":"...","time":"..."}`; the upstream's `time` is passed through
+/// unchanged (#4335). Returns `None` on a missing/unparseable body so a Remote
+/// `/latest` falls through to 404 only when the upstream genuinely has nothing.
+fn parse_latest_revision_json(bytes: &[u8]) -> Option<LatestRevision> {
     let value: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -703,10 +737,12 @@ fn parse_latest_revision_json(bytes: &[u8]) -> Option<String> {
             return None;
         }
     };
-    value
-        .get("revision")
+    let revision = value.get("revision").and_then(|v| v.as_str())?.to_string();
+    let time = value
+        .get("time")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(str::to_string);
+    Some(LatestRevision { revision, time })
 }
 
 /// Parse an upstream Conan v2 files-list body `{"files":{"name":{}, ...}}` into
@@ -933,7 +969,7 @@ async fn recipe_latest_from_remote(
     version: &str,
     user: &str,
     channel: &str,
-) -> Result<Option<String>, Response> {
+) -> Result<Option<LatestRevision>, Response> {
     let upstream_path = format!("v2/conans/{}/{}/{}/{}/latest", name, version, user, channel);
     let body = conan_upstream_json(
         proxy,
@@ -1024,7 +1060,7 @@ async fn package_latest_from_remote(
     channel: &str,
     revision: &str,
     package_id: &str,
-) -> Result<Option<String>, Response> {
+) -> Result<Option<LatestRevision>, Response> {
     let upstream_path = format!(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/latest",
         name, version, user, channel, revision, package_id
@@ -1132,6 +1168,9 @@ async fn search(
 /// reused both for the non-virtual fast path and for virtual fan-out across
 /// member repositories. Returns `Ok(None)` when the repository has no
 /// matching recipe rows.
+/// The newest recipe revision a repository holds, with its stored time: the
+/// first entry of [`recipe_revisions_for_repo`], so `/latest` and `/revisions`
+/// can never disagree about a revision's time (#4335).
 async fn latest_recipe_revision_for_repo(
     db: &PgPool,
     repository_id: uuid::Uuid,
@@ -1139,33 +1178,14 @@ async fn latest_recipe_revision_for_repo(
     version: &str,
     user: &str,
     channel: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query!(
-        r#"
-        SELECT am.metadata->>'revision' as "revision?"
-        FROM artifacts a
-        JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND am.format = 'conan'
-          AND a.name = $2
-          AND a.version = $3
-          AND am.metadata->>'user' = $4
-          AND am.metadata->>'channel' = $5
-          AND am.metadata->>'revision' IS NOT NULL
-        ORDER BY a.created_at DESC, a.id DESC
-        LIMIT 1
-        "#,
-        repository_id,
-        name,
-        version,
-        normalize_user(user),
-        normalize_channel(channel),
+) -> Result<Option<LatestRevision>, sqlx::Error> {
+    Ok(
+        recipe_revisions_for_repo(db, repository_id, name, version, user, channel)
+            .await?
+            .into_iter()
+            .next()
+            .map(|r| LatestRevision::stored(r.revision, r.created_at)),
     )
-    .fetch_optional(db)
-    .await?;
-
-    Ok(row.and_then(|r| r.revision))
 }
 
 async fn recipe_latest(
@@ -1190,7 +1210,7 @@ async fn recipe_latest(
         // not read directly contributes none of them.
         let members =
             proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
-        let mut found: Option<String> = None;
+        let mut found: Option<LatestRevision> = None;
         for member in &members {
             if !member.repo_type.is_hosted() {
                 continue;
@@ -1247,16 +1267,7 @@ async fn recipe_latest(
             .ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?
     };
 
-    let json = serde_json::json!({
-        "revision": revision,
-        "time": chrono::Utc::now().to_rfc3339()
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(revision.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,10 +1289,13 @@ async fn recipe_revisions_for_repo(
     user: &str,
     channel: &str,
 ) -> Result<Vec<RecipeRevisionRow>, sqlx::Error> {
-    let rows = sqlx::query!(
+    // Newest first; revisions stored at the same instant are ordered by
+    // their newest row id, so `/latest` (the first entry, #4335) is
+    // deterministic.
+    let rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         r#"
-        SELECT am.metadata->>'revision' as "revision?",
-               MAX(a.created_at) as "created_at!"
+        SELECT am.metadata->>'revision' AS revision,
+               MAX(a.created_at) AS created_at
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -1293,24 +1307,22 @@ async fn recipe_revisions_for_repo(
           AND am.metadata->>'channel' = $5
           AND am.metadata->>'revision' IS NOT NULL
         GROUP BY am.metadata->>'revision'
-        ORDER BY "created_at!" DESC
+        ORDER BY created_at DESC, MAX(a.id::text) DESC
         "#,
-        repository_id,
-        name,
-        version,
-        normalize_user(user),
-        normalize_channel(channel),
     )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .bind(normalize_user(user))
+    .bind(normalize_channel(channel))
     .fetch_all(db)
     .await?;
 
     Ok(rows
         .into_iter()
-        .filter_map(|r| {
-            r.revision.map(|rev| RecipeRevisionRow {
-                revision: rev,
-                created_at: r.created_at,
-            })
+        .map(|(revision, created_at)| RecipeRevisionRow {
+            revision,
+            created_at,
         })
         .collect())
 }
@@ -2190,9 +2202,10 @@ async fn recipe_file_upload(
 // GET .../packages/{package_id}/latest — Latest package revision
 // ---------------------------------------------------------------------------
 
-/// Per-repo helper: latest package revision (newest by created_at) for a
-/// given (name, version, recipe revision, package_id). Returns `Ok(None)` when
-/// the repository has no matching rows. Mirrors [`latest_recipe_revision_for_repo`].
+/// The newest package revision a repository holds for a (name, version,
+/// recipe revision, package_id), with its stored time: the first entry of
+/// [`package_revisions_for_repo`], so `/latest` and `/revisions` agree (#4335).
+/// Mirrors [`latest_recipe_revision_for_repo`].
 async fn latest_package_revision_for_repo(
     db: &PgPool,
     repository_id: uuid::Uuid,
@@ -2200,34 +2213,14 @@ async fn latest_package_revision_for_repo(
     version: &str,
     revision: &str,
     package_id: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query!(
-        r#"
-        SELECT am.metadata->>'packageRevision' as "pkg_revision?"
-        FROM artifacts a
-        JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND am.format = 'conan'
-          AND a.name = $2
-          AND a.version = $3
-          AND am.metadata->>'revision' = $4
-          AND am.metadata->>'packageId' = $5
-          AND am.metadata->>'type' = 'package'
-          AND am.metadata->>'packageRevision' IS NOT NULL
-        ORDER BY a.created_at DESC, a.id DESC
-        LIMIT 1
-        "#,
-        repository_id,
-        name,
-        version,
-        revision,
-        package_id,
+) -> Result<Option<LatestRevision>, sqlx::Error> {
+    Ok(
+        package_revisions_for_repo(db, repository_id, name, version, revision, package_id)
+            .await?
+            .into_iter()
+            .next()
+            .map(|r| LatestRevision::stored(r.revision, r.created_at)),
     )
-    .fetch_optional(db)
-    .await?;
-
-    Ok(row.and_then(|r| r.pkg_revision))
 }
 
 async fn package_latest(
@@ -2254,7 +2247,7 @@ async fn package_latest(
         // not read directly contributes none of them.
         let members =
             proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
-        let mut found: Option<String> = None;
+        let mut found: Option<LatestRevision> = None;
         for member in &members {
             if !member.repo_type.is_hosted() {
                 continue;
@@ -2333,16 +2326,7 @@ async fn package_latest(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?
     };
 
-    let json = serde_json::json!({
-        "revision": pkg_revision,
-        "time": chrono::Utc::now().to_rfc3339()
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(pkg_revision.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2363,10 +2347,11 @@ async fn package_revisions_for_repo(
     revision: &str,
     package_id: &str,
 ) -> Result<Vec<PackageRevisionRow>, sqlx::Error> {
-    let rows = sqlx::query!(
+    // Newest first, ties broken by the newest row id, as for recipes.
+    let rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         r#"
-        SELECT am.metadata->>'packageRevision' as "pkg_revision?",
-               MAX(a.created_at) as "created_at!"
+        SELECT am.metadata->>'packageRevision' AS pkg_revision,
+               MAX(a.created_at) AS created_at
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -2379,24 +2364,22 @@ async fn package_revisions_for_repo(
           AND am.metadata->>'type' = 'package'
           AND am.metadata->>'packageRevision' IS NOT NULL
         GROUP BY am.metadata->>'packageRevision'
-        ORDER BY "created_at!" DESC
+        ORDER BY created_at DESC, MAX(a.id::text) DESC
         "#,
-        repository_id,
-        name,
-        version,
-        revision,
-        package_id,
     )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .bind(revision)
+    .bind(package_id)
     .fetch_all(db)
     .await?;
 
     Ok(rows
         .into_iter()
-        .filter_map(|r| {
-            r.pkg_revision.map(|rev| PackageRevisionRow {
-                revision: rev,
-                created_at: r.created_at,
-            })
+        .map(|(revision, created_at)| PackageRevisionRow {
+            revision,
+            created_at,
         })
         .collect())
 }
@@ -9153,7 +9136,10 @@ mod agent2_recipe_reads {
         let body = br#"{"revision":"latest-rev","time":"2026-01-01T00:00:00Z"}"#;
         assert_eq!(
             super::parse_latest_revision_json(body),
-            Some("latest-rev".to_string())
+            Some(super::LatestRevision {
+                revision: "latest-rev".to_string(),
+                time: Some("2026-01-01T00:00:00Z".to_string()),
+            })
         );
     }
 
@@ -10045,5 +10031,162 @@ mod not_found_3887 {
                 assert_eq!(hidden.2, reader_absent[i].2, "{who} body for {uri}");
             }
         }
+    }
+}
+
+/// #4335: the recipe and package `/latest` endpoints report the selected
+/// revision's stored time, the same value its `/revisions` entry carries,
+/// instead of the time of the request.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod latest_time_4335 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    const STORED: &str = "2021-03-04T05:06:07.123456+00:00";
+
+    async fn backdate(pool: &sqlx::PgPool, repo_id: uuid::Uuid) {
+        sqlx::query("UPDATE artifacts SET created_at = $2::timestamptz WHERE repository_id = $1")
+            .bind(repo_id)
+            .bind(STORED)
+            .execute(pool)
+            .await
+            .expect("backdate rows");
+    }
+
+    fn json(body: &bytes::Bytes) -> serde_json::Value {
+        serde_json::from_slice(body).unwrap_or_else(|_| {
+            panic!("not json: {}", String::from_utf8_lossy(body));
+        })
+    }
+
+    fn time_of(v: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
+        let t = v["time"].as_str().expect("time string");
+        chrono::DateTime::parse_from_rfc3339(t)
+            .expect("rfc3339 time")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[tokio::test]
+    async fn latest_time_is_the_stored_revision_time_and_stable() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        for file in ["conanfile.py", "conanmanifest.txt"] {
+            seed_recipe_row(&pool, repo_id, "ltime", "1.0", "_", "_", "rrev1", file).await;
+        }
+        for file in ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"] {
+            seed_package_row(
+                &pool, repo_id, "ltime", "1.0", "_", "_", "rrev1", "pid1", "prev1", file,
+            )
+            .await;
+        }
+        backdate(&pool, repo_id).await;
+
+        let app = router_with_auth(state, make_auth(user_id, "u"));
+        let base = format!("/{repo_key}/v2/conans/ltime/1.0/_/_");
+        let pkg = format!("{base}/revisions/rrev1/packages/pid1");
+        let mut answers = Vec::new();
+        for uri in [
+            format!("{base}/latest"),
+            format!("{base}/revisions"),
+            format!("{pkg}/latest"),
+            format!("{pkg}/revisions"),
+        ] {
+            answers.push(send(app.clone(), tdh::get(uri)).await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (_, recipe_again) = send(app.clone(), tdh::get(format!("{base}/latest"))).await;
+        let (_, pkg_again) = send(app, tdh::get(format!("{pkg}/latest"))).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (status, body) in &answers {
+            assert_eq!(*status, StatusCode::OK, "{}", String::from_utf8_lossy(body));
+        }
+        let stored = chrono::DateTime::parse_from_rfc3339(STORED)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let recipe_latest = json(&answers[0].1);
+        let recipe_hist = json(&answers[1].1);
+        assert_eq!(recipe_latest["revision"], "rrev1");
+        assert_eq!(
+            time_of(&recipe_latest),
+            stored,
+            "recipe latest: {recipe_latest}"
+        );
+        assert_eq!(recipe_latest["time"], recipe_hist["revisions"][0]["time"]);
+        assert_eq!(
+            json(&recipe_again),
+            recipe_latest,
+            "recipe latest must be stable"
+        );
+
+        let pkg_latest = json(&answers[2].1);
+        let pkg_hist = json(&answers[3].1);
+        assert_eq!(pkg_latest["revision"], "prev1");
+        assert_eq!(time_of(&pkg_latest), stored, "package latest: {pkg_latest}");
+        assert_eq!(pkg_latest["time"], pkg_hist["revisions"][0]["time"]);
+        assert_eq!(
+            json(&pkg_again),
+            pkg_latest,
+            "package latest must be stable"
+        );
+    }
+
+    /// With two revisions, `/latest` names the newest one and its own time.
+    #[tokio::test]
+    async fn latest_picks_newest_revision_with_its_time() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        for (rev, at) in [
+            ("old", "2020-01-01T00:00:00+00:00"),
+            ("new", "2022-02-02T00:00:00+00:00"),
+        ] {
+            for file in ["conanfile.py", "conanmanifest.txt"] {
+                let id = seed_recipe_row(&pool, repo_id, "ltwo", "1.0", "_", "_", rev, file).await;
+                sqlx::query("UPDATE artifacts SET created_at = $2::timestamptz WHERE id = $1")
+                    .bind(id)
+                    .bind(at)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        let app = router_with_auth(state, make_auth(user_id, "u"));
+        let (status, body) = send(
+            app,
+            tdh::get(format!("/{repo_key}/v2/conans/ltwo/1.0/_/_/latest")),
+        )
+        .await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(status, StatusCode::OK);
+        let v = json(&body);
+        assert_eq!(v["revision"], "new");
+        assert_eq!(
+            time_of(&v),
+            chrono::DateTime::parse_from_rfc3339("2022-02-02T00:00:00+00:00").unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_latest_keeps_upstream_time() {
+        let parsed = super::parse_latest_revision_json(
+            br#"{"revision":"abc","time":"2025-12-09T12:51:39.337+0000"}"#,
+        )
+        .expect("parsed");
+        assert_eq!(parsed.revision, "abc");
+        assert_eq!(parsed.time.as_deref(), Some("2025-12-09T12:51:39.337+0000"));
     }
 }
