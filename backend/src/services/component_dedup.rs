@@ -129,7 +129,9 @@ impl ArtifactComponentScope {
         artifact_version: Option<&str>,
         map: &AliasMap,
     ) -> Option<Self> {
-        if !repository_format.eq_ignore_ascii_case("conda") {
+        // `conda` and `conda_native` are served by the same handlers, so both
+        // get conda alias dedup (#4254).
+        if !crate::services::conda_semantics::is_conda_format(repository_format) {
             return None;
         }
         let canonical_name = conda_identity::normalize_conda_name(artifact_name)?;
@@ -593,6 +595,29 @@ mod tests {
             &AliasMap::builtin_only()
         )
         .is_none());
+    }
+
+    #[test]
+    fn conda_native_artifacts_get_the_same_dedup_scope_as_conda() {
+        // #4254: the conda handlers serve `conda` and `conda_native`
+        // identically, so a `conda_native` artifact must fold its scanner
+        // components under the same identity a `conda` one does.
+        let map = AliasMap::builtin_only();
+        let conda = ArtifactComponentScope::for_artifact("conda", "py-opencv", Some("4.9.0"), &map)
+            .expect("conda scope");
+        for format in ["conda_native", "CONDA_NATIVE"] {
+            let native =
+                ArtifactComponentScope::for_artifact(format, "py-opencv", Some("4.9.0"), &map)
+                    .unwrap_or_else(|| panic!("{format} artifacts must get a dedup scope"));
+            assert_eq!(native.canonical_name(), conda.canonical_name());
+            assert_eq!(native.version(), conda.version());
+            assert_eq!(native.accepted_names, conda.accepted_names);
+            assert_eq!(
+                native.advisory_path_owns_findings(),
+                conda.advisory_path_owns_findings()
+            );
+            assert!(native.matches("opencv-python", Some("4.9.0")));
+        }
     }
 
     #[test]
