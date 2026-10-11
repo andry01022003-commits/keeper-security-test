@@ -5298,12 +5298,15 @@ impl proxy_helpers::ScannedProxyFile for CondaScannedPackage<'_> {
     }
 
     /// The `name@version` the file name requests, pinned only when the
-    /// package's own `info/index.json` agrees (#3003, #4039). The engine must
-    /// then actually grade that coordinate before a clean verdict counts; a
-    /// noarch Python package is graded through the `.dist-info` it installs.
-    /// A file name that does not parse, or bytes whose index disagrees or
-    /// cannot be read, are not what they are served as: inconclusive (423
-    /// under fail-closed, served `pending` and not scanned under fail-open).
+    /// package's own `info/index.json` agrees (#3003, #4039). This check is
+    /// what ties the verdict to the identity being served: the engine grades
+    /// a conda package's contents, so a completed scan is graded on its
+    /// findings whether it cataloged the package itself (a noarch Python
+    /// package's `.dist-info`), the upstream component a compiled package
+    /// vendors, or nothing (#4594, #4600). A file name that does not parse,
+    /// or bytes whose index disagrees or cannot be read, are not what they
+    /// are served as: inconclusive (423 under fail-closed, served `pending`
+    /// and not scanned under fail-open).
     fn identity(
         &self,
         req: &proxy_helpers::ScannedProxyRequest<'_>,
@@ -20017,33 +20020,61 @@ mod scan_on_proxy_tests {
         }
     }
 
-    /// #4594 keeps the identity check: when the scanner DID catalog a
-    /// `name@version` and it is not the one the file name requests, the scan
-    /// is inconclusive (423 under fail-closed) and nothing is recorded.
+    /// #4600: a compiled conda package the scanner catalogs only under the
+    /// upstream component it vendors (`libzlib` cataloged as `zlib`) is graded
+    /// on its findings, like an empty catalog (#4594): with none it is
+    /// `clean`, stored with the count of what was cataloged. Before #4600 the
+    /// identity check withheld it (423 under `fail_closed`, nothing stored).
     #[tokio::test]
-    async fn remote_cataloged_mismatch_is_still_withheld_4594() {
-        let file = "tzdata-2026c-h151e31d_0.conda";
-        let bytes = conda_v2("tzdata", "2026c");
+    async fn remote_vendored_catalog_is_graded_on_findings_4600() {
+        let file = "libzlib-1.3.1-hb9d3cd8_2.conda";
+        let bytes = conda_v2("libzlib", "1.3.1");
         let server = MockServer::start().await;
         mount_package(&server, file, &bytes).await;
         let (scanner, scans) = VersionedCveScanner::counting(
-            Some("grype-4594-test"),
-            MockCveRescan::Cataloged("evil", "6.6.6"),
+            Some("grype-4600-test"),
+            MockCveRescan::Cataloged("zlib", "1.3.1"),
         );
         let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await else {
             return;
         };
         configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", Some("high")).await;
         let digest = digest_of(&bytes);
-        let (status, body, _) = rig.get(&format!("noarch/{file}")).await;
+        let (status, body, headers) = rig.get(&format!("noarch/{file}")).await;
         let stored = stored_verdict(&rig.fx.pool, &digest).await;
         rig.teardown(std::slice::from_ref(&digest)).await;
 
-        assert_eq!(status, StatusCode::LOCKED);
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "scan_pending");
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(headers["X-AK-Scan"], "clean");
+        assert_eq!(&body[..], &bytes[..]);
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(stored, None);
+        assert_eq!(stored, Some(("clean".to_string(), Some(1))));
+    }
+
+    /// #4600: the same vendored-only catalog WITH a high finding is
+    /// `vulnerable` and blocked, and the verdict is recorded.
+    #[tokio::test]
+    async fn remote_vendored_catalog_with_a_finding_is_blocked_4600() {
+        let file = "libzlib-1.3.0-hb9d3cd8_2.conda";
+        let bytes = conda_v2("libzlib", "1.3.0");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let (scanner, scans) = VersionedCveScanner::counting(
+            Some("grype-4600-test"),
+            MockCveRescan::CatalogedVulnerable("zlib", "1.3.0"),
+        );
+        let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", Some("high")).await;
+        let digest = digest_of(&bytes);
+        let (status, body, headers) = rig.get(&format!("noarch/{file}")).await;
+        let stored = stored_verdict(&rig.fx.pool, &digest).await;
+        rig.teardown(std::slice::from_ref(&digest)).await;
+
+        assert_scan_blocked(status, &body, &headers, file);
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stored, Some(("vulnerable".to_string(), Some(1))));
     }
 
     /// Repodata is not gated: a fail-closed scanning remote still serves its

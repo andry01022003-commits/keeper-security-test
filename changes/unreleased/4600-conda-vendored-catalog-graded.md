@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4600]
+---
+- **Compiled conda packages that the scanner catalogs under a vendored upstream name are graded on their findings instead of staying inconclusive** (closes #4600). The proxy scan gate required the scanner's catalog to contain the conda package's own `name@version`, and for compiled packages it rarely does: `libzlib-1.3.1` is cataloged as `zlib 1.3.1`, `pillow` with its vendored `libjpeg-turbo`. Those scans completed and could carry real findings, but were withheld: 423 under `fail_closed`, `pending` under `fail_open`, with nothing recorded. Following #4594, a completed conda scan whose catalog names other components is now graded on its findings (`clean` with none, `vulnerable` and blocked by the policy with one), and the verdict records how many components it cataloged (`components_cataloged` in the proxy-scans view). The served identity is still checked against the package's own `info/index.json` before the scan, so bytes that disagree with their file name stay withheld. Other ecosystems keep the catalog identity check.
