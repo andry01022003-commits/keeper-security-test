@@ -7744,6 +7744,16 @@ impl BackendStagedUpload {
         self.armed = false;
         delete_generic_staging(&self.db, self.storage.as_ref(), &self.key).await;
     }
+
+    /// Keep the staged object past this handle and return its key, for an
+    /// owner that records the key durably and deletes the object itself (an
+    /// Incus chunked-upload session, #4302). The tracking row stays, so
+    /// [`sweep_stale_generic_upload_staging`] still reclaims the object if
+    /// that owner never does.
+    pub fn keep(mut self) -> String {
+        self.armed = false;
+        std::mem::take(&mut self.key)
+    }
 }
 
 impl Drop for BackendStagedUpload {
@@ -7764,7 +7774,7 @@ impl Drop for BackendStagedUpload {
 
 /// Delete one generic staging object, then its tracking row. The row is kept
 /// when the object delete fails so the sweep retries it.
-async fn delete_generic_staging(
+pub(crate) async fn delete_generic_staging(
     db: &PgPool,
     storage: &dyn crate::storage::StorageBackend,
     key: &str,

@@ -1189,6 +1189,7 @@ async fn upload_image(
             committed_offset: size_bytes,
             final_path: None,
             finalize_token,
+            staged_part_keys: Vec::new(),
         },
     ));
 
@@ -1276,7 +1277,7 @@ async fn get_session(
         r#"
         SELECT id, repository_id, user_id, artifact_path, product, version,
                filename, bytes_received, storage_temp_path, status,
-               finalize_error, artifact_id
+               finalize_error, artifact_id, staged_parts
         FROM incus_upload_sessions
         WHERE id = $1 AND repository_id = $2
         "#,
@@ -1303,6 +1304,165 @@ struct UploadSession {
     status: String,
     finalize_error: Option<String>,
     artifact_id: Option<Uuid>,
+    /// The session's chunks on the repository's storage backend (#4302), or
+    /// NULL for a session started by an earlier server version, whose chunks
+    /// live in the local `storage_temp_path` file instead.
+    staged_parts: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Shared chunk staging (#4302)
+// ---------------------------------------------------------------------------
+//
+// A chunked session used to append every chunk to a file on the local disk of
+// the replica that served the start, so behind more than one backend replica
+// a chunk or the completion routed to another replica found no staged data
+// and failed (the Incus instance of #3918). Each chunk is now staged as its
+// own object on the repository's storage backend through the #3916 generic
+// staging path (`proxy_helpers::stage_stream_on_backend`), and the session row
+// records the objects in commit order, in the same guarded UPDATE that
+// advances `bytes_received`. Any replica can therefore take any chunk. The
+// completing replica copies the recorded chunks back into its own staging
+// file and runs the unchanged seal / checksum / background-push finalize.
+//
+// Limits of this contained version (the shared-scratch redesign is separate):
+//
+// * the completion reads the whole image back from the storage backend before
+//   it hashes it, so `complete` takes one extra read of the image, and the
+//   completing replica's staging disk must still hold the whole image;
+// * each chunk is one extra object write and delete on the backend;
+// * a chunk object is tracked in `generic_upload_staging` from the moment it
+//   is written, so the hourly generic staging sweep reclaims the chunks of an
+//   abandoned session (the stale-session reaper deletes the row only); every
+//   accepted chunk refreshes the tracking rows of the session's chunks, so a
+//   session still receiving is never swept;
+// * a session started by an earlier server version (`staged_parts` NULL)
+//   keeps the local-file path and still needs session affinity.
+
+/// One chunk of a shared-staging session, as recorded in
+/// `incus_upload_sessions.staged_parts`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StagedPart {
+    key: String,
+    offset: i64,
+    size: i64,
+}
+
+/// Parse a session's recorded chunks and check that they cover exactly the
+/// committed bytes `[0, committed)`, in order and without gaps.
+fn staged_parts_covering(
+    parts: &serde_json::Value,
+    committed: i64,
+) -> Result<Vec<StagedPart>, String> {
+    let parts: Vec<StagedPart> = serde_json::from_value(parts.clone())
+        .map_err(|e| format!("unreadable staged chunk list: {e}"))?;
+    let mut next = 0_i64;
+    for part in &parts {
+        if part.offset != next || part.size < 0 {
+            return Err(format!(
+                "staged chunk {} starts at {} (size {}), expected offset {}",
+                part.key, part.offset, part.size, next
+            ));
+        }
+        next += part.size;
+    }
+    if next != committed {
+        return Err(format!(
+            "staged chunks cover {next} bytes but the session has {committed} committed"
+        ));
+    }
+    Ok(parts)
+}
+
+/// The object keys recorded on a session, best effort (for cleanup).
+fn staged_part_keys(parts: Option<&serde_json::Value>) -> Vec<String> {
+    parts
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("key").and_then(|k| k.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Stage one chunk body as an object on the repository's storage backend.
+async fn stage_chunk_on_backend(
+    state: &SharedState,
+    repo: &RepoInfo,
+    body: Body,
+) -> Result<proxy_helpers::BackendStagedUpload, Response> {
+    let (staged, _digests) = proxy_helpers::stage_stream_on_backend(
+        state,
+        &repo.storage_location(),
+        body.into_data_stream(),
+    )
+    .await?;
+    Ok(staged)
+}
+
+/// Delete a session's staged chunk objects (and their tracking rows).
+async fn purge_staged_parts(state: &SharedState, repo: &RepoInfo, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    match state.storage_for_repo(&repo.storage_location()) {
+        Ok(storage) => {
+            for key in keys {
+                proxy_helpers::delete_generic_staging(&state.db, storage.as_ref(), key).await;
+            }
+        }
+        // The tracking rows stay, so the generic staging sweep reclaims them.
+        Err(e) => tracing::warn!(error = %e, "cannot resolve storage to purge staged chunks"),
+    }
+}
+
+/// Copy a session's committed chunks, in order, from the storage backend into
+/// this replica's staging file `temp`, replacing whatever was there.
+async fn materialize_staged_parts(
+    state: &SharedState,
+    repo: &RepoInfo,
+    parts: &[StagedPart],
+    temp: &Path,
+) -> Result<(), Response> {
+    let unavailable = |what: &str, e: &dyn Display| {
+        tracing::error!(error = %e, "{what}");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Staged upload data could not be read from storage; retry the completion",
+        )
+            .into_response()
+    };
+    ensure_parent_dirs(temp).await?;
+    let mut file = tokio::fs::File::create(temp)
+        .await
+        .map_err(|e| fs_err("create temp file", e))?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    for part in parts {
+        let mut stream = storage
+            .get_stream(&part.key)
+            .await
+            .map_err(|e| unavailable("open staged chunk", &e))?;
+        let mut copied = 0_i64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| unavailable("read staged chunk", &e))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| fs_err("write to disk", e))?;
+            copied += chunk.len() as i64;
+        }
+        if copied != part.size {
+            return Err(unavailable(
+                "staged chunk size changed",
+                &format!("{} holds {copied} bytes, {} recorded", part.key, part.size),
+            ));
+        }
+    }
+    file.sync_all().await.map_err(|e| fs_err("sync file", e))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,23 +1494,31 @@ async fn start_chunked_upload(
     })?;
 
     let session_id = Uuid::new_v4();
-    // Stage to a local scratch file; the final copy is uploaded through
-    // the repo's StorageBackend at `complete_chunked_upload` time (#1471).
-    // The chosen path is persisted to `incus_upload_sessions.storage_temp_path`,
-    // so subsequent chunk/complete/cancel calls read it back from the
-    // session row and don't need to re-derive it.
+    // The local staging path is recorded for the completion's bookkeeping;
+    // the chunks themselves are staged on the repository's storage backend
+    // so any replica can take the next chunk or the completion (#4302).
     let temp_path = temp_upload_path(&state.config.storage_path, &session_id);
 
-    // Stream initial body (may be empty) to temp file
-    let (initial_bytes, _checksum) = stream_body_to_file(body, &temp_path).await?;
+    // Stage the initial body (may be empty) as the session's first chunk.
+    let staged = stage_chunk_on_backend(&state, &repo, body).await?;
+    let initial_bytes = staged.size_bytes();
+    let (first_part, parts) = if initial_bytes > 0 {
+        let parts = serde_json::json!([
+            { "key": staged.key(), "offset": 0, "size": initial_bytes }
+        ]);
+        (Some(staged), parts)
+    } else {
+        staged.discard().await;
+        (None, serde_json::json!([]))
+    };
 
     // Record session
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO incus_upload_sessions
             (id, repository_id, user_id, artifact_path, product, version,
-             filename, bytes_received, storage_temp_path)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             filename, bytes_received, storage_temp_path, staged_parts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(session_id)
@@ -1362,9 +1530,21 @@ async fn start_chunked_upload(
     .bind(&filename)
     .bind(initial_bytes)
     .bind(&*temp_path.to_string_lossy())
+    .bind(&parts)
     .execute(&state.db)
-    .await
-    .map_err(db_err)?;
+    .await;
+    match (inserted, first_part) {
+        (Ok(_), Some(part)) => {
+            part.keep();
+        }
+        (Ok(_), None) => {}
+        (Err(e), part) => {
+            if let Some(part) = part {
+                part.discard().await;
+            }
+            return Err(db_err(e));
+        }
+    }
 
     tracing::info!(
         "Started chunked upload session {} for {}/{}/{} ({} initial bytes)",
@@ -1430,6 +1610,12 @@ async fn upload_chunk(
             .into_response());
     }
 
+    if session.staged_parts.is_some() {
+        let new_total = stage_shared_chunk(&state, &repo, session_id, body).await?;
+        return Ok(chunk_accepted(prefix, &repo_key, &session_id, new_total));
+    }
+
+    // A session started by an earlier server version keeps its local file.
     // Append body to temp file (no read-back of existing data). Once a
     // finalize has sealed the staging file this open fails with ENOENT and is
     // reported as 409, so a chunk arriving after the claim cannot write bytes
@@ -1484,16 +1670,92 @@ async fn upload_chunk(
         new_total
     );
 
-    Ok(Response::builder()
+    Ok(chunk_accepted(prefix, &repo_key, &session_id, new_total))
+}
+
+/// The `202` a PATCH answers once its chunk is committed.
+fn chunk_accepted(prefix: &str, repo_key: &str, session_id: &Uuid, new_total: i64) -> Response {
+    Response::builder()
         .status(StatusCode::ACCEPTED)
         .header(
             "Location",
-            build_upload_location(prefix, &repo_key, &session_id),
+            build_upload_location(prefix, repo_key, session_id),
         )
         .header("Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", new_total))
         .body(Body::empty())
-        .unwrap())
+        .unwrap()
+}
+
+/// Stage one chunk of a shared-staging session (#4302) and commit it: the
+/// object is recorded at the session's current offset in the same guarded
+/// UPDATE that advances `bytes_received`, so the recorded chunks are always
+/// exactly the committed bytes, in order. A chunk that loses the race with a
+/// finalize claim is deleted and refused with 409, as on the local path.
+/// Returns the new committed offset.
+async fn stage_shared_chunk(
+    state: &SharedState,
+    repo: &RepoInfo,
+    session_id: Uuid,
+    body: Body,
+) -> Result<i64, Response> {
+    let staged = stage_chunk_on_backend(state, repo, body).await?;
+    let size = staged.size_bytes();
+    let committed = sqlx::query_scalar::<_, i64>(
+        "UPDATE incus_upload_sessions SET \
+             staged_parts = CASE WHEN $2 > 0 THEN staged_parts || jsonb_build_array( \
+                 jsonb_build_object('key', $3::text, 'offset', bytes_received, 'size', $2)) \
+                 ELSE staged_parts END, \
+             bytes_received = bytes_received + $2, \
+             updated_at = NOW() \
+         WHERE id = $1 AND status = 'receiving' AND staged_parts IS NOT NULL \
+         RETURNING bytes_received",
+    )
+    .bind(session_id)
+    .bind(size)
+    .bind(staged.key())
+    .fetch_optional(&state.db)
+    .await;
+    let new_total = match committed {
+        Ok(Some(total)) if size > 0 => {
+            staged.keep();
+            total
+        }
+        Ok(Some(total)) => {
+            staged.discard().await;
+            total
+        }
+        Ok(None) => {
+            staged.discard().await;
+            return Err((
+                StatusCode::CONFLICT,
+                "Upload session entered finalize while this chunk was uploading".to_string(),
+            )
+                .into_response());
+        }
+        Err(e) => {
+            staged.discard().await;
+            return Err(db_err(e));
+        }
+    };
+    // Keep every chunk of a session that is still receiving out of the
+    // generic staging sweep's age window; abandoned sessions age out.
+    let _ = sqlx::query(
+        "UPDATE generic_upload_staging SET created_at = NOW() \
+         WHERE storage_key IN ( \
+             SELECT jsonb_array_elements(staged_parts)->>'key' \
+             FROM incus_upload_sessions WHERE id = $1)",
+    )
+    .bind(session_id)
+    .execute(&state.db)
+    .await;
+    tracing::debug!(
+        session_id = %session_id,
+        bytes = size,
+        total = new_total,
+        "Incus chunk staged on the repository backend"
+    );
+    Ok(new_total)
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,7 +2059,15 @@ async fn complete_chunked_upload(
     // created in repo A cannot be finalized via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let session = get_session(&state.db, session_id, repo.id).await?;
-    let temp_path = PathBuf::from(&session.storage_temp_path);
+    // A shared-staging session (#4302) is assembled in THIS replica's staging
+    // root, whichever replica started it; an earlier version's session keeps
+    // the local file it recorded.
+    let shared = session.staged_parts.is_some();
+    let temp_path = if shared {
+        temp_upload_path(&state.config.storage_path, &session_id)
+    } else {
+        PathBuf::from(&session.storage_temp_path)
+    };
     // Both derived from the session's temp path, so every finalize attempt on
     // this session — including one reclaiming a crashed predecessor's lease —
     // names the exact same pair of files.
@@ -1825,26 +2095,60 @@ async fn complete_chunked_upload(
     // committed length: the pre-claim `session` read can be stale, and the
     // PATCH path only advances this column while the session is 'receiving'.
     // Every read this finalize performs is bounded to it.
-    let persisted_bytes: i64 =
-        match sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_one(&state.db)
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                abort_incus_finalize(
-                    &state.db,
-                    session_id,
-                    finalize_token,
-                    &temp_path,
-                    &sealed_path,
-                    &final_path,
+    let (persisted_bytes, staged_parts): (i64, Option<serde_json::Value>) = match sqlx::query_as(
+        "SELECT bytes_received, staged_parts FROM incus_upload_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            abort_incus_finalize(
+                &state.db,
+                session_id,
+                finalize_token,
+                &temp_path,
+                &sealed_path,
+                &final_path,
+            )
+            .await;
+            return Err(db_err(e));
+        }
+    };
+
+    // #4302: rebuild the committed chunks in this replica's staging file. The
+    // chunk list was read under the lease, so it is exactly the committed
+    // bytes; a stale local copy from an earlier attempt is replaced.
+    let staged_keys = staged_part_keys(staged_parts.as_ref());
+    if let Some(parts) = staged_parts.as_ref() {
+        remove_staging_files(&temp_path, &sealed_path, &final_path).await;
+        let rebuilt = match staged_parts_covering(parts, persisted_bytes) {
+            Ok(parts) => materialize_staged_parts(&state, &repo, &parts, &temp_path).await,
+            Err(reason) => {
+                tracing::error!(session = %session_id, %reason, "inconsistent staged chunks");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Upload session's staged chunks are inconsistent; cancel this \
+                     session and re-upload the image",
                 )
-                .await;
-                return Err(db_err(e));
+                    .into_response())
             }
         };
+        if let Err(resp) = rebuilt {
+            abort_incus_finalize(
+                &state.db,
+                session_id,
+                finalize_token,
+                &temp_path,
+                &sealed_path,
+                &final_path,
+            )
+            .await;
+            remove_staging_files(&temp_path, &sealed_path, &final_path).await;
+            return Err(resp);
+        }
+    }
 
     // Seal the staged chunks, stage the trailing body, and hash the result.
     // Any failure in there releases the lease back to 'receiving' (and
@@ -1882,13 +2186,16 @@ async fn complete_chunked_upload(
             // Checksum mismatch — clean up (token-guarded: only the lease
             // owner may delete the session out from under other requests)
             remove_staging_files(&temp_path, &sealed_path, &final_path).await;
-            let _ = sqlx::query(
+            let deleted = sqlx::query(
                 "DELETE FROM incus_upload_sessions WHERE id = $1 AND finalize_token = $2",
             )
             .bind(session_id)
             .bind(finalize_token)
             .execute(&state.db)
             .await;
+            if matches!(deleted, Ok(r) if r.rows_affected() == 1) {
+                purge_staged_parts(&state, &repo, &staged_keys).await;
+            }
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -1974,6 +2281,7 @@ async fn complete_chunked_upload(
             committed_offset: persisted_bytes,
             final_path: Some(final_path.clone()),
             finalize_token,
+            staged_part_keys: staged_keys,
         },
     ));
 
@@ -2057,7 +2365,7 @@ async fn cancel_chunked_upload(
     let claimed = sqlx::query(
         "DELETE FROM incus_upload_sessions \
          WHERE id = $1 AND user_id = $2 AND status = 'receiving' \
-         RETURNING storage_temp_path",
+         RETURNING storage_temp_path, staged_parts",
     )
     .bind(session_id)
     .bind(user_id)
@@ -2074,6 +2382,7 @@ async fn cancel_chunked_upload(
     };
 
     let staged: String = row.try_get("storage_temp_path").map_err(db_err)?;
+    let parts: Option<serde_json::Value> = row.try_get("staged_parts").map_err(db_err)?;
     let temp_path = PathBuf::from(staged);
     remove_staging_files(
         &temp_path,
@@ -2081,6 +2390,7 @@ async fn cancel_chunked_upload(
         &final_upload_path(&temp_path),
     )
     .await;
+    purge_staged_parts(&state, &repo, &staged_part_keys(parts.as_ref())).await;
 
     tracing::info!("Cancelled chunked upload session {}", session_id);
 
@@ -2335,6 +2645,10 @@ struct FinalizeParams {
     /// The finalizer's terminal updates must present it, so a finalizer whose
     /// lease expired and was reclaimed cannot clobber the new owner's state.
     finalize_token: Uuid,
+    /// The session's chunk objects on the storage backend (#4302), deleted
+    /// once the session is terminal. Empty for the monolithic path and for a
+    /// session started by an earlier server version.
+    staged_part_keys: Vec<String>,
 }
 
 /// Push the staged temp file to the repo's StorageBackend, create the
@@ -2424,6 +2738,9 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
     if let Some(final_path) = &params.final_path {
         let _ = tokio::fs::remove_file(final_path).await;
     }
+    // Completed or failed, the session is terminal and its staged chunks are
+    // no longer needed (#4302); a retry starts a new session.
+    purge_staged_parts(&state, &repo, &params.staged_part_keys).await;
     match outcome {
         Ok(artifact_id) => {
             tracing::info!(
@@ -4690,6 +5007,145 @@ mod streaming_pipeline_regression_tests {
         f.teardown().await;
     }
 
+    /// #4302: behind more than one backend replica, the chunks and the
+    /// completion of one upload land on different replicas. Each replica
+    /// stages on its own local disk (here: two states with different
+    /// `storage_path`s, sharing the database and the repository's storage),
+    /// so a chunk or the completion routed away from the replica that served
+    /// the start used to find no staged data and fail. Start on A, chunk on
+    /// B, chunk on A, complete on B: the image must assemble in order, and
+    /// no staged data may survive the finalize on either replica. Both
+    /// "replicas" run on this host, so A's staging directory is hidden while
+    /// B serves a request, as it would be on another pod.
+    #[tokio::test]
+    async fn chunked_upload_across_two_replicas_4302() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let scratch_a = tempfile::tempdir().expect("replica A scratch");
+        let scratch_b = tempfile::tempdir().expect("replica B scratch");
+        let replica_a = tdh::build_state(f.pool.clone(), scratch_a.path().to_str().unwrap());
+        let replica_b = tdh::build_state(f.pool.clone(), scratch_b.path().to_str().unwrap());
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let a_root = staging_root(scratch_a.path().to_str().unwrap());
+        let a_hidden = scratch_a.path().join("replica-a-disk-unreachable");
+        let hide_a = |hidden: bool| {
+            let (from, to) = if hidden {
+                (&a_root, &a_hidden)
+            } else {
+                (&a_hidden, &a_root)
+            };
+            if from.exists() {
+                std::fs::rename(from, to).expect("toggle replica A staging dir");
+            }
+        };
+        let send = |state: &SharedState, method: &str, uri: String, body: Vec<u8>| {
+            let app = tdh::router_with_auth(router(), state.clone(), auth.clone());
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::from(body))
+                .expect("build request");
+            async move { tdh::send(app, req).await }
+        };
+
+        let parts: Vec<Vec<u8>> = (0u8..3)
+            .map(|i| (0u32..(70 * 1024)).map(|b| (b % 241) as u8 ^ i).collect())
+            .collect();
+        let expected: Vec<u8> = parts.concat();
+
+        let (status, body) = send(
+            &replica_a,
+            "POST",
+            format!("/{}/images/alpine/3.20/rootfs.squashfs/uploads", f.repo_key),
+            parts[0].clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session_id: Uuid = serde_json::from_slice::<serde_json::Value>(&body)
+            .expect("start JSON")["session_id"]
+            .as_str()
+            .expect("session_id")
+            .parse()
+            .expect("uuid");
+        let session_uri = format!("/{}/uploads/{}", f.repo_key, session_id);
+        hide_a(true);
+        let (b_status, b_body) =
+            send(&replica_b, "PATCH", session_uri.clone(), parts[1].clone()).await;
+        hide_a(false);
+        let (a_status, a_body) =
+            send(&replica_a, "PATCH", session_uri.clone(), parts[2].clone()).await;
+        hide_a(true);
+        let (c_status, c_body) = send(&replica_b, "PUT", session_uri.clone(), Vec::new()).await;
+        let progress = if c_status == StatusCode::ACCEPTED {
+            Some(await_finalize(&f, session_id).await)
+        } else {
+            None
+        };
+        hide_a(false);
+        let resp = download(&f, "alpine/3.20/rootfs.squashfs").await;
+        let served_status = resp.status();
+        let served = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("download body");
+        let leftovers: Vec<std::path::PathBuf> = [&scratch_a, &scratch_b]
+            .iter()
+            .filter_map(|d| std::fs::read_dir(staging_root(d.path().to_str().unwrap())).ok())
+            .flat_map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())))
+            .collect();
+        let staged_objects = std::fs::read_dir(f.storage_dir.join("generic-upload-staging"))
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+
+        let text = |b: &Bytes| String::from_utf8_lossy(b).into_owned();
+        assert_eq!(
+            b_status,
+            StatusCode::ACCEPTED,
+            "chunk on replica B: {}",
+            text(&b_body)
+        );
+        assert_eq!(
+            a_status,
+            StatusCode::ACCEPTED,
+            "chunk on replica A: {}",
+            text(&a_body)
+        );
+        assert_eq!(
+            c_status,
+            StatusCode::ACCEPTED,
+            "complete on replica B: {}",
+            text(&c_body)
+        );
+        let complete: serde_json::Value = serde_json::from_slice(&c_body).expect("complete JSON");
+        assert_eq!(complete["size"].as_i64(), Some(expected.len() as i64));
+        assert_eq!(
+            complete["sha256"].as_str(),
+            Some(sha256_hex(&expected).as_str())
+        );
+        assert_eq!(
+            progress.as_ref().and_then(|p| p["status"].as_str()),
+            Some("completed"),
+            "{progress:?}"
+        );
+        assert_eq!(served_status, StatusCode::OK);
+        assert!(
+            served.as_ref() == expected.as_slice(),
+            "chunks assembled out of order"
+        );
+        assert!(leftovers.is_empty(), "local staging leaked: {leftovers:?}");
+        assert_eq!(staged_objects, 0, "shared staged chunks must be purged");
+    }
+
     /// The fixture repository as the finalize task sees it.
     fn fixture_repo_info(f: &tdh::Fixture) -> RepoInfo {
         RepoInfo {
@@ -4783,6 +5239,7 @@ mod streaming_pipeline_regression_tests {
                 committed_offset: image.len() as i64,
                 final_path: None,
                 finalize_token,
+                staged_part_keys: Vec::new(),
             },
         )
         .await;
@@ -4887,6 +5344,7 @@ mod streaming_pipeline_regression_tests {
                 committed_offset: 0,
                 final_path: None,
                 finalize_token,
+                staged_part_keys: Vec::new(),
             },
         )
         .await;
@@ -5012,6 +5470,7 @@ mod streaming_pipeline_regression_tests {
                 committed_offset: 0,
                 final_path: None,
                 finalize_token: stale_token,
+                staged_part_keys: Vec::new(),
             },
         )
         .await;
