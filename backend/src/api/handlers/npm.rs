@@ -4547,6 +4547,22 @@ async fn serve_tarball(
             // security scanners can identify the file as a gzip archive.
             correct_cached_tarball_content_type(&state.db, repo.id, &fetch_path).await;
 
+            // #4341: count the proxied tarball. The scanned arm records
+            // through `serve_scanned_proxy_file` and the Virtual walk through
+            // its own resolver; this unscanned direct-Remote arm recorded
+            // nothing, so npm proxy traffic was undercounted. Keyed on
+            // `fetch_path`, the canonical key the streaming tee commits the
+            // catalog row under; HEAD is never counted; off the response path
+            // like Maven's direct Remote arm (#3778).
+            proxy_helpers::record_proxy_download_deferred(
+                state,
+                repo.id,
+                repo_key,
+                &fetch_path,
+                ctx,
+            )
+            .await;
+
             // Force the outbound Content-Type to application/gzip regardless of
             // what the upstream advertised — parity with the buffered path
             // (build_tarball_response(None)) and the virtual path
@@ -4710,6 +4726,17 @@ async fn serve_tarball(
                         )
                         .await?;
                         correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
+                        // #4341: the last-known-good tarball is this member's
+                        // serve; count it under the member like every other
+                        // Remote-member serve through a Virtual (#4535).
+                        proxy_helpers::record_proxy_download_deferred(
+                            state,
+                            member.id,
+                            &member.key,
+                            &lkg_path,
+                            ctx,
+                        )
+                        .await;
                         return Ok(build_tarball_response_stream(
                             lkg.body,
                             &lkg_filename,
@@ -10782,6 +10809,94 @@ mod tests {
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
 
         cleanup().await;
+    }
+
+    /// #4341: a direct GET of a tarball on an npm Remote with scan-on-proxy
+    /// off records one proxy download under the canonical tarball path, as
+    /// the scanned and Virtual paths already did; HEAD records none.
+    #[tokio::test]
+    async fn test_remote_unscanned_tarball_download_is_recorded_4341() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        const TARBALL: &str = "is-number/-/is-number-7.0.0.tgz";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{TARBALL}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(b"\x1f\x8b\x08is-number-4341".as_ref()),
+            )
+            .mount(&mock_server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let request = |verb: &str| {
+            axum::http::Request::builder()
+                .method(verb)
+                .uri(format!("/{}/{TARBALL}", fx.repo_key))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM proxy_download_statistics d \
+                 JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+                 WHERE a.repository_id = $1 AND a.path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(TARBALL)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count statistics rows")
+        };
+        // The recorder may ride a spawned task (#3778): poll for `want`.
+        let settle = |want: i64| async move {
+            let mut seen = 0;
+            for _ in 0..100 {
+                seen = count().await;
+                if seen >= want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            seen
+        };
+
+        let mut seen = Vec::new();
+        for (verb, want) in [("GET", 1), ("HEAD", 1), ("GET", 2)] {
+            let (status, _) =
+                tdh::send(tdh::router_anon(router(), state.clone()), request(verb)).await;
+            assert_eq!(status, StatusCode::OK, "{verb}");
+            if verb == "HEAD" {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            seen.push((verb, settle(want).await));
+        }
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert_eq!(seen, vec![("GET", 1), ("HEAD", 1), ("GET", 2)]);
     }
 
     // -----------------------------------------------------------------------

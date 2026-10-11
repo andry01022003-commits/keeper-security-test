@@ -22530,6 +22530,11 @@ mod proxy_download_recording_tests {
         "proxy_fetch_streaming_with_cache_key_verified(",
         "proxy_fetch_streaming_response_with_cache_key(",
         "try_upstream_fetch_with_accept(",
+        // #4341: npm's direct-Remote tarball arm streams through the
+        // `ProxyService` method itself (the digest-flexible SRI gate has no
+        // `proxy_helpers` wrapper), so the gate has to name it or that arm is
+        // invisible to it.
+        "fetch_artifact_streaming_with_cache_path_gated_digest(",
     ];
 
     /// Calls that count as recording the serve. `try_remote_or_virtual_download`
@@ -22547,6 +22552,14 @@ mod proxy_download_recording_tests {
         // arms (the scanned 200 and the over-cap fail-open stream).
         "serve_scanned_proxy_file(",
     ];
+
+    /// Recorders that record THEIR OWN serve only (#4341). The scan-on-proxy
+    /// wrapper records the scanned 200 it builds, never the unscanned arm of
+    /// the function that calls it, so calling a function that wraps it does
+    /// not count as recording a serve the caller streams itself. Without this
+    /// the one-hop rule below let npm's unscanned direct-Remote tarball arm
+    /// pass because the same function also calls `serve_scanned_npm_tarball`.
+    const SELF_ONLY_RECORDERS: &[&str] = &["serve_scanned_proxy_file("];
 
     const MARKER: &str = "UNRECORDED-PROXY-SERVE:";
 
@@ -22635,9 +22648,16 @@ mod proxy_download_recording_tests {
                 let end = fns.get(i + 1).map(|(o, _)| *o).unwrap_or(src.len());
                 bodies.entry(name).or_default().push_str(&src[*off..end]);
             }
+            // Functions a one-hop caller or callee may lean on: those that
+            // record through something other than a self-only recorder.
             let recorders: Vec<&str> = bodies
                 .iter()
-                .filter(|(_, body)| RECORDERS.iter().any(|r| body.contains(r)))
+                .filter(|(_, body)| {
+                    RECORDERS
+                        .iter()
+                        .filter(|r| !SELF_ONLY_RECORDERS.contains(r))
+                        .any(|r| body.contains(r))
+                })
                 .map(|(name, _)| *name)
                 .collect();
 
@@ -22778,6 +22798,11 @@ mod proxy_download_recording_tests {
             ),
             // #4120 moved the Go module `.zip` download the same way.
             ("goproxy.rs", "proxy_fetch_streaming_with_format("),
+            // #4341: npm's direct-Remote tarball arm.
+            (
+                "npm.rs",
+                "fetch_artifact_streaming_with_cache_path_gated_digest(",
+            ),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()
