@@ -1518,11 +1518,11 @@ async fn recipe_revision_exists_for_repo(
     .await
 }
 
-/// A hosted repository's contribution to [`recipe_package_search`]: the
-/// package ids it stores for the recipe revision, and whether it holds that
-/// revision at all (only queried when there are no ids, since ids imply it).
+/// Storage key of the newest stored `conaninfo.txt` of each package id of a
+/// recipe revision. Backs the configuration in [`hosted_package_search`]
+/// (#4334).
 #[allow(clippy::too_many_arguments)]
-async fn hosted_package_search(
+async fn conaninfo_keys_for_recipe_revision(
     db: &PgPool,
     repository_id: uuid::Uuid,
     name: &str,
@@ -1530,19 +1530,134 @@ async fn hosted_package_search(
     user: &str,
     channel: &str,
     revision: &str,
-) -> Result<(Vec<String>, bool), Response> {
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT DISTINCT ON (am.metadata->>'packageId')
+               am.metadata->>'packageId', a.storage_key
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+          AND am.metadata->>'type' = 'package'
+          AND am.metadata->>'file' = 'conaninfo.txt'
+          AND am.metadata->>'packageId' IS NOT NULL
+        ORDER BY am.metadata->>'packageId', a.created_at DESC, a.id DESC
+        "#,
+    )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .bind(normalize_user(user))
+    .bind(normalize_channel(channel))
+    .bind(revision)
+    .fetch_all(db)
+    .await
+}
+
+/// A hosted repository's contribution to [`recipe_package_search`]: each
+/// package id it stores for the recipe revision mapped to its configuration,
+/// and whether it holds that revision at all (only queried when there are no
+/// ids, since ids imply it).
+///
+/// The configuration is conan_server's shape, `{"content": "<conaninfo.txt>"}`,
+/// which the Conan 2 client parses with `load_binary_info` to filter on
+/// settings and options (`conan list -p "os=Linux"`, `conan download -p ...`).
+/// An empty object here made every such filter match nothing (#4334).
+/// `list_only` (the client's own flag, for callers that only want the ids)
+/// skips reading the files. A `conaninfo.txt` that cannot be read leaves that
+/// id's object empty rather than failing the search.
+#[allow(clippy::too_many_arguments)]
+async fn hosted_package_search(
+    state: &SharedState,
+    repository_id: uuid::Uuid,
+    location: &crate::storage::StorageLocation,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    list_only: bool,
+) -> Result<(serde_json::Map<String, serde_json::Value>, bool), Response> {
+    let db = &state.db;
     let ids =
         package_ids_for_recipe_revision(db, repository_id, name, version, user, channel, revision)
             .await
             .map_err(map_db_err)?;
-    if !ids.is_empty() {
-        return Ok((ids, true));
+    let mut packages: serde_json::Map<String, serde_json::Value> = ids
+        .into_iter()
+        .map(|id| (id, serde_json::Value::Object(serde_json::Map::new())))
+        .collect();
+    if packages.is_empty() {
+        let exists = recipe_revision_exists_for_repo(
+            db,
+            repository_id,
+            name,
+            version,
+            user,
+            channel,
+            revision,
+        )
+        .await
+        .map_err(map_db_err)?;
+        return Ok((packages, exists));
     }
-    let exists =
-        recipe_revision_exists_for_repo(db, repository_id, name, version, user, channel, revision)
-            .await
-            .map_err(map_db_err)?;
-    Ok((ids, exists))
+    if list_only {
+        return Ok((packages, true));
+    }
+
+    let keys = conaninfo_keys_for_recipe_revision(
+        db,
+        repository_id,
+        name,
+        version,
+        user,
+        channel,
+        revision,
+    )
+    .await
+    .map_err(map_db_err)?;
+    let storage = state
+        .storage_for_repo(location)
+        .map_err(|e| e.into_response())?;
+    for (package_id, storage_key) in keys {
+        let Some(entry) = packages.get_mut(&package_id) else {
+            continue;
+        };
+        match storage.get(&storage_key).await {
+            Ok(bytes) => {
+                *entry = serde_json::json!({
+                    "content": String::from_utf8_lossy(&bytes),
+                });
+            }
+            Err(e) => tracing::warn!(
+                "conan package search: cannot read conaninfo.txt of {}: {}",
+                package_id,
+                e
+            ),
+        }
+    }
+    Ok((packages, true))
+}
+
+/// `?list_only=` on a package search: Conan sends `True` / `False`.
+#[derive(serde::Deserialize, Default)]
+struct PackageSearchQuery {
+    list_only: Option<String>,
+}
+
+impl PackageSearchQuery {
+    fn list_only(&self) -> bool {
+        self.list_only
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
+    }
 }
 
 /// Fold one upstream package-search outcome into [`recipe_package_search`]'s
@@ -1578,12 +1693,14 @@ async fn recipe_package_search(
         String,
         String,
     )>,
+    query: Option<Query<PackageSearchQuery>>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    let list_only = query.map(|Query(q)| q).unwrap_or_default().list_only();
 
-    // Package ID -> configuration map. Hosted rows contribute an empty object
-    // (the ID is what `download` needs); a remote upstream contributes the full
-    // configuration and takes precedence for shared IDs.
+    // Package ID -> configuration map. Hosted rows contribute their stored
+    // `conaninfo.txt` (#4334); a remote upstream contributes its own answer and
+    // takes precedence for shared IDs.
     let mut packages = serde_json::Map::new();
     // Whether ANY consulted source holds the recipe revision. conan_server's
     // `search_packages` answers 404 for a missing recipe revision and `200 {}`
@@ -1595,11 +1712,9 @@ async fn recipe_package_search(
     // reported as "absent" (#3887).
     let mut upstream_err: Option<Response> = None;
     let add_local = |packages: &mut serde_json::Map<String, serde_json::Value>,
-                     ids: Vec<String>| {
-        for id in ids {
-            packages
-                .entry(id)
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                     local: serde_json::Map<String, serde_json::Value>| {
+        for (id, info) in local {
+            packages.entry(id).or_insert(info);
         }
     };
 
@@ -1611,8 +1726,10 @@ async fn recipe_package_search(
             proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type.is_hosted() {
+                let location = proxy_helpers::repo_info_from_member(member).storage_location();
                 let (ids, exists) = hosted_package_search(
-                    &state.db, member.id, &name, &version, &user, &channel, &revision,
+                    &state, member.id, &location, &name, &version, &user, &channel, &revision,
+                    list_only,
                 )
                 .await?;
                 recipe_found |= exists;
@@ -1645,7 +1762,15 @@ async fn recipe_package_search(
         }
     } else {
         let (ids, exists) = hosted_package_search(
-            &state.db, repo.id, &name, &version, &user, &channel, &revision,
+            &state,
+            repo.id,
+            &repo.storage_location(),
+            &name,
+            &version,
+            &user,
+            &channel,
+            &revision,
+            list_only,
         )
         .await?;
         recipe_found = exists;
@@ -10188,5 +10313,149 @@ mod latest_time_4335 {
         .expect("parsed");
         assert_eq!(parsed.revision, "abc");
         assert_eq!(parsed.time.as_deref(), Some("2025-12-09T12:51:39.337+0000"));
+    }
+}
+
+/// #4334: a hosted package search returns each binary's `conaninfo.txt` as
+/// `{"content": ...}` (conan_server's shape), so `conan list -p "os=Linux"`
+/// and `conan download -p ...` can filter on settings.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod package_search_settings_4334 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    fn conaninfo(os: &str) -> Vec<u8> {
+        format!("[settings]\narch=x86_64\nbuild_type=Release\nos={os}\n").into_bytes()
+    }
+
+    async fn publish(
+        state: &crate::api::SharedState,
+        auth: &crate::api::middleware::auth::AuthExtension,
+        repo_key: &str,
+    ) {
+        for (file, body) in [
+            ("conanfile.py", sample_conanfile_py().to_vec()),
+            ("conanmanifest.txt", sample_conanmanifest_txt().to_vec()),
+        ] {
+            let s = upload_recipe_file(
+                state, auth, repo_key, "osq", "1.0", "_", "_", "rr1", file, &body,
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "recipe {file}");
+        }
+        for (pid, os) in [
+            ("pid_linux", "Linux"),
+            ("pid_windows", "Windows"),
+            ("pid_macos", "Macos"),
+        ] {
+            for (file, body) in [
+                ("conan_package.tgz", sample_conan_package_tgz()),
+                ("conaninfo.txt", conaninfo(os)),
+                (
+                    "conanmanifest.txt",
+                    b"1700000000\nlib/payload.txt: 00\n".to_vec(),
+                ),
+            ] {
+                let s = upload_package_file(
+                    state, auth, repo_key, "osq", "1.0", "_", "_", "rr1", pid, "prev1", file, &body,
+                )
+                .await;
+                assert_eq!(s, StatusCode::CREATED, "{pid} {file}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_search_carries_each_binarys_conaninfo() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        publish(&state, &auth, &repo_key).await;
+
+        let app = router_with_auth(state, auth);
+        let base = format!("/{repo_key}/v2/conans/osq/1.0/_/_/revisions/rr1/search");
+        let (full, full_body) =
+            send(app.clone(), tdh::get(format!("{base}?list_only=False"))).await;
+        let (listed, listed_body) = send(app, tdh::get(format!("{base}?list_only=True"))).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            full,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&full_body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&full_body).unwrap();
+        for (pid, os) in [
+            ("pid_linux", "Linux"),
+            ("pid_windows", "Windows"),
+            ("pid_macos", "Macos"),
+        ] {
+            let content = v[pid]["content"].as_str().unwrap_or_else(|| {
+                panic!("{pid} has no conaninfo content: {v}");
+            });
+            assert!(content.contains(&format!("os={os}")), "{pid}: {content}");
+            assert!(content.contains("[settings]"), "{pid}: {content}");
+        }
+
+        assert_eq!(listed, StatusCode::OK);
+        let l: serde_json::Value = serde_json::from_slice(&listed_body).unwrap();
+        let mut keys: Vec<_> = l.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["pid_linux", "pid_macos", "pid_windows"]);
+    }
+
+    /// A virtual repository's search carries its hosted member's configuration
+    /// too.
+    #[tokio::test]
+    async fn virtual_search_carries_hosted_member_conaninfo() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let (virt_id, virt_key, vdir) = create_conan_repo(&pool, "virtual").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("add member");
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        publish(&state, &auth, &repo_key).await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            tdh::get(format!(
+                "/{virt_key}/v2/conans/osq/1.0/_/_/revisions/rr1/search?list_only=False"
+            )),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await;
+        cleanup(&pool, virt_id, user_id).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&vdir);
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let content = v["pid_linux"]["content"].as_str().unwrap_or_default();
+        assert!(content.contains("os=Linux"), "virtual search: {v}");
     }
 }
