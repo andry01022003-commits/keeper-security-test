@@ -1910,6 +1910,7 @@ fn scan_config_change_audit(
                 upstream_change: None,
                 project_change: None,
                 allow_public_with_upstream_credentials: None,
+                upstream_auth_change: None,
             }),
     )
 }

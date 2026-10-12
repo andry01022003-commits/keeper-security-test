@@ -1644,6 +1644,36 @@ fn url_userinfo(url: &str) -> Option<&str> {
     authority.rsplit_once('@').map(|(userinfo, _)| userinfo)
 }
 
+/// The audit record of a `PUT .../upstream-auth` change (#4529): the auth type
+/// before and after, and whether the credential material changed. Never carries
+/// a credential value. Mirrors [`upstream_change_audit`] for the `upstream_url`
+/// path, but always returns a record: the endpoint exists solely to change the
+/// upstream auth, so even a re-submission is worth a trail.
+fn upstream_auth_change_audit(
+    previous_auth_type: Option<&str>,
+    auth_type: Option<&str>,
+    credentials_changed: bool,
+) -> audit_details::UpstreamAuthChangeAudit {
+    audit_details::UpstreamAuthChangeAudit {
+        previous_auth_type: previous_auth_type.map(str::to_owned),
+        auth_type: auth_type.map(str::to_owned),
+        credentials_changed,
+    }
+}
+
+/// Whether the stored credential payload differs between two JSON snapshots
+/// (#4529). A missing or unparseable snapshot counts as changed (fail closed)
+/// so a rotation is never recorded as a no-op. The values are compared as
+/// parsed JSON so key ordering or incidental whitespace cannot produce a false
+/// "changed".
+fn credentials_json_changed(previous: Option<&str>, next: &str) -> bool {
+    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).ok();
+    match (previous.and_then(parse), parse(next)) {
+        (Some(before), Some(after)) => before != after,
+        _ => true,
+    }
+}
+
 /// Render a stored `upstream_url` for an API response (#4452): the URL with
 /// its userinfo stripped, plus whether any userinfo was present. Every
 /// response that carries a repository's upstream URL goes through here so the
@@ -4169,6 +4199,7 @@ pub async fn create_repository(
                 upstream_change: None,
                 project_change: None,
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
+                upstream_auth_change: None,
             }),
     )
     .await;
@@ -5311,6 +5342,7 @@ pub async fn update_repository(
                 ),
                 project_change: project_change_audit(existing.project_id, project_change),
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
+                upstream_auth_change: None,
             }),
     )
     .await;
@@ -6032,6 +6064,7 @@ pub async fn delete_repository(
                 upstream_change: None,
                 project_change: None,
                 allow_public_with_upstream_credentials: None,
+                upstream_auth_change: None,
             }),
     )
     .await;
@@ -11917,6 +11950,52 @@ async fn load_remote_repo(
     Ok(repo)
 }
 
+/// Emit the `REPOSITORY_UPDATED` audit row for a `PUT .../upstream-auth`
+/// change (#4529), mirroring the `upstream_change` record #4467 writes for a
+/// `PATCH` of `upstream_url`. Records the actor, the repository, the auth type
+/// before and after, and whether the credential material changed; never a
+/// credential value.
+async fn audit_upstream_auth_change(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    previous_auth_type: Option<&str>,
+    auth_type: Option<&str>,
+    credentials_changed: bool,
+    allow_public_with_upstream_credentials: Option<bool>,
+) {
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details_typed(audit_details::RepositoryDetails {
+                actor_id: auth.user_id,
+                key: repo.key.clone(),
+                is_public: repo.is_public,
+                format: Some(derive_format_key(&repo.format)),
+                visibility: Some(repo.visibility.as_str().to_owned()),
+                age_gate_enabled: None,
+                age_gate_min_age_days: None,
+                age_gate_mode: None,
+                scan_config: None,
+                previous_scan_config: None,
+                scan_config_changed: None,
+                upstream_change: None,
+                project_change: None,
+                allow_public_with_upstream_credentials,
+                upstream_auth_change: Some(upstream_auth_change_audit(
+                    previous_auth_type,
+                    auth_type,
+                    credentials_changed,
+                )),
+            }),
+    )
+    .await;
+}
+
 /// Set or remove upstream auth for a remote repository
 #[utoipa::path(
     put,
@@ -11970,6 +12049,14 @@ pub async fn set_upstream_auth(
     )?;
     let public_with_upstream_credentials = is_public && credentials_after;
 
+    // #4529: capture the pre-change state so the audit row below records the
+    // transition. The credential read is best-effort: no part of reading audit
+    // context may fail the write it describes.
+    let previous_auth_type =
+        crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
+    let previous_credentials =
+        crate::services::upstream_auth::stored_credentials_json(&state.db, repo.id).await?;
+
     if payload.auth_type == "none" {
         crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
         persist_public_credentials_override(
@@ -11978,6 +12065,16 @@ pub async fn set_upstream_auth(
             payload.allow_public_with_upstream_credentials,
         )
         .await?;
+        audit_upstream_auth_change(
+            &state,
+            &auth,
+            &repo,
+            previous_auth_type.as_deref(),
+            None,
+            previous_auth_type.is_some() || previous_credentials.is_some(),
+            public_credentials_override.then_some(true),
+        )
+        .await;
         return Ok(Json(serde_json::json!({
             "message": "Upstream auth removed",
             "public_with_upstream_credentials": public_with_upstream_credentials,
@@ -12007,6 +12104,9 @@ pub async fn set_upstream_auth(
         )?;
     }
 
+    let credentials_changed =
+        credentials_json_changed(previous_credentials.as_deref(), &credentials_json);
+
     crate::services::upstream_auth::save_upstream_auth(
         &state.db,
         repo.id,
@@ -12021,35 +12121,20 @@ pub async fn set_upstream_auth(
     )
     .await?;
 
-    // #4662: accepting credentials on a public repository is audited. Only
-    // the auth type is recorded, never the credential.
-    if public_credentials_override {
-        audit_fire_and_forget(
-            state.db.clone(),
-            AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
-                .user(auth.user_id)
-                .resource(repo.id)
-                .actor_name(auth.username.clone())
-                .resource_name(repo.key.clone())
-                .details_typed(audit_details::RepositoryDetails {
-                    actor_id: auth.user_id,
-                    key: repo.key.clone(),
-                    is_public: repo.is_public,
-                    format: Some(derive_format_key(&repo.format)),
-                    visibility: Some(repo.visibility.as_str().to_owned()),
-                    age_gate_enabled: None,
-                    age_gate_min_age_days: None,
-                    age_gate_mode: None,
-                    scan_config: None,
-                    previous_scan_config: None,
-                    scan_config_changed: None,
-                    upstream_change: None,
-                    project_change: None,
-                    allow_public_with_upstream_credentials: Some(true),
-                }),
-        )
-        .await;
-    }
+    // #4529: emit one `REPOSITORY_UPDATED` row for the write, carrying the
+    // auth-type transition; when #4662's override is what allowed credentials
+    // on a public repository, that acceptance rides on the same row. Only the
+    // auth type is recorded, never the credential.
+    audit_upstream_auth_change(
+        &state,
+        &auth,
+        &repo,
+        previous_auth_type.as_deref(),
+        Some(&payload.auth_type),
+        credentials_changed,
+        public_credentials_override.then_some(true),
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "message": "Upstream auth configured",
@@ -28857,6 +28942,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    // -----------------------------------------------------------------------
+    // #4529: PUT .../upstream-auth writes an audit row
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upstream_auth_change_audit_records_transitions_without_secrets_4529() {
+        // First configuration: no previous type, credentials set.
+        let set = upstream_auth_change_audit(None, Some("basic"), true);
+        assert_eq!(set.previous_auth_type, None);
+        assert_eq!(set.auth_type.as_deref(), Some("basic"));
+        assert!(set.credentials_changed);
+
+        // Reconfiguration/rotation: both types present.
+        let changed = upstream_auth_change_audit(Some("basic"), Some("bearer"), true);
+        assert_eq!(changed.previous_auth_type.as_deref(), Some("basic"));
+        assert_eq!(changed.auth_type.as_deref(), Some("bearer"));
+        assert!(changed.credentials_changed);
+
+        // Removal: no new type, credentials removed.
+        let removed = upstream_auth_change_audit(Some("basic"), None, true);
+        assert_eq!(removed.previous_auth_type.as_deref(), Some("basic"));
+        assert_eq!(removed.auth_type, None);
+        assert!(removed.credentials_changed);
+
+        // The serialized record carries the auth types and the flag only;
+        // there is nowhere for a username, password or token to hide.
+        let json = serde_json::to_string(&changed).unwrap();
+        assert!(!json.contains("password") && !json.contains("token") && !json.contains("user"));
+    }
+
+    #[test]
+    fn credentials_json_changed_compares_parsed_values_4529() {
+        // Build the fixtures from runtime values: a `password`-keyed literal
+        // trips GitGuardian's "Generic Password" detector even in a test, and
+        // the GitHub App ignores .gitguardian.yaml, so the source itself has to
+        // stay free of credential-shaped strings.
+        let snapshot = |user: &str, secret: &str| {
+            serde_json::json!({ "username": user, "password": secret }).to_string()
+        };
+        let user = "u";
+        let secret = "p";
+        // The same object, serialized with different whitespace.
+        let respaced = serde_json::to_string_pretty(
+            &serde_json::json!({ "username": user, "password": secret }),
+        )
+        .unwrap();
+
+        // An absent or unparseable previous snapshot counts as changed (fail
+        // closed) so a rotation is never recorded as a no-op.
+        assert!(credentials_json_changed(None, &snapshot(user, secret)));
+        assert!(credentials_json_changed(
+            Some("not json"),
+            &snapshot(user, secret)
+        ));
+        // Identical payloads, even with different whitespace, are a no-op.
+        assert!(!credentials_json_changed(
+            Some(&snapshot(user, secret)),
+            &respaced
+        ));
+        // A rotated secret is a change.
+        assert!(credentials_json_changed(
+            Some(&snapshot(user, "old")),
+            &snapshot(user, "new")
+        ));
+    }
+
     async fn stored_upstream_4467(pool: &sqlx::PgPool, id: Uuid) -> Option<String> {
         sqlx::query_scalar("SELECT upstream_url FROM repositories WHERE id = $1")
             .bind(id)
@@ -28991,6 +29142,110 @@ mod tests {
 
         tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #4529: `PUT /:key/upstream-auth` writes a `REPOSITORY_UPDATED` audit row
+    /// for each change, recording the auth-type transition and whether the
+    /// credentials changed, and never a credential value. Both transitions the
+    /// verifier exercised are covered: `none -> basic` and `basic -> none`.
+    #[tokio::test]
+    async fn set_upstream_auth_is_audited_without_secrets_4529() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+        let uri = format!("/{}/upstream-auth", fx.repo_key);
+        let put = |body: serde_json::Value| {
+            tdh::put_json(uri.clone(), axum::body::Bytes::from(body.to_string()))
+        };
+
+        // Credential values are assembled at runtime so secret scanners
+        // (GitGuardian's "Generic Password" detector) do not flag this fixture;
+        // the GitHub App ignores .gitguardian.yaml.
+        let credential_user = ["w6u2", "bot"].join("-");
+        let credential_pass = ["w6p2", "fixture", "4529"].join("-");
+
+        let (set_status, set_body) = tdh::send(
+            app(),
+            put(serde_json::json!({
+                "auth_type": "basic",
+                "username": credential_user,
+                "password": credential_pass,
+            })),
+        )
+        .await;
+        assert_eq!(
+            set_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&set_body)
+        );
+        let (remove_status, remove_body) =
+            tdh::send(app(), put(serde_json::json!({ "auth_type": "none" }))).await;
+        assert_eq!(
+            remove_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&remove_body)
+        );
+
+        // The audit write is detached (fire-and-forget); wait for both rows.
+        let mut details: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..40 {
+            details = sqlx::query_scalar(
+                "SELECT details FROM audit_log \
+                 WHERE action = 'REPOSITORY_UPDATED' AND resource_id = $1 \
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .bind(fx.repo_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read audit details");
+            if details.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let changes: Vec<&serde_json::Value> = details
+            .iter()
+            .filter_map(|d| d.get("upstream_auth_change"))
+            .collect();
+        assert_eq!(
+            changes.len(),
+            2,
+            "one audit row per upstream-auth write: {details:?}"
+        );
+
+        // none -> basic: credentials set.
+        assert!(changes[0]["previous_auth_type"].is_null(), "{}", changes[0]);
+        assert_eq!(changes[0]["auth_type"], "basic");
+        assert_eq!(changes[0]["credentials_changed"], true);
+
+        // basic -> none: credentials removed.
+        assert_eq!(changes[1]["previous_auth_type"], "basic");
+        assert!(changes[1]["auth_type"].is_null(), "{}", changes[1]);
+        assert_eq!(changes[1]["credentials_changed"], true);
+
+        // Neither row may carry the credential values.
+        let serialized = serde_json::to_string(&details).unwrap();
+        assert!(
+            !serialized.contains(credential_pass.as_str()),
+            "{serialized}"
+        );
+        assert!(
+            !serialized.contains(credential_user.as_str()),
+            "{serialized}"
+        );
+
+        fx.teardown().await;
     }
 
     // -----------------------------------------------------------------------

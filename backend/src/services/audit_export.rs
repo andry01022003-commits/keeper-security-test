@@ -457,6 +457,11 @@ pub mod details {
         /// spend those credentials upstream.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub allow_public_with_upstream_credentials: Option<bool>,
+        /// An upstream-auth change on `PUT .../upstream-auth` (#4529). Records
+        /// the auth types before and after and whether the credential material
+        /// changed; the credential values themselves are never recorded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub upstream_auth_change: Option<UpstreamAuthChangeAudit>,
     }
 
     /// Before/after of a repository's upstream URL, with userinfo stripped
@@ -474,6 +479,23 @@ pub mod details {
     pub struct ProjectChangeAudit {
         pub previous_project_id: Option<Uuid>,
         pub project_id: Option<Uuid>,
+    }
+
+    /// Before/after of a Remote's upstream auth (#4529). Only the auth types
+    /// and whether the stored credential material changed are recorded; no
+    /// credential value (username, password, token or AWS provider secret) is
+    /// ever carried.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct UpstreamAuthChangeAudit {
+        /// Auth type before the change; `null` when no upstream auth was
+        /// configured.
+        pub previous_auth_type: Option<String>,
+        /// Auth type after the change; `null` when upstream auth was removed.
+        pub auth_type: Option<String>,
+        /// Whether the stored credential material actually changed: a first
+        /// configuration (`set`), a rotation (`changed`) or a removal
+        /// (`removed`). `false` for a re-save of identical credentials.
+        pub credentials_changed: bool,
     }
 
     /// One repository scan configuration, as carried by a
@@ -1243,6 +1265,7 @@ mod tests {
             upstream_change: None,
             project_change: None,
             allow_public_with_upstream_credentials: None,
+            upstream_auth_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

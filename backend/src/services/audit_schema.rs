@@ -286,6 +286,7 @@ mod tests {
                     upstream_change: None,
                     project_change: None,
                     allow_public_with_upstream_credentials: None,
+                    upstream_auth_change: None,
                 }),
         ];
         for entry in &entries {
@@ -370,6 +371,7 @@ mod tests {
                     project_id: None,
                 }),
                 allow_public_with_upstream_credentials: None,
+                upstream_auth_change: None,
             })
             .unwrap(),
         );
