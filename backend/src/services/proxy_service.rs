@@ -10963,7 +10963,7 @@ mod tests {
     #[tokio::test]
     async fn test_lazy_catalog_backfill_permit_is_acquired_then_released() {
         let service = ProxyService::new(
-            test_catalog_pool(),
+            fast_failing_catalog_pool(),
             Arc::new(StorageService::new(Arc::new(CacheFreshMock::new(
                 None, false,
             )))),
@@ -10989,14 +10989,17 @@ mod tests {
             "spawning a backfill must claim a limiter permit up front"
         );
 
-        // Let the spawned task run to completion against the never-connecting
-        // pool (fails fast, logs at debug, drops its permit on the way out).
-        for _ in 0..50 {
-            if service.backfill_limiter.available_permits() == before {
-                break;
+        // Let the spawned task run to completion against the fast-failing pool
+        // (logs at debug, drops its permit on the way out). `fast_failing_catalog_pool`
+        // bounds the connection attempt, so the permit is released promptly
+        // rather than racing DNS/connect latency; the generous outer bound only
+        // guards against a pathologically starved runtime.
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while service.backfill_limiter.available_permits() != before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await;
         assert_eq!(
             service.backfill_limiter.available_permits(),
             before,
@@ -12191,6 +12194,26 @@ mod tests {
     /// a live DB; the best-effort catalog write logs and returns.
     fn test_catalog_pool() -> PgPool {
         sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap()
+    }
+
+    /// Like [`test_catalog_pool`], but whose connection attempt fails fast and
+    /// *deterministically*.
+    ///
+    /// The permit-release regression test spawns a backfill task that ends in a
+    /// best-effort DB write against a never-connecting pool, and asserts the
+    /// limiter permit is released once the task finishes. With the plain
+    /// `test_catalog_pool()` the task holds its permit until the connection
+    /// attempt fails — which on a loaded CI runner was observed to take seconds
+    /// (slow resolution of the bare `invalid` host) and blow past the test's
+    /// poll window (the #4632 `services-1` flake, reproduced by delaying
+    /// `getaddrinfo`). Pointing at `127.0.0.1:1` (connection refused, no DNS)
+    /// and bounding `acquire_timeout` makes the attempt fail in well under a
+    /// second regardless of resolver or runner load.
+    fn fast_failing_catalog_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://127.0.0.1:1/")
+            .expect("lazy pool URL is valid")
     }
 
     fn template() -> CacheMetadataTemplate {
