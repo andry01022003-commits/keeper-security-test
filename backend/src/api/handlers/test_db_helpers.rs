@@ -599,12 +599,16 @@ fn cfg(storage_path: &str) -> Config {
         guest_access_enabled: true,
         guest_access_env_pinned: false,
         expose_detailed_health: false,
+        readyz_require_search: false,
         setup_password_hint: None,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         conda_attestation_require_verified: true,
+        conda_attestation_issuers: Vec::new(),
+        conda_attestation_identities: Vec::new(),
+        conda_attestation_public_keys: Vec::new(),
         peer_instance_name: "test".into(),
         peer_public_endpoint: "http://localhost:8080".into(),
         peer_api_key: "test-key".into(),
@@ -640,6 +644,9 @@ fn cfg(storage_path: &str) -> Config {
         auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        upload_progress_window_secs: 60,
+        upload_min_progress_bytes: 16 * 1024,
+        upload_max_in_flight_per_principal: 64,
         rate_limit_enabled: true,
         rate_limit_auth_per_window: 120,
         rate_limit_api_per_window: 5000,
@@ -694,6 +701,9 @@ fn cfg(storage_path: &str) -> Config {
         smtp_password: None,
         smtp_from_address: "noreply@test.local".to_string(),
         smtp_tls_mode: "starttls".to_string(),
+        smtp_tls_ca_cert: None,
+        smtp_tls_ca_cert_source: None,
+        smtp_tls_skip_verify: false,
         npm_packument_cache_enabled: true,
         npm_packument_cache_fresh_ttl_secs: 300,
         npm_packument_cache_stale_max_secs: 86_400,
@@ -2421,6 +2431,59 @@ pub fn build_state_with_proxy_and_scanner(
 /// Enable scan-on-proxy for a repository with the given
 /// `proxy_scan_action` (`"fail_open"` / `"fail_closed"`). Shared by the
 /// inline scan-and-block handler tests (#2954 PyPI, #3003 npm).
+/// A pool on which the `scan_configs` table cannot be read (#4365 item 5):
+/// every session's `search_path` puts a private schema first, holding a
+/// `scan_configs` view that raises `division_by_zero` on any row it reads.
+/// Every other table resolves to the real one, so a handler gets as far as
+/// its scan-policy read and fails there, exactly as on a database fault.
+/// Only rows that exist fault, so the repository under test needs a
+/// `scan_configs` row ([`enable_proxy_scan`]). Returns the pool and the
+/// schema to pass to [`drop_unreadable_scan_configs`]. `None` without a DB.
+pub async fn pool_with_unreadable_scan_configs() -> Option<(PgPool, String)> {
+    let base = try_pool().await?;
+    let url = crate::testing::require_db_url()?;
+    let schema = format!("ak_fault_{}", Uuid::new_v4().simple());
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE VIEW {schema}.scan_configs AS \
+             SELECT s.* FROM public.scan_configs s \
+             WHERE 1 / (s.block_on_policy_violation::int * 0) = 1"
+        ),
+    ] {
+        // The schema name is generated here (a UUID), never caller input.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&base)
+            .await
+            .expect("create the unreadable scan_configs view");
+    }
+    let search_path = format!("SET search_path TO {schema}, public");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(search_path))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect the unreadable-config pool");
+    Some((pool, schema))
+}
+
+/// Drop the schema [`pool_with_unreadable_scan_configs`] created.
+pub async fn drop_unreadable_scan_configs(pool: &PgPool, schema: &str) {
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await;
+}
+
 pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     sqlx::query(
         "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
@@ -3224,5 +3287,55 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
 
     fn make_writer(&self) -> Self::Writer {
         self.clone()
+    }
+}
+
+/// A transient failure of the virtual-member AUTHORIZATION query alone, for
+/// the #4308 regressions: the member fetch (`virtual_repo_members` +
+/// `repositories`) still succeeds, but the grant predicate an authenticated
+/// non-admin caller's visibility filter evaluates (`role_assignments`) cannot
+/// be read.
+///
+/// Holds an `ACCESS EXCLUSIVE` lock on `role_assignments` from its own
+/// connection, and returns a separate small pool whose sessions run with a
+/// short `lock_timeout`, so a query through that pool that touches the table
+/// fails with a database error (the same `AppError::Database` shape as a pool
+/// timeout) instead of waiting. Other tests touching the table only wait for
+/// the guard to drop. Returns `None` without a database.
+pub struct AuthzQueryOutage {
+    pub pool: PgPool,
+    lock: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl AuthzQueryOutage {
+    pub async fn start(lock_pool: &PgPool) -> Option<Self> {
+        use std::str::FromStr;
+        let url = crate::testing::require_db_url()?;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .options([("lock_timeout", "300")]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_with(opts)
+            .await
+            .expect("connect lock-timeout pool");
+        let mut tx = lock_pool.begin().await.expect("begin lock transaction");
+        sqlx::query("LOCK TABLE role_assignments IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("lock role_assignments");
+        Some(Self {
+            pool,
+            lock: Some(tx),
+        })
+    }
+
+    /// Release the lock (rolls the holding transaction back).
+    pub async fn end(mut self) {
+        if let Some(tx) = self.lock.take() {
+            let _ = tx.rollback().await;
+        }
+        self.pool.close().await;
     }
 }

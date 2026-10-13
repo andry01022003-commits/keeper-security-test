@@ -1065,6 +1065,26 @@ pub(crate) fn is_within_dedup_ttl(
 // scan_type) advisory lock, so there is no longer a database-free branch to
 // unit-test in isolation.
 
+/// Whether `scan_artifact_inner` must look up the artifact's OWN completed
+/// row before acting on a cross-artifact dedup match (#4425).
+///
+/// `find_reusable_scan` returns only original scans (`source_scan_id IS
+/// NULL`), so when this artifact's own completed row is a reused copy the
+/// match points at another artifact. With a prepared placeholder
+/// (`Reuse`) that is harmless: the prepare step already short-circuited to
+/// the artifact's own completed row and `convert_to_reused` no-ops on it.
+/// With `InsertFresh` there is no such guard and the reuse path would
+/// INSERT a second completed row for the same artifact and scan type, so
+/// the caller checks for an existing own row first.
+pub(crate) fn needs_own_scan_lookup(
+    source_artifact_id: Uuid,
+    current_artifact_id: Uuid,
+    prepared_action: &PreparedScanAction,
+) -> bool {
+    !should_skip_reuse_for_same_artifact(source_artifact_id, current_artifact_id)
+        && matches!(prepared_action, PreparedScanAction::InsertFresh)
+}
+
 /// Outcome of the same-artifact branch inside `scan_artifact_inner` when
 /// `find_reusable_scan` returns a row whose `artifact_id` matches the
 /// artifact currently being scanned.
@@ -4080,6 +4100,35 @@ pub enum ComponentEcosystem {
     Maven,
 }
 
+impl ComponentEcosystem {
+    /// Whether the CVE engine is expected to catalog a package of this
+    /// ecosystem AS ITSELF, so that an empty catalog means the engine could
+    /// not see the package (#4594).
+    ///
+    /// True for every ecosystem the engine has a cataloger for: the pin file
+    /// (npm, Python, RubyGems, Cargo, NuGet) or the archive's own metadata
+    /// (Maven) puts the package in the catalog, and an empty catalog means
+    /// the engine graded nothing, which is inconclusive.
+    ///
+    /// False for conda. No bundled engine catalogs a conda package as a conda
+    /// component (see [`ComponentEcosystem::Conda`]); what it catalogs is the
+    /// content the package installs (a `.dist-info`, a recognised binary).
+    /// For a compiled library or a data package (`tzdata`, `ca-certificates`)
+    /// there is nothing of that kind, and an empty catalog is the expected
+    /// result of a scan that ran to completion over the unpacked archive.
+    /// The inline gate grades such a scan on its findings, records
+    /// `components_cataloged = 0`, and still withholds a scan that could not
+    /// run. The same holds when the engine cataloged only components that are
+    /// not the conda `name@version` (#4600): a compiled package is cataloged
+    /// under the upstream component it vendors (`libzlib` as `zlib`), so that
+    /// scan is graded on its findings too. What the bytes are served as is
+    /// established from the package's own `info/index.json` before the scan
+    /// runs, and bytes that disagree with the file name are still withheld.
+    pub fn engine_catalogs_the_package(self) -> bool {
+        !matches!(self, ComponentEcosystem::Conda)
+    }
+}
+
 /// The identity a proxied artifact is being SERVED AS — derived from the
 /// request coordinate (route package name + filename version), never from
 /// bytes the upstream controls (#3003).
@@ -4263,6 +4312,15 @@ pub struct ProxyScanVerdict {
     /// no CVE id), so `findings.len()` is a LOWER BOUND on `findings_count` and
     /// the two must not be asserted equal.
     pub findings: Vec<ProxyFinding>,
+    /// How many distinct components the CVE-authoritative engine cataloged
+    /// for these bytes (#4594), or `None` when no engine reported a catalog.
+    /// Persisted on the verdict row as `components_cataloged` and shown in
+    /// the proxy-scans view. `Some(0)` on a `clean` verdict means the package
+    /// was graded on its file contents only: the engine unpacked and read it,
+    /// recognised no component, and matched no advisory (a conda package
+    /// with no Python or recognised binary content). Like `packages`, it is
+    /// attached after aggregation and never moves the counts.
+    pub components_cataloged: Option<i32>,
 }
 
 impl ProxyScanVerdict {
@@ -4539,6 +4597,7 @@ pub fn aggregate_proxy_verdict(
         packages: Vec::new(),
         scan_completeness: None,
         findings: Vec::new(),
+        components_cataloged: None,
     }
 }
 
@@ -4610,9 +4669,18 @@ pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
 ///    abort the scan — only the CVE engine is load-bearing.
 /// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
 ///    an `expected_component`. `is_vulnerable()` counts findings above `Info`,
-///    so an engine that ran but had nothing to grade reports "clean".
+///    so an engine that ran but had nothing to grade reports "clean". The one
+///    exception is an ecosystem the engine never catalogs as itself (conda,
+///    see [`ComponentEcosystem::engine_catalogs_the_package`], #4594): there
+///    an empty catalog from a completed scan is graded on its findings and
+///    recorded with `components_cataloged = 0`.
 /// 3. **What it cataloged is what we are serving** (#3003). A clean grade of
-///    some other identity says nothing about these bytes.
+///    some other identity says nothing about these bytes. Conda is again the
+///    exception (#4600): the engine grades a conda package's contents, not
+///    the package, and a compiled one is cataloged under the upstream
+///    component it vendors, so a completed scan whose catalog names other
+///    components is graded on its findings. The served identity is checked
+///    against the package's own `info/index.json` before the scan instead.
 ///
 /// All three return the same inconclusive `Err`, which the caller maps onto the
 /// repo's action (fail-closed → 423, fail-open → serve + loud pending), and no
@@ -4729,7 +4797,22 @@ async fn run_inline_proxy_scanners_target(
     // skipping the gate as "no signal" — the designed semantics finally
     // firing for exactly the case the gate was built for.
     if let (Some(expected), Some(cataloged)) = (target.expected_component, cve_cataloged.as_ref()) {
-        if cataloged.is_empty() {
+        let graded_on_contents = !expected.ecosystem.engine_catalogs_the_package();
+        if cataloged.is_empty() && graded_on_contents {
+            // #4594: the engine is not expected to catalog this package as
+            // itself (conda), and it completed `Ok` over the unpacked archive
+            // (an archive it cannot unpack is a scanner error, handled above).
+            // Nothing cataloged is then the normal result for a package with
+            // no Python or recognised binary content, so the verdict is graded
+            // on the findings alone and carries `components_cataloged = 0`.
+            info!(
+                artifact = %synthetic.name,
+                expected = %format!("{}@{}", expected.name, expected.version),
+                findings = findings.len(),
+                "inline proxy scan: CVE engine cataloged no components for a package \
+                 it does not catalog as itself; graded on file contents only"
+            );
+        } else if cataloged.is_empty() {
             warn!(
                 artifact = %synthetic.name,
                 expected = %format!("{}@{}", expected.name, expected.version),
@@ -4742,8 +4825,28 @@ async fn run_inline_proxy_scanners_target(
                  not a clean verdict)"
                     .to_string(),
             ));
-        }
-        if !cataloged.iter().any(|c| expected.matches(c)) {
+        } else if !cataloged.iter().any(|c| expected.matches(c)) && graded_on_contents {
+            // #4600: the same rule when the engine cataloged components but
+            // none is the conda package itself. That is the normal result for
+            // a compiled package (`libzlib` cataloged as `zlib`, `pillow` with
+            // its vendored `libjpeg-turbo`): the scan completed over the
+            // package's contents, so it is graded on its findings, and the
+            // verdict records how many components the grade rests on. The
+            // identity being served was already checked against the
+            // package's own `info/index.json` before the scan (bytes that
+            // disagree with the file name never reach the engine).
+            info!(
+                artifact = %synthetic.name,
+                expected = %format!("{}@{}", expected.name, expected.version),
+                cataloged = ?cataloged
+                    .iter()
+                    .map(|c| format!("{}@{}", c.name, c.version))
+                    .collect::<Vec<_>>(),
+                findings = findings.len(),
+                "inline proxy scan: CVE engine cataloged other components than a package it \
+                 does not catalog as itself (vendored content); graded on its findings"
+            );
+        } else if !cataloged.iter().any(|c| expected.matches(c)) {
             warn!(
                 artifact = %synthetic.name,
                 expected = %format!("{}@{}", expected.name, expected.version),
@@ -4833,6 +4936,16 @@ async fn run_inline_proxy_scanners_target(
     // Same contract as `packages`: attached after aggregation so the counts are
     // computed from the raw findings and this projection cannot move them.
     verdict.findings = retain_proxy_findings(&findings);
+    // #4594: what the engine cataloged, counted once per distinct
+    // `name@version`, so the stored verdict says whether it graded any
+    // component or only the file contents.
+    verdict.components_cataloged = cve_cataloged.as_ref().map(|c| {
+        let distinct: std::collections::HashSet<(&str, &str)> = c
+            .iter()
+            .map(|c| (c.name.as_str(), c.version.as_str()))
+            .collect();
+        i32::try_from(distinct.len()).unwrap_or(i32::MAX)
+    });
     Ok(verdict)
 }
 
@@ -8286,7 +8399,41 @@ impl ScannerService {
                     .ok()
                     .flatten()
             };
-            if let Some(source_scan) = reusable {
+            if let Some(mut source_scan) = reusable {
+                // #4425: `find_reusable_scan` only returns ORIGINAL scans, so
+                // an artifact whose own row is a reused copy is handed the
+                // original (another artifact's) row. Without this check the
+                // InsertFresh path (auto-scan, repository scan) would copy it
+                // into a SECOND completed row for this artifact. Prefer the
+                // artifact's own row when it passes the same reuse filters
+                // (pin, not_cataloged, TTL), so the #1373 branch below treats
+                // it as already scanned. A lookup error falls through to the
+                // copy, the pre-#4425 behaviour.
+                if needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action) {
+                    match self
+                        .scan_result_service
+                        .find_own_reusable_scan(
+                            artifact_id,
+                            checksum,
+                            scanner.scan_type(),
+                            DEDUP_TTL_DAYS,
+                            ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                            pin_identity.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(Some(own)) => source_scan = own,
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            "Own-scan lookup failed for artifact {} (scanner={}): {}; \
+                             reusing {} by copy",
+                            artifact_id,
+                            scanner.name(),
+                            e,
+                            source_scan.id
+                        ),
+                    }
+                }
                 // #1373: when the matched source scan is for THIS artifact,
                 // a completed scan for these exact bytes already exists. We
                 // must not run a fresh scan or copy results into a new row;
@@ -9943,6 +10090,16 @@ pub(crate) mod test_helpers {
         Clean,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
+        /// The engine ran to completion, found nothing, and reported an EMPTY
+        /// catalog (#4594): what grype reports for a conda package with no
+        /// Python or recognised binary content.
+        CatalogedNothing,
+        /// The engine ran to completion, found nothing, and cataloged exactly
+        /// this `name@version` (#4594).
+        Cataloged(&'static str, &'static str),
+        /// The engine ran to completion, cataloged exactly this
+        /// `name@version`, and reported one `High` finding against it (#4600).
+        CatalogedVulnerable(&'static str, &'static str),
         /// Re-scan never finishes inside the caller's `tokio::time::timeout`
         /// budget: sleeps for the given duration (longer than the budget
         /// under test) before completing. Proves the BudgetExceeded arm
@@ -10049,6 +10206,46 @@ pub(crate) mod test_helpers {
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
+                MockCveRescan::CatalogedNothing => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(Vec::new()),
+                        ..Default::default()
+                    })
+                }
+                MockCveRescan::Cataloged(name, version) => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(vec![
+                            crate::services::scanner_service::CatalogedComponent {
+                                name: name.to_string(),
+                                version: version.to_string(),
+                            },
+                        ]),
+                        ..Default::default()
+                    })
+                }
+                MockCveRescan::CatalogedVulnerable(name, version) => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(vec![
+                            crate::services::scanner_service::CatalogedComponent {
+                                name: name.to_string(),
+                                version: version.to_string(),
+                            },
+                        ]),
+                        findings: vec![crate::models::security::RawFinding {
+                            severity: crate::models::security::Severity::High,
+                            title: "CVE-2026-4600 test".to_string(),
+                            description: None,
+                            cve_id: Some("CVE-2026-4600".to_string()),
+                            affected_component: Some(name.to_string()),
+                            affected_version: Some(version.to_string()),
+                            fixed_version: None,
+                            source: Some("grype".to_string()),
+                            source_url: None,
+                            finding_class: crate::models::security::FindingClass::Vulnerability,
+                        }],
+                        ..Default::default()
+                    })
+                }
                 MockCveRescan::Hang(d) => {
                     tokio::time::sleep(d).await;
                     Ok(crate::services::scanner_service::ScanOutput::default())
@@ -22610,6 +22807,35 @@ tonic-build = "0.12"
     }
 
     #[test]
+    fn test_needs_own_scan_lookup_only_for_foreign_match_without_placeholder() {
+        // #4425: only a match on ANOTHER artifact under InsertFresh can turn
+        // into a duplicate completed row, so only that case looks up the
+        // artifact's own row first.
+        let current = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(needs_own_scan_lookup(
+            other,
+            current,
+            &PreparedScanAction::InsertFresh
+        ));
+        assert!(!needs_own_scan_lookup(
+            current,
+            current,
+            &PreparedScanAction::InsertFresh
+        ));
+        assert!(!needs_own_scan_lookup(
+            other,
+            current,
+            &PreparedScanAction::Reuse(Uuid::new_v4())
+        ));
+        assert!(!needs_own_scan_lookup(
+            current,
+            current,
+            &PreparedScanAction::Reuse(Uuid::new_v4())
+        ));
+    }
+
+    #[test]
     fn test_decide_same_artifact_action_insert_fresh_is_noop() {
         // Auto-scan-on-upload path: no placeholder was committed, so we
         // simply skip. The existing completed row already represents
@@ -24207,6 +24433,229 @@ tonic-build = "0.12"
             .await
             .expect("an assessed, finding-free scan is a clean verdict");
         assert!(!verdict.is_vulnerable());
+    }
+
+    fn tzdata_expected() -> ExpectedComponent {
+        ExpectedComponent::new(ComponentEcosystem::Conda, "tzdata", "2026c")
+    }
+
+    /// The CVE engine as it behaves on a conda package (#4594): ran to
+    /// completion, cataloged `cataloged`, and reported `findings`.
+    struct CondaGradingCveScanner {
+        cataloged: Vec<CatalogedComponent>,
+        findings: Vec<RawFinding>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scanner for CondaGradingCveScanner {
+        fn name(&self) -> &str {
+            "conda-grading-cve-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&ArtifactMetadata>,
+            _: &Bytes,
+        ) -> Result<ScanOutput> {
+            Ok(ScanOutput {
+                findings: self.findings.clone(),
+                packages: Vec::new(),
+                scan_completeness: ScanCompleteness::Complete,
+                cataloged: Some(self.cataloged.clone()),
+                vuln_db: None,
+            })
+        }
+    }
+
+    fn conda_artifact() -> Artifact {
+        test_helpers::make_test_artifact(
+            "tzdata-2026c-h151e31d_0.conda",
+            "application/octet-stream",
+            "noarch/tzdata-2026c-h151e31d_0.conda",
+        )
+    }
+
+    /// #4594: only conda is graded without cataloging itself; every
+    /// ecosystem with a pin file or a self-describing archive keeps the
+    /// empty-catalog-is-inconclusive rule.
+    #[test]
+    fn test_only_conda_is_graded_without_cataloging_itself() {
+        for eco in [
+            ComponentEcosystem::Npm,
+            ComponentEcosystem::Python,
+            ComponentEcosystem::RubyGems,
+            ComponentEcosystem::Cargo,
+            ComponentEcosystem::NuGet,
+            ComponentEcosystem::Maven,
+        ] {
+            assert!(eco.engine_catalogs_the_package(), "{eco:?}");
+        }
+        assert!(!ComponentEcosystem::Conda.engine_catalogs_the_package());
+    }
+
+    /// #4594: a conda package the engine scanned to completion and cataloged
+    /// nothing for is a clean verdict graded on file contents, with
+    /// `components_cataloged = 0`.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_zero_catalog_is_clean_on_contents() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: Vec::new(),
+        })];
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a completed conda scan that cataloged nothing is conclusive");
+        assert!(!verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "clean");
+        assert_eq!(verdict.components_cataloged, Some(0));
+        assert_eq!(verdict.findings_count, 0);
+    }
+
+    /// #4594: the same conda scan WITH findings is vulnerable; nothing
+    /// cataloged never hides a finding.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_zero_catalog_with_findings_is_vulnerable() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: vec![RawFinding {
+                severity: Severity::High,
+                title: "CVE-2026-4594 test".to_string(),
+                description: None,
+                cve_id: Some("CVE-2026-4594".to_string()),
+                affected_component: Some("libfoo".to_string()),
+                affected_version: Some("1.0".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
+            }],
+        })];
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("findings make the scan conclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.high_count, 1);
+        assert_eq!(verdict.components_cataloged, Some(0));
+    }
+
+    /// #4600: a conda scan that cataloged only components other than the
+    /// conda `name@version` (the upstream component a compiled package
+    /// vendors) is graded on its findings like an empty catalog: clean
+    /// without findings, vulnerable with one, and the verdict counts what was
+    /// cataloged. A matching catalog is clean with its count. (Before #4600
+    /// the first two were inconclusive.)
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_vendored_catalog_is_graded_on_findings() {
+        use std::sync::Arc;
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        for (name, version) in [("zlib", "1.3.1"), ("tzdata", "2025a")] {
+            let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+                cataloged: vec![CatalogedComponent {
+                    name: name.into(),
+                    version: version.into(),
+                }],
+                findings: Vec::new(),
+            })];
+            let verdict = run_inline_proxy_scanners_target(
+                &scanners,
+                &expecting_target(&artifact, &expected),
+                &Bytes::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}@{version}: a completed scan is conclusive: {e}"));
+            assert_eq!(verdict.verdict_token(), "clean", "{name}@{version}");
+            assert_eq!(verdict.components_cataloged, Some(1), "{name}@{version}");
+        }
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: vec![CatalogedComponent {
+                name: "zlib".into(),
+                version: "1.3.1".into(),
+            }],
+            findings: vec![RawFinding {
+                severity: Severity::High,
+                title: "CVE-2026-4600 test".to_string(),
+                description: None,
+                cve_id: Some("CVE-2026-4600".to_string()),
+                affected_component: Some("zlib".to_string()),
+                affected_version: Some("1.3.1".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
+            }],
+        })];
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("findings make the scan conclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.high_count, 1);
+        assert_eq!(verdict.components_cataloged, Some(1));
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: vec![
+                CatalogedComponent {
+                    name: "tzdata".into(),
+                    version: "2026c".into(),
+                },
+                CatalogedComponent {
+                    name: "tzdata".into(),
+                    version: "2026c".into(),
+                },
+            ],
+            findings: Vec::new(),
+        })];
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a matching catalog is clean");
+        assert_eq!(verdict.components_cataloged, Some(1), "counted once");
+    }
+
+    /// #4594 does not reach the Python rule: a PyPI wheel the engine
+    /// cataloged nothing for stays inconclusive.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_python_zero_catalog_stays_inconclusive() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: Vec::new(),
+        })];
+        let artifact = inline_scan_artifact();
+        let expected = ExpectedComponent::new(ComponentEcosystem::Python, "pyyaml", "5.3.1");
+        assert!(run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .is_err());
     }
 
     /// Blast-radius control: a scanner that reports NO catalog signal
@@ -26568,6 +27017,100 @@ tonic-build = "0.12"
             .bind(repo_id)
             .execute(pool)
             .await;
+    }
+
+    /// #4425 end to end: `find_reusable_scan` now returns only original
+    /// scans, so for an artifact whose own completed row is a reused copy it
+    /// hands back the ORIGINAL artifact's row. A rescan without a prepared
+    /// placeholder (auto-scan, repository scan) must still see that the
+    /// artifact is already scanned, not copy the original into a second
+    /// completed row (the release-gate assertion "Per-artifact scan list
+    /// contains exactly one completed scan", #1373). A third byte-identical
+    /// artifact copies from the original, never from the copy.
+    #[tokio::test]
+    async fn test_rescan_of_a_reused_artifact_keeps_one_completed_row() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+        let scanner = Arc::new(PinRecordingScanner::new(Vec::new()));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let ck = fresh_checksum();
+        let bytes = Bytes::from_static(b"reused-bytes-4425");
+
+        // The original: a real scan.
+        let orig = insert_artifact_with(&fx, "orig", None, "orig", &ck, bytes.clone()).await;
+        service
+            .scan_artifact_with_options(orig, true, false)
+            .await
+            .expect("scan original");
+        let original: Uuid = sqlx::query_scalar(
+            "SELECT id FROM scan_results WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(orig)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("original row");
+
+        // A byte-identical artifact gets a reused copy through the
+        // prepare-then-convert path, which stamps the copy completed NOW().
+        let copy = insert_artifact_with(&fx, "copy", None, "copy", &ck, bytes.clone()).await;
+        let srs = ScanResultService::new(fx.pool.clone());
+        let placeholder = srs
+            .create_scan_result_with_checksum(copy, fx.repo_id, "grype", Some(&ck))
+            .await
+            .expect("placeholder");
+        srs.convert_to_reused(placeholder.id, original, copy, None)
+            .await
+            .expect("convert");
+
+        // Rescan the copy with no prepared placeholder.
+        service
+            .scan_artifact_with_options(copy, true, false)
+            .await
+            .expect("rescan copy");
+        let copy_rows: Vec<(Uuid, bool, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, is_reused, source_scan_id FROM scan_results \
+             WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(copy)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("copy rows");
+        assert_eq!(
+            copy_rows,
+            vec![(placeholder.id, true, Some(original))],
+            "a rescan of an already-reused artifact must leave exactly its one completed row"
+        );
+
+        // A third artifact copies from the original, not from the copy.
+        let third = insert_artifact_with(&fx, "third", None, "third", &ck, bytes).await;
+        service
+            .scan_artifact_with_options(third, true, false)
+            .await
+            .expect("scan third");
+        let third_source: Option<Uuid> = sqlx::query_scalar(
+            "SELECT source_scan_id FROM scan_results \
+             WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(third)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("third row");
+        assert_eq!(
+            third_source,
+            Some(original),
+            "a reused row must never be the source of another reuse"
+        );
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().len(),
+            1,
+            "only the original ran a real scan"
+        );
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
     }
 
     /// 64-hex checksum (unique per call so two parallel tests don't share a

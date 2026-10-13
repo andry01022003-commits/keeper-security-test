@@ -54,6 +54,7 @@ Responses:
 | Vulnerable, record-only | `200` | `X-AK-Scan: recorded` |
 | Vulnerable and blocked by the policy | `403` | `{"error": "scan_blocked", "file": ...}` |
 | No conclusive verdict under fail-closed | `423` | `{"error": "scan_pending", "file": ...}`; retry later |
+| Scan configuration unreadable (database fault) | `503` | Retry later; never served unscanned |
 | Requested through the generic download route instead of the format route | `403` | `{"error": "scan_on_proxy_route_required", "file": ..., "handler": ...}`; see [The generic download route](#the-generic-download-route) |
 
 **Identity.** The gate takes the package coordinate from the request (for
@@ -64,6 +65,65 @@ coordinate before a clean verdict counts. When they do not agree, or the bytes
 are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
+
+**Packages the scanner does not catalog as themselves (conda).** For npm,
+PyPI, RubyGems, Cargo, NuGet and Maven the scanner catalogs the package itself
+(through the pin the gate writes, or the archive's own metadata), so a scan
+that catalogs nothing graded nothing and is inconclusive. No bundled scanner
+catalogs a conda package as a conda component: it catalogs what the package
+installs (a `.dist-info`, a binary it recognises). A compiled library or a
+data package (`tzdata`, `ca-certificates`) has nothing of that kind. For
+`conda` and `conda_native`, a scan that ran to completion over the unpacked
+archive and cataloged nothing is therefore graded on its findings: no
+findings is a `clean` verdict, and a finding is `vulnerable` as usual. The
+verdict is stored with `components_cataloged: 0` and reused like any other,
+so `fail_closed` serves it inline and `fail_open` records it for the next
+pull (#4594). The rule does not relax anything else:
+
+- a scan that could not run (archive not unpackable, scanner error, timeout,
+  over the byte cap) is still inconclusive;
+- a package whose `info/index.json` disagrees with its file name is still
+  withheld without a scan;
+- a scan that cataloged a `name@version` other than the one in the file name
+  is still inconclusive.
+
+`generic` does not run the gate, so the rule does not apply to it. If it
+adopts the gate, a generic file has no coordinate to pin and an empty catalog
+is already graded on its findings.
+
+**One decision per request.** Each enforced format derives the proxy-cache key
+and the "is this a package the gate must see" decision from the same
+normalized request path, so two spellings of one file (a trailing `/`, a
+re-capitalised VS Code asset type) share one cache entry and one decision. A
+path holding `?`, `#`, `;`, a control character or a stray `%` is always
+treated as a package.
+
+**Ambiguous proxied paths.** Two checks keep the upstream from answering for a
+different file than the one classified and cached, each a `400` before any
+upstream request:
+
+- *What the client sent.* On the npm tarball, PyPI file and Cargo download
+  routes, the VS Code gallery routes (asset, `vspackage`, legacy download),
+  the generic download route's Remote arm, and (already before) the Maven,
+  sbt and NuGet routes, a client path containing any `?`,
+  `#`, `;`, `\`, a control character or a `%` that is not a valid `%XX`
+  escape is refused. The format routes also refuse raw spaces; the generic
+  route allows them, since stored file names may contain them.
+- *The upstream path ProxyService builds.* Every relative upstream path a
+  Remote fetch sends, for every format, is refused if its path part contains
+  `#`, `;`, `\`, a control character, a stray `%` or a trailing space, or if
+  a `?` starts an empty query or one containing `/`. Queries a handler
+  appends itself (Ansible version pages, Conan search, OCI `tags/list`) pass.
+  Absolute URLs a handler builds or takes from an upstream index (Helm,
+  PyPI, npm, NuGet, the VS Code gallery) are not checked here; those
+  handlers validate the client's segments themselves before building them.
+
+Valid escapes (npm's scoped `%2F`) and Go's `!` case-escaping are unaffected.
+
+**Unreadable configuration.** If a repository's scan configuration cannot be
+read, the pull fails with a retryable `503` on every enforced format's Remote
+arm, every Virtual walk and the generic download route. It is never treated
+as "scanning off" (#4365).
 
 ## Actions
 
@@ -94,6 +154,13 @@ If either version string is unknown, a `fail_open` or `record_only`
 repository falls back to the 30-day window alone. A `fail_closed` repository
 reuses a `clean` verdict only when both versions are known and equal;
 otherwise it scans again, and an inconclusive result is `423`.
+
+Each verdict also records `components_cataloged`: how many distinct
+components the scanner cataloged when it graded the bytes (migration 287).
+`GET /api/v1/repositories/{key}/security/proxy-scans` returns it on every
+`clean` or `vulnerable` item. `0` means the verdict was graded on the file
+contents only (see the conda rule above); `null` means the scanner reported no
+catalog, or the verdict was recorded before 1.11.0.
 
 ## Virtual repositories
 
@@ -171,10 +238,10 @@ have no core proxy path to gate.
 | `conan` | `conan` | accepted | |
 | `cargo` | `cargo` | enforced | `.crate` downloads, Remote and Virtual. |
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
-| `conda` | `conda` | accepted | |
+| `conda` | `conda` | enforced | `.conda` and `.tar.bz2` package downloads, Remote and Virtual, including the `/t/<token>/` URL forms. A `.sigs` attestation sidecar follows its package: a stored verdict that blocks the package refuses the sidecar too. Channel indexes (repodata in every encoding, channeldata, shards) are not gated. |
 | `terraform` | `terraform`, `opentofu` | accepted | |
 | `alpine` | `alpine` | accepted | |
-| `conda_native` | `conda_native` | accepted | |
+| `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
 | `composer` | `composer` | accepted | |
 | `hex` | `hex` | accepted | |
 | `cocoapods` | `cocoapods` | accepted | |
@@ -185,7 +252,7 @@ have no core proxy path to gate.
 | `puppet` | `puppet` | accepted | |
 | `ansible` | `ansible` | accepted | |
 | `gitlfs` | `gitlfs` | accepted | |
-| `vscode` | `vscode` | enforced | Extension packages: the gallery download (Remote) and the legacy `.vsix` route (Remote and Virtual). |
+| `vscode` | `vscode` | enforced | Extension packages: the gallery download (Remote) and the legacy `.vsix` route (Remote and Virtual). Gallery asset types are matched ignoring case; only display metadata (manifest, details, changelog, license, icons, `.vsixmanifest`, signature, language-pack translations) streams unscanned, and any other asset type is `404` while scanning is on. |
 | `jetbrains` | `jetbrains` | accepted | |
 | `huggingface` | `huggingface` | accepted | |
 | `mlmodel` | `mlmodel` | accepted | |
@@ -203,15 +270,12 @@ have no core proxy path to gate.
 
 - **Cache commit before the verdict.** The buffered fetch commits upstream
   bytes to the proxy cache before the gate decides. A route that does not
-  re-check the verdict can then serve them warm (#4365). The generic download
+  re-check the verdict can then serve them warm (#4514; see the design note
+  [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)). The generic download
   route refuses before it reads the cache for a repository that scans on
   proxy. A non-scanning Remote member of a scanning Virtual is still subject
   to this gap: bytes the Virtual refused can be served warm by addressing the
   member directly, on its format route or on the generic route.
-- **Unreadable configuration on a direct Remote pull.** If a Remote
-  repository's `scan_on_proxy` flag cannot be read, a format route serves the
-  pull as if scanning were off (#4365). The Virtual walk and the generic
-  download route fail closed instead (see above).
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.
@@ -224,6 +288,21 @@ have no core proxy path to gate.
     digest instead of being scanned, and a stored `vulnerable` verdict for
     that digest refuses the pull (`403`);
   - and the row records no digest, the re-fetch goes through the gate.
+- **Conda packages graded on file contents.** A conda package the scanner
+  catalogs nothing for is graded on its findings alone and recorded with
+  `components_cataloged: 0` (#4594). A clean result there means the scanner
+  read the unpacked files and matched no advisory; there was no component
+  identity to look up, so a vulnerable library the scanner does not recognise
+  is not found. The proxy-scans view shows the `0` so these verdicts can be
+  told apart from component-graded ones.
+- **Conda packages cataloged under a different name.** When the scanner does
+  catalog something for a conda package but not the `name@version` in the
+  file name (a binary it recognises under its upstream name or version), the
+  scan is still inconclusive: `423` under `fail_closed`, served `pending`
+  (and not recorded) under `fail_open`.
+- **Conda `.sigs` sidecars** follow the stored verdict of their package's
+  cached bytes. Before the package has been pulled through the repository
+  there is nothing to follow and the sidecar is served.
 - **NuGet symbols packages** (`.snupkg`) are scanned without an identity pin:
   they hold `.pdb` files and no package identity the engine grades, so a
   vulnerable verdict blocks them but a missing pin does not withhold them.

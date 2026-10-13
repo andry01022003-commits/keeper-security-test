@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::handlers::repositories::{
-    require_repo_admin, require_repo_write_access, require_visible,
+    require_repo_action, require_repo_admin, require_repo_write_access, require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -1753,6 +1753,12 @@ async fn update_repo_security(
 ) -> Result<Json<ScanConfigResponse>> {
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    // Token action scope first, as on the sibling repository-configuration
+    // handlers (`set_cache_ttl`, `set_npm_scope_policy`, `invalidate_cache`,
+    // `set_egress_proxy`): a token minted read-only must not reconfigure
+    // scanning even when its owner is a repository admin
+    // (GHSA-gvhj-8vg9-358g). A session (`scopes: None`) passes.
+    auth.require_scope("write:repositories")?;
     // Tenant write gate: the /repositories nest bypasses repo_visibility_middleware,
     // so enforce is_public + per-repo role-assignment membership here.
     let repo_service = RepositoryService::new(state.db.clone());
@@ -1866,6 +1872,7 @@ fn scan_config_change_audit(
                 scan_config: Some(scan_config_audit_state(&after)),
                 previous_scan_config: Some(scan_config_audit_state(&before)),
                 scan_config_changed: Some(changed),
+                upstream_change: None,
             }),
     )
 }
@@ -2047,16 +2054,17 @@ const MAX_PROXY_FINDINGS: i64 = 200;
 /// scanner writes verdicts.
 ///
 /// Cached upstream index responses are excluded through the shared
-/// [`proxy_catalog::not_cached_index_sql`] predicate -- the same one the
+/// [`proxy_catalog::not_cached_metadata_sql`] predicate -- the same one the
 /// artifact listing uses, so the two views cannot disagree. An HTML index page
-/// has no package inventory, so counting it as `not_scanned` is a permanent
-/// false positive with no available remedy.
-fn proxy_scan_select() -> String {
+/// (or an npm packument, #4305) has no package inventory, so counting it as
+/// `not_scanned` is a permanent false positive with no available remedy.
+fn proxy_scan_select(format: &crate::models::repository::RepositoryFormat) -> String {
     format!(
         r#"
     SELECT pca.path, pca.checksum_sha256, pca.size_bytes, pca.cached_at,
            psr.verdict, psr.findings_count, psr.critical_count, psr.high_count,
-           psr.medium_count, psr.low_count, psr.max_severity, psr.scanned_at
+           psr.medium_count, psr.low_count, psr.max_severity, psr.scanned_at,
+           psr.components_cataloged
       FROM proxy_cache_artifacts pca
       LEFT JOIN proxy_scan_results psr
              ON psr.checksum_sha256 = pca.checksum_sha256
@@ -2064,7 +2072,7 @@ fn proxy_scan_select() -> String {
      WHERE pca.repository_id = $1
        AND {not_index}
 "#,
-        not_index = proxy_catalog::not_cached_index_sql("pca.path"),
+        not_index = proxy_catalog::not_cached_metadata_sql(format, "pca.path"),
     )
 }
 
@@ -2082,6 +2090,7 @@ struct ProxyScanRow {
     low_count: Option<i32>,
     max_severity: Option<String>,
     scanned_at: Option<chrono::DateTime<chrono::Utc>>,
+    components_cataloged: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -2128,6 +2137,14 @@ pub struct ProxyScanEntry {
     pub scanned_at: Option<chrono::DateTime<chrono::Utc>>,
     pub cached_at: chrono::DateTime<chrono::Utc>,
     pub size_bytes: i64,
+    /// How many distinct components the CVE engine cataloged when it graded
+    /// this digest (#4594). Set only on a `clean` or `vulnerable` entry, and
+    /// `null` for a verdict whose engine reported no catalog (or one recorded
+    /// before 1.11.0). `0` means the verdict was graded on the file contents
+    /// only: the scan unpacked and read the package, recognised no component
+    /// (a conda compiled library or data package such as `tzdata`), and
+    /// matched no advisory.
+    pub components_cataloged: Option<i32>,
     /// The CVEs behind the counts (#3395), most severe first and bounded to
     /// [`MAX_PROXY_FINDINGS`].
     ///
@@ -2241,6 +2258,7 @@ impl ProxyScanEntry {
             },
             cached_at: row.cached_at,
             size_bytes: row.size_bytes,
+            components_cataloged: scored.then_some(row.components_cataloged).flatten(),
             findings: None,
         }
     }
@@ -2262,7 +2280,11 @@ impl ProxyScanEntry {
 }
 
 /// Per-state counts over distinct digests for one repository.
-async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxyScanSummary> {
+async fn fetch_proxy_scan_summary(
+    db: &PgPool,
+    repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
+) -> Result<ProxyScanSummary> {
     sqlx::query_as::<_, ProxyScanSummary>(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT
@@ -2283,7 +2305,7 @@ async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxySca
          WHERE pca.repository_id = $1
            AND {not_index}
         "#,
-        not_index = proxy_catalog::not_cached_index_sql("pca.path"),
+        not_index = proxy_catalog::not_cached_metadata_sql(format, "pca.path"),
     )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
@@ -2297,11 +2319,12 @@ async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxySca
 async fn fetch_proxy_scan_path(
     db: &PgPool,
     repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
     path: &str,
 ) -> Result<Option<ProxyScanRow>> {
     sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
         "{} AND pca.path = $3",
-        proxy_scan_select()
+        proxy_scan_select(format)
     )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
@@ -2315,13 +2338,14 @@ async fn fetch_proxy_scan_path(
 async fn fetch_proxy_scan_page(
     db: &PgPool,
     repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ProxyScanRow>> {
     sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
         "{} AND pca.checksum_sha256 IS NOT NULL \
          ORDER BY pca.cached_at DESC, pca.path ASC LIMIT $3 OFFSET $4",
-        proxy_scan_select()
+        proxy_scan_select(format)
     )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
@@ -2334,11 +2358,15 @@ async fn fetch_proxy_scan_page(
 
 /// Paths eligible for the paged list (NULL-checksum placeholders excluded, to
 /// match the rows the page actually returns).
-async fn count_proxy_scan_paths(db: &PgPool, repo_id: Uuid) -> Result<i64> {
+async fn count_proxy_scan_paths(
+    db: &PgPool,
+    repo_id: Uuid,
+    format: &crate::models::repository::RepositoryFormat,
+) -> Result<i64> {
     sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*format!(
         "SELECT COUNT(*) FROM proxy_cache_artifacts \
          WHERE repository_id = $1 AND checksum_sha256 IS NOT NULL AND {not_index}",
-        not_index = proxy_catalog::not_cached_index_sql("path"),
+        not_index = proxy_catalog::not_cached_metadata_sql(format, "path"),
     )))
     .bind(repo_id)
     .fetch_one(db)
@@ -2394,7 +2422,7 @@ async fn get_repo_proxy_scans(
 
     let (summary, items, total, page, per_page) = match query.path.as_deref() {
         Some(path) => {
-            let row = fetch_proxy_scan_path(&state.db, repo_id, path)
+            let row = fetch_proxy_scan_path(&state.db, repo_id, &repo.format, path)
                 .await?
                 .ok_or_else(|| AppError::NotFound(PROXY_PATH_NOT_FOUND_MSG.to_string()))?;
             let digest = row.checksum_sha256.clone();
@@ -2419,9 +2447,9 @@ async fn get_repo_proxy_scans(
         }
         None => {
             let (page, per_page, offset) = proxy_scan_paging(query.page, query.per_page);
-            let summary = fetch_proxy_scan_summary(&state.db, repo_id).await?;
-            let total = count_proxy_scan_paths(&state.db, repo_id).await?;
-            let items = fetch_proxy_scan_page(&state.db, repo_id, per_page, offset)
+            let summary = fetch_proxy_scan_summary(&state.db, repo_id, &repo.format).await?;
+            let total = count_proxy_scan_paths(&state.db, repo_id, &repo.format).await?;
+            let items = fetch_proxy_scan_page(&state.db, repo_id, &repo.format, per_page, offset)
                 .await?
                 .into_iter()
                 .map(|r| ProxyScanEntry::from_row(r, scan_on_proxy))
@@ -2813,9 +2841,13 @@ async fn rescan_proxy_cached_path(
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     // Write access, not merely visibility: this spends scanner CPU and
     // rewrites a verdict that gates every tenant pulling the same digest.
+    // The tenant gate is a no-op on a public repository and admits a
+    // read-only member of a private one, so the repository `write` action is
+    // checked too (GHSA-mvmh-g8wm-r3cp).
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
 
     let path = body.path.trim().to_string();
     if path.is_empty() {
@@ -3101,7 +3133,8 @@ mod tests {
     #[test]
     fn proxy_scan_queries_filter_on_scan_type_constant() {
         assert!(
-            proxy_scan_select().contains("psr.scan_type = $2"),
+            proxy_scan_select(&crate::models::repository::RepositoryFormat::Generic)
+                .contains("psr.scan_type = $2"),
             "the shared projection must filter the join on scan_type"
         );
         let source = include_str!("security.rs");
@@ -3132,7 +3165,7 @@ mod tests {
     /// types.
     #[test]
     fn proxy_scan_projection_never_selects_repository_id() {
-        let select = proxy_scan_select();
+        let select = proxy_scan_select(&crate::models::repository::RepositoryFormat::Generic);
         let (projection, _) = select
             .split_once("FROM proxy_cache_artifacts")
             .expect("projection must read from the cache catalog");
@@ -3168,6 +3201,7 @@ mod tests {
             low_count: Some(0),
             max_severity: None,
             scanned_at: Some(chrono::Utc::now()),
+            components_cataloged: Some(3),
         }
     }
 
@@ -3273,6 +3307,26 @@ mod tests {
         assert_eq!(entry.critical_count, None);
         assert_eq!(entry.max_severity, None);
         assert_eq!(entry.scanned_at, None);
+        assert_eq!(entry.components_cataloged, None);
+    }
+
+    /// #4594: a verdict carries its cataloged-component count, `0` included
+    /// (graded on file contents only), and a legacy row's `null` stays `null`.
+    #[test]
+    fn proxy_scan_entry_carries_components_cataloged_with_a_verdict() {
+        for (stored, verdict) in [(Some(0), "clean"), (Some(4), "vulnerable"), (None, "clean")] {
+            let mut row = sample_proxy_row();
+            row.verdict = Some(verdict.to_string());
+            row.components_cataloged = stored;
+            let entry = ProxyScanEntry::from_row(row, true);
+            assert_eq!(entry.components_cataloged, stored, "{verdict}");
+            let json = serde_json::to_value(&entry).expect("serialize");
+            assert_eq!(
+                json["components_cataloged"],
+                serde_json::json!(stored),
+                "{verdict}"
+            );
+        }
     }
 
     #[test]
@@ -3895,6 +3949,60 @@ mod tests {
             .await
             .expect("seed cached bytes in storage");
         state
+    }
+
+    /// GHSA-mvmh-g8wm-r3cp #9: a proxy rescan spends scanner time and
+    /// rewrites a shared verdict, so it needs the repository `write` action.
+    /// On a public remote a signed-in user with no grant used to pass the
+    /// tenant gate alone, and so did a read-only member. A write member gets
+    /// past the gate (here to the canonical not-found for an uncached path).
+    #[tokio::test]
+    async fn rescan_requires_the_repository_write_action_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        let rescan = || {
+            rescan_proxy_cached_path(
+                State(tdh::build_state(
+                    pool.clone(),
+                    dir.to_string_lossy().as_ref(),
+                )),
+                Extension(Some(tdh::make_auth(user_id, &username))),
+                Path(key.clone()),
+                Json(ProxyRescanRequest {
+                    path: "simple/nothing/nothing-1.0.tar.gz".to_string(),
+                }),
+            )
+        };
+
+        let no_grant = rescan().await;
+        tdh::grant_repo_role(&pool, repo_id, user_id, "reader").await;
+        let reader = rescan().await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let writer = rescan().await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(no_grant, Err(AppError::Authorization(_))),
+            "no grant: {:?}",
+            no_grant.map(|_| "ok")
+        );
+        assert!(
+            matches!(reader, Err(AppError::Authorization(_))),
+            "reader: {:?}",
+            reader.map(|_| "ok")
+        );
+        assert!(
+            matches!(writer, Err(AppError::NotFound(_))),
+            "a write member must pass the gate: {:?}",
+            writer.map(|_| "ok")
+        );
     }
 
     /// Drive the rescan handler directly as `fx`'s member user.
@@ -5036,6 +5144,77 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GHSA-gvhj-8vg9-358g: a user holding `repository:admin` who presents an
+    /// API token minted with only `read:artifacts` must NOT be able to change
+    /// the repository's scan configuration. The four sibling
+    /// repository-configuration handlers (`set_cache_ttl`,
+    /// `set_npm_scope_policy`, `invalidate_cache`, `set_egress_proxy`) all
+    /// refuse such a token at the `write:repositories` scope gate; this one
+    /// must too. The same user's `write:repositories` token still succeeds.
+    #[tokio::test]
+    async fn update_repo_security_requires_write_repositories_scope_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let token = |scope: &str| AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec![scope.to_string()]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![repo_id]),
+            ..tdh::make_auth(user_id, &username)
+        };
+        let body = || UpsertScanConfigRequest {
+            scan_enabled: Some(false),
+            block_on_policy_violation: Some(false),
+            ..Default::default()
+        };
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let refused = update_repo_security(
+            State(state),
+            Extension(Some(token("read:artifacts"))),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+        let persisted_after_refusal = ScanConfigService::new(pool.clone())
+            .get_config(repo_id)
+            .await
+            .expect("get_config");
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = update_repo_security(
+            State(state),
+            Extension(Some(token("write:repositories"))),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match refused {
+            Err(AppError::Authorization(msg)) => assert!(
+                msg.contains("scope"),
+                "the refusal must come from the scope gate: {msg}"
+            ),
+            other => panic!("a read:artifacts token must be refused (403), got: {other:?}"),
+        }
+        assert!(
+            persisted_after_refusal.is_none(),
+            "a refused update_repo_security must not persist a scan config"
+        );
+        assert!(
+            allowed.is_ok(),
+            "a write:repositories token with repository:admin must pass: {allowed:?}"
+        );
     }
 
     /// #3645: `proxy_scan_action = record_only` round-trips through the

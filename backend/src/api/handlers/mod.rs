@@ -302,6 +302,29 @@ pub mod metadata_epoch;
 #[cfg(test)]
 pub(crate) mod test_db_helpers;
 
+/// #4559: router-level tests for tokens scoped to a virtual repository.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod virtual_token_scope_tests;
+
+/// #4498: router-level tests that an unreadable repository answers exactly
+/// like a missing one on the REST read endpoints.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod repo_read_existence_tests;
+
+/// #4570: router-level tests that a Git LFS batch download action can be
+/// followed on a private repository.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod gitlfs_download_auth_tests;
+
+/// #4506: router-level tests that origin policies gate proxy-cache-only
+/// content of Remote repositories.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod proxy_origin_policy_tests;
+
 pub mod admin;
 pub mod admin_security;
 pub mod age_gate;
@@ -312,6 +335,7 @@ pub mod approval;
 pub mod artifact_labels;
 pub mod artifact_presence;
 pub mod artifacts;
+pub mod attestations;
 pub mod auth;
 pub mod banners;
 pub mod bazel;
@@ -371,6 +395,7 @@ pub mod promotion_rules;
 pub mod protobuf;
 pub mod proxy_helpers;
 pub mod pub_registry;
+pub mod publish_quota;
 pub mod puppet;
 pub mod pypi;
 pub mod quality_gates;
@@ -402,6 +427,7 @@ pub mod transfer;
 pub mod trash;
 pub mod tree;
 pub mod upload;
+pub mod upload_body;
 pub mod users;
 pub mod vscode;
 pub mod wasm_proxy;
@@ -2354,11 +2380,6 @@ mod raw_error_body_class_tests {
         (
             "proxy_helpers.rs",
             "Failed to read metadata JSON",
-            "caller input",
-        ),
-        (
-            "proxy_helpers.rs",
-            "Failed to read upload body",
             "caller input",
         ),
         (

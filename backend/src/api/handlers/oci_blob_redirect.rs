@@ -124,6 +124,10 @@ pub(crate) async fn try_proxy_cached_blob_redirect(
     if !storage.supports_redirect() || !proxy.is_cache_fresh(repo_key, cache_path).await {
         return None;
     }
+    // #4506: no redirect for a Remote whose origin policy refuses its content.
+    if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
+        return None;
+    }
     let meta_key =
         ProxyService::cache_metadata_key(proxy.cache_scope(), repo_key, cache_path).ok()?;
     let meta = proxy.load_cache_metadata_pub(&meta_key).await?;

@@ -724,6 +724,25 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             );
             (StatusCode::FORBIDDEN, msg.clone()).into_response()
         }
+        // #4453: the upstream refused the Remote's credentials. Still a 502,
+        // but named as an authentication failure (the `security` line with
+        // the realm was logged where it happened), and marked so a format
+        // handler can report it instead of a not-found.
+        crate::error::AppError::UpstreamAuth(_) => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %diagnostic_path,
+                "{}",
+                e
+            );
+            let mut response = (
+                StatusCode::BAD_GATEWAY,
+                "Upstream authentication failed; check the repository's upstream credentials",
+            )
+                .into_response();
+            response.extensions_mut().insert(UpstreamAuthFailure);
+            response
+        }
         _ => {
             tracing::warn!(
                 repo_key = %repo_key,
@@ -734,6 +753,17 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
         }
     }
+}
+
+/// Response extension [`map_proxy_error`] attaches to the 502 it returns for
+/// [`AppError::UpstreamAuth`] (#4453), so a handler that only sees the
+/// `Response` can tell an upstream credentials failure from any other 502.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamAuthFailure;
+
+/// Whether a proxy error `Response` is an upstream authentication failure.
+pub(crate) fn is_upstream_auth_failure(response: &Response) -> bool {
+    response.extensions().get::<UpstreamAuthFailure>().is_some()
 }
 
 /// Shared scaffolding for the trivial `proxy_fetch*` wrappers.
@@ -900,10 +930,39 @@ pub async fn proxy_fetch_capped_with_accept(
     format: RepositoryFormat,
 ) -> Result<(Bytes, Option<String>), Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    proxy_service
+    let error = match proxy_service
         .fetch_artifact_with_accept_capped(&repo, path, accept, max)
         .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))
+    {
+        Ok(fetched) => return Ok(fetched),
+        Err(error) => error,
+    };
+    // #4518: an OCI registry that refuses the request itself (after a
+    // successful token exchange, or on plain Basic auth) while the Remote
+    // sends credentials is an upstream authentication failure like a
+    // refusing token service (#4453), not an indeterminate miss. Without
+    // credentials it stays a miss (see `oci_registry_auth_error`).
+    let error = if repo.format == RepositoryFormat::Docker
+        && crate::services::proxy_service::upstream_request_auth_refusal(&error).is_some()
+    {
+        let url = format!(
+            "{}/{}",
+            upstream_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
+        // A refusal of an anonymous bearer token never gets here (#4527), so
+        // for what does, configured credentials were sent to the upstream.
+        let credentials_sent = proxy_service.has_upstream_credentials(repo_id).await;
+        crate::services::proxy_service::oci_registry_auth_error(
+            error,
+            repo_id,
+            &url,
+            credentials_sent,
+        )
+    } else {
+        error
+    };
+    Err(map_proxy_error(repo_key, path, error))
 }
 
 /// As [`proxy_fetch_capped`], but also reports the upstream `Content-Encoding`
@@ -1218,6 +1277,35 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding(
     max: usize,
 ) -> Result<CappedMetadataGet, Response> {
     let budget_permit = proxy_metadata_budget().reserve(max).await;
+    proxy_fetch_capped_with_encoding_reserved(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        max,
+        budget_permit,
+    )
+    .await
+}
+
+/// As [`proxy_fetch_capped_budgeted_with_encoding`], with the caller holding
+/// the buffered-metadata reservation for the fetch already (at least `max`
+/// bytes of [`proxy_metadata_budget`]). The permit rides along in
+/// [`CappedMetadataGet::Buffered`] exactly as if this helper had taken it.
+///
+/// For a caller that must bound how long it waits for the reservation, or
+/// account for it together with other memory it holds (the virtual conda
+/// merge, #4608), instead of queueing on the budget without limit.
+pub async fn proxy_fetch_capped_with_encoding_reserved(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    budget_permit: OwnedSemaphorePermit,
+) -> Result<CappedMetadataGet, Response> {
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     match proxy_service
         .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
@@ -1507,6 +1595,11 @@ async fn try_member_cache_redirect(
     {
         return None;
     }
+    // #4506: likewise the member's origin policy; the fall-through fetch
+    // surfaces the refusal.
+    if proxy.cache_origin_policy_gate(&member.key).await.is_err() {
+        return None;
+    }
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     try_proxy_cache_redirect(
         storage.as_ref(),
@@ -1673,6 +1766,11 @@ pub async fn proxy_fetch_or_redirect(
             // a 302 on redirect-capable backends. Gate BEFORE signing; a hold
             // surfaces as the same 409/403 (no redirect, no upstream refetch).
             if let Err(e) = proxy_service.cache_quarantine_gate(repo_key, path).await {
+                return Err(map_proxy_error(repo_key, path, e));
+            }
+            // #4506: and on the Remote's origin policy, which the fetch paths
+            // enforce the same way.
+            if let Err(e) = proxy_service.cache_origin_policy_gate(repo_key).await {
                 return Err(map_proxy_error(repo_key, path, e));
             }
             // proxy-cache content is stored without the global key prefix,
@@ -2176,6 +2274,32 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded(
     .await
 }
 
+/// Format-carrying sibling of [`proxy_fetch_capped_with_cache_key_encoded`]
+/// (#4577). The synthesized repository carries the caller's REAL format, so
+/// `cache_classifier::classify` reaches its per-format arm for `cache_path`
+/// and a content-addressed coordinate is cached as immutable instead of
+/// falling to the `Generic` 5-minute default; see
+/// [`proxy_fetch_streaming_with_format`] for the reading a new call site owes
+/// before it passes a format. The conda CEP-16 shard proxy passes `Conda` for
+/// `{subdir}/shards/<sha256>.msgpack.zst`.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_encoded_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
+}
+
 /// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key_and_accept`]
 /// (#1608 Phase 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
 #[allow(clippy::too_many_arguments)]
@@ -2394,6 +2518,24 @@ pub async fn proxy_fetch_uncached_with_link(
     with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
         proxy_service
             .fetch_upstream_direct_with_link(&repo, path)
+            .await
+    })
+    .await
+}
+
+/// Ask a remote Terraform repository's upstream registry where a module
+/// version's source lives (#4590). Uncached; see
+/// [`ProxyService::fetch_upstream_terraform_module_location`].
+pub async fn proxy_fetch_terraform_module_location(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<crate::services::proxy_service::UpstreamModuleLocation, Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_terraform_module_location(&repo, path)
             .await
     })
     .await
@@ -2899,12 +3041,20 @@ pub(crate) fn classify_streaming_upstream(
 /// parent — including, when that parent was public, an anonymous `curl`. The
 /// member set is narrowed by [`authorize_virtual_members`] before any member is
 /// probed, so a member the caller could not read directly can never serve.
+///
+/// `ctx` is the caller's download context (#3844). `Some` records a REMOTE
+/// member's winning serve into `proxy_download_statistics` exactly once, at
+/// winner-determination, so a losing member's probe is never counted. A hosted
+/// winner is left to the caller, which may or may not count it today (Maven
+/// and the generic route do, off [`StreamingFetchResult::artifact_id`],
+/// #2260). `None` records nothing.
 pub async fn resolve_virtual_download<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
 ) -> Result<StreamingFetchResult, Response>
 where
@@ -2913,7 +3063,10 @@ where
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let had_members = !members.is_empty();
-    let members = authorize_virtual_members(db, auth, virtual_repo_id, members).await;
+    // Fallible (#4308): a DB failure while authorizing is a retryable 503, not
+    // the empty set, which would answer the definitive 404 below and let a
+    // client cache a miss for an artifact that exists.
+    let members = try_authorize_virtual_members(db, auth, virtual_repo_id, members).await?;
     if had_members && members.is_empty() {
         // Do NOT fall through to a DIFFERENT message: that would distinguish
         // "this virtual is empty" from "this virtual has members you may not
@@ -2924,7 +3077,7 @@ where
         // has no members", so the two stayed distinguishable (#3452).
         return Err(no_accessible_members_response());
     }
-    resolve_virtual_download_from_members(members, proxy_service, path, local_fetch).await
+    resolve_virtual_download_from_members(members, proxy_service, path, ctx, local_fetch).await
 }
 
 /// Body of [`resolve_virtual_download`] operating over an already-fetched (and,
@@ -2941,10 +3094,13 @@ where
 /// round-trips in Pass 1 and defeating the concurrent fan-out. Mutable indexes
 /// must instead go through [`resolve_virtual_metadata`] / the metadata-merge
 /// helpers.
+///
+/// `ctx`: see [`resolve_virtual_download`] (#3844).
 pub async fn resolve_virtual_download_from_members<F, Fut>(
     members: Vec<Repository>,
     proxy_service: Option<&ProxyService>,
     path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
 ) -> Result<StreamingFetchResult, Response>
 where
@@ -2956,6 +3112,7 @@ where
         proxy_service,
         path,
         &std::collections::HashMap::new(),
+        ctx,
         local_fetch,
     )
     .await
@@ -2975,12 +3132,14 @@ where
 /// `config.json` `dl` template names the download host, and on a split-host
 /// registry (index.crates.io vs static.crates.io) the canonical path against
 /// the index host 404s. The caller resolves and SSRF-validates the URLs; this
-/// function only threads them through the two-phase walk.
+/// function only threads them through the two-phase walk. A Remote winner is
+/// recorded (`ctx`, #3844) under the canonical `path`, the key its cache uses.
 pub async fn resolve_virtual_download_from_members_with_fetch_urls<F, Fut>(
     members: Vec<Repository>,
     proxy_service: Option<&ProxyService>,
     path: &str,
     member_fetch_urls: &std::collections::HashMap<Uuid, String>,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
 ) -> Result<StreamingFetchResult, Response>
 where
@@ -3009,7 +3168,16 @@ where
     // Borrow `local_fetch` so the per-member `probe` closure copies the
     // reference instead of moving the `Fn` into each `async move` future.
     let local_fetch = &local_fetch;
-    let outcome = resolve_members_two_phase::<StreamingFetchResult, Response, _, _, _, _>(
+    // Each hit carries its `VirtualServeOrigin` to winner-determination (#3844);
+    // see `resolve_virtual_download_streaming` for why it is not recorded here.
+    let outcome = resolve_members_two_phase::<
+        (StreamingFetchResult, VirtualServeOrigin),
+        Response,
+        _,
+        _,
+        _,
+        _,
+    >(
         &members,
         |member| async move {
             match virtual_member_fetch_strategy(
@@ -3019,10 +3187,13 @@ where
             ) {
                 VirtualMemberFetchStrategy::Local => {
                     match local_fetch(member.id, member.storage_location()).await {
-                        Ok(result) => (
-                            MemberCacheClass::DefiniteHit,
-                            Some(MemberResolveOutcome::Hit(result)),
-                        ),
+                        Ok(result) => {
+                            let origin = VirtualServeOrigin::hosted(result.artifact_id);
+                            (
+                                MemberCacheClass::DefiniteHit,
+                                Some(MemberResolveOutcome::Hit((result, origin))),
+                            )
+                        }
                         // #3220: the member's own download gate (quarantine /
                         // scan policy) refused an artifact it HOLDS. Terminal,
                         // not a miss — otherwise the block silently falls
@@ -3039,9 +3210,17 @@ where
                 VirtualMemberFetchStrategy::Proxy => match proxy_service {
                     // The cache-only probe contacts no upstream; its result is
                     // classified by the pure `classify_cache_probe`.
-                    Some(proxy) => classify_cache_probe(
-                        proxy.streaming_cached_artifact_by_path(member, path).await,
-                    ),
+                    Some(proxy) => {
+                        let (class, outcome) = classify_cache_probe(
+                            proxy.streaming_cached_artifact_by_path(member, path).await,
+                        );
+                        (
+                            class,
+                            outcome.map(|o| {
+                                o.map_hit(|result| (result, VirtualServeOrigin::remote(member)))
+                            }),
+                        )
+                    }
                     None => (MemberCacheClass::DefiniteMiss, None),
                 },
                 VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
@@ -3068,6 +3247,7 @@ where
                         None => proxy.fetch_artifact_streaming(member, path).await,
                     };
                     classify_stream_upstream(fetch, &member.key, path)
+                        .map_hit(|result| (result, VirtualServeOrigin::remote(member)))
                 }
                 None => MemberResolveOutcome::Miss,
             }
@@ -3076,7 +3256,14 @@ where
     .await;
 
     match outcome {
-        Some(MemberResolveOutcome::Hit(result)) => Ok(result),
+        Some(MemberResolveOutcome::Hit((result, origin))) => {
+            // A Remote winner implies `proxy_service` is present; the caller
+            // records a hosted winner itself (`record_hosted == false`).
+            if let (Some(ctx), Some(proxy)) = (ctx, proxy_service) {
+                record_virtual_serve(proxy.db(), Some(proxy), &origin, path, ctx, false).await;
+            }
+            Ok(result)
+        }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
         _ => Err(member_miss_response()),
     }
@@ -3112,6 +3299,74 @@ fn is_quarantine_block(e: &crate::error::AppError) -> bool {
 /// `helm::download_chart_via_index` and `pypi::serve_file`.
 pub(crate) fn is_member_policy_block_response(resp: &Response) -> bool {
     matches!(resp.status(), StatusCode::CONFLICT | StatusCode::FORBIDDEN)
+}
+
+/// Which member served a virtual download, and so which statistics table (if
+/// any) the serve belongs in (#3844).
+///
+/// The two-phase resolvers carry this from the per-member closures to
+/// winner-determination and record ONLY there. Recording inside a closure would
+/// count every member that is probed in Pass 1 or fanned out to in Pass 2 and
+/// then loses to a higher-priority member; recording at the winner counts the
+/// one member whose bytes the client actually receives, exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VirtualServeOrigin {
+    /// A hosted (Local / Staging) member's `artifacts` row:
+    /// `download_statistics` (#2260).
+    Hosted(Uuid),
+    /// A Remote member (presigned redirect, proxy-cache hit or upstream fetch):
+    /// `proxy_download_statistics`, keyed on the MEMBER's `(id, path)`, the
+    /// same coordinate a direct download from that Remote records (#3844).
+    Remote { repo_id: Uuid, repo_key: String },
+    /// A hosted serve with no `artifacts` row (row-less legacy bytes): there is
+    /// nothing to key a row on (#1278).
+    Unrecorded,
+}
+
+impl VirtualServeOrigin {
+    /// Origin of a hosted member's serve, from the resolved row id (if any).
+    pub(crate) fn hosted(artifact_id: Option<Uuid>) -> Self {
+        artifact_id.map_or(Self::Unrecorded, Self::Hosted)
+    }
+
+    /// Origin of a Remote member's serve.
+    pub(crate) fn remote(member: &Repository) -> Self {
+        Self::Remote {
+            repo_id: member.id,
+            repo_key: member.key.clone(),
+        }
+    }
+}
+
+/// Record a virtual download's WINNING member exactly once (#2260, #3844).
+///
+/// `record_hosted` is false for the buffered resolvers: a hosted winner there
+/// is left to the caller, which may or may not count it today (Maven and the
+/// generic route do, off `StreamingFetchResult::artifact_id`); recording it
+/// here too would double count those. A Remote winner needs the proxy it was
+/// resolved through (always present: only the proxy strategy yields one) and
+/// is recorded off the response path under the #3778 limiter, like Maven's
+/// direct Remote arm, so a virtual serve pays no extra time to first byte.
+/// Both recorders are HEAD-guarded and best-effort.
+async fn record_virtual_serve(
+    db: &PgPool,
+    proxy: Option<&ProxyService>,
+    origin: &VirtualServeOrigin,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    record_hosted: bool,
+) {
+    match origin {
+        VirtualServeOrigin::Hosted(artifact_id) if record_hosted => {
+            crate::services::artifact_service::record_download(db, *artifact_id, ctx).await;
+        }
+        VirtualServeOrigin::Remote { repo_id, repo_key } => {
+            if let Some(proxy) = proxy {
+                record_proxy_download_via_deferred(db, proxy, *repo_id, repo_key, path, ctx).await;
+            }
+        }
+        VirtualServeOrigin::Hosted(_) | VirtualServeOrigin::Unrecorded => {}
+    }
 }
 
 /// Streaming sibling of [`resolve_virtual_download`] that avoids
@@ -3173,7 +3428,8 @@ where
     // #3178: narrow to the members this caller may read BEFORE any member is
     // probed. The collapsed message is deliberate — see `resolve_virtual_
     // download` for why it must not be distinguishable from a genuine miss.
-    let members = authorize_virtual_members(&state.db, auth, virtual_repo_id, members).await;
+    // Fallible (#4308): an authorization query failure answers 503, not 404.
+    let members = try_authorize_virtual_members(&state.db, auth, virtual_repo_id, members).await?;
     if members.is_empty() {
         return Err(no_accessible_members_response());
     }
@@ -3193,100 +3449,97 @@ where
     // Borrow `local_fetch` so the per-member `probe` closure copies the
     // reference instead of moving the `Fn` into each `async move` future.
     let local_fetch = &local_fetch;
-    // The winning hit carries the resolved LOCAL artifact id (`Some`) so a
-    // local-member serve can be recorded exactly once at winner-determination
-    // (#2260). Remote pass-through / proxy-cache hits carry `None` and stay
-    // unrecorded (#1278). Recording in the probe would over-count members that
-    // are probed but lose to a higher-priority upstream candidate in Pass 2, so
-    // the id is threaded to the outcome instead.
-    let outcome = resolve_members_two_phase::<(Response, Option<Uuid>), Response, _, _, _, _>(
-        &members,
-        |member| async move {
-            match virtual_member_fetch_strategy(
-                &member.repo_type,
-                proxy_service.is_some(),
-                member.upstream_url.is_some(),
-            ) {
-                VirtualMemberFetchStrategy::Local => {
-                    let fetched = local_fetch(member.id, member.storage_location()).await;
-                    // Capture the local artifact id before `fetched` is consumed
-                    // into a Response by `classify_streaming_local`.
-                    let artifact_id = fetched.as_ref().ok().and_then(|r| r.artifact_id);
-                    let (class, outcome) = classify_streaming_local(
-                        fetched,
-                        default_content_type,
-                        content_disposition_filename,
-                    );
-                    // #3220: `classify_streaming_local` may return a terminal
-                    // Quarantine here (the member's download gate refusing an
-                    // artifact it holds); `map_hit` threads the artifact id onto
-                    // the success arm only, leaving that rejection intact.
-                    (
-                        class,
-                        outcome.map(|o| o.map_hit(|resp| (resp, artifact_id))),
-                    )
-                }
-                VirtualMemberFetchStrategy::Proxy => match proxy_service {
-                    Some(proxy) => {
-                        // #1555: a fresh proxy-cache hit on a redirect-capable
-                        // backend is served as a presigned redirect, never
-                        // streamed through the backend.
-                        if let Some(redirect) =
-                            try_member_cache_redirect(state, proxy, member, path, ctx).await
-                        {
-                            // Remote proxy-cache serve: not our artifact (#1278).
-                            (
-                                MemberCacheClass::DefiniteHit,
-                                Some(MemberResolveOutcome::Hit((redirect, None))),
-                            )
-                        } else {
-                            let (class, outcome) = classify_streaming_cache_probe(
-                                proxy.streaming_cached_artifact_by_path(member, path).await,
-                                default_content_type,
-                                content_disposition_filename,
-                            );
-                            (class, outcome.map(|o| o.map_hit(|resp| (resp, None))))
-                        }
-                    }
-                    None => (MemberCacheClass::DefiniteMiss, None),
-                },
-                VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
-            }
-        },
-        |member| async move {
-            match proxy_service {
-                // Remote upstream serve: not our artifact (#1278), so `None`.
-                Some(proxy) => match classify_streaming_upstream(
-                    proxy_fetch_streaming_member(
-                        proxy,
-                        member,
-                        path,
-                        default_content_type,
-                        content_disposition_filename,
-                    )
-                    .await,
+    // The winning hit carries its `VirtualServeOrigin` so the serve is recorded
+    // exactly once at winner-determination: a hosted member into
+    // `download_statistics` (#2260), a Remote member into
+    // `proxy_download_statistics` (#3844). Recording in the closures would
+    // over-count members that are probed but lose to a higher-priority
+    // candidate in Pass 2, so the origin is threaded to the outcome instead.
+    let outcome =
+        resolve_members_two_phase::<(Response, VirtualServeOrigin), Response, _, _, _, _>(
+            &members,
+            |member| async move {
+                match virtual_member_fetch_strategy(
+                    &member.repo_type,
+                    proxy_service.is_some(),
+                    member.upstream_url.is_some(),
                 ) {
-                    MemberResolveOutcome::Hit(resp) => MemberResolveOutcome::Hit((resp, None)),
-                    MemberResolveOutcome::Quarantine(resp) => {
-                        MemberResolveOutcome::Quarantine(resp)
+                    VirtualMemberFetchStrategy::Local => {
+                        let fetched = local_fetch(member.id, member.storage_location()).await;
+                        // Capture the local artifact id before `fetched` is consumed
+                        // into a Response by `classify_streaming_local`.
+                        let origin = VirtualServeOrigin::hosted(
+                            fetched.as_ref().ok().and_then(|r| r.artifact_id),
+                        );
+                        let (class, outcome) = classify_streaming_local(
+                            fetched,
+                            default_content_type,
+                            content_disposition_filename,
+                        );
+                        // #3220: `classify_streaming_local` may return a terminal
+                        // Quarantine here (the member's download gate refusing an
+                        // artifact it holds); `map_hit` threads the origin onto the
+                        // success arm only, leaving that rejection intact.
+                        (class, outcome.map(|o| o.map_hit(|resp| (resp, origin))))
                     }
-                    MemberResolveOutcome::Miss => MemberResolveOutcome::Miss,
-                },
-                None => MemberResolveOutcome::Miss,
-            }
-        },
-    )
-    .await;
+                    VirtualMemberFetchStrategy::Proxy => match proxy_service {
+                        Some(proxy) => {
+                            // #1555: a fresh proxy-cache hit on a redirect-capable
+                            // backend is served as a presigned redirect, never
+                            // streamed through the backend.
+                            if let Some(redirect) =
+                                try_member_cache_redirect(state, proxy, member, path, ctx).await
+                            {
+                                (
+                                    MemberCacheClass::DefiniteHit,
+                                    Some(MemberResolveOutcome::Hit((
+                                        redirect,
+                                        VirtualServeOrigin::remote(member),
+                                    ))),
+                                )
+                            } else {
+                                let (class, outcome) = classify_streaming_cache_probe(
+                                    proxy.streaming_cached_artifact_by_path(member, path).await,
+                                    default_content_type,
+                                    content_disposition_filename,
+                                );
+                                (
+                                    class,
+                                    outcome.map(|o| {
+                                        o.map_hit(|resp| (resp, VirtualServeOrigin::remote(member)))
+                                    }),
+                                )
+                            }
+                        }
+                        None => (MemberCacheClass::DefiniteMiss, None),
+                    },
+                    VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
+                }
+            },
+            |member| async move {
+                match proxy_service {
+                    Some(proxy) => classify_streaming_upstream(
+                        proxy_fetch_streaming_member(
+                            proxy,
+                            member,
+                            path,
+                            default_content_type,
+                            content_disposition_filename,
+                        )
+                        .await,
+                    )
+                    .map_hit(|resp| (resp, VirtualServeOrigin::remote(member))),
+                    None => MemberResolveOutcome::Miss,
+                }
+            },
+        )
+        .await;
 
     match outcome {
-        Some(MemberResolveOutcome::Hit((response, artifact_id))) => {
-            // Record the local-member winner exactly once (#2260). Inline-awaited
-            // so the row is committed before the response is returned; a Remote
-            // pass-through winner has `artifact_id == None` and stays unrecorded.
-            if let Some(artifact_id) = artifact_id {
-                crate::services::artifact_service::record_download(&state.db, artifact_id, ctx)
-                    .await;
-            }
+        Some(MemberResolveOutcome::Hit((response, origin))) => {
+            // Record the winning member exactly once (#2260, #3844). Both
+            // recorders write off the response path (#2522, #3778).
+            record_virtual_serve(&state.db, proxy_service, &origin, path, ctx, true).await;
             Ok(response)
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
@@ -3411,17 +3664,30 @@ where
             // The cache-keyed fetch is `proxy_fetch` with `fetch_path ==
             // cache_path`, widened to also report the upstream
             // `Content-Encoding` (#3260) and `Content-Type` (#3281) so the
-            // transform can re-declare them.
-            match proxy_fetch_with_cache_key(
+            // transform can re-declare them. Bounded by the member deadline
+            // (#4508): a member that misses it ends the walk with a 502
+            // naming it rather than holding every miss for the upstream's
+            // own timeout or silently answering from a lower-priority member.
+            let fetched = within_virtual_member_deadline(proxy_fetch_with_cache_key(
                 proxy,
                 member.id,
                 &member.key,
                 upstream_url,
                 path,
                 path,
-            )
-            .await
-            {
+            ))
+            .await;
+            let fetched = match fetched {
+                Ok(fetched) => fetched,
+                Err(deadline) => {
+                    return MemberResolveOutcome::Quarantine(virtual_member_deadline_response(
+                        &member.key,
+                        path,
+                        deadline,
+                    ));
+                }
+            };
+            match fetched {
                 Ok((bytes, ct, enc)) => match transform(bytes, ct, enc, member.key.clone()).await {
                     Ok(response) => MemberResolveOutcome::Hit(response),
                     Err(_) => {
@@ -3462,13 +3728,311 @@ where
     }
 }
 
+/// Environment variable bounding, in seconds, how long one Remote member of a
+/// virtual repository may take to answer a metadata fetch (#4508).
+pub const VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV: &str = "AK_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS";
+
+/// Default member deadline. The upstream client's connect and read timeouts
+/// are 60 s each, which is also what most reverse proxies allow a whole
+/// request, so a member whose upstream is down (connections blackholed, not
+/// refused) used to hold every miss past the proxy's timeout and the client
+/// saw 504. 20 s is far above a healthy metadata fetch and well under that.
+pub const DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS: u64 = 20;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only override of [`virtual_member_metadata_timeout`] for the
+    /// requests a test drives (see [`with_virtual_member_deadline`]).
+    static VIRTUAL_MEMBER_DEADLINE_OVERRIDE: std::time::Duration;
+}
+
+/// The member deadline: [`VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV`], or
+/// [`DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS`] when it is unset, not a
+/// number or zero (zero would fail every member, never disable the bound).
+pub fn virtual_member_metadata_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(deadline) = VIRTUAL_MEMBER_DEADLINE_OVERRIDE.try_with(|d| *d) {
+        return deadline;
+    }
+    static DEADLINE: OnceLock<std::time::Duration> = OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        let secs = std::env::var(VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS);
+        std::time::Duration::from_secs(secs)
+    })
+}
+
+/// Run `fut` with the member deadline set to `deadline` for every member
+/// fetch it makes on this task. Test-only.
+#[cfg(test)]
+pub(crate) async fn with_virtual_member_deadline<F: std::future::Future>(
+    deadline: std::time::Duration,
+    fut: F,
+) -> F::Output {
+    VIRTUAL_MEMBER_DEADLINE_OVERRIDE.scope(deadline, fut).await
+}
+
+/// Run one virtual member's metadata fetch under the member deadline
+/// (#4508). `Err` carries the deadline it missed.
+pub async fn within_virtual_member_deadline<F: std::future::Future>(
+    fut: F,
+) -> Result<F::Output, std::time::Duration> {
+    let deadline = virtual_member_metadata_timeout();
+    tokio::time::timeout(deadline, fut)
+        .await
+        .map_err(|_| deadline)
+}
+
+/// [`proxy_fetch_capped_budgeted`] for one virtual member's metadata, bounded
+/// by the member deadline (#4508). The budget reservation is waited for
+/// first and only the upstream fetch is timed, so a saturated buffered-metadata
+/// budget is never reported as the member being down. `Err` carries the
+/// deadline the fetch missed.
+pub async fn member_metadata_fetch_capped_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response>, std::time::Duration> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let fetched =
+        within_virtual_member_deadline(proxy_service.fetch_artifact_capped(&repo, path, max))
+            .await?;
+    Ok(fetched
+        .map(|(content, content_type)| (content, content_type, permit))
+        .map_err(|e| map_proxy_error(repo_key, path, e)))
+}
+
+/// Why a member that missed the deadline contributed nothing, for a 502 body.
+pub fn virtual_member_deadline_reason(path: &str, deadline: std::time::Duration) -> String {
+    format!(
+        "{path}: no answer within {}s ({VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV}); the upstream \
+         may be down",
+        deadline.as_secs_f64()
+    )
+}
+
+/// The 502 a virtual metadata request answers when `member` misses the
+/// member deadline (#4508): fail promptly and name the member, instead of
+/// holding the request for the upstream's own timeout.
+pub fn virtual_member_deadline_response(
+    member: &str,
+    path: &str,
+    deadline: std::time::Duration,
+) -> Response {
+    metrics::counter!(
+        "ak_virtual_member_metadata_timeouts_total",
+        "member" => member.to_string(),
+    )
+    .increment(1);
+    tracing::warn!(
+        member = %member,
+        path = %path,
+        deadline_secs = deadline.as_secs_f64(),
+        "virtual member did not answer a metadata fetch within the member deadline"
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "Virtual repository member '{member}' failed: {}",
+            virtual_member_deadline_reason(path, deadline)
+        ),
+    )
+        .into_response()
+}
+
+/// `repository_config` key on a VIRTUAL repository that opts it into degraded
+/// metadata merges (#4192): `true` serves the merge of the members that
+/// succeeded, marked partial and uncacheable. Absent or anything else:
+/// strict, i.e. any member failure fails the request with 502. Shared by
+/// [`collect_virtual_metadata`] and the conda virtual merge.
+pub const VIRTUAL_METADATA_PARTIAL_CONFIG_KEY: &str = "virtual_metadata_partial";
+
+/// Response header naming the members a degraded merge left out (#4192).
+pub const PARTIAL_MEMBERS_HEADER: &str = "x-ak-partial-members";
+
+/// Whether `value` (the stored [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`]) opts
+/// a virtual into partial merges.
+pub fn virtual_metadata_partial_opted_in(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some(v) if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("allow")
+    )
+}
+
+/// Read whether `virtual_repo_id` opted into partial merges. A failed read is
+/// strict: the lookup failing must not loosen the guarantee.
+pub async fn virtual_metadata_partial_allowed(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(virtual_repo_id)
+    .bind(VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "reading {VIRTUAL_METADATA_PARTIAL_CONFIG_KEY} failed; using strict");
+        None
+    });
+    virtual_metadata_partial_opted_in(value.as_deref())
+}
+
+/// Mark a degraded merged response: name the missing members, forbid caching
+/// (a partial document must never be cached as the complete one) and add a
+/// `Warning: 199`.
+pub fn mark_partial_metadata_response(response: &mut Response, missing: &str) {
+    use axum::http::header::{CACHE_CONTROL, ETAG, WARNING};
+    use axum::http::HeaderValue;
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(missing) {
+        headers.insert(PARTIAL_MEMBERS_HEADER, v);
+    }
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.remove(ETAG);
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "199 - \"partial merge: members {missing} are missing\""
+    )) {
+        headers.insert(WARNING, v);
+    }
+}
+
+/// Why one Remote member of a virtual contributed nothing to a merged
+/// metadata document (#4192).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualMemberFailure {
+    /// The member repository's key.
+    pub member: String,
+    /// Stable, low-cardinality class for the failure metric: `fetch`,
+    /// `parse` or `timeout` (the member deadline, #4508).
+    pub kind: &'static str,
+    /// What went wrong, phrased for an operator reading a 502 body.
+    pub reason: String,
+}
+
+/// The members a merged metadata document left out, when the virtual opted
+/// into partial merges (#4192). Empty for a complete merge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use = "a partial merge must be marked on the response it is served as"]
+pub struct PartialMerge(Option<String>);
+
+impl PartialMerge {
+    /// The comma-separated member keys left out, if any.
+    pub fn missing(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Mark `response` as partial and uncacheable when members are missing.
+    pub fn mark(&self, response: &mut Response) {
+        if let Some(missing) = &self.0 {
+            mark_partial_metadata_response(response, missing);
+        }
+    }
+
+    /// [`Self::mark`] on a handler result's success arm.
+    pub fn apply(&self, result: Result<Response, Response>) -> Result<Response, Response> {
+        result.map(|mut response| {
+            self.mark(&mut response);
+            response
+        })
+    }
+}
+
+/// What [`collect_virtual_metadata`] gathered: each contributing member's
+/// extracted document in member order, and the members a degraded merge left
+/// out, which the caller marks on the response it builds.
+#[derive(Debug)]
+pub struct VirtualMetadata<T> {
+    pub documents: Vec<(String, T)>,
+    pub partial: PartialMerge,
+}
+
+/// Count every member failure and turn the outcome into what the virtual's
+/// policy calls for (#4192): nothing missing, a partial merge naming the
+/// members (opted in), or the strict 502 naming each member and its cause.
+async fn apply_virtual_member_failures(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    format: &str,
+    path: &str,
+    failed: &[VirtualMemberFailure],
+) -> Result<PartialMerge, Response> {
+    if failed.is_empty() {
+        return Ok(PartialMerge::default());
+    }
+    let virtual_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+        .bind(virtual_repo_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| virtual_repo_id.to_string());
+    let allow_partial = virtual_metadata_partial_allowed(db, virtual_repo_id).await;
+    for f in failed {
+        metrics::counter!(
+            "ak_virtual_member_metadata_failures_total",
+            "format" => format.to_string(),
+            "virtual_repo" => virtual_key.clone(),
+            "member" => f.member.clone(),
+            "reason" => f.kind,
+        )
+        .increment(1);
+        tracing::warn!(
+            virtual_repo = %virtual_key,
+            member = %f.member,
+            path = %path,
+            kind = f.kind,
+            reason = %f.reason,
+            allow_partial,
+            "virtual member could not contribute to the merged metadata document"
+        );
+    }
+    if allow_partial {
+        return Ok(PartialMerge(Some(
+            failed
+                .iter()
+                .map(|f| f.member.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )));
+    }
+    let detail = failed
+        .iter()
+        .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("Virtual repository '{virtual_key}' cannot serve {path}: {detail}"),
+    )
+        .into_response())
+}
+
 /// Collect metadata from ALL remote members of a virtual repository.
 /// Each member's response is extracted via the `extract` closure and
-/// gathered into a `Vec<(repo_key, T)>`. The caller is responsible for
-/// merging the collected results.
+/// gathered, in member order, for the caller to merge.
 ///
 /// Suitable for metadata endpoints where responses from every upstream
-/// must be combined (conda repodata, cran PACKAGES, helm index, rubygems specs).
+/// must be combined (cran PACKAGES, helm index, hex names/versions, bazel
+/// module metadata).
+///
+/// A member that fails to fetch or whose document does not extract fails the
+/// merge loudly (#4192): by default the request is a 502 naming each failed
+/// member and the cause, because a merged index that silently lacks a member
+/// makes the client conclude its packages do not exist (or resolve a name
+/// present in two members to the lower-priority one). A virtual that opted in
+/// through [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`] gets the merge of the
+/// members that succeeded and a [`PartialMerge`] the caller marks on its
+/// response. Either way each failure counts in
+/// `ak_virtual_member_metadata_failures_total`. A member that answers 404
+/// publishes no such document: it contributes nothing and is not a failure.
+/// Members the caller may not read are not members here at all (#3323).
 ///
 /// Deliberately DROPS the upstream `Content-Encoding` (#3260): every `extract`
 /// closure PARSES the member body and the caller serves a merged document it
@@ -3487,7 +4051,7 @@ pub async fn collect_virtual_metadata<T, F, Fut>(
     virtual_repo_id: Uuid,
     path: &str,
     extract: F,
-) -> Result<Vec<(String, T)>, Response>
+) -> Result<VirtualMetadata<T>, Response>
 where
     F: Fn(Bytes, String) -> Fut,
     Fut: std::future::Future<Output = Result<T, Response>>,
@@ -3505,40 +4069,74 @@ where
         .iter()
         .filter(|m| m.repo_type == RepositoryType::Remote)
         .collect();
-    let mut results: Vec<(String, T)> = Vec::new();
+    let format = remote_members
+        .first()
+        .map(|m| m.format.as_key())
+        .unwrap_or("unknown");
+    let mut documents: Vec<(String, T)> = Vec::new();
+    let mut failed: Vec<VirtualMemberFailure> = Vec::new();
     for chunk in remote_members.chunks(MAX_VIRTUAL_FANOUT) {
         let batch = futures::future::join_all(chunk.iter().copied().map(|member| async move {
-            let (Some(proxy), Some(upstream_url)) = (proxy_service, member.upstream_url.as_deref())
-            else {
-                return None;
+            let fail = |kind: &'static str, reason: String| {
+                Some(Err(VirtualMemberFailure {
+                    member: member.key.clone(),
+                    kind,
+                    reason,
+                }))
             };
-            match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
-                Ok((bytes, _ct)) => match extract(bytes, member.key.clone()).await {
-                    Ok(data) => Some((member.key.clone(), data)),
-                    Err(_) => {
-                        tracing::warn!(
-                            member = %member.key,
-                            path = %path,
-                            "virtual metadata extract failed for member response"
-                        );
-                        None
-                    }
-                },
-                Err(_) => {
-                    tracing::warn!(
-                        member = %member.key,
-                        path = %path,
-                        "virtual metadata proxy fetch failed for member"
-                    );
-                    None
+            let Some(proxy) = proxy_service else {
+                return fail("fetch", "the proxy service is not available".to_string());
+            };
+            let Some(upstream_url) = member.upstream_url.as_deref() else {
+                return fail("fetch", "remote member has no upstream URL".to_string());
+            };
+            // Bounded by the member deadline (#4508): a member whose upstream
+            // is down must not hold the merge for the upstream's own timeout.
+            let fetched = match within_virtual_member_deadline(proxy_fetch(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                path,
+            ))
+            .await
+            {
+                Ok(fetched) => fetched,
+                Err(deadline) => {
+                    return fail("timeout", virtual_member_deadline_reason(path, deadline));
                 }
+            };
+            match fetched {
+                Ok((bytes, _ct)) => match extract(bytes, member.key.clone()).await {
+                    Ok(data) => Some(Ok((member.key.clone(), data))),
+                    Err(response) => fail(
+                        "parse",
+                        format!(
+                            "{path}: the upstream document could not be read ({})",
+                            response.status()
+                        ),
+                    ),
+                },
+                // The member publishes no such document: nothing to merge,
+                // and nothing missing from the merge either.
+                Err(response) if response.status() == StatusCode::NOT_FOUND => None,
+                Err(response) => fail(
+                    "fetch",
+                    format!("{path}: upstream fetch failed with {}", response.status()),
+                ),
             }
         }))
         .await;
-        results.extend(batch.into_iter().flatten());
+        for outcome in batch.into_iter().flatten() {
+            match outcome {
+                Ok(document) => documents.push(document),
+                Err(failure) => failed.push(failure),
+            }
+        }
     }
 
-    Ok(results)
+    let partial = apply_virtual_member_failures(db, virtual_repo_id, format, path, &failed).await?;
+    Ok(VirtualMetadata { documents, partial })
 }
 
 /// Adapt a virtual-repo member [`Repository`] (as returned by
@@ -3639,97 +4237,117 @@ pub(crate) fn combined_severity_gate(
 
 /// The effective proxy-scan policy for a Virtual repo resolving an artifact
 /// from a member (#3023): the stricter-of-two over the virtual's own config and
-/// the member's (see [`stricter_scan_policy`]). Callers gate on the returned
-/// `enabled` and thread the returned `action` and severity gate into the
+/// the member's (see [`stricter_scan_policy`]). Callers gate on `Some` and
+/// thread the returned `action` and severity gate into the
 /// per-format scan gate so the virtual path enforces the same digest-keyed
 /// verdict as a direct pull. The severity gate combines stricter-of-two the
 /// same way (#3243 stage 3): `BlockOnAny` on either side dominates, so a
 /// virtual that has not opted into threshold gating cannot become the lax
 /// route around a member's block-on-any posture, and vice versa.
-pub async fn effective_virtual_scan_policy(
+///
+/// One `scan_configs` read for both sides. An unreadable config is a
+/// retryable 503 (#4365 item 5), as in [`virtual_member_scan_policies`]:
+/// reading it as "off" used to serve the member unscanned.
+pub(crate) async fn effective_virtual_scan_policy(
     db: &PgPool,
     virtual_id: Uuid,
     member_id: Uuid,
+) -> Result<Option<MemberScanPolicy>, Response> {
+    let rows = read_scan_config_rows(db, virtual_id, &[virtual_id, member_id]).await?;
+    Ok(combined_member_policy(&rows, virtual_id, member_id))
+}
+
+/// The scan-on-proxy policy a DIRECT Remote pull is served under, or `None`
+/// when the repository has not enabled scan-on-proxy (#4102): the check every
+/// format's Remote arm runs before choosing the gate over its streaming path.
+///
+/// One `scan_configs` read for the flag, the action and the severity gate,
+/// mapped by [`scan_policy_from_row`], the same mapping the Virtual walk's
+/// [`virtual_member_scan_policies`] uses, so a member and a direct pull of the
+/// same repository resolve one policy. A missing row is scanning off. An
+/// UNREADABLE row fails closed with a retryable 503 (#4365 item 5): reading
+/// the flag as off would stream the pull unscanned for as long as the database
+/// is failing, which is the opposite of what the Virtual walk and the generic
+/// download route do.
+pub(crate) async fn remote_scan_policy(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> Result<Option<MemberScanPolicy>, Response> {
+    let rows = read_scan_config_rows(db, repo_id, &[repo_id]).await?;
+    Ok(direct_policy_from_rows(&rows, repo_id))
+}
+
+/// One `scan_configs` row as the proxy scan policy reads it:
+/// `(scan_on_proxy, proxy_scan_action, block_on_policy_violation,
+/// severity_threshold)`.
+type ScanConfigRow = (bool, String, bool, String);
+
+/// The DB-free half of [`remote_scan_policy`]: `repo_id`'s own row, if any,
+/// mapped by [`scan_policy_from_row`]; a missing row or a disabled flag is
+/// `None`.
+fn direct_policy_from_rows(
+    rows: &[(Uuid, ScanConfigRow)],
+    repo_id: Uuid,
+) -> Option<MemberScanPolicy> {
+    let (enabled, action, gate) =
+        scan_policy_from_row(rows.iter().find(|r| r.0 == repo_id).map(|r| &r.1));
+    enabled.then_some((action, gate))
+}
+
+/// [`reject_ambiguous_client_path`](crate::services::proxy_service::reject_ambiguous_client_path)
+/// over the client-derived segments of a request a format route proxies
+/// (#4365 item 3, strict form), as a `400` response; a no-op when the
+/// repository does not proxy (`proxied == false`: a hosted repository never
+/// builds an upstream URL).
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_ambiguous_client_segments(
+    proxied: bool,
+    segments: &[&str],
+) -> Result<(), Response> {
+    if !proxied {
+        return Ok(());
+    }
+    for segment in segments {
+        crate::services::proxy_service::reject_ambiguous_client_path(segment, false)
+            .map_err(IntoResponse::into_response)?;
+    }
+    Ok(())
+}
+
+/// The retryable 503 every proxy serve path answers when the scan-on-proxy
+/// configuration cannot be read (#4365 item 5).
+pub(crate) fn scan_config_unreadable() -> Response {
+    AppError::ServiceUnavailable(
+        "scan-on-proxy configuration is temporarily unreadable".to_string(),
+    )
+    .into_response()
+}
+
+/// `(enabled, action, severity_gate)` for one repository's `scan_configs`
+/// row. A missing row is disabled / fail-open / block-on-any, the column
+/// defaults. Shared by the direct and the Virtual policy reads.
+fn scan_policy_from_row(
+    row: Option<&ScanConfigRow>,
 ) -> (
     bool,
     crate::services::proxy_scan_service::ProxyScanAction,
     crate::services::proxy_scan_service::ProxySeverityGate,
 ) {
     use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
-    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
-    let virtual_enabled = svc.is_proxy_scan_enabled(virtual_id).await.unwrap_or(false);
-    let member_enabled = svc.is_proxy_scan_enabled(member_id).await.unwrap_or(false);
-    let virtual_action = svc
-        .proxy_scan_action(virtual_id)
-        .await
-        .unwrap_or(ProxyScanAction::FailOpen);
-    let member_action = svc
-        .proxy_scan_action(member_id)
-        .await
-        .unwrap_or(ProxyScanAction::FailOpen);
-    // Fail closed on a config read fault: an unreadable gate is block-on-any.
-    let virtual_gate = svc
-        .proxy_severity_gate(virtual_id)
-        .await
-        .unwrap_or(ProxySeverityGate::BlockOnAny);
-    let member_gate = svc
-        .proxy_severity_gate(member_id)
-        .await
-        .unwrap_or(ProxySeverityGate::BlockOnAny);
-    let (enabled, action) = stricter_scan_policy(
-        virtual_enabled,
-        virtual_action,
-        member_enabled,
-        member_action,
-    );
-    (
-        enabled,
-        action,
-        combined_severity_gate(action, virtual_gate, member_gate),
-    )
-}
-
-/// The proxy-scan `(action, severity_gate)` pair for a DIRECT (non-virtual)
-/// repo pull, with the shared fail-safe defaults: an unreadable action is
-/// fail-open (availability-first, matching the column default) while an
-/// unreadable severity gate is block-on-any (the fail-closed direction —
-/// a config fault must not weaken the blocking decision, #3243).
-pub async fn direct_scan_policy(
-    db: &PgPool,
-    repo_id: Uuid,
-) -> (
-    crate::services::proxy_scan_service::ProxyScanAction,
-    crate::services::proxy_scan_service::ProxySeverityGate,
-) {
-    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
-    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
-    let action = svc
-        .proxy_scan_action(repo_id)
-        .await
-        .unwrap_or(ProxyScanAction::FailOpen);
-    let gate = svc
-        .proxy_severity_gate(repo_id)
-        .await
-        .unwrap_or(ProxySeverityGate::BlockOnAny);
-    (action, gate)
-}
-
-/// The scan-on-proxy policy a DIRECT Remote pull is served under, or `None`
-/// when the repository has not enabled scan-on-proxy (#4102): the
-/// enabled-check plus [`direct_scan_policy`] a format's Remote arm runs before
-/// choosing the gate over its streaming path. NuGet uses it; the older
-/// formats still inline the same two calls. An unreadable
-/// enabled flag reads as off, the reading the npm / PyPI / Cargo / Maven
-/// arms already take (#4365 item 5 tracks failing it closed).
-pub(crate) async fn remote_scan_policy(db: &PgPool, repo_id: Uuid) -> Option<MemberScanPolicy> {
-    let enabled = crate::services::scan_config_service::ScanConfigService::new(db.clone())
-        .is_proxy_scan_enabled(repo_id)
-        .await
-        .unwrap_or(false);
-    if !enabled {
-        return None;
-    }
-    Some(direct_scan_policy(db, repo_id).await)
+    row.map(|(enabled, action, block, threshold)| {
+        (
+            *enabled,
+            ProxyScanAction::from_db(action),
+            crate::services::scan_config_service::proxy_severity_gate_for_row(
+                *block, threshold, action,
+            ),
+        )
+    })
+    .unwrap_or((
+        false,
+        ProxyScanAction::FailOpen,
+        ProxySeverityGate::BlockOnAny,
+    ))
 }
 
 /// Edges of the membership subgraph reachable from a virtual repository root,
@@ -3799,11 +4417,6 @@ pub(crate) struct ExpandedMember {
 pub(crate) struct VirtualMemberExpansion {
     /// Leaf (non-virtual) members, de-duplicated, in DFS pre-order priority.
     pub members: Vec<ExpandedMember>,
-    /// The nested virtual repositories the walk went through (the root
-    /// excluded), each once, under the same cycle and depth rules as
-    /// `members`. A token's `include_virtual_members` adds them alongside the
-    /// leaves, so a nested virtual stays readable by its own key (#4213).
-    pub nested_virtuals: Vec<Uuid>,
     /// At least one membership edge was skipped because following it would
     /// have re-entered a repository already on the current path — the stored
     /// graph contains a cycle. Unreachable through the API (the write-time
@@ -3881,7 +4494,6 @@ pub(crate) async fn expand_virtual_members(
     const MAX_DEPTH: usize = crate::services::repository_service::MAX_VIRTUAL_DEPTH;
 
     let mut members: Vec<ExpandedMember> = Vec::new();
-    let mut nested_virtuals: Vec<Uuid> = Vec::new();
     let mut expanded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut emitted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut on_path: std::collections::HashSet<Uuid> =
@@ -3913,9 +4525,6 @@ pub(crate) async fn expand_virtual_members(
                 if !expanded.insert(id) {
                     // Already expanded via an earlier (better-ranked) path.
                     continue;
-                }
-                if id != virtual_repo_id {
-                    nested_virtuals.push(id);
                 }
                 on_path.insert(id);
                 stack.push(Event::Exit(id));
@@ -3950,7 +4559,6 @@ pub(crate) async fn expand_virtual_members(
 
     Ok(VirtualMemberExpansion {
         members,
-        nested_virtuals,
         cycle_edge_skipped,
         depth_limit_reached,
     })
@@ -4122,6 +4730,10 @@ pub async fn resolve_virtual_deploy_target(
         if member.promotion_only {
             continue;
         }
+        // Strict member scope, deliberately: the #4559 parent term
+        // (`member_passes_token_scope`) is for READS through the routed
+        // virtual. A token minted on a virtual does not gain write access to
+        // the members behind it.
         if !auth.can_access_repo(member.id) {
             continue;
         }
@@ -4164,6 +4776,14 @@ pub async fn resolve_virtual_deploy_target(
 /// [`member_passes_token_scope`]. Reusing those two helpers is deliberate:
 /// listing and byte resolution now evaluate the SAME predicate from the SAME
 /// code, so "which members does this caller see" cannot drift between the two.
+///
+/// `in_scope` includes the #4559 parent term: a member is in scope when the
+/// token's scope names the member OR `virtual_repo_id`, so a token minted on a
+/// virtual reads that virtual's members through it, still subject to the
+/// owner's grants and the read-action gate below. `virtual_repo_id` must be
+/// the virtual the request was routed through (every caller passes the routed
+/// repository's id); a direct request to a member never reaches this function
+/// and keeps the strict scope check in `repo_visibility_middleware`.
 ///
 /// What this replaces (#3178). The previous implementation was NOT this
 /// predicate. Its entitlement half was
@@ -4250,13 +4870,14 @@ pub async fn authorize_virtual_members(
     virtual_repo_id: Uuid,
     members: Vec<Repository>,
 ) -> Vec<Repository> {
-    // Flattening Err into the empty set is correct for the WALKING callers
-    // (manifest/blob resolution): they probe members one by one and a missing
-    // member reads as "artifact not found here", so the deny direction is
-    // safe. Callers that AGGREGATE the filtered set into a response (OCI
-    // tags/list, #3320) must use [`try_authorize_virtual_members`] instead:
-    // for them an empty set is indistinguishable from "nothing exists" and a
-    // transient DB error would surface as 404 NAME_UNKNOWN.
+    // Flattening Err into the empty set fails CLOSED, but it also turns a
+    // transient DB error into "no member has it". Callers that AGGREGATE the
+    // filtered set into a response (OCI tags/list, #3320) must use
+    // [`try_authorize_virtual_members`]: for them an empty set is
+    // indistinguishable from "nothing exists". So must a walk that answers a
+    // package client: "not found" is a definitive answer that Gradle and
+    // Maven cache, so the shared download resolvers and the Maven virtual
+    // checksum walk use the fallible form too (#4308).
     try_authorize_virtual_members(db, auth, virtual_repo_id, members)
         .await
         .unwrap_or_default()
@@ -4686,7 +5307,8 @@ pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) ->
 }
 
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
-/// model and the #1804 / #3178 background.
+/// model, the #1804 / #3178 background and the #4559 parent term
+/// (`virtual_repo_id` is the virtual the request was routed through).
 pub async fn caller_can_read_member(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -6059,15 +6681,13 @@ pub async fn virtual_non_remote_owns_maven_gav(
 /// that prompted the streaming migration.
 /// The proxy-cache `(storage_key, metadata_key)` pair under which a recorded
 /// serve ensures its transient catalog placeholder — the keys the streaming
-/// tee later refines in place. `None` when no proxy service is wired (the
-/// scope must come from the live `ProxyService`, #3454) or when the path is
-/// too long to cache at all (it could never have a catalog row).
-fn proxy_record_target(
-    state: &crate::api::SharedState,
-    repo_key: &str,
-    path: &str,
-) -> Option<(String, String)> {
-    let scope = state.proxy_service.as_ref()?.cache_scope();
+/// tee later refines in place. The scope comes from the `ProxyService` the
+/// serve went through (#3454): `state.proxy_service` for a direct Remote, the
+/// resolver's proxy (possibly the caller's `proxy_for_virtual`) for a virtual
+/// member. `None` when the path is too long to cache at all (it could never
+/// have a catalog row).
+fn proxy_record_keys(proxy: &ProxyService, repo_key: &str, path: &str) -> Option<(String, String)> {
+    let scope = proxy.cache_scope();
     match (
         crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
         crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
@@ -6100,6 +6720,26 @@ pub(crate) async fn record_proxy_download(
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) {
+    // The scope must come from the live `ProxyService` (#3454): a placeholder
+    // row keyed under a different scope than the tee writes would never be
+    // refined in place, leaving a permanently orphaned catalog row.
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return;
+    };
+    record_proxy_download_via(&state.db, proxy, repo_id, repo_key, path, ctx).await;
+}
+
+/// Body of [`record_proxy_download`] against an explicit [`ProxyService`]
+/// (#3844): the virtual resolvers record a Remote member's winning serve under
+/// the proxy they resolved it through. Same HEAD guard and best-effort posture.
+pub(crate) async fn record_proxy_download_via(
+    db: &PgPool,
+    proxy: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
     if ctx.is_head {
         return;
     }
@@ -6108,25 +6748,37 @@ pub(crate) async fn record_proxy_download(
     // later authoritative upsert refines the same `(repo, path)` row in place.
     // A path whose key exceeds the object-store limit can never be cached, so
     // there is nothing to count — skip.
-    // The scope must come from the live `ProxyService` (#3454): a placeholder
-    // row keyed under a different scope than the tee writes would never be
-    // refined in place, leaving a permanently orphaned catalog row.
-    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
+    let Some((storage_key, metadata_key)) = proxy_record_keys(proxy, repo_key, path) else {
         return;
     };
     let ip = ctx.client_ip.map(|i| i.to_string());
-    if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
-        &state.db,
-        repo_id,
-        path,
-        &storage_key,
-        &metadata_key,
-        ctx.user_id,
-        ip.as_deref(),
-        ctx.user_agent.as_deref(),
-    )
-    .await
-    {
+    // #4551: an object served without any cache write (over the repository
+    // quota) gets no catalog placeholder; the download is still recorded,
+    // keyed on `(repository_id, path)` (#4539).
+    let recorded = if proxy.served_without_cache(repo_id, path) {
+        crate::services::proxy_catalog::record_uncached_proxy_download(
+            db,
+            repo_id,
+            path,
+            ctx.user_id,
+            ip.as_deref(),
+            ctx.user_agent.as_deref(),
+        )
+        .await
+    } else {
+        crate::services::proxy_catalog::record_proxy_download(
+            db,
+            repo_id,
+            path,
+            &storage_key,
+            &metadata_key,
+            ctx.user_id,
+            ip.as_deref(),
+            ctx.user_agent.as_deref(),
+        )
+        .await
+    };
+    if let Err(e) = recorded {
         tracing::debug!(
             repo_id = %repo_id,
             path = %path,
@@ -6163,13 +6815,31 @@ pub(crate) async fn record_proxy_download_deferred(
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) {
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return;
+    };
+    record_proxy_download_via_deferred(&state.db, proxy, repo_id, repo_key, path, ctx).await;
+}
+
+/// [`record_proxy_download_deferred`] against an explicit [`ProxyService`]
+/// (#3844): the virtual resolvers record a Remote member's winning serve under
+/// the proxy they resolved it through, off the response path like Maven's
+/// direct Remote arm (#3778).
+pub(crate) async fn record_proxy_download_via_deferred(
+    db: &PgPool,
+    proxy: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
     if ctx.is_head {
         return;
     }
-    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
+    let Some((storage_key, metadata_key)) = proxy_record_keys(proxy, repo_key, path) else {
         return;
     };
-    let db = state.db.clone();
+    let db = db.clone();
     let path_owned = path.to_string();
     let user_id = ctx.user_id;
     let ip = ctx.client_ip.map(|i| i.to_string());
@@ -6646,14 +7316,23 @@ pub async fn put_artifact_bytes(
     storage_key: &str,
     body: Bytes,
 ) -> Result<(), Response> {
+    // Every caller is a hosted publish: refuse an over-quota upload before
+    // its bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::StorageKey(storage_key),
+        body.len() as i64,
+    )
+    .await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage
-        .put(storage_key, body)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    storage.put(storage_key, body).await.map_err(|e| {
+        // #4609: a full disk is 507 + Retry-After, not an opaque 500.
+        super::upload_body::disk_full_response(&e).unwrap_or_else(|| internal_error("Storage", e))
+    })?;
     Ok(())
 }
 
@@ -6738,7 +7417,7 @@ pub async fn stage_upload_field(
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| internal_error("Staging directory", e))?;
+            .map_err(|e| spool_error("Staging directory", &e))?;
     }
 
     // Arm the RAII cleanup before the first write so any early return below
@@ -6750,17 +7429,15 @@ pub async fn stage_upload_field(
 
     let mut file = tokio::fs::File::create(&path)
         .await
-        .map_err(|e| internal_error("Staging file", e))?;
+        .map_err(|e| spool_error("Staging file", &e))?;
 
     let max = state.config.max_upload_size_bytes;
     let mut written: u64 = 0;
-    while let Some(chunk) = field.chunk().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to read upload body: {e}"),
-        )
-            .into_response()
-    })? {
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| upload_body_error_response(&e, written, max))?
+    {
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
             return Err((
@@ -6771,15 +7448,15 @@ pub async fn stage_upload_field(
         }
         file.write_all(&chunk)
             .await
-            .map_err(|e| internal_error("Staging write", e))?;
+            .map_err(|e| spool_error("Staging write", &e))?;
     }
 
     file.flush()
         .await
-        .map_err(|e| internal_error("Staging flush", e))?;
+        .map_err(|e| spool_error("Staging flush", &e))?;
     file.sync_all()
         .await
-        .map_err(|e| internal_error("Staging sync", e))?;
+        .map_err(|e| spool_error("Staging sync", &e))?;
 
     staged.size_bytes = written as i64;
     Ok(staged)
@@ -6800,6 +7477,15 @@ pub async fn put_artifact_stream(
     storage_key: &str,
     staged: StagedUpload,
 ) -> Result<crate::storage::PutStreamResult, Response> {
+    // Every caller is a hosted publish: refuse an over-quota upload before
+    // its bytes are written (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::StorageKey(storage_key),
+        staged.size_bytes,
+    )
+    .await?;
     guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -6809,11 +7495,14 @@ pub async fn put_artifact_stream(
     // Sanitised text, not `internal_error`: the raw storage error names paths
     // and backends and must not reach the client (#3718).
     let result = storage.put_stream(storage_key, stream).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
+        // #4609: a full disk is 507 + Retry-After, not an opaque 500.
+        super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::handlers::storage_err_message(&e),
+            )
+                .into_response()
+        })
     })?;
     Ok(result)
     // `staged` drops here -> scratch file removed.
@@ -6831,7 +7520,7 @@ async fn open_staged_stream(
 
     let file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| internal_error("Staging reopen", e))?;
+        .map_err(|e| spool_error("Staging reopen", &e))?;
     let reader = BufReader::with_capacity(STREAM_STAGE_CHUNK, file);
     let stream = ReaderStream::with_capacity(reader, STREAM_STAGE_CHUNK)
         .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("staged read: {e}"))));
@@ -6902,7 +7591,7 @@ pub async fn stage_stream_content_addressed<S, E>(
 >
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>>,
-    E: std::fmt::Display + 'static,
+    E: std::error::Error + 'static,
 {
     use tokio::io::AsyncWriteExt;
 
@@ -6911,7 +7600,7 @@ where
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| internal_error("Staging directory", e))?;
+            .map_err(|e| spool_error("Staging directory", &e))?;
     }
 
     // Arm the RAII cleanup before the first write so any early return below
@@ -6923,7 +7612,7 @@ where
 
     let mut file = tokio::fs::File::create(&path)
         .await
-        .map_err(|e| internal_error("Staging file", e))?;
+        .map_err(|e| spool_error("Staging file", &e))?;
 
     let max = state.config.max_upload_size_bytes;
     let mut hasher = crate::services::artifact_service::MultiHasher::new();
@@ -6931,7 +7620,7 @@ where
 
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| upload_body_error_response(&e))?;
+        let chunk = chunk.map_err(|e| upload_body_error_response(&e, written, max))?;
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
             return Err(upload_too_large_response(max));
@@ -6939,15 +7628,15 @@ where
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
-            .map_err(|e| internal_error("Staging write", e))?;
+            .map_err(|e| spool_error("Staging write", &e))?;
     }
 
     file.flush()
         .await
-        .map_err(|e| internal_error("Staging flush", e))?;
+        .map_err(|e| spool_error("Staging flush", &e))?;
     file.sync_all()
         .await
-        .map_err(|e| internal_error("Staging sync", e))?;
+        .map_err(|e| spool_error("Staging sync", &e))?;
 
     staged.size_bytes = written as i64;
     Ok((staged, hasher.finalize()))
@@ -6984,17 +7673,29 @@ pub async fn open_staged_upload_stream(
     open_staged_stream(staged.path()).await
 }
 
-/// Map an upload-body read error to its response: 413 when a multipart
-/// stream hit its size cap, 400 for any other read failure.
-fn upload_body_error_response<E: std::fmt::Display + 'static>(e: &E) -> Response {
-    match (e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
-        Some(multer::Error::StreamSizeExceeded { limit }) => upload_too_large_response(*limit),
-        _ => (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to read upload body: {e}"),
-        )
-            .into_response(),
+/// Map an upload-body read error to its response (#4609): 413 when a size
+/// cap was hit, 400 for a malformed multipart envelope, 408 `incomplete_body`
+/// when the body was cut short, and 503 + `Retry-After` for a read failure
+/// that is not the client's. Never a partial body handed on to a parser.
+fn upload_body_error_response<E: std::error::Error + 'static>(
+    e: &E,
+    received: u64,
+    max: u64,
+) -> Response {
+    match super::upload_body::classify_body_error(e, received, None, max) {
+        super::upload_body::UploadBodyError::TooLarge { limit, .. } => {
+            upload_too_large_response(limit)
+        }
+        other => other.into_response(),
     }
+}
+
+/// Map a failed scratch-file operation (#4609): a full disk or exhausted
+/// quota is `507` + `Retry-After`, any other I/O failure `503` +
+/// `Retry-After`, both logged at `error` with the cause. Previously a bare
+/// `500` that echoed the OS error (and the scratch path) to the client.
+fn spool_error(label: &str, e: &std::io::Error) -> Response {
+    super::upload_body::spool_write_error(label, e).into_response()
 }
 
 fn upload_too_large_response(max: u64) -> Response {
@@ -7053,6 +7754,16 @@ impl BackendStagedUpload {
         self.armed = false;
         delete_generic_staging(&self.db, self.storage.as_ref(), &self.key).await;
     }
+
+    /// Keep the staged object past this handle and return its key, for an
+    /// owner that records the key durably and deletes the object itself (an
+    /// Incus chunked-upload session, #4302). The tracking row stays, so
+    /// [`sweep_stale_generic_upload_staging`] still reclaims the object if
+    /// that owner never does.
+    pub fn keep(mut self) -> String {
+        self.armed = false;
+        std::mem::take(&mut self.key)
+    }
 }
 
 impl Drop for BackendStagedUpload {
@@ -7073,7 +7784,7 @@ impl Drop for BackendStagedUpload {
 
 /// Delete one generic staging object, then its tracking row. The row is kept
 /// when the object delete fails so the sweep retries it.
-async fn delete_generic_staging(
+pub(crate) async fn delete_generic_staging(
     db: &PgPool,
     storage: &dyn crate::storage::StorageBackend,
     key: &str,
@@ -7160,7 +7871,7 @@ pub async fn stage_stream_on_backend<S, E>(
 >
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
-    E: std::fmt::Display + 'static,
+    E: std::error::Error + 'static,
 {
     use crate::services::artifact_service::MultiHasher;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7204,7 +7915,10 @@ where
                 };
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
-                    Err(e) => return refuse(upload_body_error_response(&e)),
+                    Err(e) => {
+                        let received = counted.load(Ordering::Relaxed);
+                        return refuse(upload_body_error_response(&e, received, max));
+                    }
                 };
                 let written = counted
                     .fetch_add(chunk.len() as u64, Ordering::Relaxed)
@@ -7260,21 +7974,25 @@ pub struct NewArtifact<'a> {
     pub uploaded_by: Uuid,
 }
 
-/// Insert a row into `artifacts` and return the new id.
+/// Insert a hosted publish's row into `artifacts` and return the new id.
 ///
 /// Replaces the duplicated nine-column INSERT macro that every multipart
-/// upload handler otherwise repeats verbatim. Errors map to a 500
-/// "Database error" response.
+/// upload handler otherwise repeats verbatim. The INSERT runs in the
+/// transaction that decides the repository / project storage-quota admission
+/// for the row (#4422), so a publish that would exceed a quota answers the
+/// generic route's `507` and leaves no row. Other database errors map to a
+/// 500 "Database error" response.
 #[allow(clippy::result_large_err)]
 pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
     let repository_id = art.repository_id;
 
-    let mut conn = db
-        .acquire()
+    let mut tx =
+        super::publish_quota::begin_admitted_publish(db, repository_id, art.path, art.size_bytes)
+            .await?;
+    let id = insert_artifact_row(&mut tx, art).await?;
+    tx.commit()
         .await
         .map_err(|e| internal_error("Database", e))?;
-    let id = insert_artifact_row(&mut conn, art).await?;
-    drop(conn);
 
     // Apply the upload-time quarantine hold at the shared chokepoint used by the
     // helper-based format handlers (helm, hex, cran, ansible, puppet, rubygems,
@@ -8438,8 +9156,11 @@ pub(crate) async fn proxy_scan_and_record(
     };
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    // #4594: the cataloged-component count is written with the verdict, so
+    // the proxy-scans view can say when a verdict was graded on file
+    // contents only.
     if let Err(e) = pss
-        .record_verdict(
+        .record_verdict_with_catalog(
             digest,
             PROXY_SCAN_TYPE,
             verdict.verdict_token(),
@@ -8451,6 +9172,7 @@ pub(crate) async fn proxy_scan_and_record(
             verdict.max_severity_token(),
             verdict.scanner_version.as_deref(),
             Some(repo_id),
+            verdict.components_cataloged,
         )
         .await
     {
@@ -8839,9 +9561,9 @@ pub(crate) async fn gate_proxy_scan_serve(
 // Adopting the gate in a new format (#4100 Maven, #4101 Cargo, #4102 NuGet, …)
 // is: implement `ScannedProxyFile` on a small struct holding the request's
 // coordinate, and at the Remote download arm, when
-// `ScanConfigService::is_proxy_scan_enabled` is true, call
-// `serve_scanned_proxy_file` with a [`ScannedProxyRequest`] built from
-// `direct_scan_policy` (or `effective_virtual_scan_policy` per virtual member)
+// [`remote_scan_policy`] returns a policy, call
+// `serve_scanned_proxy_file` with a [`ScannedProxyRequest`] built from it
+// (or from `virtual_member_scan_policies` on the Virtual walk)
 // instead of streaming. Then add the format's handler key to
 // `crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS` so `GET /api/v1/formats`
 // reports it enforced (#4099; `scan_on_proxy_capability_matches_the_gate`
@@ -9162,7 +9884,6 @@ pub(crate) async fn virtual_member_scan_policies(
     virtual_id: Uuid,
     members: &[Repository],
 ) -> Result<Vec<Option<MemberScanPolicy>>, Response> {
-    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
     let scannable =
         |m: &Repository| m.repo_type == RepositoryType::Remote && m.upstream_url.is_some();
     if !members.iter().any(scannable) {
@@ -9174,67 +9895,73 @@ pub(crate) async fn virtual_member_scan_policies(
         .map(|m| m.id)
         .collect();
     ids.push(virtual_id);
-    let rows: Vec<(Uuid, bool, String, bool, String)> = match sqlx::query_as(
+    let rows = read_scan_config_rows(db, virtual_id, &ids).await?;
+    Ok(members
+        .iter()
+        .map(|member| {
+            scannable(member)
+                .then(|| combined_member_policy(&rows, virtual_id, member.id))
+                .flatten()
+        })
+        .collect())
+}
+
+/// `scan_configs` rows for `ids`, keyed by repository id, in ONE read: the
+/// only query the proxy scan policy runs, for a direct pull (one id) and a
+/// Virtual walk alike. An unreadable config is the retryable 503 of
+/// [`scan_config_unreadable`]: whether any side is fail-closed is exactly
+/// what cannot be read, so the caller must not serve unscanned.
+/// `context_id` (the pulled repository) only labels the log line.
+async fn read_scan_config_rows(
+    db: &PgPool,
+    context_id: Uuid,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, ScanConfigRow)>, Response> {
+    let rows: Vec<(Uuid, bool, String, bool, String)> = sqlx::query_as(
         r#"SELECT repository_id, scan_on_proxy, proxy_scan_action,
                   block_on_policy_violation, severity_threshold
            FROM scan_configs WHERE repository_id = ANY($1)"#,
     )
-    .bind(&ids)
+    .bind(ids)
     .fetch_all(db)
     .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(
-                virtual_id = %virtual_id, error = %e,
-                "could not read member scan-on-proxy configs; failing the walk closed"
-            );
-            return Err(AppError::ServiceUnavailable(
-                "scan-on-proxy configuration is temporarily unreadable".to_string(),
-            )
-            .into_response());
-        }
-    };
-    let config = |id: Uuid| {
-        rows.iter()
-            .find(|row| row.0 == id)
-            .map(|(_, enabled, action, block, threshold)| {
-                (
-                    *enabled,
-                    ProxyScanAction::from_db(action),
-                    crate::services::scan_config_service::proxy_severity_gate_for_row(
-                        *block, threshold, action,
-                    ),
-                )
-            })
-            .unwrap_or((
-                false,
-                ProxyScanAction::FailOpen,
-                ProxySeverityGate::BlockOnAny,
-            ))
-    };
-    let (virtual_enabled, virtual_action, virtual_gate) = config(virtual_id);
-    Ok(members
-        .iter()
-        .map(|member| {
-            if !scannable(member) {
-                return None;
-            }
-            let (member_enabled, member_action, member_gate) = config(member.id);
-            let (enabled, action) = stricter_scan_policy(
-                virtual_enabled,
-                virtual_action,
-                member_enabled,
-                member_action,
-            );
-            enabled.then(|| {
-                (
-                    action,
-                    combined_severity_gate(action, virtual_gate, member_gate),
-                )
-            })
-        })
+    .map_err(|e| {
+        tracing::warn!(
+            repo_id = %context_id, error = %e,
+            "could not read the scan-on-proxy config; failing the pull closed (#4365)"
+        );
+        scan_config_unreadable()
+    })?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, enabled, action, block, threshold)| (id, (enabled, action, block, threshold)))
         .collect())
+}
+
+/// The stricter-of-two policy for `member_id` behind `virtual_id`, from rows
+/// already read by [`read_scan_config_rows`]: [`stricter_scan_policy`] plus
+/// [`combined_severity_gate`] (so record-only, #3645, resolves the same way
+/// everywhere). `None` when neither side scans.
+fn combined_member_policy(
+    rows: &[(Uuid, ScanConfigRow)],
+    virtual_id: Uuid,
+    member_id: Uuid,
+) -> Option<MemberScanPolicy> {
+    let config = |id: Uuid| scan_policy_from_row(rows.iter().find(|r| r.0 == id).map(|r| &r.1));
+    let (virtual_enabled, virtual_action, virtual_gate) = config(virtual_id);
+    let (member_enabled, member_action, member_gate) = config(member_id);
+    let (enabled, action) = stricter_scan_policy(
+        virtual_enabled,
+        virtual_action,
+        member_enabled,
+        member_action,
+    );
+    enabled.then(|| {
+        (
+            action,
+            combined_severity_gate(action, virtual_gate, member_gate),
+        )
+    })
 }
 
 /// A Virtual download walk with scan-on-proxy (#4100), over an
@@ -9344,6 +10071,11 @@ where
 /// the winning artifact row's id only for hosted members (proxy-member and
 /// row-less legacy serves carry `None`, #1278), exactly as the format's
 /// fallback resolver path records it.
+///
+/// `ctx` counts a REMOTE member's winning serve inside the resolver (#3844),
+/// independently of `record`, so a format that does not (yet) count hosted
+/// virtual serves still counts its proxy serves like the direct Remote path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_unscanned_member_run<F, Fut>(
     run: Vec<Repository>,
     proxy: Option<&ProxyService>,
@@ -9354,12 +10086,13 @@ pub(crate) async fn resolve_unscanned_member_run<F, Fut>(
         &PgPool,
         &crate::api::middleware::download_telemetry::DownloadContext,
     )>,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Option<Result<Response, Response>>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: Future<Output = Result<StreamingFetchResult, Response>>,
 {
-    match resolve_virtual_download_from_members(run, proxy, path, local_fetch).await {
+    match resolve_virtual_download_from_members(run, proxy, path, ctx, local_fetch).await {
         Ok(result) => {
             if let (Some(artifact_id), Some((db, ctx))) = (result.artifact_id, record) {
                 crate::services::artifact_service::record_download(db, artifact_id, ctx).await;
@@ -9934,7 +10667,7 @@ mod scanned_proxy_file_tests {
     // ── #3645: record-only proxy scan mode ──
     //
     // These drive the gate from a REAL `scan_configs` row through
-    // `direct_scan_policy`, so the config -> (action, gate) resolution is
+    // `remote_scan_policy`, so the config -> (action, gate) resolution is
     // covered along with the serve decision.
 
     /// Write the repository's scan config through the same service the
@@ -9992,7 +10725,10 @@ mod scanned_proxy_file_tests {
         base: &str,
         file: &FakeFormat,
     ) -> Result<Response, Response> {
-        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let (action, gate) = remote_scan_policy(&fx.pool, fx.repo_id)
+            .await
+            .expect("config readable")
+            .expect("scan-on-proxy on");
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let mut req = request(fx.repo_id, &fx.repo_key, base, action);
         req.severity_gate = gate;
@@ -10150,7 +10886,10 @@ mod scanned_proxy_file_tests {
         assert_eq!(scan_header(&resp), "pending");
         assert_eq!(&body_of(resp).await[..], &bytes[..]);
 
-        let (action, gate) = direct_scan_policy(&fx.pool, fx.repo_id).await;
+        let (action, gate) = remote_scan_policy(&fx.pool, fx.repo_id)
+            .await
+            .expect("config readable")
+            .expect("scan-on-proxy on");
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let mut over = request(fx.repo_id, &fx.repo_key, &base, action);
         over.severity_gate = gate;
@@ -12059,6 +12798,7 @@ mod tests {
             Vec::new(),
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             |_id, _loc| async { Ok(empty_stream_result()) },
         )
         .await;
@@ -12072,6 +12812,7 @@ mod tests {
             members,
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             |_id, _loc| async { Ok(empty_stream_result()) },
         )
         .await;
@@ -12093,6 +12834,7 @@ mod tests {
             members,
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             |_id, _loc| async { Err((StatusCode::NOT_FOUND, "missing").into_response()) },
         )
         .await;
@@ -12115,6 +12857,7 @@ mod tests {
             members,
             None,
             "g/a/1.0/a-1.0.jar",
+            None,
             move |_id, _loc| {
                 let n = calls2.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -12181,6 +12924,19 @@ mod tests {
             crate::error::AppError::Storage("connection reset".into()),
         );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_member_policy_block_response(&resp));
+        assert!(!is_upstream_auth_failure(&resp));
+    }
+
+    #[test]
+    fn test_map_proxy_error_marks_upstream_auth_failure_4453() {
+        let resp = map_proxy_error(
+            "docker-remote",
+            "v2/library/alpine/manifests/3.20",
+            crate::error::AppError::UpstreamAuth("token service returned 401".into()),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(is_upstream_auth_failure(&resp));
         assert!(!is_member_policy_block_response(&resp));
     }
 
@@ -14434,12 +15190,16 @@ mod tests {
                 guest_access_enabled: true,
                 guest_access_env_pinned: false,
                 expose_detailed_health: false,
+                readyz_require_search: false,
                 setup_password_hint: None,
                 grpc_reflection_enabled: false,
                 swagger_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 conda_attestation_require_verified: true,
+                conda_attestation_issuers: Vec::new(),
+                conda_attestation_identities: Vec::new(),
+                conda_attestation_public_keys: Vec::new(),
                 peer_instance_name: "test".into(),
                 peer_public_endpoint: "http://localhost:8080".into(),
                 peer_api_key: "test-key".into(),
@@ -14475,6 +15235,9 @@ mod tests {
                 auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
+                upload_progress_window_secs: 60,
+                upload_min_progress_bytes: 16 * 1024,
+                upload_max_in_flight_per_principal: 64,
                 rate_limit_enabled: true,
                 rate_limit_auth_per_window: 120,
                 rate_limit_api_per_window: 5000,
@@ -14531,6 +15294,9 @@ mod tests {
                 smtp_password: None,
                 smtp_from_address: "noreply@test.local".to_string(),
                 smtp_tls_mode: "starttls".to_string(),
+                smtp_tls_ca_cert: None,
+                smtp_tls_ca_cert_source: None,
+                smtp_tls_skip_verify: false,
                 npm_packument_cache_enabled: true,
                 npm_packument_cache_fresh_ttl_secs: 300,
                 npm_packument_cache_stale_max_secs: 86_400,
@@ -17104,6 +17870,8 @@ mod tests {
     fn build_proxy_with_cache_backend(backend: StdArc<QuarantineRedirectStorage>) -> ProxyService {
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not fail");
+        // The never-connecting pool cannot answer the origin-policy gate
+        // (#4506); these tests pin the quarantine half of the redirect gate.
         ProxyService::new(
             pool,
             StdArc::new(crate::services::storage_service::StorageService::new(
@@ -17111,6 +17879,7 @@ mod tests {
             )),
             crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
+        .without_origin_policy_gate()
     }
 
     /// #2075: a fresh proxy-cache entry that is still inside its Package Age
@@ -17196,6 +17965,93 @@ mod tests {
             fresh.presign_calls.load(Ordering::SeqCst),
             1,
             "the non-held fast path must sign exactly once"
+        );
+    }
+
+    /// #4506: the presigned-redirect fast path must not hand out a fresh
+    /// cache entry of a Remote whose origin policy denies its upstream. The
+    /// refusal is the fetch paths' 403, and nothing is signed. The control
+    /// (no policy) still redirects.
+    #[tokio::test]
+    async fn test_proxy_fetch_or_redirect_refuses_origin_denied_remote_4506() {
+        use crate::models::security::{OriginPolicyPredicates, PolicyPredicates};
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        let fresh = StdArc::new(QuarantineRedirectStorage::new(/* quarantine = */ None));
+        let proxy = ProxyService::new(
+            pool.clone(),
+            StdArc::new(crate::services::storage_service::StorageService::new(
+                fresh.clone(),
+            )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        );
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let state =
+            db_helpers::build_state_presigned(pool.clone(), "s3-test", registry_storage.clone());
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let fetch = || {
+            super::proxy_fetch_or_redirect(
+                &proxy,
+                &state,
+                repo_id,
+                &repo_key,
+                "https://upstream.example.test",
+                "lodash",
+                &ctx,
+            )
+        };
+
+        let control = fetch().await.map_or_else(|e| e.status(), |r| r.status());
+        assert_eq!(
+            control,
+            StatusCode::FOUND,
+            "no policy: the fast path redirects"
+        );
+
+        crate::services::policy_service::PolicyService::new(pool.clone())
+            .create_policy(
+                &format!("4506-presign-{repo_id}"),
+                Some(repo_id),
+                "critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+                Some(PolicyPredicates {
+                    origin: OriginPolicyPredicates {
+                        denied_upstreams: vec!["https://upstream.example.test".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create origin policy");
+        let presigned_before = fresh.presign_calls.load(Ordering::SeqCst);
+        let denied = fetch().await.map_or_else(|e| e.status(), |r| r.status());
+
+        sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        assert_eq!(
+            denied,
+            StatusCode::FORBIDDEN,
+            "a denied upstream must not be handed out as a presigned redirect"
+        );
+        assert_eq!(
+            fresh.presign_calls.load(Ordering::SeqCst),
+            presigned_before,
+            "a refused entry must never be signed"
         );
     }
 
@@ -17289,6 +18145,80 @@ mod tests {
             1,
             "the HEAD must never reach the signer: still exactly one presign, the GET's"
         );
+    }
+
+    /// #4308: both shared virtual download resolvers must surface a failed
+    /// member-AUTHORIZATION query as a retryable server error. They used the
+    /// flattening `authorize_virtual_members`, so the failure became an empty
+    /// member set and the client got the definitive 404 "Virtual repository
+    /// has no accessible members", which Gradle caches as a missing artifact.
+    /// The member fetch itself succeeds here; only the visibility query an
+    /// authenticated non-admin caller runs is made to fail.
+    #[tokio::test]
+    async fn test_virtual_download_resolvers_do_not_404_on_authz_db_failure_4308() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _, vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let (member_id, _, mdir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::link_virtual_member(&pool, virtual_id, member_id, 1).await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, member_id, user_id).await;
+        let auth = tdh::make_auth(user_id, &username);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        let no_local = |_id: Uuid, _loc: StorageLocation| async {
+            Err::<StreamingFetchResult, Response>(StatusCode::NOT_FOUND.into_response())
+        };
+
+        let outage = tdh::AuthzQueryOutage::start(&pool)
+            .await
+            .expect("database configured");
+        let state = tdh::build_state(outage.pool.clone(), vdir.to_str().unwrap());
+        let buffered = resolve_virtual_download(
+            &outage.pool,
+            Some(&auth),
+            None,
+            virtual_id,
+            "a/b/1.0/b-1.0.jar",
+            None,
+            no_local,
+        )
+        .await
+        .map(|_| StatusCode::OK)
+        .unwrap_or_else(|r| r.status());
+        let streaming = resolve_virtual_download_streaming(
+            &state,
+            Some(&auth),
+            None,
+            virtual_id,
+            "a/b/1.0/b-1.0.jar",
+            "application/java-archive",
+            None,
+            &ctx,
+            no_local,
+        )
+        .await
+        .map(|r| r.status())
+        .unwrap_or_else(|r| r.status());
+        outage.end().await;
+
+        tdh::cleanup_member_repo(&pool, member_id, &mdir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&vdir);
+
+        for (label, status) in [("buffered", buffered), ("streaming", streaming)] {
+            assert!(
+                status.is_server_error(),
+                "{label}: an authorization query failure must be a retryable \
+                 server error, not the cacheable 404; got {status}"
+            );
+        }
     }
 
     /// #2075: the virtual-member redirect fast path (`try_member_cache_redirect`
@@ -17965,6 +18895,7 @@ mod tests {
             None,
             virtual_id,
             path,
+            None,
             move |mid, loc| {
                 let db = db.clone();
                 let st = st.clone();
@@ -18286,15 +19217,19 @@ mod tests {
         tdh3452::grant_repo_actions(&pool, parent_id, user_id, &["read"]).await;
         let parent_only = nonadmin_auth(user_id);
 
-        // (b) granted on BOTH, but the token ceiling carries only the parent,
-        //     so the member is out of scope. Same denial, different half of
-        //     `require_visible`.
+        // (b) granted on BOTH, but the token ceiling carries neither the
+        //     member nor the parent (since #4559 a ceiling naming the parent
+        //     reaches its members through it), so the member is out of
+        //     scope. Same denial, different half of `require_visible`; the
+        //     shape a token scoped elsewhere has on a PUBLIC virtual.
         let (scoped_user_id, _sn) = tdh3452::create_user(&pool).await;
         tdh3452::grant_repo_actions(&pool, parent_id, scoped_user_id, &["read"]).await;
         tdh3452::grant_repo_actions(&pool, member_id, scoped_user_id, &["read"]).await;
         let parent_scoped_token = crate::api::middleware::auth::AuthExtension {
             is_api_token: true,
-            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![parent_id]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                empty_virtual_id,
+            ]),
             ..nonadmin_auth(scoped_user_id)
         };
 
@@ -18327,8 +19262,16 @@ mod tests {
         }
 
         let genuinely_empty = describe(
-            resolve_virtual_download(&pool, None, None, empty_virtual_id, "a/b/c", never_serves)
-                .await,
+            resolve_virtual_download(
+                &pool,
+                None,
+                None,
+                empty_virtual_id,
+                "a/b/c",
+                None,
+                never_serves,
+            )
+            .await,
         )
         .await;
         let filtered_parent_grant = describe(
@@ -18338,6 +19281,7 @@ mod tests {
                 None,
                 parent_id,
                 "a/b/c",
+                None,
                 never_serves,
             )
             .await,
@@ -18350,6 +19294,7 @@ mod tests {
                 None,
                 parent_id,
                 "a/b/c",
+                None,
                 never_serves,
             )
             .await,
@@ -18398,6 +19343,7 @@ mod tests {
                 None,
                 parent_id,
                 "a/b/c",
+                None,
                 never_serves,
             )
             .await,
@@ -19472,7 +20418,8 @@ mod tests {
         let target = resolve_virtual_deploy_target(&pool, &svc, &auth, root_id).await;
 
         // A token scoped to the virtual only (not to any member) resolves
-        // nothing: scope to the members, or to both (#3173's composition,
+        // nothing for a WRITE (the #4559 parent term covers reads only):
+        // scope to the members, or to both (#3173's composition,
         // applied to writes).
         let mut scoped = nonadmin_auth(user_id);
         scoped.allowed_repo_ids =
@@ -21186,8 +22133,8 @@ mod scan_on_upload_coverage_tests {
         ("chef.rs", "upload_cookbook"),
         ("cocoapods.rs", "push_pod"),
         ("composer.rs", "upload"),
-        ("conan.rs", "recipe_file_upload"),
-        ("conan.rs", "package_file_upload"),
+        // Both Conan upload handlers insert through this helper (#4329).
+        ("conan.rs", "insert_conan_artifact"),
         ("gitlfs.rs", "upload_object"),
         ("goproxy.rs", "upload_zip"),
         ("goproxy.rs", "upload_mod"),
@@ -21217,18 +22164,34 @@ mod scan_on_upload_coverage_tests {
     /// without anyone remembering to list it.
     fn handler_sources() -> Vec<(String, String)> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
-        let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
-            .expect("read src/api/handlers")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
-            .map(|p| {
-                let name = p.file_name().unwrap().to_string_lossy().into_owned();
-                let src = std::fs::read_to_string(&p).expect("read handler source");
-                (name, src)
-            })
-            .collect();
+        let mut out = Vec::new();
+        collect_handler_sources(&dir, "", &mut out);
         out.sort();
         out
+    }
+
+    /// Every `.rs` file under `dir`, recursively, keyed by its path relative
+    /// to `src/api/handlers` (`rpm/depth_tests.rs`), so a handler written as a
+    /// directory module is scanned too (#4422 review). Files of a
+    /// subdirectory named `tests.rs` / `*_tests.rs` are test modules declared
+    /// from their parent under `#[cfg(test)]`, and are skipped.
+    fn collect_handler_sources(
+        dir: &std::path::Path,
+        prefix: &str,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("read a handlers directory") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                collect_handler_sources(&path, &format!("{prefix}{name}/"), out);
+            } else if name.ends_with(".rs")
+                && !(!prefix.is_empty() && (name == "tests.rs" || name.ends_with("_tests.rs")))
+            {
+                let src = std::fs::read_to_string(&path).expect("read handler source");
+                out.push((format!("{prefix}{name}"), src));
+            }
+        }
     }
 
     /// One production insert site: the enclosing function and whether the
@@ -21237,6 +22200,8 @@ mod scan_on_upload_coverage_tests {
     struct Site {
         func: String,
         covered: bool,
+        /// Covered by the gate's marker comment rather than by a check.
+        exempt: bool,
     }
 
     /// Source text of the `i`th top-level function (up to the next one).
@@ -21246,10 +22211,10 @@ mod scan_on_upload_coverage_tests {
     }
 
     /// Byte offsets of every insert site (SQL or primitive call) in `src`.
-    fn insert_offsets(src: &str) -> Vec<usize> {
-        let sql = regex::Regex::new(INSERT_SQL).expect("valid insert regex");
+    fn insert_offsets(src: &str, gate: &InsertGate) -> Vec<usize> {
+        let sql = regex::Regex::new(gate.insert_sql).expect("valid insert regex");
         let mut out: Vec<usize> = sql.find_iter(src).map(|m| m.start()).collect();
-        for needle in INSERT_CALLS {
+        for needle in gate.insert_calls {
             out.extend(src.match_indices(needle).map(|(at, _)| at));
         }
         out.sort_unstable();
@@ -21260,15 +22225,20 @@ mod scan_on_upload_coverage_tests {
     /// insert at `at` carries the marker. Walks up from the insert's line
     /// through the statement's own code lines; a line ending a previous
     /// statement or block (`;`, `{`, `}`) or a blank line ends the search.
-    fn marker_above(src: &str, at: usize) -> bool {
+    /// Shortest reason text a marker must carry after its colon.
+    const MIN_MARKER_REASON: usize = 15;
+
+    fn marker_above(src: &str, at: usize, marker: &str) -> bool {
         let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let mut in_comment = false;
         for line in src[..line_start].lines().rev().take(12) {
             let t = line.trim();
             if t.starts_with("//") {
                 in_comment = true;
-                if t.contains(MARKER) {
-                    return true;
+                // The marker must say WHY (#4422 review): a bare marker, or
+                // one followed by a word or two, does not exempt the site.
+                if let Some((_, why)) = t.split_once(marker) {
+                    return why.trim().len() >= MIN_MARKER_REASON;
                 }
             } else if in_comment
                 || t.is_empty()
@@ -21282,21 +22252,59 @@ mod scan_on_upload_coverage_tests {
         false
     }
 
-    /// `TRIGGER` calls on code (not comment) lines of `body`.
-    fn trigger_calls(body: &str) -> usize {
-        body.lines()
-            .filter(|l| !l.trim_start().starts_with("//") && l.contains(TRIGGER))
-            .count()
+    /// Whether `body` calls `call` (`name(`) as a whole word: `upload(` is not
+    /// matched by `recipe_file_upload(` (#4422 review).
+    fn calls(body: &str, call: &str) -> bool {
+        body.match_indices(call).any(|(at, _)| {
+            body[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
     }
+
+    /// Calls of any of `triggers` on code (not comment) lines of `body`.
+    fn trigger_calls(body: &str, triggers: &[&str]) -> usize {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| triggers.iter().filter(|t| l.contains(**t)).count())
+            .sum()
+    }
+
+    /// One structural gate over the production `artifacts` insert sites: the
+    /// calls that cover a site (each covers ONE), the marker that exempts a
+    /// site, and the insert-primitive calls that satisfy the gate by
+    /// themselves because the primitive runs the check inside.
+    struct InsertGate {
+        insert_sql: &'static str,
+        insert_calls: &'static [&'static str],
+        triggers: &'static [&'static str],
+        marker: &'static str,
+        self_covering: &'static [&'static str],
+    }
+
+    /// The #4166 scan-on-upload gate.
+    const SCAN_GATE: InsertGate = InsertGate {
+        insert_sql: INSERT_SQL,
+        insert_calls: INSERT_CALLS,
+        triggers: &[TRIGGER],
+        marker: MARKER,
+        self_covering: &[],
+    };
 
     /// Classify every production insert site in one source file.
     fn insert_sites(file: &str, src: &str) -> Vec<Site> {
+        gate_sites(file, src, &SCAN_GATE)
+    }
+
+    /// Classify every production insert site in one source file under `gate`.
+    fn gate_sites(file: &str, src: &str, gate: &InsertGate) -> Vec<Site> {
         let spans = test_spans(src);
         let fns = top_level_fns(src, &spans);
         let mut out = Vec::new();
         // Unmarked sites already charged against each function's triggers.
         let mut charged: std::collections::HashMap<usize, usize> = Default::default();
-        for at in insert_offsets(src) {
+        for at in insert_offsets(src, gate) {
             if spans.iter().any(|(a, b)| *a <= at && at < *b) {
                 continue;
             }
@@ -21311,24 +22319,28 @@ mod scan_on_upload_coverage_tests {
             if file == "proxy_helpers.rs" && PRIMITIVES.contains(&func.as_str()) {
                 continue;
             }
-            if marker_above(src, at) {
+            let exempt = marker_above(src, at, gate.marker);
+            if exempt || gate.self_covering.iter().any(|c| src[at..].starts_with(c)) {
                 out.push(Site {
                     func,
                     covered: true,
+                    exempt,
                 });
                 continue;
             }
             let call = format!("{func}(");
             let caller_triggers = (0..fns.len()).any(|j| {
                 let caller = body_of(src, &fns, j);
-                j != idx && caller.contains(&call) && trigger_calls(caller) > 0
+                j != idx && calls(caller, &call) && trigger_calls(caller, gate.triggers) > 0
             });
-            let budget = trigger_calls(body_of(src, &fns, idx)) + usize::from(caller_triggers);
+            let budget = trigger_calls(body_of(src, &fns, idx), gate.triggers)
+                + usize::from(caller_triggers);
             let used = charged.entry(idx).or_default();
             *used += 1;
             out.push(Site {
                 func,
                 covered: *used <= budget,
+                exempt: false,
             });
         }
         out
@@ -21406,6 +22418,210 @@ mod scan_on_upload_coverage_tests {
                 ("two".to_string(), true),
                 ("two".to_string(), false),
                 ("prim".to_string(), true),
+            ]
+        );
+    }
+
+    /// #4422: the storage-quota admission gate, over the same insert sites.
+    /// A site is covered by one of the shared admission calls in its function
+    /// (or one call hop up), by `insert_artifact` (which admits inside), or by
+    /// a `NO-QUOTA-ADMISSION:` comment saying why the row is not a publish.
+    const QUOTA_GATE: InsertGate = InsertGate {
+        insert_sql: INSERT_SQL,
+        insert_calls: INSERT_CALLS,
+        triggers: &[
+            "begin_admitted_publish(",
+            "admit_publish_in_tx(",
+            "locked_quota_denial(",
+            // The chunked-upload completion admits through the service call.
+            "check_quota_locked(",
+        ],
+        marker: QUOTA_MARKER,
+        self_covering: &["insert_artifact("],
+    };
+    const QUOTA_MARKER: &str = "NO-QUOTA-ADMISSION:";
+
+    /// #4422: the same gate over the `oci_blobs` rows a `docker push` writes.
+    const OCI_BLOB_QUOTA_GATE: InsertGate = InsertGate {
+        insert_sql: r"(?i)INSERT\s+INTO\s+(public\.)?oci_blobs\b",
+        insert_calls: &[],
+        triggers: &["oci_blob_quota_refusal(", "mount_quota_refusal("],
+        marker: QUOTA_MARKER,
+        self_covering: &[],
+    };
+
+    /// Every publish handler #4422 covers, as `(file, function holding the
+    /// insert)`: each must have an insert site ADMITTED by a check (not
+    /// exempted by a marker), so a rename or a matcher regression fails
+    /// loudly instead of silently dropping a handler out of the gate.
+    const ISSUE_4422_PUBLISH_HANDLERS: &[(&str, &str)] = &[
+        ("alpine.rs", "store_apk"),
+        ("ansible.rs", "upload_collection"),
+        ("bazel.rs", "put_file"),
+        ("cargo.rs", "store_crate_artifact"),
+        ("chef.rs", "upload_cookbook"),
+        ("cocoapods.rs", "push_pod"),
+        ("composer.rs", "upload"),
+        // Both Conan upload handlers insert through this helper (#4329).
+        ("conan.rs", "insert_conan_artifact"),
+        ("conda.rs", "store_conda_package"),
+        ("cran.rs", "upload_package"),
+        ("gitlfs.rs", "upload_object"),
+        ("goproxy.rs", "upload_zip"),
+        ("goproxy.rs", "upload_mod"),
+        ("helm.rs", "upload_chart"),
+        ("hex.rs", "publish_package"),
+        ("huggingface.rs", "upload_file_impl"),
+        ("incus.rs", "upsert_artifact"),
+        ("jetbrains.rs", "upload_plugin"),
+        ("maven.rs", "upload"),
+        ("npm.rs", "store_npm_version"),
+        ("pacman.rs", "insert_package_rows"),
+        ("protobuf.rs", "upload"),
+        ("pub_registry.rs", "upload_package"),
+        ("puppet.rs", "publish_module"),
+        ("rpm.rs", "store_rpm"),
+        ("rubygems.rs", "push_gem"),
+        ("sbt.rs", "upload_artifact"),
+        ("swift.rs", "publish_release"),
+        ("terraform.rs", "upload_module"),
+        ("terraform.rs", "upload_provider"),
+        ("upload.rs", "complete_session_commit"),
+        ("vscode.rs", "publish_extension"),
+    ];
+
+    /// The `oci_blobs` writers of a `docker push`: monolithic upload, chunked
+    /// completion and cross-repository mount.
+    const ISSUE_4422_OCI_BLOB_HANDLERS: &[&str] = &[
+        "handle_start_upload",
+        "handle_complete_upload",
+        "try_mount_blob",
+    ];
+
+    /// The only sites allowed to opt out of quota admission with a
+    /// `NO-QUOTA-ADMISSION:` reason (#4422 review): promotion copies, the
+    /// generated Protobuf label index, proxy-cache fills, and OCI manifest rows
+    /// (not counted by the usage ledger, #4545). A new exemption is a review conversation: it
+    /// fails here until it is added to this list.
+    const ISSUE_4422_EXEMPT_SITES: &[(&str, &str)] = &[
+        ("approval.rs", "approve_promotion"),
+        ("oci_v2.rs", "cache_manifest_reference_locally"),
+        ("oci_v2.rs", "stage_proxy_image_blobs"),
+        ("oci_v2.rs", "upsert_manifest_artifact"),
+        ("promotion.rs", "insert_promoted_artifact_row"),
+        ("protobuf.rs", "save_label_index"),
+    ];
+
+    type SiteSet = std::collections::BTreeSet<(String, String)>;
+
+    /// Uncovered sites, the `(file, func)` of every check-admitted site, and
+    /// of every marker-exempted site.
+    fn run_gate(gate: &InsertGate) -> (Vec<String>, SiteSet, SiteSet) {
+        let mut uncovered = Vec::new();
+        let mut admitted = SiteSet::new();
+        let mut exempt = SiteSet::new();
+        for (file, src) in handler_sources() {
+            if EXEMPT_FILES.contains(&file.as_str()) {
+                continue;
+            }
+            for site in gate_sites(&file, &src, gate) {
+                if !site.covered {
+                    uncovered.push(format!("{file}::{}", site.func));
+                } else if site.exempt {
+                    exempt.insert((file.clone(), site.func));
+                } else {
+                    admitted.insert((file.clone(), site.func));
+                }
+            }
+        }
+        (uncovered, admitted, exempt)
+    }
+
+    /// THE #4422 gate: no production `artifacts` or `oci_blobs` insert in a
+    /// handler escapes storage-quota admission, and every enumerated publish
+    /// handler is admitted by a check rather than exempted.
+    #[test]
+    fn every_format_publish_runs_quota_admission_4422() {
+        let (uncovered, admitted, mut exempt) = run_gate(&QUOTA_GATE);
+        assert!(
+            uncovered.is_empty(),
+            "these handlers insert an `artifacts` row without storage-quota \
+             admission (run the INSERT in `publish_quota::begin_admitted_publish`'s \
+             transaction, or add a `{QUOTA_MARKER}` comment saying why the row is \
+             not a publish): {uncovered:?}"
+        );
+        for (file, func) in ISSUE_4422_PUBLISH_HANDLERS {
+            assert!(
+                admitted.contains(&(file.to_string(), func.to_string())),
+                "#4422 publish handler {file}::{func} has no quota-admitted insert \
+                 site the gate can see; update ISSUE_4422_PUBLISH_HANDLERS or the matcher"
+            );
+        }
+
+        let (uncovered, admitted, blob_exempt) = run_gate(&OCI_BLOB_QUOTA_GATE);
+        assert!(
+            uncovered.is_empty(),
+            "these handlers insert an `oci_blobs` row without storage-quota \
+             admission (`oci_blob_quota_refusal`): {uncovered:?}"
+        );
+        for func in ISSUE_4422_OCI_BLOB_HANDLERS {
+            assert!(
+                admitted.contains(&("oci_v2.rs".to_string(), func.to_string())),
+                "#4422 OCI blob writer oci_v2.rs::{func} is not quota-admitted"
+            );
+        }
+
+        exempt.extend(blob_exempt);
+        let pinned: SiteSet = ISSUE_4422_EXEMPT_SITES
+            .iter()
+            .map(|(f, func)| (f.to_string(), func.to_string()))
+            .collect();
+        assert_eq!(
+            exempt, pinned,
+            "the NO-QUOTA-ADMISSION exemptions changed; a new one must be justified \
+             and added to ISSUE_4422_EXEMPT_SITES"
+        );
+    }
+
+    /// The quota gate's matcher: an admission call covers one insert, a
+    /// caller's admission covers a primitive one hop down, `insert_artifact`
+    /// covers itself, a marker exempts (and is reported as exempt), and an
+    /// unadmitted insert fails.
+    #[test]
+    fn quota_gate_classifies_sites_4422() {
+        let src = "async fn bad() {\n    q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn good() {\n    let mut tx = begin_admitted_publish(db, r, p, n).await?;\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn helper() {\n    let id = insert_artifact(db, a).await;\n}\n\
+                   async fn marked() {\n    // NO-QUOTA-ADMISSION: a promotion copy, not a publish\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn bare() {\n    // NO-QUOTA-ADMISSION: fine\n    \
+                   q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn two() {\n    admit_publish_in_tx(tx, db, r, p, n);\n    \
+                   insert_artifact_row(a);\n    insert_artifact_row(b);\n}\n\
+                   fn prim() {\n    q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn caller() {\n    locked_quota_denial(tx, db, r, p, n);\n    prim();\n}\n\
+                   fn short() {\n    q(\"INSERT INTO artifacts\");\n}\n\
+                   async fn long_short() {\n    begin_admitted_publish(db, r, p, n);\n    \
+                   very_short();\n}\n";
+        let sites: Vec<(String, bool, bool)> = gate_sites("x.rs", src, &QUOTA_GATE)
+            .into_iter()
+            .map(|s| (s.func, s.covered, s.exempt))
+            .collect();
+        let site = |f: &str, covered, exempt| (f.to_string(), covered, exempt);
+        assert_eq!(
+            sites,
+            vec![
+                site("bad", false, false),
+                site("good", true, false),
+                site("helper", true, false),
+                site("marked", true, true),
+                site("bare", false, false),
+                site("two", true, false),
+                site("two", false, false),
+                site("prim", true, false),
+                // `very_short(` must not vouch for `short`.
+                site("short", false, false),
             ]
         );
     }
@@ -21503,6 +22719,11 @@ mod proxy_download_recording_tests {
         "proxy_fetch_streaming_with_cache_key_verified(",
         "proxy_fetch_streaming_response_with_cache_key(",
         "try_upstream_fetch_with_accept(",
+        // #4341: npm's direct-Remote tarball arm streams through the
+        // `ProxyService` method itself (the digest-flexible SRI gate has no
+        // `proxy_helpers` wrapper), so the gate has to name it or that arm is
+        // invisible to it.
+        "fetch_artifact_streaming_with_cache_path_gated_digest(",
     ];
 
     /// Calls that count as recording the serve. `try_remote_or_virtual_download`
@@ -21520,6 +22741,14 @@ mod proxy_download_recording_tests {
         // arms (the scanned 200 and the over-cap fail-open stream).
         "serve_scanned_proxy_file(",
     ];
+
+    /// Recorders that record THEIR OWN serve only (#4341). The scan-on-proxy
+    /// wrapper records the scanned 200 it builds, never the unscanned arm of
+    /// the function that calls it, so calling a function that wraps it does
+    /// not count as recording a serve the caller streams itself. Without this
+    /// the one-hop rule below let npm's unscanned direct-Remote tarball arm
+    /// pass because the same function also calls `serve_scanned_npm_tarball`.
+    const SELF_ONLY_RECORDERS: &[&str] = &["serve_scanned_proxy_file("];
 
     const MARKER: &str = "UNRECORDED-PROXY-SERVE:";
 
@@ -21608,9 +22837,16 @@ mod proxy_download_recording_tests {
                 let end = fns.get(i + 1).map(|(o, _)| *o).unwrap_or(src.len());
                 bodies.entry(name).or_default().push_str(&src[*off..end]);
             }
+            // Functions a one-hop caller or callee may lean on: those that
+            // record through something other than a self-only recorder.
             let recorders: Vec<&str> = bodies
                 .iter()
-                .filter(|(_, body)| RECORDERS.iter().any(|r| body.contains(r)))
+                .filter(|(_, body)| {
+                    RECORDERS
+                        .iter()
+                        .filter(|r| !SELF_ONLY_RECORDERS.contains(r))
+                        .any(|r| body.contains(r))
+                })
                 .map(|(name, _)| *name)
                 .collect();
 
@@ -21751,6 +22987,11 @@ mod proxy_download_recording_tests {
             ),
             // #4120 moved the Go module `.zip` download the same way.
             ("goproxy.rs", "proxy_fetch_streaming_with_format("),
+            // #4341: npm's direct-Remote tarball arm.
+            (
+                "npm.rs",
+                "fetch_artifact_streaming_with_cache_path_gated_digest(",
+            ),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()
@@ -21797,13 +23038,16 @@ mod proxy_download_recording_tests {
     fn scan_on_proxy_capability_matches_the_gate() {
         const GATE_CALLS: &[&str] = &["serve_scanned_proxy_file(", "gate_proxy_scan_serve("];
 
-        // Handler key for a handler source file (see `RepositoryFormat::handler_key`).
-        fn handler_key(file: &str) -> String {
+        // Handler keys a handler source file serves (see
+        // `RepositoryFormat::handler_key`). `conda.rs` serves two: `conda`
+        // and `conda_native` are separate handler keys on one route (#4585).
+        fn handler_keys(file: &str) -> Vec<String> {
             match file {
-                "goproxy.rs" => "go".to_string(),
-                "oci_v2.rs" => "oci".to_string(),
-                "pub_registry.rs" => "pub".to_string(),
-                other => other.trim_end_matches(".rs").to_string(),
+                "goproxy.rs" => vec!["go".to_string()],
+                "oci_v2.rs" => vec!["oci".to_string()],
+                "pub_registry.rs" => vec!["pub".to_string()],
+                "conda.rs" => vec!["conda".to_string(), "conda_native".to_string()],
+                other => vec![other.trim_end_matches(".rs").to_string()],
             }
         }
 
@@ -21820,7 +23064,7 @@ mod proxy_download_recording_tests {
                 })
             });
             if reaches_gate {
-                gated.insert(handler_key(file));
+                gated.extend(handler_keys(file));
             }
         }
 
@@ -21982,6 +23226,45 @@ mod proxy_download_recording_tests {
                 "serve_scanned_nupkg(",
                 1,
             ),
+            // #4585: conda's direct Remote arm, the Virtual member walk, and
+            // the `.sigs` sidecar following its package's verdict. The `/t/`
+            // token routes delegate to `download_package`.
+            (
+                "conda.rs",
+                "download_package",
+                "serve_scanned_conda_package(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "download_package",
+                "serve_scanned_virtual_conda_package(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "serve_scanned_virtual_conda_package",
+                "serve_scanned_conda_package(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "serve_scanned_conda_package",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            (
+                "conda.rs",
+                "serve_sidecar",
+                "sidecar_blocked_by_package_verdict(",
+                2,
+            ),
+            (
+                "conda.rs",
+                "download_package_with_token",
+                "download_package(",
+                1,
+            ),
             ("nuget.rs", "v2_download", "remote_scan_policy(", 1),
             ("nuget.rs", "v2_download", "proxy_v2_download(", 1),
             ("nuget.rs", "proxy_v2_download", "serve_scanned_nupkg(", 1),
@@ -21998,13 +23281,18 @@ mod proxy_download_recording_tests {
                 1,
             ),
         ];
-        // Body of the top-level `fn name(` (brace-matched from its first `{`).
+        // Body of the top-level `fn name(` or generic `fn name<` (brace-matched
+        // from its first `{`).
         fn fn_body<'s>(src: &'s str, name: &str) -> Option<&'s str> {
-            let sig = format!("fn {name}(");
-            let at = src.match_indices(&sig).map(|(i, _)| i).find(|&i| {
-                let line_start = src[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                !src[line_start..i].trim_start().starts_with("//")
-            })?;
+            let (plain, generic) = (format!("fn {name}("), format!("fn {name}<"));
+            let at = src
+                .match_indices(&plain)
+                .chain(src.match_indices(&generic))
+                .map(|(i, _)| i)
+                .find(|&i| {
+                    let line_start = src[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    !src[line_start..i].trim_start().starts_with("//")
+                })?;
             let open = at + src[at..].find('{')?;
             let mut depth = 0usize;
             for (i, c) in src[open..].char_indices() {
@@ -22047,7 +23335,7 @@ mod proxy_download_recording_tests {
             assert!(
                 ROUTE_PINS
                     .iter()
-                    .any(|(file, ..)| handler_key(file) == *key),
+                    .any(|(file, ..)| handler_keys(file).contains(key)),
                 "#4099: `{key}` is declared enforced but has no ROUTE_PINS entry"
             );
         }
@@ -22060,6 +23348,69 @@ mod proxy_download_recording_tests {
             assert!(
                 core.contains(key),
                 "#4099: `{key}` is declared scan-on-proxy enforced but is not a core handler key"
+            );
+        }
+    }
+
+    /// #4365 item 1 exhaustiveness: every handler that enforces scan-on-proxy
+    /// derives its proxy-cache key (and, where it classifies by file name, its
+    /// scan decision) through the shared `proxy_service::proxy_serve_key`
+    /// helper, and pins that with a `serve_key_4365_tests` table. A new
+    /// enforced format fails here until it does both, so it cannot classify
+    /// one spelling and cache another.
+    #[test]
+    fn every_enforced_format_derives_its_key_through_the_shared_helper() {
+        // Calls that reach `proxy_service::proxy_serve_key`: the helper, its
+        // route-decided wrapper, and the per-format helpers built on them.
+        const SERVE_KEY_CALLS: &[&str] = &[
+            "proxy_serve_key(",
+            "route_package_serve_key(",
+            "jvm_proxy_serve_key(",
+        ];
+        // OCI decides by CONTENT (the manifest's media type and its config
+        // descriptor), not by a request file name, and its cache keys are
+        // content digests; there is no name-based classification to unify.
+        const DECIDES_BY_CONTENT: &[&str] = &["oci"];
+
+        fn handler_file(key: &str) -> String {
+            match key {
+                "go" => "goproxy.rs".to_string(),
+                "oci" => "oci_v2.rs".to_string(),
+                "pub" => "pub_registry.rs".to_string(),
+                "conda_native" => "conda.rs".to_string(),
+                other => format!("{other}.rs"),
+            }
+        }
+
+        for key in crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS {
+            if DECIDES_BY_CONTENT.contains(key) {
+                continue;
+            }
+            let file = handler_file(key);
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(f, _)| *f == file)
+                .unwrap_or_else(|| panic!("{file} missing from SERVE_SOURCES"));
+            let spans = test_spans(src);
+            let routes_through_helper = SERVE_KEY_CALLS.iter().any(|call| {
+                src.match_indices(call).any(|(at, _)| {
+                    let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let prefix = &src[line_start..at];
+                    !spans.iter().any(|(a, b)| *a <= at && at < *b)
+                        && !prefix.trim_start().starts_with("//")
+                        && !prefix.trim_start().starts_with("fn ")
+                        && !prefix.contains("fn ")
+                })
+            });
+            assert!(
+                routes_through_helper,
+                "#4365: `{key}` enforces scan-on-proxy but {file} never calls the shared \
+                 (cache_key, scannable) helper outside tests"
+            );
+            assert!(
+                src.contains("mod serve_key_4365_tests"),
+                "#4365: `{key}` enforces scan-on-proxy but {file} has no \
+                 `serve_key_4365_tests` table pinning its (cache_key, scannable) decisions"
             );
         }
     }
@@ -22156,5 +23507,607 @@ mod proxy_download_recording_tests {
              proxy-only repository of that format reports zero downloads while \
              serving continuous traffic, which is exactly what #3649 reported."
         );
+    }
+}
+
+/// #4365 item 5: the direct Remote and the Virtual policy reads share one
+/// row mapping, and an unreadable config is a 503 on both, never "off".
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_policy_read_tests {
+    use super::*;
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+
+    fn row(enabled: bool, action: &str) -> ScanConfigRow {
+        (enabled, action.to_string(), false, "critical".to_string())
+    }
+
+    #[test]
+    fn missing_row_is_scanning_off_with_the_column_defaults() {
+        let (enabled, action, gate) = scan_policy_from_row(None);
+        assert!(!enabled);
+        assert_eq!(action, ProxyScanAction::FailOpen);
+        assert_eq!(gate, ProxySeverityGate::BlockOnAny);
+        assert_eq!(direct_policy_from_rows(&[], Uuid::nil()), None);
+    }
+
+    #[test]
+    fn enabled_row_yields_its_policy_and_disabled_row_none() {
+        let (repo, other) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            direct_policy_from_rows(&[(repo, row(true, "fail_closed"))], repo),
+            Some((ProxyScanAction::FailClosed, ProxySeverityGate::BlockOnAny))
+        );
+        assert_eq!(
+            direct_policy_from_rows(&[(repo, row(false, "fail_closed"))], repo),
+            None
+        );
+        // Another repository's row says nothing about this one.
+        assert_eq!(
+            direct_policy_from_rows(&[(other, row(true, "fail_closed"))], repo),
+            None
+        );
+    }
+
+    #[test]
+    fn unreadable_config_is_a_503() {
+        assert_eq!(
+            scan_config_unreadable().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn combined_member_policy_is_the_stricter_of_two() {
+        let (virt, member, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let rows = vec![
+            (virt, row(false, "fail_closed")),
+            (member, row(true, "fail_open")),
+        ];
+        // The virtual's fail-closed action wins even though only the member scans.
+        assert_eq!(
+            combined_member_policy(&rows, virt, member).map(|p| p.0),
+            Some(ProxyScanAction::FailClosed)
+        );
+        // Neither side scans: no policy.
+        assert_eq!(combined_member_policy(&rows, virt, other), None);
+        // Record-only on every enabled side stays record-only.
+        let rec = vec![(member, row(true, "record_only"))];
+        assert_eq!(
+            combined_member_policy(&rec, virt, member),
+            Some((ProxyScanAction::RecordOnly, ProxySeverityGate::RecordOnly))
+        );
+    }
+}
+
+/// #3844: a Remote member that WINS a virtual download is counted exactly once
+/// in `proxy_download_statistics` (under the member's own id), and a member
+/// that was probed in Pass 1 or fanned out to in Pass 2 but lost is counted
+/// zero times. DB-backed with one wiremock upstream per Remote member.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod virtual_winner_recording_tests_3844 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::download_telemetry::DownloadContext;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn ctx(is_head: bool) -> DownloadContext {
+        DownloadContext {
+            is_head,
+            ..Default::default()
+        }
+    }
+
+    /// An immutable npm tarball coordinate, unique per test so the
+    /// process-global cache-metadata LRU cannot leak between tests (#2758).
+    fn tarball_path() -> String {
+        let name = format!("p{}", Uuid::new_v4().simple());
+        format!("{name}/-/{name}-1.0.0.tgz")
+    }
+
+    /// A virtual npm repo whose Remote members (in priority order) each sit in
+    /// front of their own wiremock upstream: `true` serves the tarball, `false`
+    /// answers 404.
+    struct Rig {
+        pool: PgPool,
+        virtual_id: Uuid,
+        members: Vec<(Uuid, MockServer)>,
+        proxy: Arc<ProxyService>,
+        state: crate::api::SharedState,
+        _cache_dir: tempfile::TempDir,
+    }
+
+    impl Rig {
+        async fn new(pool: PgPool, serves: &[bool]) -> Self {
+            let (virtual_id, _, _) = tdh::create_repo(&pool, "virtual", "npm").await;
+            let mut members = Vec::new();
+            for (priority, serves) in serves.iter().enumerate() {
+                let upstream = MockServer::start().await;
+                let template = if *serves {
+                    ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".as_ref())
+                } else {
+                    ResponseTemplate::new(404)
+                };
+                Mock::given(method("GET"))
+                    .respond_with(template)
+                    .mount(&upstream)
+                    .await;
+                let (member_id, _, _) = tdh::create_repo(&pool, "remote", "npm").await;
+                sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                    .bind(upstream.uri())
+                    .bind(member_id)
+                    .execute(&pool)
+                    .await
+                    .expect("point member at its upstream");
+                sqlx::query(
+                    "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                     VALUES ($1, $2, $3)",
+                )
+                .bind(virtual_id)
+                .bind(member_id)
+                .bind(priority as i32)
+                .execute(&pool)
+                .await
+                .expect("link member");
+                members.push((member_id, upstream));
+            }
+            let cache_dir = tempfile::tempdir().expect("cache dir");
+            let cache_path = cache_dir.path().to_str().unwrap();
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), cache_path);
+            let state = tdh::build_state_with_proxy(pool.clone(), cache_path, proxy.clone());
+            Self {
+                pool,
+                virtual_id,
+                members,
+                proxy,
+                state,
+                _cache_dir: cache_dir,
+            }
+        }
+
+        async fn serve_streaming(&self, path: &str, ctx: &DownloadContext) -> Response {
+            let resp = resolve_virtual_download_streaming(
+                &self.state,
+                tdh::admin_auth_ext().as_ref(),
+                Some(&self.proxy),
+                self.virtual_id,
+                path,
+                "application/octet-stream",
+                None,
+                ctx,
+                |_id, _loc| async { Err(StatusCode::NOT_FOUND.into_response()) },
+            )
+            .await
+            .expect("a member must serve the tarball");
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp
+        }
+
+        async fn serve_buffered(&self, path: &str, ctx: Option<&DownloadContext>) {
+            let result = resolve_virtual_download(
+                &self.pool,
+                tdh::admin_auth_ext().as_ref(),
+                Some(&self.proxy),
+                self.virtual_id,
+                path,
+                ctx,
+                |_id, _loc| async { Err(StatusCode::NOT_FOUND.into_response()) },
+            )
+            .await;
+            assert!(result.is_ok(), "a member must serve the tarball");
+        }
+
+        /// `proxy_download_statistics` rows recorded under member `index` for
+        /// exactly `path`, the canonical coordinate the member's cache uses.
+        async fn recorded_at(&self, index: usize, path: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM proxy_download_statistics d \
+                 JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+                 WHERE a.repository_id = $1 AND a.path = $2",
+            )
+            .bind(self.members[index].0)
+            .bind(path)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count member statistics")
+        }
+
+        /// Every `proxy_download_statistics` row under member `index`, at any
+        /// path.
+        async fn recorded_any(&self, index: usize) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM proxy_download_statistics d \
+                 JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+                 WHERE a.repository_id = $1",
+            )
+            .bind(self.members[index].0)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count member statistics")
+        }
+
+        /// Per-member counts at `path`, once their sum reaches `expected`
+        /// (bounded ~2s). The Remote winner is recorded off the response path
+        /// (#3778), so its row lands shortly after the serve; nothing else is
+        /// ever spawned (losers are never recorded), so once the winner's row
+        /// is in, the counts are final.
+        async fn recorded_all(&self, path: &str, expected: i64) -> Vec<i64> {
+            let mut out = Vec::new();
+            for _ in 0..100 {
+                out.clear();
+                for i in 0..self.members.len() {
+                    out.push(self.recorded_at(i, path).await);
+                }
+                if out.iter().sum::<i64>() >= expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            out
+        }
+
+        async fn teardown(self) {
+            for (member_id, _) in &self.members {
+                let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+                    .bind(member_id)
+                    .execute(&self.pool)
+                    .await;
+                tdh::cleanup(&self.pool, *member_id, Uuid::nil()).await;
+            }
+            tdh::cleanup(&self.pool, self.virtual_id, Uuid::nil()).await;
+        }
+    }
+
+    #[test]
+    fn virtual_serve_origin_maps_member_and_row() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            VirtualServeOrigin::hosted(Some(id)),
+            VirtualServeOrigin::Hosted(id)
+        );
+        assert_eq!(
+            VirtualServeOrigin::hosted(None),
+            VirtualServeOrigin::Unrecorded
+        );
+        let member = build_remote_repo(id, "npm-remote", "http://upstream.invalid");
+        assert_eq!(
+            VirtualServeOrigin::remote(&member),
+            VirtualServeOrigin::Remote {
+                repo_id: id,
+                repo_key: "npm-remote".to_string(),
+            }
+        );
+    }
+
+    /// Cold positive on the TOP member: confirm-top-first serves it without
+    /// contacting the member behind it. One row for the winner, none for the
+    /// other member.
+    #[tokio::test]
+    async fn streaming_top_remote_winner_records_once_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true, true]).await;
+        let path = tarball_path();
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let counts = rig.recorded_all(&path, 1).await;
+        rig.teardown().await;
+        assert_eq!(counts, vec![1, 0], "only the winning member is counted");
+    }
+
+    /// The top member misses upstream, so Pass 2 fans out to BOTH remaining
+    /// members concurrently. The higher-priority of the two wins; the losing
+    /// member's upstream probe (and the top member's miss) must count zero.
+    #[tokio::test]
+    async fn streaming_fanout_loser_and_miss_record_nothing_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[false, true, true]).await;
+        let path = tarball_path();
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let counts = rig.recorded_all(&path, 1).await;
+        rig.teardown().await;
+        assert_eq!(
+            counts,
+            vec![0, 1, 0],
+            "the fan-out winner counts once; the miss and the losing probe count zero"
+        );
+    }
+
+    /// A lower-priority member that is a Pass-1 CACHE HIT loses to a
+    /// higher-priority member resolved upstream in Pass 2. The cache hit was
+    /// probed but never served, so it must count zero.
+    #[tokio::test]
+    async fn streaming_pass1_cache_hit_that_loses_records_nothing_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true, true]).await;
+        let path = tarball_path();
+        // Warm member 1's cache directly (no statistics are recorded here).
+        let members = fetch_virtual_members(&rig.pool, rig.virtual_id)
+            .await
+            .expect("members");
+        let warm = rig
+            .proxy
+            .fetch_artifact_streaming(&members[1], &path)
+            .await
+            .expect("warm member 1");
+        let mut body = warm.body;
+        while body.next().await.is_some() {}
+        let mut cached = false;
+        for _ in 0..100 {
+            if matches!(
+                rig.proxy
+                    .streaming_cached_artifact_by_path(&members[1], &path)
+                    .await,
+                Ok(Some(_))
+            ) {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            cached,
+            "member 1's cache must be warm before the virtual serve"
+        );
+
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let counts = rig.recorded_all(&path, 1).await;
+        rig.teardown().await;
+        assert_eq!(
+            counts,
+            vec![1, 0],
+            "the upstream winner counts; the losing cache-hit probe does not"
+        );
+    }
+
+    /// Each served GET counts once; a HEAD never counts.
+    #[tokio::test]
+    async fn streaming_repeat_get_counts_each_and_head_counts_zero_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true]).await;
+        let path = tarball_path();
+        rig.serve_streaming(&path, &ctx(true)).await;
+        let after_head = rig.recorded_at(0, &path).await;
+        rig.serve_streaming(&path, &ctx(false)).await;
+        rig.serve_streaming(&path, &ctx(false)).await;
+        let after_gets = rig.recorded_all(&path, 2).await[0];
+        rig.teardown().await;
+        assert_eq!(after_head, 0, "a HEAD serves no bytes and is never counted");
+        assert_eq!(after_gets, 2, "each served GET is counted exactly once");
+    }
+
+    /// The buffered resolver (cocoapods, composer, npm, maven, ...) counts the
+    /// Remote winner once when the caller passes its context, and records
+    /// nothing when it does not.
+    #[tokio::test]
+    async fn buffered_remote_winner_records_once_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[false, true, true]).await;
+        let path = tarball_path();
+        rig.serve_buffered(&path, Some(&ctx(false))).await;
+        let with_ctx = rig.recorded_all(&path, 1).await;
+        rig.serve_buffered(&path, Some(&ctx(true))).await;
+        rig.serve_buffered(&path, None).await;
+        // Neither call spawns a recorder; give a stray one time to land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_uncounted = rig.recorded_all(&path, 1).await;
+        rig.teardown().await;
+        assert_eq!(with_ctx, vec![0, 1, 0], "only the winner is counted");
+        assert_eq!(
+            after_uncounted,
+            vec![0, 1, 0],
+            "a HEAD and a context-less call record nothing"
+        );
+    }
+
+    /// npm / cargo (`_with_fetch_urls`): the winning member fetched its bytes
+    /// from an absolute URL that differs from the canonical path, but the serve
+    /// is recorded under the canonical `path`, the key its cache uses — never
+    /// under the fetch URL.
+    #[tokio::test]
+    async fn fetch_url_override_records_under_canonical_path_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool, &[true]).await;
+        let path = tarball_path();
+        let (member_id, upstream) = &rig.members[0];
+        let fetch_url = format!("{}/download/elsewhere/pkg.tgz", upstream.uri());
+        let members = fetch_virtual_members(&rig.pool, rig.virtual_id)
+            .await
+            .expect("members");
+        let urls = std::collections::HashMap::from([(*member_id, fetch_url)]);
+        let served = resolve_virtual_download_from_members_with_fetch_urls(
+            members,
+            Some(&rig.proxy),
+            &path,
+            &urls,
+            Some(&ctx(false)),
+            |_id, _loc| async { Err(StatusCode::NOT_FOUND.into_response()) },
+        )
+        .await;
+        assert!(served.is_ok(), "the member must serve via its fetch URL");
+        let at_canonical = rig.recorded_all(&path, 1).await;
+        let anywhere = rig.recorded_any(0).await;
+        rig.teardown().await;
+        assert_eq!(at_canonical, vec![1], "recorded under the canonical path");
+        assert_eq!(anywhere, 1, "and nowhere else");
+    }
+
+    /// The buffered resolver leaves a HOSTED winner to its caller
+    /// (`record_hosted == false`): it must write no `download_statistics` row
+    /// itself, or callers that count `artifact_id` (Maven, the generic route)
+    /// would count every hosted virtual download twice. The Remote member
+    /// behind it lost, so it records nothing either.
+    #[tokio::test]
+    async fn buffered_hosted_winner_is_not_recorded_by_the_resolver_3844() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let rig = Rig::new(pool.clone(), &[true]).await;
+        let path = tarball_path();
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        sqlx::query("UPDATE virtual_repo_members SET priority = 1 WHERE virtual_repo_id = $1")
+            .bind(rig.virtual_id)
+            .execute(&pool)
+            .await
+            .expect("move the remote member behind");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(rig.virtual_id)
+        .bind(local_id)
+        .execute(&pool)
+        .await
+        .expect("link hosted member first");
+        let local_state = tdh::build_state(pool.clone(), local_dir.to_str().unwrap());
+        let local_info = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let storage_key = format!("{local_key}/{path}");
+        put_artifact_bytes(
+            &local_state,
+            &local_info,
+            &storage_key,
+            Bytes::from_static(b"hosted"),
+        )
+        .await
+        .expect("seed hosted bytes");
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'pkg', '1.0.0', 6, $3, 'application/gzip', $4) RETURNING id",
+        )
+        .bind(local_id)
+        .bind(&path)
+        .bind(format!("{:0>64}", "3844"))
+        .bind(&storage_key)
+        .fetch_one(&pool)
+        .await
+        .expect("seed hosted row");
+
+        let db = pool.clone();
+        let st = local_state.clone();
+        let p = path.clone();
+        let result = resolve_virtual_download(
+            &pool,
+            tdh::admin_auth_ext().as_ref(),
+            Some(&rig.proxy),
+            rig.virtual_id,
+            &path,
+            Some(&ctx(false)),
+            move |mid, loc| {
+                let db = db.clone();
+                let st = st.clone();
+                let p = p.clone();
+                async move { local_fetch_by_path(&db, &st, mid, &loc, &p).await }
+            },
+        )
+        .await;
+        let winner = result.as_ref().ok().and_then(|r| r.artifact_id);
+        drop(result);
+        // A recorder the resolver spawned would land within this window.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let hosted_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count hosted rows");
+        let remote_rows = rig.recorded_any(0).await;
+        tdh::cleanup(&pool, local_id, Uuid::nil()).await;
+        rig.teardown().await;
+        assert_eq!(winner, Some(artifact_id), "the hosted member wins");
+        assert_eq!(
+            hosted_rows, 0,
+            "the resolver leaves the hosted winner to its caller"
+        );
+        assert_eq!(remote_rows, 0, "the losing Remote member is not counted");
+    }
+}
+
+// #4609: the shared spooling primitive never hands a partial body on. A body
+// cut short is 408 `incomplete_body`, a read failure that is not the client's
+// is 503, and a scratch file that cannot be written is 503/507, each with
+// `Retry-After` where retrying can help.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod spool_failure_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn stream_of(
+        items: Vec<std::result::Result<Bytes, std::io::Error>>,
+    ) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> {
+        futures::stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_408_incomplete_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let err = stage_stream_content_addressed(
+            &state,
+            stream_of(vec![
+                Ok(Bytes::from_static(b"partial")),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before message completed",
+                )),
+            ]),
+        )
+        .await
+        .err()
+        .expect("a cut-short body must not be staged");
+        assert_eq!(err.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn server_side_read_failure_is_503_with_retry_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let err = stage_stream_content_addressed(
+            &state,
+            stream_of(vec![Err(std::io::Error::other("decoder failed"))]),
+        )
+        .await
+        .err()
+        .expect("must fail");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.headers().contains_key(axum::http::header::RETRY_AFTER));
+    }
+
+    /// Injected spool failure: the scratch directory cannot be created
+    /// (storage path is a regular file). 503 + Retry-After, not a bare 500
+    /// that echoes the OS error and path.
+    #[tokio::test]
+    async fn unwritable_scratch_is_503_with_retry_after() {
+        if std::env::var_os("AK_UPLOAD_STAGING_DIR").is_some()
+            || std::env::var_os("AK_INCUS_UPLOAD_TMP_DIR").is_some()
+        {
+            return; // staging is redirected; this layout cannot be forced
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("storage-is-a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let state = tdh::build_state(tdh::lazy_pool(), not_a_dir.to_str().unwrap());
+        let err = stage_stream_content_addressed(
+            &state,
+            stream_of(vec![Ok(Bytes::from_static(b"body"))]),
+        )
+        .await
+        .err()
+        .expect("must fail");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.headers().contains_key(axum::http::header::RETRY_AFTER));
     }
 }

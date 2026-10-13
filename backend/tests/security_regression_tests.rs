@@ -375,7 +375,6 @@ mod credential_change_grpc {
     /// signed with `SECRET` — the exact shape the interceptor decodes.
     fn admin_token_at(user_id: Uuid, iat: i64) -> String {
         let claims = Claims {
-            read_expansion_repo_ids: None,
             sub: user_id,
             username: "grpc-user".to_string(),
             email: "grpc-user@test.local".to_string(),

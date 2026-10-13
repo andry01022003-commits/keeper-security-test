@@ -27,6 +27,10 @@ struct ScanFindingCveRow {
     first_detected_at: DateTime<Utc>,
     last_detected_at: DateTime<Utc>,
     all_acknowledged: bool,
+    /// Whether the artifact's latest completed scans still report this CVE
+    /// (#4338). Only the per-artifact history selects it; `None` elsewhere.
+    #[sqlx(default)]
+    in_latest_scan: Option<bool>,
 }
 
 /// Build a deterministic synthetic UUID for a (artifact, cve) pair.
@@ -235,7 +239,12 @@ fn scan_finding_to_history_entry(row: ScanFindingCveRow) -> CveHistoryEntry {
         cve_published_at: None,
         first_detected_at: row.first_detected_at,
         last_detected_at: row.last_detected_at,
-        status: status_string_from_acknowledged(row.all_acknowledged).to_string(),
+        // #4338: no longer reported by the latest scans = fixed.
+        status: if row.in_latest_scan == Some(false) {
+            "fixed".to_string()
+        } else {
+            status_string_from_acknowledged(row.all_acknowledged).to_string()
+        },
         acknowledged_by: None,
         acknowledged_at: None,
         acknowledged_reason: None,
@@ -364,25 +373,34 @@ fn project_scan_rows_to_entries(
 // the parameter binds; only the query text moved out.
 
 /// `scan_findings` aggregate keyed on (artifact_id, cve_id), filtered by a
-/// single artifact. Mirrors the inline query in
-/// `build_cve_entries_from_scan_findings` (#1375).
-pub(crate) const SCAN_FINDINGS_BY_ARTIFACT_SQL: &str = r#"
+/// single artifact (#1375), joined to the artifact's CURRENT state under the
+/// shared open-findings definition (#4338, [`crate::services::open_findings`]):
+/// a CVE the latest completed scans still report takes its severity and
+/// acknowledgement from those scans, and one they no longer report comes back
+/// with `in_latest_scan = false` and is shown as `fixed`. Counting the `open`
+/// entries therefore gives the artifact's open CVEs exactly as the dashboards
+/// count them.
+pub(crate) static SCAN_FINDINGS_BY_ARTIFACT_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"{cte}
 SELECT
-    artifact_id,
-    cve_id,
-    CASE severity_rank
+    h.artifact_id,
+    h.cve_id,
+    CASE COALESCE(v.severity_rank, h.severity_rank)
         WHEN 4 THEN 'critical'
         WHEN 3 THEN 'high'
         WHEN 2 THEN 'medium'
         WHEN 1 THEN 'low'
         ELSE NULL
     END AS severity,
-    affected_component,
-    affected_version,
-    fixed_version,
-    first_detected_at,
-    last_detected_at,
-    all_acknowledged
+    h.affected_component,
+    h.affected_version,
+    h.fixed_version,
+    h.first_detected_at,
+    h.last_detected_at,
+    COALESCE(v.acknowledged, h.all_acknowledged) AS all_acknowledged,
+    (v.advisory IS NOT NULL) AS in_latest_scan
 FROM (
     SELECT
         artifact_id,
@@ -406,79 +424,17 @@ FROM (
     WHERE artifact_id = $1
       AND cve_id IS NOT NULL
     GROUP BY artifact_id, cve_id
-    ORDER BY MIN(created_at) DESC
-) inner_ranked
-"#;
-
-/// CVE-history counts CTE, scoped to one repository. The outer projection
-/// must keep the column order in lockstep with the `(i64, i64, i64, i64,
-/// i64, i64, i64)` tuple destructured in `get_cve_trends`. (#1375)
-pub(crate) const CVE_TRENDS_COUNTS_REPO_SQL: &str = r#"
-WITH per_cve AS (
-    SELECT
-        sf.artifact_id,
-        sf.cve_id,
-        MAX(
-            CASE LOWER(sf.severity)
-                WHEN 'critical' THEN 4
-                WHEN 'high' THEN 3
-                WHEN 'medium' THEN 2
-                WHEN 'low' THEN 1
-                ELSE 0
-            END
-        ) AS severity_rank,
-        BOOL_AND(sf.is_acknowledged) AS all_ack
-    FROM scan_findings sf
-    JOIN artifacts a ON sf.artifact_id = a.id
-    WHERE sf.cve_id IS NOT NULL
-      AND a.repository_id = $1
-      AND NOT a.is_deleted
-    GROUP BY sf.artifact_id, sf.cve_id
-)
-SELECT
-    COUNT(*) AS total,
-    COUNT(*) FILTER (WHERE NOT all_ack) AS open,
-    COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
-    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
-    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
-    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
-    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
-FROM per_cve
-"#;
-
-/// CVE-history counts CTE, all-repos variant. Must stay byte-aligned with
-/// the repo-scoped variant above (same severity CASE, same projection).
-pub(crate) const CVE_TRENDS_COUNTS_ALL_SQL: &str = r#"
-WITH per_cve AS (
-    SELECT
-        sf.artifact_id,
-        sf.cve_id,
-        MAX(
-            CASE LOWER(sf.severity)
-                WHEN 'critical' THEN 4
-                WHEN 'high' THEN 3
-                WHEN 'medium' THEN 2
-                WHEN 'low' THEN 1
-                ELSE 0
-            END
-        ) AS severity_rank,
-        BOOL_AND(sf.is_acknowledged) AS all_ack
-    FROM scan_findings sf
-    JOIN artifacts a ON sf.artifact_id = a.id
-    WHERE sf.cve_id IS NOT NULL
-      AND NOT a.is_deleted
-    GROUP BY sf.artifact_id, sf.cve_id
-)
-SELECT
-    COUNT(*) AS total,
-    COUNT(*) FILTER (WHERE NOT all_ack) AS open,
-    COUNT(*) FILTER (WHERE all_ack) AS acknowledged,
-    COUNT(*) FILTER (WHERE severity_rank = 4) AS critical,
-    COUNT(*) FILTER (WHERE severity_rank = 3) AS high,
-    COUNT(*) FILTER (WHERE severity_rank = 2) AS medium,
-    COUNT(*) FILTER (WHERE severity_rank = 1) AS low
-FROM per_cve
-"#;
+) h
+LEFT JOIN vulnerabilities v
+    ON v.artifact_id = h.artifact_id
+   AND v.advisory = UPPER(BTRIM(h.cve_id))
+ORDER BY h.first_detected_at DESC
+"#,
+            cte = crate::services::open_findings::vulnerabilities_cte(
+                crate::services::open_findings::FindingScope::Artifact(Uuid::nil())
+            )
+        )
+    });
 
 /// CVE-history timeline projection (most recent 100 within 30 days), scoped
 /// to one repository. The severity CASE table must stay aligned with the
@@ -1180,7 +1136,7 @@ impl SbomService {
         // shows up as `high` rather than the lexicographically-larger but
         // operationally-lower `medium`. Same fix as `get_cve_trends`. (#1375)
         let rows: Vec<ScanFindingCveRow> = if let Some(artifact_id) = artifact_filter {
-            sqlx::query_as::<_, ScanFindingCveRow>(SCAN_FINDINGS_BY_ARTIFACT_SQL)
+            sqlx::query_as::<_, ScanFindingCveRow>(SCAN_FINDINGS_BY_ARTIFACT_SQL.as_str())
                 .bind(artifact_id)
                 .fetch_all(&self.db)
                 .await?
@@ -1419,6 +1375,11 @@ impl SbomService {
             )));
         }
 
+        // #4338: the repository's materialized counts follow the triage change.
+        crate::services::scan_result_service::ScanResultService::new(self.db.clone())
+            .refresh_score_for_artifact(artifact_id)
+            .await;
+
         // Re-read the (now-mutated) aggregate so the response carries the
         // same shape as the read path: synth id, aggregated severity, MIN/MAX
         // detection timestamps, and an `all_acknowledged` flag that now
@@ -1463,24 +1424,26 @@ impl SbomService {
     /// We dedupe by (artifact_id, cve_id) so multi-scanner overlap doesn't
     /// double-count a single vulnerability.
     pub async fn get_cve_trends(&self, repository_id: Option<Uuid>) -> Result<CveTrends> {
-        let (total, open, acknowledged, critical, high, medium, low): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = if let Some(repo_id) = repository_id {
-            sqlx::query_as(CVE_TRENDS_COUNTS_REPO_SQL)
-                .bind(repo_id)
-                .fetch_one(&self.db)
-                .await?
-        } else {
-            sqlx::query_as(CVE_TRENDS_COUNTS_ALL_SQL)
-                .fetch_one(&self.db)
-                .await?
+        // #4338: the counts are the shared definition of open vulnerabilities
+        // (latest completed scan per artifact and scan type, one per
+        // (artifact, advisory), severity buckets count OPEN ones only), so
+        // the Overview card agrees with the security dashboard and the
+        // per-repository scores. They used to count every (artifact, CVE)
+        // ever recorded, acknowledged ones included in the severity buckets.
+        let scope = match repository_id {
+            Some(id) => crate::services::open_findings::FindingScope::Repository(id),
+            None => crate::services::open_findings::FindingScope::All,
         };
+        let counts = crate::services::open_findings::severity_counts(&self.db, scope).await?;
+        let (total, open, acknowledged, critical, high, medium, low) = (
+            counts.total(),
+            counts.open,
+            counts.acknowledged,
+            counts.critical,
+            counts.high,
+            counts.medium,
+            counts.low,
+        );
 
         // Timeline (most recent 100 newly-detected CVEs in the last 30 days)
         // derived from scan_findings.
@@ -3648,6 +3611,7 @@ mod tests {
             first_detected_at,
             last_detected_at: first_detected_at,
             all_acknowledged,
+            in_latest_scan: None,
         }
     }
 
@@ -4002,6 +3966,7 @@ mod tests {
             first_detected_at: now,
             last_detected_at: now,
             all_acknowledged: false,
+            in_latest_scan: None,
         };
         let t = scan_finding_to_timeline_entry(&row, now);
         // None fields default to empty strings in the DTO.
@@ -4465,86 +4430,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cve_trends_counts_repo_sql_uses_per_cve_cte() {
-        // Counts must come from a per-CVE CTE so multi-scanner overlap
-        // does not double-count.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("WITH per_cve AS"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("GROUP BY sf.artifact_id, sf.cve_id"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_sql_filters_deleted_artifacts() {
-        // A soft-deleted artifact must not contribute to the open count.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("NOT a.is_deleted"));
-        assert!(CVE_TRENDS_COUNTS_ALL_SQL.contains("NOT a.is_deleted"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_sql_emits_named_columns_in_tuple_order() {
-        // The outer SELECT in the counts CTE projects exactly seven
-        // columns in this order: total, open, acknowledged, critical,
-        // high, medium, low. The async caller destructures into a 7-i64
-        // tuple, so any column reorder here would silently swap the
-        // counts on the trends dashboard.
-        let columns = [
-            "AS total",
-            "AS open",
-            "AS acknowledged",
-            "AS critical",
-            "AS high",
-            "AS medium",
-            "AS low",
-        ];
-        for c in columns {
-            assert!(
-                CVE_TRENDS_COUNTS_REPO_SQL.contains(c),
-                "counts SQL missing column alias: {c}"
-            );
-            assert!(
-                CVE_TRENDS_COUNTS_ALL_SQL.contains(c),
-                "counts SQL missing column alias: {c}"
-            );
-        }
-        // Order: total appears before open before acknowledged.
-        let p_total = CVE_TRENDS_COUNTS_REPO_SQL.find("AS total").unwrap();
-        let p_open = CVE_TRENDS_COUNTS_REPO_SQL.find("AS open").unwrap();
-        let p_ack = CVE_TRENDS_COUNTS_REPO_SQL.find("AS acknowledged").unwrap();
-        let p_crit = CVE_TRENDS_COUNTS_REPO_SQL.find("AS critical").unwrap();
-        let p_low = CVE_TRENDS_COUNTS_REPO_SQL.find("AS low").unwrap();
-        assert!(p_total < p_open);
-        assert!(p_open < p_ack);
-        assert!(p_ack < p_crit);
-        assert!(p_crit < p_low);
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_uses_filter_clauses() {
-        // Each severity count is gated by a FILTER (WHERE severity_rank
-        // = N) -- losing the FILTER would turn each count into the total.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 4)"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 3)"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 2)"));
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("FILTER (WHERE severity_rank = 1)"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_uses_bool_and_for_ack() {
-        // `acknowledged` only counts when EVERY scan_findings row for the
-        // (artifact, cve) pair is acknowledged -- otherwise a single
-        // unacknowledged scanner would silently mark it acked.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("BOOL_AND(sf.is_acknowledged)"));
-    }
-
-    #[test]
-    fn test_cve_trends_counts_repo_scopes_by_repository_id() {
-        // The repo-scoped variant must bind $1 to a.repository_id; the
-        // all-repos variant must omit it. Pin both halves so a copy-paste
-        // could not collapse them.
-        assert!(CVE_TRENDS_COUNTS_REPO_SQL.contains("a.repository_id = $1"));
-        assert!(!CVE_TRENDS_COUNTS_ALL_SQL.contains("a.repository_id ="));
-    }
-
-    #[test]
     fn test_cve_trends_timeline_repo_sql_30_day_window() {
         // The timeline is "newly-detected in the last 30 days"; the
         // INTERVAL must be present in both variants or the dashboard
@@ -4656,8 +4541,6 @@ mod tests {
         // an empty query against Postgres.
         assert!(!SCAN_FINDINGS_BY_ARTIFACT_SQL.trim().is_empty());
         assert!(!SCAN_FINDINGS_BY_CVE_SQL.trim().is_empty());
-        assert!(!CVE_TRENDS_COUNTS_REPO_SQL.trim().is_empty());
-        assert!(!CVE_TRENDS_COUNTS_ALL_SQL.trim().is_empty());
         assert!(!CVE_TRENDS_TIMELINE_REPO_SQL.trim().is_empty());
         assert!(!CVE_TRENDS_TIMELINE_ALL_SQL.trim().is_empty());
         assert!(!FIXED_CVES_COUNT_REPO_SQL.trim().is_empty());
@@ -4674,28 +4557,6 @@ mod tests {
         assert!(!SCAN_FINDINGS_BY_ARTIFACT_SQL.contains("LOWER(cve_id) = LOWER($1)"));
         assert!(SCAN_FINDINGS_BY_CVE_SQL.contains("LOWER(cve_id) = LOWER($1)"));
         assert!(!SCAN_FINDINGS_BY_CVE_SQL.contains("WHERE artifact_id = $1"));
-    }
-
-    #[test]
-    fn test_cve_trends_repo_and_all_sql_severity_ranks_align() {
-        // Both variants of the counts CTE must use the same ranked CASE;
-        // a drift would silently misreport severities on the all-repos
-        // dashboard vs the per-repo one.
-        for label_then in [
-            "WHEN 'critical' THEN 4",
-            "WHEN 'high' THEN 3",
-            "WHEN 'medium' THEN 2",
-            "WHEN 'low' THEN 1",
-        ] {
-            assert!(
-                CVE_TRENDS_COUNTS_REPO_SQL.contains(label_then),
-                "repo SQL missing rank clause: {label_then}"
-            );
-            assert!(
-                CVE_TRENDS_COUNTS_ALL_SQL.contains(label_then),
-                "all-repos SQL missing rank clause: {label_then}"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------

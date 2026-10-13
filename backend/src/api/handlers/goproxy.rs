@@ -11,6 +11,7 @@
 //!   PUT  /go/{repo_key}/*module/@v/{version}.zip     - Upload module zip
 //!   PUT  /go/{repo_key}/*module/@v/{version}.mod     - Upload go.mod
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -335,7 +336,7 @@ async fn handle_put(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: reject read-scoped API tokens on PUT.
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
@@ -1186,6 +1187,10 @@ async fn get_mod_file(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    // go.mod is metadata: the Remote arm above serves it through the
+                    // capped fetch and records no proxy download, so a Remote member
+                    // serving it here is not counted either (#3844).
+                    None,
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -1365,6 +1370,7 @@ async fn download_zip(
                     allowed,
                     state.proxy_service.as_deref(),
                     &upstream_path,
+                    Some(ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -1574,6 +1580,13 @@ async fn upload_zip(
     let checksum = format!("{:x}", hasher.finalize());
 
     let size_bytes = body.len() as i64;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
     let storage_key = build_go_zip_storage_key(module, version);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
@@ -1591,6 +1604,13 @@ async fn upload_zip(
     })?;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1610,9 +1630,10 @@ async fn upload_zip(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -1714,6 +1735,13 @@ async fn upload_mod(
     let checksum = format!("{:x}", hasher.finalize());
 
     let size_bytes = body.len() as i64;
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
     let storage_key = build_go_mod_storage_key(module, version);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
@@ -1731,6 +1759,13 @@ async fn upload_mod(
     })?;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1750,9 +1785,10 @@ async fn upload_mod(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;

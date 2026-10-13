@@ -1186,6 +1186,19 @@ pub(crate) fn is_jvm_archive_name(filename: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// The `(groupId:artifactId, version)` a Maven download is curated as, both
+/// from the cache-normalized path (#4365 item 6), so every spelling the proxy
+/// cache serves as one entry is curated as one package. `None` for metadata,
+/// checksums and paths that name no coordinate.
+fn maven_curation_target(path: &str) -> Option<(String, Option<String>)> {
+    let pkg = crate::services::proxy_service::maven_proxy_package_name(path)?;
+    let version =
+        MavenHandler::parse_coordinates(crate::services::proxy_service::normalize_cache_path(path))
+            .ok()
+            .map(|c| c.version);
+    Some((pkg, version))
+}
+
 /// Refuse a Maven/sbt proxy path that the upstream request could read
 /// differently from the classified and cached path (#4100): a decoded `?`
 /// or `#` becomes a query or fragment when joined into the upstream URL,
@@ -1226,15 +1239,23 @@ pub(crate) fn reject_ambiguous_proxy_path(path: &str) -> Result<(), Response> {
     Ok(())
 }
 
+/// The canonical `(cache_key, scannable)` decision for a Maven or sbt proxy
+/// path (#4365 item 1): everything is scanned except the known non-package
+/// files of [`is_unscanned_jvm_companion`], decided on the cache key's file
+/// name.
+pub(crate) fn jvm_proxy_serve_key(path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(path, |file| !is_unscanned_jvm_companion(file))
+}
+
 /// A proxied request the scan-on-proxy gate must see (#4100).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JvmScanTarget<'p> {
+pub(crate) struct JvmScanTarget {
     /// The request path normalized EXACTLY as the proxy cache keys it
     /// ([`normalize_cache_path`](crate::services::proxy_service::normalize_cache_path)),
     /// which is also the path the gate fetches and caches under. Classifying
     /// any other spelling would let an alias of a refused archive (a trailing
     /// `/`) stream the same cached bytes unscanned.
-    pub path: &'p str,
+    pub path: String,
     /// The coordinate the path names, when it parses. `None` is still
     /// scanned, with no identity pin.
     pub coordinate: Option<JvmArchiveCoordinate>,
@@ -1249,14 +1270,15 @@ pub(crate) struct JvmScanTarget<'p> {
 /// anything else is scanned with no pin. A classifier (`-tests`,
 /// `-linux-x86_64`, ...) names the same coordinate, since Maven's archiver
 /// writes the project's `pom.properties` into every classified jar it builds.
-pub(crate) fn maven_scan_target(path: &str) -> Option<JvmScanTarget<'_>> {
-    let path = crate::services::proxy_service::normalize_cache_path(path);
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    if filename.is_empty() || is_unscanned_jvm_companion(filename) {
+pub(crate) fn maven_scan_target(path: &str) -> Option<JvmScanTarget> {
+    let key = jvm_proxy_serve_key(path);
+    if !key.scannable {
         return None;
     }
+    let path = key.cache_key;
+    let filename = path.rsplit('/').next().unwrap_or(&path);
     let coordinate = is_jvm_archive_name(filename)
-        .then(|| MavenHandler::parse_coordinates(path).ok())
+        .then(|| MavenHandler::parse_coordinates(&path).ok())
         .flatten()
         .map(|coords| JvmArchiveCoordinate {
             group_id: coords.group_id,
@@ -1677,10 +1699,10 @@ async fn download(
     // so a rule authored for the curation catalog matches here. Metadata and
     // checksum/signature sidecars derive no package identity (the helper returns
     // `None`) and pass through untouched; hosted repos / curation-off are no-ops.
-    if let Some(pkg) = crate::services::proxy_service::maven_proxy_package_name(&path) {
-        let version = crate::formats::maven::MavenHandler::parse_coordinates(&path)
-            .ok()
-            .map(|c| c.version);
+    //
+    // Both the name and the version come from the cache-normalized path
+    // (#4365 item 6), so a trailing `/` cannot dodge a rule.
+    if let Some((pkg, version)) = maven_curation_target(&path) {
         proxy_helpers::enforce_curation(&state.db, &repo, &pkg, version.as_deref()).await?;
     }
 
@@ -1902,14 +1924,13 @@ async fn download(
             // checksum. A private member's checksum reveals the existence and
             // exact content hash of its artifact, so it must be gated the same
             // way the artifact bytes are.
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-            let members = proxy_helpers::authorize_virtual_members(
-                &state.db,
-                auth.as_ref(),
-                repo.id,
-                members,
-            )
-            .await;
+            //
+            // The fallible form (#4308): a failed authorization query is a
+            // retryable 503, never an empty member set that answers the
+            // definitive 404 Gradle caches as "this checksum does not exist".
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await?;
 
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
@@ -1967,8 +1988,14 @@ async fn download(
 }
 
 /// Fetch a single Remote virtual member's Maven metadata document at `path`
-/// from upstream (via the proxy cache), as a UTF-8 string. Returns `None` for a
-/// non-Remote member or any miss.
+/// from upstream (via the proxy cache), as a UTF-8 string. Returns `Ok(None)`
+/// for a non-Remote member or any miss.
+///
+/// Bounded by the virtual member deadline (#4508): a member whose upstream is
+/// down used to hold every metadata miss for the upstream client's full
+/// timeout, longer than a reverse proxy waits, so clients saw 504 and builds
+/// crawled. A member that misses the deadline is `Err`, a 502 naming it,
+/// which the merge returns instead of waiting.
 ///
 /// Extracted so the Maven virtual metadata-merge loops can fan out across remote
 /// members CONCURRENTLY (#2069): a cold metadata merge then costs the slowest
@@ -1979,13 +2006,16 @@ async fn fetch_remote_member_metadata(
     state: &SharedState,
     member: &crate::models::repository::Repository,
     path: &str,
-) -> Option<String> {
+) -> Result<Option<String>, Response> {
     if member.repo_type != RepositoryType::Remote {
-        return None;
+        return Ok(None);
     }
-    let upstream_url = member.upstream_url.as_deref()?;
-    let proxy = state.proxy_service.as_ref()?;
-    let (content, _, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+    let (Some(upstream_url), Some(proxy)) =
+        (member.upstream_url.as_deref(), state.proxy_service.as_ref())
+    else {
+        return Ok(None);
+    };
+    let fetched = proxy_helpers::member_metadata_fetch_capped_budgeted(
         proxy,
         member.id,
         &member.key,
@@ -1995,8 +2025,13 @@ async fn fetch_remote_member_metadata(
         RepositoryFormat::Maven,
     )
     .await
-    .ok()?;
-    std::str::from_utf8(&content).ok().map(|s| s.to_string())
+    .map_err(|deadline| {
+        proxy_helpers::virtual_member_deadline_response(&member.key, path, deadline)
+    })?;
+    let Ok((content, _, _budget_permit)) = fetched else {
+        return Ok(None);
+    };
+    Ok(std::str::from_utf8(&content).ok().map(|s| s.to_string()))
 }
 
 /// Read a Local/Staging virtual member's stored metadata document at `path`.
@@ -2114,17 +2149,20 @@ async fn fetch_maven_metadata_bytes(
                                 if member.repo_type == RepositoryType::Remote {
                                     fetch_remote_member_metadata(state, member, path).await
                                 } else {
-                                    generate_metadata_for_artifact(
+                                    Ok(generate_metadata_for_artifact(
                                         &state.db,
                                         member.id,
                                         &group_id,
                                         &artifact_id,
                                     )
                                     .await
-                                    .ok()
+                                    .ok())
                                 }
                             }))
                             .await;
+                        // A member that missed the deadline fails the merge
+                        // (#4508); nothing is cached for it.
+                        let member_docs = member_docs.into_iter().collect::<Result<Vec<_>, _>>()?;
                         for xml in member_docs.into_iter().flatten() {
                             if let Some(ts) =
                                 crate::formats::maven::parse_metadata_last_updated(&xml)
@@ -2202,11 +2240,13 @@ async fn fetch_maven_metadata_bytes(
                     if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
                     } else {
-                        read_member_stored_metadata(state, member, path).await
+                        Ok(read_member_stored_metadata(state, member, path).await)
                     }
                 }))
                 .await;
-                member_docs.extend(batch.into_iter().flatten());
+                for doc in batch {
+                    member_docs.extend(doc?);
+                }
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
@@ -2229,7 +2269,7 @@ async fn fetch_maven_metadata_bytes(
                     let mut entries: Vec<SnapshotEntry> = Vec::new();
                     if member.repo_type == RepositoryType::Remote {
                         if let Some(xml_str) =
-                            fetch_remote_member_metadata(state, member, path).await
+                            fetch_remote_member_metadata(state, member, path).await?
                         {
                             entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
@@ -2254,11 +2294,11 @@ async fn fetch_maven_metadata_bytes(
                             .await,
                         );
                     }
-                    entries
+                    Ok::<_, Response>(entries)
                 }))
                 .await;
                 for entries in per_member {
-                    all_entries.extend(entries);
+                    all_entries.extend(entries?);
                 }
             }
 
@@ -2359,7 +2399,8 @@ async fn fetch_remote_member_prefixes(
         || AppError::NotFound("Prefix file not available".to_string()).into_response();
     let upstream_url = member.upstream_url.as_deref().ok_or_else(unavailable)?;
     let proxy = state.proxy_service.as_ref().ok_or_else(unavailable)?;
-    match proxy_helpers::proxy_fetch_capped_budgeted(
+    // Bounded by the virtual member deadline like the metadata merge (#4508).
+    let fetched = proxy_helpers::member_metadata_fetch_capped_budgeted(
         proxy,
         member.id,
         &member.key,
@@ -2369,7 +2410,10 @@ async fn fetch_remote_member_prefixes(
         RepositoryFormat::Maven,
     )
     .await
-    {
+    .map_err(|deadline| {
+        proxy_helpers::virtual_member_deadline_response(&member.key, MAVEN_PREFIXES_PATH, deadline)
+    })?;
+    match fetched {
         Ok((content, _, _permit)) => {
             let text = std::str::from_utf8(&content).map_err(|_| unavailable())?;
             parse_member_prefixes_body(text)
@@ -2924,15 +2968,9 @@ async fn serve_artifact(
                     // enabled scan-on-proxy keeps the streaming path below
                     // untouched.
                     if let Some(target) = maven_scan_target(path) {
-                        if crate::services::scan_config_service::ScanConfigService::new(
-                            state.db.clone(),
-                        )
-                        .is_proxy_scan_enabled(repo.id)
-                        .await
-                        .unwrap_or(false)
+                        if let Some(policy) =
+                            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                         {
-                            let policy =
-                                proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                             let remote = MavenRemote {
                                 proxy,
                                 repo_id: repo.id,
@@ -2942,7 +2980,7 @@ async fn serve_artifact(
                             return serve_scanned_maven_archive(
                                 state,
                                 &remote,
-                                target.path,
+                                &target.path,
                                 target.coordinate.as_ref(),
                                 policy,
                                 ctx,
@@ -3135,6 +3173,7 @@ async fn serve_artifact(
                             &local_fetch,
                             content_type_for_path(path),
                             Some((&state.db, ctx)),
+                            Some(ctx),
                         )
                     };
                     let target = &target;
@@ -3149,7 +3188,7 @@ async fn serve_artifact(
                         serve_scanned_maven_archive(
                             state,
                             &remote,
-                            target.path,
+                            &target.path,
                             target.coordinate.as_ref(),
                             policy,
                             ctx,
@@ -3173,6 +3212,7 @@ async fn serve_artifact(
                     members,
                     proxy_for_virtual,
                     path,
+                    Some(ctx),
                     local_fetch,
                 )
                 .await?;
@@ -3683,21 +3723,20 @@ async fn upload(
     .await
     .map_err(map_db_err)?;
 
-    // #3839: one definition of Maven mutability. The classifier owns it —
-    // including the path-component-aware `-SNAPSHOT` test and the
-    // resolved-unique-snapshot exemption (#3554 / #3459) — so the PUT path and
-    // the proxy cache cannot disagree about whether a coordinate may be
-    // rewritten. The old `coords.version.contains("SNAPSHOT")` here let a
-    // timestamped `…-20260827.132833-10.jar` be silently overwritten even
-    // though `classify()` calls it `Immutable`, and read `1.0-SNAPSHOT-rc1` as
-    // a snapshot where the classifier reads it as a release.
+    // #3839: one definition of Maven mutability, owned by the classifier
+    // module and sharing its path-component-aware `-SNAPSHOT` test (#3554), so
+    // `1.0-SNAPSHOT-rc1` is a release here exactly as it is to the proxy
+    // cache. Every file under a `-SNAPSHOT` directory, a timestamped unique
+    // snapshot included, is republishable: a build may deploy the same
+    // attached artifact twice, and snapshots are documented as overwritable
+    // (#4476).
     let republishable = crate::services::cache_classifier::maven_coordinate_is_republishable(&path);
 
     if existing.is_some() {
         if !republishable {
             return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
         }
-        // A republishable coordinate (non-unique SNAPSHOT, maven-metadata) is
+        // A republishable coordinate (a SNAPSHOT file, maven-metadata) is
         // rewritten in place by the `ON CONFLICT` upsert below (#3587) — no
         // preflight DELETE, which was itself the race: two concurrent PUTs of
         // the same path both saw no row, both INSERTed, and the loser surfaced
@@ -3717,6 +3756,16 @@ async fn upload(
         .await
         .map_err(|e| e.into_response())?;
     }
+
+    // Refuse an over-quota upload before claiming the key or writing its
+    // bytes (#4422).
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&path),
+        size_bytes,
+    )
+    .await?;
 
     // Atomically claim the flat key BEFORE writing its bytes so that of two
     // concurrent first-publishers of the same key exactly one proceeds and the
@@ -3805,6 +3854,8 @@ async fn upload(
     // would otherwise leave a live artifact with no Maven metadata, and a
     // concurrent republish must never observe the row without it.
     let mut tx = state.db.begin().await.map_err(map_db_err)?;
+    super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
+        .await?;
     let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
         sqlx::query_as(
             r#"
@@ -5265,25 +5316,23 @@ mod tests {
     // actual axum Router so a future refactor that breaks virtual-repo
     // routing surfaces the failure here, not at release-gate time.
 
-    /// #3839: the PUT path must take its Maven mutability from
-    /// `cache_classifier`, not from a hand-rolled `version.contains("SNAPSHOT")`.
+    /// #3839 / #4476: the PUT path takes its Maven mutability from
+    /// `cache_classifier::maven_coordinate_is_republishable`, not from a
+    /// hand-rolled `version.contains("SNAPSHOT")`.
     ///
-    /// Three coordinates, one upload route, and the classifier is the oracle
-    /// for all three:
-    ///
-    /// * a RESOLVED unique snapshot (`…-20260827.132833-10.jar`) names exactly
-    ///   one deployment, so `classify` calls it `Immutable` — re-uploading
-    ///   different bytes must 409 and must not disturb the stored bytes. Under
-    ///   the old predicate it returned 201 twice and replaced the artifact a
-    ///   build may already have resolved and pinned.
+    /// * a RESOLVED unique snapshot (`…-20260827.132833-10.jar`) is
+    ///   republished in place (#4476): a snapshot repository is mutable, a
+    ///   build may deploy the same timestamped file twice, and the Maven guide
+    ///   documents that snapshots can be overwritten. `classify` still calls
+    ///   it `Immutable` for the proxy cache, which is a separate question.
     /// * a NON-unique snapshot (`…-1.0-SNAPSHOT.jar`) is republished in place
     ///   by design — that is #3295, and it must keep working.
     /// * `1.0-SNAPSHOT-rc1` merely CONTAINS the token; the classifier's
     ///   component-wise `ends_with("-snapshot")` reads it as a release, and the
-    ///   handler must now agree instead of treating it as a snapshot.
+    ///   handler must agree instead of treating it as a snapshot (#3839).
     ///
-    /// Each case asserts the handler's answer AND `classify`'s answer, so the
-    /// two halves cannot drift apart again without failing here.
+    /// Each case asserts the handler's answer AND `classify`'s answer, so
+    /// neither can drift without failing here.
     #[tokio::test]
     async fn test_maven_put_takes_snapshot_mutability_from_classifier_3839() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -5298,24 +5347,28 @@ mod tests {
         let first = bytes::Bytes::from_static(b"first bytes -- the pinned deployment");
         let second = bytes::Bytes::from_static(b"SECOND bytes, different length + content");
 
-        // (path, may the second upload replace the first?)
-        let cases: [(&str, bool); 3] = [
+        // (path, may the second upload replace the first?, does the proxy
+        // cache classify it immutable?)
+        let cases: [(&str, bool, bool); 3] = [
             (
                 "com/example/probe/6.0-SNAPSHOT/probe-6.0-20260827.132833-10.jar",
-                false,
+                true,
+                true,
             ),
             (
                 "com/example/probe/1.0-SNAPSHOT/probe-1.0-SNAPSHOT.jar",
                 true,
+                false,
             ),
             (
                 "com/example/probe/1.0-SNAPSHOT-rc1/probe-1.0-SNAPSHOT-rc1.jar",
                 false,
+                true,
             ),
         ];
 
         let mut observed = Vec::new();
-        for (path, _) in cases {
+        for (path, _, _) in cases {
             let app = fx.router_with_auth(super::router());
             let (s1, _) = tdh::send(
                 app,
@@ -5335,7 +5388,9 @@ mod tests {
 
         fx.teardown().await;
 
-        for ((path, republishable), (p, s1, s2, b2, sg, stored)) in cases.iter().zip(observed) {
+        for ((path, republishable, cached_immutable), (p, s1, s2, b2, sg, stored)) in
+            cases.iter().zip(observed)
+        {
             assert_eq!(path, &p);
             assert_eq!(
                 s1,
@@ -5344,20 +5399,25 @@ mod tests {
             );
             assert_eq!(sg, StatusCode::OK, "{path}: stored artifact must download");
 
-            // The classifier's own verdict, asserted alongside the handler's so
-            // the two definitions are pinned to each other (#3839).
+            // The classifier's own verdicts, asserted alongside the handler's.
             let immutable =
                 cache_classifier::classify(&RepositoryFormat::Maven, path).is_immutable();
             assert_eq!(
-                immutable, !*republishable,
+                immutable, *cached_immutable,
                 "{path}: test expectation must match `classify_maven`"
+            );
+            assert_eq!(
+                cache_classifier::maven_coordinate_is_republishable(path),
+                *republishable,
+                "{path}: test expectation must match the PUT-path predicate"
             );
 
             if *republishable {
                 assert_eq!(
                     s2,
                     StatusCode::CREATED,
-                    "{path}: a non-unique SNAPSHOT is republished in place (#3295); body={}",
+                    "{path}: a SNAPSHOT coordinate is republished in place \
+                     (#3295, #4476); body={}",
                     String::from_utf8_lossy(&b2)
                 );
                 assert_eq!(
@@ -5369,9 +5429,8 @@ mod tests {
                 assert_eq!(
                     s2,
                     StatusCode::CONFLICT,
-                    "{path}: `classify` calls this coordinate Immutable, so the \
-                     PUT path must refuse the overwrite instead of silently \
-                     accepting it; body={}",
+                    "{path}: a release coordinate must refuse the overwrite \
+                     instead of silently accepting it; body={}",
                     String::from_utf8_lossy(&b2)
                 );
                 assert_eq!(
@@ -5381,6 +5440,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #4308: a database failure while authorizing a Maven virtual's members
+    /// must answer a retryable server error (503 for a pool timeout), never
+    /// the definitive 404 "Virtual
+    /// repository has no accessible members" that Gradle records as a missing
+    /// artifact and stops asking for. The checksum route still went through
+    /// the flattening `authorize_virtual_members`, which turned the error into
+    /// an empty member set; the artifact route is the control (it already
+    /// used the fallible form). A real denial still answers the 404, checked
+    /// after the outage ends.
+    #[tokio::test]
+    async fn test_maven_virtual_authz_db_failure_is_503_not_404_4308() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "maven").await;
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, 1).await;
+        let path = "com/example/k/1.0/k-1.0.jar";
+        let member_info = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_info,
+            &format!("maven/{path}"),
+            path,
+            "k",
+            "1.0",
+            "application/java-archive",
+            bytes::Bytes::from_static(b"k jar"),
+            fx.user_id,
+        )
+        .await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let outage = tdh::AuthzQueryOutage::start(&fx.pool)
+            .await
+            .expect("database configured");
+        let state = tdh::build_state(outage.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let mut during = Vec::new();
+        for leaf in [path.to_string(), format!("{path}.sha1")] {
+            let app = tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, leaf))).await;
+            during.push((leaf, status, String::from_utf8_lossy(&body).into_owned()));
+        }
+        outage.end().await;
+
+        // Control: with the database healthy, a caller holding no grant on
+        // the member still gets the shared 404 (#3452 is unchanged).
+        let (stranger_id, stranger_name) = tdh::create_user(&fx.pool).await;
+        let app = tdh::router_with_auth(
+            super::router(),
+            fx.state.clone(),
+            tdh::make_auth(stranger_id, &stranger_name),
+        );
+        let (denied, _) = tdh::send(app, tdh::get(format!("/{}/{}.sha1", fx.repo_key, path))).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, stranger_id).await;
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        // The injected failure is a lock timeout, which `map_db_err` answers
+        // 500; a pool timeout (the reported trigger) goes through the same
+        // `Err` and answers 503 + POOL_EXHAUSTED. Either is retryable; the
+        // bug was the definitive 404.
+        for (leaf, status, body) in during {
+            assert!(
+                status.is_server_error(),
+                "{leaf}: an authorization query failure must be a retryable \
+                 server error, not a cacheable miss; got {status}, body={body}"
+            );
+        }
+        assert_eq!(denied, StatusCode::NOT_FOUND);
+    }
+
+    /// #4476: a Maven build that deploys the same attached snapshot artifact
+    /// twice in one execution PUTs the same timestamped path twice. Up to
+    /// 1.8.0 both were accepted, as the Maven guide documents ("snapshots ...
+    /// can be overwritten"); #3839 made a resolved unique snapshot immutable
+    /// and the second PUT answered 409, failing `mvn deploy`. Both the
+    /// identical-bytes redeploy and a rebuilt (different-bytes) one must be
+    /// accepted, and the stored bytes must be the latest upload.
+    #[tokio::test]
+    async fn test_maven_redeploy_of_a_unique_snapshot_artifact_is_accepted_4476() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let path = "com/example/object/1.0-SNAPSHOT/object-1.0-20261006.124037-3-clear.jar";
+        let uri = format!("/{}/{}", fx.repo_key, path);
+        let first = bytes::Bytes::from_static(b"object-clear.jar first build");
+        let rebuilt = bytes::Bytes::from_static(b"object-clear.jar rebuilt, other bytes");
+
+        let mut statuses = Vec::new();
+        for body in [first.clone(), first.clone(), rebuilt.clone()] {
+            let app = fx.router_with_auth(super::router());
+            let (status, resp) = tdh::send(app, tdh::put(uri.clone(), body)).await;
+            statuses.push((status, String::from_utf8_lossy(&resp).into_owned()));
+        }
+        let app = fx.router_with_auth(super::router());
+        let (sg, stored) = tdh::send(app, tdh::get(uri.clone())).await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 \
+             AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count artifact rows");
+        fx.teardown().await;
+
+        for (i, (status, body)) in statuses.iter().enumerate() {
+            assert_eq!(
+                *status,
+                StatusCode::CREATED,
+                "upload {i} of the same snapshot artifact must be accepted; body={body}"
+            );
+        }
+        assert_eq!(sg, StatusCode::OK);
+        assert_eq!(&stored[..], &rebuilt[..], "the latest deploy is served");
+        assert_eq!(rows, 1, "a redeploy rewrites the one row in place");
     }
 
     /// #3587: concurrent Maven uploads of the SAME path must not surface
@@ -9141,6 +9334,93 @@ mod tests {
         );
     }
 
+    /// #4508: a virtual's Remote member whose upstream stalls must not hold
+    /// every `maven-metadata.xml` miss for the upstream's full timeout. The
+    /// member fetch is bounded by the member deadline, and a member that
+    /// misses it fails the request with a 502 naming the member.
+    #[tokio::test]
+    async fn test_virtual_metadata_stalled_member_fails_within_the_deadline_4508() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let meta_path = "com/example/stall4508/lib/maven-metadata.xml".to_string();
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*maven-metadata\.xml$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<metadata/>")
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&mock)
+            .await;
+
+        let (local_id, _lk, dir_l) = tdh::create_repo(&pool, "local", "maven").await;
+        let (remote_id, remote_key, dir_r) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        let (virtual_id, virtual_key, dir_v) = tdh::create_repo(&pool, "virtual", "maven").await;
+        for id in [local_id, remote_id, virtual_id] {
+            tdh::publish_repo(&pool, id).await;
+        }
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 1).await;
+        tdh::link_virtual_member(&pool, virtual_id, remote_id, 2).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir_r.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir_r.to_str().unwrap(), proxy);
+
+        let started = std::time::Instant::now();
+        let result = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+            Duration::from_millis(300),
+            download(
+                State(state.clone()),
+                Extension(None),
+                Path((virtual_key.clone(), meta_path.clone())),
+                HeaderMap::new(),
+                Default::default(),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        for (id, dir) in [
+            (local_id, &dir_l),
+            (remote_id, &dir_r),
+            (virtual_id, &dir_v),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => r,
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body.contains(&remote_key),
+            "the 502 must name the member: {body}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the deadline must bound the wait: took {elapsed:?}"
+        );
+    }
+
     /// #1562: a virtual repo must serve an artifact that one of its REMOTE
     /// members can proxy-fetch on first request, even when no local member
     /// holds it (e.g. a remote-only parent POM like `io.confluent:common`).
@@ -10731,15 +11011,11 @@ mod scan_on_proxy_tests {
                         .await
                         .unwrap_or_else(|_| panic!("policies readable"));
                 for (member, got) in members.iter().zip(batched) {
-                    let (enabled, action, gate) =
+                    let single =
                         proxy_helpers::effective_virtual_scan_policy(&pool, virtual_id, member.id)
-                            .await;
-                    assert_eq!(
-                        got,
-                        enabled.then_some((action, gate)),
-                        "{label}: {}",
-                        member.key
-                    );
+                            .await
+                            .unwrap_or_else(|_| panic!("policy readable"));
+                    assert_eq!(got, single, "{label}: {}", member.key);
                 }
             }
         };
@@ -10751,6 +11027,15 @@ mod scan_on_proxy_tests {
         let dead = tdh::try_pool().await.expect("pool");
         dead.close().await;
         let err = proxy_helpers::virtual_member_scan_policies(&dead, fx.repo_id, &members)
+            .await
+            .expect_err("closed pool");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // #4365 item 5: the per-member read and the direct Remote read agree.
+        let err = proxy_helpers::effective_virtual_scan_policy(&dead, fx.repo_id, closed)
+            .await
+            .expect_err("closed pool");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err = proxy_helpers::remote_scan_policy(&dead, closed)
             .await
             .expect_err("closed pool");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -10989,5 +11274,232 @@ mod scan_on_proxy_tests {
         tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
         tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: Maven/sbt `(cache_key, scannable)` decisions, per layout. For
+/// every well-formed path the key is exactly the path the cache already used,
+/// so no warm entry is orphaned.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn jvm_serve_key_table() {
+        for (path, key, scannable) in [
+            (
+                "com/acme/widget/1.0/widget-1.0.jar",
+                "com/acme/widget/1.0/widget-1.0.jar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.war",
+                "com/acme/widget/1.0/widget-1.0.war",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.aar",
+                "com/acme/widget/1.0/widget-1.0.aar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.JAR/",
+                "com/acme/widget/1.0/widget-1.0.JAR",
+                true,
+            ),
+            (
+                "/com/acme/widget/1.0/widget-1.0.jar",
+                "com/acme/widget/1.0/widget-1.0.jar",
+                true,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.pom",
+                "com/acme/widget/1.0/widget-1.0.pom",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.pom/",
+                "com/acme/widget/1.0/widget-1.0.pom",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.module",
+                "com/acme/widget/1.0/widget-1.0.module",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0.jar.sha1",
+                "com/acme/widget/1.0/widget-1.0.jar.sha1",
+                false,
+            ),
+            (
+                "com/acme/widget/1.0/widget-1.0-sources.jar",
+                "com/acme/widget/1.0/widget-1.0-sources.jar",
+                false,
+            ),
+            (
+                "com/acme/widget/maven-metadata.xml",
+                "com/acme/widget/maven-metadata.xml",
+                false,
+            ),
+            // sbt / Ivy layout.
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                false,
+            ),
+            // An ambiguous spelling never classifies as a companion file.
+            (
+                "com/acme/widget/1.0/widget-1.0.jar;.pom",
+                "com/acme/widget/1.0/widget-1.0.jar;.pom",
+                true,
+            ),
+        ] {
+            let got = jvm_proxy_serve_key(path);
+            assert_eq!(
+                (got.cache_key.as_str(), got.scannable),
+                (key, scannable),
+                "{path}"
+            );
+            // The scan target agrees with the key on every path.
+            assert_eq!(maven_scan_target(path).is_some(), scannable, "{path}");
+            if let Some(target) = maven_scan_target(path) {
+                assert_eq!(target.path, key, "{path}");
+            }
+        }
+    }
+
+    /// #4365 item 6: the curated package AND version come from the
+    /// cache-normalized path, so a trailing or doubled `/` names the same
+    /// curation target as the canonical spelling.
+    #[test]
+    fn curation_target_uses_the_cache_normalized_path() {
+        let expected = Some(("com.acme:widget".to_string(), Some("1.0".to_string())));
+        for path in [
+            "com/acme/widget/1.0/widget-1.0.jar",
+            "com/acme/widget/1.0/widget-1.0.jar/",
+            "/com/acme/widget/1.0/widget-1.0.jar//",
+        ] {
+            assert_eq!(maven_curation_target(path), expected, "{path}");
+        }
+        assert_eq!(
+            maven_curation_target("com/acme/widget/1.0/widget-1.0.jar.sha1/"),
+            None
+        );
+        assert_eq!(
+            maven_curation_target("com/acme/widget/maven-metadata.xml"),
+            None
+        );
+    }
+}
+
+/// #4365 item 5 at the route: an unreadable scan-on-proxy config is a 503 on
+/// the direct Remote route and on the Virtual walk, before any upstream
+/// request (it used to stream the Remote pull unscanned).
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod unreadable_config_route_4365_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const JAR: &str = "com/acme/widget/1.0/widget-1.0.jar";
+
+    async fn upstream() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"jar".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn hits(server: &wiremock::MockServer) -> usize {
+        server.received_requests().await.expect("recording").len()
+    }
+
+    #[tokio::test]
+    async fn unreadable_config_is_503_on_remote_and_virtual_routes() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let Some((faulty, schema)) = tdh::pool_with_unreadable_scan_configs().await else {
+            fx.teardown().await;
+            return;
+        };
+        let server = upstream().await;
+        sqlx::query("UPDATE repositories SET upstream_url = $2, is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .bind(server.uri())
+            .execute(&fx.pool)
+            .await
+            .expect("point at upstream");
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let dir = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_state_with_proxy(
+            faulty.clone(),
+            &dir,
+            tdh::build_proxy_service_with_fs(faulty.clone(), &dir),
+        );
+        let (remote_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{}/{JAR}", fx.repo_key)),
+        )
+        .await;
+        let remote_hits = hits(&server).await;
+
+        // A Virtual over the same (scanning) Remote member.
+        let Some(vfx) = tdh::Fixture::setup("virtual", "maven").await else {
+            tdh::drop_unreadable_scan_configs(&fx.pool, &schema).await;
+            fx.teardown().await;
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(vfx.repo_id)
+            .execute(&vfx.pool)
+            .await
+            .expect("public virtual");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(vfx.repo_id)
+        .bind(fx.repo_id)
+        .execute(&vfx.pool)
+        .await
+        .expect("attach member");
+        let (virtual_status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}/{JAR}", vfx.repo_key)),
+        )
+        .await;
+        let virtual_hits = hits(&server).await;
+
+        tdh::drop_unreadable_scan_configs(&fx.pool, &schema).await;
+        faulty.close().await;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(vfx.repo_id)
+            .execute(&vfx.pool)
+            .await;
+        vfx.teardown().await;
+        fx.teardown().await;
+
+        assert_eq!(
+            remote_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "direct Remote"
+        );
+        assert_eq!(
+            virtual_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Virtual walk"
+        );
+        assert_eq!(remote_hits, 0, "refused before any upstream request");
+        assert_eq!(virtual_hits, 0, "refused before any upstream request");
     }
 }

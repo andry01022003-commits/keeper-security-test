@@ -42,6 +42,7 @@ use crate::services::audit_service::{
 };
 use crate::services::cache_classifier;
 use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
+use crate::services::conda_allowlist;
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, DisplayStorageUsage,
@@ -313,10 +314,9 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
 ///   `require_repo_access`. So a token scoped to some unrelated repository can
 ///   reach a PUBLIC virtual, and the grant-half aggregate then hands it a byte
 ///   total for private members it is scoped away from and whose own `GET`
-///   correctly 404s. Nor is read-through the right premise:
-///   `proxy_helpers::caller_can_read_member` gates the by-path download on
-///   `can_access_repo(member.id)` with no parent term anywhere, so such a
-///   token is DENIED those members' bytes.
+///   correctly 404s. The parent term #4559 added does not supply it either:
+///   it asks whether the VIRTUAL is in the token's scope, and for a token
+///   scoped to some unrelated repository it is not.
 ///
 /// [`MemberVisibility`] therefore carries the whole principal, and
 /// [`build_member_visibility_clause`] renders the predicate above verbatim.
@@ -326,10 +326,11 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
 /// predicate, applied row-wise because that path has the rows in hand. The
 /// aggregate sums its rows inside the database, so it renders one clause.
 ///
-/// The consequence #3173 accepts deliberately holds here too: a token scoped
-/// only to a virtual sees 0 bytes for members it does not carry. That is
-/// consistent with the download, which also refuses. Scope tokens to the
-/// members, or to both.
+/// The storage aggregate applies the #4559 parent term too: a token whose
+/// scope names the virtual counts the members its owner may read, matching
+/// the listing and the download through the same virtual. The aggregate
+/// renders it with `build_member_visibility_clause_through`, keyed on the
+/// virtual being summed; this value carries the principal unchanged.
 pub(crate) fn member_read_visibility(auth: Option<&AuthExtension>) -> MemberVisibility {
     match auth {
         None => MemberVisibility::Anonymous,
@@ -375,125 +376,80 @@ pub(crate) fn member_grant_visibility(auth: Option<&AuthExtension>) -> RepoVisib
 /// The SCOPE half, applied per member row.
 ///
 /// A public member bypasses scope entirely, matching `require_visible`'s early
-/// return. Otherwise the member must itself be in the token's scope.
+/// return. Otherwise the member passes when it is itself in the token's scope,
+/// OR when `routed_virtual_id` is (#4559).
 ///
-/// An earlier revision also passed when the PARENT virtual was in scope,
-/// arguing that the by-path download already read through. That premise was
-/// wrong: `proxy_helpers::caller_can_read_member` gates on
-/// `can_access_repo(member.id)` and has no parent term anywhere, so a token
-/// scoped to a virtual but not to a member is DENIED that member's bytes.
-/// Read-through would have created the inconsistency it claimed to remove,
-/// reversed — and widened enumeration past `require_visible`, letting a token
-/// list artifact names, versions and sizes for a member it is scoped away
-/// from. Strict scoping is what agrees with both.
+/// # The parent term (#4559)
 ///
-/// Consequence, accepted deliberately: a token scoped only to a virtual sees
-/// an empty listing. That is consistent with the download, which also refuses.
-/// Scope tokens to the members, to both, or with a selector carrying
-/// `include_virtual_members` (#4130). The listing says so rather than
-/// answering an unexplained empty page — see
-/// [`members_hidden_by_token_scope`].
+/// `routed_virtual_id` is the virtual repository the REQUEST was routed
+/// through (`/<format>/V/...`, `GET /api/v1/repositories/V/...`, the
+/// `/t/<token>/` forms of either), whose own read was already authorized for
+/// this caller, token scope included, before any member was resolved. Every
+/// caller passes exactly that id; never pass a virtual the request did not
+/// name, and pass the member's own id when there is no parent (as
+/// `last_promotion` does), which reduces the term to the member term.
+///
+/// A token minted on a virtual (a repository token, or a user token whose
+/// `repo_selector` names it) therefore reads the virtual's members THROUGH the
+/// virtual, without its scope naming them. What it does not get:
+///
+/// * the member's own URL. The term is evaluated only here, where the parent
+///   is the routed repository; `repo_visibility_middleware` and
+///   `require_visible` gate a direct request on `can_access_repo(member)`
+///   exactly as before, so a consumer token on `conda-virtual` still cannot
+///   read `conda-forge` directly (the allowlist bypass noted in #4583).
+/// * anything its owner cannot read. This is the SCOPE half only; the GRANT
+///   half ([`member_grant_visibility`] in SQL) and, on content paths, the
+///   read-action gate in `proxy_helpers::try_authorize_virtual_members` still
+///   apply to the member with the token owner's identity. A member the owner
+///   holds no grant on stays out of the listing and out of the walk.
+/// * writes. Deploy-target resolution through a virtual
+///   (`proxy_helpers::resolve_virtual_deploy_target`) checks
+///   `can_access_repo(member)` directly and is unchanged.
+///
+/// The listing paths (this function, per row) and the content paths
+/// (`proxy_helpers::try_authorize_virtual_members`, which calls this function
+/// with the same routed id) share the term, so what a token lists through a
+/// virtual and what it can fetch through it cannot drift. The storage
+/// aggregate renders the same term in SQL
+/// (`build_member_visibility_clause_through`). Nested virtuals are expanded
+/// into their leaves before this runs and every leaf is checked against the
+/// ROOT the request was routed through, so the term reaches nested members
+/// transitively; an intermediate virtual's own scope is not consulted, as its
+/// own ACL never was.
+///
+/// Before #4559 the parent id was ignored and a token scoped only to a virtual
+/// saw an empty listing and an empty walk; scoping a token to the members, or
+/// to both, still works and is no longer required.
 pub(crate) fn member_passes_token_scope(
     auth: Option<&AuthExtension>,
-    parent_repo_id: Uuid,
+    routed_virtual_id: Uuid,
     member_id: Uuid,
     member_visibility: crate::models::repository::RepositoryVisibility,
 ) -> bool {
-    let _ = parent_repo_id;
     // `internal` behaves as `private` here, deliberately. The escape hatch this
     // helper grants past the token scope exists only because an ANONYMOUS
     // caller is served a public member anyway, so a scoped credential must not
     // be worse off than none (#3704). An internal member gives an anonymous
     // caller nothing, so there is no such baseline and the scope stays a
     // ceiling -- which is also what the spec requires: a repository-scoped
-    // token whose allowed set excludes an internal repository is refused.
+    // token whose allowed set excludes an internal repository is refused,
+    // unless it reaches that repository as a member of a virtual its scope
+    // names (#4559).
     match auth {
         None => member_visibility.allows_anonymous_read(),
-        Some(a) => member_visibility.allows_anonymous_read() || a.can_access_repo(member_id),
+        Some(a) => {
+            member_visibility.allows_anonymous_read()
+                || a.can_access_repo(member_id)
+                || a.can_access_repo(routed_virtual_id)
+        }
     }
 }
 
-/// How many of `repo`'s members this caller is ENTITLED to read but its token
-/// is not scoped to (#4130).
-///
-/// The two halves of the member predicate are counted separately on purpose.
-/// Only members that pass the GRANT half and fail the SCOPE half are counted,
-/// so the number describes the caller's own token against the caller's own
-/// entitlements — facts it can already establish by presenting a
-/// differently-scoped credential of its own. A member the caller has no grant
-/// for is never counted and never mentioned, so this reveals nothing that
-/// `require_visible` would not.
-///
-/// `0` for anything that is not a virtual repository read by a repo-scoped
-/// token, which is the only case that can produce the silent empty page.
-pub(crate) async fn members_hidden_by_token_scope(
-    db: &sqlx::PgPool,
-    auth: Option<&AuthExtension>,
-    repo: &crate::models::repository::Repository,
-) -> usize {
-    if repo.repo_type != RepositoryType::Virtual {
-        return 0;
-    }
-    // Only a scope-restricted credential can lose members this way; a browser
-    // session and an unscoped token both grant every repository.
-    if !auth.is_some_and(|a| matches!(a.access_scope(), AccessScope::Restricted(_))) {
-        return 0;
-    }
-    let Ok(members) = proxy_helpers::fetch_virtual_members(db, repo.id).await else {
-        return 0;
-    };
-    let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
-    let repo_service = RepositoryService::new(db.clone());
-    let Ok(granted) = repo_service
-        .filter_visible_repo_ids(&member_ids, &member_grant_visibility(auth))
-        .await
-    else {
-        return 0;
-    };
-    let granted: std::collections::HashSet<Uuid> = granted.into_iter().collect();
-    members
-        .iter()
-        .filter(|m| {
-            granted.contains(&m.id) && !member_passes_token_scope(auth, repo.id, m.id, m.visibility)
-        })
-        .count()
-}
-
-/// The #4130 notices for a repository, empty unless token scope dropped
-/// members this caller is entitled to.
-pub(crate) async fn member_scope_notices(
-    db: &sqlx::PgPool,
-    auth: Option<&AuthExtension>,
-    repo: &crate::models::repository::Repository,
-) -> Vec<crate::api::dto::ListNotice> {
-    let hidden = members_hidden_by_token_scope(db, auth, repo).await;
-    match hidden {
-        0 => Vec::new(),
-        n => vec![crate::api::dto::ListNotice::members_out_of_token_scope(n)],
-    }
-}
-
-/// Attach the #4130 notice to an artifact listing when token scope dropped
-/// members the caller is entitled to. Applied to the grouped `list_artifacts`
-/// returns; the flat branch calls [`member_scope_notices`] directly.
-async fn with_member_scope_notice(
-    result: Result<Json<ArtifactListResponse>>,
-    db: &sqlx::PgPool,
-    auth: Option<&AuthExtension>,
-    repo: &crate::models::repository::Repository,
-) -> Result<Json<ArtifactListResponse>> {
-    let mut response = result?;
-    let hidden = members_hidden_by_token_scope(db, auth, repo).await;
-    if hidden > 0 {
-        response
-            .0
-            .notices
-            .push(crate::api::dto::ListNotice::members_out_of_token_scope(
-                hidden,
-            ));
-    }
-    Ok(response)
-}
+/// The 404 message for a repository that does not exist, and for one the
+/// caller may not read (#4498). The two must be indistinguishable, so this is
+/// exactly what `RepositoryService::get_by_key` answers for a missing key.
+pub(crate) const REPOSITORY_NOT_FOUND: &str = "Repository not found";
 
 /// Ensure a repository is READABLE by the current user.
 ///
@@ -504,7 +460,8 @@ async fn with_member_scope_notice(
 /// repository-scoped API tokens.
 ///
 /// Denials on private repos return `NotFound` (not `Forbidden`) to avoid
-/// leaking the existence of repositories the caller may not see.
+/// leaking the existence of repositories the caller may not see, with the
+/// same message a missing key gets ([`REPOSITORY_NOT_FOUND`], #4498).
 ///
 /// # Why the action is `read` and is fixed here (#3331)
 ///
@@ -550,7 +507,11 @@ pub(crate) async fn require_visible(
     if repo.visibility.allows_anonymous_read() {
         return Ok(());
     }
-    let not_found = || AppError::NotFound(format!("Repository '{}' not found", repo.key));
+    // #4498: the SAME body `RepositoryService::get_by_key` answers for a key
+    // that names no repository. Naming the key here made the two 404s
+    // distinguishable, so a caller who may not read a repository could still
+    // learn that it exists.
+    let not_found = || AppError::NotFound(REPOSITORY_NOT_FOUND.to_string());
     match auth {
         Some(a) => {
             // Repository-scoped API tokens must still allow this repo.
@@ -905,6 +866,13 @@ pub fn router() -> Router<SharedState> {
                 .put(set_upstream_filter)
                 .delete(delete_upstream_filter),
         )
+        // Package allowlist on a virtual conda channel (#4576)
+        .route(
+            "/:key/allowlist",
+            get(get_conda_allowlist)
+                .put(set_conda_allowlist)
+                .delete(delete_conda_allowlist),
+        )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
         // Per-repository outbound egress proxy (#2469, #2811)
@@ -1208,6 +1176,17 @@ pub struct UpdateRepositoryRequest {
     pub key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Replace the repository's upstream URL (#4467), e.g. to rotate
+    /// credentials embedded as userinfo or to repoint a Remote. Validated
+    /// exactly like `upstream_url` on create (anti-SSRF, scheme/host and the
+    /// per-format checks). The response redacts userinfo and reports
+    /// `upstream_url_has_credentials`. Moving to a different origin
+    /// (scheme, host or port) while upstream-auth credentials are configured
+    /// is refused (409): remove them first, so they are never sent to a host
+    /// they were not configured for. Rotating embedded credentials keeps the
+    /// age gate's first-seen times and approvals; a host or path change starts
+    /// them afresh. Omit to leave the URL unchanged.
+    pub upstream_url: Option<String>,
     /// Baseline read audience: `public`, `internal`, or `private`.
     ///
     /// This is the authoritative field. `is_public` and its alias
@@ -1258,6 +1237,14 @@ pub struct UpdateRepositoryRequest {
     /// Only valid for remote repositories. Pass an empty string to remove.
     /// Max 256 characters. Stored in `repository_config` under `custom_user_agent`.
     pub custom_user_agent: Option<String>,
+    /// Virtual repositories only: when a member's metadata cannot be fetched
+    /// or parsed, serve the merge of the members that succeeded (marked with
+    /// `X-AK-Partial-Members` and `Cache-Control: no-store`) instead of
+    /// failing with 502. Defaults to `false` (strict). Honoured by every
+    /// virtual metadata merge: conda channels and the merged indexes of Helm,
+    /// CRAN, Hex and Bazel virtuals (#4192). Stored in `repository_config`
+    /// under `virtual_metadata_partial`.
+    pub virtual_metadata_partial: Option<bool>,
     /// Assign this repository to a project (#2472). P1 is set-only: omitting
     /// the field leaves the assignment unchanged (unassignment ships with the
     /// project-admin surface in P2).
@@ -1561,6 +1548,32 @@ async fn with_repodata_depth(
     response.repodata_depth = depth;
     response.repodata_depth_editable = editable;
     Ok(response)
+}
+
+/// The audit record of a PATCH's `upstream_url` change (#4467): both URLs with
+/// userinfo stripped, and whether the embedded credentials changed. `None`
+/// when the request did not change the URL.
+fn upstream_change_audit(
+    previous: Option<&str>,
+    requested: Option<&str>,
+) -> Option<audit_details::UpstreamChangeAudit> {
+    let requested = requested?;
+    if previous == Some(requested) {
+        return None;
+    }
+    let strip = |url: &str| crate::services::proxy_service::strip_url_userinfo(url).0;
+    Some(audit_details::UpstreamChangeAudit {
+        previous_upstream_url: previous.map(strip),
+        upstream_url: Some(strip(requested)),
+        credentials_changed: previous.and_then(url_userinfo) != url_userinfo(requested),
+    })
+}
+
+/// The `userinfo` of a `scheme://userinfo@host/...` URL, if any.
+fn url_userinfo(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    authority.rsplit_once('@').map(|(userinfo, _)| userinfo)
 }
 
 /// Render a stored `upstream_url` for an API response (#4452): the URL with
@@ -3268,9 +3281,10 @@ pub async fn list_repositories(
             // every listing request — the live SUM's cost scales with total
             // artifact count, not page size. The ledger is byte-for-byte
             // equivalent to that SUM: 182's row-level AFTER triggers charge
-            // `hosted_bytes` under the identical predicate the old query used
+            // `hosted_bytes` under the identical predicate the live SUM uses
             // (`is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`,
-            // the #2218 rules), `proxy_bytes`/`oci_bytes` count their tables
+            // the #2218 rules, and `NOT LIKE 'oci-manifests/%'` since #4483,
+            // migration 288), `proxy_bytes`/`oci_bytes` count their tables
             // whole, and the `pending_delete_at` mark-and-sweep marker is a
             // deliberate zero-delta no-op. `RepositoryService::get_storage_usage`
             // stays the live-SUM oracle (reconciler / quota fallback).
@@ -3874,6 +3888,7 @@ pub async fn create_repository(
                 scan_config: None,
                 previous_scan_config: None,
                 scan_config_changed: None,
+                upstream_change: None,
             }),
     )
     .await;
@@ -3881,9 +3896,23 @@ pub async fn create_repository(
     let repo_id = repo.id;
     let repo_type_out = repo.repo_type.clone();
     let repo_format_out = repo.format.clone();
-    // A new repository stores nothing yet; a new virtual reports a member
-    // figure of 0 like every other virtual response (#4423).
-    let mut response = repo_to_display_response(repo, new_repository_storage(&repo_type_out));
+    // A new repository stores nothing of its own yet. A new virtual created
+    // with members that already hold content reports their total, scoped to
+    // the members the caller can see, exactly as the next GET does (#4505);
+    // without members it reports 0 like every other virtual (#4423).
+    let created_with_members = repo_type_out == RepositoryType::Virtual
+        && payload
+            .member_repos
+            .as_deref()
+            .is_some_and(|members| !members.is_empty());
+    let storage = if created_with_members {
+        service
+            .get_display_storage_usage(&repo, &member_read_visibility(Some(&auth)))
+            .await?
+    } else {
+        new_repository_storage(&repo_type_out)
+    };
+    let mut response = repo_to_display_response(repo, storage);
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -4454,7 +4483,7 @@ pub async fn get_repository_storage_tree(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id"),
         (status = 404, description = "Repository not found"),
-        (status = 409, description = "Repository key conflict, nonempty repository depth change, or concurrent layout change"),
+        (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
 )]
@@ -4586,6 +4615,18 @@ pub async fn update_repository(
         &existing.repo_type,
         payload.oci_trusted_bearer_realms.as_deref(),
     )?;
+    // #4467: an upstream URL change is applied. The service validates it like
+    // create does and refuses (409) an origin change while upstream-auth
+    // credentials are configured. Age-gate state still keyed by the old URL's
+    // pre-#4467 fingerprint moves first, so a credential rotation keeps it.
+    if payload.upstream_url.is_some() {
+        crate::services::age_gate_service::rekey_legacy_fingerprint(
+            &state.db,
+            existing.id,
+            existing.upstream_url.as_deref(),
+        )
+        .await?;
+    }
 
     let repo = service
         .update_with_repodata_depth(
@@ -4597,7 +4638,7 @@ pub async fn update_repository(
                 visibility: effective_visibility,
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
-                upstream_url: None,
+                upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
                 // P1 set-only (#2472): a present field maps to Some(Some(id));
@@ -4675,6 +4716,21 @@ pub async fn update_repository(
             repo.id,
             "quarantine_enabled",
             if enabled { "true" } else { "false" },
+        )
+        .await?;
+    }
+
+    if let Some(allow) = payload.virtual_metadata_partial {
+        if repo.repo_type != RepositoryType::Virtual {
+            return Err(AppError::Validation(
+                "virtual_metadata_partial is only valid for virtual repositories".to_string(),
+            ));
+        }
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "virtual_metadata_partial",
+            if allow { "true" } else { "false" },
         )
         .await?;
     }
@@ -4922,6 +4978,10 @@ pub async fn update_repository(
                 scan_config: None,
                 previous_scan_config: None,
                 scan_config_changed: None,
+                upstream_change: upstream_change_audit(
+                    existing.upstream_url.as_deref(),
+                    payload.upstream_url.as_deref(),
+                ),
             }),
     )
     .await;
@@ -5639,6 +5699,7 @@ pub async fn delete_repository(
                 scan_config: None,
                 previous_scan_config: None,
                 scan_config_changed: None,
+                upstream_change: None,
             }),
     )
     .await;
@@ -5820,9 +5881,6 @@ pub struct ArtifactResponse {
 pub struct ArtifactListResponse {
     pub items: Vec<ArtifactResponse>,
     pub pagination: Pagination,
-    /// Non-fatal remarks about this page (#4130). Omitted when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notices: Vec<crate::api::dto::ListNotice>,
     /// Maven component grouping.  Only present when `group_by=maven_component`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<MavenComponentResponse>>,
@@ -5979,24 +6037,18 @@ pub async fn list_artifacts(
     let count_exact = query.count.as_deref() == Some("exact");
 
     if want_component_grouping {
-        return with_member_scope_notice(
-            list_artifacts_grouped_by_maven_component(
-                &artifact_service,
-                &state,
-                &repo,
-                &key,
-                query.path_prefix.as_deref(),
-                query.q.as_deref(),
-                query.cursor.as_deref(),
-                count_exact,
-                page,
-                per_page,
-                auth.as_ref(),
-            )
-            .await,
-            &state.db,
-            auth.as_ref(),
+        return list_artifacts_grouped_by_maven_component(
+            &artifact_service,
+            &state,
             &repo,
+            &key,
+            query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            query.cursor.as_deref(),
+            count_exact,
+            page,
+            per_page,
+            auth.as_ref(),
         )
         .await;
     }
@@ -6012,22 +6064,16 @@ pub async fn list_artifacts(
     let want_docker_grouping = query.group_by.as_deref() == Some("docker_tag") && is_docker_format;
 
     if want_docker_grouping {
-        return with_member_scope_notice(
-            list_artifacts_grouped_by_docker_tag(
-                &state,
-                &repo,
-                &key,
-                query.q.as_deref(),
-                query.cursor.as_deref(),
-                count_exact,
-                page,
-                per_page,
-                auth.as_ref(),
-            )
-            .await,
-            &state.db,
-            auth.as_ref(),
+        return list_artifacts_grouped_by_docker_tag(
+            &state,
             &repo,
+            &key,
+            query.q.as_deref(),
+            query.cursor.as_deref(),
+            count_exact,
+            page,
+            per_page,
+            auth.as_ref(),
         )
         .await;
     }
@@ -6228,7 +6274,6 @@ pub async fn list_artifacts(
     );
 
     Ok(Json(ArtifactListResponse {
-        notices: member_scope_notices(&state.db, auth.as_ref(), &repo).await,
         items,
         pagination: Pagination {
             page,
@@ -6300,11 +6345,14 @@ async fn list_remote_cached_artifacts(
     // longer pre-excluded from the count — an acceptable approximation in
     // exchange for O(page) reads.
     let proxy = state.proxy_service.as_deref();
-    let paths = match proxy {
+    let mut paths = match proxy {
         Some(proxy) => proxy.list_cached_paths(&repo.key).await,
         // No proxy service configured (e.g. proxying disabled): nothing cached.
         None => Vec::new(),
     };
+    // Cached npm packuments are metadata, not packages (#4305); index pages
+    // are dropped inside `filter_and_paginate_paths` for every format.
+    paths.retain(|p| !crate::services::proxy_catalog::is_cached_metadata_path(&repo.format, p));
 
     let (page_paths, total) = filter_and_paginate_paths(paths, path_prefix, q, page, per_page);
     let total_pages = cached_total_pages(total, per_page);
@@ -6327,7 +6375,6 @@ async fn list_remote_cached_artifacts(
         .collect();
 
     Ok(Json(ArtifactListResponse {
-        notices: Vec::new(),
         items,
         pagination: Pagination {
             page,
@@ -6391,6 +6438,7 @@ async fn list_remote_cached_from_catalog(
     let mut rows = proxy_catalog::browse_page(
         &state.db,
         repo.id,
+        &repo.format,
         prefix_like.as_deref(),
         q_like.as_deref(),
         after_path,
@@ -6411,6 +6459,7 @@ async fn list_remote_cached_from_catalog(
             proxy_catalog::browse_count(
                 &state.db,
                 repo.id,
+                &repo.format,
                 prefix_like.as_deref(),
                 q_like.as_deref(),
             )
@@ -6441,7 +6490,6 @@ async fn list_remote_cached_from_catalog(
         .collect();
 
     Ok(Json(ArtifactListResponse {
-        notices: Vec::new(),
         items,
         pagination: Pagination {
             page,
@@ -7201,7 +7249,6 @@ async fn list_artifacts_grouped_by_maven_component(
         };
         let total = grouped_listing_total(exact_total, offset, components.len(), has_more);
         return Ok(Json(ArtifactListResponse {
-            notices: Vec::new(),
             items: Vec::new(),
             pagination: Pagination {
                 page,
@@ -7303,7 +7350,6 @@ async fn list_artifacts_grouped_by_maven_component(
     .await?;
 
     Ok(Json(ArtifactListResponse {
-        notices: Vec::new(),
         items: Vec::new(),
         pagination: Pagination {
             page,
@@ -8066,7 +8112,6 @@ async fn list_artifacts_grouped_by_docker_tag(
     let total = grouped_listing_total(exact_total, offset, docker_tags.len(), has_more);
 
     Ok(Json(ArtifactListResponse {
-        notices: Vec::new(),
         items: Vec::new(),
         pagination: Pagination {
             page,
@@ -8710,6 +8755,7 @@ pub async fn get_artifact_metadata(
             members,
             proxy_for_virtual,
             &path,
+            Some(&dl_ctx),
             move |member_id, location| {
                 let db = db.clone();
                 let state = state_clone.clone();
@@ -8729,8 +8775,8 @@ pub async fn get_artifact_metadata(
         // a real download — so it must reach the #2365 recorder. When the
         // shadowing guard proved a non-Remote member owns the exact path, the
         // served body is that local member's artifact (Remote members were
-        // suppressed); attribute the download to its row. Remote pass-through
-        // resolves no local `artifacts` row and stays unrecorded (#1278).
+        // suppressed); attribute the download to its row. A Remote member's
+        // winning serve is counted by the resolver itself (#3844).
         if owns_locally {
             if let Some(artifact_id) =
                 proxy_helpers::virtual_local_winner_artifact_id(&state.db, repo.id, &path).await
@@ -10076,7 +10122,7 @@ fn generic_route_proxy_serve(scan_on_proxy: &Result<bool>) -> GenericRouteProxyS
 /// formats `GET /api/v1/formats` reports as `scan_on_proxy: "enforced"`, so a
 /// format that adopts the gate closes this route in the same change.
 fn generic_route_checks_scan_on_proxy(format: &RepositoryFormat) -> bool {
-    crate::formats::handler_enforces_scan_on_proxy(format.handler_key())
+    crate::formats::format_enforces_scan_on_proxy(format)
 }
 
 /// The #4442 refusal for `path`, logged so an operator can see clients using
@@ -10443,6 +10489,11 @@ pub async fn download_artifact(
                 {
                     return Ok(refusal);
                 }
+                // #4365 item 3: the client's path is joined into the upstream
+                // URL and keys the proxy cache, so a `?`, `#`, `;`, `\` or a
+                // stray `%` in it is refused (spaces are legitimate file names
+                // here and are left to URL encoding).
+                crate::services::proxy_service::reject_ambiguous_client_path(&path, true)?;
                 let rules = load_routing_rules(&state.db, repo.id).await;
                 let rewritten = routing_rules::apply_routing_rules(&path, &rules);
                 let fetch_path = rewritten.clone().unwrap_or_else(|| path.clone());
@@ -10557,6 +10608,7 @@ pub async fn download_artifact(
                 members,
                 proxy_for_virtual,
                 &path,
+                Some(&dl_ctx),
                 |member_id, location| {
                     let db = db.clone();
                     let state = state.clone();
@@ -10576,8 +10628,8 @@ pub async fn download_artifact(
             // response streams a member's BYTES, a real download. When the
             // shadowing guard proved a non-Remote member owns the exact path
             // (Remote members were suppressed), attribute the download to
-            // that local member's artifact row. Remote pass-through resolves
-            // no local `artifacts` row and stays unrecorded (#1278). No
+            // that local member's artifact row. A Remote member's winning
+            // serve is counted by the resolver itself (#3844). No
             // double-count: the direct-row path records in `download_stream`
             // and cannot reach this arm.
             if owns_locally && !is_head {
@@ -12143,6 +12195,240 @@ pub async fn delete_upstream_filter(
     )))
 }
 
+// ---------------------------------------------------------------------------
+// Conda virtual channel allowlist (#4576)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CondaAllowlistResponse {
+    pub repository_key: String,
+    /// Whether the list is enforced. `false` when none is configured. A
+    /// stored list that can no longer be read is enforced as admit-nothing,
+    /// so it reports `true` with `error` set and no entries.
+    pub enabled: bool,
+    /// The admitted packages.
+    pub entries: Vec<conda_allowlist::AllowlistEntry>,
+    /// `entries.len()`.
+    pub entry_count: usize,
+    /// Set when the stored list is unusable (only possible after a direct
+    /// database edit): nothing from remote members is admitted until a valid
+    /// list is saved or the list is deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CondaAllowlistResponse {
+    fn new(repository_key: String, stored: conda_allowlist::StoredAllowlist) -> Self {
+        use conda_allowlist::StoredAllowlist as Stored;
+        let (enabled, entries, error) = match stored {
+            Stored::None => (false, Vec::new(), None),
+            Stored::Valid(list) => (list.enabled, list.entries, None),
+            Stored::Unusable(err) => (true, Vec::new(), Some(err)),
+        };
+        Self {
+            repository_key,
+            enabled,
+            entry_count: entries.len(),
+            entries,
+            error,
+        }
+    }
+}
+
+/// Resolve `key` to a virtual conda repository the caller administers. The
+/// allowlist is a supply-chain control like the upstream filter, so reading
+/// and changing it both require the repository `admin` action.
+async fn conda_allowlist_repo(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+    write: bool,
+) -> Result<(AuthExtension, crate::models::repository::Repository)> {
+    use crate::models::repository::RepositoryFormat;
+    let auth = require_auth(auth)?;
+    auth.require_scope(if write {
+        "write:repositories"
+    } else {
+        "read:repositories"
+    })?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(key).await?;
+    require_repo_access(&auth, repo.id)?;
+    if repo.repo_type != RepositoryType::Virtual
+        || !matches!(
+            repo.format,
+            RepositoryFormat::Conda | RepositoryFormat::CondaNative
+        )
+    {
+        return Err(AppError::Validation(
+            "The allowlist is only available on virtual conda repositories".to_string(),
+        ));
+    }
+    if write {
+        require_repo_write_access(&auth, &repo, &repo_service).await?;
+    }
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    Ok((auth, repo))
+}
+
+/// Audit a change to the allowlist (best-effort).
+async fn audit_conda_allowlist_change(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    previous: &conda_allowlist::StoredAllowlist,
+    current: Option<&conda_allowlist::CondaAllowlist>,
+) {
+    use conda_allowlist::StoredAllowlist as Stored;
+    let previous = match previous {
+        Stored::None => serde_json::Value::Null,
+        Stored::Valid(list) => serde_json::json!({
+            "enabled": list.enabled,
+            "entry_count": list.entries.len(),
+        }),
+        Stored::Unusable(_) => serde_json::json!({ "unusable": true }),
+    };
+    let current = current.map_or(serde_json::Value::Null, |list| {
+        serde_json::json!({
+            "enabled": list.enabled,
+            "entry_count": list.entries.len(),
+        })
+    });
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(
+            AuditAction::RepositoryAllowlistChanged,
+            ResourceType::Repository,
+        )
+        .user(auth.user_id)
+        .resource(repo.id)
+        .actor_name(auth.username.clone())
+        .resource_name(repo.key.clone())
+        .details(serde_json::json!({
+            "repository": repo.key,
+            "previous": previous,
+            "current": current,
+        })),
+    )
+    .await;
+}
+
+/// Get the package allowlist of a virtual conda repository
+#[utoipa::path(
+    get,
+    path = "/{key}/allowlist",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current allowlist", body = CondaAllowlistResponse),
+        (status = 400, description = "Repository is not a virtual conda repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_conda_allowlist(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<CondaAllowlistResponse>> {
+    let (_, repo) = conda_allowlist_repo(&state, auth, &key, false).await?;
+    let stored = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    Ok(Json(CondaAllowlistResponse::new(key, stored)))
+}
+
+/// Set the package allowlist of a virtual conda repository
+///
+/// Restricts what the virtual's REMOTE members contribute. When `enabled`,
+/// a remote package record is listed in the virtual's `repodata.json` (every
+/// encoding) only if some entry admits it, `channeldata.json` keeps only
+/// admitted names, and a download through the virtual of a package the list
+/// does not admit is never served from a remote member (404, as the index
+/// implies). Hosted (local/staging) members are not filtered.
+///
+/// An entry is `{"name": ..., "version": ..., "subdirs": [...]}`: `name` is an
+/// exact conda package name or a glob (`*`, `?`), case-insensitive; `version`
+/// is an optional conda version spec evaluated with conda ordering (`2.2.3`
+/// is exact, `2.2.*`, `>=2,<3`, `1.0|1.1`); a version that does not parse is
+/// not admitted by a constrained entry. `subdirs` optionally restricts the
+/// entry to platforms. A package is admitted when any entry admits it.
+///
+/// `enabled` is required: an enabled empty list admits nothing from remotes;
+/// `enabled: false` keeps the entries but restores the unfiltered merge.
+/// Limits: 10,000 entries, names up to 128 bytes, version specs up to 256
+/// bytes, 32 subdirs per entry. Changes apply to the next request.
+#[utoipa::path(
+    put,
+    path = "/{key}/allowlist",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = conda_allowlist::CondaAllowlist,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Allowlist saved", body = CondaAllowlistResponse),
+        (status = 400, description = "Invalid entry, too many entries, or not a virtual conda repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_conda_allowlist(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<conda_allowlist::CondaAllowlist>,
+) -> Result<Json<CondaAllowlistResponse>> {
+    let (auth, repo) = conda_allowlist_repo(&state, auth, &key, true).await?;
+    let previous = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    conda_allowlist::save_allowlist(&state.db, repo.id, &payload).await?;
+    audit_conda_allowlist_change(&state, &auth, &repo, &previous, Some(&payload)).await;
+    Ok(Json(CondaAllowlistResponse::new(
+        key,
+        conda_allowlist::StoredAllowlist::Valid(payload),
+    )))
+}
+
+/// Remove the package allowlist of a virtual conda repository
+#[utoipa::path(
+    delete,
+    path = "/{key}/allowlist",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Allowlist removed", body = CondaAllowlistResponse),
+        (status = 400, description = "Repository is not a virtual conda repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_conda_allowlist(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<CondaAllowlistResponse>> {
+    let (auth, repo) = conda_allowlist_repo(&state, auth, &key, true).await?;
+    let previous = conda_allowlist::load_allowlist(&state.db, repo.id).await?;
+    if conda_allowlist::delete_allowlist(&state.db, repo.id).await? {
+        audit_conda_allowlist_change(&state, &auth, &repo, &previous, None).await;
+    }
+    Ok(Json(CondaAllowlistResponse::new(
+        key,
+        conda_allowlist::StoredAllowlist::None,
+    )))
+}
+
 /// Load routing rules from repository_config for a given repository ID.
 /// Returns an empty Vec if no rules are configured.
 async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule> {
@@ -12198,6 +12484,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_upstream_filter,
         set_upstream_filter,
         delete_upstream_filter,
+        get_conda_allowlist,
+        set_conda_allowlist,
+        delete_conda_allowlist,
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
@@ -12245,6 +12534,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RoutingRule,
         UpstreamFilter,
         UpstreamFilterResponse,
+        conda_allowlist::CondaAllowlist,
+        conda_allowlist::AllowlistEntry,
+        CondaAllowlistResponse,
         DebianRepositoryConfig,
         DebianConfigPatch,
         crate::formats::debian::DebianMetadataStrategy,
@@ -13844,7 +14136,6 @@ mod tests {
     #[test]
     fn artifact_list_response_serializes_keyset_fields_when_present() {
         let resp = ArtifactListResponse {
-            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -15756,7 +16047,6 @@ mod tests {
     #[test]
     fn test_artifact_list_response_without_components() {
         let resp = ArtifactListResponse {
-            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -15791,7 +16081,6 @@ mod tests {
             last_promotion: None,
         };
         let resp = ArtifactListResponse {
-            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -15825,7 +16114,6 @@ mod tests {
             last_promotion: None,
         };
         let resp = ArtifactListResponse {
-            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -20976,7 +21264,8 @@ mod tests {
         let result = require_visible(&repo, &None, &svc).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
+            // #4498: the same body a missing key gets, not the key.
+            AppError::NotFound(msg) => assert_eq!(msg, REPOSITORY_NOT_FOUND),
             other => panic!("Expected NotFound error, got: {:?}", other),
         }
     }
@@ -20992,7 +21281,8 @@ mod tests {
         let result = require_visible(&repo, &auth, &svc).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
+            // #4498: the same body a missing key gets, not the key.
+            AppError::NotFound(msg) => assert_eq!(msg, REPOSITORY_NOT_FOUND),
             other => panic!("Expected NotFound error, got: {:?}", other),
         }
     }
@@ -25482,21 +25772,29 @@ mod tests {
             );
         }
         for format in [
-            Npm, Yarn, Pnpm, Bower, Pypi, Poetry, Jupyter, Maven, Gradle, Sbt, Cargo, Nuget,
-            Chocolatey, Powershell, Vscode, Docker, HelmOci,
+            Npm,
+            Yarn,
+            Pnpm,
+            Bower,
+            Pypi,
+            Poetry,
+            Jupyter,
+            Maven,
+            Gradle,
+            Sbt,
+            Cargo,
+            Nuget,
+            Chocolatey,
+            Powershell,
+            Vscode,
+            Docker,
+            HelmOci,
+            Conda,
+            CondaNative,
         ] {
             assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
-        for format in [
-            Generic,
-            Github,
-            Helm,
-            Go,
-            Rubygems,
-            Conda,
-            CondaNative,
-            Debian,
-        ] {
+        for format in [Generic, Github, Helm, Go, Rubygems, Debian] {
             assert!(!generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
     }
@@ -25667,6 +25965,71 @@ mod tests {
                 );
                 fx.teardown().await;
             }
+        }
+    }
+
+    /// #4365 item 3 (strict): a decoded `?` in a client path is refused with
+    /// 400 before any upstream request, on the generic route of a format that
+    /// does not scan and on the npm format route. The same file without the
+    /// `?` is fetched (positive control), so zero hits is meaningful.
+    #[tokio::test]
+    async fn client_path_with_a_query_is_400_on_generic_and_format_routes_4365() {
+        for (format, mk_router, ok_path, bad_path) in [
+            (
+                "generic",
+                download_router as fn() -> Router<SharedState>,
+                "download/files/x.tgz",
+                "download/files/x.tgz%3FversionId=abc",
+            ),
+            (
+                "npm",
+                crate::api::handlers::npm::router as fn() -> Router<SharedState>,
+                "left-pad/-/left-pad-1.3.0.tgz",
+                "left-pad/-/left-pad-1.3.0.tgz%3FversionId=abc",
+            ),
+        ] {
+            let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                return;
+            };
+            let server = upstream_answering_4442(b"bytes").await;
+            point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+            let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
+
+            let (status, _) = tdh::send(
+                tdh::router_anon(mk_router(), state.clone()),
+                tdh::get(format!("/{}/{bad_path}", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {bad_path}");
+            assert_eq!(
+                upstream_requests_4442(&server).await,
+                0,
+                "{format}: refused before any upstream request"
+            );
+            for bad in ["x%5Cy.tgz", "x%3By.tgz", "x%23y.tgz"] {
+                let path = ok_path
+                    .replace("x.tgz", bad)
+                    .replace("left-pad-1.3.0.tgz", bad);
+                let (status, _) = tdh::send(
+                    tdh::router_anon(mk_router(), state.clone()),
+                    tdh::get(format!("/{}/{path}", fx.repo_key)),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {path}");
+            }
+            assert_eq!(upstream_requests_4442(&server).await, 0, "{format}");
+
+            let (status, _) = tdh::send(
+                tdh::router_anon(mk_router(), state),
+                tdh::get(format!("/{}/{ok_path}", fx.repo_key)),
+            )
+            .await;
+            assert_ne!(status, StatusCode::BAD_REQUEST, "{format}: {ok_path}");
+            assert!(
+                upstream_requests_4442(&server).await > 0,
+                "{format}: the plain path reaches the upstream"
+            );
+            fx.teardown().await;
         }
     }
 
@@ -27535,6 +27898,216 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #4467: PATCH applies upstream_url instead of silently dropping it
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upstream_url_origin_changes_compares_scheme_host_port_only_4467() {
+        let old = Some("https://alice:old@upstream.example.com/etag");
+        for same in [
+            "https://alice:new@upstream.example.com/status",
+            "https://UPSTREAM.example.com:443/other?x=1",
+            "https://upstream.example.com",
+        ] {
+            assert!(
+                !crate::services::repository_service::upstream_url_origin_changes(old, same),
+                "{same}"
+            );
+        }
+        for moved in [
+            "http://upstream.example.com/etag",
+            "https://upstream.example.com:8443/etag",
+            "https://other.example.com/etag",
+            "not a url",
+        ] {
+            assert!(
+                crate::services::repository_service::upstream_url_origin_changes(old, moved),
+                "{moved}"
+            );
+        }
+        assert!(
+            crate::services::repository_service::upstream_url_origin_changes(
+                None,
+                "https://upstream.example.com"
+            )
+        );
+    }
+
+    #[test]
+    fn upstream_change_audit_redacts_and_flags_credential_changes_4467() {
+        let old = Some("https://alice:old@h.example.com/x");
+        assert_eq!(upstream_change_audit(old, None), None);
+        assert_eq!(upstream_change_audit(old, old), None);
+        let rotated =
+            upstream_change_audit(old, Some("https://alice:new@h.example.com/x")).expect("changed");
+        assert_eq!(
+            rotated.previous_upstream_url.as_deref(),
+            Some("https://h.example.com/x")
+        );
+        assert_eq!(
+            rotated.upstream_url.as_deref(),
+            Some("https://h.example.com/x")
+        );
+        assert!(rotated.credentials_changed);
+        let json = serde_json::to_string(&rotated).unwrap();
+        assert!(!json.contains("old") && !json.contains("new") && !json.contains("alice"));
+        let moved = upstream_change_audit(old, Some("https://alice:old@o.example.com/x")).unwrap();
+        assert!(!moved.credentials_changed);
+        assert_eq!(
+            moved.upstream_url.as_deref(),
+            Some("https://o.example.com/x")
+        );
+        assert!(upstream_change_audit(None, Some("https://h.example.com")).is_some());
+    }
+
+    #[test]
+    fn update_request_accepts_upstream_url_4467() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "upstream_url": "https://h.example.com" }))
+                .expect("deserialize");
+        assert_eq!(req.upstream_url.as_deref(), Some("https://h.example.com"));
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "description": "x" })).expect("deserialize");
+        assert!(req.upstream_url.is_none());
+    }
+
+    async fn stored_upstream_4467(pool: &sqlx::PgPool, id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT upstream_url FROM repositories WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("stored upstream_url")
+    }
+
+    #[tokio::test]
+    async fn test_patch_upstream_url_is_applied_and_validated_db_4467() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upstream-4467-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let update = |json: serde_json::Value| -> Json<UpdateRepositoryRequest> {
+            Json(serde_json::from_value(json).expect("deserialize update payload"))
+        };
+
+        let repo_key = format!("upstream-4467-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            make_create_request(
+                &repo_key,
+                "rotating",
+                "generic",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://alice:old-4467@upstream.example.com/etag"
+                }),
+            ),
+        )
+        .await
+        .expect("remote create must succeed");
+
+        // Rotation of embedded credentials is applied, and redacted on the way out.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({
+                "upstream_url": "https://alice:new-4467@upstream.example.com/status"
+            })),
+        )
+        .await
+        .expect("upstream_url update must succeed");
+        assert_eq!(
+            resp.upstream_url.as_deref(),
+            Some("https://upstream.example.com/status")
+        );
+        assert!(resp.upstream_url_has_credentials);
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+
+        // Create-time validation applies: an SSRF target is a 400 and changes nothing.
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "upstream_url": "http://169.254.169.254/latest" })),
+        )
+        .await
+        .expect_err("metadata address must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+
+        // An unrelated update leaves the URL alone.
+        update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "description": "x" })),
+        )
+        .await
+        .expect("unrelated update must succeed");
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+
+        // With upstream-auth credentials configured, a different origin is a
+        // 409 and the same origin is still allowed.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'upstream_auth_type', 'basic')",
+        )
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("configure upstream auth");
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "upstream_url": "https://other.example.com/status" })),
+        )
+        .await
+        .expect_err("origin change with credentials configured must be refused");
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m.contains("upstream-auth")),
+            "{err:?}"
+        );
+        assert_eq!(
+            stored_upstream_4467(&pool, created.id).await.as_deref(),
+            Some("https://alice:new-4467@upstream.example.com/status")
+        );
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(repo_key.clone()),
+            update(serde_json::json!({ "upstream_url": "https://upstream.example.com/v2" })),
+        )
+        .await
+        .expect("same-origin change must succeed");
+        assert_eq!(
+            resp.upstream_url.as_deref(),
+            Some("https://upstream.example.com/v2")
+        );
+        assert!(!resp.upstream_url_has_credentials);
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
     // custom_user_agent: handler plumbing (create / update / get round-trips)
     // -----------------------------------------------------------------------
 
@@ -27883,6 +28456,65 @@ mod tests {
         tdh::cleanup(&pool, remote_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
         let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    /// DB-backed: `virtual_metadata_partial` (#4192) is accepted on a virtual
+    /// repository and persisted, and refused with a 400 anywhere else.
+    #[tokio::test]
+    async fn test_virtual_metadata_partial_only_on_virtual_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (local_id, local_key, storage_dir) = tdh::create_repo(&pool, "local", "conda").await;
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "conda").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let update = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+        let stored = |repo_id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'virtual_metadata_partial'",
+                )
+                .bind(repo_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query repository_config")
+            }
+        };
+
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(virtual_key.clone()),
+            Json(update(r#"{"virtual_metadata_partial":true}"#)),
+        )
+        .await
+        .expect("a virtual repository accepts virtual_metadata_partial");
+        let virtual_value = stored(virtual_id).await;
+
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(local_key.clone()),
+            Json(update(r#"{"virtual_metadata_partial":true}"#)),
+        )
+        .await
+        .expect_err("a local repository must refuse virtual_metadata_partial");
+        let local_value = stored(local_id).await;
+
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+
+        assert_eq!(virtual_value.as_deref(), Some("true"));
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(local_value, None);
     }
 
     /// DB-backed: the hosted types are untouched — enabling quarantine on a
@@ -30324,6 +30956,93 @@ mod apt_validation_tests {
     // ledger-backed batch behind the listing (#3079).
     // -----------------------------------------------------------------------
 
+    /// #4505: the response to creating a virtual repository whose members
+    /// already hold content reports the members' total, the same figure the
+    /// next `GET` reports, rather than 0.
+    #[tokio::test]
+    async fn test_create_virtual_reports_existing_member_storage_4505() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let prefix = format!("vs4505{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let member = seeded_repo_3078(&pool, &prefix, "member", "local").await;
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $3, 9692, repeat('c', 64), 'application/octet-stream', $4, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(member)
+        .bind(format!("p/{prefix}"))
+        .bind(format!("cas/00/{}", Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .expect("seed member artifact");
+
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let admin = tdh::admin_auth(admin_id, &admin_name);
+        let storage = std::env::temp_dir().join(format!("{prefix}-storage"));
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let virt_key = format!("{prefix}-virt");
+        let body = serde_json::json!({
+            "key": virt_key,
+            "name": virt_key,
+            "format": "generic",
+            "repo_type": "virtual",
+            "member_repos": [{"repo_key": format!("{prefix}-member"), "priority": 1}],
+        });
+        let router = tdh::router_with_auth(super::router(), state, admin.clone());
+        let (status, resp) = tdh::send(
+            router,
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                bytes::Bytes::from(body.to_string()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "create failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let created: serde_json::Value = serde_json::from_slice(&resp).expect("create json");
+        let from_create = virtual_member_figure_4423(&created);
+        let from_get = virtual_total_from_detail_3081(&pool, &virt_key, admin).await;
+        assert_eq!(from_get, 9692, "GET reports the member total");
+        assert_eq!(
+            from_create, from_get,
+            "the create response must report the same member total as GET"
+        );
+        let virt_id: Uuid = sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
+            .bind(&virt_key)
+            .fetch_one(&pool)
+            .await
+            .expect("virtual id");
+        sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&pool)
+            .await
+            .ok();
+        for id in [virt_id, member] {
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        tdh::cleanup_user(&pool, admin_id).await;
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
     /// Read `storage_used_bytes` for `key` from `GET /{key}` — the DETAIL
     /// path, whose aggregate is the live per-repo walk
     /// (`get_virtual_storage_usage`).
@@ -30836,8 +31555,12 @@ mod apt_validation_tests {
     ///
     /// * token scoped to `[x]` only          -> 0     (V reachable via the
     ///   `is_public` arm; NEITHER member is in scope)
-    /// * token scoped to `[virt, near]`      -> 1,000 (`far` withheld, `near`
-    ///   still counted — the control against an always-zero "fix")
+    /// * token scoped to `[near]`            -> 1,000 (V again reached via
+    ///   `is_public`, so no #4559 parent term: `far` withheld, `near` still
+    ///   counted — the control against an always-zero "fix")
+    /// * token scoped to `[virt]`            -> 10 GiB + 1,000 (#4559: the
+    ///   scope names the virtual being summed, so every member the owner may
+    ///   read is counted, as the listing and download through V admit them)
     /// * the same user with an UNRESTRICTED credential -> 10 GiB + 1,000
     ///   (proves the bytes are genuinely reachable, so the two figures above
     ///   are caused by scope and not by a broken fixture)
@@ -30896,14 +31619,27 @@ mod apt_validation_tests {
              a byte total for members it is scoped away from"
         );
 
-        // A token carrying the virtual and ONE member: exactly that member's
-        // bytes, on both aggregation paths.
-        let scoped_near = scoped_token_3081(u_id, &u_name, vec![virt, near]);
+        // A token carrying ONE member but not the virtual: exactly that
+        // member's bytes. Only the detail path: a repo-scoped listing shows
+        // only the repositories its scope names, so the virtual is not in it.
+        let scoped_near = scoped_token_3081(u_id, &u_name, vec![near]);
         assert_repo_hidden_3081(&pool, &far_key, scoped_near.clone()).await;
         assert_eq!(
-            virtual_total_seen_by_3081(&pool, &prefix, &virt_key, scoped_near).await,
+            virtual_total_from_detail_3081(&pool, &virt_key, scoped_near).await,
             NEAR_BYTES,
             "the total must count the in-scope member and withhold the out-of-scope one"
+        );
+
+        // #4559: a token carrying the VIRTUAL counts every member its owner
+        // may read through it, on both aggregation paths, while each member's
+        // own `GET` stays hidden from it.
+        let scoped_virt = scoped_token_3081(u_id, &u_name, vec![virt]);
+        assert_repo_hidden_3081(&pool, &far_key, scoped_virt.clone()).await;
+        assert_repo_hidden_3081(&pool, &near_key, scoped_virt.clone()).await;
+        assert_eq!(
+            virtual_total_seen_by_3081(&pool, &prefix, &virt_key, scoped_virt).await,
+            FAR_BYTES + NEAR_BYTES,
+            "a token scoped to the virtual must count the members its owner may read"
         );
 
         // Fixture control: the SAME user on an unrestricted credential sees
@@ -30922,10 +31658,11 @@ mod apt_validation_tests {
     /// #3081: the PATCH response carries the same aggregate as `GET`, and was
     /// untested. `update_repository` gates on `require_repo_access` (token
     /// scope on the PARENT) plus `repository:admin`, so the caller here is
-    /// scoped to the virtual — and must still be refused the bytes of a member
-    /// that scope does not carry.
+    /// scoped to the virtual. Since #4559 that scope covers the members read
+    /// through the virtual, so what withholds a member's bytes is the owner's
+    /// grant on it, not the token scope.
     #[tokio::test]
-    async fn test_patch_response_total_excludes_out_of_scope_members_3081() {
+    async fn test_patch_response_total_is_caller_scoped_3081() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::http::StatusCode;
 
@@ -30974,12 +31711,12 @@ mod apt_validation_tests {
             }
         };
 
-        // Scoped to the virtual and `near` only: `far`'s 500,000 bytes are
-        // withheld, `near`'s 1,000 are still reported.
+        // Scoped to the virtual only, owner granted on both members: the
+        // #4559 parent term counts both.
         assert_eq!(
-            patch_total(scoped_token_3081(u_id, &u_name, vec![virt, near])).await,
-            1_000,
-            "the PATCH response total must exclude a member the token is scoped away from"
+            patch_total(scoped_token_3081(u_id, &u_name, vec![virt])).await,
+            501_000,
+            "a token scoped to the virtual must count the members its owner may read"
         );
 
         // Control: the same user unrestricted sees the full union.
@@ -30987,6 +31724,20 @@ mod apt_validation_tests {
             patch_total(tdh::make_auth(u_id, &u_name)).await,
             501_000,
             "an unrestricted credential must still see the full union in the PATCH response"
+        );
+
+        // Revoke the owner's grant on `far`: the same virtual-scoped token now
+        // has its 500,000 bytes withheld, `near`'s 1,000 still reported.
+        sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1 AND user_id = $2")
+            .bind(far)
+            .bind(u_id)
+            .execute(&pool)
+            .await
+            .expect("revoke far grant");
+        assert_eq!(
+            patch_total(scoped_token_3081(u_id, &u_name, vec![virt])).await,
+            1_000,
+            "the PATCH response total must exclude a member the owner cannot read"
         );
 
         drop_repos_test(&pool, &[virt, far, near]).await;
@@ -31709,89 +32460,11 @@ mod virtual_member_visibility_tests {
     /// anonymous one; dropping the grant conjunct let a token keep reading a
     /// member after its owner's grant was revoked.
     ///
-    /// It also asserts read-through: a token scoped to the VIRTUAL reaches the
-    /// virtual's members. That is deliberate -- the by-path download through
-    /// the same virtual already serves member bytes to such a token, so
-    /// without it the listing returns `200 OK` with zero items while the
-    /// download of those same items succeeds.
-    /// #4213 review: the notice must reach the FLAT artifacts listing, which
-    /// is the one #4130 is about. Only the grouped and remote branches were
-    /// wrapped, and the remote wrap was dead — a Remote repository is never
-    /// Virtual, so its count is always zero.
-    #[tokio::test]
-    async fn artifacts_listing_reports_members_dropped_by_token_scope() {
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let fx = Fixture::seed(&pool, "generic").await;
-
-        // `insider` may read the private member; its token names the parent
-        // only, so that member is dropped and the listing must say so.
-        let scoped_to_parent = fx.scoped_token(&fx.insider, vec![fx.virt_id]);
-        let (status, json) = fx
-            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_parent)
-            .await;
-
-        // Same caller, member in scope: nothing to report.
-        let scoped_to_both = fx.scoped_token(&fx.insider, vec![fx.virt_id, fx.private_id]);
-        let (full_status, full_json) = fx
-            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_both)
-            .await;
-
-        fx.cleanup().await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["notices"][0]["code"].as_str(),
-            Some(crate::api::dto::NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE),
-            "the flat artifacts listing must carry the notice: {json}"
-        );
-
-        assert_eq!(full_status, StatusCode::OK);
-        assert!(
-            full_json["notices"].is_null(),
-            "a token scoped to the member has nothing to be told: {full_json}"
-        );
-    }
-
-    /// #4213 review, after #3813: an INTERNAL member is not exempt from token
-    /// scope the way a public one is (an anonymous caller gets nothing from
-    /// it, so there is no baseline to protect). Dropped by the token's scope,
-    /// it must be reported like a private one, while the public member, which
-    /// passes the scope, is not counted.
-    #[tokio::test]
-    async fn notice_counts_an_internal_member_like_a_private_one() {
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let fx = Fixture::seed(&pool, "generic").await;
-        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
-            .bind(fx.private_id)
-            .execute(&pool)
-            .await
-            .expect("make the member internal");
-
-        let scoped_to_parent = fx.scoped_token(&fx.insider, vec![fx.virt_id]);
-        let (status, json) = fx
-            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_parent)
-            .await;
-
-        fx.cleanup().await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["notices"][0]["code"].as_str(),
-            Some(crate::api::dto::NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE),
-            "an internal member dropped by token scope is reported: {json}"
-        );
-        assert!(
-            json["notices"][0]["message"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("1 member")),
-            "only the internal member counts; the public one passes the scope: {json}"
-        );
-    }
-
+    /// It also asserts the #4559 parent term: a token scoped to the VIRTUAL
+    /// lists the members its owner may read, matching the download through the
+    /// same virtual, while the grant half still hides a member the owner holds
+    /// no grant on, and a token whose scope does not name the virtual does not
+    /// reach the virtual at all.
     #[tokio::test]
     async fn members_endpoint_honours_token_scope_and_grants_3163() {
         let Some(pool) = tdh::try_pool().await else {
@@ -31814,6 +32487,11 @@ mod virtual_member_visibility_tests {
         // scope was discarded entirely.
         let at = fx.scoped_admin_token(vec![fx.virt_id]);
         let (adm_status, adm_keys) = fx.members_seen(at).await;
+
+        // An ADMIN whose token is scoped to the public MEMBER only: the scope
+        // binds at the (private) virtual parent, so it is not listed at all.
+        let at_elsewhere = fx.scoped_admin_token(vec![fx.public_id]);
+        let (adm_elsewhere_status, _) = fx.members_seen(at_elsewhere).await;
 
         // Positive control: same caller, member now IN scope.
         let it2 = fx.scoped_token(&fx.insider, vec![fx.virt_id, fx.private_id]);
@@ -31840,16 +32518,14 @@ mod virtual_member_visibility_tests {
             "token scope must not substitute for a grant: {private_key} has no \
              grant for this caller; got {virt_keys:?}"
         );
-        // STRICT scoping: the private member is NOT in this token's scope, so
-        // even a caller who holds the grant must not enumerate it. This is what
-        // agrees with the download path -- `caller_can_read_member` gates on
-        // `can_access_repo(member.id)` with no parent term, so read-through
-        // here would let a token list what it cannot fetch.
+        // #4559 parent term: the private member is not named by this token's
+        // scope, but the virtual is and the owner holds a grant on the member,
+        // so it is listed -- as the download through the same virtual serves
+        // it (`caller_can_read_member` evaluates the same term).
         assert!(
-            !ins_keys.contains(&private_key),
-            "a token scoped only to the virtual must not enumerate a private \
-             member outside its scope, because the download refuses it too; \
-             got {ins_keys:?}"
+            ins_keys.contains(&private_key),
+            "a token scoped to the virtual must list a member its owner may \
+             read; got {ins_keys:?}"
         );
         // Scope the token to the MEMBER and the same caller does see it --
         // the positive control, without which the assertion above is
@@ -31860,13 +32536,21 @@ mod virtual_member_visibility_tests {
             "with {private_key} in scope AND a grant, it must be listed; \
              got {ins2_keys:?}"
         );
-        // An admin token scoped to the virtual only: the scope still binds.
-        // Before the fix `is_admin` was matched ahead of `Restricted`, so the
-        // scope was discarded entirely and every member was listed.
+        // An admin token scoped to the virtual: the parent term admits every
+        // member through it (an admin satisfies the grant half).
         assert!(
-            !adm_keys.contains(&private_key),
-            "an admin's deliberately-scoped token must stay scoped; \
-             got {adm_keys:?}"
+            adm_keys.contains(&private_key),
+            "an admin token scoped to the virtual reads its members through \
+             it; got {adm_keys:?}"
+        );
+        // ...but an admin token scoped elsewhere is still bound by its scope.
+        // Before the #3163 fix `is_admin` was matched ahead of `Restricted`,
+        // so the scope was discarded entirely.
+        assert_ne!(
+            adm_elsewhere_status,
+            StatusCode::OK,
+            "an admin's token scoped away from a private virtual must not \
+             reach it"
         );
     }
 
@@ -32857,5 +33541,235 @@ mod upstream_filter_endpoint_tests {
         assert_eq!(json(&after_body)["include_patterns"], serde_json::json!([]));
 
         assert_eq!(local_status, StatusCode::BAD_REQUEST);
+    }
+}
+
+/// `GET/PUT/DELETE /:key/allowlist` on a virtual conda repository (#4576).
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod conda_allowlist_endpoint_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::{Body, Bytes};
+    use axum::http::{Request, StatusCode};
+
+    fn uri(key: &str) -> String {
+        format!("/{key}/allowlist")
+    }
+
+    fn put(key: &str, body: serde_json::Value) -> Request<Body> {
+        tdh::put_json(uri(key), Bytes::from(body.to_string()))
+    }
+
+    fn delete(key: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri(key))
+            .body(Body::empty())
+            .expect("build DELETE request")
+    }
+
+    fn json(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).expect("JSON body")
+    }
+
+    async fn audit_rows(pool: &sqlx::PgPool, repo_id: uuid::Uuid) -> i64 {
+        // The audit write is detached (fire-and-forget); give it a moment.
+        let mut count = 0;
+        for _ in 0..40 {
+            count = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'REPOSITORY_ALLOWLIST_CHANGED' AND resource_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("count audit rows");
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn conda_allowlist_crud_is_admin_gated_validated_and_audited() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "conda").await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let list = serde_json::json!({
+            "enabled": true,
+            "entries": [
+                {"name": "numpy", "version": ">=2,<3", "subdirs": ["linux-64"]},
+                {"name": "tzdata"},
+            ],
+        });
+
+        let (member_id, member_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, member_id).await;
+        let member_app = tdh::router_with_auth(
+            super::router(),
+            fx.state.clone(),
+            tdh::make_auth(member_id, &member_name),
+        );
+        let (member_put, _) = tdh::send(member_app, put(&key, list.clone())).await;
+        let (anon_get, _) = tdh::send(fx.router_anon(super::router()), tdh::get(uri(&key))).await;
+
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+
+        let (empty_status, empty_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let bad = serde_json::json!({"enabled": true, "entries": [
+            {"name": "numpy"},
+            {"name": "numpy", "version": ">=>2"},
+        ]});
+        let (bad_status, bad_body) = tdh::send(app(), put(&key, bad)).await;
+        let (bad_name_status, _) = tdh::send(
+            app(),
+            put(
+                &key,
+                serde_json::json!({"enabled": true, "entries": [{"name": "Num Py"}]}),
+            ),
+        )
+        .await;
+        let (no_enabled_status, _) = tdh::send(
+            app(),
+            put(&key, serde_json::json!({"entries": [{"name": "numpy"}]})),
+        )
+        .await;
+        let (put_status, put_body) = tdh::send(app(), put(&key, list.clone())).await;
+        let (get_status, get_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let (del_status, del_body) = tdh::send(app(), delete(&key)).await;
+        let (after_status, after_body) = tdh::send(app(), tdh::get(uri(&key))).await;
+        let audits = audit_rows(&fx.pool, fx.repo_id).await;
+
+        // Only a virtual conda repository carries an allowlist.
+        let (remote_id, remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "conda").await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        tdh::grant_repo_admin(&fx.pool, remote_id, fx.user_id).await;
+        let (remote_status, _) = tdh::send(app(), put(&remote_key, list.clone())).await;
+
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        tdh::cleanup_user(&fx.pool, member_id).await;
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(member_put, StatusCode::FORBIDDEN);
+        assert_eq!(anon_get, StatusCode::UNAUTHORIZED);
+
+        assert_eq!(empty_status, StatusCode::OK);
+        let empty = json(&empty_body);
+        assert_eq!(empty["enabled"], false);
+        assert_eq!(empty["entry_count"], 0);
+
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        let bad = String::from_utf8_lossy(&bad_body);
+        assert!(bad.contains("entries[1]"), "{bad}");
+        assert_eq!(bad_name_status, StatusCode::BAD_REQUEST);
+        assert!(
+            no_enabled_status.is_client_error(),
+            "`enabled` is required, got {no_enabled_status}"
+        );
+
+        assert_eq!(put_status, StatusCode::OK);
+        let saved = json(&put_body);
+        assert_eq!(saved["repository_key"], key.as_str());
+        assert_eq!(saved["enabled"], true);
+        assert_eq!(saved["entry_count"], 2);
+        assert_eq!(saved["entries"], list["entries"]);
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(json(&get_body), saved);
+
+        assert_eq!(del_status, StatusCode::OK);
+        assert_eq!(json(&del_body)["enabled"], false);
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(json(&after_body)["entries"], serde_json::json!([]));
+
+        assert_eq!(audits, 2, "the PUT and the DELETE are audited");
+        assert_eq!(remote_status, StatusCode::BAD_REQUEST);
+    }
+}
+
+/// #4305: an npm Remote caches each packument in the proxy-cache catalog
+/// under the bare package name (`@scope/name`, `name`) next to the tarballs
+/// (`@scope/name/-/name-1.0.0.tgz`). A packument is metadata, like a PyPI
+/// index page: the cached-artifact listing must not offer it as a package
+/// that can be downloaded, invalidated and deleted.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod npm_cached_packument_listing_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use uuid::Uuid;
+
+    async fn seed_catalog_row(pool: &sqlx::PgPool, repo_id: Uuid, path: &str, ct: &str) {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (id, repository_id, path, storage_key, \
+             metadata_key, size_bytes, checksum_sha256, content_type) \
+             VALUES ($1, $2, $3, $4, $5, 1900, repeat('c', 64), $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("proxy-cache/{repo_id}/{path}/__content__"))
+        .bind(format!("proxy-cache/{repo_id}/{path}/__cache_meta__.json"))
+        .bind(ct)
+        .execute(pool)
+        .await
+        .expect("insert proxy cache row");
+    }
+
+    #[tokio::test]
+    async fn npm_remote_listing_omits_cached_packuments_4305() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        const TARBALL: &str = "@example-org/example-package/-/example-package-1.0.0.tgz";
+        for (path, ct) in [
+            (
+                "@example-org/example-package",
+                "application/json; charset=utf-8",
+            ),
+            ("left-pad", "application/json"),
+            (TARBALL, "application/gzip"),
+        ] {
+            seed_catalog_row(&fx.pool, fx.repo_id, path, ct).await;
+        }
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::admin_auth(fx.user_id, "admin-4305"),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/artifacts?count=exact", fx.repo_key)),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+        let paths: Vec<&str> = json["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| i["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(paths, vec![TARBALL], "{json}");
+        assert_eq!(json["pagination"]["total"], 1, "{json}");
     }
 }

@@ -10,6 +10,7 @@
 //!   GET  /cran/{repo_key}/bin/macosx/contrib/{rversion}/PACKAGES  - macOS binary index
 //!   PUT  /cran/{repo_key}/src/contrib/{filename}          - Upload package (auth required)
 
+use crate::api::handlers::upload_body::UploadBody;
 use std::io::Write as IoWrite;
 
 use axum::body::Body;
@@ -20,7 +21,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
@@ -73,7 +73,7 @@ async fn build_virtual_combined_index(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
-) -> Result<String, Response> {
+) -> Result<(String, proxy_helpers::PartialMerge), Response> {
     // Caller-authorized member walk (#3323): the PACKAGES index is content, so
     // a member this caller may not read directly must not contribute entries.
     let members =
@@ -106,7 +106,7 @@ async fn build_virtual_combined_index(
     )
     .await?;
 
-    for (_key, remote_index) in remote_indexes {
+    for (_key, remote_index) in remote_indexes.documents {
         if !remote_index.is_empty() {
             if !combined.is_empty() {
                 combined.push('\n');
@@ -115,7 +115,7 @@ async fn build_virtual_combined_index(
         }
     }
 
-    Ok(combined)
+    Ok((combined, remote_indexes.partial))
 }
 
 // ---------------------------------------------------------------------------
@@ -130,13 +130,16 @@ async fn package_index(
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let combined = build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
-        return Ok(Response::builder()
+        let (combined, partial) =
+            build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .header(CONTENT_LENGTH, combined.len().to_string())
             .body(Body::from(combined))
-            .unwrap());
+            .unwrap();
+        partial.mark(&mut response);
+        return Ok(response);
     }
 
     let index = build_source_index(&state.db, repo.id).await?;
@@ -161,7 +164,8 @@ async fn package_index_gz(
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let combined = build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
+        let (combined, partial) =
+            build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
         let compressed = gzip_compress(combined.as_bytes()).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -170,12 +174,14 @@ async fn package_index_gz(
                 .into_response()
         })?;
 
-        return Ok(Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/gzip")
             .header(CONTENT_LENGTH, compressed.len().to_string())
             .body(Body::from(compressed))
-            .unwrap());
+            .unwrap();
+        partial.mark(&mut response);
+        return Ok(response);
     }
 
     let index = build_source_index(&state.db, repo.id).await?;
@@ -319,7 +325,7 @@ async fn upload_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, filename)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "cran", "write:artifacts")?.user_id;
@@ -513,6 +519,7 @@ fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use flate2::read::GzDecoder;
     use std::io::Read;
 

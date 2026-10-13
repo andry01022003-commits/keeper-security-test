@@ -24,7 +24,7 @@ registries are intentionally more permissive for client compatibility: in additi
 HTTP **Basic** auth with the API token supplied in the *password* field (any username), matching the \
 `pip` netrc / Artifactory-style `token:<api_token>` convention used by package managers that cannot send a \
 Bearer header. This Basic-with-token fallback applies to format endpoints only, never to `/api/v1/*`.",
-        version = "1.10.0",
+        version = "1.11.0",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
     ),
@@ -161,6 +161,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ("signing", handlers::signing::SigningApiDoc::openapi()),
         ("security", handlers::security::SecurityApiDoc::openapi()),
         ("sbom", handlers::sbom::SbomApiDoc::openapi()),
+        (
+            "attestations",
+            handlers::attestations::AttestationsApiDoc::openapi(),
+        ),
         (
             "environments",
             handlers::environments::EnvironmentsApiDoc::openapi(),
@@ -783,6 +787,10 @@ mod tests {
             (
                 "/api/v1/environments/",
                 vec![include_str!("handlers/environments.rs")],
+            ),
+            (
+                "/api/v1/attestations/",
+                vec![include_str!("handlers/attestations.rs")],
             ),
             (
                 "/api/v1/artifacts/",

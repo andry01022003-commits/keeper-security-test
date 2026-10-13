@@ -541,7 +541,7 @@ async fn index_yaml(
         )
         .await?;
 
-        for (_member_key, index) in remote_indexes {
+        for (_member_key, index) in remote_indexes.documents {
             merge_upstream_index_entries(&repo_key, index, &mut all_charts);
         }
 
@@ -552,7 +552,11 @@ async fn index_yaml(
             }
         }
 
-        return build_index_response(all_charts, None);
+        // A member that failed is a 502 above (#4192), unless the virtual
+        // allows partial merges: then the index is marked as such.
+        return remote_indexes
+            .partial
+            .apply(build_index_response(all_charts, None));
     }
 
     let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
@@ -1094,6 +1098,17 @@ async fn upload_chart(
         .await
         .map_err(|e| proxy_helpers::internal_error("Database", e))?;
 
+    // Each row is admitted against the storage quotas in this transaction
+    // right before its INSERT, so the prov is admitted against usage that
+    // already includes the chart (#4422).
+    super::publish_quota::admit_publish_in_tx(
+        &mut tx,
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = proxy_helpers::insert_artifact_row(
         &mut tx,
         proxy_helpers::NewArtifact {
@@ -1111,25 +1126,36 @@ async fn upload_chart(
     .await?;
 
     let prov_artifact_id = match prov_put.as_ref() {
-        Some(prov_put) => Some(
-            // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
-            // signature, not package content; the chart row above is scanned.
-            proxy_helpers::insert_artifact_row(
+        Some(prov_put) => {
+            let prov_size = prov_put.bytes_written as i64;
+            super::publish_quota::admit_publish_in_tx(
                 &mut tx,
-                proxy_helpers::NewArtifact {
-                    repository_id: repo.id,
-                    path: &prov_artifact_path,
-                    name: chart_name,
-                    version: chart_version,
-                    size_bytes: prov_put.bytes_written as i64,
-                    checksum_sha256: &prov_put.checksum_sha256,
-                    content_type: PROV_CONTENT_TYPE,
-                    storage_key: &prov_storage_key,
-                    uploaded_by: user_id,
-                },
+                &state.db,
+                repo.id,
+                &prov_artifact_path,
+                prov_size,
             )
-            .await?,
-        ),
+            .await?;
+            Some(
+                // NO-SCAN-ON-UPLOAD: the `.prov` row is the chart's provenance
+                // signature, not package content; the chart row above is scanned.
+                proxy_helpers::insert_artifact_row(
+                    &mut tx,
+                    proxy_helpers::NewArtifact {
+                        repository_id: repo.id,
+                        path: &prov_artifact_path,
+                        name: chart_name,
+                        version: chart_version,
+                        size_bytes: prov_size,
+                        checksum_sha256: &prov_put.checksum_sha256,
+                        content_type: PROV_CONTENT_TYPE,
+                        storage_key: &prov_storage_key,
+                        uploaded_by: user_id,
+                    },
+                )
+                .await?,
+            )
+        }
         None => None,
     };
 
@@ -2447,6 +2473,57 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             .unwrap();
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::OK);
+        f.teardown().await;
+    }
+
+    /// #4422 review: chart and `.prov` are admitted row by row in ONE
+    /// transaction, the prov against usage that already includes the chart.
+    /// When each fits alone but not together, the push is refused with 507
+    /// and neither row lands; at exactly their sum both are admitted.
+    #[tokio::test]
+    async fn test_helm_chart_and_prov_admitted_together_against_quota_4422() {
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+        let together = (tgz.len() + REAL_PROV.len()) as i64;
+        let set_quota = |quota: i64| {
+            sqlx::query("UPDATE repositories SET quota_bytes = $2 WHERE id = $1")
+                .bind(f.repo_id)
+                .bind(quota)
+                .execute(&f.pool)
+        };
+        let parts: &[(&str, &str, &[u8])] = &[
+            ("chart", "provchart-0.1.0.tgz", &tgz),
+            ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+        ];
+        let rows = || {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+        };
+
+        set_quota(together - 1).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 0, "neither row may land");
+
+        set_quota(together).await.unwrap();
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows().await.unwrap(), 2);
+
         f.teardown().await;
     }
 
@@ -4086,6 +4163,232 @@ mod virtual_member_authz_tests {
             (StatusCode::OK, Bytes::from_static(PRIVATE_BYTES)),
             "the private member's granted principal must still download its \
              chart through the virtual"
+        );
+    }
+}
+
+/// #4192 / #4508: a Remote member of a virtual Helm repository whose
+/// `index.yaml` cannot be fetched or parsed, or that does not answer within
+/// the member deadline, fails the merged index loudly (502 naming the member)
+/// instead of serving an index that silently lacks the member. A member that
+/// answers 404 publishes nothing and is not a failure; a virtual that opted
+/// into partial merges serves the rest, marked partial and uncacheable.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod virtual_member_failure_tests {
+    use axum::http::{HeaderMap, StatusCode};
+    use bytes::Bytes;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const GOOD_INDEX: &str = "apiVersion: v1\nentries:\n  alpha:\n  - name: alpha\n    \
+                              version: 1.0.0\n    urls:\n    - charts/alpha-1.0.0.tgz\n";
+
+    /// A public virtual over one public Remote member per upstream, in
+    /// priority order.
+    struct Rig {
+        pool: sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        virtual_key: String,
+        member_keys: Vec<String>,
+        member_ids: Vec<(uuid::Uuid, std::path::PathBuf)>,
+        state: crate::api::SharedState,
+        _cache: tempfile::TempDir,
+    }
+
+    impl Rig {
+        async fn new(pool: sqlx::PgPool, upstreams: &[String]) -> Self {
+            let (virtual_id, virtual_key, _vd) = tdh::create_repo(&pool, "virtual", "helm").await;
+            tdh::publish_repo(&pool, virtual_id).await;
+            let mut member_keys = Vec::new();
+            let mut member_ids = Vec::new();
+            for (i, upstream) in upstreams.iter().enumerate() {
+                let (id, key, dir) = tdh::create_repo(&pool, "remote", "helm").await;
+                sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                    .bind(upstream)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .expect("point member at mock upstream");
+                tdh::publish_repo(&pool, id).await;
+                tdh::link_virtual_member(&pool, virtual_id, id, i as i32 + 1).await;
+                member_keys.push(key);
+                member_ids.push((id, dir));
+            }
+            let cache = tempfile::tempdir().expect("proxy cache tempdir");
+            let root = cache.path().to_str().expect("utf8 tempdir").to_string();
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &root);
+            let state = tdh::build_state_with_proxy(pool.clone(), &root, proxy);
+            Self {
+                pool,
+                virtual_id,
+                virtual_key,
+                member_keys,
+                member_ids,
+                state,
+                _cache: cache,
+            }
+        }
+
+        async fn index(&self) -> (StatusCode, Bytes, HeaderMap) {
+            let app = tdh::router_anon(super::router(), self.state.clone());
+            tdh::send_with_headers(app, tdh::get(format!("/{}/index.yaml", self.virtual_key))).await
+        }
+
+        async fn allow_partial(&self) {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) \
+                 VALUES ($1, 'virtual_metadata_partial', 'true')",
+            )
+            .bind(self.virtual_id)
+            .execute(&self.pool)
+            .await
+            .expect("opt the virtual into partial merges");
+        }
+
+        async fn cleanup(self) {
+            for (id, dir) in &self.member_ids {
+                tdh::cleanup_member_repo(&self.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                .bind(self.virtual_id)
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(self.virtual_id)
+                .execute(&self.pool)
+                .await;
+        }
+    }
+
+    async fn upstream(template: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/index.yaml"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn good_upstream() -> MockServer {
+        upstream(ResponseTemplate::new(200).set_body_string(GOOD_INDEX)).await
+    }
+
+    /// #4192: a member answering 500 or a document that does not parse fails
+    /// the merged index with 502 naming that member, by default.
+    #[tokio::test]
+    async fn failed_member_fails_the_merged_index_by_default_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for bad in [
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(200).set_body_string("entries: [this is: not an index"),
+        ] {
+            let good = good_upstream().await;
+            let bad = upstream(bad).await;
+            let rig = Rig::new(pool.clone(), &[good.uri(), bad.uri()]).await;
+            let (status, body, _) = rig.index().await;
+            let bad_key = rig.member_keys[1].clone();
+            rig.cleanup().await;
+
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert!(
+                body.contains(&bad_key),
+                "the 502 must name the member: {body}"
+            );
+        }
+    }
+
+    /// #4192: with `virtual_metadata_partial` the healthy members are served,
+    /// the missing member is named, and the response is not cacheable.
+    #[tokio::test]
+    async fn failed_member_is_served_partial_when_the_virtual_allows_it_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let bad = upstream(ResponseTemplate::new(500)).await;
+        let rig = Rig::new(pool, &[good.uri(), bad.uri()]).await;
+        rig.allow_partial().await;
+        let (status, body, headers) = rig.index().await;
+        let bad_key = rig.member_keys[1].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert_eq!(
+            headers
+                .get("x-ak-partial-members")
+                .and_then(|v| v.to_str().ok()),
+            Some(bad_key.as_str())
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(headers.get(axum::http::header::WARNING).is_some());
+    }
+
+    /// #4192: a member that answers 404 publishes no index; that is not a
+    /// failure, and the other members' entries are served.
+    #[tokio::test]
+    async fn member_without_an_index_is_not_a_failure_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let empty = MockServer::start().await; // every path 404s
+        let rig = Rig::new(pool, &[good.uri(), empty.uri()]).await;
+        let (status, body, headers) = rig.index().await;
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert!(headers.get("x-ak-partial-members").is_none());
+    }
+
+    /// #4508: a member that does not answer within the member deadline fails
+    /// the merged index with 502 naming it, promptly, instead of holding the
+    /// request for the upstream's full timeout (which outlasts a reverse
+    /// proxy's and turns into a 504).
+    #[tokio::test]
+    async fn stalled_member_fails_within_the_deadline_4508() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let stalled = upstream(
+            ResponseTemplate::new(200)
+                .set_body_string(GOOD_INDEX)
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .await;
+        let rig = Rig::new(pool, &[good.uri(), stalled.uri()]).await;
+        let started = std::time::Instant::now();
+        let (status, body, _) = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+            std::time::Duration::from_millis(300),
+            rig.index(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let stalled_key = rig.member_keys[1].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body.contains(&stalled_key), "{body}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the deadline must bound the wait: took {elapsed:?}"
         );
     }
 }

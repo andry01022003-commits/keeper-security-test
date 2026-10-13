@@ -98,16 +98,17 @@ async fn sbt_remote_stream(
 /// no identity pin. Classified on the cache-normalized path, exactly as
 /// [`maven::maven_scan_target`] is, so no alias of an archive's cache entry
 /// (a trailing `/`, an upper-case extension) skips the gate.
-fn sbt_scan_target(path: &str) -> Option<maven::JvmScanTarget<'_>> {
-    let path = crate::services::proxy_service::normalize_cache_path(path);
-    let segments: Vec<&str> = path.split('/').collect();
-    let filename = segments.last().copied().unwrap_or_default();
-    if filename.is_empty() || maven::is_unscanned_jvm_companion(filename) {
+fn sbt_scan_target(path: &str) -> Option<maven::JvmScanTarget> {
+    let key = maven::jvm_proxy_serve_key(path);
+    if !key.scannable {
         return None;
     }
+    let path = key.cache_key.as_str();
+    let segments: Vec<&str> = path.split('/').collect();
+    let filename = segments.last().copied().unwrap_or_default();
     if !maven::is_jvm_archive_name(filename) {
         return Some(maven::JvmScanTarget {
-            path,
+            path: path.to_string(),
             coordinate: None,
         });
     }
@@ -129,7 +130,10 @@ fn sbt_scan_target(path: &str) -> Option<maven::JvmScanTarget<'_>> {
                 version: version.to_string(),
             }
         });
-        return Some(maven::JvmScanTarget { path, coordinate });
+        return Some(maven::JvmScanTarget {
+            path: path.to_string(),
+            coordinate,
+        });
     }
     maven::maven_scan_target(path)
 }
@@ -179,7 +183,7 @@ async fn serve_scanned_sbt_virtual(
     proxy: &crate::services::proxy_service::ProxyService,
     virtual_id: uuid::Uuid,
     request_path: &str,
-    target: &maven::JvmScanTarget<'_>,
+    target: &maven::JvmScanTarget,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_id).await?;
@@ -197,6 +201,7 @@ async fn serve_scanned_sbt_virtual(
             &local_fetch,
             "application/octet-stream",
             None,
+            Some(ctx),
         )
     };
     let scanned = |member: crate::models::repository::Repository, policy| async move {
@@ -205,7 +210,7 @@ async fn serve_scanned_sbt_virtual(
             state,
             proxy,
             (member.id, &member.key, &upstream_url),
-            target.path,
+            &target.path,
             target.coordinate.as_ref(),
             policy,
             ctx,
@@ -227,6 +232,7 @@ async fn serve_scanned_sbt_virtual(
         members,
         Some(proxy),
         request_path,
+        Some(ctx),
         &local_fetch,
     )
     .await?;
@@ -330,20 +336,14 @@ async fn download_by_path(
                     // checksums pass through, and a repository that has not
                     // enabled scan-on-proxy keeps the streaming path below.
                     if let Some(target) = sbt_scan_target(artifact_path) {
-                        if crate::services::scan_config_service::ScanConfigService::new(
-                            state.db.clone(),
-                        )
-                        .is_proxy_scan_enabled(repo.id)
-                        .await
-                        .unwrap_or(false)
+                        if let Some(policy) =
+                            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                         {
-                            let policy =
-                                proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                             return serve_scanned_sbt_archive(
                                 &state,
                                 proxy,
                                 (repo.id, &repo_key, upstream_url),
-                                target.path,
+                                &target.path,
                                 target.coordinate.as_ref(),
                                 policy,
                                 &ctx,
@@ -398,6 +398,7 @@ async fn download_by_path(
                     state.proxy_service.as_deref(),
                     repo.id,
                     artifact_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -550,6 +551,14 @@ async fn upload_artifact(
         "application/java-archive"
     };
 
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
+
     // Store the file. #2624: on shared cloud namespaces new objects embed the
     // repository id (`sbt/{repository_id}/{path}`) so keys can never collide
     // across repositories; filesystem backends and STORAGE_KEY_SCHEME=flat
@@ -589,6 +598,13 @@ async fn upload_artifact(
 
     let size_bytes = body.len() as i64;
 
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -608,9 +624,10 @@ async fn upload_artifact(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -1504,5 +1521,51 @@ mod scan_on_proxy_tests {
         tdh::cleanup_member_repo(&fx.pool, held, &held_dir).await;
         tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: sbt `(cache_key, scannable)` decisions, through the Maven
+/// helper both JVM routes share, for the Ivy and the Maven layouts.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn sbt_serve_key_table() {
+        for (path, key, scannable) in [
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar/",
+                "org.acme/widget_2.13/1.0/jars/widget_2.13.jar",
+                true,
+            ),
+            (
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                "org.acme/widget_2.13/1.0/ivys/ivy.xml",
+                false,
+            ),
+            (
+                "org/acme/widget_2.13/1.0/widget_2.13-1.0.pom",
+                "org/acme/widget_2.13/1.0/widget_2.13-1.0.pom",
+                false,
+            ),
+        ] {
+            let got = maven::jvm_proxy_serve_key(path);
+            assert_eq!(
+                (got.cache_key.as_str(), got.scannable),
+                (key, scannable),
+                "{path}"
+            );
+            let target = sbt_scan_target(path);
+            assert_eq!(target.is_some(), scannable, "{path}");
+            if let Some(target) = target {
+                assert_eq!(target.path, key, "{path}");
+            }
+        }
     }
 }

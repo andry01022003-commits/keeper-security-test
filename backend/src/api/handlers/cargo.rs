@@ -10,6 +10,7 @@
 //!   GET  /cargo/{repo_key}/api/v1/crates/{name}/{version}/download - Download crate
 //!   GET  /cargo/{repo_key}/index/*path                             - Sparse index lookup
 
+use crate::api::handlers::upload_body::UploadBody;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -270,9 +271,10 @@ async fn index_cksum_at(
 /// URL builder has no access to (and the Virtual path never resolves one), so
 /// that marker — which no known registry uses in practice — is left literal
 /// rather than half-substituted, the same failure shape it had before.
-/// `{prefix}` is computed from the name as passed (both callers hand over the
-/// lowercased name, so `{prefix}` and `{lowerprefix}` coincide here; the
-/// distinct expansions stay for spec fidelity).
+/// `{crate}` and `{prefix}` use the name as passed, which both callers hand
+/// over in the CANONICAL spelling the client requested (#4339): crates.io
+/// serves a `.crate` only under its canonical name (`Inflector`, not
+/// `inflector`), so a mixed-case crate's prefix differs from `{lowerprefix}`.
 fn build_download_url(dl_url: &str, name: &str, version: &str) -> String {
     let is_template = [
         "{crate}",
@@ -332,8 +334,9 @@ fn split_url(url: &str) -> Option<(String, String)> {
 }
 
 /// Resolve each Remote member's `dl` download template for the Virtual
-/// download path (#3952), returning `member.id -> absolute download URL` for
-/// the requested `{name_lower}@{version}`.
+/// download path (#3952), returning `member.id -> download URL` for the
+/// requested `{name}@{version}`. `name` is the canonical spelling the client
+/// requested, which is the only spelling crates.io serves (#4339).
 ///
 /// Every step degrades to "no entry", which hands the member the canonical
 /// `api/v1/crates/{name}/{version}/download` path against its own
@@ -343,6 +346,11 @@ fn split_url(url: &str) -> Option<(String, String)> {
 /// * a member that is not Remote, or has no `upstream_url`, or whose
 ///   `config.json` cannot be fetched/parsed, gets no entry;
 /// * a member whose `config.json` carries no `dl` gets no entry.
+///
+/// Except for a mixed-case name (#4339): the canonical path the resolver would
+/// fall back to is the LOWERCASE cache key, which crates.io 404s, so such a
+/// member gets the canonical-name path relative to its own `upstream_url`
+/// instead (`build_upstream_url` joins a relative fetch path onto it).
 ///
 /// The one deliberate member-scoped failure is SSRF: a hostile or
 /// misconfigured `config.json` could set `dl` to a cloud-metadata or internal
@@ -355,7 +363,7 @@ fn split_url(url: &str) -> Option<(String, String)> {
 async fn resolve_virtual_member_dl_urls(
     state: &SharedState,
     members: &[crate::models::repository::Repository],
-    name_lower: &str,
+    name: &str,
     version: &str,
 ) -> HashMap<uuid::Uuid, String> {
     let mut urls = HashMap::new();
@@ -364,6 +372,9 @@ async fn resolve_virtual_member_dl_urls(
     }
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
     let index_url_overrides = fetch_index_upstream_overrides(&state.db, &member_ids).await;
+    // #4339: the resolver's own fallback is the lowercase cache key.
+    let canonical_fallback =
+        (name != name.to_ascii_lowercase()).then(|| canonical_crate_download_path(name, version));
     for member in members {
         if member.repo_type != RepositoryType::Remote {
             continue;
@@ -372,23 +383,38 @@ async fn resolve_virtual_member_dl_urls(
             continue;
         };
         let base_url = resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
-        let Some(dl_url) = fetch_dl_template(state, member.id, &member.key, &base_url).await else {
-            continue;
+        let resolved = match fetch_dl_template(state, member.id, &member.key, &base_url).await {
+            Some(dl_url) => {
+                let full = build_download_url(&dl_url, name, version);
+                match validate_outbound_url(&full, "Cargo upstream download URL") {
+                    Ok(()) => Some(full),
+                    Err(e) => {
+                        tracing::warn!(
+                            member_key = %member.key,
+                            crate_name = %name,
+                            error = %e,
+                            "virtual member's config.json `dl` failed SSRF validation; \
+                             falling back to its index host for this download"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
         };
-        let full = build_download_url(&dl_url, name_lower, version);
-        if let Err(e) = validate_outbound_url(&full, "Cargo upstream download URL") {
-            tracing::warn!(
-                member_key = %member.key,
-                crate_name = %name_lower,
-                error = %e,
-                "virtual member's config.json `dl` failed SSRF validation; \
-                 falling back to its index host for this download"
-            );
-            continue;
+        if let Some(url) = resolved.or_else(|| canonical_fallback.clone()) {
+            urls.insert(member.id, url);
         }
-        urls.insert(member.id, full);
     }
     urls
+}
+
+/// The `api/v1/crates/{name}/{version}/download` path under the crate's
+/// canonical (as-requested) name: what a registry without a `dl` template is
+/// asked for. The proxy cache key stays [`crate_serve_key`] on the lowercase
+/// name, so every spelling shares one cache entry (#4339).
+fn canonical_crate_download_path(name: &str, version: &str) -> String {
+    format!("api/v1/crates/{}/{}/download", name, version)
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,6 +1733,13 @@ async fn store_crate_artifact(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
     let storage_key = format!("cargo/{}/{}/{}", name_lower, crate_version, filename);
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        crate_bytes.len() as i64,
+    )
+    .await?;
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
@@ -1729,6 +1762,13 @@ async fn store_crate_artifact(
     .await
     .map_err(|e| e.into_response())?;
 
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1748,9 +1788,10 @@ async fn store_crate_artifact(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -1804,7 +1845,7 @@ async fn publish(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: a read-scoped service-account token must not be
     // accepted for `cargo publish`. Enforce the write scope on the token
@@ -1909,6 +1950,11 @@ async fn download(
 ) -> Result<Response, Response> {
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
+    // #4365 item 3: the name and version are joined into the upstream path.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&name, &version],
+    )?;
 
     // Curation enforcement (#2930): block a curated crate before it is resolved
     // locally or proxied from upstream. The cargo handler's private `RepoInfo`
@@ -1980,13 +2026,16 @@ async fn download(
                     // This handles split-host registries like crates.io where
                     // the index lives at index.crates.io but downloads come
                     // from crates.io/api/v1/crates.
-                    let fallback_path =
-                        format!("api/v1/crates/{}/{}/download", name_lower, version);
+                    // #4339: the upstream is asked for the CANONICAL name the
+                    // client requested (cargo always sends the spelling the
+                    // index carries); crates.io 404s any other spelling. Only
+                    // the cache key and the catalog use the lowercase name.
+                    let fallback_path = canonical_crate_download_path(&name, &version);
                     let (dl_base, dl_path) = match resolve_upstream_dl_url(&state, &repo, &repo_key)
                         .await
                     {
                         Some(dl_url) => {
-                            let full = build_download_url(&dl_url, &name_lower, &version);
+                            let full = build_download_url(&dl_url, &name, &version);
                             // Validate the resolved download URL against SSRF.
                             // A malicious upstream config.json could set `dl` to
                             // a cloud metadata endpoint or internal service URL.
@@ -2001,7 +2050,7 @@ async fn download(
                     // Use the canonical local cache path regardless of which
                     // upstream URL was resolved so that subsequent requests hit
                     // the proxy cache even after a config.json TTL change.
-                    let cache_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                    let cache_path = crate_serve_key(&name_lower, &version).cache_key;
 
                     // Stream the crate rather than buffering it (#895 / #2192,
                     // the cargo instance of that class). This used to be a
@@ -2063,8 +2112,9 @@ async fn download(
                     // bytes without consulting a verdict. Same cache key, same
                     // index `cksum` check. Repositories that have not opted in
                     // keep the untouched streaming path.
-                    if crate_proxy_scan_enabled(&state, repo.id).await {
-                        let policy = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
+                    if let Some(policy) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                    {
                         let coordinate = CrateCoordinate {
                             name: &name_lower,
                             version: &version,
@@ -2128,7 +2178,7 @@ async fn download(
             }
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
-                let upstream_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                let upstream_path = crate_serve_key(&name_lower, &version).cache_key;
 
                 // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s;
                 // narrowed to name + EXACT VERSION by #3953). If a non-Remote
@@ -2244,7 +2294,7 @@ async fn download(
                 // guard suppressed the proxy: Remote members cannot serve
                 // then, so no `config.json` round-trip is owed to them.
                 let member_fetch_urls = if proxy_for_virtual.is_some() {
-                    resolve_virtual_member_dl_urls(&state, &members, &name_lower, &version).await
+                    resolve_virtual_member_dl_urls(&state, &members, &name, &version).await
                 } else {
                     HashMap::new()
                 };
@@ -2375,13 +2425,17 @@ fn virtual_crate_response(
     streamed_crate_response(filename, content_type, result)
 }
 
-/// Whether scan-on-proxy is on for `repo_id`. An unreadable config is off,
-/// the same reading the npm / PyPI serve paths take.
-async fn crate_proxy_scan_enabled(state: &SharedState, repo_id: uuid::Uuid) -> bool {
-    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .is_proxy_scan_enabled(repo_id)
-        .await
-        .unwrap_or(false)
+/// The canonical `(cache_key, scannable)` decision for a proxied `.crate`
+/// (#4365 item 1): every download is a package, cached under the canonical
+/// `api/v1/crates/{name}/{version}/download` path whichever upstream URL
+/// serves it.
+fn crate_serve_key(
+    name_lower: &str,
+    version: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!(
+        "api/v1/crates/{name_lower}/{version}/download"
+    ))
 }
 
 type CrateScanPolicy = (
@@ -2612,6 +2666,7 @@ async fn resolve_unscanned_crate_members(
         proxy,
         coordinate.cache_path,
         member_fetch_urls,
+        Some(coordinate.ctx),
         |member_id, location| async move {
             proxy_helpers::local_fetch_by_name_version(
                 &state.db, state, member_id, &location, name, version,
@@ -2643,19 +2698,13 @@ async fn serve_scanned_virtual_crate(
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
 ) -> Option<Result<Response, Response>> {
-    let mut policies = Vec::with_capacity(members.len());
-    for member in members {
-        let policy = if member.repo_type == RepositoryType::Remote && member.upstream_url.is_some()
-        {
-            let (enabled, action, severity_gate) =
-                proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_id, member.id)
-                    .await;
-            enabled.then_some((action, severity_gate))
-        } else {
-            None
+    // One batched read for the virtual and its Remote members; an unreadable
+    // config fails the walk closed with a 503 (#4365 item 5).
+    let policies =
+        match proxy_helpers::virtual_member_scan_policies(&state.db, virtual_id, members).await {
+            Ok(policies) => policies,
+            Err(resp) => return Some(Err(resp)),
         };
-        policies.push(policy);
-    }
     if policies.iter().all(Option::is_none) {
         return None;
     }
@@ -6829,6 +6878,46 @@ mod catalog_registration_tests {
         assert_eq!(row.description.as_deref(), Some("a catalogued crate"));
     }
 
+    /// #4422: `cargo publish` into a repository whose quota the crate would
+    /// exceed is refused with the generic upload route's 507 and leaves no
+    /// artifact row.
+    #[tokio::test]
+    async fn crate_publish_is_refused_by_repository_quota_4422() {
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 10 WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/api/v1/crates/new", fx.repo_key),
+                publish_body("quota-crate", "0.1.0", "over the cap"),
+            ),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            "{body}"
+        );
+        assert!(body.contains("Repository storage quota exceeded"), "{body}");
+        assert_eq!(rows, 0, "a refused publish must leave no artifact row");
+    }
+
     /// #3411: a native publish must fire `artifact.uploaded` exactly once.
     ///
     /// The native format handlers write their `artifacts` row directly instead
@@ -8658,6 +8747,74 @@ mod age_gate_tests {
         rig.teardown().await;
     }
 
+    /// #4339: crates.io serves a `.crate` only under the crate's CANONICAL
+    /// name (non-canonical downloads 404 since 2023-12-18), and cargo always
+    /// requests that spelling, so `Inflector` must reach the upstream as
+    /// `Inflector`. The Remote arm used to build the upstream path from the
+    /// lowercased name and 404ed every crate with an uppercase letter. The
+    /// mock serves only the canonical path, as crates.io does.
+    #[tokio::test]
+    async fn test_remote_download_keeps_canonical_mixed_case_crate_name_4339() {
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let body = b"the Inflector crate".repeat(8);
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/crates/Inflector/0.11.4/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/crates/inflector/0.11.4/download"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let (status, served) = tdh::send(
+            tdh::router_anon(mounted_router(), state),
+            tdh::get(format!(
+                "/cargo/{}/api/v1/crates/Inflector/0.11.4/download",
+                fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a mixed-case crate must be fetched under its canonical name; got {}",
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(&served[..], &body[..]);
+    }
+
+    /// #4339 on the Virtual walk: a Remote member with no `dl` template falls
+    /// back to the canonical `api/v1/crates/{name}/{version}/download` path
+    /// against its own upstream, and that path must carry the canonical name
+    /// too. The proxy cache stays keyed on the lowercase name.
+    #[tokio::test]
+    async fn test_virtual_download_keeps_canonical_mixed_case_crate_name_4339() {
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let member = rig.add_remote(1, false, true).await;
+        let body = b"the Inflector crate via a virtual".repeat(8);
+        rig.mount_download(member, "Inflector", "0.11.4", &body, 1)
+            .await;
+        let (status, served, _) = rig.get(rig.download_uri("Inflector", "0.11.4")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a mixed-case crate must be fetched under its canonical name; got {}",
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(&served[..], &body[..]);
+        rig.teardown().await;
+    }
+
     /// #3952 companion for the handler test above:
     /// `resolve_virtual_member_dl_urls` itself. The member whose `config.json`
     /// names a public download host gets an expanded `{crate}`/`{version}` URL
@@ -9573,6 +9730,30 @@ mod age_gate_tests {
             assert_eq!(scan_header(&headers), None);
             assert_eq!(&served[..], &body[..]);
             rig.teardown().await;
+        }
+    }
+}
+
+/// #4365 item 1: Cargo decides by route (every download is a crate); the
+/// cache key is the canonical download path whichever `dl` URL served it.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn crate_serve_key_table() {
+        for (name, version, key) in [
+            ("serde", "1.0.0", "api/v1/crates/serde/1.0.0/download"),
+            (
+                "tokio-util",
+                "0.7.10-alpha.1",
+                "api/v1/crates/tokio-util/0.7.10-alpha.1/download",
+            ),
+        ] {
+            let got = crate_serve_key(name, version);
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
         }
     }
 }

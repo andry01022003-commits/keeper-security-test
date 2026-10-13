@@ -64,12 +64,49 @@ with bounded memory):
   and then written to the backend, so each concurrent completion needs the full
   artifact size.
 - Incus/LXC image uploads (monolithic and chunked).
+- Git LFS object uploads (`PUT /lfs/{key}/objects/{oid}`), up to 2 GB each.
 - Format-native publish routes that stream to staging: Ansible, Chef, Helm,
   JetBrains, Maven, NuGet, Pub, PyPI, Swift and Terraform.
 
 Other format-native publish routes (npm, Cargo, Debian, RubyGems and similar)
 read the request body into memory instead of onto disk, bounded by
 `MAX_UPLOAD_SIZE` per request; size replica memory for those, not scratch disk.
+
+The routes that open the package to validate it (conda, RubyGems, npm, Cargo,
+Composer, Hex, VS Code, Go modules, Alpine, Pacman, CRAN and RPM) receive the
+body into one buffer of exactly its declared size, charged to a process-wide
+budget, `UPLOAD_MEMORY_BUDGET_BYTES` (#4609). Unset, the budget is half the
+container's cgroup memory limit (no cap without a limit); `0` disables it. An
+upload that does not fit while others hold the budget is refused at once with
+`503` and `Retry-After`, and one larger than the whole budget with `413`, so
+concurrent large uploads are shed instead of getting the replica OOM-killed.
+Size the replica's memory limit at roughly twice the largest package you expect
+on these routes, plus the concurrency you want to admit.
+
+Conan recipe and package files are received the same way (#4329), so a
+`conan_package.tgz` cut short is refused with `408` and nothing is stored.
+Conan file transfers (`/conan/.../files/<name>`) are also exempt from the
+request timeout described below.
+
+## When an upload cannot be received
+
+The server only parses a package after it has received the whole body. When it
+cannot, the response says why, so a client does not go debugging a package that
+was never the problem (#4609):
+
+| Situation | Response |
+|---|---|
+| The body ended before its `Content-Length`, or the connection broke | `408`, `{"code": "incomplete_body"}` |
+| The body made too little progress (see below) | `408` |
+| The in-memory upload budget is in use by other uploads, or the buffer could not be allocated | `503` + `Retry-After`, `{"code": "upload_capacity_exhausted"}` |
+| Reading the body failed for a reason that is not the client's | `503` + `Retry-After`, `{"code": "upload_receive_failed"}` |
+| The scratch or storage disk is full (or over quota) | `507` + `Retry-After`, `{"code": "insufficient_storage"}` |
+| The scratch file could not be written for another reason | `503` + `Retry-After`, `{"code": "upload_spool_failed"}` |
+| The body is larger than `MAX_UPLOAD_SIZE` | `413` |
+
+A `400` from a publish route therefore means the complete package was received
+and is itself invalid. The server-side cause of a `503` or `507` is logged at
+`error`; the response carries a fixed message.
 
 ## Sizing rule of thumb
 
@@ -79,9 +116,32 @@ scratch bytes ≈ (largest expected artifact) × (concurrent spooling uploads pe
 
 `MAX_UPLOAD_SIZE` (default 10 GiB) caps a single spooled body. A replica that
 accepts *N* concurrent spooling uploads of that size can need up to *N* ×
-`MAX_UPLOAD_SIZE` of free scratch space at once. Artifact Keeper does not cap
-upload concurrency itself; your ingress and clients do, so measure it from
-your traffic rather than assuming the worst case.
+`MAX_UPLOAD_SIZE` of free scratch space at once. Artifact Keeper caps upload
+concurrency per principal (below) and overall (`GLOBAL_MAX_CONCURRENCY`,
+default 512 requests of any kind), but most deployments run far below those
+caps, so measure concurrency from your traffic rather than assuming the worst
+case.
+
+## Limits on slow and concurrent uploads
+
+Upload and download routes are exempt from the router-wide
+`GLOBAL_REQUEST_TIMEOUT_SECS` wall-clock timeout, because that clock includes
+the time the client spends sending the body (#3263). Two other limits keep a
+slow or stalled upload from holding server capacity indefinitely
+(GHSA-9f9r-c4w8-rjv9):
+
+| Setting | Default | Effect |
+|---|---|---|
+| `UPLOAD_PROGRESS_WINDOW_SECS` | `60` | An upload body that delivers fewer than `UPLOAD_MIN_PROGRESS_BYTES` during one window spent waiting for data is aborted with `408 Request Timeout`, and its scratch file is removed. `0` disables the deadline. |
+| `UPLOAD_MIN_PROGRESS_BYTES` | `16384` | The bytes required per window (about 270 B/s at the default window). |
+| `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL` | `64` | Concurrent uploads one user, or one client address for an anonymous caller, may have in flight on the native-format routes, the repository artifact routes and `/api/v1/uploads`. Further uploads get `429 Too Many Requests` with `Retry-After`. `0` disables the cap. |
+
+Time the server spends on its own work (authentication, database lookups,
+writing to the storage backend) does not count against the progress window;
+only time spent waiting for the client to send does. Health and readiness
+probes (`/health`, `/healthz`, `/ready`, `/readyz`, `/livez`) are never refused
+by the `GLOBAL_MAX_CONCURRENCY` limit, so a replica saturated by uploads still
+reports itself alive.
 
 Practical guidance:
 

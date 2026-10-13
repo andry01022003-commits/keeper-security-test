@@ -14,6 +14,7 @@
 //!   PUT  /rpm/{repo_key}/packages/*path              - Upload RPM package
 //!   POST /rpm/{repo_key}/upload                      - Upload RPM (alternative)
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -2365,7 +2366,7 @@ async fn upload_package_put(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, pkg_path)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
@@ -2393,7 +2394,7 @@ async fn upload_relative(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
@@ -2421,7 +2422,7 @@ async fn upload_package_post(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
@@ -5492,8 +5493,12 @@ mod tests {
             Outsider,
             Insider,
             // The fixture user through a repository-scoped token that covers
-            // the virtual and the public member only.
+            // the public member only. The virtual is public, so the token
+            // reaches it without naming it, and gets no #4559 parent term.
             Scoped,
+            // The same user through a token scoped to the virtual only: the
+            // #4559 parent term reaches every member the user may read.
+            VirtualScoped,
         }
         let public_id = members[0];
         let fetch = |caller: Caller, file: &'static str| {
@@ -5508,9 +5513,13 @@ mod tests {
                 Caller::Scoped => {
                     let mut auth = tdh::make_auth(f.user_id, &f.username);
                     auth.allowed_repo_ids =
-                        crate::models::access_scope::AccessScope::Restricted(vec![
-                            f.repo_id, public_id,
-                        ]);
+                        crate::models::access_scope::AccessScope::Restricted(vec![public_id]);
+                    tdh::router_with_auth(super::router(), f.state.clone(), auth)
+                }
+                Caller::VirtualScoped => {
+                    let mut auth = tdh::make_auth(f.user_id, &f.username);
+                    auth.allowed_repo_ids =
+                        crate::models::access_scope::AccessScope::Restricted(vec![f.repo_id]);
                     tdh::router_with_auth(super::router(), f.state.clone(), auth)
                 }
             };
@@ -5559,6 +5568,7 @@ mod tests {
         let pubkey_served = fetch(Caller::Anonymous, "repomd.xml.key").await;
         // A repository-scoped token narrows the set below the user's grants.
         let scoped = docs(Caller::Scoped).await;
+        let virtual_scoped = docs(Caller::VirtualScoped).await;
         // Revoking the private grant: the caller no longer gets the old set's
         // cached render.
         sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
@@ -5654,6 +5664,11 @@ mod tests {
             names(&scoped),
             [true, false, false],
             "a repository-scoped token must narrow the member set to its ceiling"
+        );
+        assert_eq!(
+            names(&virtual_scoped),
+            [true, true, true],
+            "#4559: a token scoped to the virtual reads every member its owner may read"
         );
         assert_eq!(
             names(&revoked),

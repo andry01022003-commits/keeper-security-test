@@ -243,10 +243,14 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // -- PyPI family ----------------------------------------------------
         // The simple index (`simple/`, `simple/<pkg>/`) is mutable; the wheels
         // and sdists it points at are immutable.
-        RepositoryFormat::Pypi
-        | RepositoryFormat::Poetry
-        | RepositoryFormat::Conda
-        | RepositoryFormat::Jupyter => classify_pypi(&lower, speaks_pep658(format)),
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter => {
+            classify_pypi(&lower, speaks_pep658(format))
+        }
+
+        // -- conda ----------------------------------------------------------
+        // Packages and CEP-16 shards (content-addressed) are immutable;
+        // repodata and the shard index are rewritten in place.
+        RepositoryFormat::Conda => classify_conda(&lower),
 
         // -- npm family -----------------------------------------------------
         // The packument (the metadata JSON at `<pkg>` / `@scope/<pkg>`) is
@@ -380,42 +384,41 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
 
 /// Whether a Maven coordinate may be REPUBLISHED in place, i.e. whether a
 /// second upload to the same `artifacts.path` legitimately replaces the first
-/// (#3839).
+/// (#3839, #4476).
 ///
-/// This is the upload-side face of [`classify_maven`] and deliberately shares
-/// its two predicates ([`has_snapshot_component`] and
-/// [`is_unique_snapshot_artifact`]) so the Maven PUT handler and the proxy
-/// cache cannot drift apart on what "SNAPSHOT" means. Before #3839 the handler
-/// re-derived the rule as `version.contains("SNAPSHOT")`, which disagreed with
-/// the classifier twice over: it let a RESOLVED unique snapshot
-/// (`app-1.0-20260827.132833-10.jar`, a filename that names exactly one
-/// deployment and which `classify` calls `Immutable`) be silently overwritten,
-/// and it read a version that merely CONTAINS the token (`1.0-SNAPSHOT-rc1`)
-/// as a snapshot where the classifier's component-wise `ends_with` reads it as
-/// a release.
+/// Republishable:
 ///
-/// Only the two genuinely in-place coordinates are republishable:
-///
-/// * `maven-metadata.xml` and its checksum/signature siblings — rewritten on
+/// * `maven-metadata.xml` and its checksum/signature siblings, rewritten on
 ///   every deploy by definition, and
-/// * a NON-unique snapshot under a `-SNAPSHOT` version directory
-///   (`app-1.0-SNAPSHOT.jar`, or an Ivy-layout `mylib.jar`), which is the
-///   #3295 behaviour this must preserve.
+/// * every file under a `-SNAPSHOT` version DIRECTORY: a non-unique snapshot
+///   (`app-1.0-SNAPSHOT.jar`, or an Ivy-layout `mylib.jar`, the #3295 case)
+///   AND a resolved unique snapshot (`app-1.0-20260827.132833-10.jar`).
 ///
-/// Everything else — every release coordinate, and a resolved unique snapshot —
-/// is answered with `409 Conflict` by the caller. Note this is intentionally
-/// NOT `!classify(..).is_immutable()`: `classify_maven` falls back to *mutable*
-/// for a leaf whose extension it does not recognise (so the proxy revalidates
-/// rather than caching an unknown file forever), and inheriting that fallback
-/// here would turn every unrecognised extension under a RELEASE version into an
-/// overwritable coordinate.
+/// The unique-snapshot half is #4476. #3839 made a timestamped snapshot file
+/// immutable on upload, because [`classify_maven`] caches it forever in a
+/// proxy. On the hosted PUT path that broke `mvn deploy` for any build that
+/// uploads the same attached artifact twice in one execution (both uploads
+/// carry the same timestamp and build number), which every release up to
+/// 1.8.0 accepted and which the Maven guide documents: snapshots "can be
+/// overwritten". A snapshot repository is mutable by contract, so the PUT
+/// path follows that contract; the proxy-cache classification is a separate
+/// question and is unchanged.
+///
+/// The SNAPSHOT test stays the classifier's path-COMPONENT test
+/// ([`has_snapshot_component`], #3554), so a version that merely CONTAINS the
+/// token (`1.0-SNAPSHOT-rc1`) is still a release, and every release
+/// coordinate is still answered `409 Conflict` by the caller. Note this is
+/// intentionally NOT `!classify(..).is_immutable()`: `classify_maven` falls
+/// back to *mutable* for a leaf whose extension it does not recognise (so the
+/// proxy revalidates rather than caching an unknown file forever), and
+/// inheriting that fallback here would turn every unrecognised extension under
+/// a RELEASE version into an overwritable coordinate.
 pub fn maven_coordinate_is_republishable(path: &str) -> bool {
     let lower = path.trim_start_matches('/').to_ascii_lowercase();
-    let leaf = leaf(&lower);
-    if leaf.starts_with("maven-metadata.xml") {
+    if leaf(&lower).starts_with("maven-metadata.xml") {
         return true;
     }
-    has_snapshot_component(&lower) && !is_unique_snapshot_artifact(leaf)
+    has_snapshot_component(&lower)
 }
 
 /// Maven §2.1: only `maven-metadata.xml*` is mutable.
@@ -546,6 +549,25 @@ fn classify_pypi(lower: &str, pep658: bool) -> Mutability {
     Mutability::mutable_default()
 }
 
+/// conda: `.conda` / `.tar.bz2` packages are immutable (they share the PyPI
+/// package-file rule, without the PEP 658 sidecar protocol, #3356), and so is
+/// a CEP-16 shard, `<sha256>.msgpack.zst`, which is addressed by the hash of
+/// its bytes (#4577). `repodata.json`, the shard index
+/// (`repodata_shards.msgpack.zst`) and every other channel document are
+/// rewritten in place and stay mutable.
+fn classify_conda(lower: &str) -> Mutability {
+    if is_conda_shard_file(leaf(lower)) {
+        return Mutability::Immutable;
+    }
+    classify_pypi(lower, false)
+}
+
+/// Whether a (lower-cased) leaf is a CEP-16 shard file name.
+fn is_conda_shard_file(leaf: &str) -> bool {
+    leaf.strip_suffix(".msgpack.zst")
+        .is_some_and(|stem| stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// npm §2.1: packument metadata is mutable; tarballs are immutable.
 fn classify_npm(lower: &str) -> Mutability {
     // Only a *real package tarball* is immutable. In the canonical npm registry
@@ -641,11 +663,23 @@ fn classify_cargo(lower: &str) -> Mutability {
 ///   `.debian.tar.*`.
 /// - **dists/**: Release, InRelease, Packages, Sources, Translation, Contents,
 ///   dep11, etc. are rewritten in place by upstream on each publish.
+/// - **flat repositories** (#4619, `deb <uri> /`): there is no `pool/` or
+///   `dists/` tree; the binary packages sit wherever the `Packages`
+///   `Filename:` says (`amd64/kubectl_1.34.0-1.1_amd64.deb` on pkgs.k8s.io).
+///   They are version-pinned by the same rule as `pool/`, so a binary package
+///   outside `dists/` is immutable. Under `dists/` (#3596 vendor layouts) the
+///   classification is unchanged.
 fn classify_debian(lower: &str) -> Mutability {
-    if lower.contains("/by-hash/") {
+    if lower.contains("/by-hash/") || lower.starts_with("by-hash/") {
         return Mutability::Immutable;
     }
     if lower.starts_with("pool/") || lower.contains("/pool/") {
+        return Mutability::Immutable;
+    }
+    let leaf = leaf(lower);
+    let is_binary_package =
+        leaf.ends_with(".deb") || leaf.ends_with(".udeb") || leaf.ends_with(".ddeb");
+    if is_binary_package && !lower.starts_with("dists/") {
         return Mutability::Immutable;
     }
     Mutability::mutable_default()
@@ -1121,6 +1155,22 @@ mod tests {
             (Conda, "linux-64/repodata.json", false),
             (Conda, "linux-64/numpy-1.26.4-py312.conda.metadata", false),
             (Conda, "linux-64/numpy-1.26.4-py312.tar.bz2.metadata", false),
+            // CEP-16 (#4577): a shard is content-addressed and immutable in
+            // both published layouts (`shards/` as prefix.dev serves it, and
+            // beside the index as conda.anaconda.org does); the shard index
+            // is rewritten in place.
+            (
+                Conda,
+                "noarch/shards/95f5d933b0b2eb6b655f89936ae28ffc2f2f4b90f0365b773d09e4562f25a233.msgpack.zst",
+                true,
+            ),
+            (
+                Conda,
+                "noarch/95f5d933b0b2eb6b655f89936ae28ffc2f2f4b90f0365b773d09e4562f25a233.msgpack.zst",
+                true,
+            ),
+            (Conda, "noarch/repodata_shards.msgpack.zst", false),
+            (Conda, "noarch/shards/not-a-hash.msgpack.zst", false),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),
             (Npm, "@types/node", false),
@@ -1179,6 +1229,14 @@ mod tests {
             (Debian, "dists/bookworm/i18n/Translation-en.bz2", false),
             (Debian, "dists/bookworm/main/source/Sources.xz", false),
             (Debian, "dists/bookworm/main/Contents-amd64.gz", false),
+            // #4619 flat repository (`deb <uri> /`): the indices at the root
+            // are rewritten in place, the packages next to them are pinned.
+            (Debian, "InRelease", false),
+            (Debian, "Release.gpg", false),
+            (Debian, "Packages.gz", false),
+            (Debian, "amd64/kubectl_1.34.0-1.1_amd64.deb", true),
+            (Debian, "foo_1.0_all.deb", true),
+            (Debian, "by-hash/SHA256/abc123def456", true),
             // GitHub-shaped paths must not change generic write permissions.
             (
                 Generic,

@@ -193,6 +193,32 @@ async fn await_tee_publish(metadata_key: &str) -> bool {
     true
 }
 
+/// Drop this process's memoised sidecar lookup for `metadata_key` before a
+/// streaming re-enter (#4013).
+///
+/// The metadata LRU memoises a MISS (`None`) for [`PROXY_METADATA_LRU_TTL`].
+/// The cache check that preceded the election stored exactly that miss, and
+/// the leader that has since filled the entry may live on another replica,
+/// whose publish invalidated only its own process's LRU. Without this the
+/// re-enter re-reads the stale miss for up to 30 s and elects a second
+/// upstream fetch of an object that is already in the shared cache.
+async fn forget_cached_sidecar_miss(metadata_key: &str) {
+    let lru = proxy_metadata_lru().await;
+    if matches!(lru.get(metadata_key).await, Some(None)) {
+        lru.invalidate(metadata_key).await;
+    }
+}
+
+/// Completion signal of the streaming publish registered for `metadata_key`
+/// (#4013): flips to `true` when its writer task ends (commit, reject or
+/// error). Read right after [`CachePersister::tee_stream`] registered it, so
+/// it is this leader's own publish. `None` when nothing is registered.
+fn tee_publish_done(metadata_key: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+    lock_tee_publish_registry()
+        .get(metadata_key)
+        .map(|entry| entry.done_rx.clone())
+}
+
 /// Response from an upstream registry fetch.
 pub(crate) struct UpstreamResponse {
     pub(crate) content: Bytes,
@@ -222,6 +248,9 @@ pub(crate) struct UpstreamResponse {
     pub(crate) commit_sha: Option<String>,
     pub(crate) effective_url: String,
     pub(crate) link: Option<String>,
+    /// Upstream `X-Terraform-Get`, when it sent one: where a Terraform module
+    /// registry's `.../download` endpoint says the module source lives (#4590).
+    pub(crate) terraform_get: Option<String>,
 }
 
 /// Streaming response from an upstream registry fetch. Used by the
@@ -874,6 +903,241 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// The error for an OCI token endpoint that answered `status` (not 2xx).
+///
+/// A 401/403 when the Remote's credentials were actually SENT to the token
+/// service means it refused them: [`AppError::UpstreamAuth`], a 502 with its
+/// own code, plus a `security`-target line naming the redacted realm so an
+/// operator sees a credentials problem rather than the `Storage error` /
+/// `MANIFEST_UNKNOWN` it used to surface as (#4453). The WARN is sampled per
+/// Remote `repo_id` ([`security_warn_admitted`]; `None` always logs).
+///
+/// A 401/403 to an ANONYMOUS token request (no credentials configured, or
+/// withheld from an untrusted cross-origin realm, #3591) is not a
+/// credentials problem the operator can fix: it keeps the `Storage`
+/// classification, so the manifest handlers report a miss, and is logged at
+/// INFO (#4527). Neither the log nor the message carries credentials. Any
+/// other status keeps the `Storage` classification.
+pub(crate) fn token_endpoint_status_error(
+    realm: &str,
+    status: StatusCode,
+    credentials_sent: bool,
+    repo_id: Option<Uuid>,
+) -> AppError {
+    let realm = redact_url_for_diagnostics(realm);
+    let refused = status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN;
+    if refused && credentials_sent {
+        if let Some(suppressed) =
+            security_warn_admitted(SampledSecurityWarn::TokenServiceRejected, repo_id)
+        {
+            tracing::warn!(
+                target: "security",
+                realm = %realm,
+                status = %status,
+                credentials_sent,
+                suppressed,
+                "upstream OCI token service rejected the proxy's authentication; check the \
+                 Remote's upstream credentials (and oci_trusted_bearer_realms for a \
+                 cross-origin realm)"
+            );
+        }
+        return AppError::UpstreamAuth(format!(
+            "upstream token service {realm} returned {status}; check the repository's \
+             upstream credentials"
+        ));
+    }
+    if refused {
+        tracing::info!(
+            realm = %realm,
+            status = %status,
+            "upstream OCI token service refused an anonymous token request (no credentials \
+             were sent); treating the object as not available"
+        );
+    }
+    AppError::Storage(format!("Token endpoint {realm} returned status {status}"))
+}
+
+/// The error for a registry that refused the request made with an
+/// ANONYMOUS bearer token (#4527): the token service got no credentials (none
+/// configured, or withheld from an untrusted cross-origin realm), so the
+/// refusal says nothing about the Remote's credentials. Usually the image
+/// does not exist or is private (Docker Hub answers 401 for a repository
+/// that does not exist). Logged at INFO; the error keeps the `BadGateway`
+/// class but NOT the `"... {status}:"` shape [`upstream_request_auth_refusal`]
+/// recognises, so an OCI manifest fetch reports a miss, never `DENIED`.
+fn anonymous_token_refused_error(status: StatusCode, url: &str) -> AppError {
+    let url = redact_url_for_diagnostics(url);
+    tracing::info!(
+        upstream = %url,
+        status = %status,
+        "upstream registry refused a request made with an anonymous bearer token (no \
+         credentials were sent); treating the object as not available"
+    );
+    AppError::BadGateway(format!(
+        "Upstream returned error status {status} for an anonymous bearer token: {url}"
+    ))
+}
+
+/// The status of an upstream `401`/`403` answer to the request ITSELF, when
+/// `err` is one (#4518): the `BadGateway` [`validate_upstream_status`] makes
+/// of a 401/403 (including one on the retry after a successful bearer token
+/// exchange), or the `Storage` error a 401 without a Bearer challenge
+/// becomes in [`UpstreamClient::fetch_buffered`] (an upstream on plain Basic
+/// auth). `None` for anything else.
+pub(crate) fn upstream_request_auth_refusal(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(msg) | AppError::Storage(msg)) = err else {
+        return None;
+    };
+    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
+        .into_iter()
+        .find(|status| msg.starts_with(&format!("Upstream returned error status {status}:")))
+}
+
+/// At most one of each upstream-auth `security` WARN per Remote per this
+/// interval (#4518, #4453, #3591); the rest are counted and the count is
+/// reported on the next one. A client pulling a missing or private image in
+/// a loop, or a Remote with wrong credentials, must not flood the security
+/// log with one line per pull.
+const SECURITY_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound on the (WARN, Remote) pairs [`security_warn_state`] tracks; past it
+/// the state is reset (each Remote then warns once more).
+const SECURITY_WARN_KEYS: usize = 4096;
+
+/// The upstream-auth `security` WARNs sampled per Remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SampledSecurityWarn {
+    /// The OCI token service refused the proxy (#4453).
+    TokenServiceRejected,
+    /// The OCI registry refused the manifest request itself (#4518).
+    RegistryRejected,
+    /// The Remote's credentials were withheld from a cross-origin bearer
+    /// realm (#3591).
+    RealmCredentialsWithheld,
+    /// The Remote's credentials were withheld from a URL on another origin
+    /// than its configured upstream (GHSA-24rf-2gv2-j47c).
+    OffOriginCredentialsWithheld,
+}
+
+type SecurityWarnState = HashMap<(SampledSecurityWarn, Uuid), (Instant, u64)>;
+
+fn security_warn_state() -> &'static std::sync::Mutex<SecurityWarnState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<SecurityWarnState>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Whether to log `warn` for Remote `repo_id` now: `Some(n)` with the number
+/// suppressed since the last one, `None` to stay quiet. Without a Remote
+/// (`None`) it always logs.
+pub(crate) fn security_warn_admitted(
+    warn: SampledSecurityWarn,
+    repo_id: Option<Uuid>,
+) -> Option<u64> {
+    let Some(repo_id) = repo_id else {
+        return Some(0);
+    };
+    security_warn_state()
+        .lock()
+        .map(|mut state| {
+            admit_sampled_warn(
+                &mut state,
+                (warn, repo_id),
+                Instant::now(),
+                SECURITY_WARN_INTERVAL,
+                SECURITY_WARN_KEYS,
+            )
+        })
+        .unwrap_or(Some(0))
+}
+
+/// Sampling decision for a rate-limited WARN keyed by `key`: `Some(n)` to
+/// log now, `n` being how many were suppressed since the last one, or `None`
+/// to stay quiet (counted) because one was logged less than `interval` ago.
+fn admit_sampled_warn<K: std::hash::Hash + Eq>(
+    state: &mut HashMap<K, (Instant, u64)>,
+    key: K,
+    now: Instant,
+    interval: Duration,
+    max_keys: usize,
+) -> Option<u64> {
+    if let Some((last, suppressed)) = state.get_mut(&key) {
+        if now.duration_since(*last) < interval {
+            *suppressed += 1;
+            return None;
+        }
+        let missed = *suppressed;
+        *last = now;
+        *suppressed = 0;
+        return Some(missed);
+    }
+    if state.len() >= max_keys {
+        state.clear();
+    }
+    state.insert(key, (now, 0));
+    Some(0)
+}
+
+/// Reclassify an OCI registry's `401`/`403` on the manifest request itself
+/// (see [`upstream_request_auth_refusal`]) for Remote `repo_id` (#4518).
+///
+/// * Credentials were sent: [`AppError::UpstreamAuth`], the error
+///   [`token_endpoint_status_error`] gives a refusing token service (#4453),
+///   so the client gets 502 `DENIED`, plus a `security`-target WARN naming
+///   the redacted URL, sampled per Remote ([`SECURITY_WARN_INTERVAL`]).
+/// * No credentials sent: the error is returned unchanged, so the client
+///   keeps 404 `MANIFEST_UNKNOWN`, and the refusal is logged at INFO. There
+///   is nothing for the operator to fix, and an anonymous refusal usually
+///   means the image does not exist or is private (Docker Hub answers 401
+///   for a repository that does not exist).
+///
+/// `credentials_sent` is "credentials configured" for the errors that reach
+/// this: the registry gets the configured credentials on the plain request,
+/// and a refusal of a bearer token obtained WITHOUT them (none configured,
+/// or withheld from an untrusted cross-origin realm) never matches
+/// [`upstream_request_auth_refusal`] ([`anonymous_token_refused_error`],
+/// #4527).
+///
+/// Any other error is returned unchanged. OCI only: generic formats keep a
+/// 403 as `BadGateway`, which some read as "not here"
+/// ([`is_upstream_forbidden`], #3886).
+pub(crate) fn oci_registry_auth_error(
+    err: AppError,
+    repo_id: Uuid,
+    url: &str,
+    credentials_sent: bool,
+) -> AppError {
+    let Some(status) = upstream_request_auth_refusal(&err) else {
+        return err;
+    };
+    let url = redact_url_for_diagnostics(url);
+    if !credentials_sent {
+        tracing::info!(
+            upstream = %url,
+            status = %status,
+            "upstream OCI registry refused an anonymous manifest request; reporting the \
+             manifest as unknown (no upstream credentials are configured)"
+        );
+        return err;
+    }
+    if let Some(suppressed) =
+        security_warn_admitted(SampledSecurityWarn::RegistryRejected, Some(repo_id))
+    {
+        tracing::warn!(
+            target: "security",
+            upstream = %url,
+            status = %status,
+            credentials_sent,
+            suppressed,
+            "upstream OCI registry rejected the proxy's authentication on a manifest request; \
+             check the Remote's upstream credentials"
+        );
+    }
+    AppError::UpstreamAuth(format!(
+        "upstream registry {url} returned {status}; check the repository's upstream credentials"
+    ))
+}
+
 /// Whether `err` is the error [`validate_upstream_status`] produces for an
 /// upstream `403 Forbidden`.
 ///
@@ -1202,6 +1466,14 @@ impl CacheMetadata {
 /// (legacy sidecar, or policy disabled at write time) allows it. The error
 /// MUST propagate to the handler — never be degraded to a cache `Miss`, which
 /// would refetch upstream and loop.
+/// How a cache entry point names the Remote whose origin policy it applies
+/// (#4506): by key or by id, when it holds no [`Repository`].
+#[derive(Clone, Copy)]
+enum RemoteRef<'a> {
+    Key(&'a str),
+    Id(Uuid),
+}
+
 fn check_quarantine_until(quarantine_until: Option<DateTime<Utc>>) -> Result<()> {
     match quarantine_until {
         Some(until) => {
@@ -1391,6 +1663,139 @@ pub(crate) fn normalize_cache_path(path: &str) -> &str {
     path.trim_start_matches('/').trim_end_matches('/')
 }
 
+/// Refuse an upstream fetch path the upstream could read as a different
+/// resource than the one requested, classified and cached (#4365 item 3).
+///
+/// `build_upstream_url` joins the path into the upstream URL verbatim, so a
+/// decoded `#` turns the rest into a fragment (never sent), a `;` into a path
+/// parameter, and a `%` that is not a valid escape is decoded again (or
+/// rejected) by the upstream. Rejecting is used instead of percent-encoding
+/// every segment, which would change the outbound URL of every format at once
+/// (npm's scoped `%2F`, OCI `sha256:` references, PyPI `+`/`~`).
+///
+/// * An absolute URL (a Helm `urls` entry, a PyPI or npm file URL from an
+///   upstream index) is the upstream's own and passes unchanged.
+/// * `#` anywhere is refused.
+/// * In the path part (before the first `?`), any segment with `;`, an
+///   ASCII control character or a `%` not followed by two hex digits is
+///   refused. Valid escapes (`%2F`, `%20`) and Go's `!` case-escaping pass.
+/// * A `?` must start a query the handler built: non-empty and with no `/`,
+///   so a decoded `?` inside a path (`x.jar?/../y.pom`, `x.jar?`) cannot
+///   push the rest of the path into the query string.
+///
+/// Every refusal is [`AppError::Validation`], a `400`, before any upstream
+/// request.
+pub(crate) fn check_upstream_fetch_path(fetch_path: &str) -> Result<()> {
+    if fetch_path.starts_with("http://") || fetch_path.starts_with("https://") {
+        return Ok(());
+    }
+    let refuse = |what: &str| {
+        Err(AppError::Validation(format!(
+            "Proxied upstream path must not contain {what}"
+        )))
+    };
+    if fetch_path.contains('#') {
+        return refuse("'#'");
+    }
+    let (path, query) = match fetch_path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (fetch_path, None),
+    };
+    if has_ambiguous_path_chars(path) {
+        return refuse("';', '\\', control characters or a '%' that is not a valid escape");
+    }
+    // URL parsing trims trailing spaces, so `x.jar ` would fetch `x.jar`.
+    if query.is_none() && path.ends_with(' ') {
+        return refuse("a trailing space");
+    }
+    if query.is_some_and(|q| q.is_empty() || q.contains('/')) {
+        return refuse("a '?' inside the path");
+    }
+    Ok(())
+}
+
+/// Refuse a CLIENT-DERIVED proxied path or path segment that is not a plain
+/// path (#4365 item 3, strict form): any `?`, `#`, `;`, `\`, control
+/// character or stray `%` ([`has_ambiguous_path_chars`]), and a raw space
+/// unless `allow_spaces`. Unlike [`check_upstream_fetch_path`], which also
+/// sees queries a handler appends itself, this runs on what the client sent,
+/// where a `?` can only be an attempt to move part of the path into the
+/// upstream query. A `400` before anything is fetched or cached.
+pub(crate) fn reject_ambiguous_client_path(path: &str, allow_spaces: bool) -> Result<()> {
+    if has_ambiguous_path_chars(path) || (!allow_spaces && path.contains(' ')) {
+        return Err(AppError::Validation(
+            "Proxied path must not contain '?', '#', ';', '\\', control characters, \
+             a '%' that is not a valid escape, or spaces"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// One proxied request's canonical decision (#4365 item 1): the proxy-cache
+/// key it is fetched, cached and counted under, and whether the scan-on-proxy
+/// gate must see it. Both come from the same [`normalize_cache_path`] value,
+/// so two spellings of one request (a trailing `/`, a doubled leading `/`)
+/// can never be cached as one entry and classified as two things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyServeKey {
+    /// The [`normalize_cache_path`] form of the request's cache path.
+    pub(crate) cache_key: String,
+    /// Whether the scan gate must see this file when the repository scans
+    /// on proxy.
+    pub(crate) scannable: bool,
+}
+
+/// The one helper every scan-on-proxy format derives its cache key and scan
+/// decision from (#4365 item 1).
+///
+/// `is_package_file` decides on the cache key's final segment (the file
+/// name), never on the raw request. Two rules sit above it, both failing
+/// towards the gate: an empty file name is not a package (nothing to scan,
+/// and nothing is served as one), and a key [`has_ambiguous_path_chars`]
+/// is always scannable, because a `?`, `#`, `;` or stray `%` can make an
+/// upstream read a different file than the name says. Formats that decide by
+/// route rather than by name (every file on the route is a package) use
+/// [`route_package_serve_key`].
+pub(crate) fn proxy_serve_key(
+    path: &str,
+    is_package_file: impl FnOnce(&str) -> bool,
+) -> ProxyServeKey {
+    let cache_key = normalize_cache_path(path);
+    let file_name = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let scannable = !file_name.is_empty()
+        && (has_ambiguous_path_chars(cache_key) || is_package_file(file_name));
+    ProxyServeKey {
+        cache_key: cache_key.to_string(),
+        scannable,
+    }
+}
+
+/// [`proxy_serve_key`] for a route whose every file is a package (an npm
+/// tarball, a PyPI distribution, a `.crate`, a `.vsix`): the decision is the
+/// route's, and only the cache key is normalized.
+pub(crate) fn route_package_serve_key(path: &str) -> ProxyServeKey {
+    proxy_serve_key(path, |_| true)
+}
+
+/// Whether `path` holds a character an upstream may read as something other
+/// than a path byte (#4365 items 1 and 3): `?` (query), `#` (fragment), `;`
+/// (path parameter), `\` (turned into `/` by URL parsing), an ASCII control
+/// character (dropped by URL parsing), or a `%` that does not start a valid
+/// `%XX` escape (decoded again, or rejected, by the upstream). A valid escape
+/// such as npm's `%2F` is allowed.
+pub(crate) fn has_ambiguous_path_chars(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'?' | b'#' | b';' | b'\\' => true,
+        b'%' => !matches!(
+            (bytes.get(i + 1), bytes.get(i + 2)),
+            (Some(h), Some(l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit()
+        ),
+        _ => b.is_ascii_control(),
+    })
+}
+
 impl CacheKeys {
     /// Derive both the content and metadata storage keys for a proxy-cache
     /// entry, running the shared `validate_cache_path` + `check_cache_key_length`
@@ -1454,6 +1859,24 @@ pub struct DirectUpstreamBody {
     pub content_encoding: Option<String>,
     /// Upstream `Link` header, for OCI tag-pagination continuation cursors.
     pub link: Option<String>,
+}
+
+/// An upstream Terraform module registry's answer to
+/// `v1/modules/<ns>/<name>/<provider>/<version>/download` — the result of
+/// [`ProxyService::fetch_upstream_terraform_module_location`] (#4590).
+///
+/// The Module Registry Protocol puts the module's source address in the
+/// `X-Terraform-Get` header of a `204`, or (newer registries) in a JSON body
+/// `{"location": "..."}` of a `200`. Both are carried so the caller can apply
+/// the client's own precedence (header first).
+pub struct UpstreamModuleLocation {
+    /// The `X-Terraform-Get` response header, if present.
+    pub x_terraform_get: Option<String>,
+    /// The response body (empty for the usual `204`).
+    pub content: Bytes,
+    /// The URL that answered, after redirects: the base a relative location
+    /// resolves against, exactly as the Terraform client resolves it.
+    pub effective_url: String,
 }
 
 pub(crate) struct CacheStore {
@@ -2506,6 +2929,11 @@ const REALM_CREDENTIALS_WITHHELD: &str =
      service is trusted, add its https origin to the repository's oci_trusted_bearer_realms \
      (#3591)";
 
+const OFF_ORIGIN_CREDENTIALS_WITHHELD: &str =
+    "upstream URL is on a different origin than the remote's configured upstream \
+     (typically an absolute URL taken from index metadata); fetching it WITHOUT the \
+     remote's upstream credentials (GHSA-24rf-2gv2-j47c)";
+
 /// Outcome of the OCI bearer-realm credential-forwarding decision
 /// ([`UpstreamClient::realm_credential_forwarding`], GHSA-78h6-3wp8-2542,
 /// #3591).
@@ -2689,6 +3117,44 @@ impl UpstreamClient {
         self.egress_client_cache.write().await.remove(&repo_id);
     }
 
+    /// The upstream credentials to attach to a request for `url` on behalf of
+    /// repository `repo_id`: the configured ones (per `mode`) when `url` is on
+    /// the origin of the repository's configured upstream, `None` otherwise.
+    ///
+    /// Every fetcher below takes its credentials from here. Index metadata
+    /// can name any absolute URL, and the fetchers used to attach the
+    /// credentials to whatever URL they were given (GHSA-24rf-2gv2-j47c). The
+    /// configured URLs are only read when there are credentials to withhold,
+    /// so an anonymous Remote pays nothing extra.
+    async fn upstream_auth_for(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        mode: crate::services::upstream_auth::UpstreamAuthMode,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        use crate::services::upstream_auth as ua;
+        let Some(auth) = ua::load_upstream_auth_for_mode(&self.db, repo_id, mode).await? else {
+            return Ok(None);
+        };
+        let configured = ua::configured_upstream_urls(&self.db, repo_id).await?;
+        if ua::credentials_may_follow(url, &configured) {
+            return Ok(Some(auth));
+        }
+        if let Some(suppressed) = security_warn_admitted(
+            SampledSecurityWarn::OffOriginCredentialsWithheld,
+            Some(repo_id),
+        ) {
+            tracing::warn!(
+                target: "security",
+                url = %redact_url_for_diagnostics(url),
+                suppressed,
+                "{}",
+                OFF_ORIGIN_CREDENTIALS_WITHHELD
+            );
+        }
+        Ok(None)
+    }
+
     /// Buffered upstream fetch. Relocated verbatim from
     /// `ProxyService::fetch_from_upstream_with_accept`.
     ///
@@ -2721,10 +3187,7 @@ impl UpstreamClient {
         // #3130: `Anonymous` short-circuits to `None` before the credential
         // store is read, so neither the initial request nor the bearer retry
         // below can attach the repo's configured upstream credentials.
-        let upstream_auth = crate::services::upstream_auth::load_upstream_auth_for_mode(
-            &self.db, repo_id, auth_mode,
-        )
-        .await?;
+        let upstream_auth = self.upstream_auth_for(url, repo_id, auth_mode).await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
         // Per-repository egress proxy (#2469, #2811): the shared client unless
         // this repo pins its own routing.
@@ -2798,8 +3261,13 @@ impl UpstreamClient {
         let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!("Posting JSON metadata to upstream: {}", diagnostic_url);
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self
@@ -2884,6 +3352,12 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let terraform_get = response
+            .headers()
+            .get("x-terraform-get")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
         // Running-bounded accumulation: pull one body frame at a time and
         // reject the moment the total would exceed `max`. No un-bounded
         // full-body read (`response.bytes()`) is ever issued.
@@ -2928,6 +3402,7 @@ impl UpstreamClient {
             commit_sha,
             effective_url,
             link,
+            terraform_get,
         })
     }
 
@@ -2949,8 +3424,13 @@ impl UpstreamClient {
             diagnostic_url
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
         // Per-repository egress proxy (#2469, #2811); see `client_for`.
         let client = self.client_for(repo_id, url).await?;
@@ -3085,7 +3565,14 @@ impl UpstreamClient {
                     .await?;
 
                 let token = self
-                    .obtain_bearer_token(realm, &service, &scope, &realm_auth, client)
+                    .obtain_bearer_token_for(
+                        Some(repo_id),
+                        realm,
+                        &service,
+                        &scope,
+                        &realm_auth,
+                        client,
+                    )
                     .await?;
 
                 // Retry with the bearer token only. The original upstream
@@ -3108,6 +3595,15 @@ impl UpstreamClient {
                         ),
                     )
                 })?;
+
+                // #4527: no credentials went to the token service, so a
+                // refusal of the anonymous token is not a credentials problem.
+                let status = retry_response.status();
+                if realm_auth.is_none()
+                    && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN)
+                {
+                    return Err(anonymous_token_refused_error(status, url));
+                }
 
                 return Ok(Some(retry_response));
             }
@@ -3152,8 +3648,24 @@ impl UpstreamClient {
     /// Obtain a bearer token for an OCI registry, using the in-memory cache
     /// when possible. Relocated verbatim from
     /// `ProxyService::obtain_bearer_token`.
+    #[cfg(test)]
     async fn obtain_bearer_token(
         &self,
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+        client: &Client,
+    ) -> Result<String> {
+        self.obtain_bearer_token_for(None, realm, service, scope, upstream_auth, client)
+            .await
+    }
+
+    /// [`Self::obtain_bearer_token`] on behalf of Remote `repo_id`, which
+    /// keys the sampling of a token-service rejection WARN (#4453).
+    async fn obtain_bearer_token_for(
+        &self,
+        repo_id: Option<Uuid>,
         realm: &str,
         service: &str,
         scope: &str,
@@ -3203,11 +3715,12 @@ impl UpstreamClient {
         })?;
 
         if !token_response.status().is_success() {
-            return Err(AppError::Storage(format!(
-                "Token endpoint {} returned status {}",
+            return Err(token_endpoint_status_error(
                 realm,
-                token_response.status()
-            )));
+                token_response.status(),
+                upstream_auth.is_some(),
+                repo_id,
+            ));
         }
 
         let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
@@ -3454,12 +3967,20 @@ impl UpstreamClient {
                 upstream_auth.clone()
             }
             RealmCredentialForwarding::Withheld if upstream_auth.is_some() => {
-                tracing::warn!(
-                    target: "security",
-                    realm = %redact_url_for_diagnostics(realm),
-                    "{}",
-                    REALM_CREDENTIALS_WITHHELD
-                );
+                // Fires on every pull of such a Remote, so it is sampled per
+                // Remote like the other upstream-auth lines (#4518).
+                if let Some(suppressed) = security_warn_admitted(
+                    SampledSecurityWarn::RealmCredentialsWithheld,
+                    Some(repo_id),
+                ) {
+                    tracing::warn!(
+                        target: "security",
+                        realm = %redact_url_for_diagnostics(realm),
+                        suppressed,
+                        "{}",
+                        REALM_CREDENTIALS_WITHHELD
+                    );
+                }
                 None
             }
             // Anonymous remote: nothing is withheld, so nothing to warn about
@@ -3513,8 +4034,13 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
     ) -> Result<bool> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         // Conditional revalidation is an outbound upstream request like any
         // other, so it must honor this repository's egress routing (#2469).
         let client = self.client_for(repo_id, url).await?;
@@ -3666,7 +4192,27 @@ pub struct ProxyService {
     /// Per-process memo of the repository facts the TTL policy needs on the
     /// read path (#3832). See [`TtlPolicyCache`].
     ttl_policy_cache: TtlPolicyCache,
+    /// `(repository_id, cache_path)` of objects this process just served
+    /// WITHOUT any proxy-cache write because they exceed the repository's
+    /// quota (#4551). The serve's download recorder
+    /// ([`crate::api::handlers::proxy_helpers::record_proxy_download_via`])
+    /// runs in this same process for the same request and reads it, so it
+    /// records the download without inserting the `proxy_cache_artifacts`
+    /// placeholder a cache miss gets: no tee will ever refine that row, and
+    /// it would be listed as a cached 0-byte object. Bounded and short-lived;
+    /// a later serve of the path that does tee clears its entry.
+    uncached_serves: Cache<(Uuid, String), ()>,
+    /// Whether the origin-policy gate (#4506) runs. Always `true` outside
+    /// tests; only `without_origin_policy_gate`, which exists only
+    /// under `cfg(test)`, clears it, for the cache-mechanics unit tests that
+    /// run without a database.
+    origin_policy_gate: bool,
 }
+
+/// How long a [`ProxyService::uncached_serves`] entry is kept. The recorder
+/// reads it right after the serve (or from its deferred task moments later),
+/// so this only has to outlive that window.
+const UNCACHED_SERVE_TTL: Duration = Duration::from_secs(300);
 
 /// How long [`TtlPolicyCache`] trusts a looked-up value. Bounds how long a TTL
 /// change made on another replica takes to reach this one; the replica that
@@ -3701,6 +4247,22 @@ impl TtlPolicyCache {
 }
 
 impl ProxyService {
+    /// Remember that `path` of `repo_id` was just served without any cache
+    /// write because it exceeds the repository quota (#4551).
+    async fn note_served_without_cache(&self, repo_id: Uuid, path: &str) {
+        self.uncached_serves
+            .insert((repo_id, path.to_string()), ())
+            .await;
+    }
+
+    /// Whether this process just served `path` of `repo_id` without writing
+    /// it to the proxy cache (#4551), so recording that serve must not insert
+    /// a catalog placeholder.
+    pub(crate) fn served_without_cache(&self, repo_id: Uuid, path: &str) -> bool {
+        self.uncached_serves
+            .contains_key(&(repo_id, path.to_string()))
+    }
+
     /// Drop this process's cached egress client for `repo_id` so an
     /// egress-proxy change made through the API takes effect on the next
     /// upstream fetch instead of after the cache TTL (#2469, #2811).
@@ -3755,7 +4317,21 @@ impl ProxyService {
             backfill_limiter,
             cache_scope,
             ttl_policy_cache: TtlPolicyCache::new(),
+            uncached_serves: Cache::builder()
+                .max_capacity(TtlPolicyCache::CAPACITY)
+                .time_to_live(UNCACHED_SERVE_TTL)
+                .build(),
+            origin_policy_gate: true,
         }
+    }
+
+    /// A service that skips the origin-policy gate (#4506), for unit tests of
+    /// the cache mechanics that run against a never-connecting pool. Test-only:
+    /// production code cannot construct a service without the gate.
+    #[cfg(test)]
+    pub(crate) fn without_origin_policy_gate(mut self) -> Self {
+        self.origin_policy_gate = false;
+        self
     }
 
     /// This deployment's proxy-cache key scope (#3454). Handlers that derive a
@@ -3764,6 +4340,13 @@ impl ProxyService {
     /// from the bare `proxy-cache/` namespace.
     pub fn cache_scope(&self) -> &ProxyCacheScope {
         &self.cache_scope
+    }
+
+    /// The pool this proxy records its catalog against. The buffered virtual
+    /// resolvers, which are handed the proxy but not the app state, record a
+    /// Remote member's winning serve through it (#3844).
+    pub(crate) fn db(&self) -> &PgPool {
+        &self.db
     }
 
     /// Fetch artifact from upstream if not cached or cache expired.
@@ -3819,6 +4402,8 @@ impl ProxyService {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         Self::validate_relative_post_endpoint(path)?;
         let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
@@ -3872,6 +4457,15 @@ impl ProxyService {
     ) -> Result<CachedBody> {
         self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, None, max)
             .await
+    }
+
+    /// Whether repository `repo_id` has upstream credentials configured, for
+    /// diagnostics only (#4518). A failed lookup reads as `false`.
+    pub async fn has_upstream_credentials(&self, repo_id: Uuid) -> bool {
+        matches!(
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await,
+            Ok(Some(_))
+        )
     }
 
     /// Byte-ceiling-aware sibling of [`Self::fetch_artifact_with_accept`]
@@ -3957,6 +4551,9 @@ impl ProxyService {
         repo_key: &str,
         path: &str,
     ) -> Result<Option<CachedBody>> {
+        // #4506: the Remote's origin policy applies to its cached content too.
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, repo_key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
         let mutability = self.effective_mutability_by_key(repo_key, path).await;
@@ -4031,6 +4628,27 @@ impl ProxyService {
         self.storage.backend()
     }
 
+    /// Content validator of a FRESH proxy-cache entry: the SHA-256 of the
+    /// cached body when the entry exists, is a positive entry, and has not
+    /// expired under the repository's current TTL policy; `None` otherwise.
+    ///
+    /// Reads only the metadata sidecar (through the sidecar LRU), never the
+    /// body. A derived document built from cached entries (the merged index of
+    /// a virtual conda channel, #4608) records these validators when it is
+    /// built and is reused only while every one of them is unchanged, i.e.
+    /// exactly while a rebuild would read the same bytes out of the cache
+    /// without contacting the upstream.
+    pub async fn fresh_cache_validator(&self, repo_key: &str, path: &str) -> Option<String> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let metadata = self.load_cache_metadata(&keys.metadata).await.ok()??;
+        let now = Utc::now();
+        if metadata.negative_cached_until.is_some_and(|t| t > now) {
+            return None;
+        }
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        (metadata.expires_under(mutability) > now).then_some(metadata.checksum_sha256)
+    }
+
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
         // A path that fails validation cannot have produced a cache entry
         // we'd want to redirect to anyway: treat it as a miss so the caller
@@ -4044,6 +4662,16 @@ impl ProxyService {
         // revalidate.
         let mutability = self.effective_mutability_by_key(repo_key, path).await;
         self.cache_store.is_fresh(&keys, mutability).await
+    }
+
+    /// Gate a presigned-redirect fast path on the Remote's origin policy
+    /// (#4506), the sibling of [`Self::cache_quarantine_gate`]. A redirect
+    /// hands out the cached object without the body passing through the
+    /// gated fetch paths, so every fast path asks this after its freshness
+    /// probe and before signing. A refusal is the fetch paths' 403.
+    pub async fn cache_origin_policy_gate(&self, repo_key: &str) -> Result<()> {
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await
     }
 
     /// Gate a presigned-redirect fast path on a Package Age Policy hold (#2075).
@@ -4236,6 +4864,8 @@ impl ProxyService {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
 
         // Cache keys use the caller-supplied cache_path
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -4434,6 +5064,7 @@ impl ProxyService {
                             crate::services::metrics_service::record_proxy_cache_quota_exceeded(
                                 &repo.key,
                             );
+                            self.note_served_without_cache(repo.id, cache_path).await;
                         }
 
                         // B6 (coalescing 502 leak, remaining path): the upstream fetch
@@ -4698,6 +5329,8 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<StreamingFetchResult> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -4711,6 +5344,12 @@ impl ProxyService {
         // A Deferred digest survives the re-enters as a cheap
         // [`DeferredCommitDigest`] clone — every clone shares the ONE
         // underlying resolution, so a re-enter never re-fetches the sidecar.
+        //
+        // Under the cross-replica coordinator (#4013) a re-enter is not a
+        // timed poll: a losing leader blocks on the cluster lock until the
+        // remote leader has PUBLISHED, so each re-enter corresponds to a
+        // finished remote fill and normally lands on the warm cache. The
+        // budget is therefore never drained by waiting on a large object.
         const STREAM_REENTER_BUDGET: usize = 8;
         for _ in 0..STREAM_REENTER_BUDGET {
             if let Some(result) = self
@@ -4750,6 +5389,8 @@ impl ProxyService {
         repo: &Repository,
         cache_path: &str,
     ) -> Result<Option<StreamingFetchResult>> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
         self.try_streaming_cache_hit(repo, cache_path, cache_path, &cache_key, &metadata_key)
@@ -4803,7 +5444,13 @@ impl ProxyService {
             })
             .await?;
 
-        Ok(handle.map(StreamingFetchResult::from))
+        match handle {
+            Some(handle) => Ok(Some(StreamingFetchResult::from(handle))),
+            None => {
+                forget_cached_sidecar_miss(&metadata_key).await;
+                Ok(None)
+            }
+        }
     }
 
     /// Streaming cache-hit fast path, factored out so both the coordinated
@@ -5157,6 +5804,9 @@ impl ProxyService {
                      streaming it to the client without any proxy-cache write"
                 );
                 crate::services::metrics_service::record_proxy_cache_quota_exceeded(&repo.key);
+                // #4551: the recorder of this serve must not leave a catalog
+                // placeholder for an object that is never cached.
+                self.note_served_without_cache(repo.id, cache_path).await;
                 if hold_active {
                     return Err(AppError::Conflict(
                         "Artifact is quarantined and pending security review".to_string(),
@@ -5165,10 +5815,20 @@ impl ProxyService {
                 return Ok(StreamHandle {
                     body: upstream.body,
                     headers,
+                    cache_published: None,
                 });
             }
         }
 
+        // This serve tees into the cache, so its recorder takes the normal
+        // placeholder path again (#4551).
+        self.uncached_serves
+            .invalidate(&(repo.id, cache_path.to_string()))
+            .await;
+
+        // #4013: the cross-replica coordinator releases its lock on the tee
+        // writer's completion, so capture that signal before the key moves.
+        let publish_key = metadata_key.clone();
         let body = self.cache_persister.tee_stream(
             upstream.body,
             cache_key,
@@ -5225,7 +5885,11 @@ impl ProxyService {
             ));
         }
 
-        Ok(StreamHandle { body, headers })
+        Ok(StreamHandle {
+            body,
+            headers,
+            cache_published: tee_publish_done(&publish_key),
+        })
     }
 
     /// Apply the buffered path's upstream-error correctness to the streaming
@@ -5327,7 +5991,11 @@ impl ProxyService {
                 content_encoding: metadata.content_encoding.clone(),
                 commit_sha: metadata.upstream_commit_sha.clone(),
             };
-            return Ok(StreamHandle { body, headers });
+            return Ok(StreamHandle {
+                body,
+                headers,
+                cache_published: None,
+            });
         }
 
         Err(upstream_err)
@@ -5375,6 +6043,8 @@ impl ProxyService {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
         Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
 
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
@@ -5419,6 +6089,8 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>, String)> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let full_url = self.gated_upstream_url(repo, path).await?;
         // #2192 / #1608 Phase 4c: use the 16 MiB LARGE ceiling, not the 8 MiB
         // DEFAULT. The sole caller is the PyPI download-URL-resolution simple-
@@ -5456,6 +6128,8 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<DirectUpstreamBody> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
             .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
@@ -5465,6 +6139,32 @@ impl ProxyService {
             content_type: resp.content_type,
             content_encoding: resp.content_encoding,
             link: resp.link,
+        })
+    }
+
+    /// Ask an upstream Terraform module registry where a module version's
+    /// source lives (#4590), uncached.
+    ///
+    /// The answer is a small location document (usually an empty `204` whose
+    /// `X-Terraform-Get` header carries the address), not the module itself, so
+    /// it is read directly rather than through the proxy cache: the cache
+    /// stores bodies, and the body here is empty. The location may also be a
+    /// short-lived signed URL, which must not be replayed from a cache.
+    pub async fn fetch_upstream_terraform_module_location(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<UpstreamModuleLocation> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
+        let full_url = self.gated_upstream_url(repo, path).await?;
+        let resp = self
+            .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            .await?;
+        Ok(UpstreamModuleLocation {
+            x_terraform_get: resp.terraform_get,
+            content: resp.content,
+            effective_url: resp.effective_url,
         })
     }
 
@@ -5622,6 +6322,8 @@ impl ProxyService {
         distribution: &str,
         dists_ttl_secs: i64,
     ) -> Result<(Bytes, Option<String>, bool)> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
@@ -5808,8 +6510,14 @@ impl ProxyService {
         repo_id: Uuid,
         etag: &str,
     ) -> Result<Option<UpstreamResponse>> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_client
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
 
         // Conditional metadata refresh is an outbound upstream request, so it
         // routes through this repository's egress proxy like every other
@@ -6084,6 +6792,9 @@ impl ProxyService {
         repo_key: &str,
         cache_path: &str,
     ) -> Result<Option<(BoxStream<'static, Result<Bytes>>, i64)>> {
+        // #4506: the Remote's origin policy applies to its cached content too.
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await?;
         let keys = CacheKeys::derive(&self.cache_scope, repo_key, cache_path)?;
         let Some(meta) = self.load_cache_metadata(&keys.metadata).await? else {
             return Ok(None);
@@ -6574,6 +7285,8 @@ impl ProxyService {
         upstream_url: &str,
         fetch_path: &str,
     ) -> Result<()> {
+        // #4365 item 3: an ambiguous path never reaches the upstream.
+        check_upstream_fetch_path(fetch_path)?;
         crate::services::upstream_filter::ensure_upstream_allowed(
             &self.db,
             repo.id,
@@ -6582,6 +7295,88 @@ impl ProxyService {
             fetch_path,
         )
         .await
+    }
+
+    /// The origin-policy gate for content a Remote serves (#4506): refuse,
+    /// with the same 403 the hosted download gate answers, when an applicable
+    /// scan policy's origin predicates (`allowed_upstreams`,
+    /// `denied_upstreams`, `allowed_repositories`, `denied_repositories`,
+    /// `allowed_kinds`) reject the Remote's proxied content.
+    ///
+    /// Proxy fetches record a `proxy_cache_artifacts` row, not an `artifacts`
+    /// row, so the hosted download gate never saw an origin for them and an
+    /// upstream deny policy did not gate a Remote at all. The origin is a
+    /// property of the Remote (kind `proxy`, its key, its configured
+    /// upstream), not of the path, so the gate runs once at each public entry
+    /// that serves a Remote's cache or upstream, before the cache is read and
+    /// before the upstream is contacted. A cache entry written before the
+    /// policy was attached is refused like a miss.
+    ///
+    /// A policy lookup error fails closed (the error propagates).
+    async fn ensure_origin_policy_allows(&self, repo: &Repository) -> Result<()> {
+        if !self.origin_policy_gate {
+            return Ok(());
+        }
+        self.origin_policy_gate(repo.id, &repo.key, repo.upstream_url.as_deref())
+            .await
+    }
+
+    async fn origin_policy_gate(
+        &self,
+        repo_id: Uuid,
+        repo_key: &str,
+        upstream_url: Option<&str>,
+    ) -> Result<()> {
+        let violations = crate::services::policy_service::PolicyService::new(self.db.clone())
+            .evaluate_proxy_origin(repo_id, repo_key, upstream_url)
+            .await?;
+        if violations.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            repository_id = %repo_id,
+            repo_key = %repo_key,
+            violations = ?violations,
+            "proxied download refused by the repository's origin policy"
+        );
+        Err(AppError::Authorization(
+            "Artifact download is blocked by the repository's scan policy".to_string(),
+        ))
+    }
+
+    /// [`Self::ensure_origin_policy_allows`] for the cache entry points that
+    /// are keyed by repository key (or id) alone. A key that names no Remote
+    /// has no proxied content to gate.
+    async fn ensure_origin_policy_allows_for(&self, repo_ref: RemoteRef<'_>) -> Result<()> {
+        if !self.origin_policy_gate {
+            return Ok(());
+        }
+        let row: Option<(Uuid, String, Option<String>)> = match repo_ref {
+            RemoteRef::Key(key) => {
+                sqlx::query_as(
+                    "SELECT id, key, upstream_url FROM repositories \
+                 WHERE key = $1 AND repo_type = 'remote'",
+                )
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await
+            }
+            RemoteRef::Id(id) => {
+                sqlx::query_as(
+                    "SELECT id, key, upstream_url FROM repositories \
+                 WHERE id = $1 AND repo_type = 'remote'",
+                )
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await
+            }
+        }
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let Some((id, key, upstream_url)) = row else {
+            return Ok(());
+        };
+        self.origin_policy_gate(id, &key, upstream_url.as_deref())
+            .await
     }
 
     /// Build full upstream URL for an artifact path.
@@ -7372,6 +8167,9 @@ impl ProxyService {
         repo_id: Uuid,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
+        // #4506: the Remote's origin policy, before the upstream is contacted.
+        self.ensure_origin_policy_allows_for(RemoteRef::Id(repo_id))
+            .await?;
         // #4399: the off-host URL is matched as a full absolute URL (there is
         // no configured-upstream prefix to strip on another host).
         crate::services::upstream_filter::ensure_upstream_allowed(
@@ -7652,8 +8450,13 @@ impl ProxyService {
 /// local-upload path stores) keeps proxy package names globally unambiguous and
 /// lets the remote component-grouping branch reconstruct the `groupId` /
 /// `artifactId` split without consulting the storage path.
+///
+/// Derived from [`normalize_cache_path`], the spelling the proxy cache keys
+/// the file on and the scan gate classifies (#4365 item 6). Trimming only the
+/// leading `/` let `.../widget-1.0.jar/` (empty file name, no coordinate)
+/// skip a curation rule while being served from `.../widget-1.0.jar`'s entry.
 pub(crate) fn maven_proxy_package_name(path: &str) -> Option<String> {
-    let path = path.trim_start_matches('/');
+    let path = normalize_cache_path(path);
     let filename = path.rsplit('/').next().unwrap_or(path);
     let lower = filename.to_ascii_lowercase();
 
@@ -9743,6 +10546,28 @@ mod tests {
     fn test_maven_proxy_package_name_skips_unparseable_path() {
         // Too few segments to be a GAV → no package.
         assert!(maven_proxy_package_name("org/junit/something.jar").is_none());
+    }
+
+    /// #4365 item 6: every spelling the proxy cache keys as one entry names
+    /// the same curated package, so a trailing `/` cannot skip a rule.
+    #[test]
+    fn test_maven_proxy_package_name_uses_the_cache_normalized_path() {
+        let canonical = "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar";
+        let expected = maven_proxy_package_name(canonical);
+        assert!(expected.is_some());
+        for alias in [
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar/",
+            "/org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar//",
+            "//org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar",
+        ] {
+            assert_eq!(normalize_cache_path(alias), canonical, "{alias}");
+            assert_eq!(maven_proxy_package_name(alias), expected, "{alias}");
+        }
+        // A trailing slash on a sidecar still names no package.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha1/")
+                .is_none()
+        );
     }
 
     #[test]
@@ -13856,6 +14681,110 @@ mod tests {
         }
     }
 
+    /// Point Remote `repo_id` at `upstream_url`, the URL its credentials
+    /// belong to (GHSA-24rf-2gv2-j47c).
+    async fn point_remote_at(pool: &sqlx::PgPool, repo_id: Uuid, upstream_url: &str) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("point the remote at its upstream");
+    }
+
+    /// GHSA-24rf-2gv2-j47c: a Remote's configured upstream credentials go only
+    /// to the configured upstream's origin. Index metadata (a PyPI `href`, a
+    /// Helm `urls` entry, a Cargo `dl` template, a Composer `dist.url`, a
+    /// Terraform `download_url`) can name any absolute URL, and every shared
+    /// fetcher used to attach the credentials to whatever URL it was given.
+    /// Two listeners on different ports are two origins: the foreign one must
+    /// receive no `Authorization` from any fetcher, and the configured one
+    /// still gets the credentials.
+    #[tokio::test]
+    async fn upstream_credentials_only_go_to_the_configured_origin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_auth::UpstreamAuthMode;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let foreign = MockServer::start().await;
+        for server in [&upstream, &foreign] {
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"fresh\"")
+                        .set_body_bytes(b"{}".as_ref()),
+                )
+                .mount(server)
+                .await;
+        }
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        point_remote_at(&pool, repo_id, &format!("{}/simple", upstream.uri())).await;
+        crate::services::upstream_auth::save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            r#"{"username":"ghsa-24rf","password":"not-a-real-secret"}"#,
+        )
+        .await
+        .expect("save upstream credentials");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let client = &proxy.upstream_client;
+        let mode = UpstreamAuthMode::RepoConfigured;
+
+        let off_origin = format!("{}/files/pkg-1.0.tar.gz", foreign.uri());
+        let _ = client
+            .fetch_buffered(&off_origin, repo_id, None, 1 << 20, mode)
+            .await;
+        let _ = client.fetch_stream(&off_origin, repo_id).await;
+        let _ = client
+            .check_etag_changed(&off_origin, "\"stale\"", repo_id, None)
+            .await;
+        let _ = proxy
+            .fetch_from_upstream_conditional(&off_origin, repo_id, "\"stale\"")
+            .await;
+        let _ = client
+            .post_json_buffered(&off_origin, repo_id, Bytes::from_static(b"{}"), 1 << 20)
+            .await;
+
+        // Control: the configured origin still gets the credentials.
+        let on_origin = format!("{}/files/pkg-1.0.tar.gz", upstream.uri());
+        let _ = client
+            .fetch_buffered(&on_origin, repo_id, None, 1 << 20, mode)
+            .await;
+        let _ = client.fetch_stream(&on_origin, repo_id).await;
+
+        let foreign_requests = foreign.received_requests().await.unwrap_or_default();
+        let upstream_requests = upstream.received_requests().await.unwrap_or_default();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            foreign_requests.len(),
+            5,
+            "every fetcher must still reach the off-origin URL, only without credentials"
+        );
+        for r in &foreign_requests {
+            assert!(
+                !r.headers.contains_key("authorization"),
+                "{} {} on another origin received the upstream credentials",
+                r.method,
+                r.url.path()
+            );
+        }
+        assert_eq!(upstream_requests.len(), 2);
+        for r in &upstream_requests {
+            assert!(
+                r.headers.contains_key("authorization"),
+                "the configured upstream must still receive its credentials"
+            );
+        }
+    }
+
     /// #4452: redacting `upstream_url` on read must not change what the
     /// proxy sends upstream. Userinfo embedded in a Remote's upstream URL is
     /// still presented as HTTP Basic auth; the mock only answers 200 when the
@@ -15777,7 +16706,8 @@ mod tests {
         // Build the service with a `lazy` PgPool: we never call any
         // code path that touches the DB on this test.
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
-        let proxy = ProxyService::new(pool, storage, ProxyCacheScope::unscoped());
+        let proxy = ProxyService::new(pool, storage, ProxyCacheScope::unscoped())
+            .without_origin_policy_gate();
 
         let repo_key = "npm-proxy";
         let cache_path = "abbrev/-/abbrev-1.1.1.tgz";
@@ -16050,6 +16980,95 @@ mod tests {
         );
     }
 
+    /// #4551: an object larger than a Remote repository's quota is streamed to
+    /// the client without any cache write, so recording that serve must not
+    /// leave a `proxy_cache_artifacts` placeholder (`size_bytes = 0`) that
+    /// listings present as a cached 0-byte object. The download is still
+    /// recorded, keyed on `(repository_id, path)` (#4539), with no catalog row.
+    #[tokio::test]
+    async fn test_over_quota_stream_through_leaves_no_catalog_placeholder_4551() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar_path = "junit/junit/4.13.2/junit-4.13.2.jar";
+        let jar = vec![b'j'; 4096];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{jar_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+        let tmp = std::env::temp_dir().join(format!("ak-4551-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let mut repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
+        repo.id = repo_id;
+
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        for _ in 0..2 {
+            let handle = proxy
+                .fetch_artifact_streaming(&repo, jar_path)
+                .await
+                .expect("an over-quota object is still streamed to the client");
+            assert_eq!(drain_stream(handle.body).await.len(), jar.len());
+            crate::api::handlers::proxy_helpers::record_proxy_download_via(
+                &pool, &proxy, repo_id, &repo_key, jar_path, &ctx,
+            )
+            .await;
+        }
+
+        let catalog_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(jar_path)
+        .fetch_one(&pool)
+        .await
+        .expect("count catalog rows");
+        let downloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_download_statistics WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(jar_path)
+        .fetch_one(&pool)
+        .await
+        .expect("count downloads");
+
+        let _ = sqlx::query("DELETE FROM proxy_download_statistics WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+
+        assert_eq!(
+            catalog_rows, 0,
+            "an object streamed through without a cache write must not get a catalog row"
+        );
+        assert_eq!(downloads, 2, "both serves are still recorded");
+    }
+
     #[test]
     fn test_remote_target_returns_borrowed_upstream_for_remote_repo() {
         let repo = remote_repo_for(
@@ -16269,6 +17288,152 @@ mod tests {
     }
 
     /// Drain a streaming proxy body into a single `Vec<u8>`.
+    /// #4013 review: the streaming leader's handle carries the tee writer's
+    /// publish signal, which flips only once the cache entry is committed.
+    /// (The cross-replica lock is released on it; without it the lock would
+    /// be released at the client's EOF, before the sidecar exists.)
+    #[tokio::test]
+    async fn test_streaming_leader_handle_carries_the_cache_publish_signal() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"publish-signal-body".to_vec();
+        let artifact = "org/acme/sig/1.0/sig-1.0.jar";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{artifact}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let tmp = std::env::temp_dir().join(format!("ak-4013-sig-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for(
+            &format!("sig-{}", Uuid::new_v4()),
+            &server.uri(),
+            tmp.to_str().unwrap(),
+        );
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+        let handle = proxy
+            .open_streaming_leader(&repo, artifact, artifact, cache_key, metadata_key, None)
+            .await
+            .expect("leader opens");
+        let mut published = handle
+            .cache_published
+            .clone()
+            .expect("a tee'd leader body must carry its publish signal");
+        assert!(
+            !*published.borrow(),
+            "nothing is published before the body is read"
+        );
+        assert_eq!(drain_stream(handle.body).await, body);
+        tokio::time::timeout(Duration::from_secs(10), published.wait_for(|done| *done))
+            .await
+            .expect("publish finishes")
+            .expect("signal observed");
+        assert!(
+            proxy.is_cache_fresh(&repo.key, artifact).await,
+            "when the signal flips, the entry is committed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #4013 review: a streaming re-enter must forget the miss its own cache
+    /// check memoised. Another replica may have filled the shared cache in
+    /// the meantime, and its publish only invalidated ITS process's LRU.
+    #[tokio::test]
+    async fn test_streaming_reenter_forgets_the_memoised_cache_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use crate::services::proxy_hydration::coordinate_stream_fanout;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("ak-4013-reenter-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        // No upstream is ever contacted: the attempt below falls back.
+        let repo = remote_repo_for(
+            &format!("reenter-{}", Uuid::new_v4()),
+            "http://upstream.invalid",
+            tmp.to_str().unwrap(),
+        );
+        let artifact = "org/acme/re/1.0/re-1.0.jar";
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+
+        // An in-process leader for the same object that has already started
+        // emitting, so the attempt is a late arrival: it waits for the
+        // leader and then asks the caller to re-enter (`Ok(None)`).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+        let leader_body: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|i| (i, rx))
+            }));
+        let leader = coordinate_stream_fanout(&format!("proxy-stream:{cache_key}"), || async {
+            Ok(StreamHandle {
+                body: leader_body,
+                headers: Default::default(),
+                cache_published: None,
+            })
+        })
+        .await
+        .expect("ok")
+        .expect("leader");
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::spawn(async move {
+            let mut body = leader.body;
+            let _ = body.next().await;
+            let _ = first_tx.send(());
+            while body.next().await.is_some() {}
+        });
+        tx.send(Ok(Bytes::from_static(b"x"))).await.expect("send");
+        first_rx.await.expect("leader started emitting");
+
+        let attempt = {
+            let proxy = Arc::clone(&proxy);
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                proxy
+                    .try_fetch_artifact_streaming_once(&repo, artifact, artifact, None)
+                    .await
+                    .map(|r| r.is_none())
+            })
+        };
+        let lru = proxy_metadata_lru().await;
+        let mut memoised = false;
+        for _ in 0..100 {
+            if matches!(lru.get(&metadata_key).await, Some(None)) {
+                memoised = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(memoised, "the attempt's cache check memoised the miss");
+        drop(tx);
+        let reentered = tokio::time::timeout(Duration::from_secs(10), attempt)
+            .await
+            .expect("attempt finishes with the leader")
+            .expect("join")
+            .expect("no error");
+        drain.await.expect("drain");
+        assert!(reentered, "a late arrival asks the caller to re-enter");
+        assert!(
+            lru.get(&metadata_key).await.is_none(),
+            "the re-enter must re-read the sidecar, not the memoised miss"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
         let mut body = body;
         let mut out = Vec::new();
@@ -16517,7 +17682,7 @@ mod tests {
             entries,
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage.clone());
+        let svc = build_proxy_service_with_storage(storage.clone()).without_origin_policy_gate();
         let repo = pypi_remote_repo("pypi-remote");
 
         let result = svc
@@ -16544,7 +17709,7 @@ mod tests {
             entries: std::collections::HashMap::new(),
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage);
+        let svc = build_proxy_service_with_storage(storage).without_origin_policy_gate();
         let repo = pypi_remote_repo("pypi-remote");
 
         let probe = svc
@@ -16707,7 +17872,7 @@ mod tests {
             entries,
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage.clone());
+        let svc = build_proxy_service_with_storage(storage.clone()).without_origin_policy_gate();
         let repo = pypi_remote_repo(&repo_key);
 
         let (content, _ct, _enc) = svc
@@ -16949,6 +18114,225 @@ mod tests {
             *ttl, MAX_TOKEN_TTL_SECS,
             "an oversized expires_in must be capped at MAX_TOKEN_TTL_SECS",
         );
+    }
+
+    // -- #4453: a token-service 401/403 is an upstream auth failure ----------
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_401_is_upstream_auth_failure_4453() {
+        use crate::services::upstream_auth::UpstreamAuthType;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/forbidden/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/broken/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        // Generated per run so no credential-shaped literal is committed.
+        let secret = Uuid::new_v4().simple().to_string();
+        let creds = Some(UpstreamAuthType::Basic {
+            username: "svc-4453".to_string(),
+            password: secret.clone(),
+        });
+
+        // #4527: only a refusal of credentials actually sent is an upstream
+        // auth failure; both statuses with credentials here.
+        for (realm_path, creds, sent) in [
+            ("/token", &creds, "credentials_sent=true"),
+            ("/forbidden/token", &creds, "credentials_sent=true"),
+        ] {
+            let realm = format!("{}{realm_path}?account=svc-4453", server.uri());
+            let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            let err = client
+                .obtain_bearer_token(
+                    &realm,
+                    "reg.test",
+                    "repository:img:pull",
+                    creds,
+                    &client.http_client,
+                )
+                .await
+                .expect_err("a rejected token request must fail");
+            drop(guard);
+            let redacted = format!("{}{realm_path}", server.uri());
+            match err {
+                AppError::UpstreamAuth(msg) => {
+                    assert!(msg.contains(&redacted), "names the token service: {msg}");
+                    assert!(!msg.contains(&secret) && !msg.contains("svc-4453"), "{msg}");
+                }
+                other => panic!("{realm_path}: expected UpstreamAuth, got {other:?}"),
+            }
+            // The operator-facing line: WARN on the `security` target, the
+            // redacted realm, whether credentials were sent, and no secret.
+            let logs = capture.text();
+            assert!(
+                logs.contains("WARN") && logs.contains("security") && logs.contains(sent),
+                "{logs}"
+            );
+            assert!(logs.contains(&redacted), "{logs}");
+            assert!(
+                !logs.contains(&secret) && !logs.contains("svc-4453"),
+                "{logs}"
+            );
+        }
+
+        // #4527: an anonymous token request that is refused is not a
+        // credentials problem: Storage (a miss for the manifest handlers),
+        // logged at INFO, never on the `security` target.
+        for realm_path in ["/token", "/forbidden/token"] {
+            let realm = format!("{}{realm_path}", server.uri());
+            let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            let err = client
+                .obtain_bearer_token(
+                    &realm,
+                    "reg.test",
+                    "repository:img:pull",
+                    &None,
+                    &client.http_client,
+                )
+                .await
+                .expect_err("a rejected token request must fail");
+            drop(guard);
+            assert!(matches!(err, AppError::Storage(_)), "{realm_path}: {err:?}");
+            let logs = capture.text();
+            assert!(!logs.contains("security"), "{logs}");
+            assert!(
+                logs.contains("refused an anonymous token request"),
+                "{logs}"
+            );
+        }
+
+        let realm = format!("{}/broken/token", server.uri());
+        let err = client
+            .obtain_bearer_token(
+                &realm,
+                "reg.test",
+                "repository:img:pull",
+                &creds,
+                &client.http_client,
+            )
+            .await
+            .expect_err("a 500 token response must fail");
+        assert!(matches!(err, AppError::Storage(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_token_endpoint_status_error_redacts_the_realm_4453() {
+        let err = token_endpoint_status_error(
+            "https://bob:pw@auth.example.test/token?account=bob",
+            StatusCode::UNAUTHORIZED,
+            true,
+            None,
+        );
+        let AppError::UpstreamAuth(msg) = err else {
+            panic!("expected UpstreamAuth");
+        };
+        assert!(msg.contains("https://auth.example.test/token"), "{msg}");
+        assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        assert!(matches!(
+            token_endpoint_status_error("https://a.test/t", StatusCode::BAD_REQUEST, false, None),
+            AppError::Storage(_)
+        ));
+        // #4527: nothing was sent, so a refusal is not an auth failure.
+        assert!(matches!(
+            token_endpoint_status_error("https://a.test/t", StatusCode::UNAUTHORIZED, false, None),
+            AppError::Storage(_)
+        ));
+        let anon =
+            anonymous_token_refused_error(StatusCode::UNAUTHORIZED, "https://u:p@r.test/v2/x");
+        assert!(upstream_request_auth_refusal(&anon).is_none(), "{anon:?}");
+        assert!(!format!("{anon:?}").contains("u:p"), "{anon:?}");
+    }
+
+    /// #4518: only an upstream 401/403 on the request itself becomes an
+    /// upstream auth failure, only when credentials were sent, and the error
+    /// names the redacted URL only.
+    #[test]
+    fn test_oci_registry_auth_error_classifies_request_refusals_4518() {
+        let url = "https://bob:pw@reg.example.test/v2/img/manifests/v1";
+        let refused = || {
+            [
+                validate_upstream_status(StatusCode::UNAUTHORIZED, url).unwrap_err(),
+                validate_upstream_status(StatusCode::FORBIDDEN, url).unwrap_err(),
+                AppError::Storage(format!(
+                    "Upstream returned error status {}: {url}",
+                    StatusCode::UNAUTHORIZED
+                )),
+            ]
+        };
+        for err in refused() {
+            assert!(upstream_request_auth_refusal(&err).is_some(), "{err:?}");
+            let AppError::UpstreamAuth(msg) =
+                oci_registry_auth_error(err, Uuid::new_v4(), url, true)
+            else {
+                panic!("expected UpstreamAuth");
+            };
+            assert!(
+                msg.contains("https://reg.example.test/v2/img/manifests/v1"),
+                "{msg}"
+            );
+            assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        }
+        // Anonymous: unchanged, so the manifest handlers keep the miss.
+        for err in refused() {
+            let before = format!("{err:?}");
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, false);
+            assert_eq!(format!("{after:?}"), before);
+        }
+        let unchanged = [
+            validate_upstream_status(StatusCode::NOT_FOUND, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_REQUEST, url).unwrap_err(),
+            validate_upstream_status(StatusCode::TOO_MANY_REQUESTS, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_GATEWAY, url).unwrap_err(),
+            AppError::Storage("Token endpoint x returned status 401 Unauthorized".into()),
+        ];
+        for err in unchanged {
+            assert!(upstream_request_auth_refusal(&err).is_none(), "{err:?}");
+            let before = format!("{err:?}");
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, true);
+            assert_eq!(format!("{after:?}"), before);
+        }
+    }
+
+    /// #4518: the registry-auth WARN is sampled per Remote: one per
+    /// interval, the rest counted and reported on the next one.
+    #[test]
+    fn test_admit_sampled_warn_4518() {
+        let mut state = HashMap::new();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Instant::now();
+        let every = Duration::from_secs(60);
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), Some(0));
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), None);
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(admit_sampled_warn(&mut state, a, later, every, 8), None);
+        // Another Remote is not throttled by the first.
+        assert_eq!(admit_sampled_warn(&mut state, b, later, every, 8), Some(0));
+        let next = t0 + every;
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), Some(2));
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), None);
+        // Bounded: a full table is reset rather than grown.
+        let mut full = HashMap::new();
+        assert_eq!(admit_sampled_warn(&mut full, a, t0, every, 1), Some(0));
+        assert_eq!(admit_sampled_warn(&mut full, b, t0, every, 1), Some(0));
+        assert_eq!(full.len(), 1);
     }
 
     // -- #3606: the token cache is scoped to the credential ------------------
@@ -17365,6 +18749,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// #4518 follow-up (W6 verify FAIL 2): repeated pulls through a Remote
+    /// with wrong credentials log each upstream-auth `security` WARN once
+    /// per Remote per interval, not once per pull: the token-service
+    /// rejection of credentials actually sent (#4453, same-origin realm) and
+    /// the cross-origin "credentials withheld" line (#3591), through the real
+    /// `exchange_bearer_then` wiring. With the credentials withheld, the
+    /// refused anonymous token is not an auth failure at all (#4527).
+    #[tokio::test]
+    async fn test_upstream_auth_security_warns_are_sampled_per_remote_4518() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (registry, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let token_listener = std::net::TcpListener::bind((registry.address().ip(), 0))
+            .expect("bind token-service listener");
+        let token_service = MockServer::builder().listener(token_listener).start().await;
+        // Both token services refuse.
+        for server in [&registry, &token_service] {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(server)
+                .await;
+        }
+        let challenge = |realm_origin: String| {
+            ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!("Bearer realm=\"{realm_origin}/token\",service=\"registry\"").as_str(),
+            )
+        };
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/cross/manifests/1"))
+            .respond_with(challenge(token_service.uri()))
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/same/manifests/1"))
+            .respond_with(challenge(registry.uri()))
+            .mount(&registry)
+            .await;
+
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+            // The registry is this Remote's configured upstream, so its
+            // credentials belong there (GHSA-24rf-2gv2-j47c).
+            point_remote_at(&pool, repo_id, &registry.uri()).await;
+            save_upstream_auth(
+                &pool,
+                repo_id,
+                "basic",
+                &build_credentials_json(&UpstreamAuthType::Basic {
+                    username: "svc-sampled".to_string(),
+                    password: Uuid::new_v4().simple().to_string(),
+                }),
+            )
+            .await
+            .expect("save upstream auth");
+            repos.push((repo_id, storage_dir));
+        }
+
+        let mut logs = Vec::new();
+        let mut outcomes = Vec::new();
+        for ((repo_id, storage_dir), image) in repos.iter().zip(["cross", "same"]) {
+            let proxy =
+                tdh::build_proxy_service_with_fs(pool.clone(), storage_dir.to_str().unwrap());
+            let url = format!("{}/v2/acme/{image}/manifests/1", registry.uri());
+            let capture = tdh::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            for _ in 0..3 {
+                let result = proxy.fetch_from_upstream(&url, *repo_id, 1 << 20).await;
+                let Err(err) = result else {
+                    panic!("{image}: the token service refuses");
+                };
+                outcomes.push((image, format!("{err:?}")));
+            }
+            drop(guard);
+            logs.push(capture.text());
+        }
+        for (repo_id, storage_dir) in &repos {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .ok();
+            let _ = std::fs::remove_dir_all(storage_dir);
+        }
+
+        let count = |logs: &str, needle: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("security") && l.contains(needle))
+                .count()
+        };
+        let (cross, same) = (&logs[0], &logs[1]);
+        // Cross-origin realm: credentials withheld (one sampled WARN across
+        // three pulls); the anonymous token request is then refused, which is
+        // not a credentials problem (#4527): INFO only, and a miss.
+        assert_eq!(
+            count(cross, "WITHOUT the upstream's Basic credentials"),
+            1,
+            "{cross}"
+        );
+        assert_eq!(count(cross, "token service rejected"), 0, "{cross}");
+        assert!(
+            cross.contains("refused an anonymous token request"),
+            "{cross}"
+        );
+        for (image, err) in &outcomes {
+            let auth = err.starts_with("UpstreamAuth");
+            assert_eq!(auth, *image == "same", "{image}: {err}");
+        }
+        // Same-origin realm: credentials sent and refused, once.
+        assert_eq!(count(same, "token service rejected"), 1, "{same}");
+        assert_eq!(
+            count(same, "WITHOUT the upstream's Basic credentials"),
+            0,
+            "{same}"
+        );
+        assert!(same.contains("credentials_sent=true"), "{same}");
+    }
+
     /// End to end through `fetch_from_upstream` (pins the call site in
     /// `exchange_bearer_then`): a credentialed remote whose registry names a
     /// cross-origin realm that is NOT in its allowlist must request the token
@@ -17421,6 +18933,9 @@ mod tests {
             .await;
 
         let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        // The registry is this Remote's configured upstream, so its
+        // credentials belong there (GHSA-24rf-2gv2-j47c).
+        point_remote_at(&pool, repo_id, &registry.uri()).await;
         save_upstream_auth(
             &pool,
             repo_id,
@@ -17574,7 +19089,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/token"))
-            .respond_with(ResponseTemplate::new(403))
+            .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
 
@@ -17585,10 +19100,12 @@ mod tests {
         let err = client
             .obtain_bearer_token(&realm, "", "", &None, &client.http_client)
             .await
-            .expect_err("a 403 from the token endpoint must surface as an error");
+            .expect_err("a 404 from the token endpoint must surface as an error");
+        // 401/403 are upstream auth failures (#4453, tested separately); any
+        // other non-2xx status stays a Storage error.
         assert!(
             matches!(err, AppError::Storage(_)),
-            "non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
+            "non-auth non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
         );
     }
 
@@ -21239,6 +22756,55 @@ mod tests {
         );
     }
 
+    /// #4013: a re-enter drops a memoised MISS (another replica may have just
+    /// filled the shared cache) but keeps a memoised hit.
+    #[tokio::test]
+    async fn test_forget_cached_sidecar_miss_drops_only_a_memoised_miss() {
+        let miss = format!(
+            "proxy-cache/{}/_test_/reenter-miss/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let hit = format!(
+            "proxy-cache/{}/_test_/reenter-hit/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let lru = proxy_metadata_lru().await;
+        lru.insert(miss.clone(), None).await;
+        lru.insert(hit.clone(), Some(sample_cache_metadata("kept")))
+            .await;
+        forget_cached_sidecar_miss(&miss).await;
+        forget_cached_sidecar_miss(&hit).await;
+        assert!(
+            lru.get(&miss).await.is_none(),
+            "the stale miss must be re-read from storage on re-enter"
+        );
+        assert!(
+            matches!(lru.get(&hit).await, Some(Some(_))),
+            "a memoised hit is still valid and is kept"
+        );
+        lru.invalidate(&hit).await;
+    }
+
+    /// #4013: the streaming leader's publish signal is the writer's #3335
+    /// registration: absent before, `false` while writing, `true` after.
+    #[tokio::test]
+    async fn test_tee_publish_done_tracks_the_writer_registration() {
+        let key = format!(
+            "proxy-cache/{}/_test_/publish-done/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        assert!(tee_publish_done(&key).is_none());
+        let guard = TeePublishGuard::register(&key);
+        let mut done = tee_publish_done(&key).expect("registered");
+        assert!(!*done.borrow());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), done.wait_for(|d| *d))
+            .await
+            .expect("flips on writer exit")
+            .expect("value observed");
+        assert!(tee_publish_done(&key).is_none(), "deregistered on exit");
+    }
+
     #[tokio::test]
     async fn test_load_cache_metadata_uses_lru_after_first_load() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -21880,6 +23446,7 @@ mod tests {
         /// A deployment addressing this bucket under `scope`.
         fn deployment(&self, scope: ProxyCacheScope) -> ProxyService {
             ProxyService::new(test_catalog_pool(), self.storage(), scope)
+                .without_origin_policy_gate()
         }
     }
 
@@ -22459,5 +24026,223 @@ mod upstream_filter_cache_tests {
             expired_streaming.err()
         );
         assert_eq!(hits, 0, "a refused path must never reach the upstream");
+    }
+
+    /// #4365 item 3: an ambiguous fetch path is a 400 (`Validation`) on the
+    /// buffered and the streaming fetch, before any upstream request.
+    #[tokio::test]
+    async fn ambiguous_fetch_path_is_refused_before_the_upstream_4365() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("jar"))
+            .mount(&upstream)
+            .await;
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &upstream.uri(),
+            RepositoryFormat::Maven,
+        );
+        let svc = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let mut outcomes = Vec::new();
+        for path in [
+            "org/acme/w/1.0/w-1.0.jar;x.pom",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+        ] {
+            outcomes.push((path, svc.fetch_artifact(&repo, path).await.err()));
+            outcomes.push((path, svc.fetch_artifact_streaming(&repo, path).await.err()));
+        }
+        let hits = upstream.received_requests().await.unwrap().len();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        for (path, err) in outcomes {
+            assert!(
+                matches!(err, Some(AppError::Validation(_))),
+                "{path}: {err:?}"
+            );
+        }
+        assert_eq!(hits, 0, "an ambiguous path must never reach the upstream");
+    }
+}
+
+/// #4365 item 1: the shared `(cache_key, scannable)` helper.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod proxy_serve_key_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_is_the_normalized_path_and_the_decision_is_on_its_file_name() {
+        let is_jar = |f: &str| f.ends_with(".jar");
+        for (path, key, scannable) in [
+            ("a/b/c.jar", "a/b/c.jar", true),
+            ("/a/b/c.jar/", "a/b/c.jar", true),
+            ("//a/b/c.jar//", "a/b/c.jar", true),
+            ("a/b/c.pom", "a/b/c.pom", false),
+            ("a/b/c.pom/", "a/b/c.pom", false),
+            // Nothing to serve as a package.
+            ("", "", false),
+            ("/", "", false),
+            // Ambiguous keys always reach the gate, whatever the name says.
+            ("a/b/c.jar?.pom", "a/b/c.jar?.pom", true),
+            ("a/b/c.jar#.pom", "a/b/c.jar#.pom", true),
+            ("a/b/c.jar;.pom", "a/b/c.jar;.pom", true),
+            ("a/b/c.jar%.pom", "a/b/c.jar%.pom", true),
+            ("a/b/c\t.pom", "a/b/c\t.pom", true),
+            // A valid escape is not ambiguous.
+            ("a/b%20c/d.pom", "a/b%20c/d.pom", false),
+        ] {
+            assert_eq!(
+                proxy_serve_key(path, is_jar),
+                ProxyServeKey {
+                    cache_key: key.to_string(),
+                    scannable
+                },
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            route_package_serve_key("/pkg/-/pkg-1.0.0.tgz"),
+            ProxyServeKey {
+                cache_key: "pkg/-/pkg-1.0.0.tgz".to_string(),
+                scannable: true
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_path_chars() {
+        for ambiguous in [
+            "a?b", "a#b", "a;b", "a%", "a%2", "a%zz", "a%2g", "a\nb", "a\u{7f}b",
+        ] {
+            assert!(has_ambiguous_path_chars(ambiguous), "{ambiguous:?}");
+        }
+        for plain in [
+            "@scope%2Fname",
+            "@scope%2fname/-/name-1.0.0.tgz",
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            "a/b%20c%2Bd/e",
+            "pkg+1.0~rc1.tar.gz",
+            "sha256:abc",
+        ] {
+            assert!(!has_ambiguous_path_chars(plain), "{plain:?}");
+        }
+    }
+}
+
+/// #4365 item 3: reject, do not encode. Every format's legitimate upstream
+/// path shape passes unchanged; a path an upstream could read as another
+/// resource is refused.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod upstream_fetch_path_tests {
+    use super::*;
+
+    #[test]
+    fn legitimate_upstream_paths_pass_unchanged() {
+        for ok in [
+            // npm scoped packument and tarball.
+            "@types%2Fnode",
+            "@types/node/-/node-20.0.0.tgz",
+            // Go module proxy `!`-case escaping.
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            // Helm `urls` entries and index-resolved file URLs are absolute.
+            "https://github.com/org/chart/releases/download/v1/chart-1.0.0.tgz",
+            "https://files.example/pkg.whl?token=a/b#sha256=abc",
+            // Handler-built queries (Ansible, Conan search, OCI tags/list).
+            "api/v3/collections/ns/name/versions/?limit=100&offset=0",
+            "v2/conans/search?q=zlib%2A",
+            "library/alpine/tags/list?n=101&last=3.19",
+            // Maven, PyPI, Cargo, VS Code legacy paths.
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+            "packages/requests/2.31.0/requests-2.31.0+local~rc1.tar.gz",
+            "api/v1/crates/serde/1.0.0/download",
+            "extensions/Publisher%20Name/My%20Extension/1.0.0%2Bbuild/download",
+            "sha256:0123abcd",
+        ] {
+            assert!(check_upstream_fetch_path(ok).is_ok(), "{ok}");
+        }
+        // The handler-built relative queries, from the handlers' own builders,
+        // with inputs that would put a `/` or a `#` in a naive query.
+        for built in [
+            crate::api::handlers::ansible::upstream_versions_page_path("ns", "name", 3),
+            crate::api::handlers::conan::upstream_search_path("zlib/1.*#rev"),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(100, Some("v1/+build#x")),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(10, None),
+        ] {
+            assert!(check_upstream_fetch_path(&built).is_ok(), "{built}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_upstream_paths_are_400() {
+        for bad in [
+            "org/acme/w/1.0/w-1.0.jar#/x.pom",
+            "pkg/-/pkg-1.0.0.tgz#",
+            "org/acme/w/1.0/w-1.0.jar;jsessionid=1",
+            "org/acme/w/1.0/w-1.0.jar%",
+            "org/acme/w/1.0/w-1.0.jar%2",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.ja\tr",
+            "org/acme/w/1.0/w-1.0.ja\u{7f}r",
+            "org/acme/w/1.0/w-1.0.jar?",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+            "org/acme/w/1.0/w-1.0.jar\\..\\x.pom",
+            "org/acme/w/1.0/w-1.0.jar ",
+        ] {
+            assert!(
+                matches!(check_upstream_fetch_path(bad), Err(AppError::Validation(_))),
+                "{bad:?}"
+            );
+        }
+    }
+}
+
+/// #4365 item 3 (strict form): what a client may put in a proxied path.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod client_path_tests {
+    use super::*;
+
+    #[test]
+    fn client_paths_with_query_fragment_or_stray_escapes_are_400() {
+        for bad in [
+            "pkg/-/x.tgz?versionId=abc",
+            "x.tgz?acl",
+            "x.tgz#frag",
+            "x.jar;jsessionid=1",
+            "x\\y.jar",
+            "x.jar%",
+            "x.jar%zz",
+            "x\tjar",
+        ] {
+            for allow_spaces in [false, true] {
+                assert!(
+                    matches!(
+                        reject_ambiguous_client_path(bad, allow_spaces),
+                        Err(AppError::Validation(_))
+                    ),
+                    "{bad:?}"
+                );
+            }
+        }
+        // A raw space is refused on format routes, allowed on the generic one.
+        assert!(reject_ambiguous_client_path("my file.txt", false).is_err());
+        assert!(reject_ambiguous_client_path("my file.txt", true).is_ok());
+        for ok in [
+            "@scope/name",
+            "pkg/-/pkg-1.0.0.tgz",
+            "serde",
+            "1.0.0+build.1",
+            "a%2Fb",
+        ] {
+            assert!(reject_ambiguous_client_path(ok, false).is_ok(), "{ok}");
+        }
     }
 }

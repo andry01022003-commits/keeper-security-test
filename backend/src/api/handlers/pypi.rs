@@ -2364,8 +2364,25 @@ fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
 /// spellings of one request could address two different cache entries -- or,
 /// worse, one spelling could address the entry another package's bytes were
 /// written under. The newtype makes that unrepresentable.
+///
+/// The key of [`pypi_file_serve_key`], so every PyPI proxy-cache key goes
+/// through the shared helper (#4365 item 1).
 fn build_pypi_proxy_cache_path(project: &NormalizedProjectName, filename: &str) -> String {
-    format!("simple/{}/{}", project.as_str(), filename)
+    pypi_file_serve_key(project, filename).cache_key
+}
+
+/// The canonical `(cache_key, scannable)` decision for a proxied PyPI file
+/// (#4365 item 1), cached under `simple/{project}/{filename}`. Every
+/// distribution is a package; a PEP 658 `.metadata` sidecar (the core
+/// metadata the resolver reads, served by its own route) is not.
+fn pypi_file_serve_key(
+    project: &NormalizedProjectName,
+    filename: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(
+        &format!("simple/{}/{}", project.as_str(), filename),
+        |file| !file.to_ascii_lowercase().ends_with(".metadata"),
+    )
 }
 
 /// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
@@ -2664,6 +2681,12 @@ async fn serve_file(
     auth: Option<&AuthExtension>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // #4365 item 3: the file name is joined into the upstream path and keys
+    // the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
         r#"
@@ -2712,15 +2735,9 @@ async fn serve_file(
                     // which serve bytes without consulting a scan verdict. Repos
                     // that have not enabled scan-on-proxy skip this entirely and
                     // keep today's untouched streaming behavior (no regression).
-                    if crate::services::scan_config_service::ScanConfigService::new(
-                        state.db.clone(),
-                    )
-                    .is_proxy_scan_enabled(repo.id)
-                    .await
-                    .unwrap_or(false)
+                    if let Some((action, severity_gate)) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
                     {
-                        let (action, severity_gate) =
-                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                         return serve_scanned_pypi_file(
                             state,
                             proxy,
@@ -3037,12 +3054,11 @@ async fn serve_file(
                             // a not-found or other error falls through to the next
                             // member. A member with scanning disabled keeps the
                             // untouched streaming cache path below (no regression).
-                            let (scan_enabled, action, severity_gate) =
-                                proxy_helpers::effective_virtual_scan_policy(
-                                    &state.db, repo.id, member.id,
-                                )
-                                .await;
-                            if scan_enabled {
+                            let scan = proxy_helpers::effective_virtual_scan_policy(
+                                &state.db, repo.id, member.id,
+                            )
+                            .await?;
+                            if let Some((action, severity_gate)) = scan {
                                 match serve_scanned_pypi_file(
                                     state,
                                     proxy,
@@ -3720,7 +3736,7 @@ async fn resolve_pypi_remote_fetch_target(
     // packages/requests/2.31.0/requests-2.31.0.tar.gz which differ from the
     // simple/ convention. A stable cache key ensures the cache-check
     // optimization in serve_file works for all upstream registry types.
-    let cache_path = format!("simple/{}/{}", normalized, filename);
+    let cache_path = build_pypi_proxy_cache_path(project, filename);
 
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
         Some(pair) => pair,
@@ -3768,6 +3784,11 @@ async fn pypi_proxy_cache_redirect(
         return None;
     }
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
+        return None;
+    }
+    // #4506: a Remote whose origin policy refuses its content gets no
+    // redirect; the gated fetch below answers the 403.
+    if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
         return None;
     }
     let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
@@ -19428,6 +19449,66 @@ mod tests {
         );
     }
 
+    /// #4594 is conda-only: a PyPI wheel whose own METADATA agrees with the
+    /// file name, scanned to completion with NOTHING cataloged, is still
+    /// inconclusive. Fail-closed withholds it (423) and records no verdict.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_zero_catalog_wheel_stays_locked_4594() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "zerocat";
+        let filename = "zerocat-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] =
+            Box::leak(build_test_wheel("zerocat", "1.0.0").into_boxed_slice());
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let (cve, scans) = VersionedCveScanner::counting(
+            Some("grype-0.84.0-test"),
+            MockCveRescan::CatalogedNothing,
+        );
+        let state = scan_state_with_live_scanner(&fx, &storage_path, cve);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let status = match super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            &proj(project),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) | Err(r) => r.status(),
+        };
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT verdict FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(&digest)
+                .fetch_optional(&fx.pool)
+                .await
+                .expect("read verdict");
+        tdh::drop_proxy_verdicts(&fx.pool, std::slice::from_ref(&digest)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(stored, None, "an inconclusive scan records no verdict");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wheel was scanned (its identity is established), not skipped"
+        );
+    }
+
     /// #4019, blocked half: a recorded `vulnerable` verdict must 403 the next
     /// download straight from the row, with no second scan.
     #[tokio::test]
@@ -21937,6 +22018,88 @@ mod legacy_json_xmlrpc_route_tests {
         assert_eq!(status7, StatusCode::NOT_FOUND);
     }
 
+    /// GHSA-24rf-2gv2-j47c, the advisory's live reproduction: an anonymous
+    /// download through a credentialed PyPI remote whose simple index names
+    /// the file by an absolute URL on ANOTHER origin. The file must still be
+    /// fetched from there, but without the remote's credentials, which keep
+    /// going to the configured upstream (the index fetch).
+    #[tokio::test]
+    async fn file_on_another_origin_is_fetched_without_upstream_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        // Same allow-listed address, another port: another origin.
+        let foreign_listener = std::net::TcpListener::bind((upstream.address().ip(), 0))
+            .expect("bind the foreign listener");
+        let foreign = MockServer::builder()
+            .listener(foreign_listener)
+            .start()
+            .await;
+        let file_url = format!("{}/files/advcpkg-1.0.tar.gz", foreign.uri());
+        Mock::given(method("GET"))
+            .and(path("/simple/advcpkg/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(format!(
+                        "<html><body><a href=\"{file_url}\">advcpkg-1.0.tar.gz</a></body></html>"
+                    )),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/advcpkg-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist-bytes".as_ref()))
+            .mount(&foreign)
+            .await;
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        crate::services::upstream_auth::save_upstream_auth(
+            &fx.pool,
+            fx.repo_id,
+            "basic",
+            r#"{"username":"ghsa-24rf","password":"not-a-real-secret"}"#,
+        )
+        .await
+        .expect("save upstream credentials");
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/advcpkg/advcpkg-1.0.tar.gz",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let index_requests = upstream.received_requests().await.unwrap_or_default();
+        let file_requests = foreign.received_requests().await.unwrap_or_default();
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"sdist-bytes");
+        assert!(
+            !file_requests.is_empty(),
+            "the file must come from the href's origin"
+        );
+        for r in &file_requests {
+            assert!(
+                !r.headers.contains_key("authorization"),
+                "the remote's credentials were sent to {}",
+                r.url
+            );
+        }
+        assert!(
+            index_requests
+                .iter()
+                .any(|r| r.headers.contains_key("authorization")),
+            "the configured upstream must still receive the credentials"
+        );
+    }
+
     /// Remote repository: the upstream document is proxied and every download
     /// URL is rewritten to this repository; an upstream 404 is a 404, and an
     /// upstream configured as its simple index still reaches `/pypi/...`.
@@ -22624,5 +22787,37 @@ mod legacy_json_xmlrpc_route_tests {
                 .starts_with(&format!("{ROUTE_BASE}/pypi/{key}/")),
             "{doc}"
         );
+    }
+}
+
+/// #4365 item 1: PyPI decides by route (every distribution is a package);
+/// the cache key is the stable `simple/{project}/{filename}` path.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn pypi_file_serve_key_table() {
+        let project = NormalizedProjectName::parse("requests").expect("valid name");
+        for (file, scannable) in [
+            ("requests-2.31.0.tar.gz", true),
+            ("requests-2.31.0-py3-none-any.whl", true),
+            ("requests-2.31.0-py3-none-any.whl.metadata", false),
+        ] {
+            let got = pypi_file_serve_key(&project, file);
+            assert_eq!(got.cache_key, format!("simple/requests/{file}"));
+            assert_eq!(got.cache_key, build_pypi_proxy_cache_path(&project, file));
+            assert_eq!(got.scannable, scannable, "{file}");
+        }
+        // PEP 503: every spelling of a project name reaches one key.
+        for raw in ["Foo_Bar.baz", "foo-bar-baz", "FOO__bar--BAZ", "foo.bar_baz"] {
+            let project = NormalizedProjectName::parse(raw).expect("valid name");
+            assert_eq!(
+                pypi_file_serve_key(&project, "foo_bar_baz-1.0.tar.gz").cache_key,
+                "simple/foo-bar-baz/foo_bar_baz-1.0.tar.gz",
+                "{raw}"
+            );
+        }
     }
 }

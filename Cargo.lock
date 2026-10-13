@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "artifact-keeper-backend"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -264,6 +264,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http",
+ "http-body",
  "http-body-util",
  "hyper-util",
  "jsonwebtoken 11.1.0",

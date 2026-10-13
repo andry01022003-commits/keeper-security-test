@@ -12,6 +12,7 @@
 //!   PUT  /npm/{repo_key}/{package}                    - Publish package
 //!   PUT  /npm/{repo_key}/{@scope}/{package}           - Publish scoped package
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
@@ -4426,6 +4427,11 @@ async fn serve_tarball(
     // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
     // collapsed the scope and package into one path segment that no upstream
     // tarball route matched, so the remote-proxy fetch 404'd (B7).
+    // #4365 item 3: the name and file name are joined into the upstream path.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[package_name, filename],
+    )?;
     let upstream_path = build_tarball_upstream_path(package_name, filename);
 
     // For remote repos, always proxy tarballs from upstream (hits cache if
@@ -4482,13 +4488,9 @@ async fn serve_tarball(
             // scan-on-proxy skip this entirely and keep today's untouched
             // streaming behavior (no regression). Runs after the age gate so
             // a last-known-good substitution is scanned as what is served.
-            if crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-                .is_proxy_scan_enabled(repo.id)
-                .await
-                .unwrap_or(false)
+            if let Some((action, severity_gate)) =
+                proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
             {
-                let (action, severity_gate) =
-                    proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -4544,6 +4546,22 @@ async fn serve_tarball(
             // Correct the cached artifact record so that SBOM generation and
             // security scanners can identify the file as a gzip archive.
             correct_cached_tarball_content_type(&state.db, repo.id, &fetch_path).await;
+
+            // #4341: count the proxied tarball. The scanned arm records
+            // through `serve_scanned_proxy_file` and the Virtual walk through
+            // its own resolver; this unscanned direct-Remote arm recorded
+            // nothing, so npm proxy traffic was undercounted. Keyed on
+            // `fetch_path`, the canonical key the streaming tee commits the
+            // catalog row under; HEAD is never counted; off the response path
+            // like Maven's direct Remote arm (#3778).
+            proxy_helpers::record_proxy_download_deferred(
+                state,
+                repo.id,
+                repo_key,
+                &fetch_path,
+                ctx,
+            )
+            .await;
 
             // Force the outbound Content-Type to application/gzip regardless of
             // what the upstream advertised — parity with the buffered path
@@ -4708,6 +4726,17 @@ async fn serve_tarball(
                         )
                         .await?;
                         correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
+                        // #4341: the last-known-good tarball is this member's
+                        // serve; count it under the member like every other
+                        // Remote-member serve through a Virtual (#4535).
+                        proxy_helpers::record_proxy_download_deferred(
+                            state,
+                            member.id,
+                            &member.key,
+                            &lkg_path,
+                            ctx,
+                        )
+                        .await;
                         return Ok(build_tarball_response_stream(
                             lkg.body,
                             &lkg_filename,
@@ -4740,12 +4769,12 @@ async fn serve_tarball(
                 let Some(ref member_upstream) = member.upstream_url else {
                     continue;
                 };
-                let (enabled, action, severity_gate) =
+                let Some((action, severity_gate)) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
-                        .await;
-                if !enabled {
+                        .await?
+                else {
                     continue;
-                }
+                };
                 // #3785: a member upstream outside the `/-/` layout (GitHub
                 // Packages) is fetched from the URL its packument advertises.
                 let source_path = resolve_npm_tarball_upstream(
@@ -4814,6 +4843,7 @@ async fn serve_tarball(
             proxy_for_virtual,
             &upstream_path,
             &member_fetch_urls,
+            Some(ctx),
             |member_id, location| {
                 let db = db.clone();
                 let state = state.clone();
@@ -5136,13 +5166,16 @@ async fn serve_scanned_npm_tarball(
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // #4365 item 1: every file on the tarball route is a package; the cache
+    // key is the canonical form of the tarball path.
+    let key = crate::services::proxy_service::route_package_serve_key(fetch_path);
     let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
         fetch_base: upstream_url,
         format: RepositoryFormat::Npm,
         source_path,
-        cache_path: fetch_path,
+        cache_path: &key.cache_key,
         filename,
         action,
         severity_gate,
@@ -5292,7 +5325,7 @@ async fn publish(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let package = validate_publish_package_name(&package)?;
     publish_package(&state, auth, &repo_key, &package, &headers, body).await
@@ -5303,7 +5336,7 @@ async fn publish_scoped(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package)): Path<(String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let full_name = validate_scoped_publish_package_name(&scope, &package)?;
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
@@ -5487,17 +5520,23 @@ async fn store_npm_version(
     // before any bytes are written; the authoritative admission happens
     // under lock in the same transaction as the artifact INSERT below.
     let size_bytes = ver.tarball_bytes.len() as i64;
-    let repo_service = state.create_repository_service();
-    if let Some(scope) = repo_service
-        .quota_preflight(repo_id, size_bytes)
-        .await
-        .map_err(IntoResponse::into_response)?
-    {
-        return Err(scope.into_error().into_response());
-    }
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo_id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        size_bytes,
+    )
+    .await?;
 
-    // Store the tarball
-    let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);
+    // Store the tarball. On a shared cloud namespace the key is repo-scoped
+    // (#4293), so the guard below only ever refuses a key another repository
+    // could own on the legacy flat scheme (`STORAGE_KEY_SCHEME=flat`).
+    let storage_key = build_npm_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &location.backend,
+        repo_id,
+        &artifact_path,
+    );
     proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
     let storage = state.storage_for_repo_or_500(location)?;
     storage
@@ -5510,14 +5549,13 @@ async fn store_npm_version(
     // a capped project) cannot jointly over-admit. A denial here is only
     // reachable when a concurrent upload consumed the headroom after the
     // preflight above.
-    let mut tx = state.db.begin().await.map_err(map_db_err)?;
-    let admission = repo_service
-        .check_quota_locked(&mut tx, repo_id, &artifact_path, size_bytes)
-        .await
-        .map_err(IntoResponse::into_response)?;
-    if let Some(scope) = admission.denied_by {
-        return Err(scope.into_error().into_response());
-    }
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -6139,9 +6177,25 @@ fn build_npm_artifact_path(package_name: &str, version: &str, tarball_filename: 
     format!("{}/{}/{}", package_name, version, tarball_filename)
 }
 
-/// Build the storage key for an npm tarball.
-fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
-    format!("npm/{}/{}/{}", package_name, version, tarball_filename)
+/// Build the storage key a new npm tarball is written to, from its artifact
+/// path (`{package}/{version}/{file}`).
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `npm/{repository_id}/{path}` of the #2624 scheme, so two repositories
+/// holding the same package version write two objects. The flat
+/// `npm/{path}` key every repository used to share made the second
+/// repository's publish fail the cross-repository write guard with 409
+/// "already owned by another repository" (#4293). Filesystem backends (one
+/// directory per repository) and `STORAGE_KEY_SCHEME=flat` keep the flat key.
+/// Existing tarballs are untouched: every npm read resolves the object
+/// through the `storage_key` its artifact row recorded.
+fn build_npm_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> String {
+    scheme.write_key(storage_backend, "npm", repo_id, artifact_path)
 }
 
 /// Build a scoped package name from scope and package.
@@ -9447,10 +9501,18 @@ mod tests {
     // build_npm_storage_key
     // -----------------------------------------------------------------------
 
+    fn npm_key(scheme: crate::storage::StorageKeyScheme, backend: &str, path: &str) -> String {
+        build_npm_storage_key(scheme, backend, uuid::Uuid::nil(), path)
+    }
+
     #[test]
     fn test_build_npm_storage_key_unscoped() {
         assert_eq!(
-            build_npm_storage_key("express", "4.18.2", "express-4.18.2.tgz"),
+            npm_key(
+                crate::storage::StorageKeyScheme::RepoScoped,
+                "filesystem",
+                &build_npm_artifact_path("express", "4.18.2", "express-4.18.2.tgz")
+            ),
             "npm/express/4.18.2/express-4.18.2.tgz"
         );
     }
@@ -9458,9 +9520,33 @@ mod tests {
     #[test]
     fn test_build_npm_storage_key_scoped() {
         assert_eq!(
-            build_npm_storage_key("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz"),
+            npm_key(
+                crate::storage::StorageKeyScheme::RepoScoped,
+                "filesystem",
+                &build_npm_artifact_path("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz")
+            ),
             "npm/@vue/compiler-core/3.4.0/compiler-core-3.4.0.tgz"
         );
+    }
+
+    /// #4293: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn test_build_npm_storage_key_is_repo_scoped_on_cloud_4293() {
+        use crate::storage::StorageKeyScheme;
+        let path = "@company/lib-name/1.2.0/lib-name-1.2.0.tgz";
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                npm_key(StorageKeyScheme::RepoScoped, backend, path),
+                format!("npm/{}/{path}", uuid::Uuid::nil()),
+                "{backend}"
+            );
+            assert_eq!(
+                npm_key(StorageKeyScheme::Flat, backend, path),
+                format!("npm/{path}"),
+                "{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -10778,6 +10864,94 @@ mod tests {
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
 
         cleanup().await;
+    }
+
+    /// #4341: a direct GET of a tarball on an npm Remote with scan-on-proxy
+    /// off records one proxy download under the canonical tarball path, as
+    /// the scanned and Virtual paths already did; HEAD records none.
+    #[tokio::test]
+    async fn test_remote_unscanned_tarball_download_is_recorded_4341() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        const TARBALL: &str = "is-number/-/is-number-7.0.0.tgz";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{TARBALL}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(b"\x1f\x8b\x08is-number-4341".as_ref()),
+            )
+            .mount(&mock_server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let request = |verb: &str| {
+            axum::http::Request::builder()
+                .method(verb)
+                .uri(format!("/{}/{TARBALL}", fx.repo_key))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM proxy_download_statistics d \
+                 JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+                 WHERE a.repository_id = $1 AND a.path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(TARBALL)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count statistics rows")
+        };
+        // The recorder may ride a spawned task (#3778): poll for `want`.
+        let settle = |want: i64| async move {
+            let mut seen = 0;
+            for _ in 0..100 {
+                seen = count().await;
+                if seen >= want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            seen
+        };
+
+        let mut seen = Vec::new();
+        for (verb, want) in [("GET", 1), ("HEAD", 1), ("GET", 2)] {
+            let (status, _) =
+                tdh::send(tdh::router_anon(router(), state.clone()), request(verb)).await;
+            assert_eq!(status, StatusCode::OK, "{verb}");
+            if verb == "HEAD" {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            seen.push((verb, settle(want).await));
+        }
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert_eq!(seen, vec![("GET", 1), ("HEAD", 1), ("GET", 2)]);
     }
 
     // -----------------------------------------------------------------------
@@ -13387,6 +13561,110 @@ mod tests {
             member_ledger,
             Some(3),
             "the member is charged the tarball once"
+        );
+    }
+
+    /// #4293: on a shared cloud namespace (S3/GCS/Azure) the same package
+    /// version must be publishable into two independent npm repositories. The
+    /// tarball key was the flat `npm/{package}/{version}/{file}`, so the second
+    /// repository's publish hit the cross-repository write guard and answered
+    /// 409 "already owned by another repository". New tarballs are written
+    /// under the repo-scoped key (`npm/{repository_id}/...`, the #2624 scheme
+    /// Maven already uses), and each repository serves its own copy.
+    #[tokio::test]
+    async fn test_same_package_publishes_to_two_cloud_repositories_4293() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "npm").await;
+            sqlx::query(
+                "UPDATE repositories SET storage_backend = 's3', storage_path = key \
+                 WHERE id = $1",
+            )
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set cloud backend");
+            tdh::grant_repo_access(&pool, repo_id, user_id).await;
+            repos.push((repo_id, repo_key, dir));
+        }
+
+        let tarball = b"same tarball bytes in both repositories";
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(tarball);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@company/lib-name",
+                "versions": { "1.2.0": { "name": "@company/lib-name", "version": "1.2.0" } },
+                "_attachments": { "lib-name-1.2.0.tgz": { "data": tarball_b64 } },
+            }))
+            .expect("serialize publish body"),
+        );
+
+        let mut outcomes = Vec::new();
+        for (repo_id, repo_key, _) in &repos {
+            let published = super::publish_package(
+                &state,
+                Some(tdh::make_auth(user_id, &username)),
+                repo_key,
+                "@company/lib-name",
+                &HeaderMap::new(),
+                body.clone(),
+            )
+            .await
+            .map(|r| r.status())
+            .map_err(|r| r.status());
+            let row_key: Option<String> = sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 \
+                 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("artifact row");
+            let router = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(user_id, &username),
+            );
+            let (dl_status, dl_body) = tdh::send(
+                router,
+                tdh::get(format!(
+                    "/{repo_key}/@company/lib-name/-/lib-name-1.2.0.tgz"
+                )),
+            )
+            .await;
+            outcomes.push((*repo_id, published, row_key, dl_status, dl_body));
+        }
+        let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+
+        for (repo_id, _, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *repo_id, dir).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (repo_id, published, _, _, _) in &outcomes {
+            assert!(
+                published.is_ok(),
+                "publishing the same version into repository {repo_id} must \
+                 succeed, got {published:?}"
+            );
+        }
+        for (repo_id, _, row_key, dl_status, dl_body) in outcomes {
+            let expected = format!("npm/{repo_id}/@company/lib-name/1.2.0/lib-name-1.2.0.tgz");
+            assert_eq!(row_key.as_deref(), Some(expected.as_str()));
+            assert!(objects.contains(&expected), "{expected} must be written");
+            assert_eq!(dl_status, StatusCode::OK);
+            assert_eq!(&dl_body[..], &tarball[..]);
+        }
+        assert!(
+            !objects.iter().any(|k| k.starts_with("npm/@company/")),
+            "the legacy flat key must not be written on a cloud backend: {objects:?}"
         );
     }
 
@@ -17944,5 +18222,35 @@ mod virtual_packument_member_authz_tests {
         tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
         tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4365 item 1: npm decides by route (every tarball is a package); the
+/// cache key is the tarball path the fetch already used.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn npm_tarball_serve_key_table() {
+        for (name, file, key) in [
+            (
+                "lodash",
+                "lodash-4.17.21.tgz",
+                "lodash/-/lodash-4.17.21.tgz",
+            ),
+            (
+                "@types/node",
+                "node-20.0.0.tgz",
+                "@types/node/-/node-20.0.0.tgz",
+            ),
+        ] {
+            let got = crate::services::proxy_service::route_package_serve_key(
+                &build_tarball_upstream_path(name, file),
+            );
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
+        }
     }
 }

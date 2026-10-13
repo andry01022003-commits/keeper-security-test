@@ -192,35 +192,6 @@ impl AuthExtension {
         self.access_scope().grants(repo_id)
     }
 
-    /// Add a token's `include_virtual_members` expansion to its scope, for a
-    /// READ request only (#4213 review).
-    ///
-    /// Applied once, where the credential becomes a principal, so every
-    /// handler downstream sees a scope that is already right for the request.
-    /// On a write the members are simply not there, and a write path nobody
-    /// remembered to audit denies them like any other out-of-scope repository.
-    /// An unrestricted scope has nothing to add.
-    pub(crate) fn with_read_expansion(mut self, expansion: Vec<Uuid>, is_read: bool) -> Self {
-        if is_read {
-            if let AccessScope::Restricted(ids) = &mut self.allowed_repo_ids {
-                for id in expansion {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                }
-            }
-        }
-        self
-    }
-
-    /// A JWT principal for this request: [`From<Claims>`] plus the read
-    /// expansion an exchanged token carries. `From<Claims>` alone never adds
-    /// it, so any path that has no request to classify stays write-safe.
-    pub(crate) fn from_claims_for_request(claims: Claims, is_read: bool) -> Self {
-        let expansion = claims.read_expansion_repo_ids.clone().unwrap_or_default();
-        Self::from(claims).with_read_expansion(expansion, is_read)
-    }
-
     /// Return an authorization error if scope check fails.
     pub fn require_scope(&self, scope: &str) -> crate::error::Result<()> {
         if self.has_scope(scope) {
@@ -886,7 +857,6 @@ pub async fn auth_middleware(
     }
 
     // Extract token from request headers
-    let is_read = request_is_read(&request);
     let extracted = extract_token(&request);
 
     // Track whether the request even attempted header-based auth, so the
@@ -907,9 +877,8 @@ pub async fn auth_middleware(
         // PR #1190 was supposed to close.
         ExtractedToken::Bearer(token) => {
             match auth_service.validate_access_token_async(token).await {
-                Ok(claims) => Ok(AuthExtension::from_claims_for_request(claims, is_read)),
-                Err(_) => match validate_api_token_with_scopes(&auth_service, token, is_read).await
-                {
+                Ok(claims) => Ok(AuthExtension::from(claims)),
+                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
                     Ok(ext) => Ok(ext),
                     // Same transient bcrypt-capacity shed as the Basic branch
                     // below: a saturated cap is "retry shortly", not "wrong
@@ -920,7 +889,7 @@ pub async fn auth_middleware(
             }
         }
         ExtractedToken::ApiKey(token) => {
-            match validate_api_token_with_scopes(&auth_service, token, is_read).await {
+            match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => Ok(ext),
                 Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
                 Err(TokenAuthError::Invalid) => Err("Invalid or expired API token"),
@@ -980,9 +949,7 @@ pub async fn auth_middleware(
                         // (added by #2798) over-reached the #2786 need; #2806
                         // restores the /api/v1 Basic-auth boundary.
                         match auth_service.validate_access_token_async(&password).await {
-                            Ok(claims) => {
-                                Ok(AuthExtension::from_claims_for_request(claims, is_read))
-                            }
+                            Ok(claims) => Ok(AuthExtension::from(claims)),
                             Err(_) => Err("Invalid credentials"),
                         }
                     }
@@ -1122,13 +1089,11 @@ fn classify_token_validation_err(err: AppError) -> TokenAuthError {
 async fn validate_api_token_with_scopes(
     auth_service: &AuthService,
     token: &str,
-    is_read: bool,
 ) -> Result<AuthExtension, TokenAuthError> {
     let validation = auth_service
         .validate_api_token(token)
         .await
         .map_err(classify_token_validation_err)?;
-    let expansion = validation.read_expansion_repo_ids.clone();
 
     Ok(AuthExtension {
         user_id: validation.user.id,
@@ -1145,8 +1110,7 @@ async fn validate_api_token_with_scopes(
     // An admin-owned token only wields admin when its scope ceiling grants
     // the `admin` scope (or `*`); a narrow-scoped token is demoted to a
     // non-admin principal here (GHSA-vvc3).
-    .with_scope_gated_admin()
-    .with_read_expansion(expansion, is_read))
+    .with_scope_gated_admin())
 }
 
 /// Outcome of resolving an authentication credential.
@@ -1223,7 +1187,6 @@ pub(crate) async fn try_resolve_auth_outcome(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
     allow_basic_api_token: bool,
-    is_read: bool,
 ) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
@@ -1231,11 +1194,9 @@ pub(crate) async fn try_resolve_auth_outcome(
             // rationale: optional-auth routes still need to reject pre-change
             // tokens across replicas (#1173).
             if let Ok(claims) = auth_service.validate_access_token_async(token).await {
-                return AuthOutcome::Resolved(AuthExtension::from_claims_for_request(
-                    claims, is_read,
-                ));
+                return AuthOutcome::Resolved(AuthExtension::from(claims));
             }
-            match validate_api_token_with_scopes(auth_service, token, is_read).await {
+            match validate_api_token_with_scopes(auth_service, token).await {
                 Ok(ext) => return AuthOutcome::Resolved(ext),
                 // A transient bcrypt-capacity shed must surface as 503, not
                 // 401. See `AuthOutcome::Overloaded`.
@@ -1257,7 +1218,7 @@ pub(crate) async fn try_resolve_auth_outcome(
             AuthOutcome::InvalidCredential
         }
         ExtractedToken::ApiKey(token) => {
-            match validate_api_token_with_scopes(auth_service, token, is_read).await {
+            match validate_api_token_with_scopes(auth_service, token).await {
                 Ok(ext) => AuthOutcome::Resolved(ext),
                 // See `AuthOutcome::Overloaded`: saturated bcrypt cap is a
                 // retryable 503, never a 401.
@@ -1291,9 +1252,7 @@ pub(crate) async fn try_resolve_auth_outcome(
             // package managers like Maven, pip/twine, and Helm send the AK access
             // token as the Basic auth password.
             if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
-                return AuthOutcome::Resolved(AuthExtension::from_claims_for_request(
-                    claims, is_read,
-                ));
+                return AuthOutcome::Resolved(AuthExtension::from(claims));
             }
             // Fall back to treating the password as an API token — compatible with
             // pip netrc / Artifactory-style `token:<api_token>` credential format.
@@ -1308,7 +1267,7 @@ pub(crate) async fn try_resolve_auth_outcome(
             if !allow_basic_api_token {
                 return AuthOutcome::InvalidCredential;
             }
-            match validate_api_token_with_scopes(auth_service, &password, is_read).await {
+            match validate_api_token_with_scopes(auth_service, &password).await {
                 Ok(ext) => AuthOutcome::Resolved(ext),
                 // The token fallback also burns a bcrypt verify under the
                 // same process-wide cap; preserve the shed as Overloaded so
@@ -1383,7 +1342,8 @@ pub(crate) fn extract_ticket_from_query(query: Option<&str>) -> Option<String> {
 /// Tickets are minted for downloads/streams only. Any write operation
 /// (POST, PUT, PATCH, DELETE) authenticated by a ticket must be rejected
 /// even when the underlying user has write permission, because the ticket
-/// embeds no scope information and the calling client may be a browser
+/// carries no action scope (only the minter's repository restriction)
+/// and the calling client may be a browser
 /// `<a href>` or `EventSource` that the user did not consent to use for
 /// mutations.
 fn ticket_method_allowed(method: &Method) -> bool {
@@ -1422,14 +1382,14 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
-    let (user_id, _purpose, resource_path) =
+    let redeemed =
         crate::services::auth_config_service::AuthConfigService::validate_download_ticket(
             db, ticket,
         )
         .await
         .ok()?;
 
-    if !ticket_path_allowed(resource_path.as_deref(), request_path) {
+    if !ticket_path_allowed(redeemed.resource_path.as_deref(), request_path) {
         // Ticket has been consumed by validate_download_ticket; treat the
         // mismatch as an authentication failure so the client cannot reuse
         // the same ticket against a different path.
@@ -1448,31 +1408,28 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
+    // A ticket minted before its repository scope was recorded carries no
+    // restriction we could restore, so it authenticates nothing (fail
+    // closed, GHSA-2mfv-xg68-gq4p). Such tickets expire within minutes.
+    let repo_scope = redeemed.repo_scope?;
+
     // Load the owning user. We block deactivated users so a revoked account
     // cannot keep downloading via outstanding tickets, but we honour service
     // accounts and not-yet-rotated passwords because the ticket itself is
     // the proof of intent: the JWT session that minted it had whatever
     // rights the user had at mint time.
     //
-    // Uses `sqlx::query_as::<_, User>` rather than the `query_as!` macro so
-    // adding the ticket-consumer middleware does not require regenerating
-    // the offline SQLx query cache.
-    let user: User = sqlx::query_as::<_, User>(
-        r#"
-        SELECT
-            id, username, email, password_hash, display_name,
-            auth_provider, external_id, is_admin, is_active,
-            is_service_account, must_change_password,
-            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-            last_login_at, created_at, updated_at
-        FROM users
-        WHERE id = $1 AND is_active = true
-        "#,
-    )
-    .bind(user_id)
-    .fetch_optional(db)
-    .await
-    .ok()??;
+    // `SELECT *` rather than a hand-written column list: the list this
+    // replaced had drifted behind `User` (it lacked the lockout and
+    // password-change columns), so every decode failed and no ticket ever
+    // authenticated (GHSA-2mfv-xg68-gq4p). `query_as::<_, User>` rather than
+    // the `query_as!` macro keeps this out of the offline SQLx query cache.
+    let user: User =
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1 AND is_active = true")
+            .bind(redeemed.user_id)
+            .fetch_optional(db)
+            .await
+            .ok()??;
 
     let mut ext = AuthExtension::from(user);
     // Tickets are read-only. Drop admin elevation so a ticket minted by an
@@ -1496,6 +1453,11 @@ async fn try_resolve_ticket_auth(
     // intentionally minted a download URL.
     ext.is_api_token = true;
     ext.scopes = Some(vec![]);
+    // The minting credential's repository restriction, not the owner's full
+    // reach: `From<User>` grants every repository the user can access, which
+    // would let a repository-restricted token mint its way out of its
+    // restriction (GHSA-2mfv-xg68-gq4p).
+    ext.allowed_repo_ids = repo_scope;
     Some(ext)
 }
 
@@ -1513,10 +1475,22 @@ struct TicketRequestParts {
 
 fn extract_ticket_request_parts(request: &Request) -> Option<TicketRequestParts> {
     let ticket = extract_ticket_from_query(request.uri().query())?;
+    // A ticket is bound to the path the client will request, which is the
+    // FULL path. Inside a nest (`/api/v1/repositories`, ...) axum has already
+    // stripped `request.uri()` down to a suffix, so compare against
+    // `OriginalUri` (populated by the outer router), falling back to the
+    // request URI for a flat router with no nest. Without this a path-bound
+    // ticket never matched on a nested route (GHSA-2mfv-xg68-gq4p follow-on:
+    // the web UI and Terraform mirror ticket flows).
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
     Some(TicketRequestParts {
         ticket,
         method: request.method().clone(),
-        path: request.uri().path().to_string(),
+        path,
     })
 }
 
@@ -1561,12 +1535,11 @@ pub async fn optional_auth_middleware(
         return refusal;
     }
 
-    let is_read = request_is_read(&request);
     let extracted = extract_token(&request);
     // /api/v1 optional-auth route: an API token is NOT accepted as the Basic
     // password (`allow_basic_api_token=false`) — the /api/v1 Basic-auth boundary
     // (#2806). Bearer/X-Api-Key token auth and bcrypt/JWT Basic auth still work.
-    let outcome = try_resolve_auth_outcome(&auth_service, extracted, false, is_read).await;
+    let outcome = try_resolve_auth_outcome(&auth_service, extracted, false).await;
     // A transient bcrypt-capacity shed surfaces here as `Overloaded`. Return a
     // retryable 503 immediately rather than silently dropping to anonymous and
     // letting a downstream `require_auth_basic*` turn it into a misleading 401
@@ -1630,7 +1603,6 @@ pub async fn admin_middleware(
         return refusal;
     }
 
-    let is_read = request_is_read(&request);
     let extracted = extract_token(&request);
 
     if matches!(extracted, ExtractedToken::Basic(encoded) if decode_basic_credentials(encoded).is_none())
@@ -1646,7 +1618,7 @@ pub async fn admin_middleware(
     //
     // /api/v1 admin route: an API token is NOT accepted as the Basic password
     // (`allow_basic_api_token=false`) — the /api/v1 Basic-auth boundary (#2806).
-    let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false, is_read).await {
+    let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false).await {
         AuthOutcome::Resolved(ext) => ext,
         AuthOutcome::Overloaded => return service_unavailable_response(),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
@@ -1787,6 +1759,13 @@ fn percent_decode_path_segment(segment: &str) -> Option<Cow<'_, str>> {
 pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
+    // rattler's conda token layout puts the credential in front of the whole
+    // path: `/t/<TOKEN>/conda/<repo_key>/...`. Drop the `t/<TOKEN>` pair so
+    // the rest is the ordinary `/conda/<repo_key>/...` shape below.
+    if rattler_conda_token_rest(trimmed).is_some() {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     // Format prefix (pypi, npm, maven, ...).
     let format = segments.next().unwrap_or("");
     // Conda token channels embed the credential in the URL path:
@@ -1861,6 +1840,9 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
 /// token segment.
 pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
+    if let Some((token, _rest)) = rattler_conda_token_rest(trimmed) {
+        return Some(token);
+    }
     let mut segments = trimmed.split('/');
     if segments.next()? != "conda" {
         return None;
@@ -1881,6 +1863,21 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     // Same shape test `extract_repo_key` applies to the matching skip.
     segments.next()?;
     Some(token)
+}
+
+/// Split rattler's conda token layout, `t/<TOKEN>/conda/<repo_key>/...`
+/// (leading `/` already trimmed), into the token and the path after it.
+/// `None` unless the token is non-empty and a repository key follows `conda`,
+/// so no other `/t/...` path is mistaken for a credential.
+fn rattler_conda_token_rest(trimmed: &str) -> Option<(&str, &str)> {
+    let rest = trimmed.strip_prefix("t/")?;
+    let (token, rest) = rest.split_once('/')?;
+    let after = rest.strip_prefix("conda/")?;
+    let repo_key = after.split('/').next().unwrap_or("");
+    if token.is_empty() || repo_key.is_empty() {
+        return None;
+    }
+    Some((token, rest))
 }
 
 /// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
@@ -1974,68 +1971,6 @@ pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> 
 /// not whether an anonymous caller is turned away -- neither admits one.
 pub(crate) fn should_allow_repo_access(visibility: RepositoryVisibility, has_auth: bool) -> bool {
     visibility.allows_anonymous_read() || has_auth
-}
-
-/// Whether a request only reads, for deciding whether a token's
-/// `include_virtual_members` expansion joins its scope (#4213 review).
-///
-/// Conservative on purpose: a safe method, or one of the POSTs a public
-/// repository serves to anonymous readers (the VS Code gallery query, PyPI
-/// XML-RPC). Anything else counts as a write and the expansion is withheld,
-/// so the failure mode of a wrong answer here is a refused read, never a
-/// permitted write.
-///
-/// **A request that hands out a credential is never a read**, whatever its
-/// method. A credential outlives the request, so one minted from a scope that
-/// already holds the expansion would carry the members into its
-/// action-independent ceiling, where a later write would pass. That is how a
-/// GET to Conan's `users/authenticate` escaped the rule (#4213 review). Such
-/// an exchange sees only the base scope, and passes the expansion on as its
-/// own claim if it needs to (see `/v2/token` and Conan's authenticate).
-///
-/// The path comes from `OriginalUri` when present, so the answer does not
-/// depend on which nested router the middleware runs under.
-pub(crate) fn request_is_read(request: &Request) -> bool {
-    let path = request
-        .extensions()
-        .get::<axum::extract::OriginalUri>()
-        .map(|uri| uri.0.path().to_owned())
-        .unwrap_or_else(|| request.uri().path().to_owned());
-    is_read_request(request.method(), &path)
-}
-
-/// [`request_is_read`] on its parts, so the rule is unit-testable.
-pub(crate) fn is_read_request(method: &Method, path: &str) -> bool {
-    if is_credential_exchange(path) {
-        return false;
-    }
-    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
-        || (*method == Method::POST && is_anonymous_readable_format_post(path))
-}
-
-/// Endpoints that exchange the presented credential for a new one, served on
-/// GET as well as POST (#4213 review). See [`request_is_read`].
-///
-/// `/v2/token` builds its JWT from a re-validated credential rather than from
-/// the principal, so it is listed for the invariant, not because it leaks.
-fn is_credential_exchange(path: &str) -> bool {
-    let trimmed = path.strip_prefix('/').unwrap_or(path);
-    let mut segments = trimmed.split('/');
-    match segments.next() {
-        // /conan/<repo_key>/v2/users/authenticate
-        Some("conan") => {
-            matches!(segments.next(), Some(k) if !k.is_empty())
-                && segments.next() == Some("v2")
-                && segments.next() == Some("users")
-                && segments.next() == Some("authenticate")
-                && matches!(segments.next(), None | Some(""))
-        }
-        // /v2/token
-        Some("v2") => {
-            segments.next() == Some("token") && matches!(segments.next(), None | Some(""))
-        }
-        _ => false,
-    }
 }
 
 /// Return true when the HTTP method is a write operation (POST, PUT, PATCH,
@@ -2572,12 +2507,10 @@ pub async fn repo_visibility_middleware(
     // - a VALID credential -> the existence-hiding 404 below
     //   (GHSA-fv45-mwhh-q23r).
     let Some(repo) = repo else {
-        let is_read = request_is_read(&request);
         let extracted = extract_visibility_token(&request);
         // Format/registry endpoint: preserve pip-netrc / Artifactory-style
         // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
-        let outcome =
-            try_resolve_auth_outcome(&vis_state.auth_service, extracted, true, is_read).await;
+        let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
         // Transient bcrypt-capacity shed -> retryable 503 (see
         // `AuthOutcome::Overloaded`), never a 401.
         if matches!(outcome, AuthOutcome::Overloaded) {
@@ -2638,11 +2571,10 @@ pub async fn repo_visibility_middleware(
     // Perform optional auth (shared with optional_auth_middleware). Conda
     // token channels carry the credential in the URL path, so fall back to it
     // when no header/cookie credential is present.
-    let is_read = request_is_read(&request);
     let extracted = extract_visibility_token(&request);
     // Format/registry endpoint: preserve pip-netrc / Artifactory-style
     // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
-    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true, is_read).await;
+    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
     // Transient bcrypt-capacity shed -> retryable 503 (see
     // `AuthOutcome::Overloaded`), never a 401.
     if matches!(outcome, AuthOutcome::Overloaded) {
@@ -3490,7 +3422,6 @@ mod tests {
     fn test_auth_extension_from_claims() {
         let user_id = Uuid::new_v4();
         let claims = Claims {
-            read_expansion_repo_ids: None,
             sub: user_id,
             username: "testuser".to_string(),
             email: "test@example.com".to_string(),
@@ -3560,7 +3491,6 @@ mod tests {
     #[test]
     fn test_auth_extension_from_claims_non_admin() {
         let claims = Claims {
-            read_expansion_repo_ids: None,
             sub: Uuid::new_v4(),
             username: "regular".to_string(),
             email: "regular@example.com".to_string(),
@@ -3612,7 +3542,6 @@ mod tests {
 
     fn claims_with(is_admin: bool, scopes: Option<Vec<String>>) -> Claims {
         Claims {
-            read_expansion_repo_ids: None,
             sub: Uuid::new_v4(),
             username: "principal".to_string(),
             email: "principal@example.com".to_string(),
@@ -3955,7 +3884,6 @@ mod tests {
     #[test]
     fn test_from_claims_propagates_scopes_ceiling() {
         let claims = Claims {
-            read_expansion_repo_ids: None,
             sub: Uuid::new_v4(),
             username: "exchanged".to_string(),
             email: "exchanged@example.com".to_string(),
@@ -3977,126 +3905,6 @@ mod tests {
         assert_eq!(ext.scopes, Some(vec!["read:artifacts".to_string()]));
         assert!(ext.has_scope("read:artifacts"));
         assert!(!ext.has_scope("write:artifacts"));
-    }
-
-    /// #4213 review: which requests get a token's `include_virtual_members`
-    /// expansion. Safe methods and the POSTs a public repository serves to
-    /// anonymous readers; everything else is a write and gets none.
-    #[test]
-    fn read_classification_is_conservative() {
-        for m in [Method::GET, Method::HEAD, Method::OPTIONS] {
-            assert!(
-                is_read_request(&m, "/api/v1/repositories/x/artifacts"),
-                "{m}"
-            );
-        }
-        for m in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
-            assert!(
-                !is_read_request(&m, "/api/v1/repositories/x/artifacts"),
-                "{m}"
-            );
-        }
-        // The virtual VS Code gallery (#3960) queries by POST and must keep
-        // reading members through a flagged token.
-        assert!(is_read_request(
-            &Method::POST,
-            "/vscode/team/gallery/extensionquery"
-        ));
-        assert!(is_read_request(&Method::POST, "/pypi/team/pypi"));
-        // Upload negotiation and credential exchange stay writes.
-        assert!(!is_read_request(&Method::POST, "/lfs/team/objects/batch"));
-        assert!(!is_read_request(
-            &Method::POST,
-            "/conan/team/v1/users/authenticate"
-        ));
-        // A credential exchange is never a read, on ANY method: its output
-        // outlives the request (#4213 review, the Conan GET).
-        for m in [Method::GET, Method::HEAD, Method::POST] {
-            assert!(
-                !is_read_request(&m, "/conan/team/v2/users/authenticate"),
-                "{m}"
-            );
-            assert!(
-                !is_read_request(&m, "/conan/team/v2/users/authenticate/"),
-                "{m}"
-            );
-            assert!(!is_read_request(&m, "/v2/token"), "{m}");
-        }
-        // ...and only those: neighbouring Conan and OCI reads still read.
-        assert!(is_read_request(
-            &Method::GET,
-            "/conan/team/v2/users/check_credentials"
-        ));
-        assert!(is_read_request(&Method::GET, "/v2/team/manifests/latest"));
-        assert!(is_read_request(&Method::GET, "/v2/"));
-    }
-
-    /// The merge: members join the scope for a read, never for a write, and
-    /// an unrestricted scope is left alone.
-    #[test]
-    fn read_expansion_joins_the_scope_for_reads_only() {
-        let (named, member) = (Uuid::new_v4(), Uuid::new_v4());
-        let base = || AuthExtension {
-            allowed_repo_ids: AccessScope::Restricted(vec![named]),
-            ..AuthExtension::default()
-        };
-
-        let read = base().with_read_expansion(vec![member], true);
-        assert!(read.can_access_repo(member));
-        assert!(read.can_access_repo(named));
-
-        let write = base().with_read_expansion(vec![member], false);
-        assert!(
-            !write.can_access_repo(member),
-            "a write never sees the member"
-        );
-        assert!(write.can_access_repo(named));
-
-        let admin = AuthExtension {
-            allowed_repo_ids: AccessScope::Admin,
-            ..AuthExtension::default()
-        }
-        .with_read_expansion(vec![member], true);
-        assert!(matches!(admin.allowed_repo_ids, AccessScope::Admin));
-    }
-
-    /// An exchanged JWT carries the expansion as its own claim. The
-    /// request-aware conversion applies it to reads; plain `From<Claims>`,
-    /// used wherever there is no request to classify, never does; and a JWT
-    /// minted before this change has none.
-    #[test]
-    fn jwt_read_expansion_applies_to_reads_only() {
-        let member = Uuid::new_v4();
-        let claims = Claims {
-            sub: Uuid::new_v4(),
-            username: "svc".to_string(),
-            email: "svc@example.com".to_string(),
-            is_admin: false,
-            allowed_repo_ids: Some(vec![Uuid::new_v4()]),
-            read_expansion_repo_ids: Some(vec![member]),
-            iat: 0,
-            iat_ms: None,
-            exp: 0,
-            token_type: "access".to_string(),
-            jti: None,
-            scopes: Some(vec!["read:artifacts".to_string()]),
-            family_id: None,
-            scan_pull_repo: None,
-        };
-
-        assert!(
-            AuthExtension::from_claims_for_request(claims.clone(), true).can_access_repo(member)
-        );
-        assert!(
-            !AuthExtension::from_claims_for_request(claims.clone(), false).can_access_repo(member)
-        );
-        assert!(!AuthExtension::from(claims.clone()).can_access_repo(member));
-
-        let legacy = Claims {
-            read_expansion_repo_ids: None,
-            ..claims
-        };
-        assert!(!AuthExtension::from_claims_for_request(legacy, true).can_access_repo(member));
     }
 
     #[test]
@@ -4557,6 +4365,22 @@ mod tests {
         assert_eq!(extract_repo_key("/maven/privat%"), "privat%");
         // `%ff` decodes to a byte that is not valid UTF-8 on its own.
         assert_eq!(extract_repo_key("/maven/privat%ff/com/acme"), "privat%ff");
+    }
+
+    #[test]
+    fn test_rattler_conda_token_layout() {
+        let path = "/t/abc123token/conda/my-channel/noarch/repodata.json";
+        assert_eq!(extract_conda_url_token(path), Some("abc123token"));
+        assert_eq!(extract_repo_key(path), "my-channel");
+        assert_eq!(
+            extract_repo_key("/t/tok/conda/my-channel/channeldata.json"),
+            "my-channel"
+        );
+        // Not the rattler layout: no token, no `conda`, or no repository key.
+        assert_eq!(extract_conda_url_token("/t//conda/my-channel/x"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/pypi/my-repo/simple"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda/"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda"), None);
     }
 
     #[test]
@@ -6421,7 +6245,6 @@ mod tests {
         // the credential-change watermark (strict `<`) accepts the token.
         let now = Utc::now();
         let claims = Claims {
-            read_expansion_repo_ids: None,
             sub,
             username: username.to_string(),
             email: format!("{}@example.test", username),
@@ -6467,8 +6290,7 @@ mod tests {
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
 
         let resolved =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false, false)
-                .await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -6730,8 +6552,7 @@ mod tests {
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("any:{}", token));
 
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true, false)
-                .await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true).await;
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -6778,7 +6599,7 @@ mod tests {
                 .header(AUTHORIZATION, header)
                 .body(axum::body::Body::empty())
                 .expect("build request");
-            try_resolve_auth_outcome(auth_service, extract_token(&request), true, false).await
+            try_resolve_auth_outcome(auth_service, extract_token(&request), true).await
         }
 
         let empty_outcome = resolve(&auth_service, "Token ").await;
@@ -6857,8 +6678,7 @@ mod tests {
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("any:{}", token));
 
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false, false)
-                .await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -7257,8 +7077,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_no_credential_for_none() {
         let auth_service = make_test_auth_service();
-        let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::None, false, false).await;
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None, false).await;
         assert!(matches!(outcome, AuthOutcome::NoCredential));
     }
 
@@ -7335,8 +7154,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_invalid_for_garbage_scheme() {
         let auth_service = make_test_auth_service();
-        let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Invalid, false, false).await;
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Invalid, false).await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -7349,13 +7167,8 @@ mod tests {
         // validator rejects it BEFORE any DB lookup, isolating this
         // genuine-invalid case from the pool-timeout -> Overloaded case (#2125).
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(
-            &auth_service,
-            ExtractedToken::Bearer("badtok"),
-            false,
-            false,
-        )
-        .await;
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("badtok"), false).await;
         assert!(
             matches!(outcome, AuthOutcome::InvalidCredential),
             "Bearer that fails every validator must produce InvalidCredential, got: {:?}",
@@ -7369,13 +7182,8 @@ mod tests {
         // before any DB lookup: a genuine-invalid ApiKey stays InvalidCredential
         // (the pool-timeout -> Overloaded case is covered separately, #2125).
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(
-            &auth_service,
-            ExtractedToken::ApiKey("badtok"),
-            false,
-            false,
-        )
-        .await;
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("badtok"), false).await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -7388,7 +7196,6 @@ mod tests {
         let outcome = try_resolve_auth_outcome(
             &auth_service,
             ExtractedToken::Basic("not-base64-at-all"),
-            false,
             false,
         )
         .await;
@@ -7407,8 +7214,7 @@ mod tests {
         let creds = base64::engine::general_purpose::STANDARD.encode("alice:secret");
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&creds), false, false)
-                .await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&creds), false).await;
         assert!(
             matches!(outcome, AuthOutcome::Overloaded),
             "pool-timeout during Basic auth pre-check must be Overloaded, got: {:?}",
@@ -7587,6 +7393,185 @@ mod tests {
                 repo_visibility_middleware,
             ));
         app.oneshot(request).await.unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-2mfv-xg68-gq4p: a download ticket carries the repository
+    // restriction of the credential that minted it, and a valid ticket
+    // actually redeems. Production router, real database.
+    // -----------------------------------------------------------------------
+
+    /// Mint a ticket bound to `path` with `bearer` through the production
+    /// router. Returns the status and, on 200, the ticket.
+    async fn mint_ticket_via_router(
+        state: &crate::api::SharedState,
+        bearer: &str,
+        path: &str,
+    ) -> (StatusCode, String) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        let body = serde_json::json!({ "purpose": "download", "resource_path": path });
+        let mut req = tdh::post(
+            "/api/v1/auth/ticket".to_string(),
+            "application/json",
+            axum::body::Bytes::from(body.to_string()),
+        );
+        req.headers_mut().insert(
+            "authorization",
+            bearer.parse::<axum::http::HeaderValue>().expect("bearer"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        (
+            status,
+            json["ticket"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Redeem `ticket` on `path` with no other credential.
+    async fn redeem_ticket_via_router(
+        state: &crate::api::SharedState,
+        path: &str,
+        ticket: &str,
+    ) -> (StatusCode, axum::body::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        tdh::send(app, tdh::get(format!("{path}?ticket={ticket}"))).await
+    }
+
+    #[tokio::test]
+    async fn download_ticket_keeps_the_minting_credentials_repository_restriction() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // A second private repository the same user can also read.
+        let (other_id, other_key, other_dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        tdh::grant_repo_access(&fx.pool, other_id, fx.user_id).await;
+        let seed = |id: Uuid, key: &str, dir: &std::path::Path, body: &'static [u8]| {
+            let info = tdh::make_repo_info(id, key, dir, "local", None);
+            let state = fx.state.clone();
+            let pool = fx.pool.clone();
+            let user = fx.user_id;
+            async move {
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &info,
+                    "ticket/file.bin",
+                    "ticket/file.bin",
+                    "file.bin",
+                    "1",
+                    "application/octet-stream",
+                    axum::body::Bytes::from_static(body),
+                    user,
+                )
+                .await
+            }
+        };
+        seed(fx.repo_id, &fx.repo_key, &fx.storage_dir, b"allowed-bytes").await;
+        seed(other_id, &other_key, &other_dir, b"other-bytes").await;
+        let allowed_path = format!(
+            "/api/v1/repositories/{}/download/ticket/file.bin",
+            fx.repo_key
+        );
+        let other_path = format!("/api/v1/repositories/{other_key}/download/ticket/file.bin");
+
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        );
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(fx.user_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("load user");
+        let bearer_with = |scopes: Option<Vec<String>>, repos: Option<Vec<Uuid>>| {
+            let pair = auth_service
+                .generate_tokens_with_scope(&user, scopes, repos)
+                .expect("mint access token");
+            format!("Bearer {}", pair.access_token)
+        };
+        // The advisory's credential: read:artifacts, restricted to one repository.
+        let restricted = bearer_with(
+            Some(vec!["read:artifacts".to_string()]),
+            Some(vec![fx.repo_id]),
+        );
+        let unrestricted = tdh::bearer_for(&fx.state, fx.user_id).await;
+
+        // Baseline: the restricted credential cannot read the other repository.
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(other_path.clone());
+        req.headers_mut().insert(
+            "authorization",
+            restricted
+                .parse::<axum::http::HeaderValue>()
+                .expect("bearer"),
+        );
+        let (direct, _) = tdh::send(app, req).await;
+
+        // 1) An unrestricted session's ticket redeems (the User lookup works).
+        let (minted, ticket) = mint_ticket_via_router(&fx.state, &unrestricted, &other_path).await;
+        let (session_ticket, session_body) =
+            redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 2) The restricted credential's ticket redeems inside its scope.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &allowed_path).await;
+        let (in_scope, in_scope_body) =
+            redeem_ticket_via_router(&fx.state, &allowed_path, &ticket).await;
+
+        // 3) ...and does NOT read the other repository.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &other_path).await;
+        let (out_of_scope, _) = redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 4) A credential without read:artifacts cannot mint a ticket.
+        let write_only = bearer_with(Some(vec!["write:artifacts".to_string()]), None);
+        let (write_only_mint, _) =
+            mint_ticket_via_router(&fx.state, &write_only, &allowed_path).await;
+
+        let _ = sqlx::query("DELETE FROM download_tickets WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_member_repo(&fx.pool, other_id, &other_dir).await;
+        let _ = std::fs::remove_dir_all(&other_dir);
+        fx.teardown().await;
+
+        assert_eq!(
+            direct,
+            StatusCode::NOT_FOUND,
+            "precondition: the token is restricted"
+        );
+        assert_eq!(
+            minted,
+            StatusCode::OK,
+            "an unrestricted session mints a ticket"
+        );
+        assert_eq!(
+            session_ticket,
+            StatusCode::OK,
+            "a valid ticket must redeem: {}",
+            String::from_utf8_lossy(&session_body)
+        );
+        assert_eq!(&session_body[..], b"other-bytes");
+        assert_eq!(
+            in_scope,
+            StatusCode::OK,
+            "a restricted credential's ticket must redeem inside its scope: {}",
+            String::from_utf8_lossy(&in_scope_body)
+        );
+        assert_eq!(&in_scope_body[..], b"allowed-bytes");
+        assert_eq!(
+            out_of_scope,
+            StatusCode::NOT_FOUND,
+            "a ticket must not read a repository its minting credential could not"
+        );
+        assert_eq!(
+            write_only_mint,
+            StatusCode::FORBIDDEN,
+            "minting a download ticket needs read:artifacts"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8340,7 +8325,6 @@ mod tests {
     ) -> String {
         let now = Utc::now();
         let claims = Claims {
-            read_expansion_repo_ids: None,
             sub,
             username: username.to_string(),
             email: format!("{}@example.test", username),

@@ -399,9 +399,10 @@ pub(crate) fn validate_remote_upstream(
                 if *format == RepositoryFormat::Debian && is_debian_flat_or_mirrorlist(url) {
                     return Err(AppError::Validation(
                         "Debian remote upstream must be a concrete archive root (apt expands \
-                         `dists/<suite>/...` beneath it), not a flat repository, mirrorlist, or \
-                         `mirror://` URL. Point it at the archive root (e.g. \
-                         http://deb.debian.org/debian)."
+                         `dists/<suite>/...` beneath it, e.g. http://deb.debian.org/debian) or \
+                         the directory of a flat repository (the URI of a `deb <uri> /` line, \
+                         e.g. https://pkgs.k8s.io/core:/stable:/v1.34/deb/), not an index file, \
+                         a `./` component, a mirrorlist, or a `mirror://` URL."
                             .to_string(),
                     ));
                 }
@@ -432,15 +433,39 @@ fn reject_url_controls_and_whitespace(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refusal for an update that moves `upstream_url` to another origin while
+/// upstream-auth credentials are configured (#4467).
+pub(crate) const UPSTREAM_ORIGIN_CHANGE_WITH_AUTH: &str =
+    "upstream_url cannot move to a different origin (scheme, host or port) while upstream \
+     credentials are configured: remove them first (PUT /api/v1/repositories/{key}/upstream-auth \
+     with auth_type \"none\"), change upstream_url, then configure credentials for the new upstream";
+
+/// Whether replacing the stored upstream URL with `requested` changes its
+/// origin (scheme, host, port; userinfo, path and query do not count). An
+/// absent or unparseable URL on either side counts as a change (#4467).
+pub(crate) fn upstream_url_origin_changes(stored: Option<&str>, requested: &str) -> bool {
+    let origin = |url: &str| {
+        reqwest::Url::parse(url)
+            .ok()
+            .map(|u| u.origin())
+            .filter(|o| o.is_tuple())
+    };
+    match (stored.and_then(origin), origin(requested)) {
+        (Some(old), Some(new)) => old != new,
+        _ => true,
+    }
+}
+
 /// Heuristic: a URL whose path or query names a mirrorlist/metalink endpoint.
 fn is_mirrorlist_or_metalink(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("mirrorlist") || lower.contains("metalink")
 }
 
-/// Heuristic: a Debian remote upstream that is a flat repository, a
-/// mirrorlist, or the apt `mirror://` method rather than a concrete archive
-/// root. apt expands `dists/<suite>/...` beneath a proper archive root
+/// Heuristic: a Debian remote upstream aimed at a flat repository's index
+/// file or `./` component, a mirrorlist, or the apt `mirror://` method rather
+/// than a concrete archive root or flat-repository directory (#4619 serves
+/// the flat layout from the directory itself). apt expands `dists/<suite>/...` beneath a proper archive root
 /// (e.g. `http://deb.debian.org/debian`), which this must NOT reject; it
 /// rejects the shapes the remote-proxy trust model cannot verify against a
 /// signed Release:
@@ -832,6 +857,44 @@ pub(crate) fn build_member_visibility_clause(
     table_alias: &str,
     first_param: usize,
 ) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
+    render_member_visibility_clause(visibility, table_alias, first_param, None)
+}
+
+/// [`build_member_visibility_clause`] for the members of a virtual repository
+/// summed as part of THAT virtual (the storage aggregate), with the #4559
+/// parent term: `<scope>` becomes
+///
+/// ```text
+/// ({alias}.id = ANY($scope) OR {routed_virtual_expr} = ANY($scope))
+/// ```
+///
+/// so a token whose scope names the virtual counts the members its owner may
+/// read, exactly as `member_passes_token_scope` admits them on the listing and
+/// content paths. `routed_virtual_expr` is a fixed SQL expression naming the
+/// virtual being aggregated (`$1` in the per-repo walk, the CTE's `root_id` in
+/// the batch); it is never caller input. The grant half and the `public` arm
+/// are unchanged, and an unrestricted principal renders the same clause as
+/// [`build_member_visibility_clause`].
+pub(crate) fn build_member_visibility_clause_through(
+    visibility: &MemberVisibility,
+    table_alias: &str,
+    first_param: usize,
+    routed_virtual_expr: &'static str,
+) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
+    render_member_visibility_clause(
+        visibility,
+        table_alias,
+        first_param,
+        Some(routed_virtual_expr),
+    )
+}
+
+fn render_member_visibility_clause(
+    visibility: &MemberVisibility,
+    table_alias: &str,
+    first_param: usize,
+    routed_virtual_expr: Option<&'static str>,
+) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
     match visibility {
         MemberVisibility::Unfiltered => ("true".to_string(), None, None),
         MemberVisibility::Anonymous => ("visibility = 'public'".to_string(), None, None),
@@ -841,9 +904,12 @@ pub(crate) fn build_member_visibility_clause(
             allowed_repo_ids,
         } => {
             let scope_param = first_param + 1;
-            let scope = match allowed_repo_ids {
-                None => "true".to_string(),
-                Some(_) => format!("{table_alias}.id = ANY(${scope_param})"),
+            let scope = match (allowed_repo_ids, routed_virtual_expr) {
+                (None, _) => "true".to_string(),
+                (Some(_), None) => format!("{table_alias}.id = ANY(${scope_param})"),
+                (Some(_), Some(parent)) => format!(
+                    "({table_alias}.id = ANY(${scope_param}) OR {parent} = ANY(${scope_param}))"
+                ),
             };
             let entitlement = if *is_admin {
                 "true".to_string()
@@ -1740,6 +1806,30 @@ impl RepositoryService {
         }
 
         let mut tx = self.db.begin().await?;
+        if let Some(ref new_url) = req.upstream_url {
+            // #4467: never re-target stored upstream-auth credentials at a host
+            // they were not configured for. Checked in this transaction with
+            // the repository row locked; `save_upstream_auth` takes a share
+            // lock on the same row, so a concurrent credential write either
+            // lands first (and this sees it) or waits for this commit.
+            let stored: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT upstream_url FROM repositories WHERE id = $1 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(stored) = stored {
+                if upstream_url_origin_changes(stored.as_deref(), new_url)
+                    && crate::services::upstream_auth::get_upstream_auth_type_in(&mut tx, id)
+                        .await?
+                        .is_some()
+                {
+                    return Err(AppError::Conflict(
+                        UPSTREAM_ORIGIN_CHANGE_WITH_AUTH.to_string(),
+                    ));
+                }
+            }
+        }
         if let Some(depth) = repodata_depth {
             // Re-sending the current depth is a no-op and must stay one: the
             // config write takes the exclusive layout lock, which would refuse
@@ -2303,14 +2393,22 @@ impl RepositoryService {
         // repos counts in each of them; physical-footprint dedup on shared
         // cloud backends is the refresher's `DedupScope` concern, not this
         // SUM's.
-        let usage = sqlx::query_scalar!(
+        //
+        // #4483 / #4545: OCI manifest rows (`oci-manifests/%` keys) are NOT
+        // counted. Their `size_bytes` is the IMAGE size (#3601), whose config
+        // and layer bytes the `oci_blobs` branch already counts, so including
+        // them counted every image twice and once more per extra tag. Same
+        // rule as the stats refresher (#3286) and the ledger (migration 288).
+        // Runtime-checked: the predicate is shared with the ledger SQL.
+        let usage: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
+            SELECT COALESCE(SUM(bytes), 0)::BIGINT
             FROM (
                 SELECT size_bytes AS bytes
                   FROM artifacts
                  WHERE repository_id = $1 AND is_deleted = false
                    AND storage_key NOT LIKE 'proxy-cache/%'
+                   AND storage_key NOT LIKE 'oci-manifests/%'
                 UNION ALL
                 SELECT size_bytes AS bytes
                   FROM proxy_cache_artifacts
@@ -2321,8 +2419,8 @@ impl RepositoryService {
                  WHERE repository_id = $1
             ) t
             "#,
-            repo_id
         )
+        .bind(repo_id)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2392,6 +2490,11 @@ impl RepositoryService {
     /// [`MemberVisibility::Unfiltered`] (internal oracles/reconcilers) produces
     /// the literal `true` clause, i.e. the unfiltered pre-#3081 sum.
     ///
+    /// The scope half carries the #4559 parent term
+    /// ([`build_member_visibility_clause_through`] keyed on `$1`): a token
+    /// whose scope names THIS virtual counts the leaves its owner may read,
+    /// as the listing and the download through the virtual admit them.
+    ///
     /// Only the LEAVES are filtered — the membership walk itself is unchanged,
     /// so an invisible intermediate virtual still contributes the leaves the
     /// caller *can* see.
@@ -2403,7 +2506,7 @@ impl RepositoryService {
         // `$2` = user id, `$3` = token scope, `$4` = depth. The bind order is
         // the same for every variant; an unreferenced bind is a typed NULL.
         let (visibility_clause, user_id_bind, scope_bind) =
-            build_member_visibility_clause(visibility, "leaf", 2);
+            build_member_visibility_clause_through(visibility, "leaf", 2, "$1");
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(repo_id, depth) AS (
@@ -2434,6 +2537,7 @@ impl RepositoryService {
                  WHERE repository_id IN (SELECT id FROM leaves)
                    AND is_deleted = false
                    AND storage_key NOT LIKE 'proxy-cache/%'
+                   AND storage_key NOT LIKE 'oci-manifests/%'
                 UNION ALL
                 SELECT size_bytes AS bytes
                   FROM proxy_cache_artifacts
@@ -2494,7 +2598,7 @@ impl RepositoryService {
         // clause, so an internal read is byte-identical to the pre-#3081
         // aggregate. `$2` = user id, `$3` = token scope, `$4` = depth.
         let (visibility_clause, user_id_bind, scope_bind) =
-            build_member_visibility_clause(visibility, "leaf", 2);
+            build_member_visibility_clause_through(visibility, "leaf", 2, "reachable.root_id");
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(root_id, repo_id, depth) AS (
@@ -2766,7 +2870,12 @@ impl RepositoryService {
         project: QuotaUsage,
         additional_bytes: i64,
     ) -> Option<QuotaScope> {
-        if !Self::quota_allows(repo.quota_bytes, repo.used_bytes, additional_bytes) {
+        // An upload that adds no bytes (a re-push of identical content, a
+        // shrinking overwrite) is always admitted, even when usage is already
+        // over a quota that was lowered or never enforced (#4422).
+        if additional_bytes <= 0 {
+            None
+        } else if !Self::quota_allows(repo.quota_bytes, repo.used_bytes, additional_bytes) {
             Some(QuotaScope::Repository)
         } else if !Self::quota_allows(project.quota_bytes, project.used_bytes, additional_bytes) {
             Some(QuotaScope::Project)
@@ -2933,28 +3042,34 @@ impl RepositoryService {
 
         // Net-delta accounting for overwrites: subtract the bytes already
         // charged for the (repository_id, path) row we are about to replace.
-        let existing_at_path: i64 = sqlx::query_scalar!(
+        // Same hosted predicate as the ledger (#4483: OCI manifest rows are
+        // not charged).
+        let existing_at_path: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
               FROM artifacts
              WHERE repository_id = $1 AND path = $2 AND is_deleted = false
                AND storage_key NOT LIKE 'proxy-cache/%'
+               AND storage_key NOT LIKE 'oci-manifests/%'
             "#,
-            repo_id,
-            path
         )
+        .bind(repo_id)
+        .bind(path)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let base_usage = repo_total.map(|total| total - existing_at_path);
+        // Charged the NET delta against the full usage (the same sum as the
+        // base usage plus the new size), so an upload that adds no bytes is
+        // admitted even over the cap (#4422).
         let denied_by = Self::quota_denial(
-            QuotaUsage::new(repo_quota, base_usage.unwrap_or(0)),
+            QuotaUsage::new(repo_quota, repo_total.unwrap_or(0)),
             QuotaUsage::new(
                 project_quota.map(|(_, quota)| quota),
-                project_total.map_or(0, |total| total - existing_at_path),
+                project_total.unwrap_or(0),
             ),
-            new_size,
+            new_size - existing_at_path,
         );
         // No manual charge here: the caller's artifact INSERT (same
         // transaction, made while the row locks taken above are still held)
@@ -3050,15 +3165,18 @@ impl RepositoryService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let hosted: i64 = sqlx::query_scalar!(
+        // Migration 288's trigger rule (#4483 / #4545): OCI manifest rows
+        // record the image size, whose bytes `oci_bytes` already carries.
+        let hosted: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
               FROM artifacts
              WHERE repository_id = $1 AND is_deleted = false
                AND storage_key NOT LIKE 'proxy-cache/%'
+               AND storage_key NOT LIKE 'oci-manifests/%'
             "#,
-            repo_id
         )
+        .bind(repo_id)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -3163,8 +3281,9 @@ impl RepositoryService {
     ///
     /// Same recompute as [`Self::reconcile_usage_ledger`] — deliberately, so
     /// there is ONE definition of what the ledger should contain. It mirrors
-    /// migration 182's trigger rules exactly: `artifacts` counted iff
-    /// `is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`, every
+    /// the ledger trigger rules exactly (migration 182, amended by 288):
+    /// `artifacts` counted iff `is_deleted = false AND storage_key NOT LIKE
+    /// 'proxy-cache/%' AND storage_key NOT LIKE 'oci-manifests/%'`, every
     /// `proxy_cache_artifacts` row, every `oci_blobs` row (the
     /// `pending_delete_at` marker is not a deletion and does not change the
     /// count).
@@ -4055,6 +4174,14 @@ mod tests {
         let flat_component = Some("http://apt.example.com/flat/ ./".to_string());
         // A well-formed archive root (apt expands `dists/<suite>/...` beneath).
         let base = Some("http://deb.debian.org/debian".to_string());
+        // #4619: a flat repository's directory (`deb <uri> /`) is accepted.
+        let flat_dir = Some("https://pkgs.k8s.io/core:/stable:/v1.34/deb/".to_string());
+        assert!(validate_remote_upstream(
+            &RepositoryType::Remote,
+            &flat_dir,
+            &RepositoryFormat::Debian
+        )
+        .is_ok());
         let ubuntu = Some("http://archive.ubuntu.com/ubuntu".to_string());
 
         for bad in [&mirror, &mirrorlist, &flat_index, &flat_component] {
@@ -4441,6 +4568,21 @@ mod tests {
                 u(Some(10), 10),
                 u(Some(10), 10),
                 0,
+                None,
+            ),
+            (
+                // #4422: a zero-delta upload is admitted even over the cap.
+                "zero_byte_already_over_both",
+                u(Some(10), 50),
+                u(Some(10), 50),
+                0,
+                None,
+            ),
+            (
+                "shrinking_overwrite_already_over",
+                u(Some(10), 50),
+                u(None, 0),
+                -20,
                 None,
             ),
         ];
@@ -6444,7 +6586,8 @@ mod tests {
         /// layer/config blobs live in `oci_blobs`, not `artifacts` (only
         /// manifests land there), so the live usage SUM behind
         /// `storage_used_bytes` must include them. On unfixed code this
-        /// returns 700 (manifest only).
+        /// returns 700 (manifest only). The manifest row itself is not
+        /// counted (#4483): it records the image size those blobs make up.
         #[tokio::test]
         async fn test_get_storage_usage_counts_oci_blobs() {
             let Some(pool) = tdh::try_pool().await else {
@@ -6475,7 +6618,85 @@ mod tests {
                 .get_storage_usage(repo.id)
                 .await
                 .expect("storage usage");
-            assert_eq!(usage, 750_700, "manifest (700) + layers (500k + 250k)");
+            assert_eq!(
+                usage, 750_000,
+                "layers (500k + 250k); the manifest row is not counted (#4483)"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #4483 / #4545: an OCI manifest's `artifacts` row records the IMAGE
+        /// size (config + layers, #3601), and those bytes are already counted
+        /// once through `oci_blobs`. Neither the live usage SUM nor the
+        /// trigger-maintained ledger (and so quota) may count them again:
+        /// `oci-manifests/%` rows are excluded, the #3286 rule the storage
+        /// stats refresher already applies. Two tags of the same image add
+        /// nothing. A non-manifest `artifacts` row in the same repository
+        /// still counts.
+        #[tokio::test]
+        async fn test_oci_manifest_rows_do_not_double_count_image_bytes_4483() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            // One image: a 37-byte config and a 17-byte layer (54 bytes),
+            // tagged twice; each tag row records the 54-byte image size.
+            let config = format!("sha256:{}", Uuid::new_v4().simple());
+            let layer = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &config, 37).await;
+            insert_oci_blob(&pool, repo.id, &layer, 17).await;
+            for tag in ["v1", "latest"] {
+                insert_artifact(
+                    &pool,
+                    repo.id,
+                    &format!("v2/img/manifests/{tag}"),
+                    "oci-manifests/sha256:4483",
+                    54,
+                )
+                .await;
+            }
+            // A non-manifest row (e.g. a generic file) still counts.
+            insert_artifact(&pool, repo.id, "notes/readme.txt", "cas/48/83", 100).await;
+
+            assert_eq!(
+                service.get_storage_usage(repo.id).await.expect("usage"),
+                154,
+                "live usage: blobs once (54) + the generic row (100)"
+            );
+            let (hosted, proxy, oci) = ledger_row(&pool, repo.id).await;
+            assert_eq!(
+                (hosted, proxy, oci),
+                (100, 0, 54),
+                "trigger-maintained ledger must not charge manifest rows"
+            );
+            assert_eq!(
+                service
+                    .reconcile_usage_ledger(repo.id)
+                    .await
+                    .expect("reconcile"),
+                154,
+                "the reconciler's recompute agrees with the triggers"
+            );
+            assert_eq!(ledger_row(&pool, repo.id).await, (100, 0, 54));
+
+            // Soft-deleting a manifest row moves nothing either.
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true \
+                 WHERE repository_id = $1 AND path = 'v2/img/manifests/latest'",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("soft delete tag row");
+            assert_eq!(ledger_row(&pool, repo.id).await, (100, 0, 54));
 
             cleanup_repo(&pool, repo.id).await;
         }
@@ -6610,7 +6831,8 @@ mod tests {
                 .await
                 .expect("create m2");
 
-            // m1: a manifest artifact (700) + a 500k layer. m2: a 250k layer.
+            // m1: a manifest artifact (700, not counted: it records the image
+            // size its blobs make up, #4483) + a 500k layer. m2: a 250k layer.
             insert_artifact(
                 &pool,
                 m1.id,
@@ -6645,12 +6867,12 @@ mod tests {
 
             let m1_usage = service.get_storage_usage(m1.id).await.expect("m1 usage");
             let m2_usage = service.get_storage_usage(m2.id).await.expect("m2 usage");
-            assert_eq!(m1_usage, 500_700);
+            assert_eq!(m1_usage, 500_000);
             assert_eq!(m2_usage, 250_000);
 
             // Pre-fix behaviour the customer saw: the virtual owns no artifact
             // rows, so the plain per-repo figure is 0 despite the members
-            // holding 750,700 bytes of resolvable content.
+            // holding 750,000 bytes of resolvable content.
             assert_eq!(
                 service.get_storage_usage(virt.id).await.expect("virt own"),
                 0,

@@ -21,6 +21,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::models::repository::RepositoryFormat;
 
 /// One catalog row's browsable fields (visibility seam for #2270 / PF-002).
 #[derive(Debug, Clone)]
@@ -326,6 +327,35 @@ pub fn not_cached_index_sql(path_column: &str) -> String {
     format!("NOT {}", cached_index_sql(path_column))
 }
 
+/// Whether a repository of `format` caches package metadata under the bare
+/// package name (#4305). The npm handler (npm, yarn, pnpm, bower) caches each
+/// packument at `name` or `@scope/name` and every tarball at
+/// `<name>/-/<file>`, the registry's tarball layout, so for these formats a
+/// cached path with no `/-/` segment is a packument, not a package.
+fn caches_packuments(format: &RepositoryFormat) -> bool {
+    format.handler_key() == "npm"
+}
+
+/// [`is_cached_index_path`] for a repository of `format`: also true for a
+/// cached npm packument (#4305). A packument listed as an artifact could be
+/// downloaded and invalidated like a package, while deleting it answered
+/// "Artifact not found".
+pub fn is_cached_metadata_path(format: &RepositoryFormat, path: &str) -> bool {
+    is_cached_index_path(path) || (caches_packuments(format) && !path.contains("/-/"))
+}
+
+/// The SQL form of "this row is a real artifact" for a repository of
+/// `format`: [`not_cached_index_sql`], and for the npm family also a tarball
+/// path (`/-/` segment, #4305). `-` and `/` are not `LIKE` metacharacters.
+pub fn not_cached_metadata_sql(format: &RepositoryFormat, path_column: &str) -> String {
+    let not_index = not_cached_index_sql(path_column);
+    if caches_packuments(format) {
+        format!("({not_index} AND {path_column} LIKE '%/-/%')")
+    } else {
+        not_index
+    }
+}
+
 /// One catalog row as surfaced by the remote-repository browse listing
 /// (PF-002 / #2519). Unlike [`ProxyCacheEntry`] this carries `cached_at`, so
 /// the listing can render the cache timestamp without reading the storage
@@ -372,12 +402,16 @@ pub async fn has_rows(db: &PgPool, repository_id: Uuid) -> Result<bool> {
 /// cursor). The caller passes `limit = per_page + 1` and uses the extra row
 /// as the authoritative `has_more` signal (#2520 pattern).
 ///
-/// Cached index responses ([`is_cached_index_path`]) are excluded: they are
-/// cache entries, not artifacts, and listing them produced rows with an empty
-/// name. They remain in the table and in storage accounting.
+/// Cached index responses ([`is_cached_metadata_path`]: index pages, and for
+/// the npm family packuments, #4305) are excluded: they are cache entries,
+/// not artifacts, and listing them produced rows with an empty name (or, for
+/// a packument, a "package" that could not be deleted). They remain in the
+/// table and in storage accounting.
+#[allow(clippy::too_many_arguments)]
 pub async fn browse_page(
     db: &PgPool,
     repository_id: Uuid,
+    format: &RepositoryFormat,
     prefix_like: Option<&str>,
     q_like: Option<&str>,
     after_path: Option<&str>,
@@ -398,7 +432,7 @@ pub async fn browse_page(
         ORDER BY path
         LIMIT $5 OFFSET $6
         "#,
-        not_index = not_cached_index_sql("path"),
+        not_index = not_cached_metadata_sql(format, "path"),
     )))
     .bind(repository_id)
     .bind(prefix_like)
@@ -422,6 +456,7 @@ pub async fn browse_page(
 pub async fn browse_count(
     db: &PgPool,
     repository_id: Uuid,
+    format: &RepositoryFormat,
     prefix_like: Option<&str>,
     q_like: Option<&str>,
 ) -> Result<i64> {
@@ -434,7 +469,7 @@ pub async fn browse_count(
           AND ($3::TEXT IS NULL OR path ILIKE $3 ESCAPE '\')
           AND {not_index}
         "#,
-        not_index = not_cached_index_sql("path"),
+        not_index = not_cached_metadata_sql(format, "path"),
     )))
     .bind(repository_id)
     .bind(prefix_like)
@@ -592,6 +627,12 @@ pub async fn find_cached_entry(
 /// serve, with no double count and the proxy sibling kept fully separate from
 /// the hot `download_statistics` table.
 ///
+/// The row also carries the serve's `(repository_id, path)` (#4539). That, not
+/// `proxy_cache_id`, is the history key: evicting or purging the catalog row
+/// sets `proxy_cache_id` to NULL (migration 279) and leaves the download in
+/// place, and a later re-cache of the same path gets a new catalog id. Hot-path
+/// cost: two more columns on the one INSERT the serve already does.
+///
 /// The caller applies the HEAD guard, mirroring
 /// `artifact_service::record_download`'s `is_head` short circuit so a metadata
 /// probe never inflates the count. Best-effort: a failure is logged by the
@@ -619,8 +660,8 @@ pub async fn record_proxy_download(
             RETURNING id
         )
         INSERT INTO proxy_download_statistics
-            (proxy_cache_id, user_id, ip_address, user_agent)
-        SELECT id, $5, $6, $7 FROM ensured
+            (proxy_cache_id, repository_id, path, user_id, ip_address, user_agent)
+        SELECT id, $1, $2, $5, $6, $7 FROM ensured
         "#,
         repository_id,
         path,
@@ -636,9 +677,50 @@ pub async fn record_proxy_download(
     Ok(res.rows_affected())
 }
 
+/// Record one proxy-served download of an object that was NOT written to the
+/// proxy cache (#4551): one larger than the repository quota is streamed to
+/// the client with no cache write, so no tee will ever refine a catalog
+/// placeholder for it, and [`record_proxy_download`]'s placeholder would stay
+/// behind as a cached 0-byte entry. The statistics row carries the history
+/// key `(repository_id, path)` (#4539) and links to the catalog row only when
+/// one already exists (whose `last_accessed_at` is bumped, as on a hit);
+/// otherwise `proxy_cache_id` stays NULL. Runtime-checked so the offline
+/// `.sqlx` cache is untouched.
+pub async fn record_uncached_proxy_download(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    user_id: Option<Uuid>,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        WITH touched AS (
+            UPDATE proxy_cache_artifacts SET last_accessed_at = now()
+             WHERE repository_id = $1 AND path = $2
+            RETURNING id
+        )
+        INSERT INTO proxy_download_statistics
+            (proxy_cache_id, repository_id, path, user_id, ip_address, user_agent)
+        SELECT (SELECT id FROM touched), $1, $2, $3, $4, $5
+        "#,
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(user_id)
+    .bind(ip_address)
+    .bind(user_agent)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(res.rows_affected())
+}
+
 /// Recorded proxy-download counts for the given cached `paths`, keyed by path
 /// (#3265). Paths with no recorded serve are absent from the map; the caller
-/// substitutes zero.
+/// substitutes zero. Keyed on `(repository_id, path)` (#4539), so the count
+/// includes serves recorded before the entry was last evicted and re-cached.
 ///
 /// Batched (`= ANY`) so a listing page costs one query rather than one per
 /// row, mirroring `ArtifactService::get_download_stats_batch` on the hosted
@@ -655,7 +737,8 @@ pub async fn download_counts_by_paths(
         r#"
         SELECT a.path, COUNT(d.id)::BIGINT
         FROM proxy_cache_artifacts a
-        LEFT JOIN proxy_download_statistics d ON d.proxy_cache_id = a.id
+        LEFT JOIN proxy_download_statistics d
+               ON d.repository_id = a.repository_id AND d.path = a.path
         WHERE a.repository_id = $1
           AND a.path = ANY($2)
         GROUP BY a.path
@@ -670,7 +753,8 @@ pub async fn download_counts_by_paths(
     Ok(rows.into_iter().collect())
 }
 
-/// Count of proxy downloads recorded for one repository's cached objects.
+/// Count of proxy downloads recorded for one repository, including serves of
+/// objects since evicted from its cache (#4539).
 /// Backs analytics that `UNION ALL` the hosted `download_statistics` count with
 /// the proxy sibling; exposed here so the union math lives beside the table.
 pub async fn download_count_by_repo(db: &PgPool, repository_id: Uuid) -> Result<i64> {
@@ -678,8 +762,7 @@ pub async fn download_count_by_repo(db: &PgPool, repository_id: Uuid) -> Result<
         r#"
         SELECT COUNT(*)::BIGINT AS "count!"
         FROM proxy_download_statistics pds
-        JOIN proxy_cache_artifacts pca ON pca.id = pds.proxy_cache_id
-        WHERE pca.repository_id = $1
+        WHERE pds.repository_id = $1
         "#,
         repository_id
     )
@@ -905,6 +988,70 @@ mod tests {
         }
     }
 
+    /// #4305: for the npm family a cached path without a `/-/` segment is a
+    /// packument, and the SQL form agrees with the Rust form on every sample,
+    /// for an npm-family and a generic repository alike.
+    #[tokio::test]
+    async fn cached_metadata_sql_and_rust_agree_for_npm_packuments() {
+        let samples = [
+            ("@example-org/example-package", true),
+            ("left-pad", true),
+            ("-/v1/search", true),
+            (
+                "@example-org/example-package/-/example-package-1.0.0.tgz",
+                false,
+            ),
+            ("left-pad/-/left-pad-1.3.0.tgz", false),
+            ("simple/idna/", true),
+        ];
+        for format in [
+            RepositoryFormat::Npm,
+            RepositoryFormat::Yarn,
+            RepositoryFormat::Pnpm,
+        ] {
+            for (path, metadata) in samples {
+                assert_eq!(
+                    is_cached_metadata_path(&format, path),
+                    metadata,
+                    "{format:?} {path}"
+                );
+            }
+        }
+        // Other formats keep the index-only rule.
+        assert!(!is_cached_metadata_path(
+            &RepositoryFormat::Generic,
+            "left-pad"
+        ));
+        assert!(is_cached_metadata_path(
+            &RepositoryFormat::Generic,
+            "simple/idna/"
+        ));
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let paths: Vec<String> = samples.iter().map(|(p, _)| (*p).to_string()).collect();
+        for format in [RepositoryFormat::Npm, RepositoryFormat::Generic] {
+            let sql = format!(
+                "SELECT s.path, {} AS is_artifact FROM UNNEST($1::TEXT[]) AS s(path)",
+                not_cached_metadata_sql(&format, "s.path")
+            );
+            let rows: Vec<(String, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+                .bind(&paths)
+                .fetch_all(&pool)
+                .await
+                .expect("evaluate not_cached_metadata_sql in postgres");
+            assert_eq!(rows.len(), samples.len());
+            for (path, is_artifact) in rows {
+                assert_eq!(
+                    is_artifact,
+                    !is_cached_metadata_path(&format, &path),
+                    "{format:?}: SQL and Rust disagree about {path:?}"
+                );
+            }
+        }
+    }
+
     /// The artifact listing must not surface cached index responses -- they
     /// rendered with an empty Name column -- while storage accounting must
     /// still count their bytes. Both halves in one test so a "fix" that simply
@@ -940,9 +1087,18 @@ mod tests {
         // Near-miss artifact: must survive the filter.
         seed("simple/index/index-1.0.tar.gz", 20).await;
 
-        let rows = browse_page(&pool, repo, None, None, None, 0, 50)
-            .await
-            .expect("browse");
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            None,
+            None,
+            None,
+            0,
+            50,
+        )
+        .await
+        .expect("browse");
         let listed: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             listed,
@@ -957,7 +1113,9 @@ mod tests {
             "no empty-name rows"
         );
         assert_eq!(
-            browse_count(&pool, repo, None, None).await.expect("count"),
+            browse_count(&pool, repo, &RepositoryFormat::Generic, None, None)
+                .await
+                .expect("count"),
             2,
             "the exact count must match the rows the listing returns"
         );
@@ -1390,6 +1548,7 @@ mod tests {
             let rows = browse_page(
                 &pool,
                 repo,
+                &RepositoryFormat::Generic,
                 None,
                 None,
                 after.as_deref(),
@@ -1415,7 +1574,12 @@ mod tests {
 
         let expected: Vec<String> = (0..total).map(|i| format!("pkg/obj-{i:03}.bin")).collect();
         assert_eq!(walked, expected, "full walk yields every row exactly once");
-        assert_eq!(browse_count(&pool, repo, None, None).await.unwrap(), 25);
+        assert_eq!(
+            browse_count(&pool, repo, &RepositoryFormat::Generic, None, None)
+                .await
+                .unwrap(),
+            25
+        );
         cleanup_repo(&pool, repo).await;
     }
 
@@ -1459,9 +1623,18 @@ mod tests {
         };
 
         // Prefix filter: starts_with semantics.
-        let rows = browse_page(&pool, repo, Some("a/%"), None, None, 0, 10)
-            .await
-            .unwrap();
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            Some("a/%"),
+            None,
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             ["a/one.whl", "a/two.whl"]
@@ -1470,9 +1643,18 @@ mod tests {
         // Substring filter is case-insensitive, like the legacy
         // `to_lowercase().contains()` filter: an upper-cased needle still
         // matches the lower-cased stored path.
-        let rows = browse_page(&pool, repo, None, Some("%TWO%"), None, 0, 10)
-            .await
-            .unwrap();
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            None,
+            Some("%TWO%"),
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             ["a/two.whl"]
@@ -1481,15 +1663,26 @@ mod tests {
         // `%` / `_` in user input match literally once escaped: `100%_`
         // must match only the literal path, not wildcard onto `100xy`.
         let q = format!("%{}%", escape("100%_"));
-        let rows = browse_page(&pool, repo, None, Some(&q), None, 0, 10)
-            .await
-            .unwrap();
+        let rows = browse_page(
+            &pool,
+            repo,
+            &RepositoryFormat::Generic,
+            None,
+            Some(&q),
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             ["b/100%_done.whl"]
         );
         assert_eq!(
-            browse_count(&pool, repo, None, Some(&q)).await.unwrap(),
+            browse_count(&pool, repo, &RepositoryFormat::Generic, None, Some(&q))
+                .await
+                .unwrap(),
             1,
             "count applies the same escaped filters as the page"
         );
@@ -1682,6 +1875,138 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `(proxy_cache_id IS NULL, repository_id, path)` of every proxy
+    /// download row recorded for `repo`.
+    async fn history_rows(pool: &PgPool, repo: Uuid) -> Vec<(bool, Uuid, String)> {
+        sqlx::query_as(
+            "SELECT proxy_cache_id IS NULL, repository_id, path \
+             FROM proxy_download_statistics WHERE repository_id = $1 ORDER BY downloaded_at",
+        )
+        .bind(repo)
+        .fetch_all(pool)
+        .await
+        .expect("read history rows")
+    }
+
+    /// #4539: evicting a cache entry (the lifecycle sweep deletes the catalog
+    /// row) keeps its download history, keyed on `(repository_id, path)`; a
+    /// re-cache of the same path continues the same count; deleting the
+    /// repository still removes the history.
+    #[tokio::test]
+    async fn test_download_history_survives_eviction_and_recache_4539() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/pkg/pkg-2.0.whl";
+        for _ in 0..2 {
+            record_proxy_download(&pool, repo, path, "k", "m", None, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(false, repo, path.to_string()); 2],
+            "each serve is keyed on the coordinate it was served from"
+        );
+
+        // Lifecycle eviction / cache purge deletes the catalog row.
+        sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("evict");
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(true, repo, path.to_string()); 2],
+            "eviction detaches the history from the catalog row, never deletes it"
+        );
+        assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 2);
+
+        // Re-cached and served again: a new catalog row, one continuous count.
+        record_proxy_download(&pool, repo, path, "k", "m", None, None, None)
+            .await
+            .unwrap();
+        let counts = download_counts_by_paths(&pool, repo, &[path.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(counts.get(path).copied(), Some(3));
+        assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 3);
+
+        cleanup_repo(&pool, repo).await;
+        assert!(
+            history_rows(&pool, repo).await.is_empty(),
+            "deleting the repository still deletes its proxy download history"
+        );
+    }
+
+    /// #4539 rolling deploy: a pod still on the previous release inserts
+    /// `proxy_cache_id` only; migration 277's trigger keys the row from the
+    /// catalog so it is not left unkeyed once eviction stops deleting it.
+    #[tokio::test]
+    async fn test_legacy_insert_is_keyed_by_trigger_4539() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/legacy/legacy-1.0.whl";
+        upsert(&pool, repo, path, "k", "m", 7, None, None, None, None)
+            .await
+            .expect("cache row");
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (proxy_cache_id) \
+             SELECT id FROM proxy_cache_artifacts WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("legacy insert");
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(false, repo, path.to_string())]
+        );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #4539: migration 278's batched backfill keys a row that predates the
+    /// key columns, and is safe to run again (it is `-- no-transaction` and
+    /// re-runs in full after an interruption).
+    #[tokio::test]
+    async fn test_history_backfill_migration_keys_old_rows_4539() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/old/old-1.0.whl";
+        record_proxy_download(&pool, repo, path, "k", "m", None, None, None)
+            .await
+            .unwrap();
+        // Shape of a row written before migration 277.
+        sqlx::query(
+            "UPDATE proxy_download_statistics SET repository_id = NULL, path = NULL \
+             WHERE proxy_cache_id IN (SELECT id FROM proxy_cache_artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("strip key");
+        assert!(history_rows(&pool, repo).await.is_empty());
+
+        let backfill =
+            include_str!("../../migrations/278_proxy_download_statistics_history_backfill.sql");
+        for _ in 0..2 {
+            sqlx::raw_sql(backfill)
+                .execute(&pool)
+                .await
+                .expect("run backfill");
+        }
+        assert_eq!(
+            history_rows(&pool, repo).await,
+            vec![(false, repo, path.to_string())]
+        );
         cleanup_repo(&pool, repo).await;
     }
 }

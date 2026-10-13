@@ -144,6 +144,15 @@ mod test_env {
 }
 
 /// Read an environment variable and parse it, falling back to a default on missing or invalid values.
+/// `SMTP_TLS_CA_CERT` (path or inline PEM), falling back to the shared
+/// `CUSTOM_CA_CERT_PATH`. Returns the value and the variable it came from.
+fn smtp_tls_ca_cert_from_env() -> Option<(String, &'static str)> {
+    let non_empty = |k: &str| env::var(k).ok().filter(|v| !v.trim().is_empty());
+    non_empty("SMTP_TLS_CA_CERT")
+        .map(|v| (v, "SMTP_TLS_CA_CERT"))
+        .or_else(|| non_empty("CUSTOM_CA_CERT_PATH").map(|v| (v, "CUSTOM_CA_CERT_PATH")))
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
@@ -204,6 +213,24 @@ fn resolve_blob_gc_min_age_secs(raw: u64) -> u64 {
         );
     }
     secs
+}
+
+/// Parse a comma-separated environment variable into its trimmed, non-empty
+/// entries. Unset or empty yields an empty list.
+fn parse_comma_list_env(key: &str) -> Vec<String> {
+    parse_comma_list(env::var(key).ok().as_deref())
+}
+
+/// The pure half of [`parse_comma_list_env`].
+fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Parse a comma-separated list of CIDR ranges from env var `key`.
@@ -551,6 +578,13 @@ pub struct Config {
     /// endpoints regardless of this flag.
     pub expose_detailed_health: bool,
 
+    /// When true, `/readyz` answers 503 while OpenSearch is unhealthy (or not
+    /// configured), naming it under `failing`. Default false: ready means
+    /// "can serve artifacts" (database + migrations), and search status is
+    /// only reported under `dependencies` (#4610). Set it where search is part
+    /// of what a replica must provide before it takes traffic.
+    pub readyz_require_search: bool,
+
     /// Optional operator-supplied instruction for retrieving the generated
     /// initial admin password, shown on the first-time-setup login screen. The
     /// default screen text assumes a Docker Compose deployment
@@ -608,6 +642,22 @@ pub struct Config {
     /// Fail-closed by default. Set `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`/
     /// `0` to accept unverified attestations in a trusted/dev environment.
     pub conda_attestation_require_verified: bool,
+
+    /// OIDC issuers a keyless CEP-27 bundle's certificate may name
+    /// (`CONDA_ATTESTATION_ISSUERS`, comma list). Empty means the default,
+    /// the GitHub Actions issuer.
+    pub conda_attestation_issuers: Vec<String>,
+
+    /// Certificate identity (SAN) patterns a keyless CEP-27 bundle must match
+    /// (`CONDA_ATTESTATION_IDENTITIES`, comma list, `*` wildcard). Empty
+    /// means any identity the issuer vouches for.
+    pub conda_attestation_identities: Vec<String>,
+
+    /// Public keys for key-based CEP-27 bundles
+    /// (`CONDA_ATTESTATION_PUBLIC_KEYS`, comma list of PEM file paths or
+    /// inline PEMs, each optionally `name=`-prefixed). See
+    /// `services::curation::attestation_verify::policy`.
+    pub conda_attestation_public_keys: Vec<String>,
 
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
@@ -852,13 +902,37 @@ pub struct Config {
     /// uploads and downloads turns a duration cap into an effective size cap —
     /// a ~90 MB upload over a slow link was aborted mid-body and the client saw
     /// only a connection reset. See `api::routes::is_byte_transfer_path` for the
-    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE` and
-    /// their concurrency by `GLOBAL_MAX_CONCURRENCY`.
+    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE`, their
+    /// concurrency by `GLOBAL_MAX_CONCURRENCY` and
+    /// `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`, and a stalled upload body by
+    /// `UPLOAD_PROGRESS_WINDOW_SECS` (GHSA-9f9r-c4w8-rjv9).
     ///
     /// This value therefore only has to exceed the slowest legitimate
     /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
+
+    /// Progress window, in seconds, for artifact upload bodies on the
+    /// byte-transfer routes that `global_request_timeout_secs` exempts
+    /// (GHSA-9f9r-c4w8-rjv9). An upload body that delivers fewer than
+    /// `upload_min_progress_bytes` during one window spent waiting for data is
+    /// aborted with 408, so a stalled or trickling client cannot hold a global
+    /// request permit indefinitely. Env var: `UPLOAD_PROGRESS_WINDOW_SECS`.
+    /// Default 60. Set to 0 to disable the deadline.
+    pub upload_progress_window_secs: u64,
+
+    /// Bytes an upload body must deliver per `upload_progress_window_secs`.
+    /// The default (16 KiB per 60 s, about 270 B/s) is far below any real
+    /// link. Env var: `UPLOAD_MIN_PROGRESS_BYTES`. Default 16384.
+    pub upload_min_progress_bytes: u64,
+
+    /// Concurrent artifact uploads one principal (an authenticated user, or a
+    /// client address for an anonymous caller) may have in flight on the
+    /// byte-transfer routes; further ones get 429 with `Retry-After`, so one
+    /// credential cannot hold the whole `global_max_concurrency` pool
+    /// (GHSA-9f9r-c4w8-rjv9). Env var: `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`.
+    /// Default 64. Set to 0 to disable the cap.
+    pub upload_max_in_flight_per_principal: usize,
 
     /// Idle timeout in seconds. Connections idle longer than this will be
     /// closed. Defaults to 600 (10 minutes).
@@ -1087,13 +1161,29 @@ pub struct Config {
     /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
     pub proxy_singleflight_advisory_locks_enabled: bool,
 
-    /// Follower poll cadence (milliseconds) while the cluster leader fetches,
-    /// when `proxy_singleflight_advisory_locks_enabled` is true. Default: 200.
+    /// Follower poll cadence (milliseconds) for the BUFFERED proxy path while
+    /// the cluster leader fetches, when `proxy_singleflight_advisory_locks_enabled`
+    /// is true. The streaming path does not poll (it blocks on the lock, see
+    /// below). Default: 200.
     pub proxy_singleflight_lock_poll_interval_ms: u64,
 
     /// Upper bound (seconds) a follower waits for the leader's commit before
     /// falling back to its own bounded fetch, when advisory locks are enabled.
-    /// Default: 65.
+    /// On the streaming path (#4013) only one request per replica waits: that
+    /// replica's in-process leader blocks on the advisory lock with this as its
+    /// `lock_timeout`, and the cluster leader releases the lock after its cache
+    /// publish, so the waiter wakes exactly when the object is readable and
+    /// serves it (and its local followers) from cache. If the leader is still
+    /// filling at the deadline the waiter fetches once for its replica, so a
+    /// cold object costs 1 upstream fetch, or at most one per replica when the
+    /// fill outlives this. Each waiting replica holds one database connection
+    /// per cold key while it waits (the server drops a waiter whose client went
+    /// away within about a second, PG 14+). Keep it BELOW the ingress / load
+    /// balancer read timeout (nginx-ingress: 60 s): a client cut off first
+    /// retries into a fresh wait, so the per-replica fallback never fires.
+    /// Default: 65. Concurrent waits per replica are capped by
+    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` (default 32, read by
+    /// `HydrationCoordinator::from_env`); past the cap a replica fetches at once.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
     // -- OCI virtual-resolution negative cache (#1424) --
@@ -1140,8 +1230,25 @@ pub struct Config {
     /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
     pub smtp_from_address: String,
 
-    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    /// TLS mode for the SMTP connection: "starttls" (default, STARTTLS
+    /// required), "starttls-opportunistic" (STARTTLS when the server offers
+    /// it, plaintext otherwise), "tls" (implicit TLS), or "none".
     pub smtp_tls_mode: String,
+
+    /// Extra CA certificate(s) trusted for the SMTP server's TLS certificate,
+    /// added to the system trust store. Either a path to a PEM file or the
+    /// PEM text itself. `SMTP_TLS_CA_CERT` wins; when it is unset the shared
+    /// `CUSTOM_CA_CERT_PATH` (also used by the outbound HTTP clients) applies.
+    pub smtp_tls_ca_cert: Option<String>,
+
+    /// Where `smtp_tls_ca_cert` came from: `SMTP_TLS_CA_CERT` or
+    /// `CUSTOM_CA_CERT_PATH`. Used for log and error messages only.
+    pub smtp_tls_ca_cert_source: Option<&'static str>,
+
+    /// Skip verification of the SMTP server's certificate and hostname
+    /// (`SMTP_TLS_SKIP_VERIFY`, default false). Testing only: it lets anyone
+    /// on the path read the SMTP credentials.
+    pub smtp_tls_skip_verify: bool,
 
     // -- npm computed-packument cache (#2162) --
     /// Whether the npm computed-packument response cache (with
@@ -1244,12 +1351,16 @@ redacted_debug!(Config {
     show guest_access_enabled,
     show guest_access_env_pinned,
     show expose_detailed_health,
+    show readyz_require_search,
     show setup_password_hint,
     show grpc_reflection_enabled,
     show swagger_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show conda_attestation_require_verified,
+    show conda_attestation_issuers,
+    show conda_attestation_identities,
+    show conda_attestation_public_keys,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
@@ -1285,6 +1396,9 @@ redacted_debug!(Config {
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show upload_progress_window_secs,
+    show upload_min_progress_bytes,
+    show upload_max_in_flight_per_principal,
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
@@ -1333,6 +1447,8 @@ redacted_debug!(Config {
     redact_option smtp_password,
     show smtp_from_address,
     show smtp_tls_mode,
+    show smtp_tls_ca_cert_source,
+    show smtp_tls_skip_verify,
     show npm_packument_cache_enabled,
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
@@ -1387,12 +1503,16 @@ impl Default for Config {
             guest_access_enabled: true,
             guest_access_env_pinned: false,
             expose_detailed_health: false,
+            readyz_require_search: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
+            conda_attestation_issuers: Vec::new(),
+            conda_attestation_identities: Vec::new(),
+            conda_attestation_public_keys: Vec::new(),
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
@@ -1428,6 +1548,9 @@ impl Default for Config {
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            upload_progress_window_secs: 60,
+            upload_min_progress_bytes: 16 * 1024,
+            upload_max_in_flight_per_principal: 64,
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
@@ -1479,6 +1602,9 @@ impl Default for Config {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".into(),
             smtp_tls_mode: "starttls".into(),
+            smtp_tls_ca_cert: None,
+            smtp_tls_ca_cert_source: None,
+            smtp_tls_skip_verify: false,
             npm_packument_cache_enabled: true,
             npm_packument_cache_fresh_ttl_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
@@ -1595,6 +1721,10 @@ impl Config {
             expose_detailed_health: parse_opt_in_flag(
                 env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
             ),
+            // #4610: OpenSearch gates /readyz only when an operator opts in.
+            readyz_require_search: parse_opt_in_flag(
+                env::var("READYZ_REQUIRE_SEARCH").ok().as_deref(),
+            ),
             // Deployment-aware first-run instruction (#2802): the default
             // setup screen text assumes Docker Compose. Operators on
             // Kubernetes or packaged installs can override it here. Empty or
@@ -1633,6 +1763,9 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            conda_attestation_issuers: parse_comma_list_env("CONDA_ATTESTATION_ISSUERS"),
+            conda_attestation_identities: parse_comma_list_env("CONDA_ATTESTATION_IDENTITIES"),
+            conda_attestation_public_keys: parse_comma_list_env("CONDA_ATTESTATION_PUBLIC_KEYS"),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
@@ -1760,6 +1893,12 @@ impl Config {
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            upload_progress_window_secs: env_parse("UPLOAD_PROGRESS_WINDOW_SECS", 60_u64),
+            upload_min_progress_bytes: env_parse("UPLOAD_MIN_PROGRESS_BYTES", 16_384_u64),
+            upload_max_in_flight_per_principal: env_parse(
+                "UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL",
+                64_usize,
+            ),
             rate_limit_enabled: parse_opt_out_flag(env::var("RATE_LIMIT_ENABLED").ok().as_deref()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
@@ -1913,7 +2052,7 @@ impl Config {
                     .unwrap_or_else(|_| "starttls".into())
                     .to_lowercase();
                 match mode.as_str() {
-                    "starttls" | "tls" | "none" => mode,
+                    "starttls" | "starttls-opportunistic" | "tls" | "none" => mode,
                     _ => {
                         tracing::warn!(
                             value = %mode,
@@ -1923,6 +2062,14 @@ impl Config {
                     }
                 }
             },
+            smtp_tls_ca_cert: smtp_tls_ca_cert_from_env().map(|(v, _)| v),
+            smtp_tls_ca_cert_source: smtp_tls_ca_cert_from_env().map(|(_, src)| src),
+            smtp_tls_skip_verify: env::var("SMTP_TLS_SKIP_VERIFY")
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(false),
             // On by default; only an explicit, recognized negative disables
             // the npm computed-packument cache (#2162).
             npm_packument_cache_enabled: parse_opt_out_flag(
@@ -5956,12 +6103,13 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor, grpc override from, grpc override
-        // to) per Dockerfile that builds grype. The override ARGs are part of
-        // the pin: two images built from the same grype tag with different
-        // overrides ship different binaries, and .trivyignore describes only
-        // one of them (#3465 drifted exactly this way before it was retired).
-        let mut builds: Vec<(String, String, String, String, String, String)> = Vec::new();
+        // (file, version, commit, go floor, [grpc from, grpc to, x/net from,
+        // x/net to]) per Dockerfile that builds grype. The override ARGs are
+        // part of the pin: two images built from the same grype tag with
+        // different overrides ship different binaries, and .trivyignore
+        // describes only one of them (#3465 drifted exactly this way before it
+        // was retired).
+        let mut builds: Vec<(String, String, String, String, [String; 4])> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -5983,8 +6131,12 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
-                arg("GRPC_FROM"),
-                arg("GRPC_TO"),
+                [
+                    arg("GRPC_FROM"),
+                    arg("GRPC_TO"),
+                    arg("XNET_FROM"),
+                    arg("XNET_TO"),
+                ],
             ));
         }
 
@@ -5994,15 +6146,15 @@ mod tests {
              to build grype from source, found: {builds:?}"
         );
 
-        let (_, version, commit, go_min, grpc_from, grpc_to) = builds[0].clone();
-        for (file_name, v, c, g, gf, gt) in &builds {
+        let (_, version, commit, go_min, overrides) = builds[0].clone();
+        for (file_name, v, c, g, o) in &builds {
             assert_eq!(
-                (v, c, g, gf, gt),
-                (&version, &commit, &go_min, &grpc_from, &grpc_to),
+                (v, c, g, o),
+                (&version, &commit, &go_min, &overrides),
                 "grype source-build pin drift in {file_name}: it builds \
-                 v{v} @ {c} on go>={g} (grpc {gf}->{gt}) while another \
+                 v{v} @ {c} on go>={g} (overrides {o:?}) while another \
                  Dockerfile builds v{version} @ {commit} on go>={go_min} \
-                 (grpc {grpc_from}->{grpc_to}). Every image must ship the \
+                 (overrides {overrides:?}). Every image must ship the \
                  same grype build, otherwise .trivyignore's rationale \
                  describes a binary only some images carry. All: {builds:?}"
             );
