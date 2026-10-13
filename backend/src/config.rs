@@ -616,6 +616,10 @@ pub struct Config {
     /// deployment that had not set `ENVIRONMENT=production` served them to
     /// anonymous callers.
     pub swagger_enabled: bool,
+    /// Master gate for the WASM plugin runtime. This defaults to enabled for
+    /// upstream compatibility; only an explicit `false`/`0` prevents runtime
+    /// construction, startup loading, and plugin route registration.
+    pub plugins_enabled: bool,
 
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
@@ -1415,6 +1419,7 @@ redacted_debug!(Config {
     show setup_password_hint,
     show grpc_reflection_enabled,
     show swagger_enabled,
+    show plugins_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show conda_attestation_require_verified,
@@ -1570,6 +1575,7 @@ impl Default for Config {
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
+            plugins_enabled: true,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
@@ -1824,6 +1830,10 @@ impl Config {
             // `ENABLE_SWAGGER` is now the sole switch (`ENVIRONMENT` no
             // longer enables it).
             swagger_enabled: parse_opt_in_flag(env::var("ENABLE_SWAGGER").ok().as_deref()),
+            // Compatibility-preserving outer gate for the WASM runtime. Only
+            // an explicit negative disables plugins; unset/invalid values keep
+            // the existing behavior.
+            plugins_enabled: parse_opt_out_flag(env::var("PLUGINS_ENABLED").ok().as_deref()),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -3784,6 +3794,48 @@ mod tests {
         assert!(!config.expose_detailed_health);
         assert!(!config.grpc_reflection_enabled);
         assert!(!config.swagger_enabled);
+    }
+
+    #[test]
+    fn test_config_plugins_enabled_default_true() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("PLUGINS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("PLUGINS_ENABLED");
+
+        assert!(Config::from_env().unwrap().plugins_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("PLUGINS_ENABLED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_plugins_enabled_explicit_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("PLUGINS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        for value in ["false", "FALSE", "  false  ", "0"] {
+            env::set_var("PLUGINS_ENABLED", value);
+            assert!(!Config::from_env().unwrap().plugins_enabled);
+        }
+        for value in ["true", "1", "garbage", ""] {
+            env::set_var("PLUGINS_ENABLED", value);
+            assert!(Config::from_env().unwrap().plugins_enabled);
+        }
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("PLUGINS_ENABLED", saved_flag);
     }
 
     #[test]

@@ -67,6 +67,11 @@ pub fn create_router(state: SharedState) -> Router {
     // default 10 GB). A value of 0 disables the limit entirely.
     let upload_limit = state.config.max_upload_size_bytes;
 
+    let wasm_proxy_routes = if state.config.plugins_enabled {
+        Router::new().nest("/ext", handlers::wasm_proxy::router())
+    } else {
+        Router::new()
+    };
     // One in-flight upload budget per principal, shared by every upload
     // surface below (GHSA-9f9r-c4w8-rjv9).
     let upload_admission = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
@@ -134,7 +139,7 @@ pub fn create_router(state: SharedState) -> Router {
         // served via this prefix currently references `/incus/...` download
         // URLs; making those URLs prefix-aware is tracked as a follow-up.
         .nest("/lxc", handlers::incus::router())
-        .nest("/ext", handlers::wasm_proxy::router())
+        .merge(wasm_proxy_routes)
         // Per-principal in-flight upload cap (GHSA-9f9r-c4w8-rjv9). Layered
         // inside the visibility middleware so it sees the caller's identity.
         .layer(middleware::from_fn_with_state(
@@ -666,6 +671,40 @@ fn api_v1_routes(
     auth_service.register_for_global_flush();
 
     let upload_limit = state.config.max_upload_size_bytes;
+
+    let plugin_routes = if state.config.plugins_enabled {
+        Router::new()
+            .nest(
+                "/plugins",
+                handlers::plugins::router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
+            )
+            .nest(
+                "/plugins",
+                handlers::plugins::admin_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+            )
+            .nest(
+                "/formats",
+                handlers::plugins::format_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                )),
+            )
+            .nest(
+                "/formats",
+                handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+            )
+    } else {
+        Router::new()
+    };
 
     // Rate limiters, driven by Config fields. The exemption set and trusted
     // reverse-proxy policy arrive from `create_router` (see the doc comment
@@ -1204,38 +1243,7 @@ fn api_v1_routes(
                 admin_middleware,
             )),
         )
-        // Plugin read-only routes with auth middleware
-        .nest(
-            "/plugins",
-            handlers::plugins::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
-        )
-        // Plugin install + lifecycle routes require admin (loads arbitrary WASM)
-        .nest(
-            "/plugins",
-            handlers::plugins::admin_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                admin_middleware,
-            )),
-        )
-        // Format handler read-only routes (list, get) with optional auth
-        .nest(
-            "/formats",
-            handlers::plugins::format_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                optional_auth_middleware,
-            )),
-        )
-        // Format handler mutating routes (enable, disable, test) require admin
-        .nest(
-            "/formats",
-            handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                admin_middleware,
-            )),
-        )
+        .merge(plugin_routes)
         // Public webhook JWKS (#921): receivers verify `v2=` signatures
         // against it without credentials. No auth layer; also exempt from the
         // guest-access guard (`guest_access::is_allowlisted`).
@@ -1481,12 +1489,21 @@ mod tests {
     //! folded into `incus` or given its own handler with prefix-aware URL
     //! construction (tracked as a follow-up to #1272).
     use super::{
-        build_login_rate_limit_state, build_token_exchange_rate_limit_state,
+        api_v1_routes, build_login_rate_limit_state, build_token_exchange_rate_limit_state,
         token_exchange_per_window, DEFAULT_TOKEN_EXCHANGE_PER_WINDOW,
     };
     use super::{is_byte_transfer_path, request_timed_out_response};
     use crate::api::middleware::rate_limit::RateLimitExemptions;
+    use crate::api::middleware::upload_guard::UploadAdmission;
+    use crate::api::{AppState, SharedState};
+    use crate::storage::filesystem::FilesystemStorage;
+    use crate::storage::{StorageBackend, StorageRegistry};
+    use axum::body::Body;
+    use axum::Router;
+    use axum::http::{Method, Request, StatusCode};
+    use sqlx::PgPool;
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[test]
     fn token_exchange_budget_defaults_and_parses() {
@@ -1549,6 +1566,34 @@ mod tests {
     }
 
     const ROUTES_RS_SRC: &str = include_str!("routes.rs");
+
+    fn plugin_test_state(plugins_enabled: bool) -> SharedState {
+        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("connect_lazy should not fail");
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(FilesystemStorage::new("/tmp/test-plugin-routes"));
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut config = crate::config::Config::test_config();
+        config.plugins_enabled = plugins_enabled;
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    fn plugin_test_router(plugins_enabled: bool) -> Router {
+        let state = plugin_test_state(plugins_enabled);
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let trusted_proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&state.config, &exemptions, &trusted_proxies);
+        let uploads = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
+        api_v1_routes(state.clone(), exemptions, trusted_proxies, login, uploads)
+            .with_state(state)
+    }
 
     #[test]
     fn lxc_route_is_registered_alongside_incus() {
@@ -1704,6 +1749,65 @@ mod tests {
             next_middleware.contains("admin_middleware"),
             "plugin install + lifecycle routes must be gated by admin_middleware"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_have_no_runtime_state_or_routes() {
+        let state = plugin_test_state(false);
+        assert!(state.plugin_registry.is_none());
+        assert!(state.wasm_plugin_service.is_none());
+
+        let app = plugin_test_router(false);
+        for (method, uri) in [
+            (Method::GET, "/plugins"),
+            (Method::POST, "/plugins/install/zip"),
+            (Method::GET, "/formats"),
+            (Method::POST, "/formats/example/enable"),
+            (Method::GET, "/ext/example/repository/index"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_plugins_retain_management_routes() {
+        let response = plugin_test_router(true)
+            .oneshot(
+                Request::builder()
+                    .uri("/plugins")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn plugin_routes_are_conditionally_mounted() {
+        assert!(
+            ROUTES_RS_SRC
+                .contains("let plugin_routes = if state.config.plugins_enabled"),
+            "plugin management and format-handler routes must be controlled by the process-level gate"
+        );
+        assert!(ROUTES_RS_SRC.contains(".merge(plugin_routes)"));
+        assert!(
+            ROUTES_RS_SRC
+                .contains("let wasm_proxy_routes = if state.config.plugins_enabled"),
+            "the WASM protocol proxy must be controlled by the same process-level gate"
+        );
+        assert!(ROUTES_RS_SRC.contains(".merge(wasm_proxy_routes)"));
     }
 
     #[test]

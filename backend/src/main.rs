@@ -291,16 +291,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // pins the enforcement so this message and the behaviour cannot drift apart
     // again.
 
-    // Initialize WASM plugin system (T068)
     let plugins_dir =
         PathBuf::from(std::env::var("PLUGINS_DIR").unwrap_or_else(|_| "./plugins".to_string()));
-    let (plugin_registry, wasm_plugin_service) = initialize_wasm_plugins(
-        db_pool.clone(),
-        plugins_dir,
-        config.plugins_require_signed,
-        config.plugins_trusted_pubkey.clone(),
-    )
-    .await?;
+    let plugin_services =
+        initialize_wasm_plugins_if_enabled(&config, db_pool.clone(), plugins_dir).await?;
 
     // Initialize OpenSearch (optional, graceful fallback)
     let search_service = match &config.opensearch_url {
@@ -852,16 +846,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     let scanner_service = Arc::new(scanner_service);
 
-    // Create application state with WASM plugin support
     let scheduler_storage = primary_storage.clone();
-    let mut app_state = api::AppState::with_wasm_plugins(
-        config.clone(),
-        db_pool.clone(),
-        primary_storage,
-        storage_registry.clone(),
-        plugin_registry,
-        wasm_plugin_service,
-    );
+    let mut app_state = match plugin_services {
+        Some((plugin_registry, wasm_plugin_service)) => api::AppState::with_wasm_plugins(
+            config.clone(),
+            db_pool.clone(),
+            primary_storage,
+            storage_registry.clone(),
+            plugin_registry,
+            wasm_plugin_service,
+        ),
+        None => api::AppState::new(
+            config.clone(),
+            db_pool.clone(),
+            primary_storage,
+            storage_registry.clone(),
+        ),
+    };
     app_state.set_scanner_service(scanner_service);
 
     // Initialize quality check service for health scoring and quality gates
@@ -1615,6 +1616,29 @@ fn main() -> Result<()> {
 ///
 /// Creates the plugin registry, loads active plugins from the database,
 /// and returns both the registry and the plugin service.
+async fn initialize_wasm_plugins_if_enabled(
+    config: &Config,
+    db_pool: sqlx::PgPool,
+    plugins_dir: PathBuf,
+) -> Result<Option<(Arc<PluginRegistry>, Arc<WasmPluginService>)>> {
+    if !config.plugins_enabled {
+        tracing::info!(
+            event = "plugins_disabled_by_operator",
+            "WASM plugin runtime disabled by operator"
+        );
+        return Ok(None);
+    }
+
+    initialize_wasm_plugins(
+        db_pool,
+        plugins_dir,
+        config.plugins_require_signed,
+        config.plugins_trusted_pubkey.clone(),
+    )
+    .await
+    .map(Some)
+}
+
 async fn initialize_wasm_plugins(
     db_pool: sqlx::PgPool,
     plugins_dir: PathBuf,
@@ -3640,6 +3664,22 @@ mod tests {
         hasher.update(embedded.as_bytes());
         let hash = hasher.finalize();
         assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_skip_runtime_directory_and_database_loading() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("must-not-be-created");
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake").unwrap();
+        let config = Config {
+            plugins_enabled: false,
+            ..Default::default()
+        };
+        let services = initialize_wasm_plugins_if_enabled(&config, pool, plugins_dir.clone())
+            .await
+            .expect("disabled plugins must not initialize runtime state");
+        assert!(services.is_none());
+        assert!(!plugins_dir.exists());
     }
 }
 // warm cache benchmark

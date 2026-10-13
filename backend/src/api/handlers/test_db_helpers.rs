@@ -603,6 +603,7 @@ fn cfg(storage_path: &str) -> Config {
         setup_password_hint: None,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
+        plugins_enabled: true,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         conda_attestation_require_verified: true,

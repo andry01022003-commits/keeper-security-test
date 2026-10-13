@@ -73,6 +73,7 @@ fn test_config(storage_path: &str) -> Config {
         readyz_require_search: false,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
+        plugins_enabled: true,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         conda_attestation_require_verified: true,
