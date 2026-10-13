@@ -5399,6 +5399,13 @@ fn parse_npm_publish_payload(
 
     let mut versions = Vec::new();
     for (version, version_data) in versions_obj {
+        if json_contains_nul(version_data) {
+            return Err(AppError::Validation(format!(
+                "Metadata for version {} contains a NUL character",
+                version
+            ))
+            .into_response());
+        }
         let parsed =
             extract_version_tarball(package_name, version, version_data.clone(), attachments_obj)?;
         versions.push(parsed);
@@ -5416,6 +5423,17 @@ fn parse_npm_publish_payload(
         versions,
         dist_tags,
     })
+}
+
+fn json_contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(json_contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| k.contains('\0') || json_contains_nul(v)),
+        _ => false,
+    }
 }
 
 /// Extract and decode the tarball for a single version from the attachments map.
@@ -5476,6 +5494,7 @@ async fn store_npm_version(
     package_name: &str,
     user_id: uuid::Uuid,
     ver: &NpmVersionToPublish,
+    enqueue_sync_tasks: bool,
 ) -> Result<(), Response> {
     let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
 
@@ -5580,6 +5599,24 @@ async fn store_npm_version(
     .fetch_one(&mut *tx)
     .await
     .map_err(map_db_err)?;
+
+    // Store metadata
+    let npm_metadata = serde_json::json!({
+        "name": package_name,
+        "version": ver.version,
+        "version_data": ver.version_data,
+    });
+
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'npm', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+    )
+    .bind(artifact_id)
+    .bind(&npm_metadata)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_err)?;
     tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
@@ -5590,23 +5627,6 @@ async fn store_npm_version(
         repo_id,
         artifact_id,
     )
-    .await;
-
-    // Store metadata
-    let npm_metadata = serde_json::json!({
-        "name": package_name,
-        "version": ver.version,
-        "version_data": ver.version_data,
-    });
-
-    let _ = sqlx::query(
-        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
-         VALUES ($1, 'npm', $2) \
-         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
-    )
-    .bind(artifact_id)
-    .bind(&npm_metadata)
-    .execute(&state.db)
     .await;
 
     record_npm_install_script_analysis(state, artifact_id, &ver.version_data).await;
@@ -5630,6 +5650,18 @@ async fn store_npm_version(
     )
     .await;
 
+    if enqueue_sync_tasks {
+        crate::services::peer_instance_service::PeerInstanceService::new(state.db.clone())
+            .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo_id,
+                path: &artifact_path,
+                size_bytes,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+    }
+
     info!(
         "npm publish: {} {} ({}) to repo {}",
         package_name, ver.version, ver.tarball_filename, repo_key
@@ -5652,8 +5684,8 @@ async fn store_npm_version(
 /// script differs — a `package.json` field here, a payload file there — and
 /// the rules operate on shell text, which is common to both.
 ///
-/// Best-effort, like the metadata write above it: the artifact row is already
-/// committed, so a failure must not fail an otherwise-successful publish. But
+/// Best-effort: the artifact row and its metadata are already committed, so a
+/// failure must not fail an otherwise-successful publish. But
 /// a package with no install scripts still records a row, because "we looked
 /// and there were none" and "we never looked" must stay distinguishable
 /// (#4047).
@@ -5737,6 +5769,7 @@ async fn publish_package(
     repo.reject_if_promotion_only(false)?;
 
     let parsed = parse_npm_publish_payload(&body, package_name)?;
+    let enqueue_sync_tasks = !super::is_replication_request(headers);
 
     for ver in &parsed.versions {
         store_npm_version(
@@ -5747,6 +5780,7 @@ async fn publish_package(
             package_name,
             user_id,
             ver,
+            enqueue_sync_tasks,
         )
         .await?;
     }
@@ -9879,6 +9913,24 @@ mod tests {
                 "pkg",
                 "missing attachments",
             ),
+            (
+                serde_json::json!({
+                    "name": "pkg",
+                    "versions": { "1.0.0": { "keywords": ["ok", "a\u{0}b"] } },
+                    "_attachments": { "pkg-1.0.0.tgz": { "data": "dGVzdA==" } }
+                }),
+                "pkg",
+                "NUL in version metadata",
+            ),
+            (
+                serde_json::json!({
+                    "name": "pkg",
+                    "versions": { "1.0.0": { "a\u{0}b": true } },
+                    "_attachments": { "pkg-1.0.0.tgz": { "data": "dGVzdA==" } }
+                }),
+                "pkg",
+                "NUL in version metadata key",
+            ),
         ];
 
         for (payload, url_name, label) in cases {
@@ -12868,6 +12920,125 @@ mod tests {
         assert_eq!(dist_tags["next"], "2.0.0-rc.1");
         // ...and `latest` is the highest STABLE version, not the prerelease.
         assert_eq!(dist_tags["latest"], "1.1.0");
+    }
+
+    #[tokio::test]
+    async fn publish_queues_push_sync_tasks_for_each_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{
+            PeerInstanceService, RegisterPeerInstanceRequest, ReplicationMode,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let peer_service = PeerInstanceService::new(fx.pool.clone());
+        let peer = peer_service
+            .register(RegisterPeerInstanceRequest {
+                name: format!("npm-repl-peer-{}", fx.repo_id),
+                endpoint_url: "https://peer.example.test".to_string(),
+                region: None,
+                cache_size_bytes: 1024 * 1024,
+                sync_filter: None,
+                api_key: "peer-key".to_string(),
+            })
+            .await
+            .expect("register test peer");
+        peer_service
+            .assign_repository(
+                peer.id,
+                fx.repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .expect("assign npm repo to peer");
+
+        let publish = |versions: &[&str], headers: HeaderMap| {
+            let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+            let mut version_map = serde_json::Map::new();
+            let mut attachments = serde_json::Map::new();
+            for v in versions {
+                version_map.insert(
+                    v.to_string(),
+                    serde_json::json!({ "name": "repl-widget", "version": v }),
+                );
+                attachments.insert(
+                    format!("repl-widget-{v}.tgz"),
+                    serde_json::json!({ "data": tarball_b64 }),
+                );
+            }
+            let body = serde_json::json!({
+                "name": "repl-widget",
+                "versions": version_map,
+                "_attachments": attachments,
+            });
+            let state = fx.state.clone();
+            let auth = tdh::make_auth(fx.user_id, &fx.username);
+            let repo_key = fx.repo_key.clone();
+            async move {
+                super::publish_package(
+                    &state,
+                    Some(auth),
+                    &repo_key,
+                    "repl-widget",
+                    &headers,
+                    Bytes::from(serde_json::to_vec(&body).expect("serialize publish body")),
+                )
+                .await
+                .map(|r| r.status())
+                .map_err(|r| r.status())
+            }
+        };
+
+        assert!(publish(&["1.0.0", "1.1.0"], HeaderMap::new()).await.is_ok());
+
+        let mut replicated = HeaderMap::new();
+        replicated.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        assert!(publish(&["2.0.0"], replicated).await.is_ok());
+
+        let queued: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT a.version, am.format FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
+               AND a.repository_id = $2 \
+             ORDER BY a.version",
+        )
+        .bind(peer.id)
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("list npm sync tasks");
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND name = 'repl-widget' AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count npm artifacts");
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(stored, 3);
+        assert_eq!(
+            queued,
+            vec![
+                ("1.0.0".to_string(), Some("npm".to_string())),
+                ("1.1.0".to_string(), Some("npm".to_string())),
+            ]
+        );
     }
 
     /// #1543 finding-2: a plain `npm publish` of a PRERELEASE must not pin

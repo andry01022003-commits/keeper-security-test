@@ -3486,76 +3486,6 @@ fn should_enqueue_maven_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
 }
 
-async fn queue_maven_sync_tasks(
-    state: &SharedState,
-    repo_id: uuid::Uuid,
-    artifact_id: uuid::Uuid,
-    artifact_path: &str,
-    artifact_size: i64,
-    artifact_created: chrono::DateTime<chrono::Utc>,
-) {
-    #[derive(sqlx::FromRow)]
-    struct SubWithFilter {
-        peer_instance_id: uuid::Uuid,
-        artifact_filter: Option<serde_json::Value>,
-    }
-
-    let subscriptions = match sqlx::query_as::<_, SubWithFilter>(
-        r#"
-        SELECT prs.peer_instance_id, sp.artifact_filter
-        FROM peer_repo_subscriptions prs
-        LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
-        WHERE prs.repository_id = $1
-          AND prs.sync_enabled = true
-          AND prs.replication_mode::text IN ('push', 'mirror')
-        "#,
-    )
-    .bind(repo_id)
-    .fetch_all(&state.db)
-    .await
-    {
-        Ok(subs) => subs,
-        Err(e) => {
-            warn!(
-                "Failed to query Maven peer subscriptions for repo {} artifact {}: {}",
-                repo_id, artifact_id, e
-            );
-            return;
-        }
-    };
-
-    for sub in subscriptions {
-        let filter: crate::services::sync_policy_service::ArtifactFilter = sub
-            .artifact_filter
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        if !filter.matches(artifact_path, artifact_size, artifact_created) {
-            continue;
-        }
-
-        if let Err(e) = sqlx::query(
-            r#"
-            INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority)
-            VALUES ($1, $2, 0)
-            ON CONFLICT (peer_instance_id, artifact_id, task_type)
-            DO UPDATE SET priority = GREATEST(sync_tasks.priority, 0)
-            "#,
-        )
-        .bind(sub.peer_instance_id)
-        .bind(artifact_id)
-        .execute(&state.db)
-        .await
-        {
-            warn!(
-                "Failed to queue Maven sync task for peer {} artifact {}: {}",
-                sub.peer_instance_id, artifact_id, e
-            );
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PUT /maven/{repo_key}/*path — Upload artifact
 // ---------------------------------------------------------------------------
@@ -3948,15 +3878,15 @@ async fn upload(
     .await;
 
     if should_enqueue_maven_sync_tasks(&headers) {
-        queue_maven_sync_tasks(
-            &state,
-            repo.id,
-            artifact_id,
-            &path,
-            size_bytes,
-            artifact_created,
-        )
-        .await;
+        crate::services::peer_instance_service::PeerInstanceService::new(state.db.clone())
+            .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo.id,
+                path: &path,
+                size_bytes,
+                created_at: artifact_created,
+            })
+            .await;
     }
 
     // Update repository timestamp

@@ -8,6 +8,25 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
+/// Select all peer subscriptions (with their optional artifact filter) that are
+/// eligible to receive a push of a newly uploaded artifact in the repository.
+const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
+    SELECT prs.peer_instance_id, sp.artifact_filter
+    FROM peer_repo_subscriptions prs
+    LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
+    WHERE prs.repository_id = $1
+      AND prs.sync_enabled = true
+      AND prs.replication_mode::text IN ('push', 'mirror')
+    "#;
+
+pub struct PublishedArtifact<'a> {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub path: &'a str,
+    pub size_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Peer instance status
 #[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
 #[sqlx(type_name = "instance_status", rename_all = "lowercase")]
@@ -686,6 +705,70 @@ impl PeerInstanceService {
         Ok(id)
     }
 
+    pub async fn queue_push_sync_tasks(&self, artifact: &PublishedArtifact<'_>) -> usize {
+        #[derive(sqlx::FromRow)]
+        struct SubWithFilter {
+            peer_instance_id: Uuid,
+            artifact_filter: Option<serde_json::Value>,
+        }
+
+        let subscriptions: Vec<SubWithFilter> = match sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
+            .bind(artifact.repository_id)
+            .fetch_all(&self.db)
+            .await
+        {
+            Ok(subs) => subs,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to query peer subscriptions for repo {} artifact {}: {}",
+                    artifact.repository_id,
+                    artifact.id,
+                    e
+                );
+                return 0;
+            }
+        };
+
+        let mut queued = 0usize;
+        for sub in &subscriptions {
+            let filter: crate::services::sync_policy_service::ArtifactFilter = sub
+                .artifact_filter
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
+            if !filter.matches(artifact.path, artifact.size_bytes, artifact.created_at) {
+                tracing::debug!(
+                    "Artifact {} filtered out for peer {} by policy artifact_filter",
+                    artifact.id,
+                    sub.peer_instance_id,
+                );
+                continue;
+            }
+
+            match self
+                .queue_sync_task(sub.peer_instance_id, artifact.id, 0)
+                .await
+            {
+                Ok(_) => queued += 1,
+                Err(e) => tracing::warn!(
+                    "Failed to queue sync task for peer {} artifact {}: {}",
+                    sub.peer_instance_id,
+                    artifact.id,
+                    e
+                ),
+            }
+        }
+        if queued > 0 {
+            tracing::info!(
+                "Queued sync tasks for artifact {} to {} peer(s)",
+                artifact.id,
+                queued
+            );
+        }
+        queued
+    }
+
     /// Get pending sync tasks for a peer instance
     pub async fn get_pending_sync_tasks(
         &self,
@@ -925,6 +1008,15 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    #[test]
+    fn test_push_mirror_subscriptions_sql_filters_enabled_push_mirror() {
+        let sql = PUSH_MIRROR_SUBSCRIPTIONS_SQL;
+        assert!(sql.contains("FROM peer_repo_subscriptions prs"));
+        assert!(sql.contains("LEFT JOIN sync_policies sp"));
+        assert!(sql.contains("prs.sync_enabled = true"));
+        assert!(sql.contains("replication_mode::text IN ('push', 'mirror')"));
+    }
+
     /// Tier-2 (skips without DATABASE_URL): the `is_local` peer row must
     /// follow PEER_INSTANCE_NAME / PEER_PUBLIC_ENDPOINT on every boot, in
     /// place — same row id, no duplicate row — not only at first boot (#2832).
@@ -1129,6 +1221,145 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    async fn insert_test_artifact(pool: &sqlx::PgPool, repo_id: Uuid, path: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $2, 1, 'sha', 'application/octet-stream', $2) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn queued_push_peers(pool: &sqlx::PgPool, artifact_id: Uuid) -> Vec<Uuid> {
+        sqlx::query_scalar(
+            "SELECT peer_instance_id FROM sync_tasks \
+             WHERE artifact_id = $1 AND task_type = 'push' ORDER BY peer_instance_id",
+        )
+        .bind(artifact_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn published<'a>(id: Uuid, repository_id: Uuid, path: &'a str) -> PublishedArtifact<'a> {
+        PublishedArtifact {
+            id,
+            repository_id,
+            path,
+            size_bytes: 1,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_push_sync_tasks_targets_enabled_push_and_mirror_subscriptions() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let repo_id = insert_test_repo(&pool, &Uuid::new_v4()).await;
+
+        let mut peers = Vec::new();
+        for (mode, enabled) in [
+            (ReplicationMode::Push, true),
+            (ReplicationMode::Mirror, true),
+            (ReplicationMode::Pull, true),
+            (ReplicationMode::Push, false),
+        ] {
+            let peer_id = register_test_peer(&svc, &Uuid::new_v4()).await;
+            svc.assign_repository(peer_id, repo_id, enabled, Some(mode), None, None)
+                .await
+                .unwrap();
+            peers.push(peer_id);
+        }
+
+        let path = "pkg/1.0.0/pkg-1.0.0.tgz";
+        let artifact_id = insert_test_artifact(&pool, repo_id, path).await;
+        let artifact = published(artifact_id, repo_id, path);
+
+        assert_eq!(svc.queue_push_sync_tasks(&artifact).await, 2);
+        assert_eq!(svc.queue_push_sync_tasks(&artifact).await, 2);
+        let mut expected = vec![peers[0], peers[1]];
+        expected.sort();
+        assert_eq!(queued_push_peers(&pool, artifact_id).await, expected);
+
+        for peer_id in peers {
+            cleanup_assign(&pool, peer_id, repo_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_push_sync_tasks_skips_artifacts_excluded_by_policy_filter() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let suffix = Uuid::new_v4();
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        svc.assign_repository(
+            peer_id,
+            repo_id,
+            true,
+            Some(ReplicationMode::Push),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let policy_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_policies \
+             (name, repo_selector, peer_selector, artifact_filter, precedence) \
+             VALUES ($1, $2, $3, $4, 0) RETURNING id",
+        )
+        .bind(format!("exclude-tgz-{suffix}"))
+        .bind(serde_json::json!({ "match_repos": [repo_id] }))
+        .bind(serde_json::json!({ "match_peers": [peer_id] }))
+        .bind(serde_json::json!({ "exclude_paths": ["*.tgz"] }))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE peer_repo_subscriptions SET policy_id = $1 \
+             WHERE peer_instance_id = $2 AND repository_id = $3",
+        )
+        .bind(policy_id)
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let excluded_path = "pkg/1.0.0/pkg-1.0.0.tgz";
+        let included_path = "pkg/1.0.0/pkg-1.0.0.mod";
+        let excluded = insert_test_artifact(&pool, repo_id, excluded_path).await;
+        let included = insert_test_artifact(&pool, repo_id, included_path).await;
+
+        assert_eq!(
+            svc.queue_push_sync_tasks(&published(excluded, repo_id, excluded_path))
+                .await,
+            0
+        );
+        assert_eq!(
+            svc.queue_push_sync_tasks(&published(included, repo_id, included_path))
+                .await,
+            1
+        );
+        assert!(queued_push_peers(&pool, excluded).await.is_empty());
+        assert_eq!(queued_push_peers(&pool, included).await, vec![peer_id]);
+
+        cleanup_assign(&pool, peer_id, repo_id).await;
+        sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(policy_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     async fn cleanup_assign(pool: &sqlx::PgPool, peer_id: Uuid, repo_id: Uuid) {

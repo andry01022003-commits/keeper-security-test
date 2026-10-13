@@ -49,17 +49,6 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                 ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
                 "#;
 
-/// Select all peer subscriptions (with their optional artifact filter) that are
-/// eligible to receive a push of a newly uploaded artifact in the repository.
-const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
-                    SELECT prs.peer_instance_id, sp.artifact_filter
-                    FROM peer_repo_subscriptions prs
-                    LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
-                    WHERE prs.repository_id = $1
-                      AND prs.sync_enabled = true
-                      AND prs.replication_mode::text IN ('push', 'mirror')
-                    "#;
-
 /// The three content digests persisted on every artifact row.
 ///
 /// Registry clients look artifacts up by any of SHA-256, SHA-1, or MD5 (Maven
@@ -1090,78 +1079,25 @@ impl ArtifactService {
 
         // Queue sync tasks for peer replication (non-blocking)
         if enqueue_sync_tasks {
-            let db = self.db.clone();
+            let peer_service =
+                crate::services::peer_instance_service::PeerInstanceService::new(self.db.clone());
             let artifact_id = artifact.id;
             let repository_id = artifact.repository_id;
             let artifact_path = artifact.path.clone();
             let artifact_size = artifact.size_bytes;
             let artifact_created = artifact.created_at;
             tokio::spawn(async move {
-                // Find peers with push/mirror subscriptions, including the policy's artifact_filter
-                #[derive(sqlx::FromRow)]
-                struct SubWithFilter {
-                    peer_instance_id: uuid::Uuid,
-                    artifact_filter: Option<serde_json::Value>,
-                }
-
-                let subscriptions: std::result::Result<Vec<SubWithFilter>, _> =
-                    sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
-                        .bind(repository_id)
-                        .fetch_all(&db)
-                        .await;
-
-                match subscriptions {
-                    Ok(subs) if !subs.is_empty() => {
-                        let peer_service =
-                            crate::services::peer_instance_service::PeerInstanceService::new(db);
-                        let mut queued = 0usize;
-                        for sub in &subs {
-                            let filter: crate::services::sync_policy_service::ArtifactFilter = sub
-                                .artifact_filter
-                                .as_ref()
-                                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                                .unwrap_or_default();
-
-                            if !filter.matches(&artifact_path, artifact_size, artifact_created) {
-                                tracing::debug!(
-                                    "Artifact {} filtered out for peer {} by policy artifact_filter",
-                                    artifact_id,
-                                    sub.peer_instance_id,
-                                );
-                                continue;
-                            }
-
-                            if let Err(e) = peer_service
-                                .queue_sync_task(sub.peer_instance_id, artifact_id, 0)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to queue sync task for peer {} artifact {}: {}",
-                                    sub.peer_instance_id,
-                                    artifact_id,
-                                    e
-                                );
-                            } else {
-                                queued += 1;
-                            }
-                        }
-                        if queued > 0 {
-                            tracing::info!(
-                                "Queued sync tasks for artifact {} to {} peer(s)",
-                                artifact_id,
-                                queued
-                            );
-                        }
-                    }
-                    Ok(_) => {} // No push/mirror subscriptions
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to query peer subscriptions for repo {}: {}",
+                peer_service
+                    .queue_push_sync_tasks(
+                        &crate::services::peer_instance_service::PublishedArtifact {
+                            id: artifact_id,
                             repository_id,
-                            e
-                        );
-                    }
-                }
+                            path: &artifact_path,
+                            size_bytes: artifact_size,
+                            created_at: artifact_created,
+                        },
+                    )
+                    .await;
             });
         }
 
@@ -4421,15 +4357,6 @@ mod tests {
         assert!(sql.contains("sync_enabled"));
         assert!(sql.contains("is_local = false"));
         assert!(sql.contains("ON CONFLICT"));
-    }
-
-    #[test]
-    fn test_push_mirror_subscriptions_sql_filters_enabled_push_mirror() {
-        let sql = PUSH_MIRROR_SUBSCRIPTIONS_SQL;
-        assert!(sql.contains("FROM peer_repo_subscriptions prs"));
-        assert!(sql.contains("LEFT JOIN sync_policies sp"));
-        assert!(sql.contains("prs.sync_enabled = true"));
-        assert!(sql.contains("replication_mode::text IN ('push', 'mirror')"));
     }
 
     #[test]
