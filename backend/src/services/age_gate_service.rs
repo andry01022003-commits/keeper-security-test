@@ -6,6 +6,7 @@
 //! supplied metadata or content, while Local members remain ungated.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -19,6 +20,9 @@ use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::event_bus::EventBus;
 use crate::services::metrics_service;
 use crate::services::upstream_metadata::UpstreamMetadataCache;
+use crate::services::version_order::{
+    compare_natural_segment, compare_semver_prerelease_identifier,
+};
 
 pub const AUTO_APPROVE_REASON: &str = "auto-approved: crossed age threshold";
 
@@ -167,9 +171,94 @@ pub async fn resolve_repo_params(db: &PgPool, repository_id: Uuid) -> Result<Age
 /// registry. Binding the identity to the upstream means a repoint starts a
 /// fresh clock by construction, instead of requiring every repository-update
 /// path to remember to invalidate observations.
+///
+/// Userinfo is not part of the identity (#4467): rotating credentials embedded
+/// in the URL names the same registry, so it must not restart every version's
+/// clock or void manual approvals. Host and path still are.
 pub fn upstream_fingerprint(upstream_url: Option<&str>) -> String {
-    let normalized = normalize_upstream_url(upstream_url.unwrap_or_default());
-    hex::encode(Sha256::digest(normalized.as_bytes()))
+    let raw = upstream_url.unwrap_or_default().trim();
+    let (stripped, _) = crate::services::proxy_service::strip_url_userinfo(raw);
+    hex::encode(Sha256::digest(normalize_upstream_url(&stripped).as_bytes()))
+}
+
+/// The fingerprint releases before #4467 computed for `upstream_url` (userinfo
+/// included), when it differs from [`upstream_fingerprint`]; `None` for a URL
+/// without userinfo, whose fingerprint did not change.
+pub(crate) fn legacy_upstream_fingerprint(upstream_url: Option<&str>) -> Option<String> {
+    let legacy = hex::encode(Sha256::digest(
+        normalize_upstream_url(upstream_url.unwrap_or_default()).as_bytes(),
+    ));
+    (legacy != upstream_fingerprint(upstream_url)).then_some(legacy)
+}
+
+/// Move one repository's age-gate state recorded under the legacy
+/// (userinfo-bearing) fingerprint of `upstream_url` to the current one (#4467):
+/// first-seen observations keep their EARLIEST time and review rows keep their
+/// decisions, so the fingerprint change neither restarts clocks nor voids
+/// approvals. Idempotent; a no-op for a URL without userinfo. Returns the
+/// number of rows moved.
+pub async fn rekey_legacy_fingerprint(
+    db: &PgPool,
+    repo_id: Uuid,
+    upstream_url: Option<&str>,
+) -> Result<u64> {
+    let Some(legacy) = legacy_upstream_fingerprint(upstream_url) else {
+        return Ok(0);
+    };
+    let current = upstream_fingerprint(upstream_url);
+    let mut tx = db.begin().await?;
+    let moved = sqlx::query(
+        "INSERT INTO age_gate_version_observations
+             (repository_id, upstream_fingerprint, package_name, package_version, first_seen_at)
+         SELECT repository_id, $3, package_name, package_version, first_seen_at
+         FROM age_gate_version_observations
+         WHERE repository_id = $1 AND upstream_fingerprint = $2
+         ON CONFLICT (repository_id, upstream_fingerprint, package_name, package_version)
+         DO UPDATE SET first_seen_at =
+             LEAST(age_gate_version_observations.first_seen_at, EXCLUDED.first_seen_at)",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .bind(&current)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "DELETE FROM age_gate_version_observations
+         WHERE repository_id = $1 AND upstream_fingerprint = $2",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .execute(&mut *tx)
+    .await?;
+    let reviews = sqlx::query(
+        "UPDATE age_gate_reviews SET basis_upstream_fingerprint = $3
+         WHERE repository_id = $1 AND basis_upstream_fingerprint = $2",
+    )
+    .bind(repo_id)
+    .bind(&legacy)
+    .bind(&current)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(moved + reviews)
+}
+
+/// Startup pass: [`rekey_legacy_fingerprint`] for every repository whose
+/// upstream URL carries userinfo. Best-effort and idempotent, so every replica
+/// may run it; rows an older replica writes during a rolling upgrade are
+/// picked up by the next start or by the PATCH that rotates the URL.
+pub async fn rekey_all_legacy_fingerprints(db: &PgPool) -> Result<u64> {
+    let repos: Vec<(Uuid, Option<String>)> =
+        sqlx::query_as("SELECT id, upstream_url FROM repositories WHERE upstream_url LIKE '%@%'")
+            .fetch_all(db)
+            .await?;
+    let mut moved = 0;
+    for (id, url) in repos {
+        moved += rekey_legacy_fingerprint(db, id, url.as_deref()).await?;
+    }
+    Ok(moved)
 }
 
 /// Normalize an upstream URL so that cosmetically different spellings of the
@@ -2004,7 +2093,15 @@ pub(crate) fn format_label(format: &RepositoryFormat) -> &'static str {
 }
 
 /// Drop any `dist-tags` entry whose target version is no longer present in the
-/// filtered packument, then re-point `latest` to the newest surviving version.
+/// filtered packument, then re-point `latest` if the gate removed its target.
+///
+/// `latest` is the publisher's choice, so a surviving `latest` is kept even when
+/// a higher prerelease also survived: re-pointing it to the newest version would
+/// hand `npm install pkg` a nightly. When the gate removed it, the replacement is
+/// the newest allowed release at or below the old `latest`, then the newest
+/// allowed release, then the newest allowed version of any kind. A blocked
+/// prerelease `latest` is therefore replaced by a release whenever one
+/// survives.
 ///
 /// `allowed` is the set of versions that survived age-gate filtering and must be
 /// sorted newest-first. When `allowed` is empty every tag is removed, leaving an
@@ -2017,8 +2114,27 @@ fn reconcile_dist_tags(packument: &mut serde_json::Value, allowed: &[String]) {
     else {
         return;
     };
+    let previous_latest = dist_tags
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     dist_tags.retain(|_tag, target| target.as_str().is_some_and(|v| allowed_set.contains(v)));
-    if let Some(latest) = allowed.first() {
+    if dist_tags.contains_key("latest") {
+        return;
+    }
+
+    let is_release = |v: &&String| split_version_prerelease(v).1.is_none();
+    let replacement = allowed
+        .iter()
+        .filter(is_release)
+        .find(|v| {
+            previous_latest
+                .as_deref()
+                .is_none_or(|latest| version_compare(v, latest) <= 0)
+        })
+        .or_else(|| allowed.iter().find(is_release))
+        .or_else(|| allowed.first());
+    if let Some(latest) = replacement {
         dist_tags.insert(
             "latest".to_string(),
             serde_json::Value::String(latest.clone()),
@@ -2038,7 +2154,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
     let (main_a, pre_a) = split_version_prerelease(a);
     let (main_b, pre_b) = split_version_prerelease(b);
 
-    let main_cmp = compare_dot_segments(main_a, main_b);
+    let main_cmp = compare_dot_segments(main_a, main_b, compare_natural_segment);
     if main_cmp != 0 {
         return main_cmp;
     }
@@ -2047,7 +2163,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
         (None, None) => 0,
         (None, Some(_)) => 1,
         (Some(_), None) => -1,
-        (Some(pa), Some(pb)) => compare_dot_segments(pa, pb),
+        (Some(pa), Some(pb)) => compare_dot_segments(pa, pb, compare_semver_prerelease_identifier),
     }
 }
 
@@ -2058,10 +2174,13 @@ fn split_version_prerelease(version: &str) -> (&str, Option<&str>) {
 }
 
 /// Compare two dot-separated version segment lists (the numeric core such as
-/// `1.2.3`, or a prerelease tail such as `alpha.1`). Each segment is compared
-/// numerically when both sides parse as integers, otherwise lexically. Missing
-/// trailing segments default to `0`. Returns -1, 0, or 1.
-fn compare_dot_segments(a: &str, b: &str) -> i32 {
+/// `1.2.3`, or a prerelease tail such as `alpha.1`), one segment at a time with
+/// `compare_segment`. Missing trailing segments default to `0`. Returns -1, 0,
+/// or 1.
+///
+/// `compare_segment` must be a total order, or so is not the result: `sort_by`
+/// panics on a comparator with a cycle once the slice is long enough.
+fn compare_dot_segments(a: &str, b: &str, compare_segment: fn(&str, &str) -> Ordering) -> i32 {
     let seg_a: Vec<&str> = a.split('.').collect();
     let seg_b: Vec<&str> = b.split('.').collect();
 
@@ -2069,25 +2188,16 @@ fn compare_dot_segments(a: &str, b: &str) -> i32 {
         let sa = seg_a.get(i).unwrap_or(&"0");
         let sb = seg_b.get(i).unwrap_or(&"0");
 
-        match (sa.parse::<u64>(), sb.parse::<u64>()) {
-            (Ok(na), Ok(nb)) => {
-                if na < nb {
-                    return -1;
-                }
-                if na > nb {
-                    return 1;
-                }
-            }
-            _ => match sa.cmp(sb) {
-                std::cmp::Ordering::Less => return -1,
-                std::cmp::Ordering::Greater => return 1,
-                std::cmp::Ordering::Equal => {}
-            },
+        match compare_segment(sa, sb) {
+            Ordering::Less => return -1,
+            Ordering::Greater => return 1,
+            Ordering::Equal => {}
         }
     }
     0
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2258,6 +2368,102 @@ mod tests {
     }
 
     const TEST_UPSTREAM: &str = "https://upstream.example.test";
+
+    /// #4467: state recorded under the pre-#4467 (userinfo-bearing)
+    /// fingerprint moves to the current one with its earliest first-seen time
+    /// and its review decision, so neither the upgrade nor a later credential
+    /// rotation restarts a clock or voids an approval. A repoint to another
+    /// host still gets a fresh identity.
+    #[tokio::test]
+    async fn rekey_keeps_first_seen_and_reviews_across_credential_rotation_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let old_url = "https://svc:old-4467@registry.example.test/npm";
+        sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(old_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy = legacy_upstream_fingerprint(Some(old_url)).expect("credentialed url");
+        let current = upstream_fingerprint(Some(old_url));
+        // 1.0.0 seen 30 days ago under the legacy key, and again just now
+        // under the new key (a request served after the upgrade): the
+        // earliest time must win.
+        for (fp, age) in [(&legacy, 30), (&current, 0)] {
+            sqlx::query(
+                "INSERT INTO age_gate_version_observations \
+                 (repository_id, upstream_fingerprint, package_name, package_version, first_seen_at) \
+                 VALUES ($1, $2, 'pkg', '1.0.0', NOW() - make_interval(days => $3))",
+            )
+            .bind(repo_id)
+            .bind(fp)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status, \
+             basis_mode, basis_upstream_fingerprint) \
+             VALUES ($1, 'pkg', '2.0.0', 'approved', 'first_seen', $2)",
+        )
+        .bind(repo_id)
+        .bind(&legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        rekey_all_legacy_fingerprints(&pool).await.expect("rekey");
+        // Idempotent.
+        assert_eq!(
+            rekey_legacy_fingerprint(&pool, repo_id, Some(old_url))
+                .await
+                .unwrap(),
+            0
+        );
+
+        // The credential rotation keeps the (now current) identity.
+        let rotated = "https://svc:new-4467@registry.example.test/npm";
+        assert_eq!(upstream_fingerprint(Some(rotated)), current);
+        let observations: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT upstream_fingerprint, \
+             EXTRACT(DAY FROM NOW() - first_seen_at)::int \
+             FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let basis: Option<String> = sqlx::query_scalar(
+            "SELECT basis_upstream_fingerprint FROM age_gate_reviews WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        assert_eq!(observations, vec![(current.clone(), 30)]);
+        assert_eq!(basis.as_deref(), Some(current.as_str()));
+        assert_eq!(
+            review_identity_match(
+                Some("first_seen"),
+                basis.as_deref(),
+                AgeGateMode::FirstSeen,
+                &upstream_fingerprint(Some(rotated)),
+            ),
+            ReviewIdentityMatch::Matches
+        );
+        // A repoint to another host is a different identity.
+        assert_ne!(
+            upstream_fingerprint(Some("https://svc:new-4467@other.example.test/npm")),
+            current
+        );
+    }
 
     fn npm_params(id: Uuid, key: String, min_age_days: i32) -> AgeGateRepoParams {
         params_with_mode(
@@ -2717,6 +2923,96 @@ mod tests {
         });
         reconcile_dist_tags(&mut packument, &["2.0.0".to_string(), "1.0.0".to_string()]);
         assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_keeps_surviving_latest_over_newer_prerelease() {
+        // typescript: `latest` is a release, nightlies above it are allowed too.
+        // `npm install typescript` must keep resolving to the release.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2", "next": "7.1.0-dev.20260926.1" },
+            "versions": { "7.0.2": {}, "7.1.0-dev.20260926.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["7.1.0-dev.20260926.1".to_string(), "7.0.2".to_string()],
+        );
+        let tags = packument["dist-tags"].as_object().unwrap();
+        assert_eq!(tags.get("latest"), Some(&serde_json::json!("7.0.2")));
+        assert_eq!(
+            tags.get("next"),
+            Some(&serde_json::json!("7.1.0-dev.20260926.1"))
+        );
+    }
+
+    #[test]
+    fn reconcile_dist_tags_repoints_blocked_latest_to_a_release_not_a_prerelease() {
+        // `latest` was blocked; the newest survivor is a prerelease and a release
+        // line above the old `latest` survives as well. Neither is a fit for
+        // `latest`: the replacement is the newest release at or below it.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2" },
+            "versions": { "8.0.0": {}, "7.1.0-dev.1": {}, "7.0.1": {}, "7.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "8.0.0".to_string(),
+                "7.1.0-dev.1".to_string(),
+                "7.0.1".to_string(),
+                "7.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("7.0.1"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_takes_a_newer_release_when_none_at_or_below_latest_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "3.0.0-rc.1": {}, "3.0.0": {}, "2.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "3.0.0".to_string(),
+                "3.0.0-rc.1".to_string(),
+                "2.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("3.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_replaces_a_blocked_prerelease_latest_with_a_release() {
+        // A publisher may tag a prerelease as `latest`. When the gate blocks
+        // it, the replacement is the newest release below it, not an older
+        // prerelease of the same line.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "3.0.0-beta.5" },
+            "versions": { "3.0.0-beta.4": {}, "2.9.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["3.0.0-beta.4".to_string(), "2.9.0".to_string()],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.9.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_falls_back_to_a_prerelease_when_no_release_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0-rc.2": {}, "1.0.0-rc.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["1.0.0-rc.2".to_string(), "1.0.0-rc.1".to_string()],
+        );
+        assert_eq!(
+            packument["dist-tags"]["latest"],
+            serde_json::json!("1.0.0-rc.2")
+        );
     }
 
     #[test]
@@ -3217,6 +3513,81 @@ mod tests {
     }
 
     #[test]
+    fn version_compare_numeric_prerelease_sorts_below_alphanumeric() {
+        // SemVer 2.0.0 §11.4.3: numeric identifiers have lower precedence
+        // than alphanumeric ones, whatever their lexical order.
+        assert!(version_compare("2.0.0-next.103", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.74", "2.0.0-next.2150693d") < 0);
+        assert!(version_compare("2.0.0-next.2150693d", "2.0.0-next.74") > 0);
+        assert!(version_compare("1.0.0-1", "1.0.0-alpha") < 0);
+    }
+
+    #[test]
+    fn version_compare_ranks_digit_led_core_segments_by_their_digits() {
+        // The core uses natural order, not the SemVer prerelease rule, so a
+        // PyPI pre-release or a build suffix stays below the next release.
+        assert!(version_compare("2.0.0rc1", "2.0.1") < 0);
+        assert!(version_compare("1.1rc1", "1.2") < 0);
+        assert!(version_compare("2.0.0+cu118", "2.0.1") < 0);
+    }
+
+    #[test]
+    fn version_compare_is_transitive_across_numeric_and_hash_prereleases() {
+        // The three versions that formed a cycle under the old comparator.
+        let cycle = ["2.0.0-next.74", "2.0.0-next.103", "2.0.0-next.2150693d"];
+        for a in cycle {
+            for b in cycle {
+                for c in cycle {
+                    if version_compare(a, b) <= 0 && version_compare(b, c) <= 0 {
+                        assert!(version_compare(a, c) <= 0, "{a} <= {b} <= {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_npm_packument_blocks_sorts_mixed_prereleases_without_panicking() {
+        // The version keys of confusing-browser-globals, whose packument made
+        // `sort_by` panic with "user-provided comparison function does not
+        // correctly implement a total order". Insertion sort on a short slice
+        // never notices, so the test needs the full, long list.
+        let keys: Vec<&str> = concat!(
+            "0.0.0 1.0.1 1.0.2 1.0.3 1.0.4 1.0.5 1.0.5-next.9b4009d7 1.0.5-next.c662dfb0 ",
+            "1.0.6 1.0.6-next.6a95aae9 1.0.7 1.0.8 1.0.9 1.0.10 1.0.11 1.1.0-next.14 ",
+            "1.1.0-next.61 1.1.0-next.62 1.1.0-next.85 1.1.0-next.103 2.0.0-next.03604a46 ",
+            "2.0.0-next.096703ab 2.0.0-next.101 2.0.0-next.102 2.0.0-next.103 ",
+            "2.0.0-next.104 2.0.0-next.2150693d 2.0.0-next.247 2.0.0-next.260 ",
+            "2.0.0-next.279 2.0.0-next.281 2.0.0-next.299 2.0.0-next.300 ",
+            "2.0.0-next.3e165448 2.0.0-next.47d2d941 2.0.0-next.66cc7a90 2.0.0-next.74 ",
+            "2.0.0-next.75 2.0.0-next.81 2.0.0-next.91 2.0.0-next.9754a231 ",
+            "2.0.0-next.a671462c 2.0.0-next.b0cbf2ca 2.0.0-next.b2fd8db8 ",
+            "2.0.0-next.fb6e6f70 ",
+        )
+        .split_whitespace()
+        .collect();
+        let versions: serde_json::Map<String, serde_json::Value> = keys
+            .iter()
+            .map(|k| (k.to_string(), serde_json::json!({})))
+            .collect();
+        let mut packument = serde_json::json!({
+            "dist-tags": {"latest": "1.0.11"},
+            "versions": versions,
+        });
+
+        let allowed = apply_npm_packument_blocks(&mut packument, &std::collections::HashSet::new());
+
+        assert_eq!(allowed.len(), keys.len());
+        for pair in allowed.windows(2) {
+            assert!(version_compare(&pair[0], &pair[1]) >= 0, "{pair:?}");
+        }
+        // Numeric prereleases rank below hash prereleases of the same core.
+        let pos = |v: &str| allowed.iter().position(|a| a == v).unwrap();
+        assert!(pos("2.0.0-next.2150693d") < pos("2.0.0-next.300"));
+        assert!(pos("2.0.0-next.300") < pos("2.0.0-next.74"));
+    }
+
+    #[test]
     fn pypi_anchor_version_parses_wheel() {
         let anchor =
             r#"<a href="/packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl">link</a>"#;
@@ -3261,6 +3632,35 @@ mod tests {
             upstream_fingerprint(Some("https://evil.example.test"))
         );
         assert_ne!(canonical, upstream_fingerprint(None));
+        // #4467: rotating userinfo keeps the identity; host and path do not.
+        let rotated_old = Some("https://alice:old@registry.example.test/npm");
+        let rotated_new = Some("https://alice:new@registry.example.test/npm");
+        assert_eq!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(rotated_new)
+        );
+        assert_eq!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://registry.example.test/npm"))
+        );
+        assert_ne!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://alice:old@other.example.test/npm"))
+        );
+        assert_ne!(
+            upstream_fingerprint(rotated_old),
+            upstream_fingerprint(Some("https://alice:old@registry.example.test/pypi"))
+        );
+        assert!(legacy_upstream_fingerprint(rotated_old).is_some());
+        assert_ne!(
+            legacy_upstream_fingerprint(rotated_old),
+            legacy_upstream_fingerprint(rotated_new)
+        );
+        assert_eq!(
+            legacy_upstream_fingerprint(Some("https://registry.npmjs.org")),
+            None
+        );
+        assert_eq!(legacy_upstream_fingerprint(None), None);
         // Paths stay case-sensitive: most registries treat them that way.
         assert_ne!(
             upstream_fingerprint(Some("https://example.test/Repo")),

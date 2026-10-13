@@ -10,6 +10,7 @@
 //!   GET  /cran/{repo_key}/bin/macosx/contrib/{rversion}/PACKAGES  - macOS binary index
 //!   PUT  /cran/{repo_key}/src/contrib/{filename}          - Upload package (auth required)
 
+use crate::api::handlers::upload_body::UploadBody;
 use std::io::Write as IoWrite;
 
 use axum::body::Body;
@@ -20,7 +21,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
@@ -73,7 +73,7 @@ async fn build_virtual_combined_index(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
-) -> Result<String, Response> {
+) -> Result<(String, proxy_helpers::PartialMerge), Response> {
     // Caller-authorized member walk (#3323): the PACKAGES index is content, so
     // a member this caller may not read directly must not contribute entries.
     let members =
@@ -106,7 +106,7 @@ async fn build_virtual_combined_index(
     )
     .await?;
 
-    for (_key, remote_index) in remote_indexes {
+    for (_key, remote_index) in remote_indexes.documents {
         if !remote_index.is_empty() {
             if !combined.is_empty() {
                 combined.push('\n');
@@ -115,7 +115,7 @@ async fn build_virtual_combined_index(
         }
     }
 
-    Ok(combined)
+    Ok((combined, remote_indexes.partial))
 }
 
 // ---------------------------------------------------------------------------
@@ -130,13 +130,16 @@ async fn package_index(
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let combined = build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
-        return Ok(Response::builder()
+        let (combined, partial) =
+            build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .header(CONTENT_LENGTH, combined.len().to_string())
             .body(Body::from(combined))
-            .unwrap());
+            .unwrap();
+        partial.mark(&mut response);
+        return Ok(response);
     }
 
     let index = build_source_index(&state.db, repo.id).await?;
@@ -161,7 +164,8 @@ async fn package_index_gz(
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let combined = build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
+        let (combined, partial) =
+            build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
         let compressed = gzip_compress(combined.as_bytes()).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -170,12 +174,14 @@ async fn package_index_gz(
                 .into_response()
         })?;
 
-        return Ok(Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/gzip")
             .header(CONTENT_LENGTH, compressed.len().to_string())
             .body(Body::from(compressed))
-            .unwrap());
+            .unwrap();
+        partial.mark(&mut response);
+        return Ok(response);
     }
 
     let index = build_source_index(&state.db, repo.id).await?;
@@ -319,7 +325,7 @@ async fn upload_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, filename)): Path<(String, String)>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "cran", "write:artifacts")?.user_id;
@@ -394,6 +400,29 @@ async fn upload_package(
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "cran", &pkg_metadata)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
+
+    // Catalog row + the one artifact.uploaded webhook event this publish fires
+    // (#3659, #3939). Not inside `insert_artifact`: its other callers already
+    // register, so emitting there would double-deliver.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "cran",
+        &pkg_name,
+        &pkg_version,
+        size_bytes,
+        &computed_sha256,
+        None,
+    )
+    .await;
 
     info!(
         "CRAN upload: {} {} ({}) to repo {}",
@@ -439,6 +468,11 @@ fn source_index_coordinates(path: &str, name: &str, version: &str) -> (String, S
 }
 
 /// Build PACKAGES index in CRAN DCF text format for source packages.
+///
+/// Rows under `bin/<platform>/contrib/` are binary packages a migration
+/// imported at their source path (#2525): they are not source packages, and advertising them here
+/// would send `install.packages()` after a `.tar.gz` that does not exist.
+/// Native uploads never store under `bin/`.
 async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, Response> {
     use sqlx::Row;
     // Runtime query (not the `query!` macro) so the added `a.path` column does
@@ -451,6 +485,7 @@ async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, 
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
+          AND a.path NOT LIKE 'bin/%/contrib/%'
         ORDER BY a.name, a.created_at DESC
         "#,
     )
@@ -480,9 +515,11 @@ fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     encoder.finish()
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -833,6 +870,100 @@ mod tests {
         f.teardown().await;
     }
 
+    /// #4166: CRAN inserts through `proxy_helpers::insert_artifact`, which
+    /// never triggered scan-on-upload. A native upload into a
+    /// `scan_on_upload` repository must now enqueue a scan.
+    #[tokio::test]
+    async fn test_cran_upload_triggers_scan_on_upload_4166() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let req = tdh::put(
+            format!("/{}/src/contrib/scanme_1.0.tar.gz", f.repo_key),
+            Bytes::from_static(b"fake-r-pkg"),
+        );
+        let scans = tdh::native_upload_probe_scans(
+            &f,
+            super::router(),
+            req,
+            true,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        f.teardown().await;
+        assert!(
+            scans > 0,
+            "a native CRAN upload must enqueue a scan (#4166)"
+        );
+    }
+
+    /// #2525: a migrated binary package keeps its `bin/...` source path and
+    /// must not be listed in the source `PACKAGES` index, while a migrated
+    /// source package (canonical `<name>/<version>/<file>` path) is.
+    #[tokio::test]
+    async fn test_cran_source_index_excludes_migrated_binaries_2525() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/dplyr/1.1.4/dplyr_1.1.4.tar.gz",
+            "dplyr/1.1.4/dplyr_1.1.4.tar.gz",
+            "dplyr",
+            "1.1.4",
+            "application/x-gzip",
+            Bytes::from_static(b"src-pkg"),
+            f.user_id,
+        )
+        .await;
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/bin/windows/contrib/4.3/Rcpp_1.0.12.zip",
+            "bin/windows/contrib/4.3/Rcpp_1.0.12.zip",
+            "Rcpp_1.0.12.zip",
+            "",
+            "application/zip",
+            Bytes::from_static(b"bin-pkg"),
+            f.user_id,
+        )
+        .await;
+
+        // A source package that happens to be called `bin` is stored at
+        // `bin/<version>/...` and must still be listed.
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/bin/0.1/bin_0.1.tar.gz",
+            "bin/0.1/bin_0.1.tar.gz",
+            "bin",
+            "0.1",
+            "application/x-gzip",
+            Bytes::from_static(b"src-pkg-named-bin"),
+            f.user_id,
+        )
+        .await;
+
+        let index = build_source_index(&f.pool, repo.id)
+            .await
+            .unwrap_or_else(|_| panic!("index builds"));
+        assert!(index.contains("Package: dplyr"), "{index}");
+        assert!(
+            index.contains("Package: bin\n"),
+            "a source package named `bin` stays listed: {index}"
+        );
+        assert!(
+            !index.contains("Rcpp"),
+            "binary rows must not reach the source index: {index}"
+        );
+        f.teardown().await;
+    }
+
     #[tokio::test]
     async fn test_cran_upload_rejects_unauthenticated() {
         let Some(f) = tdh::Fixture::setup("local", "cran").await else {
@@ -878,11 +1009,14 @@ mod tests {
         f.teardown().await;
     }
 
+    /// Also #3939: a CRAN upload registers its catalog row and fires exactly
+    /// one `artifact.uploaded` (it used to fire none).
     #[tokio::test]
     async fn test_cran_upload_succeeds_for_hosted() {
         let Some(f) = tdh::Fixture::setup("local", "cran").await else {
             return;
         };
+        let mut events = f.state.event_bus.subscribe();
         let app = f.router_with_auth(super::router());
         let body: Vec<u8> = vec![0u8; 32];
         let req = tdh::put(
@@ -891,7 +1025,14 @@ mod tests {
         );
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::OK);
+        tdh::assert_one_artifact_uploaded(&mut events, &f.pool, f.repo_id, "dplyr", "1.1.0").await;
+        let row = tdh::catalog_row(&f.pool, f.repo_id, "dplyr").await;
         f.teardown().await;
+        assert_eq!(
+            row.expect("a CRAN upload must write a packages row")
+                .versions,
+            vec!["1.1.0".to_string()]
+        );
     }
 
     #[tokio::test]

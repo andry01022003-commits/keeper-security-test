@@ -5,8 +5,10 @@ pub mod filesystem;
 pub mod gcs;
 pub mod keys;
 pub mod path_format;
+pub(crate) mod public_endpoint;
 pub mod registry;
 pub mod s3;
+pub mod verify;
 
 pub use keys::StorageKeyScheme;
 pub use path_format::StoragePathFormat;
@@ -135,6 +137,14 @@ pub enum PresignedUrlSource {
     Azure,
     /// Google Cloud Storage signed URL
     Gcs,
+}
+
+/// One object returned by [`StorageBackend::list_keys`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedKey {
+    pub key: String,
+    /// Last-modified time when the listing reports it.
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Storage backend trait
@@ -347,6 +357,16 @@ pub trait StorageBackend: Send + Sync {
         stream: BoxStream<'static, Result<Bytes>>,
     ) -> Result<PutStreamResult>;
 
+    /// Enumerate the keys stored under `prefix` (a key prefix such as
+    /// `maven/`), for the admin storage reindex (#1570).
+    ///
+    /// `Ok(None)` means the backend cannot enumerate its objects; callers must
+    /// report that instead of treating it as an empty namespace. Keys are
+    /// returned in the same form `get`/`put` accept.
+    async fn list_keys(&self, _prefix: &str) -> Result<Option<Vec<ListedKey>>> {
+        Ok(None)
+    }
+
     /// Perform a lightweight connectivity probe against the storage backend.
     ///
     /// Returns `Ok(())` if the backend is reachable and authenticated.
@@ -401,6 +421,7 @@ pub(crate) async fn buffered_put_stream_fallback<B: StorageBackend + ?Sized>(
     })
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1036,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod bucket_root_namespace_tests {
     use super::*;

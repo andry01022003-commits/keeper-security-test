@@ -40,6 +40,10 @@
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
 //! - S3_PRESIGN_EXPIRY_SECS: URL expiry in seconds (default: 3600)
+//! - S3_PUBLIC_ENDPOINT: Origin (`scheme://host[:port]`) that clients use to
+//!   reach the object store, when it differs from S3_ENDPOINT (e.g. an
+//!   in-cluster MinIO service name). Presigned URLs are signed for and point
+//!   at this host; the backend's own S3 calls keep S3_ENDPOINT (#4417).
 //!
 //! For CloudFront CDN:
 //! - CLOUDFRONT_DISTRIBUTION_URL: CloudFront distribution URL (optional)
@@ -65,6 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
+use super::public_endpoint::{public_endpoint_from_env, EndpointPath};
 use super::{PresignedUrl, PresignedUrlSource, PutStreamResult, StoragePathFormat};
 use crate::error::{AppError, Result};
 
@@ -569,6 +574,14 @@ fn bucket_root_url(probe_url: &url::Url, probe_segment: &str) -> url::Url {
     root
 }
 
+/// True when an `object_store` copy error is an endpoint's `411 Length
+/// Required` rejection of the header-less CopyObject PUT (#3737).
+fn copy_rejected_for_missing_length(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("411 length required")
+        || (lowered.contains("411") && lowered.contains("length required"))
+}
+
 /// True when an `object_store` LIST error is its XML parser rejecting the
 /// response body rather than a transport, auth or not-found failure.
 ///
@@ -591,6 +604,10 @@ fn list_response_is_unparsable(message: &str) -> bool {
 struct ListBucketPage {
     /// `<Contents><Key>` values, in document order, exactly as sent.
     keys: Vec<String>,
+    /// `<Contents><LastModified>` of each key (parallel to `keys`), `None`
+    /// when absent or unparsable (#1570 review: the storage reindex needs
+    /// object age on the REST fallback too).
+    last_modified: Vec<Option<chrono::DateTime<chrono::Utc>>>,
     /// `<IsTruncated>`.
     is_truncated: bool,
     /// `<NextContinuationToken>`, absent when empty.
@@ -628,6 +645,10 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
     let mut stack: Vec<String> = Vec::new();
     let mut root: Option<String> = None;
     let mut text = String::new();
+    // Per-`<Contents>` accumulators: `<Key>` and `<LastModified>` may come in
+    // either order, so the entry is recorded when `</Contents>` closes.
+    let mut entry_key: Option<String> = None;
+    let mut entry_modified: Option<chrono::DateTime<chrono::Utc>> = None;
 
     loop {
         match reader.read_event() {
@@ -674,7 +695,19 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                     .unwrap_or_else(|| local(e.local_name().as_ref()));
                 let parent = stack.last().map(String::as_str).unwrap_or("");
                 match (parent, closed.as_str()) {
-                    ("Contents", "Key") => page.keys.push(std::mem::take(&mut text)),
+                    ("Contents", "Key") => entry_key = Some(std::mem::take(&mut text)),
+                    ("Contents", "LastModified") => {
+                        entry_modified = chrono::DateTime::parse_from_rfc3339(text.trim())
+                            .ok()
+                            .map(|d| d.with_timezone(&chrono::Utc));
+                    }
+                    ("ListBucketResult", "Contents") => {
+                        if let Some(key) = entry_key.take() {
+                            page.keys.push(key);
+                            page.last_modified.push(entry_modified.take());
+                        }
+                        entry_modified = None;
+                    }
                     ("ListBucketResult", "IsTruncated") => {
                         page.is_truncated = text.trim().eq_ignore_ascii_case("true");
                     }
@@ -687,7 +720,14 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 }
                 text.clear();
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                // A truncated body may end inside `<Contents>`: keep the key.
+                if let Some(key) = entry_key.take() {
+                    page.keys.push(key);
+                    page.last_modified.push(entry_modified.take());
+                }
+                break;
+            }
             // Decl, Comment, PI, DocType, and self-closing elements carry no
             // value we read.
             Ok(_) => {}
@@ -718,6 +758,12 @@ pub struct S3Config {
     pub region: String,
     /// Custom endpoint URL (for MinIO compatibility)
     pub endpoint: Option<String>,
+    /// Client-facing origin for presigned download URLs (`S3_PUBLIC_ENDPOINT`,
+    /// #4417). When set, presigned GET URLs are signed for and point at this
+    /// host instead of [`Self::endpoint`]; the backend's own requests are
+    /// unaffected. Validated by
+    /// [`crate::storage::public_endpoint::parse_public_endpoint`].
+    pub public_endpoint: Option<String>,
     /// Optional key prefix for all objects
     pub prefix: Option<String>,
     /// Enable redirect downloads via presigned URLs
@@ -793,6 +839,8 @@ impl S3Config {
             std::env::var("S3_BUCKET").map_err(|_| AppError::Config("S3_BUCKET not set".into()))?;
         let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
         let endpoint = std::env::var("S3_ENDPOINT").ok();
+        let public_endpoint =
+            public_endpoint_from_env("S3_PUBLIC_ENDPOINT", EndpointPath::Forbidden)?;
         let prefix = std::env::var("S3_PREFIX").ok();
         if let Some(p) = prefix.as_deref() {
             if s3_prefix_collides_with_reserved_namespace(p) {
@@ -861,6 +909,7 @@ impl S3Config {
             bucket,
             region,
             endpoint,
+            public_endpoint,
             prefix,
             redirect_downloads,
             presign_expiry: Duration::from_secs(presign_expiry_secs),
@@ -929,6 +978,7 @@ impl S3Config {
             bucket,
             region,
             endpoint,
+            public_endpoint: None,
             prefix,
             redirect_downloads: false,
             presign_expiry: Duration::from_secs(3600),
@@ -957,6 +1007,13 @@ impl S3Config {
     /// Enable redirect downloads
     pub fn with_redirect_downloads(mut self, enabled: bool) -> Self {
         self.redirect_downloads = enabled;
+        self
+    }
+
+    /// Set the client-facing origin for presigned URLs (`S3_PUBLIC_ENDPOINT`,
+    /// #4417). The value is used as given; [`Self::from_env`] validates it.
+    pub fn with_public_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.public_endpoint = Some(endpoint.into());
         self
     }
 
@@ -1159,8 +1216,13 @@ fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) ->
 /// The original error string is appended as `caused by:` so the full
 /// message is still searchable in the logs.
 pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
-    let raw = err.to_string();
-    let l = raw.to_lowercase();
+    let full = err.to_string();
+    let l = full.to_lowercase();
+    // The raw text is kept for searchability, minus any request URL (#3954):
+    // object_store embeds the endpoint, bucket and key URL in generic and
+    // retry errors, and this message now reaches INFO logs and exported span
+    // status through the storage spans' `err` recording.
+    let raw = redact_urls_in_text(&full);
 
     let category = if l.contains("certificate")
         || l.contains("tls")
@@ -1223,6 +1285,21 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
     };
 
     format!("{}. caused by: {}", category, raw)
+}
+
+/// Replace every `http(s)://...` URL in `text` with `<url>` (#3954).
+pub(crate) fn redact_urls_in_text(text: &str) -> std::borrow::Cow<'_, str> {
+    static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).expect("static regex")
+    });
+    URL.replace_all(text, "<url>")
+}
+
+/// `AppError::Storage` for a failed object-store call: `context`, then the
+/// [`classify_s3_error`] diagnostic, so no request URL (endpoint, bucket)
+/// reaches the error text that storage spans record (#3954).
+fn s3_storage_error(context: impl std::fmt::Display, err: &object_store::Error) -> AppError {
+    AppError::Storage(format!("{context}: {}", classify_s3_error(err)))
 }
 
 /// Generate the full S3 key with optional prefix.
@@ -1340,6 +1417,11 @@ pub struct S3Backend {
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
     path_format: StoragePathFormat,
+    /// Store used ONLY to presign the GET URLs handed to clients, built by
+    /// [`Self::build_signing_store`] when dedicated presign credentials or
+    /// `S3_PUBLIC_ENDPOINT` are configured. `None` signs with [`Self::store`].
+    /// Never used for the backend's own requests: its endpoint may be one the
+    /// backend cannot reach (#4417).
     signing_store: Option<AmazonS3>,
     /// When true, delete objects one at a time with HTTP DELETE instead of the
     /// S3 multi-object delete API (POST ?delete). Needed for providers like
@@ -1359,6 +1441,14 @@ pub struct S3Backend {
     /// One-way and advisory: a spurious latch costs a slower listing path, not
     /// correctness, so a relaxed load/store is enough.
     list_fallback_latched: AtomicBool,
+    /// Latched once this endpoint has answered `object_store`'s CopyObject
+    /// with `411 Length Required` (#3737), so every later copy goes straight
+    /// to [`S3Backend::copy_object_with_explicit_length`] instead of paying a
+    /// rejected round trip first. Google Cloud Storage's S3-compatible XML API
+    /// requires `Content-Length` on every PUT, including the empty-bodied
+    /// CopyObject that `object_store` sends without one; AWS tolerates the
+    /// omission. One-way and advisory, like `list_fallback_latched`.
+    copy_length_fallback_latched: AtomicBool,
 }
 
 impl S3Backend {
@@ -1563,6 +1653,68 @@ impl S3Backend {
             .map_err(|e| AppError::Config(format!("Failed to build S3 client: {}", e)))
     }
 
+    /// The configuration [`Self::signing_store`] is built from, or `None`
+    /// when presigning can use the main store unchanged.
+    ///
+    /// The public endpoint replaces only the endpoint. Everything else --
+    /// bucket, region, credentials chain, path-style addressing -- stays the
+    /// same, so the URL is signed exactly as the backend would sign it for
+    /// itself, just for the host the client will send (SigV4 signs the
+    /// `host` header, so it cannot be rewritten after signing).
+    ///
+    /// CloudFront, when configured, signs every client URL itself, so the
+    /// public endpoint is ignored there (it would never be used).
+    fn signing_config(config: &S3Config) -> Option<S3Config> {
+        let dedicated_creds =
+            config.presign_access_key.is_some() && config.presign_secret_key.is_some();
+        let public_endpoint = config
+            .public_endpoint
+            .as_ref()
+            .filter(|_| config.cloudfront.is_none());
+        if !dedicated_creds && public_endpoint.is_none() {
+            return None;
+        }
+        let mut signing = config.clone();
+        signing.public_endpoint = public_endpoint.cloned();
+        if let Some(public) = public_endpoint {
+            signing.endpoint = Some(public.clone());
+        }
+        Some(signing)
+    }
+
+    /// Build the presign-only store (see [`Self::signing_store`]): dedicated
+    /// `S3_PRESIGN_*` credentials when set, otherwise the normal credential
+    /// chain, and `S3_PUBLIC_ENDPOINT` as the endpoint when set.
+    ///
+    /// Without dedicated keys the store resolves its own copy of the
+    /// credential chain, so under IRSA / ECS / web identity it fetches and
+    /// caches credentials separately from [`Self::store`] (harmless, one extra
+    /// STS or container-credential call per refresh).
+    fn build_signing_store(config: &S3Config) -> Result<Option<AmazonS3>> {
+        if config.public_endpoint.is_some() && config.cloudfront.is_some() {
+            tracing::info!(
+                "S3_PUBLIC_ENDPOINT is ignored: CloudFront is configured and signs the \
+                 presigned download URLs"
+            );
+        }
+        let Some(signing) = Self::signing_config(config) else {
+            return Ok(None);
+        };
+        // Only a complete pair overrides the chain: `build_store` with a lone
+        // access key would configure no credentials at all.
+        let (ak, sk) = match (&signing.presign_access_key, &signing.presign_secret_key) {
+            (Some(ak), Some(sk)) => {
+                tracing::info!("Using dedicated credentials for presigned URL signing");
+                (Some(ak.as_str()), Some(sk.as_str()))
+            }
+            _ => (None, None),
+        };
+        if let Some(public) = &signing.public_endpoint {
+            tracing::info!(public_endpoint = %public, "Presigned S3 URLs use S3_PUBLIC_ENDPOINT");
+        }
+        Self::build_store(&signing, ak, sk).map(Some)
+    }
+
     /// Validate at startup that some recognized credential source is configured.
     ///
     /// Without this check, `S3Backend::new` would silently construct a client
@@ -1690,23 +1842,28 @@ impl S3Backend {
         let store = Self::build_store(&config, None, None)?;
         let bulk_store = Self::build_bulk_store(&config, None, None)?;
 
-        let signing_store = match (&config.presign_access_key, &config.presign_secret_key) {
-            (Some(ak), Some(sk)) => {
-                let ss = Self::build_store(&config, Some(ak), Some(sk))?;
-                tracing::info!("Using dedicated credentials for presigned URL signing");
-                Some(ss)
-            }
-            _ => None,
-        };
+        let signing_store = Self::build_signing_store(&config)?;
 
         if config.redirect_downloads {
             tracing::info!(
                 bucket = %config.bucket,
                 cloudfront = config.cloudfront.is_some(),
                 expiry_secs = config.presign_expiry.as_secs(),
-                dedicated_signing_creds = signing_store.is_some(),
+                dedicated_signing_creds = config.presign_access_key.is_some()
+                    && config.presign_secret_key.is_some(),
+                public_endpoint = config.public_endpoint.as_deref().unwrap_or("-"),
                 "S3 redirect downloads enabled"
             );
+            if config.endpoint.is_some()
+                && config.public_endpoint.is_none()
+                && config.cloudfront.is_none()
+            {
+                tracing::info!(
+                    "Presigned S3 URLs point at S3_ENDPOINT. If clients cannot reach that \
+                     address (for example an in-cluster service name), set \
+                     S3_PUBLIC_ENDPOINT to the address they use (#4417)."
+                );
+            }
         }
 
         if config.path_format != StoragePathFormat::Native {
@@ -1751,6 +1908,7 @@ impl S3Backend {
             control_timeout: (config.control_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.control_timeout_secs)),
             list_fallback_latched: AtomicBool::new(config.provider == S3Provider::Oss),
+            copy_length_fallback_latched: AtomicBool::new(false),
         })
     }
 
@@ -1812,7 +1970,7 @@ impl S3Backend {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
-                    AppError::Storage(format!("Failed to read fallback '{}': {}", fallback_key, e))
+                    s3_storage_error(format!("Failed to read fallback '{}'", fallback_key), &e)
                 })?;
                 tracing::info!(
                     key = %key,
@@ -1823,10 +1981,13 @@ impl S3Backend {
                 Ok(Some(bytes))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get fallback object '{}' for '{}': {}",
-                fallback_key, key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get fallback object '{}' for '{}'",
+                    fallback_key, key
+                ),
+                &e,
+            )),
         }
     }
 
@@ -1866,10 +2027,13 @@ impl S3Backend {
                 Ok(Some(bytes))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get fallback object range '{}' for '{}': {}",
-                fallback_key, key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get fallback object range '{}' for '{}'",
+                    fallback_key, key
+                ),
+                &e,
+            )),
         }
     }
 
@@ -1889,10 +2053,13 @@ impl S3Backend {
             .signed_url(http::Method::DELETE, path, Duration::from_secs(300))
             .await
             .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to generate presigned DELETE URL for '{}': {}",
-                    display_key, e
-                ))
+                s3_storage_error(
+                    format!(
+                        "Failed to generate presigned DELETE URL for '{}'",
+                        display_key
+                    ),
+                    &e,
+                )
             })?;
 
         let response = reqwest::Client::new()
@@ -1900,9 +2067,11 @@ impl S3Backend {
             .send()
             .await
             .map_err(|e| {
+                // `without_url`: the URL is presigned, so it carries a signature.
                 AppError::Storage(format!(
                     "Failed to send DELETE request for '{}': {}",
-                    display_key, e
+                    display_key,
+                    e.without_url()
                 ))
             })?;
 
@@ -1938,7 +2107,7 @@ impl super::StorageBackend for S3Backend {
         self.path_format.has_fallback()
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -1948,14 +2117,14 @@ impl super::StorageBackend for S3Backend {
             .await
             .map_err(|e| {
                 tracing::error!(key = %key, error = %e, "S3 put_object failed");
-                AppError::Storage(format!("Failed to put object '{}': {}", key, e))
+                s3_storage_error(format!("Failed to put object '{}'", key), &e)
             })?;
 
         tracing::debug!(key = %key, "S3 put object successful");
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -1964,7 +2133,7 @@ impl super::StorageBackend for S3Backend {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
-                    AppError::Storage(format!("Failed to read object '{}': {}", key, e))
+                    s3_storage_error(format!("Failed to read object '{}'", key), &e)
                 })?;
                 tracing::debug!(key = %key, size = bytes.len(), "S3 get object successful");
                 Ok(bytes)
@@ -1978,14 +2147,14 @@ impl super::StorageBackend for S3Backend {
                     key
                 )))
             }
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get object '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to get object '{}'", key),
+                &e,
+            )),
         }
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -1994,10 +2163,10 @@ impl super::StorageBackend for S3Backend {
             Ok(_) => return Ok(true),
             Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => {
-                return Err(AppError::Storage(format!(
-                    "Failed to check existence of '{}': {}",
-                    key, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to check existence of '{}'", key),
+                    &e,
+                ));
             }
         }
 
@@ -2015,10 +2184,13 @@ impl super::StorageBackend for S3Backend {
                     }
                     Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => {
-                        return Err(AppError::Storage(format!(
-                            "Failed to check fallback existence of '{}' for '{}': {}",
-                            fallback_key, key, e
-                        )));
+                        return Err(s3_storage_error(
+                            format!(
+                                "Failed to check fallback existence of '{}' for '{}'",
+                                fallback_key, key
+                            ),
+                            &e,
+                        ));
                     }
                 }
             }
@@ -2027,7 +2199,7 @@ impl super::StorageBackend for S3Backend {
         Ok(false)
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2042,10 +2214,10 @@ impl super::StorageBackend for S3Backend {
             match self.store.delete(&path).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => {
-                    return Err(AppError::Storage(format!(
-                        "Failed to delete object '{}': {}",
-                        key, e
-                    )))
+                    return Err(s3_storage_error(
+                        format!("Failed to delete object '{}'", key),
+                        &e,
+                    ))
                 }
             }
         }
@@ -2054,7 +2226,7 @@ impl super::StorageBackend for S3Backend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         S3Backend::copy(self, source, dest).await
     }
@@ -2073,17 +2245,17 @@ impl super::StorageBackend for S3Backend {
     /// Returns `Ok(None)` when the object is missing rather than an error,
     /// so the freshness probe can treat "ETag unavailable" as "do not
     /// fast-path" without losing the distinction from a real I/O failure.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "head_etag"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
         match self.store.head(&path).await {
             Ok(meta) => Ok(meta.e_tag),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(AppError::Storage(format!(
-                "head_etag failed for '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("head_etag failed for '{}'", key),
+                &e,
+            )),
         }
     }
 
@@ -2091,7 +2263,7 @@ impl super::StorageBackend for S3Backend {
         self.redirect_downloads
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_url"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -2128,15 +2300,15 @@ impl super::StorageBackend for S3Backend {
             .signed_url(http::Method::GET, &path, clamped_expiry)
             .await
             .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to generate presigned URL for '{}': {}",
-                    key, e
-                ))
+                s3_storage_error(
+                    format!("Failed to generate presigned URL for '{}'", key),
+                    &e,
+                )
             })?;
 
         tracing::debug!(
             key = %key, expires_in_secs = clamped_expiry.as_secs(), source = "s3",
-            dedicated_creds = self.signing_store.is_some(),
+            dedicated_signer = self.signing_store.is_some(),
             "Generated S3 presigned URL"
         );
 
@@ -2147,7 +2319,11 @@ impl super::StorageBackend for S3Backend {
         }))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         let path: ObjectPath = ".health-probe".into();
         match self.store.head(&path).await {
@@ -2159,7 +2335,7 @@ impl super::StorageBackend for S3Backend {
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
@@ -2196,10 +2372,10 @@ impl super::StorageBackend for S3Backend {
                 )));
             }
             Err(e) => {
-                return Err(AppError::Storage(format!(
-                    "Failed to get object '{}': {}",
-                    key_owned, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to get object '{}'", key_owned),
+                    &e,
+                ));
             }
         };
 
@@ -2210,7 +2386,7 @@ impl super::StorageBackend for S3Backend {
         Ok(Box::pin(stream))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -2243,10 +2419,13 @@ impl super::StorageBackend for S3Backend {
                     key
                 )))
             }
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get object range '{}' (offset={}, length={}): {}",
-                key, offset, length, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!(
+                    "Failed to get object range '{}' (offset={}, length={})",
+                    key, offset, length
+                ),
+                &e,
+            )),
         }
     }
 
@@ -2259,7 +2438,7 @@ impl super::StorageBackend for S3Backend {
     /// `AbortMultipartUpload` on drop, so the upload does not linger until the
     /// bucket's `AbortIncompleteMultipartUpload` lifecycle rule reclaims it. A
     /// successfully completed upload defuses the guard and is never aborted.
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "client", storage.system = "s3", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -2292,10 +2471,10 @@ impl super::StorageBackend for S3Backend {
                     total += data.len() as u64;
                     if upload_id.is_none() {
                         let id = self.store.create_multipart(&path).await.map_err(|e| {
-                            AppError::Storage(format!(
-                                "Failed to start multipart upload for '{}': {}",
-                                key, e
-                            ))
+                            s3_storage_error(
+                                format!("Failed to start multipart upload for '{}'", key),
+                                &e,
+                            )
                         })?;
                         abort_guard.arm(id.clone());
                         upload_id = Some(id);
@@ -2414,10 +2593,10 @@ impl super::StorageBackend for S3Backend {
                 .await
             {
                 abort_guard.abort_now().await;
-                return Err(AppError::Storage(format!(
-                    "Failed to complete multipart upload for '{}': {}",
-                    key, e
-                )));
+                return Err(s3_storage_error(
+                    format!("Failed to complete multipart upload for '{}'", key),
+                    &e,
+                ));
             }
             // Upload completed: defuse the guard so drop never aborts it.
             abort_guard.disarm();
@@ -2436,6 +2615,17 @@ impl super::StorageBackend for S3Backend {
 impl S3Backend {
     /// List keys with optional prefix
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each object's last-modified time
+    /// when the listing reports it (`None` on the #3593 REST fallback).
+    pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
         // Compose the search prefix through `make_full_key` so a listing
         // resolves the same physical location a `get`/`put` of a key under it
         // would (#3368).
@@ -2471,9 +2661,12 @@ impl S3Backend {
                 .await
             {
                 Ok(objects) => {
-                    let keys: Vec<String> = objects
+                    let keys: Vec<super::ListedKey> = objects
                         .into_iter()
-                        .map(|meta| self.strip_prefix(meta.location.as_ref()))
+                        .map(|meta| super::ListedKey {
+                            key: self.strip_prefix(meta.location.as_ref()),
+                            last_modified: Some(meta.last_modified),
+                        })
                         .collect();
                     tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
                     return Ok(keys);
@@ -2496,7 +2689,13 @@ impl S3Backend {
         }
 
         let full_keys = self.rest_list_objects(&search_prefix).await?;
-        let keys: Vec<String> = full_keys.iter().map(|key| self.strip_prefix(key)).collect();
+        let keys: Vec<super::ListedKey> = full_keys
+            .iter()
+            .map(|(key, last_modified)| super::ListedKey {
+                key: self.strip_prefix(key),
+                last_modified: *last_modified,
+            })
+            .collect();
 
         tracing::debug!(
             prefix = ?prefix,
@@ -2515,7 +2714,10 @@ impl S3Backend {
     /// [`AwsAuthorizer`] against the store's own credential chain (so IRSA and
     /// container credentials keep working), and it rides [`Self::raw_http`].
     /// Returns FULL keys — the caller strips the configured prefix.
-    async fn rest_list_objects(&self, search_prefix: &str) -> Result<Vec<String>> {
+    async fn rest_list_objects(
+        &self,
+        search_prefix: &str,
+    ) -> Result<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
         use object_store::signer::Signer;
 
         // Both `signed_url` and `credentials()` resolve credentials
@@ -2559,7 +2761,7 @@ impl S3Backend {
                 ))
             })?;
 
-        let mut keys: Vec<String> = Vec::new();
+        let mut keys: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut url = root.clone();
@@ -2609,7 +2811,7 @@ impl S3Backend {
             }
 
             let page = parse_list_bucket_result(&body)?;
-            keys.extend(page.keys);
+            keys.extend(page.keys.into_iter().zip(page.last_modified));
 
             match page.next_continuation_token {
                 Some(token) if page.is_truncated => {
@@ -2648,18 +2850,161 @@ impl S3Backend {
             return self.multipart_server_side_copy(source, dest, size).await;
         }
 
+        if self.copy_length_fallback_latched.load(Ordering::Relaxed) {
+            return self.copy_object_with_explicit_length(source, dest).await;
+        }
+
         let source_key = self.full_key(source);
         let dest_key = self.full_key(dest);
 
         let from: ObjectPath = source_key.into();
         let to: ObjectPath = dest_key.into();
 
-        self.bulk_store.copy(&from, &to).await.map_err(|e| {
-            AppError::Storage(format!("Failed to copy '{}' to '{}': {}", source, dest, e))
-        })?;
+        if let Err(e) = self.bulk_store.copy(&from, &to).await {
+            let message = e.to_string();
+            if !copy_rejected_for_missing_length(&message) {
+                return Err(AppError::Storage(format!(
+                    "Failed to copy '{}' to '{}': {}",
+                    source,
+                    dest,
+                    redact_urls_in_text(&message)
+                )));
+            }
+            tracing::warn!(
+                source = %source,
+                dest = %dest,
+                error = %message,
+                "S3 endpoint rejected CopyObject without Content-Length (411); \
+                 retrying with an explicit Content-Length: 0 and using that form \
+                 for every later copy on this backend (#3737)"
+            );
+            self.copy_length_fallback_latched
+                .store(true, Ordering::Relaxed);
+            return self.copy_object_with_explicit_length(source, dest).await;
+        }
 
         tracing::debug!(source = %source, dest = %dest, "S3 copy object successful");
         Ok(())
+    }
+
+    /// Server-side `CopyObject` carrying an explicit `Content-Length: 0`, for
+    /// endpoints that reject the header-less PUT `object_store` sends (#3737).
+    ///
+    /// Google Cloud Storage's S3-compatible XML API answers a PUT without
+    /// `Content-Length` with `411 Length Required`, even when the body is
+    /// empty; `object_store` exposes no per-call header override, so this is a
+    /// hand-rolled request signed exactly like [`Self::upload_part_copy`]. An
+    /// unsigned store cannot sign it, so it falls back to the streaming
+    /// PUT-copy every provider supports.
+    async fn copy_object_with_explicit_length(&self, source: &str, dest: &str) -> Result<()> {
+        if !self.sign_requests {
+            return self.streaming_put_copy(source, dest).await;
+        }
+        let copy_source = s3_copy_source_value(&self.bucket, &self.full_key(source));
+        let dest_path: ObjectPath = self.full_key(dest).into();
+        let mut url = self.signed_copy_url(&dest_path).await?;
+        url.set_query(None);
+        self.send_signed_copy_put(
+            url,
+            &[("x-amz-copy-source", copy_source.as_str())],
+            &format!("CopyObject '{}' -> '{}'", source, dest),
+        )
+        .await?;
+        tracing::debug!(
+            source = %source,
+            dest = %dest,
+            "S3 CopyObject with explicit Content-Length successful"
+        );
+        Ok(())
+    }
+
+    /// Build the path-style/virtual-hosted URL for a hand-rolled PUT against
+    /// `dest_path`, derived from the configured store (see
+    /// [`Self::upload_part_copy`]). The caller replaces the query string.
+    async fn signed_copy_url(&self, dest_path: &ObjectPath) -> Result<url::Url> {
+        use object_store::signer::Signer;
+        self.store
+            .signed_url(http::Method::PUT, dest_path, Duration::from_secs(300))
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to build copy URL for '{}': {}",
+                    dest_path.as_ref(),
+                    e
+                ))
+            })
+    }
+
+    /// Send one hand-rolled, SigV4-signed, empty-bodied copy PUT
+    /// (`CopyObject` or `UploadPartCopy`) and return the `ETag` from its
+    /// result document.
+    ///
+    /// The request always carries `Content-Length: 0`: S3 accepts it and
+    /// Google Cloud Storage's S3-compatible API requires it on every PUT
+    /// (#3737). A `200 OK` whose body is an `<Error>` document is a failure
+    /// (S3 copy operations can report errors that way).
+    async fn send_signed_copy_put(
+        &self,
+        url: url::Url,
+        headers: &[(&str, &str)],
+        what: &str,
+    ) -> Result<String> {
+        let credential = self
+            .bulk_store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to resolve S3 credentials for {}: {}",
+                    what, e
+                ))
+            })?;
+
+        let mut builder = http::Request::builder()
+            .method(http::Method::PUT)
+            .uri(url.as_str())
+            .header(http::header::CONTENT_LENGTH, "0");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder
+            .body(object_store::client::HttpRequestBody::empty())
+            .map_err(|e| AppError::Storage(format!("Failed to build {} request: {}", what, e)))?;
+        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+
+        let mut send = self
+            .raw_http
+            .put(url.as_str())
+            .headers(request.headers().clone());
+        if let Some(timeout) = self.bulk_timeout {
+            // A server-side copy of up to 5 GiB is bulk work: give it the
+            // bulk ceiling, not reqwest's unbounded default.
+            send = send.timeout(timeout);
+        }
+        let response = send.send().await.map_err(|e| {
+            AppError::Storage(format!("{} failed to send: {}", what, e.without_url()))
+        })?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AppError::Storage(format!(
+                "{} failed: {} {}: {}",
+                what,
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body
+            )));
+        }
+        parse_copy_part_etag(&body).ok_or_else(|| {
+            AppError::Storage(format!(
+                "{} returned {} without a copy-result ETag: {}",
+                what,
+                status.as_u16(),
+                body
+            ))
+        })
     }
 
     /// Copy by reading the source back and streaming it into `dest` with a
@@ -2829,95 +3174,34 @@ impl S3Backend {
         part_idx: usize,
         range: (u64, u64),
     ) -> Result<PartId> {
-        use object_store::signer::Signer;
-
-        let display = dest_path.as_ref();
         // "Part number of part being copied. This is a positive integer
         // between 1 and 10,000" (S3 API Reference, UploadPartCopy).
         let part_number = part_idx + 1;
 
-        let mut url = self
-            .store
-            .signed_url(http::Method::PUT, dest_path, Duration::from_secs(300))
-            .await
-            .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to build UploadPartCopy URL for '{}': {}",
-                    display, e
-                ))
-            })?;
+        let mut url = self.signed_copy_url(dest_path).await?;
         url.set_query(None);
         url.query_pairs_mut()
             .append_pair("partNumber", &part_number.to_string())
             .append_pair("uploadId", upload_id);
 
-        let credential = self
-            .bulk_store
-            .credentials()
-            .get_credential()
-            .await
-            .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to resolve S3 credentials for UploadPartCopy of '{}': {}",
-                    display, e
-                ))
-            })?;
-
         // "The range value must use the form bytes=first-last, where the
         // first and last are the zero-based byte offsets to copy" (S3 API
         // Reference, UploadPartCopy, x-amz-copy-source-range). Inclusive.
         let range_value = format!("bytes={}-{}", range.0, range.1);
-        let mut request = http::Request::builder()
-            .method(http::Method::PUT)
-            .uri(url.as_str())
-            .header("x-amz-copy-source", copy_source)
-            .header("x-amz-copy-source-range", &range_value)
-            .body(object_store::client::HttpRequestBody::empty())
-            .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to build UploadPartCopy request for '{}': {}",
-                    display, e
-                ))
-            })?;
-        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
-
-        let mut send = self
-            .raw_http
-            .put(url.as_str())
-            .headers(request.headers().clone());
-        if let Some(timeout) = self.bulk_timeout {
-            // A 5 GiB server-side copy is bulk work: give it the bulk
-            // ceiling, not reqwest's unbounded default.
-            send = send.timeout(timeout);
-        }
-        let response = send.send().await.map_err(|e| {
-            AppError::Storage(format!(
-                "UploadPartCopy part {} for '{}' failed to send: {}",
-                part_number, display, e
-            ))
-        })?;
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(AppError::Storage(format!(
-                "UploadPartCopy part {} for '{}' failed: {} {}: {}",
-                part_number,
-                display,
-                status.as_u16(),
-                status.canonical_reason().unwrap_or(""),
-                body
-            )));
-        }
-        let etag = parse_copy_part_etag(&body).ok_or_else(|| {
-            AppError::Storage(format!(
-                "UploadPartCopy part {} for '{}' returned {} without a CopyPartResult ETag: {}",
-                part_number,
-                display,
-                status.as_u16(),
-                body
-            ))
-        })?;
+        let etag = self
+            .send_signed_copy_put(
+                url,
+                &[
+                    ("x-amz-copy-source", copy_source),
+                    ("x-amz-copy-source-range", range_value.as_str()),
+                ],
+                &format!(
+                    "UploadPartCopy part {} for '{}'",
+                    part_number,
+                    dest_path.as_ref()
+                ),
+            )
+            .await?;
         Ok(PartId { content_id: etag })
     }
 
@@ -3003,6 +3287,7 @@ impl S3Backend {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4008,6 +4293,330 @@ mod tests {
         assert!(backend.is_ok());
     }
 
+    // ---- S3_PUBLIC_ENDPOINT (#4417) ----
+
+    const PUBLIC_TEST_AK: &str = "AKIDPUBLIC4417";
+    const PUBLIC_TEST_SK: &str = "public-endpoint-secret-4417";
+
+    /// Recompute the SigV4 query-string signature of a presigned GET `url`
+    /// as the object store would when the request arrives with `Host: host`,
+    /// and report whether it matches the `X-Amz-Signature` in the URL.
+    /// Independent of object_store's signer, so it proves which host the
+    /// signature actually covers.
+    fn presigned_signature_valid_for_host(url: &url::Url, host: &str, secret: &str) -> bool {
+        use hmac::{Hmac, Mac};
+        fn hmac(key: &[u8], data: &str) -> Vec<u8> {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+            mac.update(data.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        }
+        let mut pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "X-Amz-Signature")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
+        let query = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        };
+        let amz_date = param("X-Amz-Date");
+        let credential = param("X-Amz-Credential");
+        let scope = credential
+            .split_once('/')
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        let mut scope_parts = scope.split('/');
+        let (day, region, service) = (
+            scope_parts.next().unwrap_or_default(),
+            scope_parts.next().unwrap_or_default(),
+            scope_parts.next().unwrap_or_default(),
+        );
+        let canonical_request = format!(
+            "GET\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
+            url.path(),
+            query,
+            host
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            scope,
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let k_date = hmac(format!("AWS4{secret}").as_bytes(), day);
+        let k_region = hmac(&k_date, region);
+        let k_service = hmac(&k_region, service);
+        let k_signing = hmac(&k_service, "aws4_request");
+        hex::encode(hmac(&k_signing, &string_to_sign)) == param("X-Amz-Signature")
+    }
+
+    /// Presign `key` on a backend built from `config` (redirects on, static
+    /// presign credentials so no credential chain is consulted).
+    async fn presign_with(mut config: S3Config, key: &str) -> url::Url {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        config.redirect_downloads = true;
+        config.presign_access_key = Some(PUBLIC_TEST_AK.to_string());
+        config.presign_secret_key = Some(PUBLIC_TEST_SK.to_string());
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        let presigned =
+            StorageBackendTrait::get_presigned_url(&backend, key, Duration::from_secs(300))
+                .await
+                .expect("presign ok")
+                .expect("redirects enabled");
+        assert_eq!(presigned.source, PresignedUrlSource::S3);
+        url::Url::parse(&presigned.url).expect("presigned URL parses")
+    }
+
+    #[test]
+    fn test_signing_config_unset_public_endpoint_is_unchanged_4417() {
+        let config = S3Config::new(
+            "b".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        assert!(config.public_endpoint.is_none());
+        assert!(
+            S3Backend::signing_config(&config).is_none(),
+            "no public endpoint and no presign creds: presign with the main store"
+        );
+    }
+
+    #[test]
+    fn test_signing_config_swaps_only_the_endpoint_4417() {
+        let config = S3Config::new(
+            "b".into(),
+            "eu-west-1".into(),
+            Some("http://storage-minio:9000".into()),
+            Some("pfx".into()),
+        )
+        .with_public_endpoint("https://dl.example.com");
+        let signing = S3Backend::signing_config(&config).expect("signing config");
+        assert_eq!(signing.endpoint.as_deref(), Some("https://dl.example.com"));
+        assert_eq!(signing.bucket, "b");
+        assert_eq!(signing.region, "eu-west-1");
+        assert_eq!(signing.prefix.as_deref(), Some("pfx"));
+        // The caller's config (and so the backend's own store) keeps the
+        // internal endpoint.
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("http://storage-minio:9000")
+        );
+
+        // Dedicated creds without a public endpoint keep the internal one.
+        let mut creds_only = S3Config::new(
+            "b".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        creds_only.presign_access_key = Some("ak".into());
+        creds_only.presign_secret_key = Some("sk".into());
+        let signing = S3Backend::signing_config(&creds_only).expect("signing config");
+        assert_eq!(
+            signing.endpoint.as_deref(),
+            Some("http://storage-minio:9000")
+        );
+
+        // A lone presign key is not a credential pair and changes nothing.
+        let mut half = S3Config::new("b".into(), "us-east-1".into(), None, None);
+        half.presign_access_key = Some("ak".into());
+        assert!(S3Backend::signing_config(&half).is_none());
+    }
+
+    fn test_cloudfront_config() -> CloudFrontConfig {
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        CloudFrontConfig {
+            distribution_url: "https://d1234.cloudfront.net".to_string(),
+            key_pair_id: "KTEST4417".to_string(),
+            private_key: key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cloudfront_takes_precedence_over_public_endpoint_4417() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        )
+        .with_public_endpoint("https://dl.example.com")
+        .with_cloudfront(test_cloudfront_config())
+        .with_redirect_downloads(true);
+        assert!(
+            S3Backend::signing_config(&config).is_none(),
+            "CloudFront signs client URLs; the public endpoint must not build a signer"
+        );
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        let presigned =
+            StorageBackendTrait::get_presigned_url(&backend, "a.bin", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(presigned.source, PresignedUrlSource::CloudFront);
+        assert!(
+            presigned
+                .url
+                .starts_with("https://d1234.cloudfront.net/a.bin?"),
+            "{}",
+            presigned.url
+        );
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_without_public_endpoint_keeps_internal_host_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        let url = presign_with(config, "maven/a.jar").await;
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("storage-minio"));
+        assert_eq!(url.port(), Some(9000));
+        assert_eq!(url.path(), "/artifacts/maven/a.jar");
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "storage-minio:9000",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_signed_for_public_endpoint_path_style_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            Some("tenant-a".into()),
+        )
+        .with_public_endpoint("https://dl.example.com");
+        let url = presign_with(config, "oci/blobs/sha256/ab/abcd").await;
+
+        // Path-style addressing, same as the backend's own requests, on the
+        // public origin (default https port dropped).
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("dl.example.com"));
+        assert_eq!(url.port(), None);
+        assert_eq!(url.path(), "/artifacts/tenant-a/oci/blobs/sha256/ab/abcd");
+        assert!(url.as_str().contains("X-Amz-Signature="));
+
+        // The signature validates for the Host the client sends, and would
+        // be rejected for the internal host.
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "dl.example.com",
+            PUBLIC_TEST_SK
+        ));
+        assert!(!presigned_signature_valid_for_host(
+            &url,
+            "storage-minio:9000",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_public_endpoint_with_port_over_aws_default_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        // No internal custom endpoint (AWS default) and a public origin with an
+        // explicit port: the port is part of the signed Host.
+        let config = S3Config::new("artifacts".into(), "us-west-2".into(), None, None)
+            .with_public_endpoint("http://s3-gw.example.com:8443");
+        let url = presign_with(config, "generic/file.bin").await;
+        assert_eq!(url.host_str(), Some("s3-gw.example.com"));
+        assert_eq!(url.port(), Some(8443));
+        assert_eq!(url.path(), "/artifacts/generic/file.bin");
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            "s3-gw.example.com:8443",
+            PUBLIC_TEST_SK
+        ));
+        assert!(!presigned_signature_valid_for_host(
+            &url,
+            "s3-gw.example.com",
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_public_endpoint_does_not_move_backend_requests_4417() {
+        let _env = AnonymousS3TestEnv::enter();
+        // The backend's own calls must keep S3_ENDPOINT: point it at a mock
+        // and the public endpoint at an unroutable host, then HEAD an object.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path("/artifacts/k"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("last-modified", "Mon, 05 Oct 2026 00:00:00 GMT")
+                    .insert_header("etag", "\"e\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some(server.uri()),
+            None,
+        )
+        .with_public_endpoint("http://public.invalid:9");
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        assert!(StorageBackendTrait::exists(&backend, "k")
+            .await
+            .expect("exists ok"));
+    }
+
+    #[test]
+    fn test_s3_config_from_env_rejects_malformed_public_endpoint_4417() {
+        let _env = CredEnvTestEnv::enter();
+        let saved_bucket = std::env::var("S3_BUCKET").ok();
+        let saved_public = std::env::var("S3_PUBLIC_ENDPOINT").ok();
+        std::env::set_var("S3_BUCKET", "b");
+
+        std::env::set_var("S3_PUBLIC_ENDPOINT", "dl.example.com:9000");
+        let err = S3Config::from_env().expect_err("malformed public endpoint");
+        assert!(err.to_string().contains("S3_PUBLIC_ENDPOINT"), "{err}");
+
+        std::env::set_var("S3_PUBLIC_ENDPOINT", "https://dl.example.com/");
+        let config = S3Config::from_env().expect("valid public endpoint");
+        assert_eq!(
+            config.public_endpoint.as_deref(),
+            Some("https://dl.example.com")
+        );
+
+        std::env::remove_var("S3_PUBLIC_ENDPOINT");
+        assert!(S3Config::from_env().unwrap().public_endpoint.is_none());
+
+        match saved_bucket {
+            Some(v) => std::env::set_var("S3_BUCKET", v),
+            None => std::env::remove_var("S3_BUCKET"),
+        }
+        if let Some(v) = saved_public {
+            std::env::set_var("S3_PUBLIC_ENDPOINT", v);
+        }
+    }
+
     #[tokio::test]
     async fn test_s3_backend_new_with_tls_config() {
         let _env = AnonymousS3TestEnv::enter();
@@ -4933,6 +5542,7 @@ mod tests {
             provider: S3Provider::Generic,
             control_timeout: Some(S3_CONTROL_TIMEOUT),
             list_fallback_latched: AtomicBool::new(false),
+            copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete,
         }
     }
@@ -5248,6 +5858,7 @@ mod tests {
                 provider: S3Provider::Generic,
                 control_timeout: Some(S3_CONTROL_TIMEOUT),
                 list_fallback_latched: AtomicBool::new(false),
+                copy_length_fallback_latched: AtomicBool::new(false),
                 disable_multi_delete: false,
             };
             backend.copy("src-key", "dst-key").await
@@ -5331,6 +5942,7 @@ mod tests {
             provider: S3Provider::Generic,
             control_timeout: Some(S3_CONTROL_TIMEOUT),
             list_fallback_latched: AtomicBool::new(false),
+            copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete: false,
         };
 
@@ -6120,6 +6732,27 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_redacts_request_urls_from_the_raw_text() {
+        // #3954: the message reaches INFO logs and exported span status.
+        let e = generic_err(
+            "Error performing GET https://minio.internal:9000/my-bucket/a/b?x=1 in 1s - boom",
+        );
+        let msg = classify_s3_error(&e);
+        assert!(!msg.contains("minio.internal"), "got: {msg}");
+        assert!(!msg.contains("my-bucket"), "got: {msg}");
+        assert!(
+            msg.contains("Error performing GET <url> in 1s - boom"),
+            "got: {msg}"
+        );
+        let err = s3_storage_error(format!("Failed to get object '{}'", "k"), &e);
+        assert!(
+            err.to_string()
+                .contains("Failed to get object 'k': S3 request failed. caused by:"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn test_classify_unknown_error_fallthrough() {
         // An unrecognized error must NOT be misclassified into a wrong
         // bucket; it should fall through to the generic "S3 request
@@ -6185,6 +6818,31 @@ mod tests {
         );
         assert!(!page.is_truncated);
         assert!(page.next_continuation_token.is_none());
+    }
+
+    /// #1570 review: the REST fallback must carry `<LastModified>` so the
+    /// storage reindex can tell settled ghosts from in-flight uploads on
+    /// endpoints (Alibaba OSS) that always use it.
+    #[test]
+    fn test_parse_list_response_carries_last_modified_1570() {
+        let page = parse_list_bucket_result(OSS_LIST_RESPONSE).expect("OSS sample must parse");
+        assert_eq!(page.last_modified.len(), page.keys.len());
+        assert!(page.last_modified.iter().all(Option::is_some), "{page:?}");
+
+        // Either element order, and a missing/garbled value is `None`.
+        let xml = r#"<ListBucketResult>
+            <Contents><LastModified>2020-06-22T11:42:35.000Z</LastModified><Key>a</Key></Contents>
+            <Contents><Key>b</Key></Contents>
+            <Contents><Key>c</Key><LastModified>not a date</LastModified></Contents>
+        </ListBucketResult>"#;
+        let page = parse_list_bucket_result(xml).expect("must parse");
+        assert_eq!(page.keys, vec!["a", "b", "c"]);
+        assert_eq!(
+            page.last_modified[0].map(|d| d.to_rfc3339()),
+            Some("2020-06-22T11:42:35+00:00".to_string())
+        );
+        assert_eq!(page.last_modified[1], None);
+        assert_eq!(page.last_modified[2], None);
     }
 
     #[test]
@@ -6719,6 +7377,148 @@ mod tests {
         );
     }
 
+    /// Matches a request that carries no `Content-Length` header at all —
+    /// the shape Google Cloud Storage's S3 API rejects with 411 (#3737).
+    struct MissingContentLength;
+
+    impl wiremock::Match for MissingContentLength {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            !request.headers.contains_key(http::header::CONTENT_LENGTH)
+        }
+    }
+
+    /// Stand up a GCS-like S3 endpoint: the source HEAD answers, a CopyObject
+    /// PUT without `Content-Length` is refused with `411 Length Required`
+    /// exactly as `storage.googleapis.com` does, and one that carries it
+    /// succeeds with a `CopyObjectResult`.
+    async fn gcs_like_copy_server(source_path: &str, dest_path: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{header, header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path(source_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"deadbeef\"")
+                    .set_body_bytes(vec![0u8; 7]),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(dest_path))
+            .and(header_exists("x-amz-copy-source"))
+            .and(MissingContentLength)
+            .respond_with(ResponseTemplate::new(411).set_body_string(
+                "<?xml version='1.0' encoding='UTF-8'?><Error><Code>MissingContentLength</Code>\
+                 <Message>Length Required</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(dest_path))
+            .and(header_exists("x-amz-copy-source"))
+            .and(header("content-length", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult>\
+                 <LastModified>2026-09-28T00:00:00.000Z</LastModified>\
+                 <ETag>\"deadbeef\"</ETag></CopyObjectResult>",
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn test_copy_succeeds_on_endpoint_requiring_content_length_3737() {
+        let _env = SignedS3TestEnv::enter();
+        let server = gcs_like_copy_server(
+            "/example-bucket/proxy-cache-staging/abc",
+            "/example-bucket/proxy-cache/scope/pypi-remote/six.whl/__content__",
+        )
+        .await;
+
+        let backend = S3Backend::new(S3Config::new(
+            "example-bucket".to_string(),
+            "auto".to_string(),
+            Some(server.uri()),
+            None,
+        ))
+        .await
+        .expect("S3Backend::new");
+
+        for attempt in 0..2 {
+            backend
+                .copy(
+                    "proxy-cache-staging/abc",
+                    "proxy-cache/scope/pypi-remote/six.whl/__content__",
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "copy #{attempt} must succeed on an endpoint that requires \
+                         Content-Length on CopyObject (GCS, #3737): {e}"
+                    )
+                });
+        }
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        let copies: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == http::Method::PUT)
+            .collect();
+        assert_eq!(
+            copies
+                .iter()
+                .filter(|r| !r.headers.contains_key(http::header::CONTENT_LENGTH))
+                .count(),
+            1,
+            "only the first copy may pay the rejected header-less CopyObject; the 411 \
+             latches the explicit-length form for every later copy"
+        );
+        assert_eq!(
+            copies
+                .iter()
+                .filter(|r| r
+                    .headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .is_some_and(|v| v == "0"))
+                .count(),
+            2,
+            "both copies must be completed by a CopyObject carrying Content-Length: 0"
+        );
+        let signed = copies
+            .iter()
+            .find(|r| r.headers.contains_key(http::header::CONTENT_LENGTH))
+            .expect("the explicit-length CopyObject was sent");
+        assert_eq!(
+            signed
+                .headers
+                .get("x-amz-copy-source")
+                .and_then(|v| v.to_str().ok()),
+            Some("example-bucket/proxy-cache-staging/abc"),
+            "the retried CopyObject must still be server-side from the staged source"
+        );
+        assert!(
+            signed.headers.contains_key(http::header::AUTHORIZATION),
+            "the hand-rolled CopyObject must be SigV4-signed"
+        );
+    }
+
+    #[test]
+    fn test_copy_rejected_for_missing_length_matches_only_411() {
+        assert!(copy_rejected_for_missing_length(
+            "Generic S3 error: Error performing PUT https://storage.googleapis.com/b/k in 103ms \
+             - Server returned non-2xx status code: 411 Length Required: "
+        ));
+        assert!(!copy_rejected_for_missing_length(
+            "Server returned non-2xx status code: 404 Not Found"
+        ));
+        assert!(!copy_rejected_for_missing_length(
+            "Server returned non-2xx status code: 403 Forbidden: key 411"
+        ));
+    }
+
     #[tokio::test]
     async fn test_non_oss_copy_still_uses_server_side_copyobject_3594() {
         use wiremock::matchers::{method, path};
@@ -6769,6 +7569,7 @@ mod tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod integration_tests {
     use super::*;

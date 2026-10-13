@@ -30,6 +30,7 @@ use crate::api::{
 };
 use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
+use crate::models::repository::RepositoryVisibility;
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
 use crate::services::permission_service::PermissionService;
@@ -228,6 +229,44 @@ impl AuthExtension {
             }
         }
         Ok(())
+    }
+
+    /// Repository ceiling for token minting (#4225), the repository-scope
+    /// counterpart of [`enforce_mint_ceiling`](Self::enforce_mint_ceiling).
+    ///
+    /// Returns the repositories a token minted by this credential must be
+    /// restricted to, or `None` when the credential has no repository
+    /// restriction (interactive sessions and unrestricted tokens), in which
+    /// case the request's own restriction, if any, applies unchanged.
+    ///
+    /// A repository-restricted credential (a token restricted by
+    /// `repo_selector` or `repository_ids`, or a JWT exchanged from one) passes
+    /// its restriction on: the new token is stamped with the credential's
+    /// resolved repositories. It may not name its own restriction
+    /// (`requests_restriction`), because a selector is resolved at
+    /// authentication time and cannot be proven no wider than the credential's
+    /// here; that is a 403 rather than a silent override. A credential whose
+    /// restriction currently matches no repository cannot mint at all, since
+    /// an empty restriction would be stored as none. Admins are not exempt: an
+    /// admin token restricted to some repositories is still restricted.
+    pub fn mint_repo_ceiling(
+        &self,
+        requests_restriction: bool,
+    ) -> crate::error::Result<Option<Vec<Uuid>>> {
+        match &self.allowed_repo_ids {
+            AccessScope::Admin => Ok(None),
+            AccessScope::Restricted(_) if requests_restriction => Err(AppError::Authorization(
+                "A repository-restricted credential cannot set a repository restriction on \
+                 the token it mints; the new token inherits the credential's own"
+                    .to_string(),
+            )),
+            AccessScope::Restricted(ids) if ids.is_empty() => Err(AppError::Authorization(
+                "The presenting credential is restricted to repositories that match nothing, \
+                 so it cannot mint a token"
+                    .to_string(),
+            )),
+            AccessScope::Restricted(ids) => Ok(Some(ids.clone())),
+        }
     }
 
     /// Fold the effective-admin decision at construction time so every
@@ -1139,6 +1178,11 @@ pub(crate) enum AuthOutcome {
 /// `username:password` logins are unaffected in BOTH modes. The discrimination is
 /// per-middleware (structural), never request-path string matching — axum's
 /// nest-prefix stripping makes path matching unreliable here.
+///
+/// Runs in an `INTERNAL` `authenticate` span (#4455), so a trace shows how
+/// much of a request went to credential validation (JWT, API-token lookup,
+/// bcrypt). The span records no credential material.
+#[tracing::instrument(name = "authenticate", level = "info", skip_all)]
 pub(crate) async fn try_resolve_auth_outcome(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
@@ -1298,7 +1342,8 @@ pub(crate) fn extract_ticket_from_query(query: Option<&str>) -> Option<String> {
 /// Tickets are minted for downloads/streams only. Any write operation
 /// (POST, PUT, PATCH, DELETE) authenticated by a ticket must be rejected
 /// even when the underlying user has write permission, because the ticket
-/// embeds no scope information and the calling client may be a browser
+/// carries no action scope (only the minter's repository restriction)
+/// and the calling client may be a browser
 /// `<a href>` or `EventSource` that the user did not consent to use for
 /// mutations.
 fn ticket_method_allowed(method: &Method) -> bool {
@@ -1337,14 +1382,14 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
-    let (user_id, _purpose, resource_path) =
+    let redeemed =
         crate::services::auth_config_service::AuthConfigService::validate_download_ticket(
             db, ticket,
         )
         .await
         .ok()?;
 
-    if !ticket_path_allowed(resource_path.as_deref(), request_path) {
+    if !ticket_path_allowed(redeemed.resource_path.as_deref(), request_path) {
         // Ticket has been consumed by validate_download_ticket; treat the
         // mismatch as an authentication failure so the client cannot reuse
         // the same ticket against a different path.
@@ -1363,31 +1408,28 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
+    // A ticket minted before its repository scope was recorded carries no
+    // restriction we could restore, so it authenticates nothing (fail
+    // closed, GHSA-2mfv-xg68-gq4p). Such tickets expire within minutes.
+    let repo_scope = redeemed.repo_scope?;
+
     // Load the owning user. We block deactivated users so a revoked account
     // cannot keep downloading via outstanding tickets, but we honour service
     // accounts and not-yet-rotated passwords because the ticket itself is
     // the proof of intent: the JWT session that minted it had whatever
     // rights the user had at mint time.
     //
-    // Uses `sqlx::query_as::<_, User>` rather than the `query_as!` macro so
-    // adding the ticket-consumer middleware does not require regenerating
-    // the offline SQLx query cache.
-    let user: User = sqlx::query_as::<_, User>(
-        r#"
-        SELECT
-            id, username, email, password_hash, display_name,
-            auth_provider, external_id, is_admin, is_active,
-            is_service_account, must_change_password,
-            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-            last_login_at, created_at, updated_at
-        FROM users
-        WHERE id = $1 AND is_active = true
-        "#,
-    )
-    .bind(user_id)
-    .fetch_optional(db)
-    .await
-    .ok()??;
+    // `SELECT *` rather than a hand-written column list: the list this
+    // replaced had drifted behind `User` (it lacked the lockout and
+    // password-change columns), so every decode failed and no ticket ever
+    // authenticated (GHSA-2mfv-xg68-gq4p). `query_as::<_, User>` rather than
+    // the `query_as!` macro keeps this out of the offline SQLx query cache.
+    let user: User =
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1 AND is_active = true")
+            .bind(redeemed.user_id)
+            .fetch_optional(db)
+            .await
+            .ok()??;
 
     let mut ext = AuthExtension::from(user);
     // Tickets are read-only. Drop admin elevation so a ticket minted by an
@@ -1411,6 +1453,11 @@ async fn try_resolve_ticket_auth(
     // intentionally minted a download URL.
     ext.is_api_token = true;
     ext.scopes = Some(vec![]);
+    // The minting credential's repository restriction, not the owner's full
+    // reach: `From<User>` grants every repository the user can access, which
+    // would let a repository-restricted token mint its way out of its
+    // restriction (GHSA-2mfv-xg68-gq4p).
+    ext.allowed_repo_ids = repo_scope;
     Some(ext)
 }
 
@@ -1428,10 +1475,22 @@ struct TicketRequestParts {
 
 fn extract_ticket_request_parts(request: &Request) -> Option<TicketRequestParts> {
     let ticket = extract_ticket_from_query(request.uri().query())?;
+    // A ticket is bound to the path the client will request, which is the
+    // FULL path. Inside a nest (`/api/v1/repositories`, ...) axum has already
+    // stripped `request.uri()` down to a suffix, so compare against
+    // `OriginalUri` (populated by the outer router), falling back to the
+    // request URI for a flat router with no nest. Without this a path-bound
+    // ticket never matched on a nested route (GHSA-2mfv-xg68-gq4p follow-on:
+    // the web UI and Terraform mirror ticket flows).
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
     Some(TicketRequestParts {
         ticket,
         method: request.method().clone(),
-        path: request.uri().path().to_string(),
+        path,
     })
 }
 
@@ -1700,6 +1759,13 @@ fn percent_decode_path_segment(segment: &str) -> Option<Cow<'_, str>> {
 pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
+    // rattler's conda token layout puts the credential in front of the whole
+    // path: `/t/<TOKEN>/conda/<repo_key>/...`. Drop the `t/<TOKEN>` pair so
+    // the rest is the ordinary `/conda/<repo_key>/...` shape below.
+    if rattler_conda_token_rest(trimmed).is_some() {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     // Format prefix (pypi, npm, maven, ...).
     let format = segments.next().unwrap_or("");
     // Conda token channels embed the credential in the URL path:
@@ -1774,6 +1840,9 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
 /// token segment.
 pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
+    if let Some((token, _rest)) = rattler_conda_token_rest(trimmed) {
+        return Some(token);
+    }
     let mut segments = trimmed.split('/');
     if segments.next()? != "conda" {
         return None;
@@ -1794,6 +1863,21 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     // Same shape test `extract_repo_key` applies to the matching skip.
     segments.next()?;
     Some(token)
+}
+
+/// Split rattler's conda token layout, `t/<TOKEN>/conda/<repo_key>/...`
+/// (leading `/` already trimmed), into the token and the path after it.
+/// `None` unless the token is non-empty and a repository key follows `conda`,
+/// so no other `/t/...` path is mistaken for a credential.
+fn rattler_conda_token_rest(trimmed: &str) -> Option<(&str, &str)> {
+    let rest = trimmed.strip_prefix("t/")?;
+    let (token, rest) = rest.split_once('/')?;
+    let after = rest.strip_prefix("conda/")?;
+    let repo_key = after.split('/').next().unwrap_or("");
+    if token.is_empty() || repo_key.is_empty() {
+        return None;
+    }
+    Some((token, rest))
 }
 
 /// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
@@ -1873,13 +1957,20 @@ pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> 
     ExtractedToken::None
 }
 
-/// Decide whether a request to a repository should be allowed.
+/// Decide whether a request to a repository should be allowed past the coarse
+/// visibility gate.
 ///
-/// Returns `true` when the request should proceed (public repo, or private
-/// repo with authentication).  Returns `false` when access should be denied
-/// (private repo, no auth).
-pub(crate) fn should_allow_repo_access(is_public: bool, has_auth: bool) -> bool {
-    is_public || has_auth
+/// Returns `true` when the request should proceed: a repository anyone may read
+/// anonymously, or any repository with an authenticated caller. Returns `false`
+/// only for an anonymous caller against a repository that is not anonymously
+/// readable.
+///
+/// `internal` and `private` answer identically here, and deliberately so. This
+/// gate decides only whether the request reaches the finer checks below; what
+/// separates the two is which principals satisfy the ACL baseline once there,
+/// not whether an anonymous caller is turned away -- neither admits one.
+pub(crate) fn should_allow_repo_access(visibility: RepositoryVisibility, has_auth: bool) -> bool {
+    visibility.allows_anonymous_read() || has_auth
 }
 
 /// Return true when the HTTP method is a write operation (POST, PUT, PATCH,
@@ -2170,10 +2261,43 @@ pub(crate) fn action_for_method(method: &Method) -> &'static str {
 /// anonymous one on the same public repository (#2329).
 ///
 /// This applies only to the `read` action. Write and delete actions are still
-/// fully governed by the ACL when rules exist, and private repositories
-/// (`is_public == false`) never take this shortcut.
-pub(crate) fn public_read_satisfies_acl(is_public: bool, action: &str) -> bool {
-    is_public && action == "read"
+/// fully governed by the ACL when rules exist, and repositories that are not
+/// anonymously readable never take this shortcut.
+///
+/// Use this ONLY where the question is the *anonymous* baseline -- the token
+/// repository-scope ceilings (#3648, #3704). An `internal` repository has no
+/// anonymous baseline to have fallen below (an anonymous caller is turned away
+/// by [`should_allow_repo_access`]), so it must NOT be exempted from a scope
+/// ceiling. For the authenticated baseline, use
+/// [`authenticated_read_satisfies_acl`] instead.
+pub(crate) fn public_read_satisfies_acl(visibility: RepositoryVisibility, action: &str) -> bool {
+    visibility.allows_anonymous_read() && action == "read"
+}
+
+/// Whether a fine-grained ACL check may be skipped for an ALREADY-AUTHENTICATED
+/// caller because the repository's visibility grants them a read baseline.
+///
+/// This is the #2329 argument applied to the full visibility axis: a caller must
+/// never be left below the baseline their repository already grants them. On a
+/// `public` repository that baseline comes from anonymous access; on an
+/// `internal` one it comes from being a resolved principal at all. Enforcing the
+/// ACL against them where rules happen to exist would make holding a credential
+/// strictly worse than the baseline in both cases.
+///
+/// Reads only, exactly as [`public_read_satisfies_acl`]: writes and deletes stay
+/// fully governed by `check_repository_action`, deny-by-default (#2603 G1), and
+/// `private` never takes this shortcut.
+///
+/// Callers MUST have established that the request is authenticated. Every
+/// current call site sits inside an `auth_ext`/`claims` binding, which is why
+/// this takes no `has_auth` argument -- passing one would invite calling it on
+/// the anonymous path, where it would grant an `internal` repository to the
+/// world.
+pub(crate) fn authenticated_read_satisfies_acl(
+    visibility: RepositoryVisibility,
+    action: &str,
+) -> bool {
+    visibility.allows_authenticated_read() && action == "read"
 }
 
 /// Middleware that enforces repository visibility on format handler routes.
@@ -2280,7 +2404,9 @@ pub async fn repo_visibility_middleware(
             use sqlx::Row;
             let row = sqlx::query(
                 "SELECT id, format::text as format, repo_type::text as repo_type, \
-                 upstream_url, storage_backend, storage_path, is_public, \
+                 upstream_url, storage_backend, storage_path, visibility, \
+                 promotion_only, age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+                 curation_enabled, curation_default_action, \
                  (SELECT value FROM repository_config \
                   WHERE repository_id = repositories.id \
                   AND key = 'index_upstream_url') AS index_upstream_url \
@@ -2306,8 +2432,26 @@ pub async fn repo_visibility_middleware(
                     upstream_url: r.get("upstream_url"),
                     storage_backend: r.get("storage_backend"),
                     storage_path: r.get("storage_path"),
-                    is_public: r.get("is_public"),
+                    // Fails closed: an unreadable/unknown visibility is
+                    // treated as `private`, the narrowest audience, rather
+                    // than defaulting a repository open.
+                    visibility: r
+                        .try_get::<RepositoryVisibility, _>("visibility")
+                        .unwrap_or_else(|e| {
+                            tracing::error!(
+                                error = %e,
+                                repo_key = %repo_key,
+                                "unreadable repository visibility; failing closed to private"
+                            );
+                            RepositoryVisibility::Private
+                        }),
                     index_upstream_url: r.get("index_upstream_url"),
+                    promotion_only: r.get("promotion_only"),
+                    age_gate_enabled: r.get("age_gate_enabled"),
+                    age_gate_min_age_days: r.get("age_gate_min_age_days"),
+                    age_gate_mode: r.get("age_gate_mode"),
+                    curation_enabled: r.get("curation_enabled"),
+                    curation_default_action: r.get("curation_default_action"),
                 };
                 // Populate the shared cache; evict stale entries on write.
                 {
@@ -2408,7 +2552,11 @@ pub async fn repo_visibility_middleware(
         return not_found_response();
     };
 
-    let is_public = repo.is_public;
+    // The key names a real repository: tag the request's trace with it so
+    // traces can be filtered per repository (#4455). Span attribute only.
+    crate::api::middleware::request_span::record_repository_key(&repo_key);
+
+    let visibility = repo.visibility;
     // The VS Code gallery query is a protocol-mandated POST that is purely a
     // metadata search, so it must be reachable anonymously on a public repo.
     // Only that strict subset skips the #508 anonymous-write gate: git-lfs
@@ -2481,8 +2629,25 @@ pub async fn repo_visibility_middleware(
     }
 
     // Check visibility: public repos are open for reads, private repos need auth.
-    if !should_allow_repo_access(is_public, auth_ext.is_some()) {
-        return unauthorized_response();
+    if !should_allow_repo_access(visibility, auth_ext.is_some()) {
+        // #1849: an anonymous caller may still hold an anonymous read rule
+        // (`principal_type = 'anonymous'`) on this non-public repository —
+        // the IP-restricted CI download grant — evaluated against the
+        // in-flight request's client IP. This arm is only reachable for a
+        // READ: anonymous writes already left by the #508 gate above, and
+        // `auth_ext.is_some()` callers answered `true` just now. A denial
+        // keeps the identical 401 challenge, so a caller outside the CIDRs
+        // cannot tell a conditioned repo from a rules-less one; a lookup
+        // error fails closed (denied, not served).
+        let anonymous_read_granted = auth_ext.is_none()
+            && vis_state
+                .permission_service
+                .check_anonymous_repository_action(repo.id, "read")
+                .await
+                .unwrap_or(false);
+        if !anonymous_read_granted {
+            return unauthorized_response();
+        }
     }
 
     // #504: Enforce API token repository scope. If the token carries an
@@ -2524,10 +2689,15 @@ pub async fn repo_visibility_middleware(
         action_for_method(request.method())
     };
     if let Some(ref ext) = auth_ext {
-        if !public_read_satisfies_acl(is_public, scope_gate_action) && !ext.can_access_repo(repo.id)
+        if !public_read_satisfies_acl(visibility, scope_gate_action)
+            && !ext.can_access_repo(repo.id)
         {
-            // #3717: a READ refused here is always a read of a PRIVATE
-            // repository (the public case short-circuited just above), so it
+            // #3717: a READ refused here is always a read of a repository
+            // that is NOT anonymously readable -- `private`, or `internal`,
+            // whose scope ceiling is deliberately not relaxed (an anonymous
+            // caller gets nothing from it, so a scoped credential has no
+            // baseline to have fallen below). The public case short-circuited
+            // just above. Both hide their existence identically, so it
             // takes the same existence-hiding `not_found_response()` the
             // no-repo branch and both ACL read denials (#3524, #3709) answer.
             // Repository-scoped tokens are self-service, so a 403 here handed
@@ -2546,7 +2716,9 @@ pub async fn repo_visibility_middleware(
             // public repository (the short-circuit above), but the two POSTs
             // do, and a public repository has no existence to hide: they keep
             // the 403 there, as `test_3648` pins.
-            if !is_public && (scope_gate_action == "read" || non_mutating_post) {
+            if !visibility.allows_anonymous_read()
+                && (scope_gate_action == "read" || non_mutating_post)
+            {
                 // Same fields and level as the two ACL read denials below, so
                 // the operator can still tell this from a missing repository.
                 tracing::info!(
@@ -2630,15 +2802,17 @@ pub async fn repo_visibility_middleware(
                 };
 
                 if has_rules {
-                    // #2329: On a *public* repository, reads are always allowed
-                    // for anonymous callers (visibility check above), so an
-                    // authenticated caller must not end up with *less* read
-                    // access just because ACL rules exist. Grant the anonymous
-                    // read baseline and skip the ACL for reads only; private
-                    // repos never take this shortcut. Anonymous callers never
-                    // reach this block at all (no `auth_ext`), so the existing
-                    // anonymous-public contract is untouched.
-                    if !public_read_satisfies_acl(is_public, action) {
+                    // #2329, applied to the full visibility axis: a caller
+                    // must never end up with *less* read access than the
+                    // baseline their repository already grants them, merely
+                    // because ACL rules happen to exist. On `public` that
+                    // baseline is anonymous access; on `internal` it is being a
+                    // resolved principal at all. Skip the ACL for reads only;
+                    // `private` never takes this shortcut. Anonymous callers
+                    // never reach this block (no `auth_ext`), which is what
+                    // makes it safe to grant the internal baseline here --
+                    // the caller is authenticated by construction.
+                    if !authenticated_read_satisfies_acl(visibility, action) {
                         // Check for the specific action first, then fall back to
                         // "admin" which implies all actions (#827 policy compat).
                         // Both calls resolve from the same cached action set, so
@@ -2767,11 +2941,16 @@ pub async fn repo_visibility_middleware(
                             return not_found_response();
                         }
                     }
-                } else if !is_public {
-                    // A private repo with NO fine-grained permission rules must
-                    // still not be readable by every authenticated user. Mirror
-                    // the REST `require_visible` model: a non-admin needs a role
-                    // assignment scoped to this repo (or a global assignment).
+                } else if !visibility.allows_authenticated_read() {
+                    // A repo with NO fine-grained permission rules whose
+                    // visibility grants no authenticated baseline -- i.e.
+                    // `private` -- must still not be readable by every
+                    // authenticated user. Mirror the REST `require_visible`
+                    // model: a non-admin needs a role assignment scoped to this
+                    // repo (or a global assignment). An `internal` repository
+                    // is exactly the case that SHOULD fall through to a read
+                    // here, which is why the condition asks about the
+                    // authenticated baseline rather than about `is_public`.
                     //
                     // Without this branch the native-protocol path
                     // default-ALLOWED rule-less private repos to any
@@ -2844,6 +3023,7 @@ pub async fn repo_visibility_middleware(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4188,6 +4368,22 @@ mod tests {
     }
 
     #[test]
+    fn test_rattler_conda_token_layout() {
+        let path = "/t/abc123token/conda/my-channel/noarch/repodata.json";
+        assert_eq!(extract_conda_url_token(path), Some("abc123token"));
+        assert_eq!(extract_repo_key(path), "my-channel");
+        assert_eq!(
+            extract_repo_key("/t/tok/conda/my-channel/channeldata.json"),
+            "my-channel"
+        );
+        // Not the rattler layout: no token, no `conda`, or no repository key.
+        assert_eq!(extract_conda_url_token("/t//conda/my-channel/x"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/pypi/my-repo/simple"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda/"), None);
+        assert_eq!(extract_conda_url_token("/t/tok/conda"), None);
+    }
+
+    #[test]
     fn test_extract_conda_url_token() {
         assert_eq!(
             extract_conda_url_token("/conda/t/abc123token/my-channel/noarch/repodata.json"),
@@ -4221,22 +4417,118 @@ mod tests {
 
     #[test]
     fn test_allow_public_no_auth() {
-        assert!(should_allow_repo_access(true, false));
+        assert!(should_allow_repo_access(
+            RepositoryVisibility::Public,
+            false
+        ));
     }
 
     #[test]
     fn test_allow_public_with_auth() {
-        assert!(should_allow_repo_access(true, true));
+        assert!(should_allow_repo_access(RepositoryVisibility::Public, true));
     }
 
     #[test]
     fn test_deny_private_no_auth() {
-        assert!(!should_allow_repo_access(false, false));
+        assert!(!should_allow_repo_access(
+            RepositoryVisibility::Private,
+            false
+        ));
     }
 
     #[test]
     fn test_allow_private_with_auth() {
-        assert!(should_allow_repo_access(false, true));
+        assert!(should_allow_repo_access(
+            RepositoryVisibility::Private,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_deny_internal_no_auth() {
+        assert!(!should_allow_repo_access(
+            RepositoryVisibility::Internal,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_allow_internal_with_auth() {
+        assert!(should_allow_repo_access(
+            RepositoryVisibility::Internal,
+            true
+        ));
+    }
+
+    /// The whole (visibility x has_auth) matrix in one place, so a future edit
+    /// to the gate cannot quietly change one cell.
+    ///
+    /// `internal` and `private` are identical HERE by design: this gate only
+    /// decides whether the request reaches the finer checks. What separates
+    /// them is which principals satisfy the ACL baseline once there, which
+    /// `authenticated_read_satisfies_acl` owns.
+    #[test]
+    fn test_should_allow_repo_access_full_matrix() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        let cases = [
+            (Public, false, true),
+            (Public, true, true),
+            (Internal, false, false),
+            (Internal, true, true),
+            (Private, false, false),
+            (Private, true, true),
+        ];
+        for (visibility, has_auth, expected) in cases {
+            assert_eq!(
+                should_allow_repo_access(visibility, has_auth),
+                expected,
+                "visibility={visibility:?} has_auth={has_auth}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // public_read_satisfies_acl / authenticated_read_satisfies_acl
+    // -----------------------------------------------------------------------
+
+    /// The ANONYMOUS baseline. `internal` must NOT satisfy it: an anonymous
+    /// caller is turned away from an internal repository, so a repo-scoped
+    /// credential has no credential-free baseline to have fallen below and the
+    /// scope ceiling (#3648, #3704) must keep confining it.
+    #[test]
+    fn test_public_read_satisfies_acl_is_public_only() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        assert!(public_read_satisfies_acl(Public, "read"));
+        assert!(!public_read_satisfies_acl(Internal, "read"));
+        assert!(!public_read_satisfies_acl(Private, "read"));
+    }
+
+    /// The AUTHENTICATED baseline (#2329 applied to the full axis).
+    #[test]
+    fn test_authenticated_read_satisfies_acl_covers_internal() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        assert!(authenticated_read_satisfies_acl(Public, "read"));
+        assert!(authenticated_read_satisfies_acl(Internal, "read"));
+        assert!(!authenticated_read_satisfies_acl(Private, "read"));
+    }
+
+    /// Neither predicate may ever satisfy a mutation, in any visibility state.
+    /// This is the #2603 G1 invariant: visibility confers a READ baseline only.
+    #[test]
+    fn test_no_visibility_satisfies_a_write_or_delete() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        for visibility in [Public, Internal, Private] {
+            for action in ["write", "delete", "admin"] {
+                assert!(
+                    !public_read_satisfies_acl(visibility, action),
+                    "public_read_satisfies_acl({visibility:?}, {action})"
+                );
+                assert!(
+                    !authenticated_read_satisfies_acl(visibility, action),
+                    "authenticated_read_satisfies_acl({visibility:?}, {action})"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5125,7 +5417,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_allows_anonymous_get() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         let method = Method::GET;
         assert!(
@@ -5140,7 +5432,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_blocks_anonymous_post() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         // Middleware allows access (public repo)...
         assert!(should_allow_repo_access(is_public, has_auth));
@@ -5153,7 +5445,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_blocks_anonymous_put() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         assert!(should_allow_repo_access(is_public, has_auth));
         assert!(
@@ -5164,7 +5456,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_blocks_anonymous_delete() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         assert!(should_allow_repo_access(is_public, has_auth));
         assert!(
@@ -5175,7 +5467,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_allows_anonymous_head() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         assert!(should_allow_repo_access(is_public, has_auth));
         assert!(
@@ -5186,7 +5478,7 @@ mod tests {
 
     #[test]
     fn test_private_repo_blocks_anonymous_get() {
-        let is_public = false;
+        let is_public = RepositoryVisibility::Private;
         let has_auth = false;
         assert!(
             !should_allow_repo_access(is_public, has_auth),
@@ -5196,7 +5488,7 @@ mod tests {
 
     #[test]
     fn test_private_repo_allows_authenticated_get() {
-        let is_public = false;
+        let is_public = RepositoryVisibility::Private;
         let has_auth = true;
         assert!(
             should_allow_repo_access(is_public, has_auth),
@@ -5206,7 +5498,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_allows_authenticated_write() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = true;
         assert!(should_allow_repo_access(is_public, has_auth));
         // With auth present, even write methods are allowed through the
@@ -5273,15 +5565,15 @@ mod tests {
         // authenticated user with no grant is at least as allowed as
         // anonymous (#2329 core regression).
         assert!(public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::GET)
         ));
         assert!(public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::HEAD)
         ));
         assert!(public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::OPTIONS)
         ));
     }
@@ -5291,13 +5583,25 @@ mod tests {
         // Private repo: no shortcut for any action — the ungranted user must
         // still hit the ACL (and be denied). No over-allow.
         assert!(!public_read_satisfies_acl(
-            false,
+            RepositoryVisibility::Private,
             action_for_method(&Method::GET)
         ));
-        assert!(!public_read_satisfies_acl(false, "read"));
-        assert!(!public_read_satisfies_acl(false, "write"));
-        assert!(!public_read_satisfies_acl(false, "delete"));
-        assert!(!public_read_satisfies_acl(false, "admin"));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "read"
+        ));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "write"
+        ));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "delete"
+        ));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "admin"
+        ));
     }
 
     #[test]
@@ -5305,22 +5609,25 @@ mod tests {
         // Public repo but non-read actions: writes and deletes remain fully
         // ACL-gated even on public repos.
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::PUT)
         ));
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::POST)
         ));
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::PATCH)
         ));
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::DELETE)
         ));
-        assert!(!public_read_satisfies_acl(true, "admin"));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Public,
+            "admin"
+        ));
     }
 
     #[test]
@@ -5331,9 +5638,10 @@ mod tests {
         // repos is never narrower than the anonymous baseline.
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
             let anonymous_read_allowed =
-                should_allow_repo_access(true, false) && !is_write_method(&method);
+                should_allow_repo_access(RepositoryVisibility::Public, false)
+                    && !is_write_method(&method);
             assert_eq!(
-                public_read_satisfies_acl(true, action_for_method(&method)),
+                public_read_satisfies_acl(RepositoryVisibility::Public, action_for_method(&method)),
                 anonymous_read_allowed,
                 "authenticated read parity broken for {method}"
             );
@@ -7053,8 +7361,18 @@ mod tests {
             upstream_url: None,
             storage_path: "/tmp".to_string(),
             storage_backend: "filesystem".to_string(),
-            is_public,
+            visibility: if is_public {
+                crate::models::repository::RepositoryVisibility::Public
+            } else {
+                crate::models::repository::RepositoryVisibility::Private
+            },
             index_upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -7077,6 +7395,315 @@ mod tests {
         app.oneshot(request).await.unwrap()
     }
 
+    // -----------------------------------------------------------------------
+    // GHSA-2mfv-xg68-gq4p: a download ticket carries the repository
+    // restriction of the credential that minted it, and a valid ticket
+    // actually redeems. Production router, real database.
+    // -----------------------------------------------------------------------
+
+    /// Mint a ticket bound to `path` with `bearer` through the production
+    /// router. Returns the status and, on 200, the ticket.
+    async fn mint_ticket_via_router(
+        state: &crate::api::SharedState,
+        bearer: &str,
+        path: &str,
+    ) -> (StatusCode, String) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        let body = serde_json::json!({ "purpose": "download", "resource_path": path });
+        let mut req = tdh::post(
+            "/api/v1/auth/ticket".to_string(),
+            "application/json",
+            axum::body::Bytes::from(body.to_string()),
+        );
+        req.headers_mut().insert(
+            "authorization",
+            bearer.parse::<axum::http::HeaderValue>().expect("bearer"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        (
+            status,
+            json["ticket"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Redeem `ticket` on `path` with no other credential.
+    async fn redeem_ticket_via_router(
+        state: &crate::api::SharedState,
+        path: &str,
+        ticket: &str,
+    ) -> (StatusCode, axum::body::Bytes) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = crate::api::routes::create_router(state.clone());
+        tdh::send(app, tdh::get(format!("{path}?ticket={ticket}"))).await
+    }
+
+    #[tokio::test]
+    async fn download_ticket_keeps_the_minting_credentials_repository_restriction() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // A second private repository the same user can also read.
+        let (other_id, other_key, other_dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        tdh::grant_repo_access(&fx.pool, other_id, fx.user_id).await;
+        let seed = |id: Uuid, key: &str, dir: &std::path::Path, body: &'static [u8]| {
+            let info = tdh::make_repo_info(id, key, dir, "local", None);
+            let state = fx.state.clone();
+            let pool = fx.pool.clone();
+            let user = fx.user_id;
+            async move {
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &info,
+                    "ticket/file.bin",
+                    "ticket/file.bin",
+                    "file.bin",
+                    "1",
+                    "application/octet-stream",
+                    axum::body::Bytes::from_static(body),
+                    user,
+                )
+                .await
+            }
+        };
+        seed(fx.repo_id, &fx.repo_key, &fx.storage_dir, b"allowed-bytes").await;
+        seed(other_id, &other_key, &other_dir, b"other-bytes").await;
+        let allowed_path = format!(
+            "/api/v1/repositories/{}/download/ticket/file.bin",
+            fx.repo_key
+        );
+        let other_path = format!("/api/v1/repositories/{other_key}/download/ticket/file.bin");
+
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        );
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(fx.user_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("load user");
+        let bearer_with = |scopes: Option<Vec<String>>, repos: Option<Vec<Uuid>>| {
+            let pair = auth_service
+                .generate_tokens_with_scope(&user, scopes, repos)
+                .expect("mint access token");
+            format!("Bearer {}", pair.access_token)
+        };
+        // The advisory's credential: read:artifacts, restricted to one repository.
+        let restricted = bearer_with(
+            Some(vec!["read:artifacts".to_string()]),
+            Some(vec![fx.repo_id]),
+        );
+        let unrestricted = tdh::bearer_for(&fx.state, fx.user_id).await;
+
+        // Baseline: the restricted credential cannot read the other repository.
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(other_path.clone());
+        req.headers_mut().insert(
+            "authorization",
+            restricted
+                .parse::<axum::http::HeaderValue>()
+                .expect("bearer"),
+        );
+        let (direct, _) = tdh::send(app, req).await;
+
+        // 1) An unrestricted session's ticket redeems (the User lookup works).
+        let (minted, ticket) = mint_ticket_via_router(&fx.state, &unrestricted, &other_path).await;
+        let (session_ticket, session_body) =
+            redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 2) The restricted credential's ticket redeems inside its scope.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &allowed_path).await;
+        let (in_scope, in_scope_body) =
+            redeem_ticket_via_router(&fx.state, &allowed_path, &ticket).await;
+
+        // 3) ...and does NOT read the other repository.
+        let (_, ticket) = mint_ticket_via_router(&fx.state, &restricted, &other_path).await;
+        let (out_of_scope, _) = redeem_ticket_via_router(&fx.state, &other_path, &ticket).await;
+
+        // 4) A credential without read:artifacts cannot mint a ticket.
+        let write_only = bearer_with(Some(vec!["write:artifacts".to_string()]), None);
+        let (write_only_mint, _) =
+            mint_ticket_via_router(&fx.state, &write_only, &allowed_path).await;
+
+        let _ = sqlx::query("DELETE FROM download_tickets WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_member_repo(&fx.pool, other_id, &other_dir).await;
+        let _ = std::fs::remove_dir_all(&other_dir);
+        fx.teardown().await;
+
+        assert_eq!(
+            direct,
+            StatusCode::NOT_FOUND,
+            "precondition: the token is restricted"
+        );
+        assert_eq!(
+            minted,
+            StatusCode::OK,
+            "an unrestricted session mints a ticket"
+        );
+        assert_eq!(
+            session_ticket,
+            StatusCode::OK,
+            "a valid ticket must redeem: {}",
+            String::from_utf8_lossy(&session_body)
+        );
+        assert_eq!(&session_body[..], b"other-bytes");
+        assert_eq!(
+            in_scope,
+            StatusCode::OK,
+            "a restricted credential's ticket must redeem inside its scope: {}",
+            String::from_utf8_lossy(&in_scope_body)
+        );
+        assert_eq!(&in_scope_body[..], b"allowed-bytes");
+        assert_eq!(
+            out_of_scope,
+            StatusCode::NOT_FOUND,
+            "a ticket must not read a repository its minting credential could not"
+        );
+        assert_eq!(
+            write_only_mint,
+            StatusCode::FORBIDDEN,
+            "minting a download ticket needs read:artifacts"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3813: router-level coverage for the two `internal` branches.
+    //
+    // `repo_visibility_middleware`'s internal handling lives in two places --
+    // the has-rules arm (via `authenticated_read_satisfies_acl`) and the
+    // no-rules arm (via `allows_authenticated_read`) -- and until now both were
+    // covered only through their pure predicates. Nothing drove the MIDDLEWARE
+    // with an internal repository, so a one-token edit in either branch could
+    // widen or narrow `internal` with the whole suite still green.
+    //
+    // These run against a real database and the real router because that is the
+    // point: the cache-backed `make_vis_state` fixture above cannot reach the
+    // authenticated paths at all, since they query permissions and role
+    // assignments.
+    // -----------------------------------------------------------------------
+
+    /// Drive `/pypi/{key}/simple/` through the production router for an
+    /// `internal` repository, once with fine-grained rules present on it and
+    /// once without, against the three callers whose answers must differ.
+    ///
+    /// `with_rules` selects the arm: a `permissions` row naming a DIFFERENT
+    /// user makes `has_any_rules_for_target` true without granting our caller
+    /// anything, which is exactly the shape #2329 is about -- rules existing
+    /// must not drop a caller below the baseline their visibility already
+    /// gives them.
+    async fn internal_repo_middleware_arm(with_rules: bool) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set internal");
+
+        // A second repository, so the scoped-token case has a non-empty
+        // allow-list that simply does not contain the one under test. An empty
+        // allow-list would also deny, but for the wrong reason.
+        let (other_repo_id, _other_key, other_dir) =
+            tdh::create_repo(&fx.pool, "local", "pypi").await;
+
+        // The caller: authenticated, holding NO grant on the repository.
+        let (outsider, _outname) = tdh::create_user(&fx.pool).await;
+        if with_rules {
+            // A rule naming someone else. `fx.user_id` is a member by
+            // construction, so granting to them is enough to make rules exist.
+            tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read"]).await;
+        }
+
+        let uri = format!("/pypi/{}/simple/", fx.repo_key);
+        let arm = if with_rules { "has-rules" } else { "no-rules" };
+
+        // -- 1. Anonymous: internal is invisible without a credential.
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let (anon_status, _) = tdh::send(app, tdh::get(uri.clone())).await;
+
+        // -- 2. Authenticated, grant-less: the internal baseline applies.
+        let bearer = tdh::bearer_for(&fx.state, outsider).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(uri.clone());
+        req.headers_mut().insert(
+            "authorization",
+            bearer.parse::<axum::http::HeaderValue>().expect("bearer"),
+        );
+        let (auth_status, _) = tdh::send(app, req).await;
+
+        // -- 3. Repo-scoped token excluding this repository: still refused.
+        //       `internal` is a read baseline, not an exemption from the
+        //       token's own ceiling.
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        );
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(outsider)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("load outsider");
+        let scoped = auth_service
+            .generate_tokens_with_repo_scope(&user, Some(vec![other_repo_id]))
+            .expect("mint repo-scoped token");
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(uri.clone());
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", scoped.access_token)
+                .parse::<axum::http::HeaderValue>()
+                .expect("bearer"),
+        );
+        let (scoped_status, _) = tdh::send(app, req).await;
+
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        tdh::cleanup_member_repo(&fx.pool, other_repo_id, &other_dir).await;
+        fx.teardown().await;
+        let _ = std::fs::remove_dir_all(&other_dir);
+
+        assert_eq!(
+            anon_status,
+            StatusCode::UNAUTHORIZED,
+            "[{arm}] an anonymous caller must not reach an internal repository"
+        );
+        assert_eq!(
+            auth_status,
+            StatusCode::OK,
+            "[{arm}] an authenticated caller with NO grant must reach an \
+             internal repository -- this is the whole point of the state, and \
+             in the has-rules arm it is #2329: rules existing must not drop a \
+             caller below the baseline visibility already gives them"
+        );
+        assert_eq!(
+            scoped_status,
+            StatusCode::NOT_FOUND,
+            "[{arm}] a repo-scoped token whose allow-list excludes this \
+             repository must still be refused; internal is a read baseline, \
+             not an exemption from the token's own ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_repo_reaches_the_middleware_no_rules_arm() {
+        internal_repo_middleware_arm(/* with_rules */ false).await;
+    }
+
+    #[tokio::test]
+    async fn internal_repo_reaches_the_middleware_has_rules_arm() {
+        internal_repo_middleware_arm(/* with_rules */ true).await;
+    }
+
     #[tokio::test]
     async fn test_repo_visibility_no_repo_key_is_not_found() {
         // A path with no repo segment short-circuits at the empty-key check,
@@ -7097,6 +7724,44 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// #4455: the visibility middleware tags the request span with the
+    /// repository it resolved, and credential resolution runs in an
+    /// `authenticate` child span that carries no credential material.
+    #[tokio::test]
+    async fn test_repo_visibility_records_repository_key_and_authenticate_span() {
+        use crate::api::middleware::request_span::{with_request_span, REPOSITORY_KEY_FIELD};
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use tracing::Instrument;
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some(("myrepo".to_string(), cached))).await;
+        let request = empty_get("/pypi/myrepo/simple/");
+        let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
+        let resp = with_request_span(span.clone(), run_through_visibility(state, request))
+            .instrument(span)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let root = exported.one("http_request");
+        assert_eq!(
+            attr(&root, REPOSITORY_KEY_FIELD),
+            Some(opentelemetry::Value::from("myrepo"))
+        );
+        let authenticate = exported.one("authenticate");
+        assert_eq!(authenticate.parent_span_id, root.span_context.span_id());
+        for kv in &authenticate.attributes {
+            let key = kv.key.as_str();
+            assert!(
+                key.starts_with("code.")
+                    || key.starts_with("thread.")
+                    || matches!(key, "target" | "level" | "busy_ns" | "idle_ns"),
+                "unexpected attribute on the authenticate span: {key}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_repo_visibility_private_read_no_auth_returns_401() {
         let key = "private";
@@ -7104,6 +7769,77 @@ mod tests {
         let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/private/simple/")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// #3778: the cache-miss SELECT must carry the enforcement columns
+    /// (`promotion_only`, `age_gate_*`, `curation_*`) into `CachedRepo` —
+    /// Maven's resolver now builds its `RepoInfo` from this entry instead of
+    /// re-querying `repositories`, so a dropped column would read as a query
+    /// error (repo 404s) or, worse, silently default a gate. Pins the full
+    /// row -> entry mapping against a real database. DB-backed.
+    #[tokio::test]
+    async fn test_repo_visibility_cache_entry_carries_enforcement_columns_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, \
+             curation_default_action = 'review', promotion_only = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 14, \
+             age_gate_mode = 'first_seen' WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set enforcement columns");
+        tdh::publish_repo(&pool, repo_id).await;
+
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let state = RepoVisibilityState {
+            auth_service: make_test_auth_service(),
+            db: pool.clone(),
+            repo_cache: cache.clone(),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let resp = run_through_visibility(
+            state,
+            empty_get(&format!(
+                "/maven/{repo_key}/com/example/lib/1.0/lib-1.0.jar"
+            )),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public repo read passes through (handler stub reached)"
+        );
+
+        let entry = {
+            let cache = cache.read().await;
+            cache.get(&repo_key).map(|(e, _)| e.clone())
+        }
+        .expect("the middleware must populate the shared cache on its miss");
+        assert!(
+            entry.curation_enabled,
+            "curation_enabled must ride the cache"
+        );
+        assert_eq!(entry.curation_default_action, "review");
+        assert!(entry.promotion_only, "promotion_only must ride the cache");
+        assert!(
+            entry.age_gate_enabled,
+            "age_gate_enabled must ride the cache"
+        );
+        assert_eq!(entry.age_gate_min_age_days, 14);
+        assert_eq!(entry.age_gate_mode, "first_seen");
+
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     #[tokio::test]
@@ -7805,6 +8541,11 @@ mod tests {
             StatusCode::NOT_FOUND,
         ),
         (Method::POST, "/alpine//upload", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/pacman//x-1-1-any.pkg.tar.zst",
+            StatusCode::NOT_FOUND,
+        ),
         (Method::POST, "/conda//upload", StatusCode::NOT_FOUND),
         (Method::POST, "/conda/t/upload", StatusCode::UNAUTHORIZED),
         (
@@ -8128,8 +8869,14 @@ mod tests {
                 upstream_url: None,
                 storage_path,
                 storage_backend: "filesystem".to_string(),
-                is_public: false,
+                visibility: crate::models::repository::RepositoryVisibility::Private,
                 index_upstream_url: None,
+                promotion_only: false,
+                age_gate_enabled: false,
+                age_gate_min_age_days: 7,
+                age_gate_mode: "upstream_publish_time".to_string(),
+                curation_enabled: false,
+                curation_default_action: "allow".to_string(),
             };
             cache
                 .write()
@@ -8271,8 +9018,14 @@ mod tests {
                 upstream_url: None,
                 storage_path,
                 storage_backend: "filesystem".to_string(),
-                is_public: false,
+                visibility: crate::models::repository::RepositoryVisibility::Private,
                 index_upstream_url: None,
+                promotion_only: false,
+                age_gate_enabled: false,
+                age_gate_min_age_days: 7,
+                age_gate_mode: "upstream_publish_time".to_string(),
+                curation_enabled: false,
+                curation_default_action: "allow".to_string(),
             };
             cache
                 .write()

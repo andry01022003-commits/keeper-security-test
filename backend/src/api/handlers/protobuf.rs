@@ -390,6 +390,40 @@ fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
     )
 }
 
+/// A database failure as the Connect `internal` error.
+fn connect_db_error(e: sqlx::Error) -> Response {
+    connect_error(
+        crate::api::handlers::db_status(&e),
+        "internal",
+        crate::api::handlers::db_err_message(&e),
+    )
+}
+
+/// #4422: a storage-quota decision as the Connect error an upload answers:
+/// `507 resource_exhausted` naming the repository or project quota that
+/// refuses it, or `internal` when the check itself failed.
+#[allow(clippy::result_large_err)]
+fn connect_quota_decision(
+    decision: crate::error::Result<Option<crate::services::repository_service::QuotaScope>>,
+) -> Result<(), Response> {
+    match decision {
+        Ok(None) => Ok(()),
+        Ok(Some(scope)) => Err(connect_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "resource_exhausted",
+            scope.exceeded_message(),
+        )),
+        Err(e) => {
+            tracing::error!("storage quota check failed: {e}");
+            Err(connect_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "storage quota check failed",
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
@@ -708,6 +742,11 @@ async fn save_label_index(
         None => {
             crate::api::handlers::cleanup_soft_deleted_artifact(db, repo_id, &label_path).await;
             // Create label index artifact
+            // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated
+            // JSON document, not uploaded content; the module upload itself
+            // triggers the scan (#4166).
+            // NO-QUOTA-ADMISSION: the generated `_labels` index is a few bytes
+            // the registry writes for an already-admitted module commit (#4422).
             let row = sqlx::query(
                 r#"INSERT INTO artifacts (
                     repository_id, path, name, version, size_bytes,
@@ -1137,6 +1176,18 @@ async fn upload(
         let bundle_bytes = Bytes::from(bundle);
         let size_bytes = bundle_bytes.len() as i64;
 
+        // Refuse an over-quota commit before its bundle is stored (#4422).
+        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
+        connect_quota_decision(
+            super::publish_quota::preflight_quota_denial(
+                &state.db,
+                repo.id,
+                super::publish_quota::PublishAt::Path(&artifact_path),
+                size_bytes,
+            )
+            .await,
+        )?;
+
         // Store via StorageBackend
         let storage_key = build_module_storage_key(&module_name, &commit_digest);
         proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
@@ -1152,11 +1203,21 @@ async fn upload(
             )
         })?;
 
-        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
-
         super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-        // Insert artifact record
+        // Insert artifact record, admitted against the storage quotas in the
+        // same transaction (#4422).
+        let mut tx = state.db.begin().await.map_err(connect_db_error)?;
+        connect_quota_decision(
+            super::publish_quota::locked_quota_denial(
+                &mut tx,
+                &state.db,
+                repo.id,
+                &artifact_path,
+                size_bytes,
+            )
+            .await,
+        )?;
         let row = sqlx::query(
             r#"INSERT INTO artifacts (
                 repository_id, path, name, version, size_bytes,
@@ -1174,7 +1235,7 @@ async fn upload(
         .bind("application/gzip")
         .bind(&storage_key)
         .bind(user_id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             connect_error(
@@ -1183,11 +1244,19 @@ async fn upload(
                 crate::api::handlers::db_err_message(&e),
             )
         })?;
+        tx.commit().await.map_err(connect_db_error)?;
 
         let artifact_id: uuid::Uuid = row.get("id");
 
         crate::services::quarantine_service::apply_upload_hold_hosted(
             &state.db,
+            repo.id,
+            artifact_id,
+        )
+        .await;
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &state.db,
+            state.scanner_service.clone(),
             repo.id,
             artifact_id,
         )
@@ -1396,6 +1465,11 @@ async fn download(
                         state.proxy_service.as_deref(),
                         repo.id,
                         &upstream_path,
+                        // Parity with the Remote arm above, which reads the
+                        // bundle through the capped fetch and records no proxy
+                        // download: a Remote member's bundle is not counted
+                        // here either (#3844).
+                        None,
                         |member_id, location| {
                             let db = db.clone();
                             let state = state.clone();
@@ -1918,9 +1992,24 @@ fn extract_graph_edges(metadata: &Option<serde_json::Value>, commit_id: &str) ->
     edges
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4422: a quota decision maps to the Connect error an upload answers.
+    #[test]
+    fn connect_quota_decision_maps_scopes_4422() {
+        use crate::services::repository_service::QuotaScope;
+        assert!(connect_quota_decision(Ok(None)).is_ok());
+        for scope in [QuotaScope::Repository, QuotaScope::Project] {
+            let resp = connect_quota_decision(Ok(Some(scope))).unwrap_err();
+            assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        }
+        let resp =
+            connect_quota_decision(Err(crate::error::AppError::Database("x".into()))).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // -----------------------------------------------------------------------
     // connect_error
@@ -2712,6 +2801,7 @@ mod tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -2774,5 +2864,183 @@ mod catalog_registration_tests {
         let row = row.expect("a protobuf upload must write a packages row (#3659)");
         assert_eq!(row.version, digest);
         assert_eq!(row.versions, vec![digest]);
+    }
+
+    /// #4422 review: a `buf push` past the repository quota answers the
+    /// Connect `resource_exhausted` error with status 507 and writes no row.
+    #[tokio::test]
+    async fn module_upload_refused_by_quota_answers_connect_507_4422() {
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "quota" },
+                "files": [{
+                    "path": "acme/quota/v1/q.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n"),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        fx.teardown().await;
+
+        let resp: serde_json::Value = serde_json::from_slice(&resp).expect("connect error json");
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            "{resp}"
+        );
+        assert_eq!(resp["code"], "resource_exhausted", "{resp}");
+        assert_eq!(resp["message"], "Repository storage quota exceeded");
+        assert_eq!(rows, 0);
+    }
+}
+
+/// #3919 review (B1): a protobuf commit row records the COMMIT digest (over
+/// file paths + contents), not the SHA-256 of the stored gzip bundle.
+/// Download verification must not abort those downloads.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+pub(crate) mod integrity_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Push one module through the real BSR upload route and return its
+    /// commit digest (the artifact row's `version`).
+    pub(crate) async fn push_module(fx: &tdh::Fixture) -> String {
+        use base64::Engine;
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "integrity" },
+                "files": [{
+                    "path": "acme/integrity/v1/thing.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\nmessage Thing {}\n"),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        sqlx::query_scalar(
+            "SELECT version FROM artifacts \
+             WHERE repository_id = $1 AND name = 'acme/integrity' AND version <> '_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("commit row")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — collects a small test bundle to
+    // assert it was delivered in full (#1608).
+    async fn protobuf_commit_bundle_downloads_in_full_with_verification_on() {
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        assert!(fx.state.config.download_verify_checksums);
+        let digest = push_module(&fx).await;
+        let (size, recorded): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("row");
+
+        use tower::ServiceExt;
+        let resp = fx
+            .router_with_auth(crate::api::handlers::repositories::download_router())
+            .oneshot(tdh::get(format!(
+                "/{}/download/modules/acme/integrity/commits/{digest}",
+                fx.repo_key
+            )))
+            .await
+            .expect("respond");
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body = body.expect("a protobuf commit bundle must download completely");
+        assert_eq!(body.len() as i64, size);
+        // Pin the premise: the recorded checksum is NOT the bundle's digest.
+        use sha2::Digest;
+        assert_ne!(recorded.trim(), hex::encode(sha2::Sha256::digest(&body)));
+    }
+
+    /// #3910 review (B1): the scrub must not flag protobuf commit bundles as
+    /// corrupt (their row records the commit digest, not the bundle's).
+    #[tokio::test]
+    async fn scrub_reports_nothing_for_protobuf_commit_bundles() {
+        use crate::services::storage_scrub_service::{ScrubOptions, StorageScrubService};
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push_module(&fx).await;
+        let res = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone())
+            .run(&ScrubOptions {
+                max_objects: 100,
+                max_bytes: 1 << 30,
+                repair: true,
+                repository_id: Some(fx.repo_id),
+            })
+            .await
+            .expect("scrub run");
+        let findings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage_scrub_findings WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count findings");
+        fx.teardown().await;
+
+        assert_eq!(res.corrupt + res.missing + res.repaired, 0, "{res:?}");
+        assert!(res.unverifiable >= 1, "{res:?}");
+        assert_eq!(findings, 0);
     }
 }

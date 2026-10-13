@@ -120,8 +120,9 @@ permissions: {}
 #
 # #2099: it used to cancel superseded branch pushes to "stop building stale
 # containers". The arm64 legs run on GitHub-hosted `ubuntu-24.04-arm` and
-# finish fast, but the amd64 legs run on the capped self-hosted
-# `ak-ci-runners` and were still in flight when the next merge landed. The
+# finish fast, but the amd64 legs run on a capped self-hosted pool (then
+# `ak-ci-runners`, now `ak-docker-runners`) and were still in flight when the
+# next merge landed. The
 # cancel killed them mid-build, so the multi-arch *manifest* jobs — which fan
 # in from both arches and are the only thing that moves `:dev`/`:main` — never
 # ran at all. After merging #2092, #2090 and #1927 back-to-back on 2026-07-01,
@@ -550,7 +551,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -583,7 +584,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ./docker/Dockerfile.backend
@@ -609,7 +610,12 @@ jobs:
           # security input exactly like `dnf upgrade` is. Cached, it would keep
           # shipping the toolchain from whenever the layer was first built —
           # which is the failure mode #3352 exists to remove.
-          no-cache-filters: rootfs-builder,grype-bin,grype-db-seed,runtime
+          #
+          # `buildkit-bin` joined it on 2026-10-10 for the same reason: buildctl
+          # is now compiled from source on the floating `golang:1.27-alpine`
+          # too, instead of copied out of moby/buildkit (whose go1.26.8 build
+          # failed the Trivy gate on four HIGH stdlib/x-net findings).
+          no-cache-filters: rootfs-builder,grype-bin,buildkit-bin,grype-db-seed,runtime
           sbom: true
           provenance: mode=max
           build-args: |
@@ -660,7 +666,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -685,7 +691,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ./docker/Dockerfile.openscap
@@ -743,7 +749,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -768,7 +774,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ./docker/Dockerfile.scanner-adapter
@@ -828,7 +834,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -845,7 +851,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ./docker/Dockerfile.backend.alpine
@@ -1210,21 +1216,21 @@ jobs:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
       - name: Upload Scanner Adapter Trivy SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         if: always()
         with:
           sarif_file: 'scanner-adapter-trivy.sarif'
@@ -1232,7 +1238,7 @@ jobs:
 
       # Alpine SARIF upload skipped while alpine builds are suspended.
       - name: Upload Backend Alpine Trivy SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         if: false
         with:
           sarif_file: 'backend-alpine-trivy.sarif'
@@ -1387,7 +1393,7 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -1794,7 +1800,7 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -2090,7 +2096,7 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -2463,7 +2469,7 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -2672,7 +2678,7 @@ jobs:
           sparse-checkout: .github/scripts
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4

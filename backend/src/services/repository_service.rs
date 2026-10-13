@@ -11,7 +11,7 @@ use crate::api::validation::validate_outbound_url;
 use crate::error::{AppError, Result};
 #[allow(unused_imports)] // Used by sqlx query macros
 use crate::models::repository::{
-    ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
 };
 use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
 
@@ -68,12 +68,70 @@ impl RepoAccess {
     pub const READ: Self = Self::Action("read");
 }
 
+/// Which storage quota rejected an upload (#2474).
+///
+/// A repository's own `quota_bytes` and its project's `quota_bytes` are
+/// enforced independently: an upload must fit under both. The repository
+/// quota is evaluated first, so when both would be exceeded the narrower,
+/// repository-scoped reason is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaScope {
+    /// The target repository's own `quota_bytes`.
+    Repository,
+    /// The aggregate `quota_bytes` of the project the repository belongs to,
+    /// summed over every repository assigned to that project.
+    Project,
+}
+
+impl QuotaScope {
+    /// Client-facing reason for a quota rejection in this scope.
+    pub fn exceeded_message(self) -> &'static str {
+        match self {
+            QuotaScope::Repository => "Repository storage quota exceeded",
+            QuotaScope::Project => "Project storage quota exceeded",
+        }
+    }
+
+    /// The `507 QUOTA_EXCEEDED` error for a rejection in this scope.
+    pub fn into_error(self) -> AppError {
+        AppError::QuotaExceeded(self.exceeded_message().to_string())
+    }
+}
+
+/// A quota limit paired with the usage it is checked against (one level of
+/// [`RepositoryService::quota_denial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuotaUsage {
+    pub quota_bytes: Option<i64>,
+    pub used_bytes: i64,
+}
+
+impl QuotaUsage {
+    pub(crate) fn new(quota_bytes: Option<i64>, used_bytes: i64) -> Self {
+        Self {
+            quota_bytes,
+            used_bytes,
+        }
+    }
+}
+
+/// `Some(quota)` only for a real, finite limit; `None` for an unset or
+/// non-positive (unlimited sentinel) quota. Same convention as
+/// [`RepositoryService::quota_allows`].
+pub(crate) fn finite_quota(quota_bytes: Option<i64>) -> Option<i64> {
+    quota_bytes.filter(|quota| *quota > 0)
+}
+
 /// Outcome of an atomic, in-transaction quota admission check
 /// ([`RepositoryService::check_quota_locked`]).
 #[derive(Debug, Clone, Copy)]
 pub struct QuotaAdmission {
-    /// Whether the upload is permitted under the repository's storage quota.
+    /// Whether the upload is permitted under the repository's storage quota
+    /// and, when the repository belongs to a project with a finite quota,
+    /// under the project's aggregate quota.
     pub allowed: bool,
+    /// The quota that rejected the upload; `None` exactly when `allowed`.
+    pub denied_by: Option<QuotaScope>,
     /// The repository's ledger-tracked usage (`hosted + proxy + oci`
     /// counters from `repository_usage_ledger`, read under the admission
     /// row lock) EXCLUDING the row currently being written at the target
@@ -145,7 +203,10 @@ pub struct CreateRepositoryRequest {
     pub storage_backend: String,
     pub storage_path: String,
     pub upstream_url: Option<String>,
-    pub is_public: bool,
+    /// Baseline read audience. The handler resolves this from the request's
+    /// `visibility` field or its legacy `is_public` boolean, and applies the
+    /// guest-access coercion, before it reaches here.
+    pub visibility: crate::models::repository::RepositoryVisibility,
     pub quota_bytes: Option<i64>,
     /// When true, direct user uploads are rejected (artifacts must arrive via
     /// the promotion path). Defaults to false.
@@ -180,6 +241,12 @@ pub struct UpdateRepositoryRequest {
     pub key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Set the repository's audience outright. `None` leaves it unchanged.
+    pub visibility: Option<crate::models::repository::RepositoryVisibility>,
+    /// Legacy boolean. Only ever `Some(false)` from the handler, meaning "not
+    /// public" -- see `VisibilityUpdate::ClearPublic`. Writing it lets the
+    /// database trigger narrow a `public` repository while leaving an
+    /// `internal` one alone, which writing `visibility` directly would not.
     pub is_public: Option<bool>,
     pub quota_bytes: Option<Option<i64>>,
     pub upstream_url: Option<String>,
@@ -320,6 +387,7 @@ pub(crate) fn validate_remote_upstream(
                 ));
             }
             Some(url) => {
+                reject_url_controls_and_whitespace(url)?;
                 validate_outbound_url(url, "Upstream URL")?;
                 if *format == RepositoryFormat::Rpm && is_mirrorlist_or_metalink(url) {
                     return Err(AppError::Validation(
@@ -331,18 +399,61 @@ pub(crate) fn validate_remote_upstream(
                 if *format == RepositoryFormat::Debian && is_debian_flat_or_mirrorlist(url) {
                     return Err(AppError::Validation(
                         "Debian remote upstream must be a concrete archive root (apt expands \
-                         `dists/<suite>/...` beneath it), not a flat repository, mirrorlist, or \
-                         `mirror://` URL. Point it at the archive root (e.g. \
-                         http://deb.debian.org/debian)."
+                         `dists/<suite>/...` beneath it, e.g. http://deb.debian.org/debian) or \
+                         the directory of a flat repository (the URI of a `deb <uri> /` line, \
+                         e.g. https://pkgs.k8s.io/core:/stable:/v1.34/deb/), not an index file, \
+                         a `./` component, a mirrorlist, or a `mirror://` URL."
                             .to_string(),
                     ));
                 }
             }
         }
     } else if let Some(url) = upstream_url {
+        reject_url_controls_and_whitespace(url)?;
         validate_outbound_url(url, "Upstream URL")?;
     }
     Ok(())
+}
+
+/// Refuse an upstream URL carrying ASCII control characters or whitespace
+/// (#4463). The WHATWG parser behind `validate_outbound_url` silently drops
+/// leading/trailing C0 controls and every tab/CR/LF, so `"\x01https://u:p@h/"`
+/// or `"ht\ttps://u:p@h/"` validate and authenticate, yet are stored raw;
+/// the origin normalizer, which works on the stored text, would not
+/// recognise their scheme and would keep the credentials at rest. No real
+/// upstream needs either: spaces must be percent-encoded.
+fn reject_url_controls_and_whitespace(url: &str) -> Result<()> {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(AppError::Validation(
+            "Upstream URL must not contain whitespace or control characters \
+             (percent-encode them)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refusal for an update that moves `upstream_url` to another origin while
+/// upstream-auth credentials are configured (#4467).
+pub(crate) const UPSTREAM_ORIGIN_CHANGE_WITH_AUTH: &str =
+    "upstream_url cannot move to a different origin (scheme, host or port) while upstream \
+     credentials are configured: remove them first (PUT /api/v1/repositories/{key}/upstream-auth \
+     with auth_type \"none\"), change upstream_url, then configure credentials for the new upstream";
+
+/// Whether replacing the stored upstream URL with `requested` changes its
+/// origin (scheme, host, port; userinfo, path and query do not count). An
+/// absent or unparseable URL on either side counts as a change (#4467).
+pub(crate) fn upstream_url_origin_changes(stored: Option<&str>, requested: &str) -> bool {
+    let origin = |url: &str| {
+        reqwest::Url::parse(url)
+            .ok()
+            .map(|u| u.origin())
+            .filter(|o| o.is_tuple())
+    };
+    match (stored.and_then(origin), origin(requested)) {
+        (Some(old), Some(new)) => old != new,
+        _ => true,
+    }
 }
 
 /// Heuristic: a URL whose path or query names a mirrorlist/metalink endpoint.
@@ -351,9 +462,10 @@ fn is_mirrorlist_or_metalink(url: &str) -> bool {
     lower.contains("mirrorlist") || lower.contains("metalink")
 }
 
-/// Heuristic: a Debian remote upstream that is a flat repository, a
-/// mirrorlist, or the apt `mirror://` method rather than a concrete archive
-/// root. apt expands `dists/<suite>/...` beneath a proper archive root
+/// Heuristic: a Debian remote upstream aimed at a flat repository's index
+/// file or `./` component, a mirrorlist, or the apt `mirror://` method rather
+/// than a concrete archive root or flat-repository directory (#4619 serves
+/// the flat layout from the directory itself). apt expands `dists/<suite>/...` beneath a proper archive root
 /// (e.g. `http://deb.debian.org/debian`), which this must NOT reject; it
 /// rejects the shapes the remote-proxy trust model cannot verify against a
 /// signed Release:
@@ -420,6 +532,25 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
     })
 }
 
+/// Whether a listing fragment narrows fine-grained rules by the in-flight
+/// request's client IP (#1849).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpConditionMode {
+    /// Append the `allowed_cidrs` predicate, evaluating the request's
+    /// resolved client IP (`client_ip_context_middleware`) inline — a
+    /// validated `IpAddr` literal, or `NULL` outside a request scope, which
+    /// fails closed (conditioned rules match nothing). For request-serving
+    /// paths.
+    Enforce,
+    /// Omit the predicate entirely. For report-only consumers that enumerate
+    /// OTHER principals' potential access (the admin_security
+    /// accessible-users report): there is no meaningful request IP to
+    /// evaluate those principals' conditions against, and the report's
+    /// documented contract is to over-approximate (superset), never
+    /// under-report.
+    Ignore,
+}
+
 /// SQL fragment: true when the user bound at `$user_param` holds a non-empty
 /// fine-grained `permissions` grant on `target_type = 'repository'` /
 /// `target_id = repo_id_expr`, either directly (`principal_type IN ('user',
@@ -456,7 +587,11 @@ fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
     // The positional-bind instantiation used by the listing/visibility callers:
     // the user principal is a single bound value `$user_param`. Delegates to the
     // expression-based builder so the generated SQL stays byte-identical.
-    permissions_grant_exists_for(repo_id_expr, &format!("${user_param}"))
+    permissions_grant_exists_for(
+        repo_id_expr,
+        &format!("${user_param}"),
+        IpConditionMode::Enforce,
+    )
 }
 
 /// Expression-based variant of [`permissions_grant_exists`]: `user_ref` is any
@@ -470,7 +605,23 @@ fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
 /// Kept `pub(crate)` so the enumeration reuses this EXACT fragment (the project
 /// arm, the group UNION, and the `actions <> '{}'` fail-closed rule) instead of
 /// hand-rolling a copy that would drift from the data-plane read predicate.
-pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -> String {
+///
+/// `ip_mode` gates the #1849 `allowed_cidrs` predicate: request-serving paths
+/// pass [`IpConditionMode::Enforce`] so a rule only counts when the caller's
+/// IP satisfies its conditions — mirroring `check_repository_action`; the
+/// accessible-users report passes [`IpConditionMode::Ignore`] (see the enum).
+pub(crate) fn permissions_grant_exists_for(
+    repo_id_expr: &str,
+    user_ref: &str,
+    ip_mode: IpConditionMode,
+) -> String {
+    let ip_condition = match ip_mode {
+        IpConditionMode::Enforce => crate::services::permission_service::ip_condition_sql(
+            "p",
+            &crate::services::permission_service::request_ip_sql_ref(),
+        ),
+        IpConditionMode::Ignore => String::new(),
+    };
     format!(
         r#"EXISTS (
             SELECT 1 FROM permissions p
@@ -487,6 +638,7 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
                       SELECT group_id FROM user_group_members WHERE user_id = {user_ref}
                   ))
               )
+              {ip_condition}
         )"#
     )
 }
@@ -552,6 +704,14 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
 ///
 /// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
 pub(crate) fn permissions_read_grant_join_for(repo_alias: &str, user_ref: &str) -> String {
+    // #1849: a rule counts only when the in-flight request's client IP
+    // satisfies its `allowed_cidrs` condition — the same predicate
+    // `check_repository_action` enforces on the data plane, inlined from the
+    // request scope (`NULL` outside one, which matches nothing).
+    let ip_condition = crate::services::permission_service::ip_condition_sql(
+        "p",
+        &crate::services::permission_service::request_ip_sql_ref(),
+    );
     format!(
         r#"FROM repositories {repo_alias}
             JOIN permissions p
@@ -566,7 +726,8 @@ pub(crate) fn permissions_read_grant_join_for(repo_alias: &str, user_ref: &str) 
                     OR (p.principal_type = 'group' AND p.principal_id IN (
                         SELECT group_id FROM user_group_members WHERE user_id = {user_ref}
                     ))
-                 )"#
+                 )
+              {ip_condition}"#
     )
 }
 
@@ -633,13 +794,22 @@ pub(crate) fn build_visibility_clause_for(
     user_param: usize,
 ) -> (String, VisibilityBind) {
     match visibility {
-        RepoVisibility::PublicOnly => ("is_public = true".to_string(), VisibilityBind::User(None)),
+        RepoVisibility::PublicOnly => (
+            "visibility = 'public'".to_string(),
+            VisibilityBind::User(None),
+        ),
         RepoVisibility::All => ("true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::User(user_id) => {
             let grants = build_grant_predicate(table_alias, user_param);
+            // `visibility <> 'private'` is the authenticated read baseline:
+            // `public` and `internal` both admit this caller with no grant.
+            // The shorthand is correct HERE because this arm has no token-scope
+            // conjunct to bypass -- a repo-scoped token is the separate `Ids`
+            // variant, which is `in_scope` alone and confines `internal` like
+            // anything else.
             let clause = format!(
                 r#"(
-                is_public = true
+                visibility <> 'private'
                 OR {grants}
             )"#
             );
@@ -674,7 +844,7 @@ pub(crate) fn build_visibility_clause_for(
 /// The `Principal` clause is
 ///
 /// ```text
-/// (is_public = true OR (<scope> AND <entitlement>))
+/// (visibility = 'public' OR (<scope> AND (visibility <> 'private' OR <entitlement>)))
 /// ```
 ///
 /// with `<scope>` = `true` for an unrestricted token or
@@ -687,28 +857,75 @@ pub(crate) fn build_member_visibility_clause(
     table_alias: &str,
     first_param: usize,
 ) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
+    render_member_visibility_clause(visibility, table_alias, first_param, None)
+}
+
+/// [`build_member_visibility_clause`] for the members of a virtual repository
+/// summed as part of THAT virtual (the storage aggregate), with the #4559
+/// parent term: `<scope>` becomes
+///
+/// ```text
+/// ({alias}.id = ANY($scope) OR {routed_virtual_expr} = ANY($scope))
+/// ```
+///
+/// so a token whose scope names the virtual counts the members its owner may
+/// read, exactly as `member_passes_token_scope` admits them on the listing and
+/// content paths. `routed_virtual_expr` is a fixed SQL expression naming the
+/// virtual being aggregated (`$1` in the per-repo walk, the CTE's `root_id` in
+/// the batch); it is never caller input. The grant half and the `public` arm
+/// are unchanged, and an unrestricted principal renders the same clause as
+/// [`build_member_visibility_clause`].
+pub(crate) fn build_member_visibility_clause_through(
+    visibility: &MemberVisibility,
+    table_alias: &str,
+    first_param: usize,
+    routed_virtual_expr: &'static str,
+) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
+    render_member_visibility_clause(
+        visibility,
+        table_alias,
+        first_param,
+        Some(routed_virtual_expr),
+    )
+}
+
+fn render_member_visibility_clause(
+    visibility: &MemberVisibility,
+    table_alias: &str,
+    first_param: usize,
+    routed_virtual_expr: Option<&'static str>,
+) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
     match visibility {
         MemberVisibility::Unfiltered => ("true".to_string(), None, None),
-        MemberVisibility::Anonymous => ("is_public = true".to_string(), None, None),
+        MemberVisibility::Anonymous => ("visibility = 'public'".to_string(), None, None),
         MemberVisibility::Principal {
             user_id,
             is_admin,
             allowed_repo_ids,
         } => {
             let scope_param = first_param + 1;
-            let scope = match allowed_repo_ids {
-                None => "true".to_string(),
-                Some(_) => format!("{table_alias}.id = ANY(${scope_param})"),
+            let scope = match (allowed_repo_ids, routed_virtual_expr) {
+                (None, _) => "true".to_string(),
+                (Some(_), None) => format!("{table_alias}.id = ANY(${scope_param})"),
+                (Some(_), Some(parent)) => format!(
+                    "({table_alias}.id = ANY(${scope_param}) OR {parent} = ANY(${scope_param}))"
+                ),
             };
             let entitlement = if *is_admin {
                 "true".to_string()
             } else {
                 build_grant_predicate(table_alias, first_param)
             };
+            // `internal` sits INSIDE the scope conjunct, not alongside the
+            // `public` disjunct. Public bypasses the token scope because an
+            // anonymous caller is served the member anyway (#3704); internal
+            // gives an anonymous caller nothing, so the scope stays a ceiling
+            // and only the GRANT requirement is lifted. This is `require_visible`
+            // verbatim: public before the scope check, internal after it.
             let clause = format!(
                 r#"(
-                is_public = true
-                OR ({scope} AND {entitlement})
+                visibility = 'public'
+                OR ({scope} AND (visibility <> 'private' OR {entitlement}))
             )"#
             );
             // The user bind is only referenced by the non-admin entitlement
@@ -750,6 +967,9 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "conan" => Some(RepositoryFormat::Conan),
         "cargo" => Some(RepositoryFormat::Cargo),
         "generic" => Some(RepositoryFormat::Generic),
+        "github" => Some(RepositoryFormat::Github),
+        "mise" => Some(RepositoryFormat::Mise),
+        "aqua" => Some(RepositoryFormat::Aqua),
         "podman" => Some(RepositoryFormat::Podman),
         "buildx" => Some(RepositoryFormat::Buildx),
         "oras" => Some(RepositoryFormat::Oras),
@@ -784,6 +1004,7 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "cran" => Some(RepositoryFormat::Cran),
         "vagrant" => Some(RepositoryFormat::Vagrant),
         "opkg" => Some(RepositoryFormat::Opkg),
+        "pacman" => Some(RepositoryFormat::Pacman),
         "p2" => Some(RepositoryFormat::P2),
         "bazel" => Some(RepositoryFormat::Bazel),
         "protobuf" => Some(RepositoryFormat::Protobuf),
@@ -895,6 +1116,35 @@ where
     Ok(false)
 }
 
+/// The storage figures a repository response displays (#4423).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayStorageUsage {
+    /// Bytes stored in the repository itself; 0 for a virtual repository.
+    /// Summing this over repositories never counts a byte twice.
+    pub own_bytes: i64,
+    /// For a virtual repository only: the union of the bytes of the members
+    /// the caller can see (#2785, #3081). `None` for every other type.
+    pub member_bytes: Option<i64>,
+}
+
+impl DisplayStorageUsage {
+    /// A non-virtual repository's own figure.
+    pub fn own(own_bytes: i64) -> Self {
+        Self {
+            own_bytes,
+            member_bytes: None,
+        }
+    }
+
+    /// A virtual repository: no own bytes, `member_bytes` through its members.
+    pub fn virtual_repo(member_bytes: i64) -> Self {
+        Self {
+            own_bytes: 0,
+            member_bytes: Some(member_bytes),
+        }
+    }
+}
+
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
@@ -913,6 +1163,21 @@ impl RepositoryService {
     /// Create a new repository service with search indexing support.
     pub fn new_with_search(db: PgPool, search_service: Option<Arc<OpenSearchService>>) -> Self {
         Self { db, search_service }
+    }
+
+    /// Anonymous read decision (#1849): does an anonymous read rule —
+    /// `principal_type = 'anonymous'`, optionally narrowed by
+    /// `conditions.allowed_cidrs` — grant read on this repository (directly
+    /// or via its owning project) for the in-flight request's client IP?
+    ///
+    /// This is the anonymous arm of the canonical visibility gate
+    /// (`require_visible`'s `None` branch): it widens nothing for
+    /// authenticated callers and fails closed outside a request scope
+    /// (conditioned rules match nothing there).
+    pub async fn anonymous_can_read_repo(&self, repo_id: Uuid) -> Result<bool> {
+        crate::services::permission_service::PermissionService::new(self.db.clone())
+            .check_anonymous_repository_action(repo_id, "read")
+            .await
     }
 
     /// Set the search service for search indexing.
@@ -974,6 +1239,39 @@ impl RepositoryService {
 
     /// Create a new repository
     pub async fn create(&self, req: CreateRepositoryRequest) -> Result<Repository> {
+        self.create_with_repodata_depth(req, 0).await
+    }
+
+    pub async fn create_with_repodata_depth(
+        &self,
+        req: CreateRepositoryRequest,
+        repodata_depth: u32,
+    ) -> Result<Repository> {
+        self.create_with_options(req, repodata_depth, true).await
+    }
+
+    /// Create with an explicit choice about the creator's owner auto-grant.
+    ///
+    /// `grant_owner_role = false` still records `created_by` but skips the
+    /// `repository-owner`/`developer` role assignments (#2473). A project
+    /// admin's access to a repository it creates must come only from its
+    /// revocable project grant: an owner role carries `admin`, which
+    /// `check_repository_action` honours regardless of project rules, so it
+    /// would outlive the creator's removal from the project.
+    pub async fn create_with_options(
+        &self,
+        req: CreateRepositoryRequest,
+        repodata_depth: u32,
+        grant_owner_role: bool,
+    ) -> Result<Repository> {
+        crate::services::rpm_layout::validate_depth(repodata_depth)?;
+        if repodata_depth > 0
+            && (req.format != RepositoryFormat::Rpm || req.repo_type != RepositoryType::Local)
+        {
+            return Err(AppError::UnprocessableEntity(
+                crate::services::rpm_layout::UNSUPPORTED.into(),
+            ));
+        }
         // Validate remote repository has upstream URL and it is safe to contact
         validate_remote_upstream(&req.repo_type, &req.upstream_url, &req.format)?;
 
@@ -1032,15 +1330,16 @@ impl RepositoryService {
             INSERT INTO repositories (
                 key, name, description, format, repo_type,
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, promotion_only, versioning_enabled,
+                visibility, quota_bytes, promotion_only, versioning_enabled,
                 project_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13)
             RETURNING
                 id, key, name, description,
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1056,7 +1355,7 @@ impl RepositoryService {
             req.storage_backend,
             req.storage_path,
             req.upstream_url,
-            req.is_public,
+            req.visibility as _,
             req.quota_bytes,
             req.promotion_only,
             req.versioning_enabled,
@@ -1116,17 +1415,23 @@ impl RepositoryService {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| AppError::Database(e.to_string()))?;
-                    sqlx::query(
-                        "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-                         SELECT $1, r.id, $2 FROM roles r \
-                         WHERE r.name IN ('repository-owner', 'developer') \
-                         ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
-                    )
-                    .bind(creator_id)
-                    .bind(repo.id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                    if grant_owner_role {
+                        sqlx::query(
+                            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                             SELECT $1, r.id, $2 FROM roles r \
+                             WHERE r.name IN ('repository-owner', 'developer') \
+                             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+                        )
+                        .bind(creator_id)
+                        .bind(repo.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    }
+                }
+                if repodata_depth > 0 {
+                    crate::services::rpm_layout::set_depth(&mut tx, repo.id, repodata_depth)
+                        .await?;
                 }
                 tx.commit()
                     .await
@@ -1323,6 +1628,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1352,6 +1658,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1412,6 +1719,7 @@ impl RepositoryService {
                 id, key, name, description,
                 format, repo_type,
                 storage_backend, storage_path, upstream_url,
+                visibility,
                 is_public, quota_bytes, promotion_only,
                 replication_priority,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1479,6 +1787,15 @@ impl RepositoryService {
 
     /// Update a repository
     pub async fn update(&self, id: Uuid, req: UpdateRepositoryRequest) -> Result<Repository> {
+        self.update_with_repodata_depth(id, req, None).await
+    }
+
+    pub async fn update_with_repodata_depth(
+        &self,
+        id: Uuid,
+        req: UpdateRepositoryRequest,
+        repodata_depth: Option<u32>,
+    ) -> Result<Repository> {
         // Validate upstream_url is safe to contact if it is being updated.
         // `UpdateRepositoryRequest` carries neither `repo_type` nor `format`
         // (both are immutable after creation), so load the existing row to
@@ -1488,6 +1805,40 @@ impl RepositoryService {
             validate_remote_upstream(&existing.repo_type, &req.upstream_url, &existing.format)?;
         }
 
+        let mut tx = self.db.begin().await?;
+        if let Some(ref new_url) = req.upstream_url {
+            // #4467: never re-target stored upstream-auth credentials at a host
+            // they were not configured for. Checked in this transaction with
+            // the repository row locked; `save_upstream_auth` takes a share
+            // lock on the same row, so a concurrent credential write either
+            // lands first (and this sees it) or waits for this commit.
+            let stored: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT upstream_url FROM repositories WHERE id = $1 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(stored) = stored {
+                if upstream_url_origin_changes(stored.as_deref(), new_url)
+                    && crate::services::upstream_auth::get_upstream_auth_type_in(&mut tx, id)
+                        .await?
+                        .is_some()
+                {
+                    return Err(AppError::Conflict(
+                        UPSTREAM_ORIGIN_CHANGE_WITH_AUTH.to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(depth) = repodata_depth {
+            // Re-sending the current depth is a no-op and must stay one: the
+            // config write takes the exclusive layout lock, which would refuse
+            // an unrelated edit (409) while an upload holds the shared lock,
+            // and make that upload fail in turn.
+            if crate::services::rpm_layout::depth_change_requested(&mut tx, id, depth).await? {
+                crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
+            }
+        }
         let repo = sqlx::query_as!(
             Repository,
             r#"
@@ -1504,6 +1855,11 @@ impl RepositoryService {
                 project_id = COALESCE($10, project_id),
                 curation_enabled = COALESCE($11, curation_enabled),
                 curation_default_action = COALESCE($12, curation_default_action),
+                -- Written ONLY when the caller supplied `visibility`. A legacy
+                -- client's `is_public` above is left to the database trigger,
+                -- which derives from whichever column actually changed and so
+                -- leaves an `internal` repository alone.
+                visibility = COALESCE($13::repository_visibility, visibility),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -1511,6 +1867,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1530,8 +1887,9 @@ impl RepositoryService {
             req.project_id.flatten(),
             req.curation_enabled,
             req.curation_default_action,
+            req.visibility as _,
         )
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
             if is_duplicate_key_error(&e.to_string()) {
@@ -1554,7 +1912,7 @@ impl RepositoryService {
             )
             .bind(gpg_key.as_deref())
             .bind(id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
@@ -1568,10 +1926,12 @@ impl RepositoryService {
             )
             .bind(allow_unverified)
             .bind(id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
+
+        tx.commit().await?;
 
         // #2516 S2: quota admission trusts the usage-ledger counters. While a
         // repository sits at unlimited quota the admission fast path never
@@ -1946,6 +2306,7 @@ impl RepositoryService {
                 r.format as "format: RepositoryFormat",
                 r.repo_type as "repo_type: RepositoryType",
                 r.storage_backend, r.storage_path, r.upstream_url,
+                r.visibility as "visibility: RepositoryVisibility",
                 r.is_public, r.quota_bytes, r.promotion_only,
                 r.replication_priority as "replication_priority: ReplicationPriority",
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
@@ -1966,6 +2327,55 @@ impl RepositoryService {
         Ok(repos)
     }
 
+    /// Keys of EVERY virtual repository that transitively contains `repo_id`
+    /// as a member — the recursive ancestor walk (#3840).
+    ///
+    /// Cache-invalidation paths (the npm packument cache, the cargo index
+    /// cache) must reach every ancestor virtual, not only the direct parents:
+    /// with nested virtuals a write to a leaf changes the document the TOP of
+    /// the chain serves too, and a single-level walk leaves those entries
+    /// stale. `UNION` de-duplicates by ancestor id, so even a cycle in the
+    /// stored graph (impossible through the API — the write-time guard
+    /// refuses it — but possible through direct table manipulation)
+    /// terminates in O(virtuals) instead of looping. Over-invalidation is
+    /// deliberate: the walk does not restrict itself to well-formed chains,
+    /// because a missed invalidation serves stale content while a spurious
+    /// one costs one recompute.
+    ///
+    /// Degrades to an empty list on error, matching the inline queries this
+    /// replaces: the owning repository's own entry is still invalidated by
+    /// the caller and ancestor entries age out through their TTL floor.
+    pub async fn virtual_ancestor_keys(&self, repo_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE ancestors AS (
+                SELECT vrm.virtual_repo_id
+                  FROM virtual_repo_members vrm
+                 WHERE vrm.member_repo_id = $1
+                UNION
+                SELECT vrm.virtual_repo_id
+                  FROM ancestors
+                  JOIN virtual_repo_members vrm
+                    ON vrm.member_repo_id = ancestors.virtual_repo_id
+            )
+            SELECT r.key
+              FROM ancestors
+              JOIN repositories r ON r.id = ancestors.virtual_repo_id
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_all(&self.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "virtual ancestor lookup failed; ancestor virtuals converge on TTL"
+            );
+            Vec::new()
+        })
+    }
+
     /// Get repository storage usage
     pub async fn get_storage_usage(&self, repo_id: Uuid) -> Result<i64> {
         // #2218: single-repo sibling of the list-endpoint UNION. Proxy-cached
@@ -1983,14 +2393,22 @@ impl RepositoryService {
         // repos counts in each of them; physical-footprint dedup on shared
         // cloud backends is the refresher's `DedupScope` concern, not this
         // SUM's.
-        let usage = sqlx::query_scalar!(
+        //
+        // #4483 / #4545: OCI manifest rows (`oci-manifests/%` keys) are NOT
+        // counted. Their `size_bytes` is the IMAGE size (#3601), whose config
+        // and layer bytes the `oci_blobs` branch already counts, so including
+        // them counted every image twice and once more per extra tag. Same
+        // rule as the stats refresher (#3286) and the ledger (migration 288).
+        // Runtime-checked: the predicate is shared with the ledger SQL.
+        let usage: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
+            SELECT COALESCE(SUM(bytes), 0)::BIGINT
             FROM (
                 SELECT size_bytes AS bytes
                   FROM artifacts
                  WHERE repository_id = $1 AND is_deleted = false
                    AND storage_key NOT LIKE 'proxy-cache/%'
+                   AND storage_key NOT LIKE 'oci-manifests/%'
                 UNION ALL
                 SELECT size_bytes AS bytes
                   FROM proxy_cache_artifacts
@@ -2001,8 +2419,8 @@ impl RepositoryService {
                  WHERE repository_id = $1
             ) t
             "#,
-            repo_id
         )
+        .bind(repo_id)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2010,30 +2428,33 @@ impl RepositoryService {
         Ok(usage)
     }
 
-    /// Storage figure to DISPLAY for `repo` (issue #2785).
+    /// Storage figures to DISPLAY for `repo` (issues #2785, #4423).
     ///
     /// A virtual repository owns no `artifacts` / `proxy_cache_artifacts` /
     /// `oci_blobs` rows of its own — its content is whatever resolves through
-    /// its members. A plain `get_storage_usage(virtual_id)` therefore reports
-    /// the virtual's *own* rows (effectively zero) even though browsing the
-    /// virtual surfaces real member data, so the detail view showed a total
-    /// that did not match the combined total of its child repos. For a virtual
-    /// repo we instead sum over the union of its resolvable member contents;
-    /// every other repo type keeps the existing per-repo figure unchanged.
+    /// its members. Its OWN figure is therefore 0, so a client (or the project
+    /// rollup) that sums `storage_used_bytes` over repositories counts every
+    /// byte once, in the member that stores it (#4423). The union of its
+    /// resolvable member contents (#2785) is reported separately as
+    /// [`DisplayStorageUsage::member_bytes`]. Every other repo type reports
+    /// its own per-repo figure and no member figure.
     ///
     /// `visibility` is the CALLER's member visibility (issue #3081): the
-    /// virtual total is aggregated only over the members that caller is
-    /// allowed to see. It is unused for non-virtual repositories, whose own
+    /// virtual's member total is aggregated only over the members that caller
+    /// is allowed to see. It is unused for non-virtual repositories, whose own
     /// figure is already gated by the handler's `require_visible` check.
     pub async fn get_display_storage_usage(
         &self,
         repo: &Repository,
         visibility: &MemberVisibility,
-    ) -> Result<i64> {
+    ) -> Result<DisplayStorageUsage> {
         if repo.repo_type == RepositoryType::Virtual {
-            self.get_virtual_storage_usage(repo.id, visibility).await
+            let members = self.get_virtual_storage_usage(repo.id, visibility).await?;
+            Ok(DisplayStorageUsage::virtual_repo(members))
         } else {
-            self.get_storage_usage(repo.id).await
+            Ok(DisplayStorageUsage::own(
+                self.get_storage_usage(repo.id).await?,
+            ))
         }
     }
 
@@ -2069,6 +2490,11 @@ impl RepositoryService {
     /// [`MemberVisibility::Unfiltered`] (internal oracles/reconcilers) produces
     /// the literal `true` clause, i.e. the unfiltered pre-#3081 sum.
     ///
+    /// The scope half carries the #4559 parent term
+    /// ([`build_member_visibility_clause_through`] keyed on `$1`): a token
+    /// whose scope names THIS virtual counts the leaves its owner may read,
+    /// as the listing and the download through the virtual admit them.
+    ///
     /// Only the LEAVES are filtered — the membership walk itself is unchanged,
     /// so an invisible intermediate virtual still contributes the leaves the
     /// caller *can* see.
@@ -2080,7 +2506,7 @@ impl RepositoryService {
         // `$2` = user id, `$3` = token scope, `$4` = depth. The bind order is
         // the same for every variant; an unreferenced bind is a typed NULL.
         let (visibility_clause, user_id_bind, scope_bind) =
-            build_member_visibility_clause(visibility, "leaf", 2);
+            build_member_visibility_clause_through(visibility, "leaf", 2, "$1");
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(repo_id, depth) AS (
@@ -2111,6 +2537,7 @@ impl RepositoryService {
                  WHERE repository_id IN (SELECT id FROM leaves)
                    AND is_deleted = false
                    AND storage_key NOT LIKE 'proxy-cache/%'
+                   AND storage_key NOT LIKE 'oci-manifests/%'
                 UNION ALL
                 SELECT size_bytes AS bytes
                   FROM proxy_cache_artifacts
@@ -2171,7 +2598,7 @@ impl RepositoryService {
         // clause, so an internal read is byte-identical to the pre-#3081
         // aggregate. `$2` = user id, `$3` = token scope, `$4` = depth.
         let (visibility_clause, user_id_bind, scope_bind) =
-            build_member_visibility_clause(visibility, "leaf", 2);
+            build_member_visibility_clause_through(visibility, "leaf", 2, "reachable.root_id");
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(root_id, repo_id, depth) AS (
@@ -2327,17 +2754,73 @@ impl RepositoryService {
     ///   invariant to repository size. This is the unlocked best-effort
     ///   preflight; the authoritative, race-free admission is
     ///   [`Self::check_quota_locked`].
+    ///
+    /// When the repository belongs to a project with a finite
+    /// `projects.quota_bytes` (#2474), the upload must additionally fit under
+    /// the project's aggregate ledger usage across every repository assigned
+    /// to it, so splitting uploads across sibling repositories cannot evade
+    /// the project cap. Use [`Self::quota_preflight`] to learn which quota
+    /// rejected the upload.
     pub async fn check_quota(&self, repo_id: Uuid, additional_bytes: i64) -> Result<bool> {
+        Ok(self
+            .quota_preflight(repo_id, additional_bytes)
+            .await?
+            .is_none())
+    }
+
+    /// Unlocked best-effort quota preflight: `None` when an upload of
+    /// `additional_bytes` fits under the repository quota and (if any) its
+    /// project quota, otherwise the scope that rejects it. The authoritative,
+    /// race-free admission is [`Self::check_quota_locked`].
+    pub async fn quota_preflight(
+        &self,
+        repo_id: Uuid,
+        additional_bytes: i64,
+    ) -> Result<Option<QuotaScope>> {
         let repo = self.get_by_id(repo_id).await?;
-        Ok(Self::quota_allows(
-            repo.quota_bytes,
-            // Only hit the DB for usage when a finite quota is actually set.
-            match repo.quota_bytes {
-                Some(quota) if quota > 0 => self.get_ledger_usage(repo_id).await?,
-                _ => 0,
-            },
+        let repo_quota = finite_quota(repo.quota_bytes);
+        // Only hit the DB for usage when a finite quota is actually set.
+        let repo_usage = match repo_quota {
+            Some(_) => self.get_ledger_usage(repo_id).await?,
+            None => 0,
+        };
+        let (project_quota, project_usage) = match repo.project_id {
+            Some(project_id) => {
+                let quota: Option<i64> = sqlx::query_scalar!(
+                    "SELECT quota_bytes FROM projects WHERE id = $1",
+                    project_id
+                )
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .flatten();
+                match finite_quota(quota) {
+                    Some(quota) => (
+                        Some(quota),
+                        self.get_project_ledger_usage(project_id).await?,
+                    ),
+                    None => (None, 0),
+                }
+            }
+            None => (None, 0),
+        };
+        Ok(Self::quota_denial(
+            QuotaUsage::new(repo_quota, repo_usage),
+            QuotaUsage::new(project_quota, project_usage),
             additional_bytes,
         ))
+    }
+
+    /// Unlocked aggregate ledger usage of every repository assigned to
+    /// `project_id` (#2474). Repositories that have no ledger row yet fall
+    /// back to their live sum ([`Self::get_storage_usage`]), mirroring
+    /// [`Self::get_ledger_usage`].
+    async fn get_project_ledger_usage(&self, project_id: Uuid) -> Result<i64> {
+        let (mut total, unseeded) = Self::project_ledger_rows(&self.db, project_id).await?;
+        for repo_id in unseeded {
+            total += self.get_storage_usage(repo_id).await?;
+        }
+        Ok(total)
     }
 
     /// Unlocked O(1) usage read for quota preflight (#2516 S2): the sum of
@@ -2374,6 +2857,30 @@ impl RepositoryService {
             Some(quota) if quota > 0 => current_usage + additional_bytes <= quota,
             // NULL or a non-positive sentinel (0 / negative) => unlimited.
             _ => true,
+        }
+    }
+
+    /// Pure two-level quota decision (#2474): `None` when an upload of
+    /// `additional_bytes` fits under both the repository quota and the
+    /// project quota, otherwise the scope that rejects it (repository first).
+    /// Each level follows [`Self::quota_allows`] semantics, so an unset or
+    /// non-positive quota at either level never rejects.
+    pub(crate) fn quota_denial(
+        repo: QuotaUsage,
+        project: QuotaUsage,
+        additional_bytes: i64,
+    ) -> Option<QuotaScope> {
+        // An upload that adds no bytes (a re-push of identical content, a
+        // shrinking overwrite) is always admitted, even when usage is already
+        // over a quota that was lowered or never enforced (#4422).
+        if additional_bytes <= 0 {
+            None
+        } else if !Self::quota_allows(repo.quota_bytes, repo.used_bytes, additional_bytes) {
+            Some(QuotaScope::Repository)
+        } else if !Self::quota_allows(project.quota_bytes, project.used_bytes, additional_bytes) {
+            Some(QuotaScope::Project)
+        } else {
+            None
         }
     }
 
@@ -2431,8 +2938,19 @@ impl RepositoryService {
     /// `(repository_id, path)`), so an in-place overwrite is charged only its
     /// size delta rather than double-counting the bytes it replaces.
     ///
-    /// A `None`/non-positive quota means unlimited: the call returns
-    /// `allowed = true` without locking or touching the ledger.
+    /// Project quota (#2474): when the repository belongs to a project whose
+    /// `quota_bytes` is finite, the upload must also fit under the project's
+    /// aggregate ledger usage (every repository with that `project_id`, net
+    /// of the bytes at the target path). The `projects` row is locked
+    /// `FOR UPDATE` before any ledger row, so concurrent uploads into
+    /// different repositories of the same capped project serialize and the
+    /// later one observes the earlier one's committed charge — splitting
+    /// uploads across sibling repositories cannot over-admit. Proxy-cache and
+    /// OCI-blob bytes are part of the ledger, so they count toward the
+    /// project total exactly as they do toward a repository quota.
+    ///
+    /// A `None`/non-positive quota at both levels means unlimited: the call
+    /// returns `allowed = true` without locking or touching the ledger.
     pub async fn check_quota_locked(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -2440,80 +2958,177 @@ impl RepositoryService {
         path: &str,
         new_size: i64,
     ) -> Result<QuotaAdmission> {
-        let quota_bytes: Option<i64> = sqlx::query_scalar!(
-            "SELECT quota_bytes FROM repositories WHERE id = $1",
+        let repo = sqlx::query!(
+            "SELECT quota_bytes, project_id FROM repositories WHERE id = $1",
             repo_id
         )
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        let repo_quota = finite_quota(repo.quota_bytes);
 
-        let quota = match quota_bytes {
-            Some(quota) if quota > 0 => quota,
-            // NULL or a non-positive sentinel => unlimited: nothing to lock or
-            // count.
-            _ => {
-                return Ok(QuotaAdmission {
-                    allowed: true,
-                    base_usage: None,
-                })
-            }
+        // Project-wide quota (#2474). Lock ordering: the project row is
+        // locked BEFORE any ledger row, so every quota-checked upload into any
+        // repository of a capped project serializes here first; sibling
+        // uploads can therefore never both pass against the same pre-upload
+        // aggregate. The `quota_bytes > 0` predicate means only a project
+        // that actually has a finite quota is locked: unlimited projects add
+        // no serialization. The lock is held until the caller commits.
+        let project_quota: Option<(Uuid, i64)> = match repo.project_id {
+            Some(project_id) => sqlx::query_scalar!(
+                r#"SELECT quota_bytes as "quota_bytes!" FROM projects
+                    WHERE id = $1 AND quota_bytes > 0 FOR UPDATE"#,
+                project_id
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .map(|quota| (project_id, quota)),
+            None => None,
         };
+
+        if repo_quota.is_none() && project_quota.is_none() {
+            // NULL or a non-positive sentinel at both levels => unlimited:
+            // nothing to lock or count.
+            return Ok(QuotaAdmission {
+                allowed: true,
+                denied_by: None,
+                base_usage: None,
+            });
+        }
 
         // Serialize same-repo admissions on the ledger row and read the
         // maintained counters under that lock: a primary-key lookup, O(1) in
         // repository size. The lock is held until the caller commits (after
-        // its artifact INSERT).
-        let locked = sqlx::query!(
-            "SELECT hosted_bytes, proxy_bytes, oci_bytes \
-               FROM repository_usage_ledger \
-              WHERE repository_id = $1 FOR UPDATE",
-            repo_id
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let total: i64 = match locked {
-            Some(row) => row.hosted_bytes + row.proxy_bytes + row.oci_bytes,
-            // Pre-ledger repository (no row yet): lazy-create it seeded from
-            // the authoritative live sums, NOT from column defaults — a
-            // zero-seeded row would admit everything until the first
-            // reconcile pass. One-time O(rows) for the first quota-checked
-            // upload; every later admission takes the O(1) branch above. The
-            // helper locks the row first and leaves it locked in `tx`.
-            None => {
-                let (hosted, proxy, oci) = Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
-                hosted + proxy + oci
+        // its artifact INSERT). Taken only when the repository itself has a
+        // finite quota; a project-only quota serializes on the project row.
+        let repo_total: Option<i64> = match repo_quota {
+            Some(_) => {
+                let locked = sqlx::query!(
+                    "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+                       FROM repository_usage_ledger \
+                      WHERE repository_id = $1 FOR UPDATE",
+                    repo_id
+                )
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                Some(match locked {
+                    Some(row) => row.hosted_bytes + row.proxy_bytes + row.oci_bytes,
+                    // Pre-ledger repository (no row yet): lazy-create it
+                    // seeded from the authoritative live sums, NOT from
+                    // column defaults — a zero-seeded row would admit
+                    // everything until the first reconcile pass. One-time
+                    // O(rows) for the first quota-checked upload; every later
+                    // admission takes the O(1) branch above. The helper locks
+                    // the row first and leaves it locked in `tx`.
+                    None => {
+                        let (hosted, proxy, oci) =
+                            Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
+                        hosted + proxy + oci
+                    }
+                })
             }
+            None => None,
+        };
+
+        // Aggregate ledger usage across every repository in the project,
+        // read after the project lock (and this repository's ledger lock, if
+        // any) so it observes every previously admitted sibling upload.
+        let project_total: Option<i64> = match project_quota {
+            Some((project_id, _)) => Some(Self::project_ledger_usage_in_tx(tx, project_id).await?),
+            None => None,
         };
 
         // Net-delta accounting for overwrites: subtract the bytes already
         // charged for the (repository_id, path) row we are about to replace.
-        let existing_at_path: i64 = sqlx::query_scalar!(
+        // Same hosted predicate as the ledger (#4483: OCI manifest rows are
+        // not charged).
+        let existing_at_path: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
               FROM artifacts
              WHERE repository_id = $1 AND path = $2 AND is_deleted = false
                AND storage_key NOT LIKE 'proxy-cache/%'
+               AND storage_key NOT LIKE 'oci-manifests/%'
             "#,
-            repo_id,
-            path
         )
+        .bind(repo_id)
+        .bind(path)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let base_usage = total - existing_at_path;
-        let allowed = Self::quota_allows(Some(quota), base_usage, new_size);
+        let base_usage = repo_total.map(|total| total - existing_at_path);
+        // Charged the NET delta against the full usage (the same sum as the
+        // base usage plus the new size), so an upload that adds no bytes is
+        // admitted even over the cap (#4422).
+        let denied_by = Self::quota_denial(
+            QuotaUsage::new(repo_quota, repo_total.unwrap_or(0)),
+            QuotaUsage::new(
+                project_quota.map(|(_, quota)| quota),
+                project_total.unwrap_or(0),
+            ),
+            new_size - existing_at_path,
+        );
         // No manual charge here: the caller's artifact INSERT (same
-        // transaction, made while the row lock taken above is still held)
+        // transaction, made while the row locks taken above are still held)
         // fires migration 182's trigger, which applies the exact delta to
         // `hosted_bytes` before the transaction commits.
         Ok(QuotaAdmission {
-            allowed,
-            base_usage: Some(base_usage),
+            allowed: denied_by.is_none(),
+            denied_by,
+            base_usage,
         })
+    }
+
+    /// One indexed pass over a project's repositories
+    /// (`idx_repositories_project_id`) joined to their ledger rows: the sum
+    /// of the maintained counters, plus the ids of member repositories that
+    /// have no ledger row yet (callers account for those from live sums).
+    /// Virtual repositories are skipped: they store nothing of their own,
+    /// their members (in this project or not) already carry the bytes, and
+    /// counting them here would double count (#4423).
+    async fn project_ledger_rows<'e, E>(executor: E, project_id: Uuid) -> Result<(i64, Vec<Uuid>)>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let row = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(l.hosted_bytes + l.proxy_bytes + l.oci_bytes), 0)::BIGINT
+                       AS "ledger_bytes!",
+                   COALESCE(ARRAY_AGG(r.id) FILTER (WHERE l.repository_id IS NULL),
+                            '{}'::uuid[]) AS "unseeded!"
+              FROM repositories r
+              LEFT JOIN repository_usage_ledger l ON l.repository_id = r.id
+             WHERE r.project_id = $1
+               AND r.repo_type <> 'virtual'
+            "#,
+            project_id
+        )
+        .fetch_one(executor)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok((row.ledger_bytes, row.unseeded))
+    }
+
+    /// Aggregate ledger usage of every repository assigned to `project_id`,
+    /// read inside the admission transaction (#2474). The caller must already
+    /// hold the project row's `FOR UPDATE` lock. Sibling repositories that
+    /// have no ledger row yet are seeded from their live sums via
+    /// [`Self::reconcile_usage_ledger_in_tx`] (one-time, same contract as the
+    /// single-repository admission path), so a pre-ledger sibling is never
+    /// counted as empty.
+    async fn project_ledger_usage_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        project_id: Uuid,
+    ) -> Result<i64> {
+        let (mut total, unseeded) = Self::project_ledger_rows(&mut **tx, project_id).await?;
+        for repo_id in unseeded {
+            let (hosted, proxy, oci) = Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
+            total += hosted + proxy + oci;
+        }
+        Ok(total)
     }
 
     /// Recompute one repository's usage-ledger components from the
@@ -2550,15 +3165,18 @@ impl RepositoryService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let hosted: i64 = sqlx::query_scalar!(
+        // Migration 288's trigger rule (#4483 / #4545): OCI manifest rows
+        // record the image size, whose bytes `oci_bytes` already carries.
+        let hosted: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
               FROM artifacts
              WHERE repository_id = $1 AND is_deleted = false
                AND storage_key NOT LIKE 'proxy-cache/%'
+               AND storage_key NOT LIKE 'oci-manifests/%'
             "#,
-            repo_id
         )
+        .bind(repo_id)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2663,8 +3281,9 @@ impl RepositoryService {
     ///
     /// Same recompute as [`Self::reconcile_usage_ledger`] — deliberately, so
     /// there is ONE definition of what the ledger should contain. It mirrors
-    /// migration 182's trigger rules exactly: `artifacts` counted iff
-    /// `is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`, every
+    /// the ledger trigger rules exactly (migration 182, amended by 288):
+    /// `artifacts` counted iff `is_deleted = false AND storage_key NOT LIKE
+    /// 'proxy-cache/%' AND storage_key NOT LIKE 'oci-manifests/%'`, every
     /// `proxy_cache_artifacts` row, every `oci_blobs` row (the
     /// `pending_delete_at` marker is not a deletion and does not change the
     /// count).
@@ -2818,6 +3437,7 @@ fn map_virtual_member_insert_error(
 /// of files, so a call site added in a NEW module is covered without anyone
 /// remembering to extend a constant. It needs no database and runs in the
 /// offline lib suite.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod action_gate_structural_tests {
     /// Bytes after a `.user_can_access_repo(` call in which its arguments — and
@@ -2993,6 +3613,7 @@ mod action_gate_structural_tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3017,6 +3638,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/repos/test-repo".to_string(),
             upstream_url: None,
+            visibility: RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: Some(1024 * 1024 * 1024),
             promotion_only: false,
@@ -3088,6 +3710,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data".to_string(),
             upstream_url: None,
+            visibility: RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -3157,7 +3780,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/my-repo".to_string(),
             upstream_url: None,
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             quota_bytes: Some(1_000_000_000),
             promotion_only: false,
             format_key: None,
@@ -3185,7 +3808,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/npm-remote".to_string(),
             upstream_url: Some("https://registry.npmjs.org".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             quota_bytes: None,
             promotion_only: false,
             format_key: None,
@@ -3198,7 +3821,158 @@ mod tests {
             req.upstream_url,
             Some("https://registry.npmjs.org".to_string())
         );
-        assert!(!req.is_public);
+        assert_eq!(
+            req.visibility,
+            crate::models::repository::RepositoryVisibility::Private
+        );
+    }
+
+    /// Task 5.5 -- the Terraform-provider path, end to end through the real
+    /// service `update`.
+    ///
+    /// The provider declares `is_public` and sends its whole desired state on
+    /// every apply, so an `internal` repository it manages receives
+    /// `is_public: false` on every run. That must be a no-op, repeatedly. The
+    /// property is easy to lose in a refactor -- writing a derived `visibility`
+    /// alongside the boolean puts the database trigger on its "visibility wins"
+    /// branch and silently narrows the repository -- so it is pinned here
+    /// rather than left to the trigger's own tests.
+    #[tokio::test]
+    async fn legacy_is_public_false_update_leaves_internal_intact() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = RepositoryService::new(pool.clone());
+        let (repo_id, _key, _dir) =
+            crate::api::handlers::test_db_helpers::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+
+        // Two identical "full desired state" applies, exactly as the provider
+        // issues them: every managed field present, `is_public` among them.
+        for pass in 1..=2 {
+            let updated = svc
+                .update(
+                    repo_id,
+                    UpdateRepositoryRequest {
+                        name: Some("managed by terraform".to_string()),
+                        description: Some("tf".to_string()),
+                        visibility: None,
+                        is_public: Some(false),
+                        quota_bytes: Some(Some(1024)),
+                        key: None,
+                        upstream_url: None,
+                        promotion_only: None,
+                        versioning_enabled: None,
+                        project_id: None,
+                        trusted_gpg_key: None,
+                        curation_allow_unverified: None,
+                        curation_enabled: None,
+                        curation_default_action: None,
+                    },
+                )
+                .await
+                .expect("update");
+            assert_eq!(
+                updated.visibility,
+                crate::models::repository::RepositoryVisibility::Internal,
+                "pass {pass}: a legacy is_public=false write must not narrow an \
+                 internal repository"
+            );
+            assert!(!updated.is_public, "pass {pass}: the mirror stays false");
+        }
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// Migration 245 (M1): the UPDATE trigger decides from which VALUE
+    /// changed, not from which columns the statement named. A `visibility`
+    /// written equal to its current value alongside `is_public = true`
+    /// therefore does not win: the `is_public` branch runs and the repository
+    /// lands `public`. This is why the application never writes both columns
+    /// in one statement (`VisibilityUpdate::binds`); the test documents the
+    /// trigger's behaviour so a refactor that starts writing both is caught by
+    /// reading it, and so the trigger's semantics cannot drift silently.
+    #[tokio::test]
+    async fn visibility_trigger_same_value_visibility_with_is_public_true_widens() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) =
+            crate::api::handlers::test_db_helpers::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+        let both = sqlx::query(
+            "UPDATE repositories SET visibility = 'internal', is_public = true WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await;
+        let row: std::result::Result<(String, bool), sqlx::Error> =
+            sqlx::query_as("SELECT visibility::text, is_public FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        both.expect("the pair is accepted by the trigger");
+        assert_eq!(
+            row.expect("read back"),
+            ("public".to_string(), true),
+            "a same-value visibility does not win over is_public = true"
+        );
+    }
+
+    /// Migration 245: the INSERT trigger refuses `is_public = true` with a
+    /// non-public `visibility` instead of resolving the contradiction.
+    #[tokio::test]
+    async fn visibility_trigger_insert_rejects_is_public_true_with_non_public_visibility() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        for visibility in ["internal", "private"] {
+            let id = Uuid::new_v4();
+            let key = format!("vis-insert-{}", &id.to_string()[..8]);
+            let res = sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
+                 is_public, visibility) \
+                 VALUES ($1, $2, $2, $3, 'local', 'generic'::repository_format, true, \
+                 $4::repository_visibility)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(format!("/tmp/{key}"))
+            .bind(visibility)
+            .execute(&pool)
+            .await;
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+
+            let err = res.expect_err("contradictory insert must be refused");
+            let db_err = err.as_database_error().expect("a database error");
+            assert_eq!(
+                db_err.code().as_deref(),
+                Some("23514"),
+                "{visibility}: expected check_violation, got {db_err}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3208,6 +3982,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_all_none() {
         let req = UpdateRepositoryRequest {
+            visibility: None,
             versioning_enabled: None,
             key: None,
             name: None,
@@ -3233,6 +4008,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_partial() {
         let req = UpdateRepositoryRequest {
+            visibility: None,
             versioning_enabled: None,
             key: None,
             name: Some("Updated Name".to_string()),
@@ -3256,6 +4032,7 @@ mod tests {
     fn test_update_repository_request_clear_quota() {
         // quota_bytes: Some(None) should clear the quota
         let req = UpdateRepositoryRequest {
+            visibility: None,
             versioning_enabled: None,
             key: None,
             name: None,
@@ -3293,6 +4070,29 @@ mod tests {
             &RepositoryFormat::Generic,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_remote_upstream_rejects_controls_and_whitespace_4463() {
+        for url in [
+            "\x01https://u:p@upstream.example.test/",
+            "ht\ttps://u:p@upstream.example.test/x",
+            "https://upstream.example.test/a b",
+            "https://upstream.example.test/\n",
+            " https://upstream.example.test/",
+        ] {
+            for repo_type in [RepositoryType::Remote, RepositoryType::Local] {
+                let result = validate_remote_upstream(
+                    &repo_type,
+                    &Some(url.to_string()),
+                    &RepositoryFormat::Generic,
+                );
+                assert!(
+                    matches!(&result, Err(AppError::Validation(m)) if m.contains("whitespace")),
+                    "{url:?} ({repo_type:?}) must be refused, got {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3374,6 +4174,14 @@ mod tests {
         let flat_component = Some("http://apt.example.com/flat/ ./".to_string());
         // A well-formed archive root (apt expands `dists/<suite>/...` beneath).
         let base = Some("http://deb.debian.org/debian".to_string());
+        // #4619: a flat repository's directory (`deb <uri> /`) is accepted.
+        let flat_dir = Some("https://pkgs.k8s.io/core:/stable:/v1.34/deb/".to_string());
+        assert!(validate_remote_upstream(
+            &RepositoryType::Remote,
+            &flat_dir,
+            &RepositoryFormat::Debian
+        )
+        .is_ok());
         let ubuntu = Some("http://archive.ubuntu.com/ubuntu".to_string());
 
         for bad in [&mirror, &mirrorlist, &flat_index, &flat_component] {
@@ -3680,6 +4488,138 @@ mod tests {
     //      again -- the accounting is the live SUM passed as `current_usage`.
     // -----------------------------------------------------------------------
 
+    /// #2474: the two-level decision admits only when the upload fits under
+    /// BOTH the repository and the project quota, reports the repository
+    /// scope first, and treats an unset / non-positive quota at either level
+    /// as unlimited.
+    #[test]
+    fn test_quota_denial_two_level_table() {
+        let u = QuotaUsage::new;
+        // (label, repo, project, additional, expected)
+        let cases: &[(&str, QuotaUsage, QuotaUsage, i64, Option<QuotaScope>)] = &[
+            (
+                "both_unlimited",
+                u(None, 9_999),
+                u(None, 9_999),
+                1 << 40,
+                None,
+            ),
+            ("zero_sentinels", u(Some(0), 5), u(Some(0), 5), 10, None),
+            (
+                "negative_sentinels",
+                u(Some(-1), 5),
+                u(Some(-7), 5),
+                10,
+                None,
+            ),
+            (
+                "fits_both",
+                u(Some(1_000), 400),
+                u(Some(5_000), 4_000),
+                600,
+                None,
+            ),
+            (
+                "exact_both",
+                u(Some(1_000), 400),
+                u(Some(1_000), 400),
+                600,
+                None,
+            ),
+            (
+                "repo_over",
+                u(Some(1_000), 900),
+                u(Some(5_000), 0),
+                101,
+                Some(QuotaScope::Repository),
+            ),
+            (
+                // The split-across-repos evasion: each repo is under its own
+                // (here: unset) quota but the project aggregate is not.
+                "project_over_repo_unlimited",
+                u(None, 0),
+                u(Some(1_000), 600),
+                401,
+                Some(QuotaScope::Project),
+            ),
+            (
+                "project_over_repo_fits",
+                u(Some(1_000), 0),
+                u(Some(1_000), 900),
+                200,
+                Some(QuotaScope::Project),
+            ),
+            (
+                "both_over_reports_repo",
+                u(Some(100), 100),
+                u(Some(100), 100),
+                1,
+                Some(QuotaScope::Repository),
+            ),
+            (
+                "project_unlimited_repo_over",
+                u(Some(10), 10),
+                u(None, 0),
+                1,
+                Some(QuotaScope::Repository),
+            ),
+            (
+                "zero_byte_at_both_caps",
+                u(Some(10), 10),
+                u(Some(10), 10),
+                0,
+                None,
+            ),
+            (
+                // #4422: a zero-delta upload is admitted even over the cap.
+                "zero_byte_already_over_both",
+                u(Some(10), 50),
+                u(Some(10), 50),
+                0,
+                None,
+            ),
+            (
+                "shrinking_overwrite_already_over",
+                u(Some(10), 50),
+                u(None, 0),
+                -20,
+                None,
+            ),
+        ];
+        for (label, repo, project, additional, expected) in cases {
+            assert_eq!(
+                RepositoryService::quota_denial(*repo, *project, *additional),
+                *expected,
+                "case {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_finite_quota_filters_unlimited_sentinels() {
+        assert_eq!(finite_quota(None), None);
+        assert_eq!(finite_quota(Some(0)), None);
+        assert_eq!(finite_quota(Some(-5)), None);
+        assert_eq!(finite_quota(Some(1)), Some(1));
+        assert_eq!(finite_quota(Some(i64::MAX)), Some(i64::MAX));
+    }
+
+    #[test]
+    fn test_quota_scope_exceeded_messages() {
+        assert_eq!(
+            QuotaScope::Repository.exceeded_message(),
+            "Repository storage quota exceeded"
+        );
+        assert_eq!(
+            QuotaScope::Project.exceeded_message(),
+            "Project storage quota exceeded"
+        );
+        assert!(matches!(
+            QuotaScope::Project.into_error(),
+            AppError::QuotaExceeded(msg) if msg == "Project storage quota exceeded"
+        ));
+    }
+
     #[test]
     fn test_quota_allows_table() {
         // (label, quota_bytes, current_usage, additional_bytes, expect_allowed)
@@ -3809,8 +4749,21 @@ mod tests {
     #[test]
     fn test_visibility_public_only_returns_is_public_clause() {
         let (clause, bind) = build_visibility_clause(&RepoVisibility::PublicOnly);
-        assert_eq!(clause, "is_public = true");
+        assert_eq!(clause, "visibility = 'public'");
         assert_eq!(bind, VisibilityBind::User(None));
+    }
+
+    /// The anonymous listing arm must match `public` ONLY. If it ever widened
+    /// to `visibility <> 'private'`, every internal repository on the instance
+    /// would appear in an unauthenticated listing.
+    #[test]
+    fn test_visibility_public_only_never_matches_internal() {
+        let (clause, _) = build_visibility_clause(&RepoVisibility::PublicOnly);
+        assert!(
+            !clause.contains("<>") && !clause.contains("!="),
+            "anonymous listing must be an equality on 'public', got: {clause}"
+        );
+        assert!(!clause.contains("internal"), "got: {clause}");
     }
 
     #[test]
@@ -3824,7 +4777,9 @@ mod tests {
     fn test_visibility_user_returns_subquery_and_user_id() {
         let uid = Uuid::new_v4();
         let (clause, bind) = build_visibility_clause(&RepoVisibility::User(uid));
-        assert!(clause.contains("is_public = true"));
+        // The authenticated read baseline: `public` AND `internal` both admit
+        // this caller with no grant at all.
+        assert!(clause.contains("visibility <> 'private'"));
         assert!(clause.contains("role_assignments"));
         assert!(clause.contains("$3"));
         assert_eq!(bind, VisibilityBind::User(Some(uid)));
@@ -3987,15 +4942,16 @@ mod tests {
         // user_id bound at the requested positional index.
         assert!(clause.contains("ra.user_id = $6"));
         assert!(!clause.contains("$3"));
-        // is_public stays unqualified (unique to repositories, unambiguous in a join).
-        assert!(clause.contains("is_public = true"));
+        // `visibility` stays unqualified (unique to repositories, unambiguous
+        // in a join), exactly as `is_public` did.
+        assert!(clause.contains("visibility <> 'private'"));
         assert_eq!(bind, VisibilityBind::User(Some(uid)));
     }
 
     #[test]
     fn test_visibility_for_public_only_and_all_ignore_alias_and_param() {
         let (clause, bind) = build_visibility_clause_for(&RepoVisibility::PublicOnly, "r", 6);
-        assert_eq!(clause, "is_public = true");
+        assert_eq!(clause, "visibility = 'public'");
         assert_eq!(bind, VisibilityBind::User(None));
 
         let (clause, bind) = build_visibility_clause_for(&RepoVisibility::All, "r", 6);
@@ -4473,7 +5429,7 @@ mod tests {
                 storage_backend: "filesystem".to_string(),
                 storage_path: format!("/tmp/acs-{suffix}"),
                 upstream_url: None,
-                is_public: false,
+                visibility: crate::models::repository::RepositoryVisibility::Private,
                 quota_bytes: None,
                 promotion_only: false,
                 format_key: None,
@@ -4579,6 +5535,7 @@ mod tests {
 
             // update-clear (Some(None)) -> column nulled.
             let clear_req = UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: None,
                 description: None,
@@ -4601,6 +5558,7 @@ mod tests {
 
             // update-set (Some(Some(key))) -> column set again.
             let set_req = UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: None,
                 description: None,
@@ -4624,6 +5582,7 @@ mod tests {
 
             // update with trusted_gpg_key: None -> column left unchanged.
             let noop_req = UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: Some("renamed".to_string()),
                 description: None,
@@ -4684,6 +5643,7 @@ mod tests {
             // A builder for an all-omitted update carrying only the opt-in flag,
             // so each call gets its own owned request (update takes ownership).
             let allow_update = |flag: Option<bool>| UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: None,
                 description: None,
@@ -4749,6 +5709,34 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             cleanup_repo(&pool, repo2.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_create_github_mirror_formats_round_trip() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            for format in [
+                RepositoryFormat::Github,
+                RepositoryFormat::Mise,
+                RepositoryFormat::Aqua,
+            ] {
+                let suffix = uuid::Uuid::new_v4().simple().to_string();
+                let mut req = make_create_req(&suffix, format.clone());
+                req.repo_type = RepositoryType::Remote;
+                req.upstream_url = Some("https://github.com".into());
+                let repo = service.create(req).await.expect("create mirror");
+                assert_eq!(service.get_by_key(&repo.key).await.unwrap().format, format);
+                let label: String =
+                    sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+                        .bind(repo.id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(label, format.as_key());
+                cleanup_repo(&pool, repo.id).await;
+            }
         }
 
         /// `jupyter` is a PyPI alias (#3784): a hosted repository of that
@@ -5598,7 +6586,8 @@ mod tests {
         /// layer/config blobs live in `oci_blobs`, not `artifacts` (only
         /// manifests land there), so the live usage SUM behind
         /// `storage_used_bytes` must include them. On unfixed code this
-        /// returns 700 (manifest only).
+        /// returns 700 (manifest only). The manifest row itself is not
+        /// counted (#4483): it records the image size those blobs make up.
         #[tokio::test]
         async fn test_get_storage_usage_counts_oci_blobs() {
             let Some(pool) = tdh::try_pool().await else {
@@ -5629,7 +6618,85 @@ mod tests {
                 .get_storage_usage(repo.id)
                 .await
                 .expect("storage usage");
-            assert_eq!(usage, 750_700, "manifest (700) + layers (500k + 250k)");
+            assert_eq!(
+                usage, 750_000,
+                "layers (500k + 250k); the manifest row is not counted (#4483)"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #4483 / #4545: an OCI manifest's `artifacts` row records the IMAGE
+        /// size (config + layers, #3601), and those bytes are already counted
+        /// once through `oci_blobs`. Neither the live usage SUM nor the
+        /// trigger-maintained ledger (and so quota) may count them again:
+        /// `oci-manifests/%` rows are excluded, the #3286 rule the storage
+        /// stats refresher already applies. Two tags of the same image add
+        /// nothing. A non-manifest `artifacts` row in the same repository
+        /// still counts.
+        #[tokio::test]
+        async fn test_oci_manifest_rows_do_not_double_count_image_bytes_4483() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            // One image: a 37-byte config and a 17-byte layer (54 bytes),
+            // tagged twice; each tag row records the 54-byte image size.
+            let config = format!("sha256:{}", Uuid::new_v4().simple());
+            let layer = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &config, 37).await;
+            insert_oci_blob(&pool, repo.id, &layer, 17).await;
+            for tag in ["v1", "latest"] {
+                insert_artifact(
+                    &pool,
+                    repo.id,
+                    &format!("v2/img/manifests/{tag}"),
+                    "oci-manifests/sha256:4483",
+                    54,
+                )
+                .await;
+            }
+            // A non-manifest row (e.g. a generic file) still counts.
+            insert_artifact(&pool, repo.id, "notes/readme.txt", "cas/48/83", 100).await;
+
+            assert_eq!(
+                service.get_storage_usage(repo.id).await.expect("usage"),
+                154,
+                "live usage: blobs once (54) + the generic row (100)"
+            );
+            let (hosted, proxy, oci) = ledger_row(&pool, repo.id).await;
+            assert_eq!(
+                (hosted, proxy, oci),
+                (100, 0, 54),
+                "trigger-maintained ledger must not charge manifest rows"
+            );
+            assert_eq!(
+                service
+                    .reconcile_usage_ledger(repo.id)
+                    .await
+                    .expect("reconcile"),
+                154,
+                "the reconciler's recompute agrees with the triggers"
+            );
+            assert_eq!(ledger_row(&pool, repo.id).await, (100, 0, 54));
+
+            // Soft-deleting a manifest row moves nothing either.
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true \
+                 WHERE repository_id = $1 AND path = 'v2/img/manifests/latest'",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("soft delete tag row");
+            assert_eq!(ledger_row(&pool, repo.id).await, (100, 0, 54));
 
             cleanup_repo(&pool, repo.id).await;
         }
@@ -5764,7 +6831,8 @@ mod tests {
                 .await
                 .expect("create m2");
 
-            // m1: a manifest artifact (700) + a 500k layer. m2: a 250k layer.
+            // m1: a manifest artifact (700, not counted: it records the image
+            // size its blobs make up, #4483) + a 500k layer. m2: a 250k layer.
             insert_artifact(
                 &pool,
                 m1.id,
@@ -5799,12 +6867,12 @@ mod tests {
 
             let m1_usage = service.get_storage_usage(m1.id).await.expect("m1 usage");
             let m2_usage = service.get_storage_usage(m2.id).await.expect("m2 usage");
-            assert_eq!(m1_usage, 500_700);
+            assert_eq!(m1_usage, 500_000);
             assert_eq!(m2_usage, 250_000);
 
             // Pre-fix behaviour the customer saw: the virtual owns no artifact
             // rows, so the plain per-repo figure is 0 despite the members
-            // holding 750,700 bytes of resolvable content.
+            // holding 750,000 bytes of resolvable content.
             assert_eq!(
                 service.get_storage_usage(virt.id).await.expect("virt own"),
                 0,
@@ -5827,8 +6895,9 @@ mod tests {
                     .get_display_storage_usage(&virt, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display"),
-                combined,
-                "display helper unions members for a virtual repo"
+                DisplayStorageUsage::virtual_repo(combined),
+                "display helper reports no own bytes and the member union for a virtual \
+                 repo (#4423)"
             );
             // A non-virtual repo keeps its own per-repo figure via the helper.
             assert_eq!(
@@ -5836,7 +6905,7 @@ mod tests {
                     .get_display_storage_usage(&m1, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display m1"),
-                m1_usage
+                DisplayStorageUsage::own(m1_usage)
             );
 
             cleanup_repo(&pool, virt.id).await;
@@ -6273,6 +7342,105 @@ mod tests {
             cleanup_repo(&pool, a.id).await;
             cleanup_repo(&pool, b.id).await;
             cleanup_repo(&pool, c.id).await;
+        }
+
+        /// #3840: cache invalidation must reach EVERY ancestor virtual, not
+        /// only the direct parents — with nested virtuals a leaf write
+        /// changes the document the top of the chain serves too. The walk
+        /// must also terminate on a cycle in the stored graph (only possible
+        /// through direct table manipulation; the write-time guard refuses
+        /// cycle-closing inserts).
+        #[tokio::test]
+        async fn test_virtual_ancestor_keys_walks_nested_and_cycle_safe() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            let leaf = service
+                .create(make_create_req(
+                    &format!("{suffix}leaf"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf");
+            let mid = service
+                .create(make_virtual_req(
+                    &format!("{suffix}mid"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create mid");
+            let top = service
+                .create(make_virtual_req(
+                    &format!("{suffix}top"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create top");
+            service
+                .add_virtual_member(mid.id, leaf.id, Some(1))
+                .await
+                .expect("link leaf into mid");
+            service
+                .add_virtual_member(top.id, mid.id, Some(1))
+                .await
+                .expect("link mid into top");
+
+            let mut ancestors = service.virtual_ancestor_keys(leaf.id).await;
+            ancestors.sort();
+            let mut expected = vec![mid.key.clone(), top.key.clone()];
+            expected.sort();
+            assert_eq!(
+                ancestors, expected,
+                "both the direct parent and the transitive ancestor must be returned"
+            );
+            // A non-member repository has no ancestors.
+            assert!(
+                service.virtual_ancestor_keys(top.id).await.is_empty(),
+                "nothing contains the top virtual"
+            );
+
+            // Cycle safety: raw SQL bypasses the write-time guard, simulating
+            // a corrupted graph. The walk must terminate and report both
+            // cycle members as ancestors of x (each transitively contains it).
+            let x = service
+                .create(make_virtual_req(
+                    &format!("{suffix}x"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create x");
+            let y = service
+                .create(make_virtual_req(
+                    &format!("{suffix}y"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create y");
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 1), ($2, $1, 1)",
+            )
+            .bind(x.id)
+            .bind(y.id)
+            .execute(&pool)
+            .await
+            .expect("insert cycle");
+
+            let mut cyclic = service.virtual_ancestor_keys(x.id).await;
+            cyclic.sort();
+            let mut cyclic_expected = vec![x.key.clone(), y.key.clone()];
+            cyclic_expected.sort();
+            assert_eq!(
+                cyclic, cyclic_expected,
+                "a cycle must terminate and still report the reachable ancestors"
+            );
+
+            for id in [leaf.id, mid.id, top.id, x.id, y.id] {
+                cleanup_repo(&pool, id).await;
+            }
         }
 
         /// PF-007 (#2523): after inserts across all three components the
@@ -7173,6 +8341,7 @@ mod tests {
                 .update(
                     repo.id,
                     UpdateRepositoryRequest {
+                        visibility: None,
                         key: None,
                         name: None,
                         description: None,
@@ -7200,6 +8369,342 @@ mod tests {
             assert!(admit_and_insert(&service, &pool, repo.id, "stale/two", 100).await);
 
             cleanup_repo(&pool, repo.id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // Project-wide quota enforcement (#2474)
+        // -------------------------------------------------------------------
+
+        /// Create a project with `quota` and `n` generic repositories assigned
+        /// to it (no repository-level quota). Returns `(project_id, repo_ids)`.
+        async fn project_with_repos(
+            pool: &PgPool,
+            service: &RepositoryService,
+            quota: Option<i64>,
+            n: usize,
+        ) -> (Uuid, Vec<Uuid>) {
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let project_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO projects (key, name, quota_bytes) VALUES ($1, $1, $2) RETURNING id",
+            )
+            .bind(format!("pq-{tag}"))
+            .bind(quota)
+            .fetch_one(pool)
+            .await
+            .expect("create project");
+            let mut repos = Vec::with_capacity(n);
+            for i in 0..n {
+                let repo = service
+                    .create(make_create_req(
+                        &format!("{tag}-{i}"),
+                        RepositoryFormat::Generic,
+                    ))
+                    .await
+                    .expect("create repo");
+                sqlx::query("UPDATE repositories SET project_id = $1 WHERE id = $2")
+                    .bind(project_id)
+                    .bind(repo.id)
+                    .execute(pool)
+                    .await
+                    .expect("assign repo to project");
+                repos.push(repo.id);
+            }
+            (project_id, repos)
+        }
+
+        async fn cleanup_project_with_repos(pool: &PgPool, project_id: Uuid, repos: &[Uuid]) {
+            for repo in repos {
+                cleanup_repo(pool, *repo).await;
+            }
+            let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+                .bind(project_id)
+                .execute(pool)
+                .await;
+        }
+
+        async fn admission(
+            service: &RepositoryService,
+            pool: &PgPool,
+            repo: Uuid,
+            path: &str,
+            size: i64,
+        ) -> QuotaAdmission {
+            let mut tx = pool.begin().await.expect("begin");
+            service
+                .check_quota_locked(&mut tx, repo, path, size)
+                .await
+                .expect("admission")
+        }
+
+        /// #4423: a virtual repository in the same project as its hosted
+        /// member must not count the member's bytes a second time. Its own
+        /// display figure is 0 (the member union is reported separately), the
+        /// project rollup skips it, and project admission never seeds a ledger
+        /// row for it.
+        #[tokio::test]
+        async fn test_virtual_repo_not_double_counted_in_project_4423() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(10_000), 1).await;
+            let hosted = repos[0];
+            let virt = service
+                .create(make_virtual_req(
+                    &format!("{}v", uuid::Uuid::new_v4().simple()),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create virtual");
+            sqlx::query("UPDATE repositories SET project_id = $1 WHERE id = $2")
+                .bind(project)
+                .bind(virt.id)
+                .execute(&pool)
+                .await
+                .expect("assign virtual to project");
+            service
+                .add_virtual_member(virt.id, hosted, Some(1))
+                .await
+                .expect("add member");
+            assert!(admit_and_insert(&service, &pool, hosted, "dc/a", 600).await);
+
+            let mut displayed = 0;
+            for id in [hosted, virt.id] {
+                let repo = service.get_by_id(id).await.expect("repo");
+                let usage = service
+                    .get_display_storage_usage(&repo, &MemberVisibility::Unfiltered)
+                    .await
+                    .expect("display usage");
+                displayed += usage.own_bytes;
+                if id == virt.id {
+                    assert_eq!(usage, DisplayStorageUsage::virtual_repo(600));
+                }
+            }
+            assert_eq!(displayed, 600, "summing own figures counts each byte once");
+            assert_eq!(
+                service
+                    .get_project_ledger_usage(project)
+                    .await
+                    .expect("project usage"),
+                600
+            );
+            assert_eq!(
+                ledger_hosted(&pool, virt.id).await,
+                None,
+                "project admission must not seed a ledger row for a virtual repo"
+            );
+
+            cleanup_repo(&pool, virt.id).await;
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Quota evasion by splitting across repositories: two repositories
+        /// with no quota of their own share a 1000-byte project cap. Each
+        /// upload alone fits, but the aggregate must be rejected — in both
+        /// the locked admission and the unlocked preflight — and the
+        /// rejection names the project scope.
+        #[tokio::test]
+        async fn test_project_quota_rejects_aggregate_across_sibling_repos() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 2).await;
+            let (a, b) = (repos[0], repos[1]);
+
+            assert!(admit_and_insert(&service, &pool, a, "split/a", 600).await);
+            assert_eq!(
+                service.quota_preflight(b, 600).await.expect("preflight"),
+                Some(QuotaScope::Project),
+                "unlocked preflight must see the sibling's bytes"
+            );
+            assert!(!service.check_quota(b, 600).await.expect("check_quota"));
+            let denied = admission(&service, &pool, b, "split/b", 600).await;
+            assert!(!denied.allowed);
+            assert_eq!(denied.denied_by, Some(QuotaScope::Project));
+            assert_eq!(
+                denied.base_usage, None,
+                "no repository quota => no repository usage reported"
+            );
+
+            // What still fits under the project cap is admitted.
+            assert_eq!(service.quota_preflight(b, 400).await.unwrap(), None);
+            assert!(admit_and_insert(&service, &pool, b, "split/b", 400).await);
+            assert!(!admit_and_insert(&service, &pool, a, "split/c", 1).await);
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// A repository under its own quota is still bound by the project
+        /// cap, and a repository over its own quota reports the repository
+        /// scope even when the project has room.
+        #[tokio::test]
+        async fn test_project_and_repo_quotas_both_apply() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 2).await;
+            let (a, b) = (repos[0], repos[1]);
+            set_quota(&pool, a, Some(800)).await;
+            set_quota(&pool, b, Some(800)).await;
+
+            assert!(admit_and_insert(&service, &pool, a, "both/a", 700).await);
+            let over_repo = admission(&service, &pool, a, "both/a2", 200).await;
+            assert_eq!(over_repo.denied_by, Some(QuotaScope::Repository));
+            assert_eq!(over_repo.base_usage, Some(700));
+
+            // b is far under its own 800-byte quota, but 700 + 400 > 1000.
+            let over_project = admission(&service, &pool, b, "both/b", 400).await;
+            assert_eq!(over_project.denied_by, Some(QuotaScope::Project));
+            assert_eq!(over_project.base_usage, Some(0));
+            assert!(admit_and_insert(&service, &pool, b, "both/b", 300).await);
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Concurrent-upload race across sibling repositories: the first
+        /// admission holds the project row lock; an upload into a DIFFERENT
+        /// repository of the same project blocks on it and, once the first
+        /// commits, observes its bytes and is rejected. Without the project
+        /// row lock both would pass against the same pre-upload aggregate.
+        #[tokio::test]
+        async fn test_project_quota_concurrent_sibling_uploads_admit_exactly_one() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 2).await;
+            let (a, b) = (repos[0], repos[1]);
+
+            let mut tx1 = pool.begin().await.expect("begin tx1");
+            let adm1 = service
+                .check_quota_locked(&mut tx1, a, "prace/one", 600)
+                .await
+                .expect("admission 1");
+            assert!(adm1.allowed);
+
+            let pool2 = pool.clone();
+            let contender = tokio::spawn(async move {
+                let service2 = RepositoryService::new(pool2.clone());
+                admit_and_insert(&service2, &pool2, b, "prace/two", 600).await
+            });
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                !contender.is_finished(),
+                "the sibling admission must block on the project row lock"
+            );
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key) \
+                 VALUES ($1, 'prace/one', 'prace/one', 600, repeat('a', 64), \
+                         'application/octet-stream', 'keys/prace/one')",
+            )
+            .bind(a)
+            .execute(&mut *tx1)
+            .await
+            .expect("artifact insert tx1");
+            tx1.commit().await.expect("commit tx1");
+
+            assert!(
+                !contender.await.expect("contender task"),
+                "the second of two jointly-over-quota sibling uploads must be rejected"
+            );
+            let live: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = ANY($1) AND is_deleted = false",
+            )
+            .bind(&repos)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+            assert_eq!(live, 1, "exactly one upload may land across the project");
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Proxy-cache and OCI-blob bytes of member repositories count toward
+        /// the project total (the issue's "proxy-cache undercount" vector),
+        /// overwrites are charged only their net delta, and a sibling with no
+        /// ledger row yet is seeded from its live sums instead of counting as
+        /// empty.
+        #[tokio::test]
+        async fn test_project_quota_counts_proxy_oci_and_unseeded_siblings() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let (project, repos) = project_with_repos(&pool, &service, Some(1_000), 3).await;
+            let (hosted, cache, unseeded) = (repos[0], repos[1], repos[2]);
+
+            insert_proxy_cache(&pool, cache, "pkg/x.tgz", 300).await;
+            insert_oci_blob(
+                &pool,
+                cache,
+                &format!("sha256:{}", Uuid::new_v4().simple()),
+                200,
+            )
+            .await;
+            insert_artifact(&pool, unseeded, "seed/a", "keys/seed/a", 250).await;
+            // Simulate a pre-ledger sibling: its bytes exist, its row does not.
+            sqlx::query("DELETE FROM repository_usage_ledger WHERE repository_id = $1")
+                .bind(unseeded)
+                .execute(&pool)
+                .await
+                .expect("drop ledger row");
+
+            // 300 + 200 + 250 = 750 used; 250 more fits, 251 does not.
+            assert_eq!(
+                service.quota_preflight(hosted, 251).await.unwrap(),
+                Some(QuotaScope::Project),
+                "preflight must count the unseeded sibling from live sums"
+            );
+            assert_eq!(service.quota_preflight(hosted, 250).await.unwrap(), None);
+            assert_eq!(
+                admission(&service, &pool, hosted, "h/a", 251)
+                    .await
+                    .denied_by,
+                Some(QuotaScope::Project)
+            );
+            assert!(admit_and_insert(&service, &pool, hosted, "h/a", 200).await);
+            assert_eq!(
+                ledger_hosted(&pool, unseeded).await,
+                Some(250),
+                "admission seeds the missing sibling ledger row from live sums"
+            );
+
+            // Overwriting h/a (200) with 250 bytes is a +50 delta: 950+50 fits.
+            assert!(admit_and_insert(&service, &pool, hosted, "h/a", 250).await);
+            assert!(!admit_and_insert(&service, &pool, hosted, "h/b", 1).await);
+
+            cleanup_project_with_repos(&pool, project, &repos).await;
+        }
+
+        /// Unlimited projects (NULL or the `0` sentinel) are not enforced and
+        /// take no lock: the admission short-circuits exactly as for an
+        /// unassigned repository.
+        #[tokio::test]
+        async fn test_project_quota_unlimited_sentinels_admit() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            for quota in [None, Some(0)] {
+                let (project, repos) = project_with_repos(&pool, &service, quota, 1).await;
+                let adm = admission(&service, &pool, repos[0], "u/x", i64::MAX / 2).await;
+                assert!(adm.allowed, "quota {quota:?} must be unlimited");
+                assert_eq!(adm.denied_by, None);
+                assert_eq!(adm.base_usage, None);
+                assert_eq!(
+                    service
+                        .quota_preflight(repos[0], i64::MAX / 2)
+                        .await
+                        .unwrap(),
+                    None
+                );
+                cleanup_project_with_repos(&pool, project, &repos).await;
+            }
         }
 
         /// O(1) contract pin (#2516 S2): the admission critical section must
@@ -7233,5 +8738,91 @@ mod tests {
                 "admission must keep serializing on the locked ledger row"
             );
         }
+    }
+
+    /// #3813 follow-up: migration 245's backfill is exactly access-preserving
+    /// (`is_public = true` -> `public`, `false` -> `private`) and re-running
+    /// it (it shipped under earlier numbers in review) leaves a repository
+    /// that has since become `internal` untouched. Runs in an isolated schema
+    /// inside a rolled-back transaction, so it never touches real rows.
+    #[tokio::test]
+    async fn migration_245_backfills_from_is_public_and_rerun_keeps_internal() {
+        const MIGRATION: &str = include_str!("../../migrations/245_repository_visibility.sql");
+        let Some(pool) = crate::testing::try_pool_with(2).await else {
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let schema = format!("visibility_245_{}", Uuid::new_v4().simple());
+        // The pre-245 shape: every column the migration's triggers name, and
+        // no `visibility` column yet. `public` stays on the path for the
+        // existing `ak_notify_repository_changed()` trigger function.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}, public; \
+             CREATE TABLE repositories(id UUID PRIMARY KEY, key TEXT, format TEXT, \
+             repo_type TEXT, upstream_url TEXT, storage_backend TEXT, storage_path TEXT, \
+             is_public BOOLEAN NOT NULL DEFAULT false, promotion_only BOOLEAN, \
+             age_gate_enabled BOOLEAN, age_gate_min_age_days INT, age_gate_mode TEXT, \
+             curation_enabled BOOLEAN, curation_default_action TEXT);"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let (public_id, private_id, later_internal_id) =
+            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, is_public) in [
+            (public_id, true),
+            (private_id, false),
+            (later_internal_id, false),
+        ] {
+            sqlx::query("INSERT INTO repositories (id, is_public) VALUES ($1, $2)")
+                .bind(id)
+                .bind(is_public)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+
+        sqlx::raw_sql(MIGRATION).execute(&mut *tx).await.unwrap();
+        let visibility = |id: Uuid| {
+            sqlx::query_as::<_, (String, bool)>(
+                "SELECT visibility::text, is_public FROM repositories WHERE id = $1",
+            )
+            .bind(id)
+        };
+        assert_eq!(
+            visibility(public_id).fetch_one(&mut *tx).await.unwrap(),
+            ("public".to_string(), true)
+        );
+        assert_eq!(
+            visibility(private_id).fetch_one(&mut *tx).await.unwrap(),
+            ("private".to_string(), false)
+        );
+
+        // An operator narrows one repository to `internal`, then the migration
+        // is applied again: nothing moves.
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(later_internal_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql(MIGRATION).execute(&mut *tx).await.unwrap();
+        assert_eq!(
+            visibility(later_internal_id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            ("internal".to_string(), false),
+            "a re-run of migration 245 must not recompute an internal repository \
+             from is_public"
+        );
+        assert_eq!(
+            visibility(public_id).fetch_one(&mut *tx).await.unwrap(),
+            ("public".to_string(), true)
+        );
+        assert_eq!(
+            visibility(private_id).fetch_one(&mut *tx).await.unwrap(),
+            ("private".to_string(), false)
+        );
+        tx.rollback().await.unwrap();
     }
 }

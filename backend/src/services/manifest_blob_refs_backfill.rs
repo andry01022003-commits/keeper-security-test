@@ -180,7 +180,7 @@ impl BackfillCandidate {
 /// Reject a manifest body that exceeds [`MAX_IMAGE_MANIFEST_BYTES`] before
 /// it is parsed, returning the WARN-level skip reason. Pure size check,
 /// split out so the cap behaviour is unit-testable without storage.
-fn check_manifest_size(len: usize) -> Result<(), String> {
+pub(crate) fn check_manifest_size(len: usize) -> Result<(), String> {
     if len > MAX_IMAGE_MANIFEST_BYTES {
         return Err(format!(
             "image manifest body exceeds {} bytes (got {}); skipping JSON parse",
@@ -493,6 +493,7 @@ async fn process_candidate(
     Ok(inserted)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

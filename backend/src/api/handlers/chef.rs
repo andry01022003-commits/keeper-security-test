@@ -323,6 +323,7 @@ async fn download_cookbook(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -522,6 +523,13 @@ async fn upload_cookbook(
 
     let size_bytes = put.bytes_written as i64;
 
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -541,12 +549,20 @@ async fn upload_cookbook(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     let _ = sqlx::query!(
         r#"
@@ -601,6 +617,7 @@ async fn upload_cookbook(
         .unwrap())
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
 
@@ -925,6 +942,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -951,6 +969,7 @@ mod db_cov_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod upload_stream_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -1067,6 +1086,7 @@ mod upload_stream_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;

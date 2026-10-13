@@ -971,9 +971,21 @@ impl GcsBackend {
 
     /// List objects with optional prefix. Handles pagination via `nextPageToken`.
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each object's `updated` time.
+    pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
         #[derive(serde::Deserialize)]
         struct GcsObject {
             name: String,
+            #[serde(default)]
+            updated: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct GcsListResponse {
@@ -1021,7 +1033,16 @@ impl GcsBackend {
                 AppError::Storage(format!("Failed to parse GCS list response: {}", e))
             })?;
 
-            all_keys.extend(list_response.items.into_iter().map(|o| o.name));
+            all_keys.extend(list_response.items.into_iter().map(|o| {
+                super::ListedKey {
+                    key: o.name,
+                    last_modified: o
+                        .updated
+                        .as_deref()
+                        .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok())
+                        .map(|d| d.with_timezone(&chrono::Utc)),
+                }
+            }));
 
             match list_response.next_page_token {
                 Some(pt) => page_token = Some(pt),
@@ -1607,7 +1628,7 @@ impl StorageBackend for GcsBackend {
         self.path_format.has_fallback()
     }
 
-    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, content), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let response = self.authorized_put(key, content).await?;
         require_success(response, "GCS upload failed").await?;
@@ -1639,7 +1660,7 @@ impl StorageBackend for GcsBackend {
     ///
     /// On any error after the session is initiated the session is aborted with
     /// a best-effort DELETE so GCS does not retain an orphaned upload session.
-    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self, stream), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -1702,7 +1723,7 @@ impl StorageBackend for GcsBackend {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let url = self.object_download_url(key);
         let response = self.authorized_get(&url).await?;
@@ -1728,7 +1749,7 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_range"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1771,7 +1792,7 @@ impl StorageBackend for GcsBackend {
     /// read buffer (~64 KiB) instead of object-size.
     // The span covers GET initiation (time-to-first-byte); the body transfer
     // happens later as the caller polls the returned stream.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_stream"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let url = self.object_download_url(key);
         let response = self.authorized_get_stream(&url).await?;
@@ -1797,7 +1818,7 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.object_metadata_url(key);
         let response = self.authorized_get(&url).await?;
@@ -1814,7 +1835,7 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "delete"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let response = self.authorized_delete(key).await?;
 
@@ -1826,7 +1847,7 @@ impl StorageBackend for GcsBackend {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "copy"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         GcsBackend::copy(self, source, dest).await
     }
@@ -1837,7 +1858,7 @@ impl StorageBackend for GcsBackend {
     /// Returns `Ok(None)` for a missing object so the freshness probe can
     /// fall through to the slow path without losing the I/O-error
     /// distinction.
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "head_etag"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let url = self.object_metadata_url(key);
         let response = self.authorized_get(&url).await?;
@@ -1867,7 +1888,7 @@ impl StorageBackend for GcsBackend {
         matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) && self.config.redirect_downloads
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_presigned_url"))]
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -1896,7 +1917,11 @@ impl StorageBackend for GcsBackend {
         }))
     }
 
-    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "health_check"))]
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         // GET the metadata of a sentinel object (`.health-probe`). This exercises
         // the same object-level permission the backend actually uses at runtime
@@ -1935,6 +1960,7 @@ impl StorageBackend for GcsBackend {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

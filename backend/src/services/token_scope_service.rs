@@ -2,14 +2,14 @@
 //! reach, and why (#4215).
 //!
 //! A virtual repository's contents belong to its members, and a member is
-//! served only when BOTH halves of the member predicate hold: the member is in
-//! the presenting credential's repository scope, and the caller is entitled to
-//! read it. Either half can fail silently — an empty listing, a 404 — and the
-//! two are fixed in different places, so they are reported separately.
+//! served when its owner may read it and the routed parent, and the token
+//! names the member OR that parent (#4559). A parent-scoped token therefore
+//! does not need member expansion. Scope and entitlement diagnostics remain
+//! separate; native admission/scanning and credential lifetime are not graded.
 //!
 //! This is deliberately server-side. The rule exempts public members
-//! (`member_is_public || can_access_repo(..)`), `VirtualMemberResponse` does
-//! not carry `is_public`, and the entitlement half is a role-assignment
+//! through the shared scope helper, and authenticated internal visibility
+//! through the shared read gate; entitlement is also an action-capability
 //! question; a client that reconstructed either would be re-implementing an
 //! authorization predicate and would drift from it.
 
@@ -20,19 +20,22 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::api::handlers::{proxy_helpers, repositories};
+use crate::api::middleware::auth::AuthExtension;
 use crate::error::{AppError, Result};
-use crate::services::repository_service::{RepoVisibility, RepositoryService};
+use crate::models::{access_scope::AccessScope, repository::Repository};
+use crate::services::repository_service::RepositoryService;
 
 /// Why one member is out of reach. A closed set, so a client groups on it
 /// rather than parsing the prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UnreachableReason {
-    /// The member is not in the token's repository scope. Fixed by scoping the
-    /// token to the member, or by a selector with `include_virtual_members`.
+    /// Neither member nor routed parent is in scope. Name the virtual for
+    /// read-through access; direct member access remains independently scoped.
     OutOfTokenScope,
-    /// The service account holds no read access on the member. Fixed with a
-    /// grant; widening the token's scope alone would not help.
+    /// The account cannot read the parent or member. Fix its read entitlement;
+    /// widening token scope alone does not supply permission to read.
     NoGrant,
 }
 
@@ -60,12 +63,10 @@ struct VirtualRow {
     key: String,
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 struct MemberRow {
     virtual_repo_id: Uuid,
-    member_repo_id: Uuid,
-    member_repo_key: String,
-    member_is_public: bool,
+    repo: Repository,
 }
 
 /// Analyse one credential. See [`analyze_many`]; this is the single-subject
@@ -79,10 +80,10 @@ pub async fn analyze(
     Ok(out.remove(&()).unwrap_or_default())
 }
 
-/// Analyse several credentials of the SAME owner in three queries, whatever
-/// the number of tokens: the virtual repositories in play, their members, and
-/// the owner's entitlements. The token list renders a badge per row, so the
-/// per-token form would have been a query fan-out on a page load.
+/// Analyse credentials of the SAME owner once per distinct virtual, not token.
+/// Recursive leaf traversal and read-action checks reuse the runtime gates;
+/// their results are shared across the token page. A badge per token must not
+/// repeat that work for every credential naming the same virtual.
 ///
 /// `owner_user_id` is the service account the tokens belong to. Without it the
 /// entitlement half cannot be evaluated and only scope is reported — which is
@@ -122,20 +123,50 @@ pub async fn analyze_many<K: std::hash::Hash + Eq + Clone>(
         return Ok(result);
     }
 
-    // The entitlement half, for every member at once. `filter_visible_repo_ids`
-    // with `User` is the same predicate the read paths apply, so public members
-    // come back as readable here too.
-    let readable: HashSet<Uuid> = match owner_user_id {
-        Some(user_id) => {
-            let member_ids: Vec<Uuid> = members.iter().map(|m| m.member_repo_id).collect();
-            RepositoryService::new(db.clone())
-                .filter_visible_repo_ids(&member_ids, &RepoVisibility::User(user_id))
-                .await?
-                .into_iter()
-                .collect()
-        }
-        None => HashSet::new(),
+    // The entitlement half uses the read paths' tenant AND action gates,
+    // once per distinct virtual rather than once per token. Public/internal
+    // baselines are evaluated by the same authorization helper.
+    let owner = if let Some(user_id) = owner_user_id {
+        let is_admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("Account not found".to_string()))?;
+        Some(AuthExtension {
+            user_id,
+            is_admin,
+            allowed_repo_ids: AccessScope::Admin,
+            ..AuthExtension::default()
+        })
+    } else {
+        None
     };
+    let service = RepositoryService::new(db.clone());
+    let mut readable = HashSet::new();
+    let mut readable_parents = HashSet::new();
+    if owner.is_some() {
+        for virtual_row in &virtuals {
+            let parent = service.get_by_id(virtual_row.id).await?;
+            match repositories::require_visible(&parent, &owner, &service).await {
+                Ok(()) => {
+                    readable_parents.insert(parent.id);
+                }
+                Err(AppError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            }
+            let rows = members
+                .iter()
+                .filter(|m| m.virtual_repo_id == parent.id)
+                .map(|m| m.repo.clone())
+                .collect();
+            let admitted =
+                proxy_helpers::try_authorize_virtual_members(db, owner.as_ref(), parent.id, rows)
+                    .await
+                    .map_err(|r| proxy_helpers::member_walk_app_error(&r))?;
+            readable.extend(admitted.into_iter().map(|r| r.id));
+        }
+    }
 
     let key_of: HashMap<Uuid, &str> = virtuals.iter().map(|v| (v.id, v.key.as_str())).collect();
     let mut by_virtual: HashMap<Uuid, Vec<&MemberRow>> = HashMap::new();
@@ -149,6 +180,10 @@ pub async fn analyze_many<K: std::hash::Hash + Eq + Clone>(
     for (subject, scope) in subjects {
         let in_scope: Option<HashSet<Uuid>> =
             scope.as_ref().map(|ids| ids.iter().copied().collect());
+        let principal = AuthExtension {
+            allowed_repo_ids: AccessScope::from(scope),
+            ..owner.clone().unwrap_or_default()
+        };
         let mut unreachable = Vec::new();
 
         for virtual_row in &virtuals {
@@ -165,26 +200,27 @@ pub async fn analyze_many<K: std::hash::Hash + Eq + Clone>(
 
             let mut blocked = Vec::new();
             for member in rows {
-                // A public member is exempt from token scope and needs no
-                // grant, so it is always reachable.
-                if member.member_is_public {
-                    continue;
-                }
+                // Public members need no member grant, but the routed parent
+                // must still be readable before any member can be reached.
                 // Entitlement first: without it, widening the token's scope
                 // would not help, so that is the remedy to report.
-                let reason =
-                    if owner_user_id.is_some() && !readable.contains(&member.member_repo_id) {
-                        UnreachableReason::NoGrant
-                    } else if in_scope
-                        .as_ref()
-                        .is_some_and(|scope| !scope.contains(&member.member_repo_id))
-                    {
-                        UnreachableReason::OutOfTokenScope
-                    } else {
-                        continue;
-                    };
+                let reason = if owner.is_some()
+                    && (!readable_parents.contains(&virtual_row.id)
+                        || !readable.contains(&member.repo.id))
+                {
+                    UnreachableReason::NoGrant
+                } else if !repositories::member_passes_token_scope(
+                    Some(&principal),
+                    virtual_row.id,
+                    member.repo.id,
+                    member.repo.visibility,
+                ) {
+                    UnreachableReason::OutOfTokenScope
+                } else {
+                    continue;
+                };
                 blocked.push(UnreachableMember {
-                    repo_key: member.member_repo_key.clone(),
+                    repo_key: member.repo.key.clone(),
                     reason,
                 });
             }
@@ -222,51 +258,54 @@ async fn load_virtuals(
     any_unrestricted: bool,
     owner_user_id: Option<Uuid>,
 ) -> Result<Vec<VirtualRow>> {
-    let owner = match any_unrestricted {
-        true => owner_user_id,
-        false => None,
-    };
-    sqlx::query_as::<_, VirtualRow>(
-        r#"
-        SELECT DISTINCT r.id, r.key
-        FROM repositories r
-        WHERE r.repo_type = 'virtual'
-          AND (
-            r.id = ANY($1)
-            OR ($2::uuid IS NOT NULL AND EXISTS (
-                SELECT 1 FROM role_assignments ra
-                WHERE ra.user_id = $2 AND ra.repository_id = r.id
-            ))
-          )
-        ORDER BY r.key
-        "#,
+    let mut rows = sqlx::query_as::<_, VirtualRow>(
+        "SELECT id, key FROM repositories WHERE repo_type = 'virtual' AND (id = ANY($1) OR $2) ORDER BY key",
     )
     .bind(scoped_ids)
-    .bind(owner)
+    .bind(any_unrestricted && owner_user_id.is_some())
     .fetch_all(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if any_unrestricted {
+        if let Some(owner) = owner_user_id {
+            let admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
+                .bind(owner)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound("Account not found".to_string()))?;
+            let visibility = if admin {
+                crate::services::repository_service::RepoVisibility::All
+            } else {
+                crate::services::repository_service::RepoVisibility::User(owner)
+            };
+            let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+            let visible: HashSet<_> = RepositoryService::new(db.clone())
+                .filter_visible_repo_ids(&ids, &visibility)
+                .await?
+                .into_iter()
+                .collect();
+            rows.retain(|r| scoped_ids.contains(&r.id) || visible.contains(&r.id));
+        }
+    }
+    Ok(rows)
 }
 
 async fn load_members(db: &PgPool, virtual_ids: &[Uuid]) -> Result<Vec<MemberRow>> {
-    sqlx::query_as::<_, MemberRow>(
-        r#"
-        SELECT vrm.virtual_repo_id,
-               r.id   AS member_repo_id,
-               r.key  AS member_repo_key,
-               r.is_public AS member_is_public
-        FROM virtual_repo_members vrm
-        INNER JOIN repositories r ON r.id = vrm.member_repo_id
-        WHERE vrm.virtual_repo_id = ANY($1)
-        ORDER BY vrm.priority, r.key
-        "#,
-    )
-    .bind(virtual_ids)
-    .fetch_all(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))
+    let mut rows = Vec::new();
+    for virtual_repo_id in virtual_ids {
+        let members = proxy_helpers::fetch_virtual_members(db, *virtual_repo_id)
+            .await
+            .map_err(|r| proxy_helpers::member_walk_app_error(&r))?;
+        rows.extend(members.into_iter().map(|repo| MemberRow {
+            virtual_repo_id: *virtual_repo_id,
+            repo,
+        }));
+    }
+    Ok(rows)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,9 +390,9 @@ mod tests {
         }
     }
 
-    /// The reported case: scoped to the virtual alone. The granted member is
-    /// out of scope, the ungranted one is missing a grant, and the PUBLIC one
-    /// is reachable either way and must not be reported.
+    /// Scoped to the virtual alone: #4559 admits the granted member through
+    /// the parent, the ungranted member still lacks entitlement, and PUBLIC
+    /// membership keeps its read baseline; only the missing grant is reported.
     #[tokio::test]
     async fn scoped_to_the_virtual_alone_reports_scope_and_grant_separately() {
         let Some(fx) = Fixture::build().await else {
@@ -378,8 +417,8 @@ mod tests {
             .collect();
         assert_eq!(
             reasons.get(granted_key.as_str()),
-            Some(&UnreachableReason::OutOfTokenScope),
-            "entitled but unscoped member: {report:?}"
+            None,
+            "a granted member is reachable through the scoped virtual: {report:?}"
         );
         assert_eq!(
             reasons.get(ungranted_key.as_str()),
@@ -390,11 +429,11 @@ mod tests {
             !reasons.contains_key(public_key.as_str()),
             "a public member is exempt from token scope and needs no grant: {report:?}"
         );
-        assert_eq!(total_members(&report), 2);
+        assert_eq!(total_members(&report), 1);
     }
 
-    /// Scoping the token to the members too removes the scope complaint, and
-    /// leaves the grant one — which widening the scope cannot fix.
+    /// Naming members as well as the virtual does not supply a missing read
+    /// grant; parent read-through already satisfies the token scope term.
     #[tokio::test]
     async fn scoping_to_the_members_leaves_only_the_missing_grant() {
         let Some(fx) = Fixture::build().await else {
@@ -450,8 +489,98 @@ mod tests {
         assert_eq!(report[0].members[0].reason, UnreachableReason::NoGrant);
     }
 
-    /// Without an owner the entitlement half is unknowable, so only scope is
-    /// judged — the selector preview's case when no account is supplied.
+    #[tokio::test]
+    async fn recursive_analysis_reports_leaf_entitlements_not_grouping_virtuals() {
+        let Some(fx) = Fixture::build().await else {
+            return;
+        };
+        let (nested, _, dir) = tdh::create_repo(&fx.pool, "virtual", "nuget").await;
+        sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2",
+        )
+        .bind(fx.virtual_id)
+        .bind(fx.ungranted_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        tdh::link_virtual_member(&fx.pool, fx.virtual_id, nested, 4).await;
+        tdh::link_virtual_member(&fx.pool, nested, fx.ungranted_id, 1).await;
+        let result = analyze(&fx.pool, Some(fx.user_id), Some(vec![fx.virtual_id]))
+            .await
+            .unwrap();
+        assert_eq!(total_members(&result), 1);
+        assert_eq!(result[0].members[0].repo_key, fx.key(fx.ungranted_id));
+        assert_eq!(result[0].members[0].reason, UnreachableReason::NoGrant);
+        sqlx::query("INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) VALUES ($1, $2, 2)")
+            .bind(nested).bind(fx.virtual_id).execute(&fx.pool).await.unwrap();
+        let cycled = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            analyze(&fx.pool, Some(fx.user_id), Some(vec![fx.virtual_id])),
+        )
+        .await
+        .expect("cycle-safe analysis")
+        .unwrap();
+        assert_eq!(total_members(&cycled), 1);
+        tdh::cleanup_member_repo(&fx.pool, nested, &dir).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn internal_baseline_and_read_action_gates_match_runtime() {
+        let Some(fx) = Fixture::build().await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.ungranted_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        assert!(
+            analyze(&fx.pool, Some(fx.user_id), Some(vec![fx.virtual_id]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+            .bind(fx.user_id)
+            .bind(fx.granted_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        tdh::grant_repo_actions(&fx.pool, fx.granted_id, fx.user_id, &["write"]).await;
+        let result = analyze(&fx.pool, Some(fx.user_id), Some(vec![fx.virtual_id]))
+            .await
+            .unwrap();
+        assert_eq!(total_members(&result), 1);
+        assert_eq!(result[0].members[0].repo_key, fx.key(fx.granted_id));
+        assert_eq!(result[0].members[0].reason, UnreachableReason::NoGrant);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn unreadable_parent_blocks_public_and_private_members() {
+        let Some(fx) = Fixture::build().await else {
+            return;
+        };
+        sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+            .bind(fx.user_id)
+            .bind(fx.virtual_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let result = analyze(&fx.pool, Some(fx.user_id), Some(vec![fx.virtual_id]))
+            .await
+            .unwrap();
+        assert_eq!(total_members(&result), 3);
+        assert!(result[0]
+            .members
+            .iter()
+            .all(|m| m.reason == UnreachableReason::NoGrant));
+        fx.teardown().await;
+    }
+
+    /// Without an owner entitlement is unknowable; scope names the parent,
+    /// so #4559 read-through leaves no member-scope complaint to report.
     #[tokio::test]
     async fn without_an_owner_only_scope_is_judged() {
         let Some(fx) = Fixture::build().await else {
@@ -459,24 +588,10 @@ mod tests {
         };
         let result = analyze(&fx.pool, None, Some(vec![fx.virtual_id])).await;
 
-        let granted_key = fx.key(fx.granted_id).to_string();
-        let ungranted_key = fx.key(fx.ungranted_id).to_string();
         fx.teardown().await;
-
-        let report = result.expect("analysis runs");
-        let keys: HashSet<&str> = report[0]
-            .members
-            .iter()
-            .map(|m| m.repo_key.as_str())
-            .collect();
-        assert!(keys.contains(granted_key.as_str()));
-        assert!(keys.contains(ungranted_key.as_str()));
         assert!(
-            report[0]
-                .members
-                .iter()
-                .all(|m| m.reason == UnreachableReason::OutOfTokenScope),
-            "no grant verdict without an owner: {report:?}"
+            result.expect("analysis runs").is_empty(),
+            "parent scope covers member reads; no grant verdict is possible without an owner"
         );
     }
 }

@@ -278,6 +278,9 @@ impl OpenScapScanner {
                     fixed_version: None,
                     source: Some("openscap".to_string()),
                     source_url,
+                    // #3013: a failed XCCDF rule is a configuration /
+                    // compliance violation, not a known weakness.
+                    finding_class: crate::models::security::FindingClass::Policy,
                 }
             })
             .collect()
@@ -356,6 +359,7 @@ impl Scanner for OpenScapScanner {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +454,10 @@ mod tests {
         );
         assert_eq!(findings[0].source_url, Some("CCE-27286-2".to_string()));
         assert_eq!(findings[1].severity, Severity::Medium);
+        // #3013: compliance rule failures are classed `policy`.
+        assert!(findings
+            .iter()
+            .all(|f| f.finding_class == crate::models::security::FindingClass::Policy));
     }
 
     // -----------------------------------------------------------------------

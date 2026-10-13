@@ -78,6 +78,15 @@ pub struct ContentDigests {
     pub md5: String,
 }
 
+/// Where the body of a streaming upload comes from (#3916).
+pub enum UploadContent {
+    /// Bytes still to be written, e.g. re-read from a local scratch file.
+    Stream(BoxStream<'static, Result<Bytes>>),
+    /// An object already written to the upload's own storage backend under
+    /// this key (e.g. `generic-upload-staging/<uuid>`); promoted with `copy`.
+    StagedObject(String),
+}
+
 /// Incremental SHA-256 + SHA-1 + MD5 accumulator.
 ///
 /// Feed chunks with [`MultiHasher::update`], then [`MultiHasher::finalize`] into
@@ -695,6 +704,43 @@ impl ArtifactService {
         enqueue_sync_tasks: bool,
         catalog_name: Option<&str>,
     ) -> Result<Artifact> {
+        self.upload_content_with_sync_options(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            UploadContent::Stream(stream),
+            digests,
+            size_bytes,
+            uploaded_by,
+            enqueue_sync_tasks,
+            catalog_name,
+        )
+        .await
+    }
+
+    /// [`Self::upload_stream_with_sync_options`] generalised over where the
+    /// body comes from (#3916): a byte stream written with `put_stream`, or an
+    /// object the caller already staged on THIS service's backend, promoted to
+    /// the content-addressed key with a backend `copy` (server-side on S3 and
+    /// GCS) so the body never touches local disk. Every other semantic --
+    /// preflight, dedup-first, finalize -- is shared.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_content_with_sync_options(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        content: UploadContent,
+        digests: ContentDigests,
+        size_bytes: i64,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+        catalog_name: Option<&str>,
+    ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
         self.preflight_upload(repository_id, path, version, size_bytes, &digests.sha256)
@@ -706,15 +752,25 @@ impl ArtifactService {
         let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
 
         if !content_exists {
-            let put = self.storage.put_stream(&storage_key, stream).await?;
-            // `put_stream` computes only SHA-256; guard the content-addressed
-            // invariant that the streamed bytes hash to the key we stored them
-            // under (SHA-1 / MD5 for the row come from `digests`).
-            if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) {
-                return Err(AppError::Validation(format!(
-                    "Streamed content SHA-256 {} does not match staged digest {}",
-                    put.checksum_sha256, digests.sha256
-                )));
+            match content {
+                UploadContent::Stream(stream) => {
+                    let put = self.storage.put_stream(&storage_key, stream).await?;
+                    // `put_stream` computes only SHA-256; guard the
+                    // content-addressed invariant that the streamed bytes hash
+                    // to the key we stored them under (SHA-1 / MD5 for the row
+                    // come from `digests`).
+                    if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) {
+                        return Err(AppError::Validation(format!(
+                            "Streamed content SHA-256 {} does not match staged digest {}",
+                            put.checksum_sha256, digests.sha256
+                        )));
+                    }
+                }
+                // The stager hashed these exact bytes on their way into the
+                // staged object, so `digests` already describes them.
+                UploadContent::StagedObject(staged_key) => {
+                    self.storage.copy(&staged_key, &storage_key).await?;
+                }
             }
         }
 
@@ -751,15 +807,15 @@ impl ArtifactService {
         size_bytes: i64,
         checksum_sha256: &str,
     ) -> Result<()> {
-        // Check quota
-        if !self
+        crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
+        // Check quota (repository quota and, if any, its project's aggregate
+        // quota, #2474).
+        if let Some(scope) = self
             .repo_service
-            .check_quota(repository_id, size_bytes)
+            .quota_preflight(repository_id, size_bytes)
             .await?
         {
-            return Err(AppError::QuotaExceeded(
-                "Repository storage quota exceeded".to_string(),
-            ));
+            return Err(scope.into_error());
         }
 
         // Both immutability checks live in `enforce_path_immutability` so the
@@ -810,12 +866,15 @@ impl ArtifactService {
         // idempotent on identical-bytes re-uploads and (b) backfill the
         // pre-existing HEAD as revision 1 on the first versioned write to a
         // coordinate that predates the feature.
-        let versioning_active = self
-            .repo_service
-            .get_by_id(repository_id)
-            .await
-            .map(|r| versioning_applies(&r.format, r.versioning_enabled))
-            .unwrap_or(false);
+        let repo_for_upload = self.repo_service.get_by_id(repository_id).await.ok();
+        let versioning_active = repo_for_upload
+            .as_ref()
+            .is_some_and(|r| versioning_applies(&r.format, r.versioning_enabled));
+        // #2382: `.safetensors` uploads to Mlmodel repos get their header
+        // summarised into `artifact_metadata` once the row exists.
+        let safetensors_eligible = repo_for_upload.as_ref().is_some_and(|r| {
+            crate::formats::mlmodel::safetensors_metadata_eligible(&r.format, path)
+        });
         let prior_head = if versioning_active {
             sqlx::query_as::<_, PriorHeadRow>(
                 "SELECT name, version, size_bytes, checksum_sha256, checksum_sha1, \
@@ -849,12 +908,10 @@ impl ArtifactService {
             .repo_service
             .check_quota_locked(&mut tx, repository_id, path, size_bytes)
             .await?;
-        if !admission.allowed {
+        if let Some(scope) = admission.denied_by {
             // Drop `tx` (rolls back). The content blob is content-addressed;
             // if this upload orphaned it, storage GC reclaims it.
-            return Err(AppError::QuotaExceeded(
-                "Repository storage quota exceeded".to_string(),
-            ));
+            return Err(scope.into_error());
         }
 
         // Create artifact record.
@@ -980,8 +1037,8 @@ impl ArtifactService {
             // handler whose `artifacts.name` is a normalized form of it —
             // NuGet stores the lowercased id, so deriving the name here
             // registered a second, lowercased package beside the handler's.
-            let (package_name, package_version) = match catalog_name {
-                Some(catalog_name) => (catalog_name.to_string(), ver.clone()),
+            let registration = match catalog_name {
+                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone())),
                 None => match self.repo_service.get_by_id(artifact.repository_id).await {
                     Ok(repo)
                         if matches!(
@@ -989,30 +1046,46 @@ impl ArtifactService {
                             RepositoryFormat::Maven | RepositoryFormat::Gradle
                         ) =>
                     {
-                        match crate::formats::maven::MavenHandler::parse_coordinates(&artifact.path)
-                        {
-                            Ok(coords) => (
-                                format!("{}:{}", coords.group_id, coords.artifact_id),
-                                coords.version,
-                            ),
-                            Err(_) => (artifact.name.clone(), ver.clone()),
+                        // #4197: `maven-metadata.xml` and checksum/signature
+                        // sidecars are repository metadata, not packages —
+                        // `parse_coordinates` would read the artifactId
+                        // directory as a version and register a bogus row.
+                        // Same skip predicate as the catalog backfill, so
+                        // publish time and backfill can never disagree.
+                        if crate::services::package_service::is_maven_sidecar(&artifact.path) {
+                            None
+                        } else {
+                            match crate::formats::maven::MavenHandler::parse_coordinates(
+                                &artifact.path,
+                            ) {
+                                Ok(coords) => Some((
+                                    format!("{}:{}", coords.group_id, coords.artifact_id),
+                                    coords.version,
+                                )),
+                                Err(_) => Some((artifact.name.clone(), ver.clone())),
+                            }
                         }
                     }
-                    _ => (artifact.name.clone(), ver.clone()),
+                    _ => Some((artifact.name.clone(), ver.clone())),
                 },
             };
-            let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
-            pkg_svc
-                .try_create_or_update_from_artifact(
-                    artifact.repository_id,
-                    &package_name,
-                    &package_version,
-                    artifact.size_bytes,
-                    &artifact.checksum_sha256,
-                    None,
-                    None,
-                )
-                .await;
+            // A metadata/sidecar upload (None) still gets its artifact row and
+            // the sync fan-out below — only catalog registration is skipped.
+            if let Some((package_name, package_version)) = registration {
+                let pkg_svc =
+                    crate::services::package_service::PackageService::new(self.db.clone());
+                pkg_svc
+                    .try_create_or_update_from_artifact(
+                        artifact.repository_id,
+                        &package_name,
+                        &package_version,
+                        artifact.size_bytes,
+                        &artifact.checksum_sha256,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
         }
 
         // Queue sync tasks for peer replication (non-blocking)
@@ -1092,30 +1165,29 @@ impl ArtifactService {
             });
         }
 
-        // Trigger scan-on-upload if scanner service is configured
-        if let Some(ref scanner) = self.scanner_service {
-            let scanner = scanner.clone();
-            let artifact_id = artifact.id;
-            let repo_id = artifact.repository_id;
-            let db = self.db.clone();
-            tokio::spawn(async move {
-                // Check if scan_on_upload is enabled for this repository
-                let should_scan = sqlx::query_scalar!(
-                    "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
-                    repo_id
-                )
-                .fetch_optional(&db)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(false);
+        // Trigger scan-on-upload if scanner service is configured. The same
+        // gate every format-native upload handler goes through (#4166).
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &self.db,
+            self.scanner_service.clone(),
+            artifact.repository_id,
+            artifact.id,
+        )
+        .await;
 
-                if should_scan {
-                    if let Err(e) = scanner.scan_artifact(artifact_id).await {
-                        tracing::warn!("Auto-scan failed for artifact {}: {}", artifact_id, e);
-                    }
-                }
-            });
+        // #2382: summarise a `.safetensors` header into `artifact_metadata`.
+        // Placed after the quarantine hold and the scan trigger so its
+        // storage read and parse never widen the window in which a fresh row
+        // is visible without a hold.
+        if safetensors_eligible {
+            record_safetensors_metadata(
+                &self.db,
+                self.storage.as_ref(),
+                artifact.id,
+                storage_key,
+                size_bytes,
+            )
+            .await;
         }
 
         // Trigger quality checks on upload (non-blocking)
@@ -2691,6 +2763,59 @@ fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Extract and record the safetensors header summary of a freshly stored
+/// Mlmodel upload (#2382) in `artifact_metadata` under format `mlmodel`.
+///
+/// Shared by the service-layer finalize path (generic `PUT` / multipart) and
+/// the chunked-upload commit, so every way a `.safetensors` file reaches an
+/// Mlmodel repository surfaces the same metadata. Reads only the length
+/// prefix and the capped header through ranged storage reads
+/// (`formats::mlmodel::read_safetensors_summary`), never the tensor data.
+///
+/// Best-effort: the upload has already committed, so nothing here fails it.
+/// Every outcome replaces the row's `metadata` with server-derived data: the
+/// summary, or `safetensors_error` (the bounded rejection reason, or a fixed
+/// marker when storage could not be read). A stale summary of earlier bytes
+/// at the same path, or a client-supplied document, therefore never
+/// survives. Existing `properties` on the row are preserved.
+pub(crate) async fn record_safetensors_metadata(
+    db: &PgPool,
+    storage: &dyn StorageBackend,
+    artifact_id: Uuid,
+    storage_key: &str,
+    size_bytes: i64,
+) {
+    use crate::formats::mlmodel::{self, SafetensorsError};
+
+    let file_size = u64::try_from(size_bytes).unwrap_or(0);
+    let result = mlmodel::read_safetensors_summary(storage, storage_key, file_size).await;
+    // Both reasons are already clipped to `SAFETENSORS_MAX_REASON_CHARS`.
+    match &result {
+        Err(SafetensorsError::Unreadable(e)) => {
+            tracing::warn!(%artifact_id, error = %e, "safetensors header could not be read");
+        }
+        Err(SafetensorsError::Invalid(reason)) => {
+            tracing::info!(%artifact_id, %reason, "safetensors header rejected");
+        }
+        Ok(_) => {}
+    }
+    let metadata = sanitize_metadata_urls(mlmodel::safetensors_artifact_metadata(result));
+    let stored = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'mlmodel', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET \
+             format = EXCLUDED.format, metadata = EXCLUDED.metadata",
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(db)
+    .await;
+    if let Err(e) = stored {
+        tracing::warn!(%artifact_id, error = %e, "safetensors metadata could not be recorded");
+    }
+}
+
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4695,6 +4820,146 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    // ---- #2382 safetensors header metadata on the finalize path -----------
+
+    /// A `.safetensors` upload to an Mlmodel repo records its header summary
+    /// in `artifact_metadata` (format `mlmodel`) with dangerous URLs in
+    /// `__metadata__` sanitised; a malformed re-upload at the same path
+    /// replaces the summary with the rejection reason while keeping the
+    /// row's properties; non-safetensors files and Generic repos record
+    /// nothing. Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_safetensors_upload_to_mlmodel_repo_records_header_metadata() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::mlmodel::safetensors_fixture;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "local", "mlmodel").await;
+        // Versioning (#2367) is what lets new bytes land at an occupied
+        // Mlmodel path, which the re-upload below relies on.
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage.clone());
+
+        let header = serde_json::json!({
+            "__metadata__": {"format": "pt", "source_url": "javascript:alert(1)"},
+            "w": {"dtype": "F16", "shape": [4, 2], "data_offsets": [0, 16]}
+        });
+        let path = "models/tiny/versions/1/artifacts/model.safetensors";
+        let upload = |bytes: Vec<u8>| {
+            svc.upload(
+                repo_id,
+                path,
+                "model.safetensors",
+                Some("1"),
+                "application/octet-stream",
+                Bytes::from(bytes),
+                Some(user_id),
+            )
+        };
+        let artifact = upload(safetensors_fixture(&header, 16))
+            .await
+            .expect("safetensors upload succeeds");
+        let meta = svc
+            .get_metadata(artifact.id)
+            .await
+            .unwrap()
+            .expect("metadata recorded");
+        assert_eq!(meta.format, "mlmodel");
+        let st = &meta.metadata["safetensors"];
+        assert_eq!(st["total_parameters"], 8);
+        assert_eq!(st["tensors"]["w"]["dtype"], "F16");
+        assert_eq!(st["metadata"]["format"], "pt");
+        assert_eq!(st["metadata"]["source_url"], "", "dangerous URL sanitised");
+
+        // Properties set on the row survive a re-upload; a malformed header
+        // replaces the stale summary with the rejection reason.
+        sqlx::query(
+            "UPDATE artifact_metadata SET properties = '{\"k\":\"v\"}' WHERE artifact_id = $1",
+        )
+        .bind(artifact.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A storage read failure clears the summary rather than leaving one
+        // that may describe earlier bytes, and keeps the properties.
+        record_safetensors_metadata(&pool, storage.as_ref(), artifact.id, "no/such/key", 64).await;
+        let meta = svc.get_metadata(artifact.id).await.unwrap().unwrap();
+        assert!(meta.metadata.get("safetensors").is_none());
+        assert_eq!(
+            meta.metadata["safetensors_error"],
+            crate::formats::mlmodel::SAFETENSORS_UNREADABLE_REASON
+        );
+        assert_eq!(meta.properties["k"], "v");
+
+        let mut broken = 4u64.to_le_bytes().to_vec();
+        broken.extend_from_slice(b"nope-and-data");
+        let again = upload(broken)
+            .await
+            .expect("malformed upload still succeeds");
+        let meta = svc.get_metadata(again.id).await.unwrap().unwrap();
+        assert!(meta.metadata.get("safetensors").is_none());
+        assert!(meta.metadata["safetensors_error"]
+            .as_str()
+            .unwrap()
+            .contains("header rejected"));
+        assert_eq!(meta.properties["k"], "v");
+
+        // A non-safetensors file in the same repo records nothing.
+        let other = svc
+            .upload(
+                repo_id,
+                "models/tiny/versions/1/artifacts/config.json",
+                "config.json",
+                Some("1"),
+                "application/json",
+                Bytes::from_static(b"{}"),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        assert!(svc.get_metadata(other.id).await.unwrap().is_none());
+
+        // The same bytes in a Generic repo record nothing either.
+        let (generic_id, _gkey, generic_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let generic_svc = ArtifactService::new(
+            pool.clone(),
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                generic_dir.clone(),
+            )),
+        );
+        let generic = generic_svc
+            .upload(
+                generic_id,
+                "tiny/1/model.safetensors",
+                "model.safetensors",
+                Some("1"),
+                "application/octet-stream",
+                Bytes::from(safetensors_fixture(&header, 16)),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        assert!(generic_svc
+            .get_metadata(generic.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        tdh::cleanup(&pool, generic_id, user_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&generic_dir);
+    }
+
     // ---- #2367 first-class versioning: pure helpers ------------------------
 
     #[test]
@@ -5575,5 +5840,82 @@ mod tests {
         );
         assert_eq!(uploaded[0].entity_id, artifact.id.to_string());
         assert_eq!(uploaded[0].repository_id, Some(repo_id));
+    }
+    /// #4197: uploading `maven-metadata.xml` (or a checksum/signature
+    /// sidecar) through the generic finalize path must NOT register a catalog
+    /// row — `parse_coordinates` reads the artifactId directory as the
+    /// version and would invent a bogus package (`com.acme:widget` at version
+    /// `widget`). The real asset registers the row; publish time and the
+    /// #3659 backfill now share the same skip predicate.
+    #[tokio::test]
+    async fn test_4197_maven_metadata_upload_registers_no_catalog_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        // Metadata document and a checksum sidecar of a real asset: neither is
+        // a package. The `version` argument mimics the naive path-segment
+        // derivation the generic/replication callers hand in.
+        for (path, name, version) in [
+            (
+                "com/acme/widget/maven-metadata.xml",
+                "maven-metadata.xml",
+                "widget",
+            ),
+            (
+                "com/acme/widget/1.2.3/widget-1.2.3.jar.sha1",
+                "widget-1.2.3.jar.sha1",
+                "1.2.3",
+            ),
+        ] {
+            service
+                .upload(
+                    repo_id,
+                    path,
+                    name,
+                    Some(version),
+                    "application/octet-stream",
+                    Bytes::from_static(b"metadata-or-sidecar"),
+                    None,
+                )
+                .await
+                .expect("metadata/sidecar upload");
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count packages");
+        assert_eq!(
+            rows, 0,
+            "metadata/sidecar uploads must not register catalog rows (#4197)"
+        );
+
+        // Control: the real asset registers under groupId:artifactId (#2723).
+        service
+            .upload(
+                repo_id,
+                "com/acme/widget/1.2.3/widget-1.2.3.jar",
+                "widget-1.2.3.jar",
+                Some("1.2.3"),
+                "application/java-archive",
+                Bytes::from_static(b"jar-bytes"),
+                None,
+            )
+            .await
+            .expect("asset upload");
+        assert!(
+            tdh::catalog_row(&pool, repo_id, "com.acme:widget")
+                .await
+                .is_some(),
+            "the real asset registers com.acme:widget"
+        );
     }
 }

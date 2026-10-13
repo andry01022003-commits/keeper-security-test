@@ -12,11 +12,14 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::handlers::repositories::{
+    require_repo_admin, require_repo_write_access, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::quality::{QualityGateEvaluation, QualityGateViolation};
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryType, RepositoryVisibility};
 use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::quality_check_service::QualityCheckService;
@@ -72,6 +75,26 @@ pub struct PromotionResponse {
     pub promotion_id: Option<Uuid>,
     pub policy_violations: Vec<PolicyViolation>,
     pub message: Option<String>,
+    /// Every gate rule the promotion was evaluated against, passed or not,
+    /// with the reason: `[{"rule","passed","reason"}]`. Empty when the policy
+    /// check was skipped or never reached.
+    pub gate_results: Vec<GateResult>,
+}
+
+pub use crate::services::promotion_policy_service::GateResult;
+
+/// Failing per-pair promotion rules as failed [`GateResult`]s.
+fn rule_failures_to_gate_results(
+    failing: &[crate::services::promotion_rule_service::RuleEvaluationResult],
+) -> Vec<GateResult> {
+    failing
+        .iter()
+        .map(|e| GateResult {
+            rule: e.rule_name.clone(),
+            passed: false,
+            reason: e.violations.join("; "),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -117,7 +140,11 @@ pub struct PromotionHistoryEntry {
     pub id: Uuid,
     pub artifact_id: Uuid,
     pub artifact_path: String,
+    /// Key of the repository the artifact was promoted (or rejected) from.
+    /// Empty when that repository was deleted or the caller cannot read it.
     pub source_repo_key: String,
+    /// Key of the repository the artifact was promoted into. Empty when that
+    /// repository was deleted or the caller cannot read it.
     pub target_repo_key: String,
     pub status: String,
     pub rejection_reason: Option<String>,
@@ -243,12 +270,18 @@ pub async fn stream_copy_artifact(
 /// folding the raw `QualityGateEvaluation` into this three-state outcome up
 /// front, then matching on it.
 ///
-/// `NotEvaluated` covers two non-fatal cases that the previous code already
-/// treated as "skip the gate, continue":
-///   * `skip_policy_check = true` in the request
+/// `NotEvaluated` covers the non-fatal cases where skipping the gate is the
+/// documented behaviour:
+///   * `skip_policy_check = true` in the request (the admin break-glass
+///     override, #4203)
 ///   * `quality_check_service` is not wired into application state
-///   * the underlying evaluation returned `Err` (missing gate / missing health
-///     score), which has always been logged-and-continued rather than 5xx'd.
+///   * the repository has no enabled gate, or the artifact has no health
+///     score yet (the `AppError::NotFound` defaults, #4156)
+///
+/// A GENUINE evaluation failure (a database error, say) is none of those:
+/// downgrading it to `NotEvaluated` promoted the artifact without the gate
+/// having run — a fail-open (#4204). `evaluate_gate_once` now returns it as
+/// `Err` and both promote routes refuse the promotion for that artifact.
 #[derive(Debug, Clone)]
 pub enum GateOutcome {
     /// Gate evaluation says this promotion must be rejected. The handler
@@ -259,9 +292,9 @@ pub enum GateOutcome {
     /// `warn` (or anything other than `block`). The promotion proceeds and
     /// the violations are attached to the response payload.
     Warn(Vec<QualityGateViolation>),
-    /// No actionable gate state: either the gate passed, the evaluation was
-    /// skipped (caller opt-out, service not wired, or recoverable error
-    /// inside `evaluate_quality_gate`).
+    /// No actionable gate state: either the gate passed, or the evaluation
+    /// was legitimately skipped (caller opt-out, service not wired, or one
+    /// of the `AppError::NotFound` "nothing to evaluate" defaults).
     NotEvaluated,
 }
 
@@ -269,10 +302,16 @@ pub enum GateOutcome {
 /// per promotion request and reduce the result to a `GateOutcome`.
 ///
 /// Skips evaluation when the caller passed `skip_policy_check = true` or when
-/// `quality_check_service` is not wired into application state. Errors from
-/// the underlying evaluation (e.g. missing gate, missing health score) are
-/// logged and downgraded to `NotEvaluated`; they are not fatal because the
-/// promotion path historically allowed promotions without a configured gate.
+/// `quality_check_service` is not wired into application state. The two
+/// `AppError::NotFound` defaults (no enabled gate for the repository, no
+/// health score for the artifact) are logged at debug and downgraded to
+/// `NotEvaluated`: promotions on an ungated repository are the common case,
+/// not an error (#4156).
+///
+/// Any OTHER evaluation error is returned as `Err` and fails the promotion
+/// closed (#4204): a gate that could not be evaluated must not silently
+/// promote. The single route maps the error to a retryable 503; the bulk
+/// route fails just that item.
 ///
 /// Returning a single owned outcome here is what lets the handler avoid the
 /// double-evaluation pattern that existed before (#1382 review): the same
@@ -282,22 +321,22 @@ pub async fn evaluate_gate_once(
     artifact_id: Uuid,
     repository_id: Uuid,
     skip_policy_check: bool,
-) -> GateOutcome {
+) -> Result<GateOutcome> {
     if skip_policy_check {
-        return GateOutcome::NotEvaluated;
+        return Ok(GateOutcome::NotEvaluated);
     }
     let Some(qc) = quality_check_service else {
-        return GateOutcome::NotEvaluated;
+        return Ok(GateOutcome::NotEvaluated);
     };
     match qc.evaluate_quality_gate(artifact_id, repository_id).await {
-        Ok(eval) => classify_gate_evaluation(eval),
+        Ok(eval) => Ok(classify_gate_evaluation(eval)),
         Err(e) if gate_error_is_no_op(&e) => {
             tracing::debug!(
                 "Quality gate not evaluated for artifact {}: {}",
                 artifact_id,
                 e
             );
-            GateOutcome::NotEvaluated
+            Ok(GateOutcome::NotEvaluated)
         }
         Err(e) => {
             tracing::warn!(
@@ -305,7 +344,7 @@ pub async fn evaluate_gate_once(
                 artifact_id,
                 e
             );
-            GateOutcome::NotEvaluated
+            Err(e)
         }
     }
 }
@@ -319,7 +358,8 @@ pub async fn evaluate_gate_once(
 /// successful promotion on an ungated repository look like a failure to
 /// log-based alerting (#4156). Matching on the variant rather than on the
 /// message keeps the classification stable if the wording changes. Anything
-/// else (a database error, say) is a real evaluation failure and stays at WARN.
+/// else (a database error, say) is a real evaluation failure and propagates
+/// out of [`evaluate_gate_once`] as `Err` (#4204).
 fn gate_error_is_no_op(err: &AppError) -> bool {
     matches!(err, AppError::NotFound(_))
 }
@@ -345,13 +385,47 @@ pub fn classify_gate_evaluation(eval: QualityGateEvaluation) -> GateOutcome {
 /// Centralised so the handler doesn't carry the format string and the message
 /// shape is asserted by a single unit test rather than duplicated.
 pub fn gate_block_error(eval: &QualityGateEvaluation) -> AppError {
-    AppError::Conflict(format!(
+    AppError::Conflict(gate_block_message(eval))
+}
+
+/// The `promotion_history.policy_result` document for a completed policy
+/// evaluation, shared by the single and bulk paths so the same artifact leaves
+/// the same audit record whichever route promoted it (#3977).
+fn build_policy_result_json(
+    eval_result: &crate::services::promotion_policy_service::PolicyEvaluationResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "passed": eval_result.passed,
+        "action": format!("{:?}", eval_result.action).to_lowercase(),
+        "violations": eval_result.violations,
+        "cve_summary": eval_result.cve_summary,
+        "license_summary": eval_result.license_summary,
+    })
+}
+
+/// The `promotion_history.policy_result` document written when an admin used
+/// the `skip_policy_check` override (#4203): the override must be visible in
+/// the audit trail rather than indistinguishable from a policy that ran and
+/// passed. Shared by the single and bulk paths so the marker cannot drift.
+fn skipped_policy_result_json() -> serde_json::Value {
+    serde_json::json!({
+        "passed": true,
+        "violations": [],
+        "policy_check_skipped": true,
+    })
+}
+
+/// The gate-block message, shared by the single path (which renders it as a
+/// `409`) and the bulk path (which renders it as that item's failure reason).
+/// One format string so the two surfaces cannot drift.
+pub fn gate_block_message(eval: &QualityGateEvaluation) -> String {
+    format!(
         "Promotion blocked by quality gate '{}' (health score: {}, grade: {}, violations: {})",
         eval.gate_name,
         eval.health_score,
         eval.health_grade,
         eval.violations.len(),
-    ))
+    )
 }
 
 /// Look up the linked release repository key for a staging repository.
@@ -466,6 +540,27 @@ fn ensure_promotion_authorized(is_admin: bool, has_promote_scope: bool) -> Resul
     Ok(())
 }
 
+/// `skip_policy_check` is a break-glass ADMIN override (#4203): one flag
+/// switches off the quality gate, the CVE/licence policy and the promotion
+/// rules together, so honouring it for any caller holding `promote:artifacts`
+/// would hand every scoped CI token a standing policy bypass. A non-admin
+/// caller that sets the flag is refused with 403 naming it — failing loudly
+/// beats silently evaluating anyway, because the caller passed the flag
+/// believing the checks did not run and must not be allowed to keep that
+/// belief while they did.
+///
+/// Pure so the allow/deny decision is unit-testable without a database;
+/// enforced for both promote routes inside [`authorize_and_resolve_promotion`].
+fn ensure_skip_policy_check_authorized(is_admin: bool, skip_policy_check: bool) -> Result<()> {
+    if skip_policy_check && !is_admin {
+        return Err(AppError::Authorization(
+            "skip_policy_check is an admin-only override; remove the flag or promote as an admin"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Pure tenant-ownership decision for one repository in a promotion.
 ///
 /// A promotion crosses a tenant boundary when the caller is authorized for one
@@ -564,6 +659,7 @@ async fn authorize_and_resolve_promotion(
     auth: &AuthExtension,
     repo_key: &str,
     requested_target: Option<&str>,
+    skip_policy_check: bool,
 ) -> Result<PromotionEndpoints> {
     // `promote:artifacts` is a grantable, admin-only-to-mint API-token scope.
     // Only trust it for API-token principals: `has_scope` returns true for JWT
@@ -571,6 +667,9 @@ async fn authorize_and_resolve_promotion(
     // promote capability they were never granted.
     let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
     ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
+    // The break-glass override is admin-only (#4203): checked at the shared
+    // choke point so neither the single nor the bulk route can forget it.
+    ensure_skip_policy_check_authorized(auth.is_admin, skip_policy_check)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
 
@@ -630,6 +729,7 @@ fn failed_response(source: String, target: String, message: String) -> Promotion
         promotion_id: None,
         policy_violations: vec![],
         message: Some(message),
+        gate_results: vec![],
     }
 }
 
@@ -652,6 +752,229 @@ fn rule_violations_to_policy_violations(
         .collect()
 }
 
+/// What the quality gate and the CVE/licence policy decided for one item of a
+/// bulk promotion, before its per-pair promotion_rules are checked.
+#[derive(Debug)]
+enum BulkItemScreening {
+    /// The item goes on to the promotion_rules check. `violations` are the
+    /// warn-level findings reported if it is promoted; `policy_result` is its
+    /// `promotion_history.policy_result` document.
+    Proceed {
+        violations: Vec<PolicyViolation>,
+        policy_result: serde_json::Value,
+        /// Every gate rule evaluated for the item, passed or not.
+        gate_results: Vec<GateResult>,
+    },
+    /// The item fails with `message`; the batch continues.
+    Refused {
+        message: String,
+        violations: Vec<PolicyViolation>,
+        /// Every gate rule evaluated before the refusal, passed or not, so a
+        /// bulk item reports the same per-rule decision a single promotion
+        /// does.
+        gate_results: Vec<GateResult>,
+    },
+}
+
+/// Decide one bulk item from its gate outcome and policy evaluation, in the
+/// single route's order: gate block, then policy block, then warn-level
+/// violations (policy findings first, then gate violations). `policy` is `None`
+/// when the policy was not evaluated (`skip_policy_check`, or a gate block),
+/// and `Err` carries the already-sanitised evaluation error. Pure so the
+/// per-item decision #3977 added is unit-testable without a database.
+fn screen_bulk_item(
+    gate_outcome: GateOutcome,
+    policy: Option<
+        std::result::Result<
+            crate::services::promotion_policy_service::PolicyEvaluationResult,
+            &'static str,
+        >,
+    >,
+) -> BulkItemScreening {
+    if let GateOutcome::Block(ref eval) = gate_outcome {
+        let message = gate_block_message(eval);
+        return BulkItemScreening::Refused {
+            gate_results: vec![GateResult {
+                rule: "quality-gate".to_string(),
+                passed: false,
+                reason: message.clone(),
+            }],
+            message,
+            violations: vec![],
+        };
+    }
+
+    // Recorded in promotion_history exactly as the single path records it:
+    // the full evaluation when the policy ran, the empty pass otherwise.
+    let mut violations: Vec<PolicyViolation> = vec![];
+    let mut policy_result = serde_json::json!({"passed": true, "violations": []});
+    let mut gate_results: Vec<GateResult> = vec![];
+
+    match policy {
+        None => {}
+        Some(Err(e)) => {
+            return BulkItemScreening::Refused {
+                message: format!("Policy evaluation failed: {}", e),
+                violations: vec![],
+                gate_results: vec![],
+            };
+        }
+        Some(Ok(eval_result)) => {
+            violations = eval_result
+                .violations
+                .iter()
+                .map(|v| PolicyViolation {
+                    rule: v.rule.clone(),
+                    severity: v.severity.clone(),
+                    message: v.message.clone(),
+                })
+                .collect();
+            policy_result = build_policy_result_json(&eval_result);
+            gate_results = eval_result.gate_results.clone();
+            if !eval_result.passed && eval_result.action == PolicyAction::Block {
+                return BulkItemScreening::Refused {
+                    message: "Promotion blocked by policy violations".to_string(),
+                    violations,
+                    gate_results,
+                };
+            }
+        }
+    }
+
+    if let GateOutcome::Warn(gate_violations) = gate_outcome {
+        violations.extend(gate_violations.into_iter().map(|v| PolicyViolation {
+            rule: v.rule,
+            severity: "medium".to_string(),
+            message: v.message,
+        }));
+    }
+
+    BulkItemScreening::Proceed {
+        violations,
+        policy_result,
+        gate_results,
+    }
+}
+
+/// Insert the target-repository row for a promoted artifact.
+///
+/// Shared by the single and bulk promote paths, which wrote byte-identical
+/// statements and were the two largest clones the duplication gate measured in
+/// this file. The error is returned raw so each caller keeps its own shape: the
+/// single path maps a duplicate key to `409 Conflict` for the whole request,
+/// the bulk path turns it into that one item's failure and carries on.
+///
+/// `origin` is the SOURCE artifact's recorded origin (#4152), looked up by
+/// each caller so it can apply its own error shape; passing it explicitly
+/// stops the `artifacts_origin_fill` trigger relabelling the copy `hosted`.
+async fn insert_promoted_artifact_row(
+    db: &sqlx::PgPool,
+    new_artifact_id: Uuid,
+    target_repo_id: Uuid,
+    artifact: &crate::models::artifact::Artifact,
+    uploaded_by: Uuid,
+    origin: Option<serde_json::Value>,
+    oci_image: Option<&crate::services::oci_promotion::PreparedOciImage>,
+) -> std::result::Result<(), sqlx::Error> {
+    // The row, its metadata and (for a Docker/OCI manifest) the rows that make
+    // the image pullable commit together (#4578).
+    let mut tx = db.begin().await?;
+    // NO-SCAN-ON-UPLOAD: promotion copies an existing artifact whose own scans
+    // gated the promotion; it is not an upload (#4166 scope).
+    // NO-QUOTA-ADMISSION: a promotion copy, not a client publish; whether a
+    // promotion is bounded by the target's storage quota is open (#4422).
+    sqlx::query!(
+        r#"
+        INSERT INTO artifacts (
+            id, repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_md5, checksum_sha1,
+            content_type, storage_key, uploaded_by, origin
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        "#,
+        new_artifact_id,
+        target_repo_id,
+        artifact.path,
+        artifact.name,
+        artifact.version,
+        artifact.size_bytes,
+        artifact.checksum_sha256,
+        artifact.checksum_md5,
+        artifact.checksum_sha1,
+        artifact.content_type,
+        artifact.storage_key,
+        uploaded_by,
+        origin
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // Carry the format metadata document across (F9). The copy is a new
+    // artifact row, and everything format handlers serve about it is read
+    // from `artifact_metadata` keyed by THAT row: a conda channel builds each
+    // repodata record (depends, constrains, md5, license, the CEP-50
+    // attestation sidecar and its verdict) from it. Without the copy a
+    // promoted package was served with no dependencies and no attestation.
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         SELECT $1, format, metadata FROM artifact_metadata WHERE artifact_id = $2 \
+         ON CONFLICT (artifact_id) DO NOTHING",
+    )
+    .bind(new_artifact_id)
+    .bind(artifact.id)
+    .execute(&mut *tx)
+    .await?;
+
+    if let Some(image) = oci_image {
+        image
+            .register_in_tx(&mut tx, target_repo_id, uploaded_by)
+            .await?;
+    }
+    tx.commit().await
+}
+
+/// One row of the promotion audit trail. A struct rather than a parameter list
+/// because the row carries five ids that are all `Uuid` and would otherwise be
+/// positional at the call site.
+struct PromotionHistoryRecord {
+    promotion_id: Uuid,
+    artifact_id: Uuid,
+    source_repo_id: Uuid,
+    target_repo_id: Uuid,
+    promoted_by: Uuid,
+    policy_result: serde_json::Value,
+    notes: Option<String>,
+}
+
+/// Record one promotion in the audit trail. Shared by the single and bulk
+/// promote paths for the same reason as
+/// [`insert_promoted_artifact_row`]; the error is likewise returned raw
+/// because the single path surfaces it and the bulk path ignores it.
+async fn insert_promotion_history_row(
+    db: &sqlx::PgPool,
+    record: PromotionHistoryRecord,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        INSERT INTO promotion_history (
+            id, artifact_id, source_repo_id, target_repo_id,
+            promoted_by, policy_result, notes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+        record.promotion_id,
+        record.artifact_id,
+        record.source_repo_id,
+        record.target_repo_id,
+        record.promoted_by,
+        record.policy_result,
+        record.notes
+    )
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 #[utoipa::path(
     post,
     path = "/repositories/{key}/artifacts/{artifact_id}/promote",
@@ -666,7 +989,7 @@ fn rule_violations_to_policy_violations(
         (status = 200, description = "Artifact promotion result", body = PromotionResponse),
         (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
         (status = 409, description = "Artifact already exists in target", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -681,8 +1004,14 @@ pub async fn promote_artifact(
         source_repo,
         target_key,
         target_repo,
-    } = authorize_and_resolve_promotion(&state, &auth, &repo_key, req.target_repository.as_deref())
-        .await?;
+    } = authorize_and_resolve_promotion(
+        &state,
+        &auth,
+        &repo_key,
+        req.target_repository.as_deref(),
+        req.skip_policy_check,
+    )
+    .await?;
 
     // Tenant-ownership gate (campaign-#4 systemic authz). The admin-capability
     // check above does NOT bind the caller to a tenant; without this, an
@@ -711,13 +1040,25 @@ pub async fn promote_artifact(
     // violations take precedence in the error response. A gate-blocked
     // promotion returns HTTP 409 Conflict, which is the documented rejection
     // code for promotions blocked by gate policy (#1376).
+    //
+    // Fail closed on a genuine evaluation error (#4204): the raw error is
+    // already logged inside `evaluate_gate_once`; the caller gets a retryable
+    // 503 with a sanitised, actionable message rather than a promotion that
+    // never ran the gate.
     let gate_outcome = evaluate_gate_once(
         state.quality_check_service.as_deref(),
         artifact_id,
         source_repo.id,
         req.skip_policy_check,
     )
-    .await;
+    .await
+    .map_err(|_| {
+        AppError::ServiceUnavailable(
+            "Quality gate could not be evaluated; promotion refused for safety. \
+             Retry shortly, or ask an administrator to skip the policy check."
+                .to_string(),
+        )
+    })?;
 
     if let GateOutcome::Block(ref eval) = gate_outcome {
         return Err(gate_block_error(eval));
@@ -726,6 +1067,14 @@ pub async fn promote_artifact(
     // Now run shape validation. Gate evaluation has already finished above so
     // a violating artifact cannot be masked by a 400 staging-source error.
     validate_promotion_repos(&source_repo, &target_repo)?;
+    crate::services::rpm_layout::validate_copy(
+        &state.db,
+        target_repo.id,
+        &artifact.path,
+        &artifact.checksum_sha256,
+        &artifact.storage_key,
+    )
+    .await?;
 
     // Ordering note (#1382 review): quality-gate block precedes
     // approval-required. A gate-violating artifact in an approval-required
@@ -749,7 +1098,21 @@ pub async fn promote_artifact(
         super::approval::check_approval_required(&state.db, source_repo.id).await?;
 
     let mut policy_violations: Vec<PolicyViolation> = vec![];
-    let mut policy_result_json = serde_json::json!({"passed": true, "violations": []});
+    let mut gate_results: Vec<GateResult> = vec![];
+    // #4203: an admin's skip_policy_check override is recorded in the audit
+    // trail as exactly that — not as a policy that ran and passed.
+    let mut policy_result_json = if req.skip_policy_check {
+        tracing::info!(
+            artifact_id = %artifact_id,
+            source_repo = %repo_key,
+            target_repo = %target_key,
+            promoted_by = %auth.user_id,
+            "skip_policy_check admin override used for promotion"
+        );
+        skipped_policy_result_json()
+    } else {
+        serde_json::json!({"passed": true, "violations": []})
+    };
 
     if !req.skip_policy_check {
         let policy_service = PromotionPolicyService::new(state.db.clone());
@@ -767,13 +1130,8 @@ pub async fn promote_artifact(
             })
             .collect();
 
-        policy_result_json = serde_json::json!({
-            "passed": eval_result.passed,
-            "action": format!("{:?}", eval_result.action).to_lowercase(),
-            "violations": eval_result.violations,
-            "cve_summary": eval_result.cve_summary,
-            "license_summary": eval_result.license_summary,
-        });
+        policy_result_json = build_policy_result_json(&eval_result);
+        gate_results = eval_result.gate_results.clone();
 
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
             return Ok(Json(PromotionResponse {
@@ -783,6 +1141,7 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations,
                 message: Some("Promotion blocked by policy violations".to_string()),
+                gate_results,
             }));
         }
     }
@@ -807,6 +1166,10 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations: rule_violations_to_policy_violations(&failing),
                 message: Some("Promotion blocked by promotion rule violations".to_string()),
+                gate_results: gate_results
+                    .into_iter()
+                    .chain(rule_failures_to_gate_results(&failing))
+                    .collect(),
             }));
         }
     }
@@ -870,6 +1233,18 @@ pub async fn promote_artifact(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to copy artifact: {}", e)))?;
 
+    // A Docker/OCI manifest needs its child manifests and blobs in the target
+    // too, and the rows a pull resolves through (#4578). `None` for every
+    // other artifact.
+    let oci_image = crate::services::oci_promotion::prepare(
+        &state.db,
+        &*source_storage,
+        &*target_storage,
+        source_repo.id,
+        &artifact.path,
+    )
+    .await?;
+
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
     // Carry the SOURCE artifact's origin onto the copy (#4152). Without an
@@ -883,30 +1258,15 @@ pub async fn promote_artifact(
         .await
         .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
-    sqlx::query!(
-        r#"
-        INSERT INTO artifacts (
-            id, repository_id, path, name, version, size_bytes,
-            checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, uploaded_by, origin
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        "#,
+    insert_promoted_artifact_row(
+        &state.db,
         new_artifact_id,
         target_repo.id,
-        artifact.path,
-        artifact.name,
-        artifact.version,
-        artifact.size_bytes,
-        artifact.checksum_sha256,
-        artifact.checksum_md5,
-        artifact.checksum_sha1,
-        artifact.content_type,
-        artifact.storage_key,
+        &artifact,
         auth.user_id,
-        source_origin
+        source_origin,
+        oci_image.as_ref(),
     )
-    .execute(&state.db)
     .await
     .map_err(|e: sqlx::Error| {
         if e.to_string().contains("duplicate key") {
@@ -920,25 +1280,27 @@ pub async fn promote_artifact(
     })?;
 
     let promotion_id = Uuid::new_v4();
-    sqlx::query!(
-        r#"
-        INSERT INTO promotion_history (
-            id, artifact_id, source_repo_id, target_repo_id,
-            promoted_by, policy_result, notes
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-        promotion_id,
-        artifact_id,
-        source_repo.id,
-        target_repo.id,
-        auth.user_id,
-        policy_result_json,
-        req.notes
+    insert_promotion_history_row(
+        &state.db,
+        PromotionHistoryRecord {
+            promotion_id,
+            artifact_id,
+            source_repo_id: source_repo.id,
+            target_repo_id: target_repo.id,
+            promoted_by: auth.user_id,
+            policy_result: policy_result_json,
+            notes: req.notes.clone(),
+        },
     )
-    .execute(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
+
+    // #3939: the copy is a new artifact in the target repository, written
+    // with raw SQL rather than through `finalize_upload`, so the promotion
+    // emits the target repository's `artifact.uploaded` itself.
+    state
+        .event_bus
+        .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
 
     tracing::info!(
         source_repo = %repo_key,
@@ -948,11 +1310,20 @@ pub async fn promote_artifact(
         "Artifact promoted successfully"
     );
 
-    Ok(Json(build_success_response(
+    // Warn-level violations ride along with the successful result. They were
+    // accumulated above (policy warn-level findings, then any
+    // `GateOutcome::Warn` gate violations); passing them here is what makes a
+    // gate configured to `warn` visible to the caller at all. Before this was
+    // wired the vector was pushed to and then dropped, so every successful
+    // promotion reported an empty list no matter what the gate found.
+    let mut response = build_success_response(
         build_promotion_source_display(&repo_key, &artifact.path),
         build_promotion_target_display(&target_key, &artifact.path),
         promotion_id,
-    )))
+        policy_violations,
+    );
+    response.gate_results = gate_results;
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -967,7 +1338,7 @@ pub async fn promote_artifact(
     responses(
         (status = 200, description = "Bulk promotion results", body = BulkPromotionResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -982,8 +1353,30 @@ pub async fn promote_artifacts_bulk(
         source_repo,
         target_key,
         target_repo,
-    } = authorize_and_resolve_promotion(&state, &auth, &repo_key, req.target_repository.as_deref())
-        .await?;
+    } = authorize_and_resolve_promotion(
+        &state,
+        &auth,
+        &repo_key,
+        req.target_repository.as_deref(),
+        req.skip_policy_check,
+    )
+    .await?;
+
+    // #4203: record the break-glass override once per request; each promoted
+    // item also carries the `policy_check_skipped` marker in its
+    // promotion_history row (see below).
+    if req.skip_policy_check {
+        tracing::info!(
+            source_repo = %repo_key,
+            target_repo = %target_key,
+            promoted_by = %auth.user_id,
+            item_count = req.artifact_ids.len(),
+            "skip_policy_check admin override used for bulk promotion"
+        );
+    }
+    // Unlike the single route (gate before shape, #1376), the shape check runs
+    // first here: it is batch-wide and the gate is per item, so a mis-shaped
+    // batch is refused with 400 before any item's gate is evaluated.
     validate_promotion_repos(&source_repo, &target_repo)?;
 
     // Tenant-ownership gate (campaign-#4 systemic authz). Enforced once for the
@@ -1030,6 +1423,110 @@ pub async fn promote_artifacts_bulk(
 
         let source_display = build_promotion_source_display(&repo_key, &artifact.path);
         let target_display = build_promotion_target_display(&target_key, &artifact.path);
+        match crate::services::rpm_layout::validate_copy(
+            &state.db,
+            target_repo.id,
+            &artifact.path,
+            &artifact.checksum_sha256,
+            &artifact.storage_key,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                failed += 1;
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+
+        // Quality gate, per item. The bulk path ran ONLY the promotion_rules
+        // check before this: it never evaluated the quality gate and never
+        // evaluated the CVE/licence policy, so an artifact the single-promote
+        // route refuses on either was promoted here regardless — a one-element
+        // array was enough to bypass both. Evaluated once per item, exactly as
+        // `promote_artifact` does, and honouring the same `skip_policy_check`
+        // admin override.
+        //
+        // A gate block fails THIS ITEM and the batch continues, where the
+        // single path returns 409 for the whole request. That difference is
+        // deliberate: a bulk promotion reports per-artifact outcomes so a
+        // partial result stays distinguishable from a wholesale refusal.
+        //
+        // A genuine evaluation error fails the item closed (#4204) — the
+        // promotion must not proceed with the gate unevaluated. The raw
+        // error was logged inside `evaluate_gate_once`; the per-item message
+        // is the same sanitised wording other DB failures use here.
+        let gate_outcome = match evaluate_gate_once(
+            state.quality_check_service.as_deref(),
+            *artifact_id,
+            source_repo.id,
+            req.skip_policy_check,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                failed += 1;
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    crate::api::handlers::internal_err_message(
+                        "Quality gate evaluation failed; item not promoted",
+                        &e,
+                    )
+                    .to_string(),
+                ));
+                continue;
+            }
+        };
+
+        // CVE / licence policy, per item. Not queried for a gate-blocked item:
+        // the gate refusal wins, so the evaluation would be discarded.
+        let policy = if req.skip_policy_check || matches!(gate_outcome, GateOutcome::Block(_)) {
+            None
+        } else {
+            Some(
+                PromotionPolicyService::new(state.db.clone())
+                    .evaluate_artifact(*artifact_id, source_repo.id)
+                    .await
+                    .map_err(|e| crate::api::handlers::db_err_message(&e)),
+            )
+        };
+
+        let (item_violations, screening_policy_result, item_gate_results) =
+            match screen_bulk_item(gate_outcome, policy) {
+                BulkItemScreening::Proceed {
+                    violations,
+                    policy_result,
+                    gate_results,
+                } => (violations, policy_result, gate_results),
+                BulkItemScreening::Refused {
+                    message,
+                    violations,
+                    gate_results,
+                } => {
+                    failed += 1;
+                    let mut resp = failed_response(source_display, target_display, message);
+                    resp.policy_violations = violations;
+                    resp.gate_results = gate_results;
+                    results.push(resp);
+                    continue;
+                }
+            };
+
+        // #4203: an item promoted under the admin's skip_policy_check override
+        // carries the override marker in the audit trail (the policy never
+        // ran for it), not the empty-pass document a real evaluation writes.
+        let item_policy_result = if req.skip_policy_check {
+            skipped_policy_result_json()
+        } else {
+            screening_policy_result
+        };
 
         // Enforce per-pair promotion_rules per item before copying. Mirrors the
         // single-promote gate; a rule-blocked item fails and the batch continues
@@ -1051,6 +1548,11 @@ pub async fn promote_artifacts_bulk(
                         "Promotion blocked by promotion rule violations".to_string(),
                     );
                     resp.policy_violations = rule_violations_to_policy_violations(&failing);
+                    resp.gate_results = item_gate_results
+                        .iter()
+                        .cloned()
+                        .chain(rule_failures_to_gate_results(&failing))
+                        .collect();
                     results.push(resp);
                     continue;
                 }
@@ -1060,7 +1562,10 @@ pub async fn promote_artifacts_bulk(
                     results.push(failed_response(
                         source_display,
                         target_display,
-                        format!("Rule evaluation error: {}", e),
+                        format!(
+                            "Rule evaluation failed: {}",
+                            crate::api::handlers::db_err_message(&e)
+                        ),
                     ));
                     continue;
                 }
@@ -1133,6 +1638,29 @@ pub async fn promote_artifacts_bulk(
             continue;
         }
 
+        // Same Docker/OCI content copy as the single-promote path (#4578).
+        let oci_image = match crate::services::oci_promotion::prepare(
+            &state.db,
+            &*source_storage,
+            &*target_storage,
+            source_repo.id,
+            &artifact.path,
+        )
+        .await
+        {
+            Ok(image) => image,
+            Err(e) => {
+                failed += 1;
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    crate::api::handlers::internal_err_message("Failed to copy artifact", &e)
+                        .to_string(),
+                ));
+                continue;
+            }
+        };
+
         let new_artifact_id = Uuid::new_v4();
         super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
         // Same origin carry-over as the single-promote path (#4152): the
@@ -1152,30 +1680,15 @@ pub async fn promote_artifacts_bulk(
                 }
             };
 
-        let insert_result: std::result::Result<_, sqlx::Error> = sqlx::query!(
-            r#"
-            INSERT INTO artifacts (
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_md5, checksum_sha1,
-                content_type, storage_key, uploaded_by, origin
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            "#,
+        let insert_result = insert_promoted_artifact_row(
+            &state.db,
             new_artifact_id,
             target_repo.id,
-            artifact.path,
-            artifact.name,
-            artifact.version,
-            artifact.size_bytes,
-            artifact.checksum_sha256,
-            artifact.checksum_md5,
-            artifact.checksum_sha1,
-            artifact.content_type,
-            artifact.storage_key,
+            &artifact,
             auth.user_id,
-            source_origin
+            source_origin,
+            oci_image.as_ref(),
         )
-        .execute(&state.db)
         .await;
 
         if let Err(e) = insert_result {
@@ -1190,26 +1703,25 @@ pub async fn promote_artifacts_bulk(
         }
 
         let promotion_id = Uuid::new_v4();
-        let policy_result = serde_json::json!({"passed": true, "violations": []});
 
-        let _ = sqlx::query!(
-            r#"
-            INSERT INTO promotion_history (
-                id, artifact_id, source_repo_id, target_repo_id,
-                promoted_by, policy_result, notes
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            "#,
-            promotion_id,
-            artifact_id,
-            source_repo.id,
-            target_repo.id,
-            auth.user_id,
-            policy_result,
-            req.notes
+        let _ = insert_promotion_history_row(
+            &state.db,
+            PromotionHistoryRecord {
+                promotion_id,
+                artifact_id: *artifact_id,
+                source_repo_id: source_repo.id,
+                target_repo_id: target_repo.id,
+                promoted_by: auth.user_id,
+                policy_result: item_policy_result,
+                notes: req.notes.clone(),
+            },
         )
-        .execute(&state.db)
         .await;
+
+        // #3939: same per-copy event as the single-promote path.
+        state
+            .event_bus
+            .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
 
         promoted += 1;
         results.push(PromotionResponse {
@@ -1217,8 +1729,9 @@ pub async fn promote_artifacts_bulk(
             source: source_display,
             target: target_display,
             promotion_id: Some(promotion_id),
-            policy_violations: vec![],
+            policy_violations: item_violations,
             message: Some("Promoted successfully".to_string()),
+            gate_results: item_gate_results,
         });
     }
 
@@ -1251,8 +1764,9 @@ pub async fn promote_artifacts_bulk(
     request_body = RejectArtifactRequest,
     responses(
         (status = 200, description = "Artifact rejection result", body = RejectionResponse),
-        (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Caller is not an admin and holds no promote:artifacts token scope, or the repository is outside its tenant", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Artifact or repository not found, or the repository is not readable by the caller", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1264,6 +1778,17 @@ pub async fn reject_artifact(
 ) -> Result<Json<RejectionResponse>> {
     let repo_service = RepositoryService::new(state.db.clone());
     let source_repo = repo_service.get_by_key(&repo_key).await?;
+    // GHSA-mvmh-g8wm-r3cp: a rejection is the other half of the promotion
+    // decision and writes an attributed `promotion_history` row, so it needs
+    // the promotion capability (an admin, or a `promote:artifacts` token)
+    // and the tenant gate the promote routes apply. Visibility comes first so
+    // a caller who cannot read the repository gets its 404 for every
+    // artifact id, and the endpoint is not an existence oracle.
+    require_visible(&source_repo, &Some(auth.clone()), &repo_service).await?;
+    let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
+    ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
+    require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &source_repo)
+        .await?;
 
     if source_repo.repo_type != RepositoryType::Staging {
         return Err(AppError::Validation(
@@ -1336,18 +1861,25 @@ pub async fn reject_artifact(
         ("status" = Option<String>, Query, description = "Filter by status (promoted, rejected, pending_approval)"),
     ),
     responses(
-        (status = 200, description = "Promotion history for repository", body = PromotionHistoryResponse),
-        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 200, description = "Promotion history for repository. The key of a counterpart repository the caller cannot read is returned as an empty string.", body = PromotionHistoryResponse),
+        (status = 404, description = "Repository not found, or not readable by the caller", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn promotion_history(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_key): Path<String>,
     Query(query): Query<PromotionHistoryQuery>,
 ) -> Result<Json<PromotionHistoryResponse>> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&repo_key).await?;
+    // #4418: the history names artifact paths, the counterpart repository,
+    // rejection reasons, actors and policy results, so it is a READ of the
+    // repository and takes the same existence-hiding gate as the sibling read
+    // endpoints: a caller who cannot read the repository gets the same 404 as
+    // for a repository that does not exist.
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
 
     let (page, per_page, offset) = compute_promotion_pagination(query.page, query.per_page);
 
@@ -1356,8 +1888,12 @@ pub async fn promotion_history(
         id: Uuid,
         artifact_id: Uuid,
         artifact_path: Option<String>,
+        source_repo_id: Option<Uuid>,
         source_repo_key: Option<String>,
+        source_visibility: Option<RepositoryVisibility>,
+        target_repo_id: Option<Uuid>,
         target_repo_key: Option<String>,
+        target_visibility: Option<RepositoryVisibility>,
         status: String,
         rejection_reason: Option<String>,
         promoted_by: Option<Uuid>,
@@ -1375,8 +1911,12 @@ pub async fn promotion_history(
             ph.id,
             ph.artifact_id,
             a.path as artifact_path,
+            sr.id as source_repo_id,
             sr.key as source_repo_key,
+            sr.visibility as source_visibility,
+            tr.id as target_repo_id,
             tr.key as target_repo_key,
+            tr.visibility as target_visibility,
             ph.status,
             ph.rejection_reason,
             ph.promoted_by,
@@ -1416,14 +1956,34 @@ pub async fn promotion_history(
 
     let total_pages = compute_total_pages(total, per_page);
 
+    // The other side of each row (the release target of a staging repo's
+    // history, or the staging source of a release repo's) may be a repository
+    // the caller cannot read; its key is blanked exactly as the per-artifact
+    // `last_promotion` state redacts it (#4384, #4418). The requested
+    // repository passed `require_visible` above.
+    let mut readable = super::last_promotion::readable_repo_ids(
+        &state.db,
+        rows.iter().flat_map(|r| {
+            [
+                r.source_repo_id.zip(r.source_visibility),
+                r.target_repo_id.zip(r.target_visibility),
+            ]
+            .into_iter()
+            .flatten()
+        }),
+        Some(&auth),
+    )
+    .await;
+    readable.insert(repo.id);
+
     let items = rows
         .into_iter()
         .map(|row| PromotionHistoryEntry {
             id: row.id,
             artifact_id: row.artifact_id,
             artifact_path: row.artifact_path.unwrap_or_default(),
-            source_repo_key: row.source_repo_key.unwrap_or_default(),
-            target_repo_key: row.target_repo_key.unwrap_or_default(),
+            source_repo_key: readable_repo_key(row.source_repo_id, row.source_repo_key, &readable),
+            target_repo_key: readable_repo_key(row.target_repo_id, row.target_repo_key, &readable),
             status: row.status,
             rejection_reason: row.rejection_reason,
             promoted_by: row.promoted_by,
@@ -1445,6 +2005,21 @@ pub async fn promotion_history(
     }))
 }
 
+/// A promotion-history repository key as the caller may see it: the key when
+/// the repository is in `readable`, otherwise empty (the same value the
+/// response already carries for a repository that has since been deleted), so
+/// the history never names a repository its viewer could not open (#4418).
+fn readable_repo_key(
+    repo_id: Option<Uuid>,
+    key: Option<String>,
+    readable: &std::collections::HashSet<Uuid>,
+) -> String {
+    match repo_id {
+        Some(id) if readable.contains(&id) => key.unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Release target linking
 // ---------------------------------------------------------------------------
@@ -1453,9 +2028,9 @@ pub async fn promotion_history(
 pub struct ReleaseTargetResponse {
     /// Whether this staging repository has a linked release target.
     pub linked: bool,
-    /// The release repository key, if linked.
+    /// The release repository key, if linked and readable by the caller.
     pub release_repository_key: Option<String>,
-    /// The release repository ID, if linked.
+    /// The release repository ID, if linked and readable by the caller.
     pub release_repository_id: Option<Uuid>,
 }
 
@@ -1476,18 +2051,23 @@ pub struct SetReleaseTargetRequest {
         ("key" = String, Path, description = "Staging repository key"),
     ),
     responses(
-        (status = 200, description = "Release target information", body = ReleaseTargetResponse),
-        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Repository is not a staging repository", body = crate::api::openapi::ErrorResponse),
+        (status = 200, description = "Release target information. When the caller cannot read the linked release repository, `linked` is true and its key and id are null.", body = ReleaseTargetResponse),
+        (status = 404, description = "Repository not found, or not readable by the caller", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Repository is not a staging repository", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_release_target(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_key): Path<String>,
 ) -> Result<Json<ReleaseTargetResponse>> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&repo_key).await?;
+    // #4473: a READ of the staging repository's configuration, gated like
+    // promotion history (#4418) and before the type check, so a caller who
+    // cannot read the repository learns neither its link nor its type.
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
 
     if repo.repo_type != RepositoryType::Staging {
         return Err(AppError::Validation(
@@ -1511,19 +2091,24 @@ pub async fn get_release_target(
                     release_id_str
                 ))
             })?;
-            let release_key: Option<(String,)> =
-                sqlx::query_as("SELECT key FROM repositories WHERE id = $1")
+            let release: Option<(String, RepositoryVisibility)> =
+                sqlx::query_as("SELECT key, visibility FROM repositories WHERE id = $1")
                     .bind(release_id)
                     .fetch_optional(&state.db)
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
 
-            match release_key {
-                Some((key,)) => Ok(Json(ReleaseTargetResponse {
-                    linked: true,
-                    release_repository_key: Some(key),
-                    release_repository_id: Some(release_id),
-                })),
+            match release {
+                Some((key, visibility)) => {
+                    let readable = super::last_promotion::readable_repo_ids(
+                        &state.db,
+                        [(release_id, visibility)],
+                        Some(&auth),
+                    )
+                    .await
+                    .contains(&release_id);
+                    Ok(Json(linked_release_target(release_id, key, readable)))
+                }
                 None => {
                     // The linked repo was deleted; treat as unlinked.
                     Ok(Json(ReleaseTargetResponse {
@@ -1539,6 +2124,17 @@ pub async fn get_release_target(
             release_repository_key: None,
             release_repository_id: None,
         })),
+    }
+}
+
+/// The response for a staging repository linked to `release_id`. The link is
+/// always reported, but the release repository's key and id only when the
+/// caller can read it, matching the promotion-history redaction (#4473).
+fn linked_release_target(release_id: Uuid, key: String, readable: bool) -> ReleaseTargetResponse {
+    ReleaseTargetResponse {
+        linked: true,
+        release_repository_key: readable.then_some(key),
+        release_repository_id: readable.then_some(release_id),
     }
 }
 
@@ -1558,8 +2154,9 @@ pub async fn get_release_target(
     request_body = SetReleaseTargetRequest,
     responses(
         (status = 200, description = "Release target updated", body = ReleaseTargetResponse),
-        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Caller lacks the repository admin action on the staging repository, or the token lacks write:repositories", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found, or not readable by the caller", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1569,10 +2166,16 @@ pub async fn set_release_target(
     Path(repo_key): Path<String>,
     Json(req): Json<SetReleaseTargetRequest>,
 ) -> Result<Json<ReleaseTargetResponse>> {
-    auth.require_scope("write")?;
-
     let repo_service = RepositoryService::new(state.db.clone());
     let staging_repo = repo_service.get_by_key(&repo_key).await?;
+    // GHSA-mvmh-g8wm-r3cp: the link decides where every release promotion
+    // without an explicit target lands, so changing it is repository
+    // administration of the staging repository. Visibility first, as on the
+    // GET (#4473), so a caller who cannot read the repository learns neither
+    // its existence nor its type; then the token scope, the tenant gate and
+    // the repository `admin` action, as on the other configuration routes.
+    let caller = Some(auth.clone());
+    require_visible(&staging_repo, &caller, &repo_service).await?;
 
     if staging_repo.repo_type != RepositoryType::Staging {
         return Err(AppError::Validation(
@@ -1580,11 +2183,26 @@ pub async fn set_release_target(
         ));
     }
 
+    auth.require_scope("write:repositories")?;
+    require_repo_write_access(&auth, &staging_repo, &repo_service).await?;
+    require_repo_admin(&auth, staging_repo.id, &state.permission_service).await?;
+
     match req.release_repository_key {
         Some(release_key) => {
-            let release_repo = repo_service.get_by_key(&release_key).await.map_err(|_| {
-                AppError::Validation(format!("Release repository '{}' not found", release_key))
-            })?;
+            let not_found =
+                || AppError::Validation(format!("Release repository '{}' not found", release_key));
+            let release_repo = repo_service
+                .get_by_key(&release_key)
+                .await
+                .map_err(|_| not_found())?;
+            // A release repository the caller cannot read answers exactly
+            // like a missing one, so the link cannot probe for private keys.
+            require_visible(&release_repo, &caller, &repo_service)
+                .await
+                .map_err(|e| match e {
+                    AppError::NotFound(_) => not_found(),
+                    other => other,
+                })?;
 
             validate_release_target_link(&staging_repo, &release_repo)?;
 
@@ -1676,6 +2294,7 @@ pub fn validate_release_target_link(
         BulkPromoteRequest,
         PromotionResponse,
         PolicyViolation,
+        GateResult,
         BulkPromotionResponse,
         RejectArtifactRequest,
         RejectionResponse,
@@ -1721,14 +2340,20 @@ fn compute_total_pages(total: i64, per_page: u32) -> u32 {
 }
 
 /// Build a successful promotion response.
-fn build_success_response(source: String, target: String, promotion_id: Uuid) -> PromotionResponse {
+fn build_success_response(
+    source: String,
+    target: String,
+    promotion_id: Uuid,
+    policy_violations: Vec<PolicyViolation>,
+) -> PromotionResponse {
     PromotionResponse {
         promoted: true,
         source,
         target,
         promotion_id: Some(promotion_id),
-        policy_violations: vec![],
+        policy_violations,
         message: Some("Artifact promoted successfully".to_string()),
+        gate_results: vec![],
     }
 }
 
@@ -1763,6 +2388,7 @@ fn build_rejection_response(
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1882,6 +2508,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // ensure_skip_policy_check_authorized (#4203)
+    //
+    // skip_policy_check switches off every promotion check in one flag, so it
+    // is a break-glass admin override: a scoped non-admin token that sets it
+    // is refused with 403 naming the flag, on both promote routes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_policy_check_admin_allowed() {
+        assert!(ensure_skip_policy_check_authorized(true, true).is_ok());
+        assert!(ensure_skip_policy_check_authorized(true, false).is_ok());
+    }
+
+    #[test]
+    fn test_skip_policy_check_unset_always_allowed() {
+        assert!(ensure_skip_policy_check_authorized(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_skip_policy_check_non_admin_denied_and_names_the_flag() {
+        let err = ensure_skip_policy_check_authorized(false, true).unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "a non-admin skip_policy_check must be a 403; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("skip_policy_check"),
+            "the refusal must name the flag so the caller knows what to drop; got {err}"
+        );
+    }
+
+    #[test]
+    fn test_skipped_policy_result_marks_the_override() {
+        let doc = skipped_policy_result_json();
+        assert_eq!(doc["policy_check_skipped"], serde_json::json!(true));
+        assert_eq!(doc["passed"], serde_json::json!(true));
+        assert!(
+            doc["violations"].as_array().expect("array").is_empty(),
+            "a skipped evaluation records no violations"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // promotion_tenant_access_allowed (cross-tenant promote-target gate)
     //
     // Pure decision behind require_promotion_tenant_access. A repo passes the
@@ -1929,6 +2598,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/tmp/test".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -2644,6 +3314,7 @@ mod tests {
             "staging/lib.jar".to_string(),
             "release/lib.jar".to_string(),
             promo_id,
+            vec![],
         );
         assert!(resp.promoted);
         assert_eq!(resp.source, "staging/lib.jar");
@@ -2656,6 +3327,32 @@ mod tests {
         );
     }
 
+    /// A successful promotion must still REPORT warn-level violations. The
+    /// builder previously hardcoded an empty list, so the violations the
+    /// handler collects for a `warn`-configured quality gate were dropped on
+    /// the way out and a warning gate was silent to every client.
+    #[test]
+    fn test_build_success_response_carries_warn_level_violations() {
+        let promo_id = Uuid::new_v4();
+        let resp = build_success_response(
+            "staging/lib.jar".to_string(),
+            "release/lib.jar".to_string(),
+            promo_id,
+            vec![PolicyViolation {
+                rule: "min_health_score".to_string(),
+                severity: "medium".to_string(),
+                message: "Health score 10 is below the required 90".to_string(),
+            }],
+        );
+        assert!(resp.promoted, "a warn-level violation must not block");
+        assert_eq!(
+            resp.policy_violations.len(),
+            1,
+            "warn-level violations must survive into the response"
+        );
+        assert_eq!(resp.policy_violations[0].rule, "min_health_score");
+    }
+
     #[test]
     fn test_build_success_response_different_paths() {
         let promo_id = Uuid::new_v4();
@@ -2663,9 +3360,230 @@ mod tests {
             "staging-npm/@scope/pkg-1.0.0.tgz".to_string(),
             "releases-npm/@scope/pkg-1.0.0.tgz".to_string(),
             promo_id,
+            vec![],
         );
         assert!(resp.promoted);
         assert_eq!(resp.promotion_id, Some(promo_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // screen_bulk_item (per-item gate + policy decision on the bulk path, #3977)
+    // -----------------------------------------------------------------------
+
+    /// F18: a bulk item refused by a scan-policy predicate reports the same
+    /// per-rule gate results the single route returns, passed rules included,
+    /// and a promoted item reports its passed rules too.
+    #[test]
+    fn screen_bulk_item_carries_every_gate_result() {
+        let gate = |rule: &str, passed: bool| GateResult {
+            rule: rule.to_string(),
+            passed,
+            reason: format!("{rule} {passed}"),
+        };
+        let mut blocked = policy_eval(false, PolicyAction::Block, &["policy-predicate"]);
+        blocked.gate_results = vec![
+            gate("cve-severity-threshold", true),
+            gate("license-compliance", true),
+            gate("policy-predicate", false),
+        ];
+        match screen_bulk_item(GateOutcome::NotEvaluated, Some(Ok(blocked))) {
+            BulkItemScreening::Refused { gate_results, .. } => {
+                assert_eq!(gate_results.len(), 3);
+                assert!(gate_results
+                    .iter()
+                    .any(|g| g.rule == "policy-predicate" && !g.passed));
+                assert!(gate_results.iter().filter(|g| g.passed).count() == 2);
+            }
+            _ => panic!("a predicate block must refuse the item"),
+        }
+
+        let mut clean = policy_eval(true, PolicyAction::Allow, &[]);
+        clean.gate_results = vec![gate("require-signature", true)];
+        match screen_bulk_item(GateOutcome::NotEvaluated, Some(Ok(clean))) {
+            BulkItemScreening::Proceed { gate_results, .. } => {
+                assert_eq!(gate_results, vec![gate("require-signature", true)]);
+            }
+            _ => panic!("a clean item must proceed"),
+        }
+    }
+
+    fn policy_eval(
+        passed: bool,
+        action: PolicyAction,
+        rules: &[&str],
+    ) -> crate::services::promotion_policy_service::PolicyEvaluationResult {
+        crate::services::promotion_policy_service::PolicyEvaluationResult {
+            passed,
+            action,
+            violations: rules
+                .iter()
+                .map(
+                    |r| crate::services::promotion_policy_service::PolicyViolation {
+                        rule: r.to_string(),
+                        severity: "critical".to_string(),
+                        message: format!("{} violated", r),
+                        details: None,
+                    },
+                )
+                .collect(),
+            cve_summary: None,
+            license_summary: None,
+            gate_results: vec![],
+        }
+    }
+
+    fn rules_of(violations: &[PolicyViolation]) -> Vec<&str> {
+        violations.iter().map(|v| v.rule.as_str()).collect()
+    }
+
+    #[test]
+    fn test_screen_bulk_item_gate_block_refuses_with_gate_message() {
+        let eval = make_gate_eval(false, "block", vec![make_violation("min_health_score")]);
+        let expected = gate_block_message(&eval);
+        match screen_bulk_item(GateOutcome::Block(eval), None) {
+            BulkItemScreening::Refused {
+                message,
+                violations,
+                ..
+            } => {
+                assert_eq!(message, expected);
+                assert!(violations.is_empty());
+            }
+            other => panic!("gate block must refuse the item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_screen_bulk_item_gate_block_wins_over_passing_policy() {
+        let eval = make_gate_eval(false, "block", vec![]);
+        let policy = Some(Ok(policy_eval(true, PolicyAction::Allow, &[])));
+        assert!(matches!(
+            screen_bulk_item(GateOutcome::Block(eval), policy),
+            BulkItemScreening::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn test_screen_bulk_item_policy_block_refuses_with_its_violations() {
+        let policy = Some(Ok(policy_eval(
+            false,
+            PolicyAction::Block,
+            &["max_cve_severity", "denied_license"],
+        )));
+        match screen_bulk_item(GateOutcome::NotEvaluated, policy) {
+            BulkItemScreening::Refused {
+                message,
+                violations,
+                ..
+            } => {
+                assert_eq!(message, "Promotion blocked by policy violations");
+                assert_eq!(
+                    rules_of(&violations),
+                    vec!["max_cve_severity", "denied_license"]
+                );
+                assert_eq!(violations[0].severity, "critical");
+            }
+            other => panic!("policy block must refuse the item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_screen_bulk_item_policy_error_refuses_with_sanitised_message() {
+        let policy = Some(Err("Database operation failed"));
+        match screen_bulk_item(GateOutcome::NotEvaluated, policy) {
+            BulkItemScreening::Refused {
+                message,
+                violations,
+                ..
+            } => {
+                assert_eq!(
+                    message,
+                    "Policy evaluation failed: Database operation failed"
+                );
+                assert!(violations.is_empty());
+            }
+            other => panic!("a policy error must refuse the item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_screen_bulk_item_failed_warn_policy_proceeds_with_violations() {
+        // A failed evaluation whose action is `warn` does not block.
+        let policy = Some(Ok(policy_eval(
+            false,
+            PolicyAction::Warn,
+            &["max_cve_severity"],
+        )));
+        match screen_bulk_item(GateOutcome::NotEvaluated, policy) {
+            BulkItemScreening::Proceed {
+                violations,
+                policy_result,
+                ..
+            } => {
+                assert_eq!(rules_of(&violations), vec!["max_cve_severity"]);
+                assert_eq!(policy_result["passed"], false);
+                assert_eq!(policy_result["action"], "warn");
+            }
+            other => panic!("a warn policy must not refuse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_screen_bulk_item_orders_policy_before_gate_warnings() {
+        let gate = GateOutcome::Warn(vec![make_violation("min_health_score")]);
+        let policy = Some(Ok(policy_eval(
+            false,
+            PolicyAction::Warn,
+            &["denied_license"],
+        )));
+        match screen_bulk_item(gate, policy) {
+            BulkItemScreening::Proceed { violations, .. } => {
+                assert_eq!(
+                    rules_of(&violations),
+                    vec!["denied_license", "min_health_score"]
+                );
+                assert_eq!(violations[1].severity, "medium");
+                assert_eq!(violations[1].message, "Rule min_health_score failed");
+            }
+            other => panic!("warnings must not refuse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_screen_bulk_item_skipped_policy_records_empty_pass() {
+        let gate = GateOutcome::Warn(vec![make_violation("min_health_score")]);
+        match screen_bulk_item(gate, None) {
+            BulkItemScreening::Proceed {
+                violations,
+                policy_result,
+                ..
+            } => {
+                assert_eq!(rules_of(&violations), vec!["min_health_score"]);
+                assert_eq!(
+                    policy_result,
+                    serde_json::json!({"passed": true, "violations": []})
+                );
+            }
+            other => panic!("no evaluation must not refuse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_screen_bulk_item_clean_item_proceeds_without_violations() {
+        let policy = Some(Ok(policy_eval(true, PolicyAction::Allow, &[])));
+        match screen_bulk_item(GateOutcome::NotEvaluated, policy) {
+            BulkItemScreening::Proceed {
+                violations,
+                policy_result,
+                ..
+            } => {
+                assert!(violations.is_empty());
+                assert_eq!(policy_result["passed"], true);
+                assert_eq!(policy_result["action"], "allow");
+                assert!(policy_result["cve_summary"].is_null());
+            }
+            other => panic!("a clean item must proceed, got {:?}", other),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2675,8 +3593,8 @@ mod tests {
     #[test]
     fn test_build_bulk_summary_all_promoted() {
         let results = vec![
-            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4()),
-            build_success_response("s/b".to_string(), "t/b".to_string(), Uuid::new_v4()),
+            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4(), vec![]),
+            build_success_response("s/b".to_string(), "t/b".to_string(), Uuid::new_v4(), vec![]),
         ];
         let summary = build_bulk_summary(2, 2, 0, results);
         assert_eq!(summary.total, 2);
@@ -2688,7 +3606,7 @@ mod tests {
     #[test]
     fn test_build_bulk_summary_mixed_results() {
         let results = vec![
-            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4()),
+            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4(), vec![]),
             failed_response(
                 "s/b".to_string(),
                 "t/b".to_string(),
@@ -2788,8 +3706,21 @@ mod tests {
             promotion_id: Some(Uuid::nil()),
             policy_violations: vec![],
             message: Some("OK".to_string()),
+            gate_results: vec![GateResult {
+                rule: "require-signature".to_string(),
+                passed: true,
+                reason: "verified CEP-27 attestation".to_string(),
+            }],
         };
         let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["gate_results"],
+            serde_json::json!([{
+                "rule": "require-signature",
+                "passed": true,
+                "reason": "verified CEP-27 attestation"
+            }])
+        );
         assert_eq!(json["promoted"], true);
         assert_eq!(json["source"], "staging/lib.jar");
         assert_eq!(json["target"], "release/lib.jar");
@@ -3798,6 +4729,227 @@ mod tests {
             cleanup(&pool, &[src, tgt], sa).await;
         }
 
+        /// #4203 (single route): a non-admin token holding `promote:artifacts`
+        /// and grants on both repos sets `skip_policy_check` on a
+        /// rule-BLOCKED artifact. Before the fix the flag was honoured and the
+        /// artifact promoted; now the request is refused with 403 naming the
+        /// flag — and the artifact must NOT have been copied. The rule is
+        /// there to prove the refusal is the authz gate, not a policy block:
+        /// the error must name `skip_policy_check`, not a rule violation.
+        #[tokio::test]
+        async fn test_single_promote_skip_policy_check_non_admin_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4203-skip-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4203-skip-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sa-skip-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sa-skip-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let sa = make_tenant_admin(&pool, "sa-skip").await;
+            grant_repo(&pool, sa, src).await;
+            grant_repo(&pool, sa, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "saskip").await;
+            // A rule the artifact violates (720h staging on a fresh artifact):
+            // if the flag were honoured, the promote would GO THROUGH.
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let err = promote_artifact(
+                State(state.clone()),
+                Extension(scoped_token_ext(sa, &["promote:artifacts"])),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("non-admin skip_policy_check must be refused");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "non-admin skip_policy_check must be a 403; got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("skip_policy_check"),
+                "the refusal must name the flag; got {err}"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "saskip").await,
+                "the refused promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], sa).await;
+        }
+
+        /// #4203 (bulk route): the same scoped token gets the same 403 on the
+        /// batch route — the one-element-array bypass must not survive there
+        /// either.
+        #[tokio::test]
+        async fn test_bulk_promote_skip_policy_check_non_admin_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4203b-skip-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4203b-skip-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sb-skip-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sb-skip-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let sa = make_tenant_admin(&pool, "sb-skip").await;
+            grant_repo(&pool, sa, src).await;
+            grant_repo(&pool, sa, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sbskip").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let err = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(scoped_token_ext(sa, &["promote:artifacts"])),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![artifact],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("non-admin skip_policy_check must be refused on bulk too");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "non-admin skip_policy_check must be a 403; got {err:?}"
+            );
+            assert!(err.to_string().contains("skip_policy_check"));
+            assert!(
+                !target_has_artifact(&pool, tgt, "sbskip").await,
+                "the refused bulk promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], sa).await;
+        }
+
+        /// #4204: a quality-gate evaluation that fails with a genuine error
+        /// (here: the gate service's database is unreachable) must FAIL CLOSED.
+        /// Before the fix the error was logged and downgraded to NotEvaluated,
+        /// so the artifact was promoted with the gate never having run.
+        ///
+        /// The harness wires a `QualityCheckService` backed by a dead pool
+        /// (connection refused) into the otherwise-real state: every gate
+        /// query errors, which is exactly the "the gate could not be
+        /// evaluated" case the issue calls out.
+        fn state_with_broken_gate_service(state: &SharedState) -> SharedState {
+            let broken = sqlx::PgPool::connect_lazy("postgresql://127.0.0.1:1/ak_gate_eval_broken")
+                .expect("connect_lazy never fails");
+            let mut app = (**state).clone();
+            app.quality_check_service = Some(std::sync::Arc::new(QualityCheckService::new(broken)));
+            std::sync::Arc::new(app)
+        }
+
+        #[tokio::test]
+        async fn test_single_promote_gate_evaluation_error_fails_closed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4204-gate-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4204-gate-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "gf-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "gf-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "gf").await;
+            let state = state_with_broken_gate_service(&tdh::build_state(
+                pool.clone(),
+                sdir.to_str().unwrap(),
+            ));
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "gfclosed").await;
+
+            let err = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("a gate evaluation error must refuse the promotion");
+            assert!(
+                matches!(err, AppError::ServiceUnavailable(_)),
+                "the fail-closed refusal is a retryable 503; got {err:?}"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "gfclosed").await,
+                "the artifact must NOT be promoted when the gate cannot run"
+            );
+            let (history_rows,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM promotion_history WHERE artifact_id = $1")
+                    .bind(artifact)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count history rows");
+            assert_eq!(
+                history_rows, 0,
+                "a refused promotion leaves no audit-trail success row"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        #[tokio::test]
+        async fn test_bulk_promote_gate_evaluation_error_fails_item_closed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4204b-gate-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4204b-gate-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "gbf-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "gbf-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "gbf").await;
+            let state = state_with_broken_gate_service(&tdh::build_state(
+                pool.clone(),
+                sdir.to_str().unwrap(),
+            ));
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "gbfclosed").await;
+
+            let res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![artifact],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk reports per-item outcomes rather than failing the batch");
+            assert_eq!(res.0.promoted, 0, "nothing may be promoted");
+            assert_eq!(res.0.failed, 1);
+            let message = res.0.results[0].message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("Quality gate evaluation failed"),
+                "the item failure must name the gate evaluation; got {message:?}"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "gbfclosed").await,
+                "the artifact must NOT be promoted when the gate cannot run"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
         /// Cross-tenant BULK promote: tenant admin lacks the target tenant -> 403.
         #[tokio::test]
         async fn test_bulk_promote_cross_tenant_target_blocked() {
@@ -3881,6 +5033,131 @@ mod tests {
             );
 
             cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- F9: promotion carries the artifact's metadata --------------------
+
+        /// Seed a conda artifact with the metadata document a conda upload and
+        /// an attestation upload write (depends, md5, attestation + verdict).
+        async fn make_conda_artifact_with_metadata(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            filename: &str,
+        ) -> (Uuid, serde_json::Value) {
+            let path = format!("noarch/{filename}");
+            let id = make_maven_artifact(pool, repo_id, storage, &path).await;
+            let metadata = serde_json::json!({
+                "name": "acme-core",
+                "version": "1.0",
+                "build": "py_0",
+                "subdir": "noarch",
+                "depends": ["python >=3.10", "rich"],
+                "md5": "0123456789abcdef0123456789abcdef",
+                "license": "BSD-3-Clause",
+                "attestation": {"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"},
+                "attestation_verification": {"state": "verified", "method": "sigstore-key"},
+            });
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'conda', $2)",
+            )
+            .bind(id)
+            .bind(&metadata)
+            .execute(pool)
+            .await
+            .expect("insert conda metadata");
+            (id, metadata)
+        }
+
+        async fn target_metadata(
+            pool: &PgPool,
+            repo: Uuid,
+            path: &str,
+        ) -> Option<serde_json::Value> {
+            sqlx::query_scalar(
+                "SELECT am.metadata FROM artifacts a \
+                 JOIN artifact_metadata am ON am.artifact_id = a.id \
+                 WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
+            )
+            .bind(repo)
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .expect("query target metadata")
+        }
+
+        /// F9: a promoted conda package keeps its `depends`, `md5` and
+        /// attestation. The copy is a new `artifacts` row, and the target
+        /// channel's repodata is built from that row's `artifact_metadata`,
+        /// so a copy without it is served with no dependencies at all.
+        #[tokio::test]
+        async fn test_promotion_copies_artifact_metadata() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (src, src_key, sdir) = tdh::create_repo(&pool, "staging", "conda").await;
+            let (tgt, tgt_key, tdir) = tdh::create_repo(&pool, "local", "conda").await;
+            let user = make_admin(&pool, "f9meta").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let (single, metadata) =
+                make_conda_artifact_with_metadata(&pool, src, &storage, "acme-core-1.0-py_0.conda")
+                    .await;
+            let (bulk, _) =
+                make_conda_artifact_with_metadata(&pool, src, &storage, "acme-util-1.0-py_0.conda")
+                    .await;
+
+            let single_res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), single)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("single promote");
+            let bulk_res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![bulk],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote");
+            let single_meta = target_metadata(&pool, tgt, "noarch/acme-core-1.0-py_0.conda").await;
+            let bulk_meta = target_metadata(&pool, tgt, "noarch/acme-util-1.0-py_0.conda").await;
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+
+            assert!(single_res.0.promoted, "{:?}", single_res.0.message);
+            assert_eq!(bulk_res.0.promoted, 1, "{:?}", bulk_res.0.results);
+            assert_eq!(
+                single_meta.as_ref(),
+                Some(&metadata),
+                "the promoted copy must carry the source's metadata"
+            );
+            let bulk_meta = bulk_meta.expect("bulk copy must carry metadata");
+            for key in [
+                "build",
+                "depends",
+                "md5",
+                "license",
+                "attestation",
+                "attestation_verification",
+            ] {
+                assert_eq!(bulk_meta[key], metadata[key], "bulk copy lost `{key}`");
+            }
         }
 
         // ---- promoted artifact must appear in the target's prefixes.txt ------
@@ -4048,6 +5325,23 @@ mod tests {
             .expect("skip_policy_check must bypass the rule gate");
             assert!(res.0.promoted, "break-glass single promote must promote");
             assert!(target_has_artifact(&pool, tgt, "ssk").await);
+
+            // #4203: the override is visible in the audit trail — the
+            // promotion_history row names the skip rather than reading like a
+            // policy that ran and passed.
+            let promotion_id = res.0.promotion_id.expect("promotion id");
+            let (marker,): (Option<String>,) = sqlx::query_as(
+                "SELECT policy_result->>'policy_check_skipped' FROM promotion_history WHERE id = $1",
+            )
+            .bind(promotion_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read promotion history marker");
+            assert_eq!(
+                marker.as_deref(),
+                Some("true"),
+                "the audit trail must record the admin override"
+            );
 
             cleanup(&pool, &[src, tgt], user).await;
         }
@@ -4242,6 +5536,7 @@ mod tests {
             let (artifact, path) =
                 make_artifact_with_origin(&pool, src, &storage, "o4152", &proxy_origin).await;
 
+            let mut events = state.event_bus.subscribe();
             let res = promote_artifact(
                 State(state.clone()),
                 Extension(admin_ext(user)),
@@ -4255,6 +5550,11 @@ mod tests {
             .await
             .expect("promote should succeed");
             assert!(res.0.promoted, "the promotion must succeed");
+
+            // #3939: the copy is a new artifact in the TARGET repository and
+            // fires its one artifact.uploaded there.
+            let copy_id = tdh::artifact_id_at(&pool, tgt, &path).await;
+            tdh::assert_one_artifact_uploaded_event(&mut events, tgt, copy_id);
 
             let copied = tdh::origin_at(&pool, tgt, &path).await;
             assert_eq!(
@@ -4293,6 +5593,7 @@ mod tests {
             let (artifact, path) =
                 make_artifact_with_origin(&pool, src, &storage, "b4152", &proxy_origin).await;
 
+            let mut events = state.event_bus.subscribe();
             let res = promote_artifacts_bulk(
                 State(state.clone()),
                 Extension(admin_ext(user)),
@@ -4317,6 +5618,9 @@ mod tests {
                 proxy_origin,
                 "a bulk promotion copy must carry the source origin verbatim too"
             );
+            // #3939: one artifact.uploaded per promoted copy, on the target.
+            let copy_id = tdh::artifact_id_at(&pool, tgt, &path).await;
+            tdh::assert_one_artifact_uploaded_event(&mut events, tgt, copy_id);
 
             cleanup(&pool, &[src, tgt], user).await;
             let _ = std::fs::remove_dir_all(&sdir);
@@ -4383,6 +5687,561 @@ mod tests {
             cleanup(&pool, &[src, tgt], user).await;
             let _ = std::fs::remove_dir_all(&sdir);
             let _ = std::fs::remove_dir_all(&tdir);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #4418: promotion-history read gate and counterpart-key redaction.
+    // -----------------------------------------------------------------------
+    mod history_authz_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use sqlx::PgPool;
+
+        /// Two private repositories with one recorded promotion from the
+        /// first (staging side) into the second (release side).
+        struct HistoryFixture {
+            pool: PgPool,
+            state: SharedState,
+            user: Uuid,
+            username: String,
+            staging: (Uuid, String),
+            release: (Uuid, String),
+        }
+
+        impl HistoryFixture {
+            async fn setup() -> Option<Self> {
+                let pool = tdh::try_pool().await?;
+                let (user, username) = tdh::create_user(&pool).await;
+                let (s_id, s_key, s_dir) = tdh::create_repo(&pool, "staging", "generic").await;
+                let (r_id, r_key, _r_dir) = tdh::create_repo(&pool, "local", "generic").await;
+                let artifact: Uuid = sqlx::query_scalar(
+                    "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, 'app/1.0/app.bin', 'app', 1, repeat('0', 64), \
+                             'application/octet-stream', 'ph-4418') RETURNING id",
+                )
+                .bind(s_id)
+                .fetch_one(&pool)
+                .await
+                .expect("seed artifact");
+                sqlx::query(
+                    "INSERT INTO promotion_history \
+                     (artifact_id, source_repo_id, target_repo_id, status) \
+                     VALUES ($1, $2, $3, 'promoted')",
+                )
+                .bind(artifact)
+                .bind(s_id)
+                .bind(r_id)
+                .execute(&pool)
+                .await
+                .expect("seed promotion history");
+                sqlx::query(
+                    "INSERT INTO repository_config (repository_id, key, value) \
+                     VALUES ($1, 'release_repository_id', $2)",
+                )
+                .bind(s_id)
+                .bind(r_id.to_string())
+                .execute(&pool)
+                .await
+                .expect("link release target");
+                let state = tdh::build_state(pool.clone(), s_dir.to_str().unwrap());
+                Some(Self {
+                    pool,
+                    state,
+                    user,
+                    username,
+                    staging: (s_id, s_key),
+                    release: (r_id, r_key),
+                })
+            }
+
+            /// GET `/repositories/{key}/{endpoint}` on the promotion router.
+            async fn read(
+                &self,
+                key: &str,
+                endpoint: &str,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                let app = tdh::router_with_auth_ext(router(), self.state.clone(), auth);
+                let uri = format!("/repositories/{key}/{endpoint}");
+                let (status, body) = tdh::send(app, tdh::get(uri)).await;
+                let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                (status, json)
+            }
+
+            async fn history(
+                &self,
+                key: &str,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                self.read(key, "promotion-history", auth).await
+            }
+
+            async fn release_target(
+                &self,
+                key: &str,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                self.read(key, "release-target", auth).await
+            }
+
+            fn scoped_to_release(&self) -> AuthExtension {
+                AuthExtension {
+                    is_api_token: true,
+                    allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                        self.release.0,
+                    ]),
+                    ..self.member()
+                }
+            }
+
+            fn member(&self) -> AuthExtension {
+                tdh::make_auth(self.user, &self.username)
+            }
+
+            async fn teardown(self) {
+                let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                    .bind(self.staging.0)
+                    .execute(&self.pool)
+                    .await;
+                tdh::cleanup(&self.pool, self.staging.0, self.user).await;
+                tdh::cleanup(&self.pool, self.release.0, self.user).await;
+            }
+        }
+
+        fn keys(json: &serde_json::Value) -> (String, String) {
+            let item = &json["items"][0];
+            (
+                item["source_repo_key"].as_str().unwrap_or("?").to_string(),
+                item["target_repo_key"].as_str().unwrap_or("?").to_string(),
+            )
+        }
+
+        /// A caller with no grant on a private repository gets the same 404 a
+        /// missing repository gets, not the history.
+        #[tokio::test]
+        async fn non_member_gets_404_on_private_repo() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let (status, json) = f.history(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            assert!(json.get("items").is_none(), "{json}");
+            let (missing, _) = f.history("ph-4418-no-such-repo", f.member()).await;
+            assert_eq!(missing, StatusCode::NOT_FOUND);
+            f.teardown().await;
+        }
+
+        /// A repository-scoped token outside its scope is refused like a
+        /// non-member, even when the user holds a grant.
+        #[tokio::test]
+        async fn out_of_scope_token_gets_404() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            let (status, json) = f.history(&f.staging.1, f.scoped_to_release()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            assert!(json.get("items").is_none(), "{json}");
+            f.teardown().await;
+        }
+
+        /// A member of the staging repository reads its history, but the
+        /// release repository it cannot read is not named.
+        #[tokio::test]
+        async fn member_reads_history_with_unreadable_target_redacted() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            let (status, json) = f.history(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["pagination"]["total"], 1, "{json}");
+            assert_eq!(keys(&json), (f.staging.1.clone(), String::new()));
+
+            // Readable on both sides: both keys are shown.
+            tdh::grant_repo_access(&f.pool, f.release.0, f.user).await;
+            let (status, json) = f.history(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(keys(&json), (f.staging.1.clone(), f.release.1.clone()));
+            f.teardown().await;
+        }
+
+        /// Visibility, not only grants: an `internal` repository is readable
+        /// by any authenticated principal and a `public` one by everyone,
+        /// while the private counterpart stays redacted. Admins see all.
+        #[tokio::test]
+        async fn visibility_and_admin_paths() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            for visibility in ["internal", "public"] {
+                sqlx::query(
+                    "UPDATE repositories SET visibility = $2::repository_visibility WHERE id = $1",
+                )
+                .bind(f.release.0)
+                .bind(visibility)
+                .execute(&f.pool)
+                .await
+                .expect("set visibility");
+                let (status, json) = f.history(&f.release.1, f.member()).await;
+                assert_eq!(status, StatusCode::OK, "{visibility}: {json}");
+                assert_eq!(
+                    keys(&json),
+                    (String::new(), f.release.1.clone()),
+                    "{visibility}: the private staging source stays redacted"
+                );
+            }
+            let admin = AuthExtension {
+                is_admin: true,
+                ..f.member()
+            };
+            let (status, json) = f.history(&f.staging.1, admin).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(keys(&json), (f.staging.1.clone(), f.release.1.clone()));
+            f.teardown().await;
+        }
+
+        /// #4473: release-target is gated like history. A non-member gets 404
+        /// for the staging repository, and 404 rather than the type-revealing
+        /// 400 for a non-staging one; a token scoped away gets 404.
+        #[tokio::test]
+        async fn release_target_hides_repositories_the_caller_cannot_read() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            for key in [&f.staging.1, &f.release.1] {
+                let (status, json) = f.release_target(key, f.member()).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{key}: {json}");
+                assert!(
+                    json.to_string().contains("not found") && json.get("linked").is_none(),
+                    "{key}: {json}"
+                );
+            }
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            let (status, json) = f.release_target(&f.staging.1, f.scoped_to_release()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            assert!(json.get("linked").is_none(), "{json}");
+            f.teardown().await;
+        }
+
+        /// #4473: a member of the staging repository sees that it is linked,
+        /// but the release repository's key and id only once they can read it.
+        #[tokio::test]
+        async fn release_target_member_sees_link_with_unreadable_release_redacted() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            let (status, json) = f.release_target(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["linked"], true, "{json}");
+            assert!(json["release_repository_key"].is_null(), "{json}");
+            assert!(json["release_repository_id"].is_null(), "{json}");
+
+            tdh::grant_repo_access(&f.pool, f.release.0, f.user).await;
+            let (status, json) = f.release_target(&f.staging.1, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(
+                json["release_repository_key"],
+                f.release.1.as_str(),
+                "{json}"
+            );
+            assert_eq!(
+                json["release_repository_id"],
+                f.release.0.to_string().as_str(),
+                "{json}"
+            );
+            // The non-staging repository is now readable, so its type is no
+            // longer a secret: the documented 400 applies.
+            let (status, _) = f.release_target(&f.release.1, f.member()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            f.teardown().await;
+        }
+
+        /// Anonymous callers never reach either handler: the `/promotion` nest
+        /// sits behind the mandatory auth middleware, guest access or not.
+        #[tokio::test]
+        async fn anonymous_callers_get_401_through_the_production_router() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let state = tdh::build_state_with(f.pool.clone(), "/tmp/promotion-anon-4473", |c| {
+                c.guest_access_enabled = true;
+            });
+            let app = crate::api::routes::create_router(state);
+            for endpoint in ["promotion-history", "release-target"] {
+                let uri = format!("/api/v1/promotion/repositories/{}/{endpoint}", f.staging.1);
+                let (status, body) = tdh::send(app.clone(), tdh::get(uri)).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{endpoint}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            f.teardown().await;
+        }
+
+        // -------------------------------------------------------------------
+        // GHSA-mvmh-g8wm-r3cp findings #1 and #3: the release-target link and
+        // the reject endpoint are mutations and must pass the same visibility
+        // and capability gates as the rest of the promotion surface.
+        // -------------------------------------------------------------------
+
+        impl HistoryFixture {
+            async fn send_json(
+                &self,
+                method: &str,
+                uri: String,
+                body: serde_json::Value,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                let app = tdh::router_with_auth_ext(router(), self.state.clone(), auth);
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("request");
+                let (status, body) = tdh::send(app, req).await;
+                let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                (status, json)
+            }
+
+            async fn put_release_target(
+                &self,
+                key: &str,
+                release_key: Option<&str>,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                self.send_json(
+                    "PUT",
+                    format!("/repositories/{key}/release-target"),
+                    serde_json::json!({ "release_repository_key": release_key }),
+                    auth,
+                )
+                .await
+            }
+
+            async fn reject(
+                &self,
+                artifact: Uuid,
+                auth: AuthExtension,
+            ) -> (StatusCode, serde_json::Value) {
+                self.send_json(
+                    "POST",
+                    format!(
+                        "/repositories/{}/artifacts/{artifact}/reject",
+                        self.staging.1
+                    ),
+                    serde_json::json!({ "reason": "ghsa-mvmh" }),
+                    auth,
+                )
+                .await
+            }
+
+            async fn staged_artifact(&self) -> Uuid {
+                sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1")
+                    .bind(self.staging.0)
+                    .fetch_one(&self.pool)
+                    .await
+                    .expect("staged artifact")
+            }
+
+            async fn linked_release(&self) -> Option<String> {
+                sqlx::query_scalar(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'release_repository_id'",
+                )
+                .bind(self.staging.0)
+                .fetch_optional(&self.pool)
+                .await
+                .expect("read link")
+            }
+
+            async fn rejections(&self) -> i64 {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM promotion_history \
+                     WHERE source_repo_id = $1 AND status = 'rejected'",
+                )
+                .bind(self.staging.0)
+                .fetch_one(&self.pool)
+                .await
+                .expect("count rejections")
+            }
+
+            /// A state with an empty permission cache, so a grant made after
+            /// an earlier denial is read from the database.
+            fn refresh_state(&mut self) {
+                self.state = tdh::build_state(self.pool.clone(), "/tmp/ph-mvmh-promotion");
+            }
+        }
+
+        /// GHSA-mvmh #1: relinking (or unlinking) a staging repository's
+        /// release target is repository administration. A caller who cannot
+        /// see the private staging repository gets its 404, a member without
+        /// the repository `admin` action gets 403, and a release repository
+        /// the caller cannot read answers like a missing one. None of the
+        /// refusals touches the stored link.
+        #[tokio::test]
+        async fn set_release_target_requires_staging_admin_and_a_readable_release() {
+            let Some(mut f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let before = f.linked_release().await;
+            assert!(
+                before.is_some(),
+                "precondition: the fixture links a release"
+            );
+
+            // 1) No grant on the private staging repository: 404, link kept.
+            let (status, json) = f.put_release_target(&f.staging.1, None, f.member()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            let (status, json) = f
+                .put_release_target(&f.staging.1, Some(&f.release.1), f.member())
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            assert_eq!(
+                f.linked_release().await,
+                before,
+                "a refusal must not unlink"
+            );
+
+            // 2) Write membership on staging but no `admin` action: 403.
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            f.refresh_state();
+            let (status, json) = f.put_release_target(&f.staging.1, None, f.member()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert_eq!(
+                f.linked_release().await,
+                before,
+                "a refusal must not unlink"
+            );
+
+            // 3) Staging admin, release repository private and unreadable:
+            //    the same answer a nonexistent key gets.
+            tdh::grant_repo_admin(&f.pool, f.staging.0, f.user).await;
+            f.refresh_state();
+            let (hidden, hidden_json) = f
+                .put_release_target(&f.staging.1, Some(&f.release.1), f.member())
+                .await;
+            let (missing, missing_json) = f
+                .put_release_target(&f.staging.1, Some("ph-mvmh-no-such-repo"), f.member())
+                .await;
+            assert_eq!(hidden, missing, "{hidden_json} vs {missing_json}");
+            assert_ne!(hidden, StatusCode::OK, "{hidden_json}");
+            assert_eq!(
+                hidden_json["message"]
+                    .as_str()
+                    .map(|m| m.replace(&f.release.1, "K")),
+                missing_json["message"]
+                    .as_str()
+                    .map(|m| m.replace("ph-mvmh-no-such-repo", "K")),
+                "an unreadable release must be indistinguishable from a missing one"
+            );
+            assert_eq!(f.linked_release().await, before);
+
+            // 4) Staging admin who can read the release repository: allowed.
+            tdh::grant_repo_access(&f.pool, f.release.0, f.user).await;
+            f.refresh_state();
+            let (status, json) = f.put_release_target(&f.staging.1, None, f.member()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.linked_release().await, None);
+            let (status, json) = f
+                .put_release_target(&f.staging.1, Some(&f.release.1), f.member())
+                .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.linked_release().await, before);
+
+            // 5) A global admin is unaffected.
+            let (status, json) = f
+                .put_release_target(
+                    &f.staging.1,
+                    Some(&f.release.1),
+                    tdh::admin_auth(f.user, "root"),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            f.teardown().await;
+        }
+
+        /// GHSA-mvmh #3: rejecting a staged artifact needs the same
+        /// capability as promoting it (an admin, or a `promote:artifacts`
+        /// token), and a caller who cannot see the private staging
+        /// repository cannot use the endpoint as an existence oracle.
+        #[tokio::test]
+        async fn reject_artifact_requires_promotion_capability() {
+            let Some(mut f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let artifact = f.staged_artifact().await;
+
+            // 1) No grant on the private staging repository: the same 404 for
+            //    a real artifact and a random UUID, and nothing written.
+            let (real, real_json) = f.reject(artifact, f.member()).await;
+            let (random, random_json) = f.reject(Uuid::new_v4(), f.member()).await;
+            assert_eq!(real, StatusCode::NOT_FOUND, "{real_json}");
+            assert_eq!(random, StatusCode::NOT_FOUND, "{random_json}");
+            assert_eq!(f.rejections().await, 0);
+
+            // 2) A member who can see the repository but holds no promotion
+            //    capability: 403, nothing written.
+            tdh::grant_repo_access(&f.pool, f.staging.0, f.user).await;
+            f.refresh_state();
+            let (status, json) = f.reject(artifact, f.member()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert_eq!(f.rejections().await, 0);
+
+            // 3) A `promote:artifacts` token of that member: allowed.
+            let promoter = AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["promote:artifacts".to_string()]),
+                ..f.member()
+            };
+            let (status, json) = f.reject(artifact, promoter).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.rejections().await, 1);
+
+            // 4) A global admin: allowed.
+            let (status, json) = f.reject(artifact, tdh::admin_auth(f.user, "root")).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(f.rejections().await, 2);
+
+            let _ = sqlx::query("DELETE FROM promotion_history WHERE source_repo_id = $1")
+                .bind(f.staging.0)
+                .execute(&f.pool)
+                .await;
+            f.teardown().await;
+        }
+
+        #[test]
+        fn linked_release_target_redacts_unreadable_release() {
+            let id = Uuid::new_v4();
+            let shown = linked_release_target(id, "rel".to_string(), true);
+            assert!(shown.linked);
+            assert_eq!(shown.release_repository_key.as_deref(), Some("rel"));
+            assert_eq!(shown.release_repository_id, Some(id));
+            let hidden = linked_release_target(id, "rel".to_string(), false);
+            assert!(hidden.linked);
+            assert_eq!(hidden.release_repository_key, None);
+            assert_eq!(hidden.release_repository_id, None);
+        }
+
+        #[test]
+        fn readable_repo_key_blanks_unreadable_and_deleted() {
+            let open = Uuid::new_v4();
+            let readable: std::collections::HashSet<Uuid> = [open].into_iter().collect();
+            let key = || Some("k".to_string());
+            assert_eq!(readable_repo_key(Some(open), key(), &readable), "k");
+            assert_eq!(
+                readable_repo_key(Some(Uuid::new_v4()), key(), &readable),
+                ""
+            );
+            assert_eq!(readable_repo_key(None, None, &readable), "");
+            assert_eq!(readable_repo_key(Some(open), None, &readable), "");
         }
     }
 }

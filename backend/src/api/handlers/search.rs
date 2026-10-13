@@ -20,11 +20,12 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::quarantine_status_label;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -166,13 +167,18 @@ const OPENSEARCH_QUICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 /// list, or the index is restored from another deployment's snapshot. The same
 /// two predicates the PostgreSQL path spells in its `WHERE` clause, applied to
 /// the same authoritative scope.
+///
+/// The same query also hydrates each surviving hit's quarantine columns
+/// (#3066). The index does not carry them, and would be stale if it did:
+/// quarantine state changes after ingest (holds lapse, admins release or
+/// reject) without a reindex, so PostgreSQL is the only honest source.
 async fn retain_live_visible_hits(
     db: &PgPool,
     scope: &AccessScope,
     hits: Vec<ArtifactDocument>,
-) -> Result<Vec<ArtifactDocument>> {
+) -> Result<Vec<SearchResultItem>> {
     if hits.is_empty() {
-        return Ok(hits);
+        return Ok(Vec::new());
     }
 
     let ids: Vec<Uuid> = hits
@@ -183,9 +189,9 @@ async fn retain_live_visible_hits(
         return Ok(Vec::new());
     }
 
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
+    let rows: Vec<(Uuid, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
         r#"
-        SELECT a.id
+        SELECT a.id, a.quarantine_status, a.quarantine_until
         FROM artifacts a
         JOIN repositories r ON r.id = a.repository_id
         WHERE a.id = ANY($1)
@@ -199,19 +205,28 @@ async fn retain_live_visible_hits(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let live: HashSet<Uuid> = rows.into_iter().map(|(id,)| id).collect();
+    let live: HashMap<Uuid, (Option<String>, Option<DateTime<Utc>>)> = rows
+        .into_iter()
+        .map(|(id, status, until)| (id, (status, until)))
+        .collect();
 
     Ok(hits
         .into_iter()
-        .filter(|d| {
-            Uuid::parse_str(&d.id)
-                .map(|id| live.contains(&id))
-                .unwrap_or(false)
+        .filter_map(|d| {
+            let id = Uuid::parse_str(&d.id).ok()?;
+            let (status, until) = live.get(&id).cloned()?;
+            Some(build_search_result_item_from_doc(d, status, until))
         })
         .collect())
 }
 
-pub(crate) fn build_search_result_item_from_doc(d: ArtifactDocument) -> SearchResultItem {
+/// `quarantine_status` / `quarantine_until` are the raw `artifacts` columns,
+/// hydrated from PostgreSQL by `retain_live_visible_hits` (#3066).
+pub(crate) fn build_search_result_item_from_doc(
+    d: ArtifactDocument,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<DateTime<Utc>>,
+) -> SearchResultItem {
     SearchResultItem {
         id: Uuid::parse_str(&d.id).unwrap_or_default(),
         result_type: "artifact".to_string(),
@@ -223,6 +238,8 @@ pub(crate) fn build_search_result_item_from_doc(d: ArtifactDocument) -> SearchRe
         size_bytes: Some(d.size_bytes),
         created_at: DateTime::from_timestamp(d.created_at, 0).unwrap_or_default(),
         highlights: None,
+        quarantine_status: quarantine_status_label(quarantine_status.as_deref()),
+        quarantine_until,
     }
 }
 
@@ -238,6 +255,8 @@ pub(crate) fn build_search_result_item(r: SearchResult) -> SearchResultItem {
         size_bytes: Some(r.size_bytes),
         created_at: r.created_at,
         highlights: None,
+        quarantine_status: quarantine_status_label(r.quarantine_status.as_deref()),
+        quarantine_until: r.quarantine_until,
     }
 }
 
@@ -383,13 +402,24 @@ async fn resolve_visible_repos(
             // (which is tenant-only via `build_grant_predicate`) but still
             // WIDER than the read gate, because the `role_assignments` arm
             // above is action-blind. That arm is pre-existing and untouched.
+            // The visibility arm is `visibility <> 'private'`, NOT
+            // `is_public = true`: this branch is the AUTHENTICATED caller's
+            // set, and `internal` grants them a read baseline with no grant at
+            // all. The `PublicOnly` branch below stays an equality on `public`,
+            // because an anonymous caller gets nothing from an internal
+            // repository. Token scope is layered on afterwards by
+            // `intersect_token_scope`, so a repo-scoped token is still confined.
+            //
+            // NOTE this set is built HERE rather than through
+            // `build_visibility_clause_for`; the two must be kept in agreement
+            // by hand, which is what the DB tests below pin.
             let read_grants =
                 crate::services::repository_service::permissions_read_grant_join_for("r3", "$1");
             let sql = format!(
                 r#"
                 SELECT r.id
                 FROM repositories r
-                WHERE r.is_public = true
+                WHERE r.visibility <> 'private'
                 UNION
                 SELECT COALESCE(ra.repository_id, r2.id)
                 FROM role_assignments ra
@@ -412,7 +442,7 @@ async fn resolve_visible_repos(
         RepoAccessMode::PublicOnly => {
             let rows: Vec<(Uuid,)> = sqlx::query_as(
                 r#"
-                SELECT r.id FROM repositories r WHERE r.is_public = true
+                SELECT r.id FROM repositories r WHERE r.visibility = 'public'
                 "#,
             )
             .fetch_all(db)
@@ -447,6 +477,17 @@ pub struct SearchResultItem {
     pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<String>>,
+    /// Per-artifact quarantine state, with the same contract as the artifact
+    /// listing's `ArtifactResponse.quarantine_status` (#3066, #2940): always
+    /// present, `"not_quarantined"` when the row carries no state, otherwise
+    /// the recorded status (`quarantined`, `rejected`, `clean`, ...). The
+    /// reason is deliberately withheld; it stays behind
+    /// `GET /api/v1/quarantine/{artifact_id}`.
+    pub quarantine_status: String,
+    /// When a timed quarantine hold lapses. Omitted for permanent holds and
+    /// for artifacts that are not quarantined (#3066).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -545,13 +586,8 @@ pub async fn quick_search(
                 // database failure, not a search-cluster failure, so it
                 // propagates rather than falling back — the PostgreSQL path
                 // would fail the same way.
-                let hits = retain_live_visible_hits(&state.db, &scope, found.hits).await?;
-                return Ok(Json(QuickSearchResponse {
-                    results: hits
-                        .into_iter()
-                        .map(build_search_result_item_from_doc)
-                        .collect(),
-                }));
+                let results = retain_live_visible_hits(&state.db, &scope, found.hits).await?;
+                return Ok(Json(QuickSearchResponse { results }));
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1064,6 +1100,7 @@ pub async fn trigger_reindex(
 )]
 pub struct SearchApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,6 +1390,8 @@ mod tests {
             size_bytes: Some(524288),
             created_at: chrono::Utc::now(),
             highlights: Some(vec!["matched <em>my-lib</em>".to_string()]),
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         // "type" rename check
@@ -1376,8 +1415,14 @@ mod tests {
             size_bytes: None,
             created_at: chrono::Utc::now(),
             highlights: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_value(&item).unwrap();
+        // #3066: the status is always serialized, the expiry only when set.
+        assert_eq!(json["quarantine_status"], "not_quarantined");
+        assert!(json.get("quarantine_until").is_none());
+        assert!(json.get("quarantine_reason").is_none());
         // skip_serializing_if = "Option::is_none" fields
         assert!(json.get("path").is_none());
         assert!(json.get("format").is_none());
@@ -1996,7 +2041,7 @@ mod tests {
     #[test]
     fn test_build_search_result_item_from_doc_maps_every_field() {
         let doc = mk_artifact_doc();
-        let item = build_search_result_item_from_doc(doc.clone());
+        let item = build_search_result_item_from_doc(doc.clone(), None, None);
 
         assert_eq!(item.id.to_string(), doc.id);
         assert_eq!(item.result_type, "artifact");
@@ -2014,9 +2059,37 @@ mod tests {
     /// response type and a divergence would be visible to clients.
     #[test]
     fn test_doc_and_row_mappings_agree_on_result_type() {
-        let from_doc = build_search_result_item_from_doc(mk_artifact_doc());
+        let from_doc = build_search_result_item_from_doc(mk_artifact_doc(), None, None);
         let from_row = build_search_result_item(mk_search_result("lodash"));
         assert_eq!(from_doc.result_type, from_row.result_type);
+        assert_eq!(from_doc.quarantine_status, from_row.quarantine_status);
+    }
+
+    /// #3066: both backends surface the hydrated quarantine columns with the
+    /// artifact listing's semantics (label always present, expiry verbatim).
+    #[test]
+    fn test_search_result_items_carry_quarantine_state_3066() {
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        let from_doc = build_search_result_item_from_doc(
+            mk_artifact_doc(),
+            Some("quarantined".to_string()),
+            Some(until),
+        );
+        assert_eq!(from_doc.quarantine_status, "quarantined");
+        assert_eq!(from_doc.quarantine_until, Some(until));
+
+        let mut r = mk_search_result("held");
+        r.quarantine_status = Some("rejected".to_string());
+        let from_row = build_search_result_item(r);
+        assert_eq!(from_row.quarantine_status, "rejected");
+        assert!(from_row.quarantine_until.is_none());
+
+        let clean = build_search_result_item(mk_search_result("clean"));
+        assert_eq!(clean.quarantine_status, "not_quarantined");
+
+        let json = serde_json::to_value(&from_doc).unwrap();
+        assert_eq!(json["quarantine_status"], "quarantined");
+        assert!(json.get("quarantine_until").is_some());
     }
 
     /// A document id that is not a UUID must not drop the hit; it degrades to
@@ -2025,7 +2098,7 @@ mod tests {
     fn test_build_search_result_item_from_doc_tolerates_bad_uuid() {
         let mut doc = mk_artifact_doc();
         doc.id = "not-a-uuid".to_string();
-        let item = build_search_result_item_from_doc(doc);
+        let item = build_search_result_item_from_doc(doc, None, None);
         assert_eq!(item.id, Uuid::nil());
         assert_eq!(item.name, "lodash", "the rest of the hit must survive");
     }
@@ -2036,7 +2109,7 @@ mod tests {
     fn test_build_search_result_item_from_doc_tolerates_bad_timestamp() {
         let mut doc = mk_artifact_doc();
         doc.created_at = i64::MAX;
-        let item = build_search_result_item_from_doc(doc);
+        let item = build_search_result_item_from_doc(doc, None, None);
         assert_eq!(item.created_at.timestamp(), 0);
     }
 
@@ -2045,7 +2118,7 @@ mod tests {
     fn test_build_search_result_item_from_doc_preserves_absent_version() {
         let mut doc = mk_artifact_doc();
         doc.version = None;
-        let item = build_search_result_item_from_doc(doc);
+        let item = build_search_result_item_from_doc(doc, None, None);
         assert!(item.version.is_none());
     }
 
@@ -2063,6 +2136,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             download_count: 7,
             score: 0.42,
+            quarantine_status: None,
+            quarantine_until: None,
         }
     }
 
@@ -2296,6 +2371,7 @@ mod tests {
 // #3697: search must resolve BOTH authz stores
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod grant_visibility_db_tests {
     use super::*;
@@ -2314,6 +2390,56 @@ mod grant_visibility_db_tests {
         username: String,
         needle: String,
         repo_dir: std::path::PathBuf,
+    }
+
+    /// `resolve_visible_repos` builds the caller's repository set with its OWN
+    /// UNION query, NOT through `RepositoryService::build_visibility_clause_for`.
+    /// The two must agree on what `internal` means, and nothing in the type
+    /// system enforces that -- this test is the enforcement.
+    ///
+    /// The bug it pins: the visibility arm read `is_public = true`, so search
+    /// returned nothing for an internal repository that every authenticated
+    /// caller could read and download from directly.
+    #[tokio::test]
+    async fn test_resolve_visible_repos_includes_internal_for_authenticated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // Authenticated, holding NO grant on the repository at all.
+        let auth = Some(tdh::make_auth(user_id, &username));
+        let visible = resolve_visible_repos(&pool, &auth).await;
+        // ...and anonymously.
+        let anon = resolve_visible_repos(&pool, &None).await;
+
+        // Clean up before asserting so a failure does not leak the fixture.
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ids = visible
+            .expect("resolve visible")
+            .expect("a non-admin gets an explicit set, not None");
+        assert!(
+            ids.contains(&repo_id),
+            "an internal repo must be searchable by any authenticated caller \
+             without a grant"
+        );
+        // An anonymous caller is PublicOnly and must get an explicit set; a
+        // `None` (unrestricted) here would itself be the bug.
+        let anon_ids = anon
+            .expect("resolve visible anonymously")
+            .expect("an anonymous caller gets an explicit set, not None");
+        assert!(
+            !anon_ids.contains(&repo_id),
+            "an internal repo must never appear in an anonymous search set"
+        );
     }
 
     impl SearchGrantFixture {
@@ -2822,8 +2948,11 @@ mod grant_visibility_db_tests {
         };
 
         // Reference: the shared tenant fragment AND the read action term.
-        let tenant =
-            crate::services::repository_service::permissions_grant_exists_for("rr.id", "$1");
+        let tenant = crate::services::repository_service::permissions_grant_exists_for(
+            "rr.id",
+            "$1",
+            crate::services::repository_service::IpConditionMode::Enforce,
+        );
         let reference_sql = format!(
             r#"
             SELECT rr.id FROM repositories rr
@@ -2958,6 +3087,7 @@ mod grant_visibility_db_tests {
 // PostgreSQL path would have answered about visibility and liveness
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod opensearch_quick_search_db_tests {
     use super::*;
@@ -3072,23 +3202,29 @@ mod opensearch_quick_search_db_tests {
         /// `GET /api/v1/search/quick?q=<needle>` as the fixture's non-admin
         /// caller: the response status and the names it returned.
         async fn quick_hits(&self) -> (axum::http::StatusCode, Vec<String>) {
+            let (status, results) = self.quick_results().await;
+            let names = results
+                .iter()
+                .filter_map(|i| i.get("name").and_then(|n| n.as_str()))
+                .map(|s| s.to_string())
+                .collect();
+            (status, names)
+        }
+
+        /// The raw `results` items of the same request as [`Self::quick_hits`].
+        async fn quick_results(&self) -> (axum::http::StatusCode, Vec<serde_json::Value>) {
             let auth = tdh::make_auth(self.user_id, &self.username);
             let app = tdh::router_with_auth(router(), self.state.clone(), auth);
             let (status, body) =
                 tdh::send(app, tdh::get(format!("/quick?q={}&limit=10", self.needle))).await;
             let json: serde_json::Value =
                 serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
-            let names = json
+            let results = json
                 .get("results")
                 .and_then(|r| r.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|i| i.get("name").and_then(|n| n.as_str()))
-                        .map(|s| s.to_string())
-                        .collect()
-                })
+                .cloned()
                 .unwrap_or_default();
-            (status, names)
+            (status, results)
         }
 
         async fn grant_read(&self) {
@@ -3259,5 +3395,58 @@ mod opensearch_quick_search_db_tests {
             vec![needle],
             "the PostgreSQL path must answer when OpenSearch fails"
         );
+    }
+
+    /// #3066: a quarantined artifact surfaces its status and hold expiry on
+    /// both search backends, hydrated from PostgreSQL on the OpenSearch path
+    /// (the indexed document carries no quarantine state), and never the
+    /// reason.
+    #[tokio::test]
+    async fn quick_search_surfaces_quarantine_state_on_both_backends_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        fx.grant_read().await;
+        let until = chrono::Utc::now() + chrono::Duration::hours(6);
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = $2, \
+             quarantine_reason = 'secret reason' WHERE id = $1",
+        )
+        .bind(fx.artifact_id)
+        .bind(until)
+        .execute(&fx.pool)
+        .await
+        .expect("quarantine artifact");
+
+        fx.cluster_returns(ResponseTemplate::new(200).set_body_json(one_hit(
+            fx.artifact_id,
+            fx.repo_id,
+            &fx.needle,
+        )))
+        .await;
+        let (os_status, os_results) = fx.quick_results().await;
+
+        fx.server.reset().await;
+        fx.cluster_returns(ResponseTemplate::new(503)).await;
+        let (pg_status, pg_results) = fx.quick_results().await;
+        fx.teardown().await;
+
+        for (backend, status, results) in [
+            ("opensearch", os_status, os_results),
+            ("postgres", pg_status, pg_results),
+        ] {
+            assert_eq!(status, axum::http::StatusCode::OK, "{backend}");
+            assert_eq!(results.len(), 1, "{backend}: {results:?}");
+            let item = &results[0];
+            assert_eq!(item["quarantine_status"], "quarantined", "{backend}");
+            let got_until: chrono::DateTime<chrono::Utc> =
+                serde_json::from_value(item["quarantine_until"].clone())
+                    .unwrap_or_else(|e| panic!("{backend}: quarantine_until: {e}"));
+            assert_eq!(got_until.timestamp(), until.timestamp(), "{backend}");
+            assert!(
+                item.get("quarantine_reason").is_none(),
+                "{backend}: the reason must never be exposed on search"
+            );
+        }
     }
 }

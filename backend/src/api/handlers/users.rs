@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
+    http::{header, HeaderName, HeaderValue},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -35,6 +36,9 @@ use std::sync::atomic::Ordering;
 /// live in the [`self_password_router`] / [`admin_password_router`] pair
 /// from #1250; per-user CRUD that is legitimately self-or-admin lives
 /// in [`self_or_admin_router`].
+// `assign_role` is deprecated in favour of `POST /api/v1/permissions` (#3522)
+// but still served; the route registration is the one intended caller.
+#[allow(deprecated)]
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
@@ -851,7 +855,42 @@ pub struct AssignRoleRequest {
     pub role_id: Uuid,
 }
 
-/// Assign role to user.
+/// RFC 9745 `Deprecation` value for `POST /api/v1/users/{id}/roles` (#3522):
+/// an RFC 9651 structured-field Date, `@<unix seconds>`, naming when the
+/// endpoint became deprecated (1791244800 = 2026-10-06T00:00:00Z, the 1.11.0
+/// cycle). No `Sunset` is sent: no removal date has been decided.
+const ASSIGN_ROLE_DEPRECATION: &str = "@1791244800";
+
+/// RFC 8288 `Link` sent with [`ASSIGN_ROLE_DEPRECATION`]: the replacement is
+/// the fine-grained permissions API (`POST /api/v1/permissions`), which every
+/// authorization gate resolves.
+const ASSIGN_ROLE_SUCCESSOR_LINK: &str = "</api/v1/permissions>; rel=\"successor-version\"";
+
+/// The response headers that mark `POST /api/v1/users/{id}/roles` as
+/// deprecated (#3522), so clients and proxies that honour RFC 9745 surface it.
+fn assign_role_deprecation_headers() -> [(HeaderName, HeaderValue); 2] {
+    [
+        (
+            HeaderName::from_static("deprecation"),
+            HeaderValue::from_static(ASSIGN_ROLE_DEPRECATION),
+        ),
+        (
+            header::LINK,
+            HeaderValue::from_static(ASSIGN_ROLE_SUCCESSOR_LINK),
+        ),
+    ]
+}
+
+/// Assign role to user (**deprecated**, #3522).
+///
+/// **Deprecated: use `POST /api/v1/permissions` instead.** The endpoint keeps
+/// working and keeps writing `user_roles`, but every successful (200)
+/// response now carries a `Deprecation` header and a `Link:
+/// </api/v1/permissions>; rel="successor-version"` header (error responses,
+/// such as 401/403/422, do not), and the operation is flagged
+/// `deprecated` in the OpenAPI spec so generated SDKs warn on use. #3522
+/// chose this (option 1) over scoping the endpoint to a repository or making
+/// `user_roles` a live global grant.
 ///
 /// **This does not by itself grant access to any repository (#3387 / #3522).**
 ///
@@ -875,7 +914,8 @@ pub struct AssignRoleRequest {
 /// `developer` role carries `read` + `write` — making it live would retroactively
 /// hand every existing row write access to every repository in the instance,
 /// and would turn an IdP role claim into a global write grant. That decision is
-/// tracked in #3522 rather than taken as a side effect of a bug fix.
+/// tracked in #3522, which settled on deprecating this endpoint instead.
+#[deprecated(note = "user_roles grants no repository access; use POST /api/v1/permissions (#3522)")]
 #[utoipa::path(
     post,
     path = "/{id}/roles",
@@ -886,10 +926,15 @@ pub struct AssignRoleRequest {
     ),
     request_body = AssignRoleRequest,
     responses(
-        (status = 200, description = "Role assigned successfully. NOTE: roles \
-         assigned here are identity/SSO-mapping metadata and do NOT by \
-         themselves grant access to any repository — use POST \
-         /api/v1/permissions for that (#3387 / #3522)."),
+        (status = 200, description = "Role assigned successfully. DEPRECATED \
+         (#3522): roles assigned here are identity/SSO-mapping metadata and \
+         do NOT by themselves grant access to any repository — use POST \
+         /api/v1/permissions instead. The response carries a `Deprecation` \
+         header and a `Link` to /api/v1/permissions (rel=\"successor-version\").",
+         headers(
+            ("Deprecation" = String, description = "RFC 9745 deprecation date, e.g. `@1791244800`"),
+            ("Link" = String, description = "`</api/v1/permissions>; rel=\"successor-version\"`"),
+         )),
     ),
     security(("bearer_auth" = []))
 )]
@@ -898,7 +943,7 @@ pub async fn assign_role(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<AssignRoleRequest>,
-) -> Result<()> {
+) -> Result<([(HeaderName, HeaderValue); 2], ())> {
     // Defense-in-depth admin gate. See #1257.
     auth.require_admin()?;
     sqlx::query!(
@@ -931,7 +976,7 @@ pub async fn assign_role(
     )
     .await;
 
-    Ok(())
+    Ok((assign_role_deprecation_headers(), ()))
 }
 
 /// Revoke role from user
@@ -990,7 +1035,11 @@ pub async fn revoke_role(
     Ok(())
 }
 
+/// Unknown fields are refused (400) rather than dropped (#4226): this endpoint
+/// takes no repository restriction, and a client sending one must learn that
+/// instead of receiving a broader token than it asked for.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
@@ -1108,7 +1157,8 @@ pub async fn create_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreateUserApiTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Users can only create tokens for themselves unless admin
     auth.require_self_or_admin(id, "Cannot create tokens for other users")?;
@@ -1139,10 +1189,22 @@ async fn create_api_token_inner(
     // are unaffected.
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
+    // Repository ceiling (#4225): a repository-restricted credential passes
+    // its restriction on to the token it mints.
+    let inherited = auth.mint_repo_ceiling(false)?;
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let minted = auth_service
         .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
+    if let Some(ids) = inherited {
+        crate::services::repo_selector_service::store_token_selector(
+            &state.db,
+            minted.id,
+            &crate::services::repo_selector_service::inherited_token_selector(&ids),
+        )
+        .await?;
+    }
 
     audit_fire_and_forget(
         state.db.clone(),
@@ -1794,7 +1856,8 @@ pub async fn list_current_user_tokens(
 pub async fn create_current_user_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Json(payload): Json<CreateUserApiTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     create_api_token_inner(&state, &auth, auth.user_id, payload).await
 }
@@ -1895,6 +1958,7 @@ pub async fn change_current_user_password(
 )]
 pub struct UsersApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2497,6 +2561,34 @@ mod tests {
         assert_eq!(json["permissions"].as_array().unwrap().len(), 2);
     }
 
+    /// #3522: the deprecation headers are well-formed (an RFC 9651 Date and
+    /// an RFC 8288 link to the replacement API), not merely present.
+    #[test]
+    fn test_3522_assign_role_deprecation_headers_are_well_formed() {
+        let headers = assign_role_deprecation_headers();
+        let (name, value) = &headers[0];
+        assert_eq!(name.as_str(), "deprecation");
+        let date = value.to_str().unwrap();
+        let secs: i64 = date
+            .strip_prefix('@')
+            .expect("RFC 9745: an sf-date, `@` + unix seconds")
+            .parse()
+            .expect("integer seconds");
+        assert_eq!(
+            chrono::DateTime::from_timestamp(secs, 0)
+                .unwrap()
+                .format("%Y-%m-%d")
+                .to_string(),
+            "2026-10-06"
+        );
+        let (name, value) = &headers[1];
+        assert_eq!(name, header::LINK);
+        assert_eq!(
+            value.to_str().unwrap(),
+            r#"</api/v1/permissions>; rel="successor-version""#
+        );
+    }
+
     #[test]
     fn test_assign_role_request_deserialize() {
         let uid = Uuid::new_v4();
@@ -3007,6 +3099,7 @@ mod tests {
 // Router-split regression tests (#1257)
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod router_split_tests {
     //! Regression tests for #1257.
@@ -3092,6 +3185,54 @@ mod router_split_tests {
             .bind(user_id)
             .execute(pool)
             .await;
+    }
+
+    /// #3522: `POST /{id}/roles` is deprecated, not removed. It still writes
+    /// the `user_roles` row for an admin, and the response now carries the
+    /// `Deprecation` and `Link` headers pointing at `POST /api/v1/permissions`.
+    #[tokio::test]
+    async fn test_3522_deprecated_assign_role_still_assigns_and_signals_successor() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let app = build_admin_app(state, tdh::admin_auth(user_id, &username));
+        let role_id: Uuid = sqlx::query_scalar("SELECT id FROM roles WHERE name = 'developer'")
+            .fetch_one(&pool)
+            .await
+            .expect("built-in developer role");
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{user_id}/roles"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "role_id": role_id }).to_string()))
+            .unwrap();
+        let (status, body, headers) = tdh::send_with_headers(app, req).await;
+        let assigned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id = $1 AND role_id = $2)",
+        )
+        .bind(user_id)
+        .bind(role_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read user_roles");
+        let _ = sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        delete_user_row(&pool, user_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            assigned,
+            "the deprecated endpoint must keep writing user_roles"
+        );
+        assert_eq!(headers["deprecation"], ASSIGN_ROLE_DEPRECATION);
+        assert_eq!(headers[header::LINK], ASSIGN_ROLE_SUCCESSOR_LINK);
     }
 
     // ── self_or_admin_router: regression coverage ─────────────────────
@@ -3887,6 +4028,7 @@ mod router_split_tests {
 // Tests below pin the policy implemented in this PR.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod admin_scope_policy_tests {
     use super::*;
@@ -4127,6 +4269,7 @@ mod admin_scope_policy_tests {
 /// emit `PASSWORD_CHANGED` (plus `SESSIONS_INVALIDATED` for the self change),
 /// with `details.by_admin` reflecting who performed it. Each test no-ops when
 /// `DATABASE_URL` is unset (`tdh::try_pool`).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod password_audit_tests {
     use super::*;

@@ -28,6 +28,7 @@ pub mod nuget;
 pub mod oci;
 pub mod opkg;
 pub mod p2;
+pub mod pacman;
 pub mod protobuf;
 pub mod r#pub;
 pub mod puppet;
@@ -42,6 +43,7 @@ pub mod vagrant;
 pub mod vscode_extensions;
 pub mod wasm;
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod format_tests;
 
@@ -106,7 +108,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "debian" => Some(Box::new(debian::DebianHandler::new())),
         "conan" => Some(Box::new(conan::ConanHandler::new())),
         "cargo" => Some(Box::new(cargo::CargoHandler::new())),
-        "generic" => Some(Box::new(generic::GenericHandler::new())),
+        "generic" | "github" | "mise" | "aqua" => Some(Box::new(generic::GenericHandler::new())),
         "poetry" | "jupyter" => Some(Box::new(pypi::PypiHandler::new())),
         // #4039: conda is its own handler key, routed to the conda-native
         // handler whose filename grammar (`<name>-<version>-<build>` +
@@ -140,6 +142,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "bazel" => Some(Box::new(bazel::BazelHandler::new())),
         "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
         "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
+        "pacman" => Some(Box::new(pacman::PacmanHandler::new())),
         _ => None,
     }
 }
@@ -174,7 +177,10 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Debian => Box::new(debian::DebianHandler::new()),
         RepositoryFormat::Conan => Box::new(conan::ConanHandler::new()),
         RepositoryFormat::Cargo => Box::new(cargo::CargoHandler::new()),
-        RepositoryFormat::Generic => Box::new(generic::GenericHandler::new()),
+        RepositoryFormat::Generic
+        | RepositoryFormat::Github
+        | RepositoryFormat::Mise
+        | RepositoryFormat::Aqua => Box::new(generic::GenericHandler::new()),
         RepositoryFormat::Terraform | RepositoryFormat::Opentofu => {
             Box::new(terraform::TerraformHandler::new())
         }
@@ -201,6 +207,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Bazel => Box::new(bazel::BazelHandler::new()),
         RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
         RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
+        RepositoryFormat::Pacman => Box::new(pacman::PacmanHandler::new()),
     }
 }
 
@@ -263,6 +270,80 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
         }
     }
     handlers
+}
+
+/// Core handler keys whose Remote/Virtual download path enforces the inline
+/// scan-on-proxy gate (#4099): the handler routes its proxied package bytes
+/// through `proxy_helpers::serve_scanned_proxy_file` (Cargo, Conda, Maven,
+/// npm, NuGet, PyPI, sbt, VS Code; the `maven` key also serves `gradle`
+/// repositories, and `nuget` serves `chocolatey` and `powershell`) or,
+/// for OCI manifests, straight through `proxy_helpers::gate_proxy_scan_serve`.
+///
+/// `GET /api/v1/formats` reports these as `scan_on_proxy: "enforced"`; every
+/// other core handler stores the flag and serves unscanned (`"accepted"`).
+/// The `scan_on_proxy_capability_matches_the_gate` test in `proxy_helpers`
+/// reads every format handler's source and fails when a handler reaches the
+/// gate without being listed here, or is listed without reaching it, so the
+/// capability cannot drift from the router. Adopting the gate in a new format
+/// adds its key here, and a row to the coverage table in
+/// `docs/security/scan-on-proxy.md` (#4114), which
+/// `scan_on_proxy_coverage_doc_matches_the_capability` keeps in step.
+///
+/// `enforced` is a per-FORMAT capability: the format's proxy path runs the
+/// shared gate. Whether that gate blocks or only records is a per-REPOSITORY
+/// choice (`scan_configs.proxy_scan_action`: `fail_open` / `fail_closed` /
+/// `record_only`, #3645) read from `GET/PUT /repositories/{key}/security`, so
+/// the formats API carries no mode indicator: under `record_only` an
+/// `enforced` format still scans and records every pull, and serves it.
+///
+/// It is also per handler, not per file type. Maven/sbt scan every proxied
+/// file except an allowlist of non-package files (POMs, `.xml` metadata,
+/// Gradle `.module`, checksums, signatures, and `-sources`/`-javadoc` jars,
+/// skipped by name). Only `.jar`/`.war`/`.ear` carry an identity pin, and
+/// `.aar`, `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar` and `.zip` are a known gap:
+/// they are scanned as raw files, not unpacked (#4100). NuGet scans every
+/// proxied flat-container and V2 package file except the `.nuspec` manifest
+/// (#4102). Conda scans `.conda` and `.tar.bz2` package downloads; the
+/// channel indexes (repodata in every encoding, channeldata, shards) are not
+/// gated, and a `.sigs` sidecar follows its package's stored verdict (#4585).
+/// `conda` and `conda_native` are two handler keys served by the one conda
+/// route, so both are listed.
+pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
+    "cargo",        // #4101
+    "conda",        // #4585
+    "conda_native", // #4585 (the same conda route)
+    "maven",        // #4100 (also serves gradle)
+    "nuget",        // #4102 (also serves chocolatey and powershell)
+    "sbt",          // #4100
+    "npm",
+    "oci",
+    "pypi",
+    "vscode",
+];
+
+/// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
+pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {
+    SCAN_ON_PROXY_ENFORCED_HANDLERS.contains(&handler_key)
+}
+
+/// Does a repository of `format` run the scan-on-proxy gate on its proxied
+/// downloads? The per-repository-format form of
+/// [`handler_enforces_scan_on_proxy`], aliases resolved through
+/// [`RepositoryFormat::handler_key`]. Everything that has to agree with the
+/// gate asks this: the generic download route's refusal (#4442) and the
+/// dashboard's `policy_violations_blocked` count (#4582), which must not call
+/// a verdict blocked on a format that serves it anyway.
+pub fn format_enforces_scan_on_proxy(format: &RepositoryFormat) -> bool {
+    handler_enforces_scan_on_proxy(format.handler_key())
+}
+
+/// [`format_enforces_scan_on_proxy`] for a `repository_format` database label
+/// (`"conda"`, `"docker"`, ...). An unknown label is not enforced.
+pub fn format_key_enforces_scan_on_proxy(format_key: &str) -> bool {
+    RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == format_key)
+        .is_some_and(format_enforces_scan_on_proxy)
 }
 
 /// Presentation metadata for a core handler key.
@@ -331,6 +412,11 @@ fn core_handler_metadata(
         "bazel" => ("Bazel", "Bazel modules and rulesets", &[".tar.gz"]),
         "protobuf" => ("Protobuf", "Protocol Buffer schema registry", &[".proto"]),
         "incus" => ("Incus/LXC", "Incus and LXC container images", &[".tar.xz"]),
+        "pacman" => (
+            "Pacman",
+            "Arch Linux pacman packages",
+            &[".pkg.tar.zst", ".pkg.tar.xz"],
+        ),
         // Total fallback -- see the doc comment. A format that reaches this
         // arm is still listed, it just shows its raw key as the display name.
         other => (other, "Compiled-in format handler", &[]),

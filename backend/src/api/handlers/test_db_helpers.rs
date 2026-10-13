@@ -478,9 +478,12 @@ const OCI_BLOB_DIGEST_TEST_LOCK_KEY: i64 = 0x4244_3529; // "BD" + issue #3529
 /// Cross-process serialization guard for DB-backed OCI upload tests that
 /// commit a blob whose CONTENT another test also commits (#3529).
 ///
-/// `oci_upload_cleanup_keys.storage_key` is `UNIQUE` across the whole
-/// database and `blob_storage_key` is content-addressed, so two tests pushing
-/// identical bytes register the *same* cleanup-journal row: the second
+/// Until #3851, `oci_upload_cleanup_keys.storage_key` was `UNIQUE` across the
+/// whole database and `blob_storage_key` is content-addressed, so two tests
+/// pushing identical bytes registered the *same* cleanup-journal row. Rows are
+/// now per (repository, key), which removes the cross-repository collision
+/// described below; the lock is kept because tests pushing one digest also
+/// share its storage object. Historically the second
 /// `register_oci_upload_cleanup_key` hits `ON CONFLICT (storage_key)` and gets
 /// the first test's row id back. Whichever push commits first deletes that row
 /// inside its `oci_blobs` transaction (the #3187 guard) and then tears its
@@ -571,6 +574,8 @@ fn cfg(storage_path: &str) -> Config {
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
         signature_expiry_seconds: 604_800,
+        signing_key_rotation_overlap_secs: 1_209_600,
+        signing_auto_migrate_legacy_keys: false,
         jwt_expiration_secs: 86400,
         jwt_access_token_expiry_minutes: 30,
         jwt_refresh_token_expiry_days: 7,
@@ -592,13 +597,18 @@ fn cfg(storage_path: &str) -> Config {
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
+        guest_access_env_pinned: false,
         expose_detailed_health: false,
+        readyz_require_search: false,
         setup_password_hint: None,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         conda_attestation_require_verified: true,
+        conda_attestation_issuers: Vec::new(),
+        conda_attestation_identities: Vec::new(),
+        conda_attestation_public_keys: Vec::new(),
         peer_instance_name: "test".into(),
         peer_public_endpoint: "http://localhost:8080".into(),
         peer_api_key: "test-key".into(),
@@ -606,11 +616,13 @@ fn cfg(storage_path: &str) -> Config {
         dependency_track_enabled: false,
         otel_exporter_otlp_endpoint: None,
         otel_service_name: "test".into(),
+        gc_trash_retention_days: 0,
         gc_schedule: "0 0 * * * *".into(),
         storage_stats_schedule: "0 0 */4 * * *".into(),
         blob_gc_enabled: false,
         maven_flat_gc_enabled: false,
         blob_gc_sweep_grace_secs: 3600,
+        blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
         lifecycle_check_interval_secs: 60,
         stuck_scan_threshold_secs: 1800,
         stuck_scan_check_interval_secs: 600,
@@ -622,6 +634,8 @@ fn cfg(storage_path: &str) -> Config {
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
+        grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
+        metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
         database_max_connections: 20,
         database_min_connections: 5,
         database_acquire_timeout_secs: 30,
@@ -630,6 +644,9 @@ fn cfg(storage_path: &str) -> Config {
         auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        upload_progress_window_secs: 60,
+        upload_min_progress_bytes: 16 * 1024,
+        upload_max_in_flight_per_principal: 64,
         rate_limit_enabled: true,
         rate_limit_auth_per_window: 120,
         rate_limit_api_per_window: 5000,
@@ -665,18 +682,28 @@ fn cfg(storage_path: &str) -> Config {
         password_min_strength: 0,
         presigned_downloads_enabled: false,
         presigned_download_expiry_secs: 300,
+        download_verify_checksums: true,
+        storage_scrub_interval_secs: 0,
+        storage_scrub_max_objects: 500,
+        storage_scrub_max_bytes: 2 << 30,
         proxy_singleflight_advisory_locks_enabled: false,
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,
         oci_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+        npm_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         oci_virtual_negative_cache_max_entries:
             crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+        npm_virtual_negative_cache_max_entries:
+            crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
         smtp_password: None,
         smtp_from_address: "noreply@test.local".to_string(),
         smtp_tls_mode: "starttls".to_string(),
+        smtp_tls_ca_cert: None,
+        smtp_tls_ca_cert_source: None,
+        smtp_tls_skip_verify: false,
         npm_packument_cache_enabled: true,
         npm_packument_cache_fresh_ttl_secs: 300,
         npm_packument_cache_stale_max_secs: 86_400,
@@ -1185,16 +1212,23 @@ pub async fn send_with_headers(
 /// tests use this for an ordinary read/write repository member; owner-specific
 /// tests should grant the `repository-owner` role explicitly.
 pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+    grant_repo_role(pool, repo_id, user_id, "developer").await;
+}
+
+/// Grant `user_id` the built-in role `role` (e.g. `reader`, `developer`,
+/// `repository-owner`) scoped to `repo_id`. Cleaned up by [`cleanup`].
+pub async fn grant_repo_role(pool: &PgPool, repo_id: Uuid, user_id: Uuid, role: &str) {
     sqlx::query(
         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+         SELECT $1, r.id, $2 FROM roles r WHERE r.name = $3 \
          ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
     )
     .bind(user_id)
     .bind(repo_id)
+    .bind(role)
     .execute(pool)
     .await
-    .expect("grant developer role");
+    .unwrap_or_else(|e| panic!("grant {role} role: {e}"));
 }
 
 /// Like [`make_auth`] but for a GLOBAL admin (`is_admin = true`). Used by
@@ -1757,6 +1791,8 @@ pub fn make_repo_info(
 /// an `artifacts` row at `path`. Returns the inserted artifact id.
 ///
 /// Centralizes the put+insert pattern shared by every handler smoke test.
+/// The row's checksum is the placeholder `test-seed`; use
+/// [`seed_artifact_with_checksum`] when the test matches on the digest.
 #[allow(clippy::too_many_arguments)]
 pub async fn seed_artifact(
     state: &SharedState,
@@ -1769,6 +1805,38 @@ pub async fn seed_artifact(
     content_type: &str,
     content: Bytes,
     uploaded_by: Uuid,
+) -> Uuid {
+    seed_artifact_with_checksum(
+        state,
+        pool,
+        repo,
+        storage_key,
+        path,
+        name,
+        version,
+        content_type,
+        content,
+        uploaded_by,
+        "test-seed",
+    )
+    .await
+}
+
+/// [`seed_artifact`] with an explicit `checksum_sha256` for the row, for
+/// tests whose behaviour depends on the stored digest (e.g. presence checks).
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_artifact_with_checksum(
+    state: &SharedState,
+    pool: &PgPool,
+    repo: &crate::api::handlers::proxy_helpers::RepoInfo,
+    storage_key: &str,
+    path: &str,
+    name: &str,
+    version: &str,
+    content_type: &str,
+    content: Bytes,
+    uploaded_by: Uuid,
+    checksum_sha256: &str,
 ) -> Uuid {
     crate::api::handlers::proxy_helpers::put_artifact_bytes(
         state,
@@ -1786,7 +1854,7 @@ pub async fn seed_artifact(
             name,
             version,
             size_bytes: content.len() as i64,
-            checksum_sha256: "test-seed",
+            checksum_sha256,
             content_type,
             storage_key,
             uploaded_by,
@@ -1892,6 +1960,70 @@ pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<Cat
     })
 }
 
+/// Assert that the native publish just driven fired exactly ONE
+/// `artifact.uploaded` (#3411, #3939), scoped to `repo_id` and identifying the
+/// `artifacts` row it wrote for `(name, version)`.
+///
+/// Subscribe with `fx.state.event_bus.subscribe()` BEFORE sending the publish,
+/// and call this before tearing the fixture down (it reads the row). Shared by
+/// the per-format publish tests so a format that stops emitting, or starts
+/// emitting twice (a second producer on the same path), fails the same way.
+pub async fn assert_one_artifact_uploaded(
+    events: &mut tokio::sync::broadcast::Receiver<crate::services::event_bus::DomainEvent>,
+    pool: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) {
+    let artifact_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 \
+         AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .fetch_one(pool)
+    .await
+    .expect("the publish must have written an artifacts row");
+
+    assert_one_artifact_uploaded_event(events, repo_id, artifact_id);
+}
+
+/// [`assert_one_artifact_uploaded`] for a write path whose artifact id the test
+/// already holds (a promotion copy, a Git LFS object, a chunked upload).
+pub fn assert_one_artifact_uploaded_event(
+    events: &mut tokio::sync::broadcast::Receiver<crate::services::event_bus::DomainEvent>,
+    repo_id: Uuid,
+    artifact_id: Uuid,
+) {
+    let uploaded: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|e| e.event_type == "artifact.uploaded")
+        .collect();
+    assert_eq!(
+        uploaded.len(),
+        1,
+        "the write of artifact {artifact_id} must emit exactly one artifact.uploaded, got {uploaded:?}"
+    );
+    assert_eq!(uploaded[0].repository_id, Some(repo_id));
+    assert_eq!(
+        uploaded[0].entity_id,
+        artifact_id.to_string(),
+        "the event must identify the artifacts row that was written"
+    );
+}
+
+/// Id of the live `artifacts` row at `(repository, path)`.
+pub async fn artifact_id_at(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(path)
+    .fetch_one(pool)
+    .await
+    .expect("read artifact id at path")
+}
+
 /// Bundles all the per-test scaffolding so each handler test body is a
 /// single helper call followed by assertions. Returned `None` indicates
 /// the test should skip (no `DATABASE_URL`).
@@ -1967,6 +2099,103 @@ impl Fixture {
     pub fn router_with_auth(&self, router: Router<SharedState>) -> Router {
         let auth = make_auth(self.user_id, &self.username);
         router_with_auth(router, self.state.clone(), auth)
+    }
+
+    /// Drive the generic chunked upload flow (`/api/v1/uploads`: create a
+    /// session, PATCH `payload` as its one chunk, complete it) for `path` in
+    /// this fixture's repository, as the fixture user. `create_extra` fields
+    /// are merged into the create body (e.g. replication metadata) and
+    /// `replication` sets the replication header on create and complete.
+    /// Returns the completion's status and body; panics if create or the
+    /// chunk fails.
+    pub async fn chunked_upload(
+        &self,
+        path: &str,
+        payload: &[u8],
+        create_extra: serde_json::Value,
+        replication: bool,
+    ) -> (StatusCode, Bytes) {
+        let auth = make_auth(self.user_id, &self.username);
+        self.chunked_upload_as(auth, path, payload, create_extra, replication)
+            .await
+    }
+
+    /// [`Self::chunked_upload`] as `auth` (e.g. [`admin_auth`] for a trusted
+    /// replication session).
+    pub async fn chunked_upload_as(
+        &self,
+        auth: AuthExtension,
+        path: &str,
+        payload: &[u8],
+        create_extra: serde_json::Value,
+        replication: bool,
+    ) -> (StatusCode, Bytes) {
+        use sha2::{Digest, Sha256};
+        assert!(
+            !payload.is_empty(),
+            "chunked_upload needs a non-empty payload (one Content-Range chunk)"
+        );
+        let app = || {
+            crate::api::handlers::upload::router()
+                .with_state(self.state.clone())
+                .layer(Extension::<AuthExtension>(auth.clone()))
+        };
+        let mark = |mut req: Request<Body>| {
+            if replication {
+                req.headers_mut().insert(
+                    "x-artifact-keeper-replication",
+                    axum::http::HeaderValue::from_static("true"),
+                );
+            }
+            req
+        };
+        let mut create = serde_json::json!({
+            "repository_key": self.repo_key,
+            "artifact_path": path,
+            "total_size": payload.len() as i64,
+            "checksum_sha256": hex::encode(Sha256::digest(payload)),
+            "chunk_size": 1024 * 1024_i64,
+        });
+        if let (Some(body), Some(extra)) = (create.as_object_mut(), create_extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        let create = post(
+            "/".to_string(),
+            "application/json",
+            Bytes::from(serde_json::to_vec(&create).unwrap()),
+        );
+        let (status, resp) = send(app(), mark(create)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        let session: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let session_id = session["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string();
+
+        let chunk = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session_id}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, resp) = send(app(), chunk).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+
+        let complete = Request::builder()
+            .method("PUT")
+            .uri(format!("/{session_id}/complete"))
+            .body(Body::empty())
+            .unwrap();
+        send(app(), mark(complete)).await
     }
 
     /// Drop all rows owned by this fixture and remove the storage dir.
@@ -2166,6 +2395,22 @@ pub fn build_state_with_proxy(
     Arc::new(state)
 }
 
+/// Like [`build_state_with_proxy`], but lets the caller adjust the test
+/// [`Config`] before the state is built (e.g. disabling the npm
+/// computed-packument cache so a test exercises the per-request merge).
+pub fn build_state_with_proxy_with(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    mutate: impl FnOnce(&mut Config),
+) -> crate::api::SharedState {
+    let mut config = cfg(storage_path);
+    mutate(&mut config);
+    let mut state = app_state_with(config, pool, storage_path);
+    state.set_proxy_service(proxy);
+    Arc::new(state)
+}
+
 /// Like [`build_state_with_proxy`] but also wires a
 /// [`crate::services::scanner_service::ScannerService`] onto the state, so
 /// handler tests can exercise the inline proxy scan + verdict-freshness wiring
@@ -2186,6 +2431,59 @@ pub fn build_state_with_proxy_and_scanner(
 /// Enable scan-on-proxy for a repository with the given
 /// `proxy_scan_action` (`"fail_open"` / `"fail_closed"`). Shared by the
 /// inline scan-and-block handler tests (#2954 PyPI, #3003 npm).
+/// A pool on which the `scan_configs` table cannot be read (#4365 item 5):
+/// every session's `search_path` puts a private schema first, holding a
+/// `scan_configs` view that raises `division_by_zero` on any row it reads.
+/// Every other table resolves to the real one, so a handler gets as far as
+/// its scan-policy read and fails there, exactly as on a database fault.
+/// Only rows that exist fault, so the repository under test needs a
+/// `scan_configs` row ([`enable_proxy_scan`]). Returns the pool and the
+/// schema to pass to [`drop_unreadable_scan_configs`]. `None` without a DB.
+pub async fn pool_with_unreadable_scan_configs() -> Option<(PgPool, String)> {
+    let base = try_pool().await?;
+    let url = crate::testing::require_db_url()?;
+    let schema = format!("ak_fault_{}", Uuid::new_v4().simple());
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE VIEW {schema}.scan_configs AS \
+             SELECT s.* FROM public.scan_configs s \
+             WHERE 1 / (s.block_on_policy_violation::int * 0) = 1"
+        ),
+    ] {
+        // The schema name is generated here (a UUID), never caller input.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&base)
+            .await
+            .expect("create the unreadable scan_configs view");
+    }
+    let search_path = format!("SET search_path TO {schema}, public");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(search_path))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect the unreadable-config pool");
+    Some((pool, schema))
+}
+
+/// Drop the schema [`pool_with_unreadable_scan_configs`] created.
+pub async fn drop_unreadable_scan_configs(pool: &PgPool, schema: &str) {
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await;
+}
+
 pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     sqlx::query(
         "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
@@ -2198,6 +2496,119 @@ pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
     .execute(pool)
     .await
     .expect("enable scan-on-proxy");
+}
+
+/// A Maven-built jar declaring `<group>:<artifact>:<version>` in its own
+/// `META-INF/maven/<group>/<artifact>/pom.properties` (#4100 scan-on-proxy
+/// tests). A per-call nonce entry keeps every fixture's digest unique, since
+/// proxy scan verdicts are global and keyed on the content digest.
+pub fn maven_jar_fixture(group: &str, artifact: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file(
+        format!("META-INF/maven/{group}/{artifact}/pom.properties"),
+        opts,
+    )
+    .expect("pom.properties entry");
+    write!(
+        zip,
+        "groupId={group}\nartifactId={artifact}\nversion={version}\n"
+    )
+    .expect("pom.properties body");
+    zip.start_file("nonce.txt", opts).expect("nonce entry");
+    zip.write_all(Uuid::new_v4().to_string().as_bytes())
+        .expect("nonce body");
+    zip.finish().expect("finish jar").into_inner()
+}
+
+/// Seed a `vulnerable` (one critical) or `clean` proxy scan verdict for
+/// `bytes`, returning its digest for [`drop_proxy_verdicts`].
+pub async fn seed_proxy_verdict(
+    pool: &PgPool,
+    bytes: &[u8],
+    repo_id: Uuid,
+    vulnerable: bool,
+) -> String {
+    let digest = crate::api::handlers::proxy_helpers::sha256_hex(&Bytes::copy_from_slice(bytes));
+    let (verdict, n, severity) = if vulnerable {
+        ("vulnerable", 1, Some("critical"))
+    } else {
+        ("clean", 0, None)
+    };
+    crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+        .record_verdict(
+            &digest,
+            "grype",
+            verdict,
+            n,
+            n,
+            0,
+            0,
+            0,
+            severity,
+            Some("grype-0.99.0-test"),
+            Some(repo_id),
+        )
+        .await
+        .expect("seed proxy scan verdict");
+    digest
+}
+
+/// Remove the verdicts [`seed_proxy_verdict`] wrote.
+pub async fn drop_proxy_verdicts(pool: &PgPool, digests: &[String]) {
+    sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")
+        .bind(digests)
+        .execute(pool)
+        .await
+        .expect("cleanup proxy_scan_results");
+}
+
+/// Proxy downloads recorded for `path` on `repo_id` (#3446 / #4100
+/// exactly-once assertions).
+pub async fn proxy_downloads_recorded(pool: &PgPool, repo_id: Uuid, path: &str) -> i64 {
+    crate::services::proxy_catalog::download_counts_by_paths(pool, repo_id, &[path.to_string()])
+        .await
+        .expect("download counts")
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Attach a new public Remote repository of `format`, proxying `upstream`, to
+/// `virtual_id` at `priority`. Returns `(id, key, storage dir)`.
+pub async fn attach_remote_member(
+    pool: &PgPool,
+    virtual_id: Uuid,
+    format: &str,
+    upstream: &str,
+    priority: i32,
+) -> (Uuid, String, PathBuf) {
+    let (member_id, member_key, member_dir) = create_repo(pool, "remote", format).await;
+    sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+        .bind(upstream)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("configure remote member");
+    link_virtual_member(pool, virtual_id, member_id, priority).await;
+    (member_id, member_key, member_dir)
+}
+
+/// Turn on the Package Age Policy hold (#1770) for a Remote repository, so
+/// every freshly proxied object is held (`409`) for `minutes`.
+pub async fn enable_proxy_quarantine(pool: &PgPool, repo_id: Uuid, minutes: i64) {
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) \
+         VALUES ($1, 'quarantine_enabled', 'true'), \
+                ($1, 'quarantine_duration_minutes', $2)",
+    )
+    .bind(repo_id)
+    .bind(minutes.to_string())
+    .execute(pool)
+    .await
+    .expect("enable quarantine config");
+    crate::services::quarantine_service::invalidate_config_cache(repo_id);
 }
 
 /// Build a state whose scanner service holds exactly the given mock leaf
@@ -2222,6 +2633,82 @@ pub fn build_scan_state_with_leaf_scanners(
             .into_owned(),
     );
     build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
+}
+
+/// Leaf scanner for the #4166 scan-on-upload handler tests: applies to
+/// everything and completes clean. Its rows use scan_type `malware` -- allowed
+/// by the `scan_results_scan_type_check` constraint and used by no real
+/// scanner -- so the tests count only its rows.
+struct UploadProbeScanner;
+
+#[async_trait::async_trait]
+impl crate::services::scanner_service::Scanner for UploadProbeScanner {
+    fn name(&self) -> &str {
+        "upload-probe"
+    }
+
+    fn scan_type(&self) -> &str {
+        "malware"
+    }
+
+    async fn scan(
+        &self,
+        _artifact: &crate::models::artifact::Artifact,
+        _metadata: Option<&crate::models::artifact::ArtifactMetadata>,
+        _content: &Bytes,
+    ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+        Ok(crate::services::scanner_service::ScanOutput::default())
+    }
+}
+
+/// #4166: send one native upload `req` through `router` for `fx`'s repository
+/// with scanning enabled and `scan_on_upload = on_upload`, then return how many
+/// probe (`malware`) scan rows the repository has once `budget` elapses or the
+/// first row lands. Shared by the per-format scan-on-upload tests.
+pub async fn native_upload_probe_scans(
+    fx: &Fixture,
+    router: Router<SharedState>,
+    req: Request<Body>,
+    on_upload: bool,
+    budget: std::time::Duration,
+) -> i64 {
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+             scan_on_proxy, block_on_policy_violation, severity_threshold) \
+         VALUES ($1, true, $2, false, false, 'high')",
+    )
+    .bind(fx.repo_id)
+    .bind(on_upload)
+    .execute(&fx.pool)
+    .await
+    .expect("seed scan_configs");
+
+    let storage_path = fx.storage_dir.to_string_lossy().into_owned();
+    let state =
+        build_scan_state_with_leaf_scanners(fx, &storage_path, vec![Arc::new(UploadProbeScanner)]);
+    let app = router_with_auth(router, state, make_auth(fx.user_id, &fx.username));
+    let (status, body) = send(app, req).await;
+    assert!(
+        status.is_success(),
+        "native upload failed: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_results \
+             WHERE repository_id = $1 AND scan_type = 'malware'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count scan_results");
+        if n > 0 || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the
@@ -2757,4 +3244,98 @@ pub async fn collect_response(
 /// query.
 pub fn admin_auth_ext() -> Option<AuthExtension> {
     Some(admin_auth(Uuid::new_v4(), "tdh-resolver-admin"))
+}
+
+/// Collects `tracing` output written while a subscriber built with it as the
+/// writer is the thread default (`tracing::subscriber::set_default`). Clone
+/// it into the subscriber and read the text back with [`LogCapture::text`].
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Install a thread-default subscriber at `level` writing into this
+    /// capture; logs are captured until the returned guard drops.
+    pub fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(level)
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+
+    /// Everything captured so far, lossily decoded.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A transient failure of the virtual-member AUTHORIZATION query alone, for
+/// the #4308 regressions: the member fetch (`virtual_repo_members` +
+/// `repositories`) still succeeds, but the grant predicate an authenticated
+/// non-admin caller's visibility filter evaluates (`role_assignments`) cannot
+/// be read.
+///
+/// Holds an `ACCESS EXCLUSIVE` lock on `role_assignments` from its own
+/// connection, and returns a separate small pool whose sessions run with a
+/// short `lock_timeout`, so a query through that pool that touches the table
+/// fails with a database error (the same `AppError::Database` shape as a pool
+/// timeout) instead of waiting. Other tests touching the table only wait for
+/// the guard to drop. Returns `None` without a database.
+pub struct AuthzQueryOutage {
+    pub pool: PgPool,
+    lock: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl AuthzQueryOutage {
+    pub async fn start(lock_pool: &PgPool) -> Option<Self> {
+        use std::str::FromStr;
+        let url = crate::testing::require_db_url()?;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .options([("lock_timeout", "300")]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_with(opts)
+            .await
+            .expect("connect lock-timeout pool");
+        let mut tx = lock_pool.begin().await.expect("begin lock transaction");
+        sqlx::query("LOCK TABLE role_assignments IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("lock role_assignments");
+        Some(Self {
+            pool,
+            lock: Some(tx),
+        })
+    }
+
+    /// Release the lock (rolls the holding transaction back).
+    pub async fn end(mut self) {
+        if let Some(tx) = self.lock.take() {
+            let _ = tx.rollback().await;
+        }
+        self.pool.close().await;
+    }
 }

@@ -598,6 +598,7 @@ async fn download_archive(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -882,7 +883,8 @@ struct PublishParts {
 /// That stager is also what enforces `MAX_UPLOAD_SIZE` on the archive (413
 /// mid-stream); the `whole_stream` constraint here keeps the same ceiling on
 /// the envelope as a whole, which is what the route's `DefaultBodyLimit`
-/// applied while this handler still took a materialised body.
+/// applied while this handler still took a materialised body. Crossing either
+/// ceiling is a 413, not a "malformed" 400 (#4023).
 async fn stage_publish_multipart(
     state: &SharedState,
     content_type: &str,
@@ -905,10 +907,8 @@ async fn stage_publish_multipart(
         multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
 
     let bad_request = |e: multer::Error| {
-        swift_error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("Malformed multipart/form-data publish request: {}", e),
-        )
+        let (status, message) = proxy_helpers::multipart_error(&e);
+        swift_error_response(status, &message)
     };
 
     let mut staged: Option<proxy_helpers::StagedUpload> = None;
@@ -1140,6 +1140,13 @@ async fn publish_release(
         .map(str::to_string);
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1159,9 +1166,15 @@ async fn publish_release(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
+        swift_error_response(
+            crate::api::handlers::db_status(&e),
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+    tx.commit().await.map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
             crate::api::handlers::db_err_message(&e),
@@ -1170,6 +1183,13 @@ async fn publish_release(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -1275,6 +1295,7 @@ async fn lookup_identifiers(
     Ok(swift_json_response(StatusCode::OK, body))
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1822,6 +1843,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -1937,6 +1959,7 @@ mod db_cov_tests {
 /// `download_archive` sibling filters through the caller-authorized
 /// `resolve_virtual_download`; the manifest walk now applies the same
 /// `proxy_helpers::try_authorize_virtual_members` predicate.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use axum::http::StatusCode;
@@ -2074,6 +2097,7 @@ mod virtual_member_authz_tests {
 /// the stored object began with a multipart boundary rather than `PK\x03\x04`,
 /// and `checksum_sha256` (echoed as the release-metadata `checksum` and the
 /// download `Digest` header) hashed the envelope instead of the archive.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod multipart_publish_tests {
     use axum::body::Body;
@@ -2119,6 +2143,51 @@ mod multipart_publish_tests {
         }
         body.extend_from_slice(format!("--{}--\r\n", BOUNDARY).as_bytes());
         Bytes::from(body)
+    }
+
+    /// An envelope over `max_upload_size_bytes` is 413, not a "malformed" 400,
+    /// whether the ceiling is crossed before the first part (the parser
+    /// reports it) or mid-archive (it surfaces inside the stager) (#4023).
+    #[tokio::test]
+    async fn publish_multipart_oversized_envelope_is_413() {
+        let dir = std::env::temp_dir().join(format!("ak-swift-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let state = tdh::build_state_with(tdh::lazy_pool(), dir.to_str().unwrap(), |cfg| {
+            cfg.max_upload_size_bytes = 512
+        });
+        let archive = vec![0xABu8; 4096];
+        let envelope = publish_envelope(&[("source-archive", "application/zip", &archive)]);
+        let content_type = format!("multipart/form-data; boundary={}", BOUNDARY);
+        let pieces: Vec<Result<Bytes, std::io::Error>> = envelope
+            .chunks(64)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+
+        let whole =
+            super::stage_publish_multipart(&state, &content_type, Body::from(envelope.clone()))
+                .await
+                .err()
+                .map(|resp| resp.status());
+        let chunked = super::stage_publish_multipart(
+            &state,
+            &content_type,
+            Body::from_stream(futures::stream::iter(pieces)),
+        )
+        .await
+        .err()
+        .map(|resp| resp.status());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            whole,
+            Some(StatusCode::PAYLOAD_TOO_LARGE),
+            "delivered whole"
+        );
+        assert_eq!(
+            chunked,
+            Some(StatusCode::PAYLOAD_TOO_LARGE),
+            "delivered in 64-byte chunks"
+        );
     }
 
     fn publish_request(uri: String, content_type: &str, body: Bytes) -> Request<Body> {
@@ -2290,6 +2359,7 @@ mod multipart_publish_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;

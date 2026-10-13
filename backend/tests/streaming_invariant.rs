@@ -86,13 +86,28 @@ use std::path::{Path, PathBuf};
 /// body at that site). Phase progress: npm.rs 7 -> 6, total 30 -> 29. This
 /// drift went unnoticed because this gate ran in NO CI job (#3494); it is now
 /// wired into the Tier 1 integration-target step with `--no-tests=fail`.
+///
+/// Reconciliation (#4020): gating the /v2/token password grant on any HTTP
+/// method added a second capped form-body peek in rate_limit.rs
+/// (`TOKEN_FORM_PEEK_LIMIT`, 16 KiB) so the rate-limit decision can read
+/// grant_type/username before the body is re-attached unchanged — the same
+/// shape as the existing login-body peek (`LOGIN_BODY_PEEK_LIMIT`). A
+/// legitimate new metadata buffer site, not an artifact path: rate_limit.rs
+/// 1 -> 2, total 29 -> 30.
+///
+/// #4608: the virtual conda merge gate shares one merge between every request
+/// for the same document, and replays the merge's own error response (a 502,
+/// 503 or 404 line of text, read under a 1 MiB bound) to each of them. That
+/// replay reads the error body once; it never touches an artifact or a
+/// metadata document. New file conda/merge_gate.rs: 1, total 30 -> 31.
 const ALLOWLIST: &[(&str, usize)] = &[
+    ("src/api/handlers/conda/merge_gate.rs", 1),
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/npm.rs", 6),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
-    ("src/api/middleware/rate_limit.rs", 1),
+    ("src/api/middleware/rate_limit.rs", 2),
     ("src/main.rs", 1),
     ("src/services/artifactory_client.rs", 1),
     ("src/services/nexus_client.rs", 1),
@@ -450,12 +465,14 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 29,
-        "expected 29 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 31,
+        "expected 31 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
          + RPM curation-sync reconciliation (scheduler_service.rs +1) \
          + packument HTTP caching (#3052, npm.rs +1) \
-         + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494); \
+         + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494) \
+         + the /v2/token form peek (#4020, rate_limit.rs +1) \
+         + the virtual conda merge error replay (#4608, merge_gate.rs +1); \
          got {total}"
     );
 }
@@ -484,11 +501,14 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 /// (`repositories::upload_artifact` generic PUT, `maven::upload`, and
 /// `terraform::upload_module` + `upload_provider`), removing them from this
 /// list. The remainder are the long-tail format handlers (tracked for later
-/// PF-005 phases) plus two intentional small-body sinks that stay:
-///   * `oci_v2::handle_put_manifest` — an OCI *manifest* is a small bounded JSON
-///     document (blobs upload via the streamed `/blobs/uploads` path), and
+/// PF-005 phases) plus one intentional small-body sink that stays:
 ///   * `proxy_helpers::put_artifact_bytes` — the shared buffered helper the
 ///     long-tail light-format handlers still call; it goes away when they do.
+///
+/// #4568: `oci_v2::handle_put_manifest` now takes `body: Body` and reads the
+/// (small, bounded) manifest only after authentication and authorization, so
+/// an anonymous client can no longer make the server buffer it. The oci_v2.rs
+/// row is removed.
 ///
 /// Phase progress (#3595): the Swift publish route streamed. Fixing the SE-0292
 /// multipart bug there required parsing the envelope anyway, so the handler was
@@ -507,14 +527,16 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 /// moved from `body: Bytes` to `body: Body` and holds no plugin on the heap on
 /// either the multipart or the raw (`X-Plugin-Name`) path. The jetbrains.rs row
 /// is removed.
+///
+/// GHSA-9f9r-c4w8-rjv9: Git LFS `upload_object` now streams through
+/// `stage_stream_content_addressed` + `put_stream`, so the gitlfs.rs row is
+/// removed.
 const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/cocoapods.rs", 1),
     ("src/api/handlers/composer.rs", 1),
     ("src/api/handlers/conan.rs", 2),
     ("src/api/handlers/debian.rs", 1),
-    ("src/api/handlers/gitlfs.rs", 1),
     ("src/api/handlers/goproxy.rs", 2),
-    ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/proxy_helpers.rs", 1),
     ("src/api/handlers/sbt.rs", 1),
     ("src/api/handlers/vscode.rs", 1),
@@ -558,7 +580,7 @@ fn fn_body_span(masked: &str, sig_pos: usize) -> Option<(usize, usize)> {
 
 /// Byte offsets of every standalone `body: Bytes` parameter in masked code (any
 /// run of spaces between `body:` and `Bytes`, with both `body` and `Bytes` whole
-/// words).
+/// words), and of every `UploadBody(body): UploadBody` extractor.
 fn raw_body_bytes_positions(masked: &str) -> Vec<usize> {
     let b = masked.as_bytes();
     let mut out = Vec::new();
@@ -584,6 +606,19 @@ fn raw_body_bytes_positions(masked: &str) -> Vec<usize> {
             }
         }
     }
+    // `UploadBody(body): UploadBody` (#4609) is the same whole-body buffer
+    // with a memory budget and a length check; it is tracked like `body:
+    // Bytes`, so swapping the extractor is not mistaken for streaming.
+    let mut from = 0usize;
+    while let Some(rel) = masked[from..].find("UploadBody(body): UploadBody") {
+        let at = from + rel;
+        from = at + 1;
+        let prev_ok = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+        if prev_ok {
+            out.push(at);
+        }
+    }
+    out.sort_unstable();
     out
 }
 

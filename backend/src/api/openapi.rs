@@ -24,7 +24,7 @@ registries are intentionally more permissive for client compatibility: in additi
 HTTP **Basic** auth with the API token supplied in the *password* field (any username), matching the \
 `pip` netrc / Artifactory-style `token:<api_token>` convention used by package managers that cannot send a \
 Bearer header. This Basic-with-token fallback applies to format endpoints only, never to `/api/v1/*`.",
-        version = "1.10.0",
+        version = "1.11.0",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
     ),
@@ -51,12 +51,14 @@ Bearer header. This Basic-with-token fallback applies to format endpoints only, 
         (name = "webhooks", description = "Event webhook management"),
         (name = "peers", description = "Peer replication and sync"),
         (name = "admin", description = "System administration"),
+        (name = "banners", description = "System-wide maintenance and downtime banners"),
         (name = "analytics", description = "Storage and download analytics"),
         (name = "lifecycle", description = "Retention policies and cleanup"),
         (name = "monitoring", description = "Health monitoring and alerts"),
         (name = "telemetry", description = "Crash reporting and telemetry"),
         (name = "sso", description = "Single sign-on configuration"),
         (name = "migration", description = "Data migration and import"),
+        (name = "bundles", description = "Offline content bundle export and import"),
         (name = "quarantine", description = "Artifact quarantine period management"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "age-gate", description = "Age-based proxy quality gate"),
@@ -139,6 +141,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::repositories::RepositoriesApiDoc::openapi(),
         ),
         ("artifacts", handlers::artifacts::ArtifactsApiDoc::openapi()),
+        (
+            "package_analysis",
+            handlers::package_analysis::PackageAnalysisApiDoc::openapi(),
+        ),
         ("users", handlers::users::UsersApiDoc::openapi()),
         ("groups", handlers::groups::GroupsApiDoc::openapi()),
         ("packages", handlers::packages::PackagesApiDoc::openapi()),
@@ -156,10 +162,19 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ("security", handlers::security::SecurityApiDoc::openapi()),
         ("sbom", handlers::sbom::SbomApiDoc::openapi()),
         (
+            "attestations",
+            handlers::attestations::AttestationsApiDoc::openapi(),
+        ),
+        (
             "environments",
             handlers::environments::EnvironmentsApiDoc::openapi(),
         ),
+        (
+            "artifact_presence",
+            handlers::artifact_presence::ArtifactPresenceApiDoc::openapi(),
+        ),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
+        ("banners", handlers::banners::BannersApiDoc::openapi()),
         (
             "admin_security",
             handlers::admin_security::AdminSecurityApiDoc::openapi(),
@@ -170,6 +185,11 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "storage_gc",
             handlers::storage_gc::StorageGcApiDoc::openapi(),
         ),
+        (
+            "storage_integrity",
+            handlers::storage_integrity::StorageIntegrityApiDoc::openapi(),
+        ),
+        ("trash", handlers::trash::TrashApiDoc::openapi()),
         (
             "monitoring",
             handlers::monitoring::MonitoringApiDoc::openapi(),
@@ -182,6 +202,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ),
         ("projects", handlers::projects::ProjectsApiDoc::openapi()),
         ("migration", handlers::migration::MigrationApiDoc::openapi()),
+        ("bundles", handlers::bundles::BundlesApiDoc::openapi()),
         ("sso", handlers::sso::SsoApiDoc::openapi()),
         ("sso_admin", handlers::sso_admin::SsoAdminApiDoc::openapi()),
         ("totp", handlers::totp::TotpApiDoc::openapi()),
@@ -218,6 +239,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ),
         ("approval", handlers::approval::ApprovalApiDoc::openapi()),
         ("age_gate", handlers::age_gate::AgeGateApi::openapi()),
+        (
+            "download_holds",
+            handlers::download_holds::DownloadHoldsApiDoc::openapi(),
+        ),
         (
             "promotion_rules",
             handlers::promotion_rules::PromotionRulesApiDoc::openapi(),
@@ -269,6 +294,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc
 }
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +622,76 @@ mod tests {
         }
     }
 
+    /// #3522: `POST /api/v1/users/{id}/roles` is deprecated in favour of
+    /// `POST /api/v1/permissions`, and the spec must say so (generated SDKs
+    /// key their deprecation warnings off this flag). The sibling `GET` on
+    /// the same path is not deprecated.
+    #[test]
+    fn test_3522_openapi_assign_user_role_is_deprecated() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let item = &spec["paths"]["/api/v1/users/{id}/roles"];
+        assert!(item.is_object(), "path missing from the spec");
+        assert_eq!(item["post"]["deprecated"], serde_json::Value::Bool(true));
+        assert!(item["get"]["deprecated"].is_null());
+        let headers = &item["post"]["responses"]["200"]["headers"];
+        assert!(
+            headers["Deprecation"].is_object(),
+            "Deprecation header documented"
+        );
+        assert!(headers["Link"].is_object(), "Link header documented");
+        assert!(spec["paths"]["/api/v1/permissions"]["post"].is_object());
+    }
+
+    /// #3812: `visibility` is the authoritative field; the legacy boolean and
+    /// its alias stay accepted and returned but are flagged deprecated in the
+    /// spec so generated SDKs surface it.
+    #[test]
+    fn test_repository_legacy_visibility_booleans_are_deprecated_in_spec() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        for schema in [
+            "CreateRepositoryRequest",
+            "UpdateRepositoryRequest",
+            "RepositoryResponse",
+        ] {
+            let props = &spec["components"]["schemas"][schema]["properties"];
+            assert!(props.is_object(), "schema {schema} missing from the spec");
+            for field in ["is_public", "allow_anonymous_access"] {
+                assert_eq!(
+                    props[field]["deprecated"],
+                    serde_json::Value::Bool(true),
+                    "{schema}.{field} must be marked deprecated"
+                );
+            }
+            assert!(
+                props["visibility"]["deprecated"].is_null(),
+                "{schema}.visibility must not be deprecated"
+            );
+        }
+    }
+
+    /// #3924 added a second 409 to chunked-upload completion (immutable path
+    /// occupied) alongside the checksum mismatch, and clients that mapped every
+    /// 409 there to a checksum error misreported it. The documented 409 must
+    /// name both causes and point clients at the body.
+    #[test]
+    fn test_openapi_upload_complete_409_documents_both_causes() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+        let (_, item) = paths
+            .iter()
+            .find(|(p, _)| p.ends_with("/uploads/{session_id}/complete"))
+            .expect("upload completion path missing from OpenAPI spec");
+        let description = item["put"]["responses"]["409"]["description"]
+            .as_str()
+            .expect("upload completion must document a 409 response");
+        assert!(description.contains("Checksum mismatch"), "{description}");
+        assert!(
+            description.contains("Artifact version already exists and is immutable"),
+            "{description}"
+        );
+        assert!(description.contains("response body"), "{description}");
+    }
+
     /// Verify every path documented in the OpenAPI spec has a corresponding
     /// route registered in the handler routers. This catches the class of bug
     /// where a handler is annotated with `#[utoipa::path(...)]` and listed in
@@ -685,11 +781,16 @@ mod tests {
                     include_str!("handlers/security.rs"),
                     include_str!("handlers/repo_tokens.rs"),
                     include_str!("handlers/environments.rs"),
+                    include_str!("handlers/artifact_presence.rs"),
                 ],
             ),
             (
                 "/api/v1/environments/",
                 vec![include_str!("handlers/environments.rs")],
+            ),
+            (
+                "/api/v1/attestations/",
+                vec![include_str!("handlers/attestations.rs")],
             ),
             (
                 "/api/v1/artifacts/",
@@ -730,6 +831,7 @@ mod tests {
                 vec![
                     include_str!("handlers/admin.rs"),
                     include_str!("handlers/health.rs"),
+                    include_str!("handlers/storage_integrity.rs"),
                     include_str!("routes.rs"),
                 ],
             ),
@@ -789,6 +891,10 @@ mod tests {
             (
                 "/api/v1/migrations/",
                 vec![include_str!("handlers/migration.rs")],
+            ),
+            (
+                "/api/v1/bundles/",
+                vec![include_str!("handlers/bundles.rs")],
             ),
             (
                 "/api/v1/curation/",
@@ -865,6 +971,143 @@ mod tests {
         assert!(
             missing.is_empty(),
             "The following OpenAPI-documented endpoints appear to be missing route registrations:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// Regression (#4095): every handler carrying a `#[utoipa::path]` must be
+    /// listed in its module's `#[openapi(paths(...))]` AND that module doc must
+    /// be merged in [`module_docs`]. Without this, an annotated and mounted
+    /// route silently drops out of the exported spec and every generated SDK
+    /// (`get_proxy_sbom` shipped that way in 1.10.0, as did the whole
+    /// `PackageAnalysisApiDoc`). `test_all_openapi_paths_have_handlers` checks
+    /// the other direction (documented => routed); this one checks
+    /// annotated => documented, by operationId (utoipa defaults it to the fn
+    /// name unless `operation_id = "..."` overrides it).
+    #[test]
+    fn test_every_annotated_handler_is_in_the_openapi_spec() {
+        use std::collections::HashSet;
+
+        // Handlers annotated on purpose but deliberately left out of the spec.
+        // Each entry needs a reason; do not add to this list to silence a
+        // handler that is simply missing from its ApiDoc.
+        const NOT_DOCUMENTED: &[&str] = &[
+            // SSE stream: no ApiDoc in events.rs and no generated-SDK support
+            // for text/event-stream; the web UI consumes it via EventSource.
+            "event_stream",
+        ];
+
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read handlers dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let spec = build_openapi();
+        let mut documented: HashSet<String> = HashSet::new();
+        for item in spec.paths.paths.values() {
+            let ops = [
+                &item.get,
+                &item.put,
+                &item.post,
+                &item.delete,
+                &item.patch,
+                &item.head,
+            ];
+            for op in ops.into_iter().flatten() {
+                if let Some(id) = &op.operation_id {
+                    documented.insert(id.clone());
+                }
+            }
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let handlers_dir = manifest_dir.join("src/api/handlers");
+        let mut files = Vec::new();
+        collect_rs(&handlers_dir, &mut files);
+        files.sort();
+
+        let marker = "#[utoipa::path(";
+        let mut annotated = 0usize;
+        let mut missing = Vec::new();
+        // Every annotated handler, by the operationId it resolves to. Two
+        // same-named handlers in different files resolve to ONE operationId,
+        // and the spec (whose ids are unique) can hold only one of them, so a
+        // presence check alone would let the registered one mask the other.
+        let mut by_op_id: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("read handler source");
+            let mut cursor = 0usize;
+            while let Some(rel) = src[cursor..].find(marker) {
+                let start = cursor + rel;
+                // Every annotation in the handlers closes with `)]` on its own
+                // line; the handler fn follows (possibly after other attributes
+                // or comments).
+                let Some(attr_len) = src[start..].find("\n)]") else {
+                    panic!("unterminated utoipa::path in {file:?}");
+                };
+                let end = start + attr_len;
+                let attr = &src[start..end];
+                let after = &src[end..];
+                let Some(fn_pos) = after.find("fn ") else {
+                    panic!("no fn after utoipa::path in {file:?}");
+                };
+                let fn_name: String = after[fn_pos + 3..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let op_id_key = "operation_id = \"";
+                let op_id = match attr.find(op_id_key) {
+                    Some(i) => {
+                        let rest = &attr[i + op_id_key.len()..];
+                        rest[..rest.find('"').expect("closing quote")].to_string()
+                    }
+                    None => fn_name.clone(),
+                };
+                annotated += 1;
+                let exempt = NOT_DOCUMENTED.contains(&fn_name.as_str());
+                let rel = file.strip_prefix(manifest_dir).unwrap_or(file).display();
+                if !exempt {
+                    by_op_id
+                        .entry(op_id.clone())
+                        .or_default()
+                        .push(format!("{rel} :: {fn_name}"));
+                }
+                if !exempt && !documented.contains(&op_id) {
+                    missing.push(format!("{rel} :: {fn_name} (operationId {op_id})"));
+                }
+                cursor = end;
+            }
+        }
+
+        for (op_id, sites) in &by_op_id {
+            if sites.len() > 1 {
+                missing.push(format!(
+                    "operationId {op_id} is claimed by {} handlers ({}); only one can be in \
+                     the spec, so give each an explicit `operation_id = \"...\"`",
+                    sites.len(),
+                    sites.join(", ")
+                ));
+            }
+        }
+
+        // Guard the scanner itself: if the marker or layout changes and nothing
+        // is found, this test must not pass vacuously.
+        assert!(
+            annotated >= 250,
+            "found only {annotated} #[utoipa::path] annotations; the source scan is broken"
+        );
+        assert!(
+            missing.is_empty(),
+            "Handlers annotated with #[utoipa::path] but absent from the merged OpenAPI spec. \
+             Add each to its module's `#[openapi(paths(...))]`, and make sure that ApiDoc is \
+             listed in `module_docs()`:\n{}",
             missing.join("\n")
         );
     }

@@ -23,6 +23,7 @@ use sqlx::PgPool;
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
+use crate::api::middleware::request_span::record_cache_outcome;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
@@ -34,6 +35,7 @@ use crate::services::proxy_hydration::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
+use crate::services::upstream_tracing::send_upstream;
 
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
@@ -191,6 +193,32 @@ async fn await_tee_publish(metadata_key: &str) -> bool {
     true
 }
 
+/// Drop this process's memoised sidecar lookup for `metadata_key` before a
+/// streaming re-enter (#4013).
+///
+/// The metadata LRU memoises a MISS (`None`) for [`PROXY_METADATA_LRU_TTL`].
+/// The cache check that preceded the election stored exactly that miss, and
+/// the leader that has since filled the entry may live on another replica,
+/// whose publish invalidated only its own process's LRU. Without this the
+/// re-enter re-reads the stale miss for up to 30 s and elects a second
+/// upstream fetch of an object that is already in the shared cache.
+async fn forget_cached_sidecar_miss(metadata_key: &str) {
+    let lru = proxy_metadata_lru().await;
+    if matches!(lru.get(metadata_key).await, Some(None)) {
+        lru.invalidate(metadata_key).await;
+    }
+}
+
+/// Completion signal of the streaming publish registered for `metadata_key`
+/// (#4013): flips to `true` when its writer task ends (commit, reject or
+/// error). Read right after [`CachePersister::tee_stream`] registered it, so
+/// it is this leader's own publish. `None` when nothing is registered.
+fn tee_publish_done(metadata_key: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+    lock_tee_publish_registry()
+        .get(metadata_key)
+        .map(|entry| entry.done_rx.clone())
+}
+
 /// Response from an upstream registry fetch.
 pub(crate) struct UpstreamResponse {
     pub(crate) content: Bytes,
@@ -220,6 +248,9 @@ pub(crate) struct UpstreamResponse {
     pub(crate) commit_sha: Option<String>,
     pub(crate) effective_url: String,
     pub(crate) link: Option<String>,
+    /// Upstream `X-Terraform-Get`, when it sent one: where a Terraform module
+    /// registry's `.../download` endpoint says the module source lives (#4590).
+    pub(crate) terraform_get: Option<String>,
 }
 
 /// Streaming response from an upstream registry fetch. Used by the
@@ -239,6 +270,10 @@ struct UpstreamStream {
     /// (a future enhancement; currently informational only).
     #[allow(dead_code)]
     content_length: Option<u64>,
+    /// `Last-Modified` from upstream (#3912): the release date the Package Age
+    /// Policy window is measured from on the streaming path, and the value the
+    /// cache sidecar records for later conditional revalidation (#1611).
+    last_modified: Option<String>,
 }
 
 /// Output of [`ProxyService::fetch_artifact_streaming`]. Carries the
@@ -354,6 +389,54 @@ impl CacheCommitDigest {
             Self::Sha256Hex(h) | Self::Sha512Hex(h) | Self::Sha1Hex(h) => h,
         }
     }
+
+    /// The algorithm half of this digest.
+    pub fn algorithm(&self) -> CommitDigestAlgorithm {
+        match self {
+            Self::Sha256Hex(_) => CommitDigestAlgorithm::Sha256,
+            Self::Sha512Hex(_) => CommitDigestAlgorithm::Sha512,
+            Self::Sha1Hex(_) => CommitDigestAlgorithm::Sha1,
+        }
+    }
+}
+
+/// The algorithm of a [`CacheCommitDigest`], without the value.
+///
+/// Declared up front on the deferred-digest streaming path (#3982) so the tee
+/// can hash the forwarded bytes from the first chunk; the digest VALUE is only
+/// needed at cache-commit time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDigestAlgorithm {
+    Sha256,
+    Sha512,
+    Sha1,
+}
+
+/// A commit-gate digest that resolves concurrently with the body stream
+/// (#3982). The shared future is driven by the tee itself once a cold-cache
+/// leader actually tees (so the digest fetch overlaps the body stream), and a
+/// warm cache hit never polls it at all — a hit pays for the digest
+/// resolution neither on the response path nor in the background. `None` from
+/// the future means "no authoritative digest": the commit proceeds
+/// unverified, exactly like a caller that passed `None` up front.
+pub type DeferredCommitDigest =
+    futures::future::Shared<futures::future::BoxFuture<'static, Option<CacheCommitDigest>>>;
+
+/// How the streaming cache commit learns the digest it is gated on (#2274,
+/// GHSA-qxv7-p3mq-88fv).
+#[derive(Clone)]
+pub enum ExpectedCommitDigest {
+    /// Known before the fetch starts — the original gate.
+    Resolved(CacheCommitDigest),
+    /// Resolves concurrently with the body stream (#3982): the content fetch
+    /// no longer waits on the digest (e.g. Maven's `.sha1` sidecar) round-trip
+    /// before starting, cutting a warm Maven proxy GET from two sequential
+    /// proxy-cache round-trips to one. Only the final verify-and-commit step
+    /// needs both results, so the security posture is unchanged.
+    Deferred {
+        algorithm: CommitDigestAlgorithm,
+        digest: DeferredCommitDigest,
+    },
 }
 
 /// Running hasher for the non-SHA-256 commit gates (GHSA-qxv7-p3mq-88fv):
@@ -368,10 +451,16 @@ enum TeeDigestHasher {
 
 impl TeeDigestHasher {
     fn for_expected(expected: &CacheCommitDigest) -> Option<Self> {
-        match expected {
-            CacheCommitDigest::Sha1Hex(_) => Some(Self::Sha1(sha1::Sha1::default())),
-            CacheCommitDigest::Sha512Hex(_) => Some(Self::Sha512(sha2::Sha512::default())),
-            CacheCommitDigest::Sha256Hex(_) => None,
+        Self::for_algorithm(expected.algorithm())
+    }
+
+    fn for_algorithm(algorithm: CommitDigestAlgorithm) -> Option<Self> {
+        match algorithm {
+            CommitDigestAlgorithm::Sha1 => Some(Self::Sha1(sha1::Sha1::default())),
+            CommitDigestAlgorithm::Sha512 => Some(Self::Sha512(sha2::Sha512::default())),
+            // SHA-256 expectations never get one — the storage layer's
+            // observed checksum covers those.
+            CommitDigestAlgorithm::Sha256 => None,
         }
     }
 
@@ -403,9 +492,15 @@ struct CacheMetadataTemplate {
     /// Upstream `X-Repo-Commit` for the bytes being persisted — see
     /// [`UpstreamResponse::commit_sha`].
     commit_sha: Option<String>,
-    /// `Last-Modified` from upstream (#1611). `None` on the streaming path,
-    /// which does not currently surface the header into the tee template.
+    /// `Last-Modified` from upstream (#1611). Surfaced into the tee template
+    /// by the streaming leader since #3912 so the sidecar records it exactly
+    /// as the buffered path does.
     last_modified: Option<String>,
+    /// Package Age Policy hold computed by the streaming leader from the
+    /// upstream `Last-Modified` (#3912). Recorded on the committed sidecar so
+    /// the hit paths gate the entry until the window elapses; `None` when the
+    /// repository's quarantine policy is disabled.
+    quarantine_until: Option<DateTime<Utc>>,
     ttl_secs: i64,
     /// Optional content digest the cache commit is gated on (#2274, widened
     /// past SHA-256 by GHSA-qxv7-p3mq-88fv). When `Some`,
@@ -415,11 +510,13 @@ struct CacheMetadataTemplate {
     /// that returns wrong bytes cannot poison the proxy cache. `None`
     /// preserves the pre-existing behaviour for every other streaming
     /// caller (deb/pypi/plain-Remote), which gate only on the upstream
-    /// Content-Length.
-    expected_checksum: Option<CacheCommitDigest>,
+    /// Content-Length. The digest may be [`ExpectedCommitDigest::Resolved`]
+    /// up front or [`ExpectedCommitDigest::Deferred`] — resolving
+    /// concurrently with the body stream and awaited only at commit time
+    /// (#3982).
+    expected_checksum: Option<ExpectedCommitDigest>,
     /// Owning repository id for the persisted proxy-cache catalog row
     /// (#2218/#2270). Threaded so the streaming Commit arm can upsert
-    /// `proxy_cache_artifacts` with the TRUE `bytes_written`/checksum.
     repository_id: Uuid,
     /// Logical cache path (e.g. `simple/click/click-8.0.0-...whl`) — the
     /// catalog's `(repository_id, path)` identity.
@@ -618,31 +715,82 @@ pub(crate) fn redact_url_for_diagnostics(url: &str) -> String {
         (None, Some(f)) => f,
         (None, None) => url.len(),
     };
-    strip_userinfo_fallback(&url[..end])
+    strip_url_userinfo(&url[..end]).0
 }
 
-/// Best-effort userinfo removal for URL-ish strings that `reqwest::Url` could
-/// not parse. Removes a `userinfo@` segment from the authority (the part
-/// after an optional `scheme://` and before the first `/`), leaving the rest
-/// untouched.
-fn strip_userinfo_fallback(url: &str) -> String {
-    let (prefix, rest) = match url.find("://") {
-        Some(pos) => url.split_at(pos + 3),
-        None if url.starts_with("//") => url.split_at(2),
-        None => ("", url),
+/// Remove the `userinfo@` segment (`user:password@`, or a bare `token@`) from
+/// a URL's authority and report whether one was present (#4452).
+///
+/// This is the read-back sibling of [`redact_url_for_diagnostics`]: it keeps
+/// the path, query and fragment byte-for-byte and touches nothing but the
+/// userinfo, so a credential-free URL comes back exactly as stored (no
+/// `reqwest::Url` normalization such as an added trailing `/`). It is what
+/// every API surface that echoes a Remote repository's `upstream_url` renders
+/// through, paired with the returned flag so a client can still tell that
+/// credentials are configured.
+///
+/// The scheme is only recognised at the start of the string, followed by any
+/// run of `/` or `\` (WHATWG parsers accept `https:user:pass@host`,
+/// `https:/user:pass@host` and `https:\\user:pass@host` as credentialed
+/// URLs). The authority then runs to the first `/`, `?` or `#` (and `\` for
+/// the special schemes, as the URL parser does), and its userinfo is
+/// everything up to the LAST `@`. As a final guard, if `reqwest::Url` still
+/// sees a username or password in the result, the parsed URL with its
+/// userinfo cleared is returned instead, so the output never carries
+/// credentials the fetch path would send.
+pub(crate) fn strip_url_userinfo(url: &str) -> (String, bool) {
+    let (stripped, had) = strip_url_userinfo_textual(url);
+    match reqwest::Url::parse(&stripped) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_password(None);
+            let _ = parsed.set_username("");
+            (parsed.to_string(), true)
+        }
+        _ => (stripped, had),
+    }
+}
+
+/// The string-level half of [`strip_url_userinfo`]. Also the userinfo step
+/// of [`crate::services::artifact_origin::normalize_upstream_url`], whose SQL
+/// twin is `ak_strip_url_userinfo` (migration 271): keep the two in lockstep.
+pub(crate) fn strip_url_userinfo_textual(url: &str) -> (String, bool) {
+    let scheme_len = url.find(':').filter(|&i| {
+        let scheme = &url[..i];
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    let (prefix_len, special) = match scheme_len {
+        Some(i) => {
+            let slashes = url[i + 1..]
+                .bytes()
+                .take_while(|b| *b == b'/' || *b == b'\\')
+                .count();
+            let special = matches!(
+                url[..i].to_ascii_lowercase().as_str(),
+                "http" | "https" | "ws" | "wss" | "ftp"
+            );
+            // A non-special scheme only counts with a `//` authority marker;
+            // otherwise `user:pass@host/x` (no scheme at all) would keep its
+            // username as a "scheme".
+            if special || url[i + 1..].starts_with("//") {
+                (i + 1 + slashes, special)
+            } else {
+                (0, false)
+            }
+        }
+        None if url.starts_with("//") => (2, false),
+        None => (0, false),
     };
-    // The authority ends at the first path separator.
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if let Some(at) = authority.rfind('@') {
-        format!(
-            "{}{}{}",
-            prefix,
-            &authority[at + 1..],
-            &rest[authority_end..]
-        )
-    } else {
-        url.to_string()
+    let (prefix, rest) = url.split_at(prefix_len);
+    let authority_end = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => (format!("{prefix}{}{tail}", &authority[at + 1..]), at > 0),
+        None => (url.to_string(), false),
     }
 }
 
@@ -755,6 +903,257 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// The error for an OCI token endpoint that answered `status` (not 2xx).
+///
+/// A 401/403 when the Remote's credentials were actually SENT to the token
+/// service means it refused them: [`AppError::UpstreamAuth`], a 502 with its
+/// own code, plus a `security`-target line naming the redacted realm so an
+/// operator sees a credentials problem rather than the `Storage error` /
+/// `MANIFEST_UNKNOWN` it used to surface as (#4453). The WARN is sampled per
+/// Remote `repo_id` ([`security_warn_admitted`]; `None` always logs).
+///
+/// A 401/403 to an ANONYMOUS token request (no credentials configured, or
+/// withheld from an untrusted cross-origin realm, #3591) is not a
+/// credentials problem the operator can fix: it keeps the `Storage`
+/// classification, so the manifest handlers report a miss, and is logged at
+/// INFO (#4527). Neither the log nor the message carries credentials. Any
+/// other status keeps the `Storage` classification.
+pub(crate) fn token_endpoint_status_error(
+    realm: &str,
+    status: StatusCode,
+    credentials_sent: bool,
+    repo_id: Option<Uuid>,
+) -> AppError {
+    let realm = redact_url_for_diagnostics(realm);
+    let refused = status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN;
+    if refused && credentials_sent {
+        if let Some(suppressed) =
+            security_warn_admitted(SampledSecurityWarn::TokenServiceRejected, repo_id)
+        {
+            tracing::warn!(
+                target: "security",
+                realm = %realm,
+                status = %status,
+                credentials_sent,
+                suppressed,
+                "upstream OCI token service rejected the proxy's authentication; check the \
+                 Remote's upstream credentials (and oci_trusted_bearer_realms for a \
+                 cross-origin realm)"
+            );
+        }
+        return AppError::UpstreamAuth(format!(
+            "upstream token service {realm} returned {status}; check the repository's \
+             upstream credentials"
+        ));
+    }
+    if refused {
+        tracing::info!(
+            realm = %realm,
+            status = %status,
+            "upstream OCI token service refused an anonymous token request (no credentials \
+             were sent); treating the object as not available"
+        );
+    }
+    AppError::Storage(format!("Token endpoint {realm} returned status {status}"))
+}
+
+/// The error for a registry that refused the request made with an
+/// ANONYMOUS bearer token (#4527): the token service got no credentials (none
+/// configured, or withheld from an untrusted cross-origin realm), so the
+/// refusal says nothing about the Remote's credentials. Usually the image
+/// does not exist or is private (Docker Hub answers 401 for a repository
+/// that does not exist). Logged at INFO; the error keeps the `BadGateway`
+/// class but NOT the `"... {status}:"` shape [`upstream_request_auth_refusal`]
+/// recognises, so an OCI manifest fetch reports a miss, never `DENIED`.
+fn anonymous_token_refused_error(status: StatusCode, url: &str) -> AppError {
+    let url = redact_url_for_diagnostics(url);
+    tracing::info!(
+        upstream = %url,
+        status = %status,
+        "upstream registry refused a request made with an anonymous bearer token (no \
+         credentials were sent); treating the object as not available"
+    );
+    AppError::BadGateway(format!(
+        "Upstream returned error status {status} for an anonymous bearer token: {url}"
+    ))
+}
+
+/// The status of an upstream `401`/`403` answer to the request ITSELF, when
+/// `err` is one (#4518): the `BadGateway` [`validate_upstream_status`] makes
+/// of a 401/403 (including one on the retry after a successful bearer token
+/// exchange), or the `Storage` error a 401 without a Bearer challenge
+/// becomes in [`UpstreamClient::fetch_buffered`] (an upstream on plain Basic
+/// auth). `None` for anything else.
+pub(crate) fn upstream_request_auth_refusal(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(msg) | AppError::Storage(msg)) = err else {
+        return None;
+    };
+    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
+        .into_iter()
+        .find(|status| msg.starts_with(&format!("Upstream returned error status {status}:")))
+}
+
+/// At most one of each upstream-auth `security` WARN per Remote per this
+/// interval (#4518, #4453, #3591); the rest are counted and the count is
+/// reported on the next one. A client pulling a missing or private image in
+/// a loop, or a Remote with wrong credentials, must not flood the security
+/// log with one line per pull.
+const SECURITY_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound on the (WARN, Remote) pairs [`security_warn_state`] tracks; past it
+/// the state is reset (each Remote then warns once more).
+const SECURITY_WARN_KEYS: usize = 4096;
+
+/// The upstream-auth `security` WARNs sampled per Remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SampledSecurityWarn {
+    /// The OCI token service refused the proxy (#4453).
+    TokenServiceRejected,
+    /// The OCI registry refused the manifest request itself (#4518).
+    RegistryRejected,
+    /// The Remote's credentials were withheld from a cross-origin bearer
+    /// realm (#3591).
+    RealmCredentialsWithheld,
+    /// The Remote's credentials were withheld from a URL on another origin
+    /// than its configured upstream (GHSA-24rf-2gv2-j47c).
+    OffOriginCredentialsWithheld,
+}
+
+type SecurityWarnState = HashMap<(SampledSecurityWarn, Uuid), (Instant, u64)>;
+
+fn security_warn_state() -> &'static std::sync::Mutex<SecurityWarnState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<SecurityWarnState>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Whether to log `warn` for Remote `repo_id` now: `Some(n)` with the number
+/// suppressed since the last one, `None` to stay quiet. Without a Remote
+/// (`None`) it always logs.
+pub(crate) fn security_warn_admitted(
+    warn: SampledSecurityWarn,
+    repo_id: Option<Uuid>,
+) -> Option<u64> {
+    let Some(repo_id) = repo_id else {
+        return Some(0);
+    };
+    security_warn_state()
+        .lock()
+        .map(|mut state| {
+            admit_sampled_warn(
+                &mut state,
+                (warn, repo_id),
+                Instant::now(),
+                SECURITY_WARN_INTERVAL,
+                SECURITY_WARN_KEYS,
+            )
+        })
+        .unwrap_or(Some(0))
+}
+
+/// Sampling decision for a rate-limited WARN keyed by `key`: `Some(n)` to
+/// log now, `n` being how many were suppressed since the last one, or `None`
+/// to stay quiet (counted) because one was logged less than `interval` ago.
+fn admit_sampled_warn<K: std::hash::Hash + Eq>(
+    state: &mut HashMap<K, (Instant, u64)>,
+    key: K,
+    now: Instant,
+    interval: Duration,
+    max_keys: usize,
+) -> Option<u64> {
+    if let Some((last, suppressed)) = state.get_mut(&key) {
+        if now.duration_since(*last) < interval {
+            *suppressed += 1;
+            return None;
+        }
+        let missed = *suppressed;
+        *last = now;
+        *suppressed = 0;
+        return Some(missed);
+    }
+    if state.len() >= max_keys {
+        state.clear();
+    }
+    state.insert(key, (now, 0));
+    Some(0)
+}
+
+/// Reclassify an OCI registry's `401`/`403` on the manifest request itself
+/// (see [`upstream_request_auth_refusal`]) for Remote `repo_id` (#4518).
+///
+/// * Credentials were sent: [`AppError::UpstreamAuth`], the error
+///   [`token_endpoint_status_error`] gives a refusing token service (#4453),
+///   so the client gets 502 `DENIED`, plus a `security`-target WARN naming
+///   the redacted URL, sampled per Remote ([`SECURITY_WARN_INTERVAL`]).
+/// * No credentials sent: the error is returned unchanged, so the client
+///   keeps 404 `MANIFEST_UNKNOWN`, and the refusal is logged at INFO. There
+///   is nothing for the operator to fix, and an anonymous refusal usually
+///   means the image does not exist or is private (Docker Hub answers 401
+///   for a repository that does not exist).
+///
+/// `credentials_sent` is "credentials configured" for the errors that reach
+/// this: the registry gets the configured credentials on the plain request,
+/// and a refusal of a bearer token obtained WITHOUT them (none configured,
+/// or withheld from an untrusted cross-origin realm) never matches
+/// [`upstream_request_auth_refusal`] ([`anonymous_token_refused_error`],
+/// #4527).
+///
+/// Any other error is returned unchanged. OCI only: generic formats keep a
+/// 403 as `BadGateway`, which some read as "not here"
+/// ([`is_upstream_forbidden`], #3886).
+pub(crate) fn oci_registry_auth_error(
+    err: AppError,
+    repo_id: Uuid,
+    url: &str,
+    credentials_sent: bool,
+) -> AppError {
+    let Some(status) = upstream_request_auth_refusal(&err) else {
+        return err;
+    };
+    let url = redact_url_for_diagnostics(url);
+    if !credentials_sent {
+        tracing::info!(
+            upstream = %url,
+            status = %status,
+            "upstream OCI registry refused an anonymous manifest request; reporting the \
+             manifest as unknown (no upstream credentials are configured)"
+        );
+        return err;
+    }
+    if let Some(suppressed) =
+        security_warn_admitted(SampledSecurityWarn::RegistryRejected, Some(repo_id))
+    {
+        tracing::warn!(
+            target: "security",
+            upstream = %url,
+            status = %status,
+            credentials_sent,
+            suppressed,
+            "upstream OCI registry rejected the proxy's authentication on a manifest request; \
+             check the Remote's upstream credentials"
+        );
+    }
+    AppError::UpstreamAuth(format!(
+        "upstream registry {url} returned {status}; check the repository's upstream credentials"
+    ))
+}
+
+/// Whether `err` is the error [`validate_upstream_status`] produces for an
+/// upstream `403 Forbidden`.
+///
+/// Ordinary fetches keep surfacing that as 502. The one caller is PyPI's PEP
+/// 658 sidecar fetch (#3886): object stores behind CloudFront (PyTorch's
+/// `download.pytorch.org`) answer a missing key with 403 rather than 404, so
+/// for an OPTIONAL derived resource that has a local recovery (extract METADATA
+/// from the wheel) the 403 means "not here", exactly like 404.
+pub(crate) fn is_upstream_forbidden(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::BadGateway(msg)
+            if msg.starts_with(&format!("Upstream returned error status {}", StatusCode::FORBIDDEN))
+    )
+}
+
 /// Whether a single path segment is a dot segment, in the same sense the WHATWG
 /// URL parser uses when it normalizes a path.
 ///
@@ -786,6 +1185,10 @@ pub(crate) struct UpstreamHeaders {
     pub(crate) content_encoding: Option<String>,
     /// See [`UpstreamResponse::commit_sha`].
     pub(crate) commit_sha: Option<String>,
+    /// Upstream `Last-Modified` (#3912): the streaming path's only release-date
+    /// signal for the Package Age Policy window, recorded on the cache sidecar
+    /// exactly as the buffered path's `last_modified` is.
+    pub(crate) last_modified: Option<String>,
 }
 
 /// Extract the forwardable headers from an upstream response. Extracted from
@@ -813,12 +1216,17 @@ fn extract_streaming_headers(headers: &reqwest::header::HeaderMap) -> UpstreamHe
         .get(UPSTREAM_COMMIT_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let last_modified = headers
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     UpstreamHeaders {
         content_type,
         etag,
         content_length,
         content_encoding,
         commit_sha,
+        last_modified,
     }
 }
 
@@ -935,7 +1343,11 @@ pub struct CachedArtifactEntry {
 /// Cache metadata for a proxied artifact
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
-    /// When the artifact was cached
+    /// When the cached body was last fetched from upstream or confirmed
+    /// current by a conditional revalidation (304). It anchors the read-time
+    /// TTL clamp in [`cache_classifier::effective_expires_at`] (#3832), so a
+    /// lowered repository TTL is measured from the last time the body was
+    /// known to match upstream.
     pub cached_at: DateTime<Utc>,
     /// ETag from upstream (if available)
     pub upstream_etag: Option<String>,
@@ -1018,9 +1430,31 @@ impl CacheMetadata {
     ) -> crate::services::cache_classifier::CacheEntry {
         crate::services::cache_classifier::CacheEntry {
             mutability,
-            expires_at: self.expires_at,
+            expires_at: self.effective_expires_at(mutability),
             negative_cached_until: self.negative_cached_until,
         }
+    }
+
+    /// When this entry stops being fresh under the repository's *current*
+    /// TTL policy (#3832) — see [`cache_classifier::effective_expires_at`].
+    /// `mutability` must already carry the repository override
+    /// ([`ProxyService::effective_mutability`]).
+    pub(crate) fn effective_expires_at(
+        &self,
+        mutability: crate::services::cache_classifier::Mutability,
+    ) -> DateTime<Utc> {
+        cache_classifier::effective_expires_at(mutability, self.cached_at, self.expires_at)
+    }
+
+    /// Expiry for a gate that may not know the path's classification: the
+    /// effective expiry when it does, else the stamped `expires_at` (an entry
+    /// of a repository that no longer exists, or a unit-test rig with no
+    /// repository row).
+    fn expires_under(
+        &self,
+        mutability: Option<crate::services::cache_classifier::Mutability>,
+    ) -> DateTime<Utc> {
+        mutability.map_or(self.expires_at, |m| self.effective_expires_at(m))
     }
 }
 
@@ -1032,6 +1466,14 @@ impl CacheMetadata {
 /// (legacy sidecar, or policy disabled at write time) allows it. The error
 /// MUST propagate to the handler — never be degraded to a cache `Miss`, which
 /// would refetch upstream and loop.
+/// How a cache entry point names the Remote whose origin policy it applies
+/// (#4506): by key or by id, when it holds no [`Repository`].
+#[derive(Clone, Copy)]
+enum RemoteRef<'a> {
+    Key(&'a str),
+    Id(Uuid),
+}
+
 fn check_quarantine_until(quarantine_until: Option<DateTime<Utc>>) -> Result<()> {
     match quarantine_until {
         Some(until) => {
@@ -1206,6 +1648,154 @@ pub(crate) struct CacheKeys {
     pub(crate) metadata: String,
 }
 
+/// The path a proxy-cache entry is keyed on: the request path with every
+/// leading and trailing `/` removed (the only normalization
+/// [`ProxyService::validate_cache_path`] applies; dot and empty segments are
+/// rejected there rather than rewritten).
+///
+/// Exposed so a serve path that classifies a request (e.g. "is this a
+/// package archive the scan gate must see?", #4100) classifies EXACTLY the
+/// key the cache will read and write. Classifying the raw path instead let
+/// `.../widget-1.0.jar/` (empty file name, so "not an archive") stream
+/// unscanned from the same cache entry `.../widget-1.0.jar` had just been
+/// refused for.
+pub(crate) fn normalize_cache_path(path: &str) -> &str {
+    path.trim_start_matches('/').trim_end_matches('/')
+}
+
+/// Refuse an upstream fetch path the upstream could read as a different
+/// resource than the one requested, classified and cached (#4365 item 3).
+///
+/// `build_upstream_url` joins the path into the upstream URL verbatim, so a
+/// decoded `#` turns the rest into a fragment (never sent), a `;` into a path
+/// parameter, and a `%` that is not a valid escape is decoded again (or
+/// rejected) by the upstream. Rejecting is used instead of percent-encoding
+/// every segment, which would change the outbound URL of every format at once
+/// (npm's scoped `%2F`, OCI `sha256:` references, PyPI `+`/`~`).
+///
+/// * An absolute URL (a Helm `urls` entry, a PyPI or npm file URL from an
+///   upstream index) is the upstream's own and passes unchanged.
+/// * `#` anywhere is refused.
+/// * In the path part (before the first `?`), any segment with `;`, an
+///   ASCII control character or a `%` not followed by two hex digits is
+///   refused. Valid escapes (`%2F`, `%20`) and Go's `!` case-escaping pass.
+/// * A `?` must start a query the handler built: non-empty and with no `/`,
+///   so a decoded `?` inside a path (`x.jar?/../y.pom`, `x.jar?`) cannot
+///   push the rest of the path into the query string.
+///
+/// Every refusal is [`AppError::Validation`], a `400`, before any upstream
+/// request.
+pub(crate) fn check_upstream_fetch_path(fetch_path: &str) -> Result<()> {
+    if fetch_path.starts_with("http://") || fetch_path.starts_with("https://") {
+        return Ok(());
+    }
+    let refuse = |what: &str| {
+        Err(AppError::Validation(format!(
+            "Proxied upstream path must not contain {what}"
+        )))
+    };
+    if fetch_path.contains('#') {
+        return refuse("'#'");
+    }
+    let (path, query) = match fetch_path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (fetch_path, None),
+    };
+    if has_ambiguous_path_chars(path) {
+        return refuse("';', '\\', control characters or a '%' that is not a valid escape");
+    }
+    // URL parsing trims trailing spaces, so `x.jar ` would fetch `x.jar`.
+    if query.is_none() && path.ends_with(' ') {
+        return refuse("a trailing space");
+    }
+    if query.is_some_and(|q| q.is_empty() || q.contains('/')) {
+        return refuse("a '?' inside the path");
+    }
+    Ok(())
+}
+
+/// Refuse a CLIENT-DERIVED proxied path or path segment that is not a plain
+/// path (#4365 item 3, strict form): any `?`, `#`, `;`, `\`, control
+/// character or stray `%` ([`has_ambiguous_path_chars`]), and a raw space
+/// unless `allow_spaces`. Unlike [`check_upstream_fetch_path`], which also
+/// sees queries a handler appends itself, this runs on what the client sent,
+/// where a `?` can only be an attempt to move part of the path into the
+/// upstream query. A `400` before anything is fetched or cached.
+pub(crate) fn reject_ambiguous_client_path(path: &str, allow_spaces: bool) -> Result<()> {
+    if has_ambiguous_path_chars(path) || (!allow_spaces && path.contains(' ')) {
+        return Err(AppError::Validation(
+            "Proxied path must not contain '?', '#', ';', '\\', control characters, \
+             a '%' that is not a valid escape, or spaces"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// One proxied request's canonical decision (#4365 item 1): the proxy-cache
+/// key it is fetched, cached and counted under, and whether the scan-on-proxy
+/// gate must see it. Both come from the same [`normalize_cache_path`] value,
+/// so two spellings of one request (a trailing `/`, a doubled leading `/`)
+/// can never be cached as one entry and classified as two things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyServeKey {
+    /// The [`normalize_cache_path`] form of the request's cache path.
+    pub(crate) cache_key: String,
+    /// Whether the scan gate must see this file when the repository scans
+    /// on proxy.
+    pub(crate) scannable: bool,
+}
+
+/// The one helper every scan-on-proxy format derives its cache key and scan
+/// decision from (#4365 item 1).
+///
+/// `is_package_file` decides on the cache key's final segment (the file
+/// name), never on the raw request. Two rules sit above it, both failing
+/// towards the gate: an empty file name is not a package (nothing to scan,
+/// and nothing is served as one), and a key [`has_ambiguous_path_chars`]
+/// is always scannable, because a `?`, `#`, `;` or stray `%` can make an
+/// upstream read a different file than the name says. Formats that decide by
+/// route rather than by name (every file on the route is a package) use
+/// [`route_package_serve_key`].
+pub(crate) fn proxy_serve_key(
+    path: &str,
+    is_package_file: impl FnOnce(&str) -> bool,
+) -> ProxyServeKey {
+    let cache_key = normalize_cache_path(path);
+    let file_name = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let scannable = !file_name.is_empty()
+        && (has_ambiguous_path_chars(cache_key) || is_package_file(file_name));
+    ProxyServeKey {
+        cache_key: cache_key.to_string(),
+        scannable,
+    }
+}
+
+/// [`proxy_serve_key`] for a route whose every file is a package (an npm
+/// tarball, a PyPI distribution, a `.crate`, a `.vsix`): the decision is the
+/// route's, and only the cache key is normalized.
+pub(crate) fn route_package_serve_key(path: &str) -> ProxyServeKey {
+    proxy_serve_key(path, |_| true)
+}
+
+/// Whether `path` holds a character an upstream may read as something other
+/// than a path byte (#4365 items 1 and 3): `?` (query), `#` (fragment), `;`
+/// (path parameter), `\` (turned into `/` by URL parsing), an ASCII control
+/// character (dropped by URL parsing), or a `%` that does not start a valid
+/// `%XX` escape (decoded again, or rejected, by the upstream). A valid escape
+/// such as npm's `%2F` is allowed.
+pub(crate) fn has_ambiguous_path_chars(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'?' | b'#' | b';' | b'\\' => true,
+        b'%' => !matches!(
+            (bytes.get(i + 1), bytes.get(i + 2)),
+            (Some(h), Some(l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit()
+        ),
+        _ => b.is_ascii_control(),
+    })
+}
+
 impl CacheKeys {
     /// Derive both the content and metadata storage keys for a proxy-cache
     /// entry, running the shared `validate_cache_path` + `check_cache_key_length`
@@ -1271,6 +1861,24 @@ pub struct DirectUpstreamBody {
     pub link: Option<String>,
 }
 
+/// An upstream Terraform module registry's answer to
+/// `v1/modules/<ns>/<name>/<provider>/<version>/download` — the result of
+/// [`ProxyService::fetch_upstream_terraform_module_location`] (#4590).
+///
+/// The Module Registry Protocol puts the module's source address in the
+/// `X-Terraform-Get` header of a `204`, or (newer registries) in a JSON body
+/// `{"location": "..."}` of a `200`. Both are carried so the caller can apply
+/// the client's own precedence (header first).
+pub struct UpstreamModuleLocation {
+    /// The `X-Terraform-Get` response header, if present.
+    pub x_terraform_get: Option<String>,
+    /// The response body (empty for the usual `204`).
+    pub content: Bytes,
+    /// The URL that answered, after redirects: the base a relative location
+    /// resolves against, exactly as the Terraform client resolves it.
+    pub effective_url: String,
+}
+
 pub(crate) struct CacheStore {
     storage: Arc<StorageService>,
     /// This deployment's proxy-cache scope (#3454). Only needed to recover the
@@ -1317,11 +1925,26 @@ impl CacheStore {
     ///
     /// The checksum verification (and its miss-on-mismatch) is identical for
     /// both flags.
+    ///
+    /// `preloaded_metadata` (#3951): the sidecar the CALLER already loaded to
+    /// make its freshness decision. Before this parameter existed, a buffered
+    /// fetch read the same `__cache_meta__.json` twice per hit — once through
+    /// the #2301 in-process LRU for the freshness decision, then again here,
+    /// bypassing the LRU, for the body read. Reusing the in-hand sidecar
+    /// removes that second object-store round trip and the two reads can no
+    /// longer disagree. `None` preserves the direct read for callers that do
+    /// not have the sidecar in hand.
+    ///
+    /// `mutability` (#3832): the path's override-applied classification when
+    /// the caller knows it, so the fresh gate uses the effective expiry; `None`
+    /// gates on the stamped `expires_at`.
     async fn get(
         &self,
         cache_key: &str,
         metadata_key: &str,
         allow_stale: bool,
+        preloaded_metadata: Option<CacheMetadata>,
+        mutability: Option<cache_classifier::Mutability>,
     ) -> Result<Option<CachedBody>> {
         // Per-branch proxy-cache observability (#1263 follow-up / PR #1284).
         // Only the FRESH lookup (`allow_stale == false`) is counted: that is
@@ -1334,9 +1957,12 @@ impl CacheStore {
         // prefix; see `repo_key_from_cache_key`.
         let repo_label = repo_key_from_cache_key(&self.scope, cache_key);
 
-        // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
-        // propagates it via `?` to match the original behavior precisely.
-        let metadata = if allow_stale {
+        // Load metadata — or reuse the caller's sidecar (#3951). Fresh treats
+        // a read/parse error as a miss (B6); stale propagates it via `?` to
+        // match the original behavior precisely.
+        let metadata = if let Some(metadata) = preloaded_metadata {
+            metadata
+        } else if allow_stale {
             match self.load_metadata(metadata_key).await? {
                 Some(m) => m,
                 None => return Ok(None),
@@ -1366,10 +1992,10 @@ impl CacheStore {
         };
 
         // Fresh reads enforce the expiry gate; the stale fallback skips it.
-        if !allow_stale && Utc::now() > metadata.expires_at {
+        if !allow_stale && Utc::now() > metadata.expires_under(mutability) {
             tracing::debug!(
                 cache_key = %cache_key,
-                expires_at = %metadata.expires_at,
+                expires_at = %metadata.expires_under(mutability),
                 "Proxy cache miss: entry expired"
             );
             record_proxy_cache_lookup(repo_label, "miss_expired");
@@ -1474,13 +2100,19 @@ impl CacheStore {
     /// exists, is unexpired, and the content object passes ETag revalidation
     /// (or, for filesystem/legacy entries with no pinned ETag, an existence
     /// check).
-    async fn is_fresh(&self, keys: &CacheKeys) -> bool {
+    ///
+    /// `mutability` as for [`Self::get`] (#3832).
+    async fn is_fresh(
+        &self,
+        keys: &CacheKeys,
+        mutability: Option<cache_classifier::Mutability>,
+    ) -> bool {
         let cache_key = &keys.content;
 
         let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
             return false;
         };
-        if Utc::now() > metadata.expires_at {
+        if Utc::now() > metadata.expires_under(mutability) {
             return false;
         }
 
@@ -1758,6 +2390,9 @@ impl CachePersister {
             Some(metadata.checksum_sha256.as_str()),
             metadata.content_type.as_deref(),
             None,
+            // #3912: mirror the sidecar hold onto the catalog row so a held
+            // buffered entry is releasable via the quarantine API too.
+            metadata.quarantine_until,
         )
         .await
         {
@@ -1859,10 +2494,29 @@ impl CachePersister {
         // reads the completed digest or finds `None` (client disconnect
         // mid-stream, or a cache write abandoned under the #2928 ceiling),
         // which fails the gate closed and skips the cache commit.
-        let tee_hasher = template
-            .expected_checksum
-            .as_ref()
-            .and_then(TeeDigestHasher::for_expected);
+        let tee_hasher = match template.expected_checksum.as_ref() {
+            Some(ExpectedCommitDigest::Resolved(expected)) => {
+                TeeDigestHasher::for_expected(expected)
+            }
+            Some(ExpectedCommitDigest::Deferred { algorithm, .. }) => {
+                TeeDigestHasher::for_algorithm(*algorithm)
+            }
+            None => None,
+        };
+        // #3982: a deferred digest (Maven's `.sha1` sidecar) is only needed at
+        // commit time, but it must RESOLVE concurrently with the body stream
+        // rather than after it — drive the shared future now so the sidecar
+        // fetch overlaps the upstream body. Reaching `tee_stream` at all means
+        // the cache MISSED (a hit never tees), so a warm hit never pays for
+        // the sidecar: neither on the response path nor in the background.
+        if let Some(ExpectedCommitDigest::Deferred { digest, .. }) =
+            template.expected_checksum.as_ref()
+        {
+            let digest = digest.clone();
+            tokio::spawn(async move {
+                let _ = digest.await;
+            });
+        }
         let tee_digest_slot = Arc::new(std::sync::Mutex::new(None::<String>));
         let tee_digest_slot_writer = Arc::clone(&tee_digest_slot);
 
@@ -1923,7 +2577,19 @@ impl CachePersister {
                         // SHA-1/SHA-512. A missing tee digest — the client
                         // disconnected mid-stream, or the cache write was
                         // abandoned — cannot match, so the gate fails closed.
-                        if let Some(expected) = template.expected_checksum.as_ref() {
+                        // #3982: a Deferred digest resolves concurrently with
+                        // the body stream (driven by the tee at setup) and is
+                        // only awaited here, at commit time — in practice it
+                        // has long resolved, so this costs nothing. `None`
+                        // (sidecar absent / unparseable / upstream error)
+                        // commits unverified, exactly like a caller that
+                        // passed `None` up front.
+                        let expected: Option<CacheCommitDigest> = match template.expected_checksum {
+                            Some(ExpectedCommitDigest::Resolved(expected)) => Some(expected),
+                            Some(ExpectedCommitDigest::Deferred { digest, .. }) => digest.await,
+                            None => None,
+                        };
+                        if let Some(expected) = expected.as_ref() {
                             let observed_hex = match expected {
                                 CacheCommitDigest::Sha256Hex(_) => {
                                     Some(result.checksum_sha256.clone())
@@ -1982,10 +2648,13 @@ impl CachePersister {
                             content_encoding: template.content_encoding,
                             upstream_commit_sha: template.commit_sha,
                             negative_cached_until: None,
-                            // The streaming leader refuses to open upstream at all
-                            // while the repo's Package Age Policy is enabled
-                            // (#1770), so a tee'd entry is never under a hold.
-                            quarantine_until: None,
+                            // Package Age Policy (#3912): the streaming leader
+                            // computed the hold from the upstream
+                            // `Last-Modified` before deciding to serve; the
+                            // sidecar records it so every read path gates on
+                            // it until the window elapses (or an admin
+                            // releases the entry).
+                            quarantine_until: template.quarantine_until,
                             expires_at: now + chrono::Duration::seconds(template.ttl_secs),
                             content_type: template.content_type,
                             size_bytes: result.bytes_written as i64,
@@ -2024,6 +2693,10 @@ impl CachePersister {
                                         Some(metadata.checksum_sha256.as_str()),
                                         metadata.content_type.as_deref(),
                                         template.upstream_url.as_deref(),
+                                        // #3912: mirror the sidecar hold onto
+                                        // the catalog row so the entry is
+                                        // releasable via the quarantine API.
+                                        metadata.quarantine_until,
                                     )
                                     .await
                                     {
@@ -2247,6 +2920,33 @@ impl CachePersister {
     }
 }
 
+/// The `security` WARN logged when a credentialed remote's OCI bearer realm is
+/// cross-origin and not trusted, so its token is requested anonymously
+/// (GHSA-78h6-3wp8-2542, #3591).
+const REALM_CREDENTIALS_WITHHELD: &str =
+    "OCI bearer realm is a different origin than the configured upstream; requesting the \
+     token WITHOUT the upstream's Basic credentials (GHSA-78h6-3wp8-2542). If this token \
+     service is trusted, add its https origin to the repository's oci_trusted_bearer_realms \
+     (#3591)";
+
+const OFF_ORIGIN_CREDENTIALS_WITHHELD: &str =
+    "upstream URL is on a different origin than the remote's configured upstream \
+     (typically an absolute URL taken from index metadata); fetching it WITHOUT the \
+     remote's upstream credentials (GHSA-24rf-2gv2-j47c)";
+
+/// Outcome of the OCI bearer-realm credential-forwarding decision
+/// ([`UpstreamClient::realm_credential_forwarding`], GHSA-78h6-3wp8-2542,
+/// #3591).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealmCredentialForwarding {
+    /// The realm shares the configured upstream's origin.
+    SameOrigin,
+    /// Cross-origin, but explicitly trusted for this repository.
+    TrustedRealm,
+    /// Cross-origin and not trusted: request the token anonymously.
+    Withheld,
+}
+
 /// Owns the upstream HTTP fetch + OCI bearer-token-exchange lifecycle
 /// (#1618 S8 — the highest-risk structural extraction).
 ///
@@ -2417,6 +3117,44 @@ impl UpstreamClient {
         self.egress_client_cache.write().await.remove(&repo_id);
     }
 
+    /// The upstream credentials to attach to a request for `url` on behalf of
+    /// repository `repo_id`: the configured ones (per `mode`) when `url` is on
+    /// the origin of the repository's configured upstream, `None` otherwise.
+    ///
+    /// Every fetcher below takes its credentials from here. Index metadata
+    /// can name any absolute URL, and the fetchers used to attach the
+    /// credentials to whatever URL they were given (GHSA-24rf-2gv2-j47c). The
+    /// configured URLs are only read when there are credentials to withhold,
+    /// so an anonymous Remote pays nothing extra.
+    async fn upstream_auth_for(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        mode: crate::services::upstream_auth::UpstreamAuthMode,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        use crate::services::upstream_auth as ua;
+        let Some(auth) = ua::load_upstream_auth_for_mode(&self.db, repo_id, mode).await? else {
+            return Ok(None);
+        };
+        let configured = ua::configured_upstream_urls(&self.db, repo_id).await?;
+        if ua::credentials_may_follow(url, &configured) {
+            return Ok(Some(auth));
+        }
+        if let Some(suppressed) = security_warn_admitted(
+            SampledSecurityWarn::OffOriginCredentialsWithheld,
+            Some(repo_id),
+        ) {
+            tracing::warn!(
+                target: "security",
+                url = %redact_url_for_diagnostics(url),
+                suppressed,
+                "{}",
+                OFF_ORIGIN_CREDENTIALS_WITHHELD
+            );
+        }
+        Ok(None)
+    }
+
     /// Buffered upstream fetch. Relocated verbatim from
     /// `ProxyService::fetch_from_upstream_with_accept`.
     ///
@@ -2449,10 +3187,7 @@ impl UpstreamClient {
         // #3130: `Anonymous` short-circuits to `None` before the credential
         // store is read, so neither the initial request nor the bearer retry
         // below can attach the repo's configured upstream credentials.
-        let upstream_auth = crate::services::upstream_auth::load_upstream_auth_for_mode(
-            &self.db, repo_id, auth_mode,
-        )
-        .await?;
+        let upstream_auth = self.upstream_auth_for(url, repo_id, auth_mode).await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
         // Per-repository egress proxy (#2469, #2811): the shared client unless
         // this repo pins its own routing.
@@ -2470,7 +3205,7 @@ impl UpstreamClient {
             request = request.header(ACCEPT, accept_value);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -2484,7 +3219,7 @@ impl UpstreamClient {
             // helper itself never touches these headers; the closure owns that
             // decision so the buffered/streaming asymmetry is preserved (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                     let req = apply_custom_ua(req, custom_ua.as_deref());
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
@@ -2526,8 +3261,13 @@ impl UpstreamClient {
         let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!("Posting JSON metadata to upstream: {}", diagnostic_url);
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self
@@ -2541,7 +3281,7 @@ impl UpstreamClient {
         }
         request = apply_custom_ua(request, custom_ua.as_deref());
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
         })?;
 
@@ -2612,6 +3352,12 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let terraform_get = response
+            .headers()
+            .get("x-terraform-get")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
         // Running-bounded accumulation: pull one body frame at a time and
         // reject the moment the total would exceed `max`. No un-bounded
         // full-body read (`response.bytes()`) is ever issued.
@@ -2656,6 +3402,7 @@ impl UpstreamClient {
             commit_sha,
             effective_url,
             link,
+            terraform_get,
         })
     }
 
@@ -2677,8 +3424,13 @@ impl UpstreamClient {
             diagnostic_url
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
         // Per-repository egress proxy (#2469, #2811); see `client_for`.
         let client = self.client_for(repo_id, url).await?;
@@ -2693,7 +3445,7 @@ impl UpstreamClient {
         // both the initial request and the retry. This asymmetry is deliberate
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -2704,7 +3456,7 @@ impl UpstreamClient {
             // but adds NO `Accept` header, preserving the asymmetry with the
             // buffered path (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                     apply_custom_ua(req, custom_ua.as_deref())
                 })
                 .await?
@@ -2759,6 +3511,7 @@ impl UpstreamClient {
         &self,
         response: reqwest::Response,
         url: &str,
+        repo_id: Uuid,
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
         client: &Client,
         build_request: F,
@@ -2799,24 +3552,27 @@ impl UpstreamClient {
                 // endpoints (Docker Hub's auth.docker.io among them) answer
                 // such requests, and a realm that genuinely requires the
                 // upstream's credentials simply rejects the exchange, which
-                // fails closed. There is deliberately no cross-host
-                // allowance: this codebase pins credentials to the
-                // operator-configured origin everywhere else.
-                let realm_auth = if Self::realm_matches_upstream_origin(realm, url) {
-                    upstream_auth.clone()
-                } else {
-                    tracing::warn!(
-                        target: "security",
-                        realm = %redact_url_for_diagnostics(realm),
-                        "OCI bearer realm is a different origin than the configured upstream; \
-                         requesting the token WITHOUT the upstream's Basic credentials \
-                         (GHSA-78h6-3wp8-2542)"
-                    );
-                    None
-                };
+                // fails closed.
+                //
+                // The only cross-origin allowance is the one a repository
+                // administrator configured explicitly for THIS repository
+                // (#3591): `oci_trusted_bearer_realms`, a list of exact
+                // https origins validated on write. Nothing is trusted
+                // implicitly — not even Docker Hub's registry-1 ->
+                // auth.docker.io pair. See `realm_credentials`.
+                let realm_auth = self
+                    .realm_credentials(realm, url, repo_id, upstream_auth)
+                    .await?;
 
                 let token = self
-                    .obtain_bearer_token(realm, &service, &scope, &realm_auth, client)
+                    .obtain_bearer_token_for(
+                        Some(repo_id),
+                        realm,
+                        &service,
+                        &scope,
+                        &realm_auth,
+                        client,
+                    )
                     .await?;
 
                 // Retry with the bearer token only. The original upstream
@@ -2830,7 +3586,7 @@ impl UpstreamClient {
                 let retry_request = build_request(client.get(url).bearer_auth(&token));
 
                 let retry_diagnostic_url = redact_url_for_diagnostics(url);
-                let retry_response = retry_request.send().await.map_err(|e| {
+                let retry_response = send_upstream(retry_request).await.map_err(|e| {
                     classify_send_error(
                         e,
                         &format!(
@@ -2839,6 +3595,15 @@ impl UpstreamClient {
                         ),
                     )
                 })?;
+
+                // #4527: no credentials went to the token service, so a
+                // refusal of the anonymous token is not a credentials problem.
+                let status = retry_response.status();
+                if realm_auth.is_none()
+                    && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN)
+                {
+                    return Err(anonymous_token_refused_error(status, url));
+                }
 
                 return Ok(Some(retry_response));
             }
@@ -2876,14 +3641,31 @@ impl UpstreamClient {
             content_encoding: headers.content_encoding,
             commit_sha: headers.commit_sha,
             content_length: headers.content_length,
+            last_modified: headers.last_modified,
         })
     }
 
     /// Obtain a bearer token for an OCI registry, using the in-memory cache
     /// when possible. Relocated verbatim from
     /// `ProxyService::obtain_bearer_token`.
+    #[cfg(test)]
     async fn obtain_bearer_token(
         &self,
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+        client: &Client,
+    ) -> Result<String> {
+        self.obtain_bearer_token_for(None, realm, service, scope, upstream_auth, client)
+            .await
+    }
+
+    /// [`Self::obtain_bearer_token`] on behalf of Remote `repo_id`, which
+    /// keys the sampling of a token-service rejection WARN (#4453).
+    async fn obtain_bearer_token_for(
+        &self,
+        repo_id: Option<Uuid>,
         realm: &str,
         service: &str,
         scope: &str,
@@ -2925,7 +3707,7 @@ impl UpstreamClient {
 
         tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
 
-        let token_response = token_request.send().await.map_err(|e| {
+        let token_response = send_upstream(token_request).await.map_err(|e| {
             AppError::Storage(format!(
                 "Failed to request bearer token from {}: {}",
                 realm, e
@@ -2933,11 +3715,12 @@ impl UpstreamClient {
         })?;
 
         if !token_response.status().is_success() {
-            return Err(AppError::Storage(format!(
-                "Token endpoint {} returned status {}",
+            return Err(token_endpoint_status_error(
                 realm,
-                token_response.status()
-            )));
+                token_response.status(),
+                upstream_auth.is_some(),
+                repo_id,
+            ));
         }
 
         let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
@@ -3151,6 +3934,88 @@ impl UpstreamClient {
         }
     }
 
+    /// The credentials to send to an OCI bearer `realm`'s token endpoint
+    /// for repository `repo_id` (GHSA-78h6-3wp8-2542, #3591): the configured
+    /// upstream auth when the realm is same-origin or listed in the
+    /// repository's `oci_trusted_bearer_realms`, `None` otherwise. The list
+    /// is only read when there are credentials to forward and the realm is
+    /// cross-origin, so the same-origin and anonymous paths do no lookup.
+    async fn realm_credentials(
+        &self,
+        realm: &str,
+        url: &str,
+        repo_id: Uuid,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> Result<Option<crate::services::upstream_auth::UpstreamAuthType>> {
+        let trusted = if upstream_auth.is_some() && !Self::realm_matches_upstream_origin(realm, url)
+        {
+            crate::services::oci_trusted_realms::load_trusted_realms(&self.db, repo_id).await?
+        } else {
+            Vec::new()
+        };
+        let forwarded = match Self::realm_credential_forwarding(realm, url, &trusted) {
+            RealmCredentialForwarding::SameOrigin => upstream_auth.clone(),
+            RealmCredentialForwarding::TrustedRealm => {
+                // Audit trail: credentials are leaving for another origin
+                // because an administrator said so.
+                tracing::info!(
+                    target: "security",
+                    realm = %redact_url_for_diagnostics(realm),
+                    "forwarding the upstream's credentials to a cross-origin OCI bearer realm \
+                     listed in the repository's oci_trusted_bearer_realms (#3591)"
+                );
+                upstream_auth.clone()
+            }
+            RealmCredentialForwarding::Withheld if upstream_auth.is_some() => {
+                // Fires on every pull of such a Remote, so it is sampled per
+                // Remote like the other upstream-auth lines (#4518).
+                if let Some(suppressed) = security_warn_admitted(
+                    SampledSecurityWarn::RealmCredentialsWithheld,
+                    Some(repo_id),
+                ) {
+                    tracing::warn!(
+                        target: "security",
+                        realm = %redact_url_for_diagnostics(realm),
+                        suppressed,
+                        "{}",
+                        REALM_CREDENTIALS_WITHHELD
+                    );
+                }
+                None
+            }
+            // Anonymous remote: nothing is withheld, so nothing to warn about
+            // (and the allowlist hint would not apply).
+            RealmCredentialForwarding::Withheld => {
+                tracing::debug!(
+                    realm = %redact_url_for_diagnostics(realm),
+                    "cross-origin OCI bearer realm on a remote without upstream credentials"
+                );
+                None
+            }
+        };
+        Ok(forwarded)
+    }
+
+    /// Whether the configured upstream credentials may follow an OCI bearer
+    /// `realm` to its token endpoint: same origin as the upstream request URL
+    /// (GHSA-78h6-3wp8-2542), or an origin the repository administrator
+    /// listed in `oci_trusted_bearer_realms` (#3591, exact https origin
+    /// only, see [`crate::services::oci_trusted_realms::realm_is_trusted`]).
+    /// Anything else withholds them.
+    fn realm_credential_forwarding(
+        realm: &str,
+        upstream_url: &str,
+        trusted: &[String],
+    ) -> RealmCredentialForwarding {
+        if Self::realm_matches_upstream_origin(realm, upstream_url) {
+            RealmCredentialForwarding::SameOrigin
+        } else if crate::services::oci_trusted_realms::realm_is_trusted(realm, trusted) {
+            RealmCredentialForwarding::TrustedRealm
+        } else {
+            RealmCredentialForwarding::Withheld
+        }
+    }
+
     /// Check if upstream ETag has changed (returns true if changed/newer).
     /// Relocated verbatim from `ProxyService::check_etag_changed`.
     ///
@@ -3169,8 +4034,13 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
     ) -> Result<bool> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
         // Conditional revalidation is an outbound upstream request like any
         // other, so it must honor this repository's egress routing (#2469).
         let client = self.client_for(repo_id, url).await?;
@@ -3183,13 +4053,16 @@ impl UpstreamClient {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             AppError::Storage(format!("Failed to check upstream for changes: {}", e))
         })?;
+        // The URL may embed upstream `user:password@` credentials (#4452);
+        // every log line below renders the redacted form.
+        let shown = redact_url_for_diagnostics(url);
 
         match response.status() {
             StatusCode::NOT_MODIFIED => {
-                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", url);
+                tracing::debug!("Upstream unchanged (304 Not Modified) for {}", shown);
                 Ok(false)
             }
             StatusCode::OK => {
@@ -3198,11 +4071,11 @@ impl UpstreamClient {
 
                 match new_etag {
                     Some(etag) if etag == cached_etag => {
-                        tracing::debug!("Upstream ETag unchanged for {}", url);
+                        tracing::debug!("Upstream ETag unchanged for {}", shown);
                         Ok(false)
                     }
                     _ => {
-                        tracing::debug!("Upstream has newer content for {}", url);
+                        tracing::debug!("Upstream has newer content for {}", shown);
                         Ok(true)
                     }
                 }
@@ -3214,7 +4087,7 @@ impl UpstreamClient {
                 // handle the full 401 flow on the next access.
                 tracing::debug!(
                     "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
-                    url
+                    shown
                 );
                 Ok(true)
             }
@@ -3251,7 +4124,7 @@ impl UpstreamClient {
                     "Upstream returned {} for ETag check on {}; no content information, \
                      treating as a revalidation failure",
                     status,
-                    url
+                    shown
                 );
                 match validate_upstream_status(status, url) {
                     Err(err) => Err(err),
@@ -3264,7 +4137,7 @@ impl UpstreamClient {
                 tracing::warn!(
                     "Unexpected status {} checking upstream {}, assuming changed",
                     status,
-                    url
+                    shown
                 );
                 Ok(true)
             }
@@ -3316,9 +4189,80 @@ pub struct ProxyService {
     /// so two deployments sharing one bucket address disjoint key spaces
     /// instead of exchanging each other's cached upstream bytes.
     cache_scope: ProxyCacheScope,
+    /// Per-process memo of the repository facts the TTL policy needs on the
+    /// read path (#3832). See [`TtlPolicyCache`].
+    ttl_policy_cache: TtlPolicyCache,
+    /// `(repository_id, cache_path)` of objects this process just served
+    /// WITHOUT any proxy-cache write because they exceed the repository's
+    /// quota (#4551). The serve's download recorder
+    /// ([`crate::api::handlers::proxy_helpers::record_proxy_download_via`])
+    /// runs in this same process for the same request and reads it, so it
+    /// records the download without inserting the `proxy_cache_artifacts`
+    /// placeholder a cache miss gets: no tee will ever refine that row, and
+    /// it would be listed as a cached 0-byte object. Bounded and short-lived;
+    /// a later serve of the path that does tee clears its entry.
+    uncached_serves: Cache<(Uuid, String), ()>,
+    /// Whether the origin-policy gate (#4506) runs. Always `true` outside
+    /// tests; only `without_origin_policy_gate`, which exists only
+    /// under `cfg(test)`, clears it, for the cache-mechanics unit tests that
+    /// run without a database.
+    origin_policy_gate: bool,
+}
+
+/// How long a [`ProxyService::uncached_serves`] entry is kept. The recorder
+/// reads it right after the serve (or from its deferred task moments later),
+/// so this only has to outlive that window.
+const UNCACHED_SERVE_TTL: Duration = Duration::from_secs(300);
+
+/// How long [`TtlPolicyCache`] trusts a looked-up value. Bounds how long a TTL
+/// change made on another replica takes to reach this one; the replica that
+/// served the `PUT /cache-ttl` invalidates its own entry immediately.
+const TTL_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Short-TTL memo of the repository facts every mutable-path freshness gate
+/// consults (#3832): the `cache_ttl_secs` override by repository id, and the
+/// `(id, format)` of a repository by key for the key-only read paths. Without
+/// it the read-time TTL clamp would add a database round trip to every
+/// mutable cache hit.
+struct TtlPolicyCache {
+    overrides: Cache<Uuid, Option<i64>>,
+    repo_by_key: Cache<String, Option<(Uuid, RepositoryFormat)>>,
+}
+
+impl TtlPolicyCache {
+    const CAPACITY: u64 = 10_000;
+
+    fn new() -> Self {
+        Self {
+            overrides: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+            repo_by_key: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+        }
+    }
 }
 
 impl ProxyService {
+    /// Remember that `path` of `repo_id` was just served without any cache
+    /// write because it exceeds the repository quota (#4551).
+    async fn note_served_without_cache(&self, repo_id: Uuid, path: &str) {
+        self.uncached_serves
+            .insert((repo_id, path.to_string()), ())
+            .await;
+    }
+
+    /// Whether this process just served `path` of `repo_id` without writing
+    /// it to the proxy cache (#4551), so recording that serve must not insert
+    /// a catalog placeholder.
+    pub(crate) fn served_without_cache(&self, repo_id: Uuid, path: &str) -> bool {
+        self.uncached_serves
+            .contains_key(&(repo_id, path.to_string()))
+    }
+
     /// Drop this process's cached egress client for `repo_id` so an
     /// egress-proxy change made through the API takes effect on the next
     /// upstream fetch instead of after the cache TTL (#2469, #2811).
@@ -3372,7 +4316,22 @@ impl ProxyService {
             coordinator,
             backfill_limiter,
             cache_scope,
+            ttl_policy_cache: TtlPolicyCache::new(),
+            uncached_serves: Cache::builder()
+                .max_capacity(TtlPolicyCache::CAPACITY)
+                .time_to_live(UNCACHED_SERVE_TTL)
+                .build(),
+            origin_policy_gate: true,
         }
+    }
+
+    /// A service that skips the origin-policy gate (#4506), for unit tests of
+    /// the cache mechanics that run against a never-connecting pool. Test-only:
+    /// production code cannot construct a service without the gate.
+    #[cfg(test)]
+    pub(crate) fn without_origin_policy_gate(mut self) -> Self {
+        self.origin_policy_gate = false;
+        self
     }
 
     /// This deployment's proxy-cache key scope (#3454). Handlers that derive a
@@ -3381,6 +4340,13 @@ impl ProxyService {
     /// from the bare `proxy-cache/` namespace.
     pub fn cache_scope(&self) -> &ProxyCacheScope {
         &self.cache_scope
+    }
+
+    /// The pool this proxy records its catalog against. The buffered virtual
+    /// resolvers, which are handed the proxy but not the app state, record a
+    /// Remote member's winning serve through it (#3844).
+    pub(crate) fn db(&self) -> &PgPool {
+        &self.db
     }
 
     /// Fetch artifact from upstream if not cached or cache expired.
@@ -3433,9 +4399,13 @@ impl ProxyService {
         body: Bytes,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
-        let upstream_url = Self::remote_target(repo)?;
+        // Type check only (keeps the non-remote error ahead of any other
+        // work); the URL itself is built by `gated_upstream_url`.
+        Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         Self::validate_relative_post_endpoint(path)?;
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
             .upstream_client
             .post_json_buffered(&full_url, repo.id, body, max)
@@ -3487,6 +4457,15 @@ impl ProxyService {
     ) -> Result<CachedBody> {
         self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, None, max)
             .await
+    }
+
+    /// Whether repository `repo_id` has upstream credentials configured, for
+    /// diagnostics only (#4518). A failed lookup reads as `false`.
+    pub async fn has_upstream_credentials(&self, repo_id: Uuid) -> bool {
+        matches!(
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await,
+            Ok(Some(_))
+        )
     }
 
     /// Byte-ceiling-aware sibling of [`Self::fetch_artifact_with_accept`]
@@ -3565,15 +4544,22 @@ impl ProxyService {
     /// under the given `path` (without contacting upstream).
     ///
     /// Returns `Ok(Some((content, content_type)))` on cache hit, `Ok(None)`
-    /// on cache miss or expired entry.
+    /// on cache miss or expired entry. Expiry is the effective one under the
+    /// repository's current TTL (#3832).
     pub async fn get_cached_artifact_by_path(
         &self,
         repo_key: &str,
         path: &str,
     ) -> Result<Option<CachedBody>> {
+        // #4506: the Remote's origin policy applies to its cached content too.
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, repo_key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
-        self.get_cached_artifact(&cache_key, &metadata_key).await
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        self.cache_store
+            .get(&cache_key, &metadata_key, false, None, mutability)
+            .await
     }
 
     /// Metadata-only freshness check for a proxy-cached artifact.
@@ -3642,6 +4628,27 @@ impl ProxyService {
         self.storage.backend()
     }
 
+    /// Content validator of a FRESH proxy-cache entry: the SHA-256 of the
+    /// cached body when the entry exists, is a positive entry, and has not
+    /// expired under the repository's current TTL policy; `None` otherwise.
+    ///
+    /// Reads only the metadata sidecar (through the sidecar LRU), never the
+    /// body. A derived document built from cached entries (the merged index of
+    /// a virtual conda channel, #4608) records these validators when it is
+    /// built and is reused only while every one of them is unchanged, i.e.
+    /// exactly while a rebuild would read the same bytes out of the cache
+    /// without contacting the upstream.
+    pub async fn fresh_cache_validator(&self, repo_key: &str, path: &str) -> Option<String> {
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
+        let metadata = self.load_cache_metadata(&keys.metadata).await.ok()??;
+        let now = Utc::now();
+        if metadata.negative_cached_until.is_some_and(|t| t > now) {
+            return None;
+        }
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        (metadata.expires_under(mutability) > now).then_some(metadata.checksum_sha256)
+    }
+
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
         // A path that fails validation cannot have produced a cache entry
         // we'd want to redirect to anyway: treat it as a miss so the caller
@@ -3650,7 +4657,21 @@ impl ProxyService {
         let Ok(keys) = CacheKeys::derive(&self.cache_scope, repo_key, path) else {
             return false;
         };
-        self.cache_store.is_fresh(&keys).await
+        // #3832: a lowered repository TTL must also stop the presigned-redirect
+        // fast path from handing out a mutable entry the read path would now
+        // revalidate.
+        let mutability = self.effective_mutability_by_key(repo_key, path).await;
+        self.cache_store.is_fresh(&keys, mutability).await
+    }
+
+    /// Gate a presigned-redirect fast path on the Remote's origin policy
+    /// (#4506), the sibling of [`Self::cache_quarantine_gate`]. A redirect
+    /// hands out the cached object without the body passing through the
+    /// gated fetch paths, so every fast path asks this after its freshness
+    /// probe and before signing. A refusal is the fetch paths' 403.
+    pub async fn cache_origin_policy_gate(&self, repo_key: &str) -> Result<()> {
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await
     }
 
     /// Gate a presigned-redirect fast path on a Package Age Policy hold (#2075).
@@ -3679,6 +4700,79 @@ impl ProxyService {
         {
             check_quarantine_until(metadata.quarantine_until)?;
         }
+        Ok(())
+    }
+
+    /// Release a held proxy-cache entry (#3912): clear the sidecar's Package
+    /// Age Policy hold and stamp the catalog row's release, so reads of this
+    /// cached object stop answering 409 before the window elapses.
+    ///
+    /// Keyed on `(repository_id, path)` — the catalog's uniqueness key, and
+    /// the identity an operator sees on the Packages page / cache listing.
+    /// Returns 404 when no catalog row exists and 409 when the entry is not
+    /// currently held (never held, window already elapsed, or already
+    /// released), mirroring the hosted release endpoint's
+    /// [`quarantine_service::transition`] contract.
+    pub async fn release_quarantined_cache_entry(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+    ) -> Result<()> {
+        let row = proxy_catalog::find_quarantine_row(&self.db, repository_id, path)
+            .await?
+            .ok_or_else(|| AppError::NotFound("No cached artifact at that path".to_string()))?;
+
+        let still_held = row.quarantine_released_at.is_none()
+            && row.quarantine_until.is_some_and(|until| until > Utc::now());
+        if !still_held {
+            return Err(AppError::Conflict(
+                "Cached artifact is not in quarantined state; release not allowed".to_string(),
+            ));
+        }
+
+        // Clear the hold at the read-path authority FIRST: the sidecar. The
+        // catalog row is only stamped after, so a sidecar write failure leaves
+        // the release fully retryable (the row still reads as held).
+        match self.load_cache_metadata(&row.metadata_key).await {
+            Ok(Some(mut metadata)) => {
+                metadata.quarantine_until = None;
+                let json = serde_json::to_vec(&metadata).map_err(|e| {
+                    AppError::Internal(format!("Proxy cache metadata serialization failed: {e}"))
+                })?;
+                self.storage
+                    .put(&row.metadata_key, Bytes::from(json))
+                    .await?;
+                invalidate_proxy_metadata_lru(&row.metadata_key).await;
+            }
+            // A missing or unreadable sidecar cannot hold a read (the read
+            // paths treat both as a cache miss / refetch), so there is nothing
+            // to clear; the catalog row is still stamped below.
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    metadata_key = %row.metadata_key,
+                    error = %e,
+                    "proxy-cache sidecar unreadable at quarantine release; stamping the \
+                     catalog row only (the unreadable sidecar never holds a read)"
+                );
+            }
+        }
+
+        let released = proxy_catalog::mark_quarantine_released(&self.db, row.id).await?;
+        if released == 0 {
+            // Lost a race: the window elapsed or a concurrent release landed
+            // between our read and the guarded update. The sidecar is already
+            // cleared either way, so this only changes the reported status.
+            return Err(AppError::Conflict(
+                "Cached artifact is not in quarantined state; release not allowed".to_string(),
+            ));
+        }
+
+        tracing::info!(
+            repository_id = %repository_id,
+            path = %path,
+            "Proxy-cache entry released from quarantine"
+        );
         Ok(())
     }
 
@@ -3753,6 +4847,12 @@ impl ProxyService {
     /// result because reqwest no longer decodes upstream bodies, so a buffered
     /// metadata document may itself be content coded and the handler has to
     /// declare that when it serves the bytes on.
+    #[tracing::instrument(
+        name = "proxy_fetch",
+        level = "info",
+        skip_all,
+        fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "buffered")
+    )]
     pub async fn fetch_artifact_with_cache_path_and_accept_capped(
         &self,
         repo: &Repository,
@@ -3761,7 +4861,11 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<CachedBody> {
-        let upstream_url = Self::remote_target(repo)?;
+        // Type check only (keeps the non-remote error ahead of any other
+        // work); the URL itself is built by `gated_upstream_url`.
+        Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
 
         // Cache keys use the caller-supplied cache_path
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -3796,6 +4900,10 @@ impl ProxyService {
             CacheReadOutcome::Miss => { /* fall through to single-flight upstream fetch */ }
         }
 
+        // #840: a miss on a path the upstream filter refuses ends here, before
+        // the single-flight lease, without contacting upstream.
+        let full_url = self.gated_upstream_url(repo, fetch_path).await?;
+
         let hydration_lease_key = format!("proxy-cache:{}", cache_key);
         // #1631 layer 1: buffered single-flight via the injected coordinator
         // seam (was a direct `coordinate_proxy_hydration` call). The streaming
@@ -3803,15 +4911,37 @@ impl ProxyService {
         self.coordinator.coordinate(
             &hydration_lease_key,
             || async {
-                let cached = self.get_cached_artifact(&cache_key, &metadata_key).await?;
+                // Load the sidecar ONCE through the #2301 LRU and reuse it for
+                // the body read (#3951): this follower re-check used to pay
+                // two storage reads for the same `__cache_meta__.json` — a
+                // direct read inside `get_cached_artifact`, then an LRU read
+                // below for the quarantine/negative re-checks. A memoized
+                // `None` is deliberately NOT passed down: the body read then
+                // falls back to a fresh storage read, so a leader's
+                // just-written sidecar is still observed (#3335).
+                let metadata = self.load_cache_metadata(&metadata_key).await.unwrap_or(None);
+                // #3832: gate on the effective expiry, so an entry the
+                // up-front read just judged stale under a lowered TTL is not
+                // served here on the strength of its old stamp.
+                let mutability = self.effective_mutability(repo, cache_path).await;
+                let cached = self
+                    .cache_store
+                    .get(
+                        &cache_key,
+                        &metadata_key,
+                        false,
+                        metadata.clone(),
+                        Some(mutability),
+                    )
+                    .await?;
                 if cached.is_some() {
                     // Package Age Policy (#1770): a follower re-checking the
                     // cache must not serve an entry the leader just wrote
                     // under an active hold. The sidecar load mirrors the
-                    // B6-safe stance (read error -> no hold known).
-                    if let Some(metadata) =
-                        self.load_cache_metadata(&metadata_key).await.unwrap_or(None)
-                    {
+                    // B6-safe stance (read error -> no hold known), and the
+                    // hold is evaluated against the SAME sidecar revision the
+                    // body was verified against.
+                    if let Some(metadata) = &metadata {
                         check_quarantine_until(metadata.quarantine_until)?;
                     }
                     return Ok(cached);
@@ -3821,8 +4951,7 @@ impl ProxyService {
                 // a fresh negative hit as NotFound so the follower short-circuits
                 // the leader-recorded 404 instead of re-fetching upstream after
                 // the wait deadline (bounded to <=1 extra 404/replica without it).
-                if let Some(metadata) = self.load_cache_metadata(&metadata_key).await.unwrap_or(None)
-                {
+                if let Some(metadata) = &metadata {
                     if metadata
                         .negative_cached_until
                         .is_some_and(|until| until > Utc::now())
@@ -3836,7 +4965,6 @@ impl ProxyService {
                 Ok(cached)
             },
             || async {
-                let full_url = Self::build_upstream_url(upstream_url, fetch_path);
                 let upstream_result = self
                     .fetch_from_upstream_with_accept(&full_url, repo.id, accept, max)
                     .await;
@@ -3936,6 +5064,7 @@ impl ProxyService {
                             crate::services::metrics_service::record_proxy_cache_quota_exceeded(
                                 &repo.key,
                             );
+                            self.note_served_without_cache(repo.id, cache_path).await;
                         }
 
                         // B6 (coalescing 502 leak, remaining path): the upstream fetch
@@ -4023,12 +5152,12 @@ impl ProxyService {
                         // Transient error (5xx / timeout / transport): RFC 5861
                         // stale-if-error — serve the stale body we already hold.
                         if let Ok(Some((stale_content, stale_content_type, stale_content_encoding))) = self
-                            .get_stale_cached_artifact(&cache_key, &metadata_key)
+                            .get_stale_cached_artifact(&cache_key, &metadata_key, None)
                             .await
                         {
                             tracing::warn!(
                                 "Upstream fetch failed for {}; serving stale cached copy: {}",
-                                full_url,
+                                redact_url_for_diagnostics(&full_url),
                                 upstream_err
                             );
                             Ok((stale_content, stale_content_type, stale_content_encoding))
@@ -4140,6 +5269,68 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<StreamingFetchResult> {
+        self.streaming_gated_fetch(
+            repo,
+            fetch_path,
+            cache_path,
+            expected_checksum.map(ExpectedCommitDigest::Resolved),
+        )
+        .await
+    }
+
+    /// Deferred-digest sibling of
+    /// [`Self::fetch_artifact_streaming_with_cache_path_gated_digest`]
+    /// (#3982): the digest resolves CONCURRENTLY with the fetch instead of
+    /// gating whether it starts. Maven's `.sha1` sidecar rides the same
+    /// proxy-cache/storage path the content fetch does, so awaiting it first
+    /// cost every artifact GET two sequential round-trips; with the digest
+    /// deferred, a warm hit never resolves it at all (one round-trip total)
+    /// and a cold miss overlaps the sidecar with the body stream, deciding
+    /// the cache commit on both results exactly as the up-front gate did.
+    ///
+    /// `algorithm` is declared up front so the tee can hash the forwarded
+    /// bytes from the first chunk. The future resolving to `None` means "no
+    /// authoritative digest" — the commit proceeds unverified, identical to
+    /// passing `None` to the up-front variant.
+    pub async fn fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        algorithm: CommitDigestAlgorithm,
+        digest: DeferredCommitDigest,
+    ) -> Result<StreamingFetchResult> {
+        self.streaming_gated_fetch(
+            repo,
+            fetch_path,
+            cache_path,
+            Some(ExpectedCommitDigest::Deferred { algorithm, digest }),
+        )
+        .await
+    }
+
+    /// The single-flight streaming body shared by every digest-gated public
+    /// variant.
+    ///
+    /// This and [`Self::fetch_artifact_with_cache_path_and_accept_capped`] are
+    /// the two funnels of the proxy fetch, so each runs in an `INTERNAL`
+    /// `proxy_fetch` phase span (#4455) holding the cache lookup, the
+    /// upstream `CLIENT` span and the cache write.
+    #[tracing::instrument(
+        name = "proxy_fetch",
+        level = "info",
+        skip_all,
+        fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "streaming")
+    )]
+    async fn streaming_gated_fetch(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        expected_checksum: Option<ExpectedCommitDigest>,
+    ) -> Result<StreamingFetchResult> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -4149,6 +5340,16 @@ impl ProxyService {
         // usually done and the cache is warm. We loop a bounded number of times
         // to avoid an unbounded re-enter storm; in practice one re-enter hits the
         // warm cache or wins the election outright.
+        //
+        // A Deferred digest survives the re-enters as a cheap
+        // [`DeferredCommitDigest`] clone — every clone shares the ONE
+        // underlying resolution, so a re-enter never re-fetches the sidecar.
+        //
+        // Under the cross-replica coordinator (#4013) a re-enter is not a
+        // timed poll: a losing leader blocks on the cluster lock until the
+        // remote leader has PUBLISHED, so each re-enter corresponds to a
+        // finished remote fill and normally lands on the warm cache. The
+        // budget is therefore never drained by waiting on a large object.
         const STREAM_REENTER_BUDGET: usize = 8;
         for _ in 0..STREAM_REENTER_BUDGET {
             if let Some(result) = self
@@ -4188,6 +5389,8 @@ impl ProxyService {
         repo: &Repository,
         cache_path: &str,
     ) -> Result<Option<StreamingFetchResult>> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
         self.try_streaming_cache_hit(repo, cache_path, cache_path, &cache_key, &metadata_key)
@@ -4204,7 +5407,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
-        expected_checksum: Option<CacheCommitDigest>,
+        expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<Option<StreamingFetchResult>> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -4241,7 +5444,13 @@ impl ProxyService {
             })
             .await?;
 
-        Ok(handle.map(StreamingFetchResult::from))
+        match handle {
+            Some(handle) => Ok(Some(StreamingFetchResult::from(handle))),
+            None => {
+                forget_cached_sidecar_miss(&metadata_key).await;
+                Ok(None)
+            }
+        }
     }
 
     /// Streaming cache-hit fast path, factored out so both the coordinated
@@ -4267,6 +5476,7 @@ impl ProxyService {
             .await?
         {
             StreamingCacheReadOutcome::Hit(result, metadata) => {
+                record_cache_outcome("hit");
                 // #2218/#2270 back-compat: a cache hit on an object cached
                 // BEFORE this catalog existed has no `proxy_cache_artifacts`
                 // row. Fire-and-forget a best-effort backfill from the sidecar
@@ -4286,11 +5496,17 @@ impl ProxyService {
                 );
                 Ok(Some(result))
             }
-            StreamingCacheReadOutcome::NegativeHit => Err(AppError::NotFound(format!(
-                "Upstream returned 404 (negative-cached) for {}",
-                cache_path
-            ))),
-            StreamingCacheReadOutcome::Miss => Ok(None),
+            StreamingCacheReadOutcome::NegativeHit => {
+                record_cache_outcome("negative_hit");
+                Err(AppError::NotFound(format!(
+                    "Upstream returned 404 (negative-cached) for {}",
+                    cache_path
+                )))
+            }
+            StreamingCacheReadOutcome::Miss => {
+                record_cache_outcome("miss");
+                Ok(None)
+            }
         }
     }
 
@@ -4343,6 +5559,10 @@ impl ProxyService {
                 metadata.size_bytes,
                 Some(metadata.checksum_sha256.as_str()),
                 metadata.content_type.as_deref(),
+                // #3912: a pre-existing held entry backfills its hold too, so
+                // it is releasable via the quarantine API (placeholder rows
+                // only; authoritative rows keep what their commit wrote).
+                metadata.quarantine_until,
             )
             .await
             {
@@ -4380,13 +5600,15 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<StreamingCacheReadOutcome> {
-        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        // #3832: the repository's current TTL override is folded in, so the
+        // freshness verdict uses the effective (clamped) expiry.
+        let mutability = self.effective_mutability(repo, cache_path).await;
 
         // A sidecar read/parse error is treated as "no entry" (Miss) — the same
         // B6-safe stance as the buffered path. Waits (bounded) for an in-flight
         // tail-phase streaming publish of the same key first (#3335).
         let metadata = self
-            .load_cache_metadata_awaiting_publish(metadata_key)
+            .load_cache_metadata_awaiting_publish(metadata_key, mutability)
             .await;
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
 
@@ -4478,23 +5700,18 @@ impl ProxyService {
         cache_path: &str,
         cache_key: String,
         metadata_key: String,
-        expected_checksum: Option<CacheCommitDigest>,
+        expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<StreamHandle> {
-        // Package Age Policy (#1770): the streaming path has no buffered
-        // upstream `Last-Modified` to base a release-date hold on (#1771), so
-        // a repo with the policy enabled conservatively refuses to open a new
-        // streaming fetch outright. Entries cached while the policy was off
-        // are unaffected (gated by their sidecar on the hit path above), and
-        // the error propagates as 409 rather than degrading to a fall-back.
-        let quarantine_config = quarantine_service::resolve_config(&self.db, repo.id).await;
-        if quarantine_service::should_quarantine(&quarantine_config) {
-            return Err(AppError::Conflict(
-                "Artifact is quarantined and pending security review".to_string(),
-            ));
-        }
+        // Package Age Policy (#3912): the hold decision needs the upstream
+        // release date, which only exists once the streaming response headers
+        // arrive, so it is made AFTER the upstream open below — a package
+        // older than the configured window is served on first fetch, a fresh
+        // one is cached under its hold and refused with 409 until the window
+        // elapses or an admin releases the cache entry. (Before #3912 this
+        // path refused outright here, before the fetch, so the release-date
+        // window was never honoured on the streaming path.)
 
-        let upstream_url = Self::remote_target(repo)?;
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+        let full_url = self.gated_upstream_url(repo, fetch_path).await?;
         let upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
             Ok(upstream) => upstream,
             Err(err) => {
@@ -4508,6 +5725,18 @@ impl ProxyService {
                     .await;
             }
         };
+
+        // Package Age Policy (#3912): resolve the hold from the upstream
+        // `Last-Modified` now that the streaming response headers exist. A
+        // release older than the configured window yields an already-elapsed
+        // expiry, so old packages are served on first fetch; only a hold in
+        // the future actually blocks this request (after the cache tee below,
+        // so the entry is cached under its hold and later requests are gated
+        // by the sidecar until the window elapses or an admin releases it).
+        let quarantine_until = self
+            .quarantine_until_for_new_entry(repo.id, upstream.last_modified.as_deref())
+            .await;
+        let hold_active = quarantine_until.is_some_and(|until| until > Utc::now());
 
         // #1611: classify the path. Immutable paths (versioned artifacts, OCI
         // blobs) cache effectively forever; mutable indexes get the short
@@ -4558,7 +5787,10 @@ impl ProxyService {
         //     advertises a length.
         //
         // Either way the client is still served in full, matching the buffered
-        // path's over-quota behaviour.
+        // path's over-quota behaviour — EXCEPT under an active Package Age
+        // Policy hold (#3912): the bypass serves the raw upstream body with no
+        // cache write, which would hand out a held artifact with no releasable
+        // record. Under a hold the answer is the same 409 the tee path gives.
         let max_cache_bytes = Self::quota_to_cache_ceiling(self.resolve_quota_bytes(repo).await);
         if let (Some(limit), Some(advertised)) = (max_cache_bytes, upstream.content_length) {
             if advertised > limit {
@@ -4572,13 +5804,31 @@ impl ProxyService {
                      streaming it to the client without any proxy-cache write"
                 );
                 crate::services::metrics_service::record_proxy_cache_quota_exceeded(&repo.key);
+                // #4551: the recorder of this serve must not leave a catalog
+                // placeholder for an object that is never cached.
+                self.note_served_without_cache(repo.id, cache_path).await;
+                if hold_active {
+                    return Err(AppError::Conflict(
+                        "Artifact is quarantined and pending security review".to_string(),
+                    ));
+                }
                 return Ok(StreamHandle {
                     body: upstream.body,
                     headers,
+                    cache_published: None,
                 });
             }
         }
 
+        // This serve tees into the cache, so its recorder takes the normal
+        // placeholder path again (#4551).
+        self.uncached_serves
+            .invalidate(&(repo.id, cache_path.to_string()))
+            .await;
+
+        // #4013: the cross-replica coordinator releases its lock on the tee
+        // writer's completion, so capture that signal before the key moves.
+        let publish_key = metadata_key.clone();
         let body = self.cache_persister.tee_stream(
             upstream.body,
             cache_key,
@@ -4588,7 +5838,8 @@ impl ProxyService {
                 etag: upstream.etag,
                 content_encoding: upstream.content_encoding,
                 commit_sha: upstream.commit_sha,
-                last_modified: None,
+                last_modified: upstream.last_modified,
+                quarantine_until,
                 ttl_secs: cache_ttl,
                 expected_checksum,
                 // #2218/#2270: identity for the persisted catalog row, written
@@ -4601,7 +5852,44 @@ impl ProxyService {
             max_cache_bytes,
         );
 
-        Ok(StreamHandle { body, headers })
+        if hold_active {
+            // Cache-but-hold (#3912): drive the tee to completion in a
+            // detached task so the entry IS committed under its hold (the
+            // sidecar's `quarantine_until` gates every later read until the
+            // window elapses, and the catalog row gives the entry its
+            // releasable identity), then refuse THIS request with the same
+            // 409 the hit path answers. Without the drain the tee's writer
+            // task would never see a byte — the returned stream is what feeds
+            // it — and every poll during the window would re-fetch upstream.
+            tracing::info!(
+                repository = %repo.key,
+                path = %cache_path,
+                quarantine_until = %quarantine_until.expect("hold_active implies Some"),
+                "caching proxied artifact under a Package Age Policy hold; \
+                 refusing this download until the window elapses"
+            );
+            tokio::spawn(async move {
+                let mut drain = body;
+                while let Some(item) = drain.next().await {
+                    if let Err(e) = item {
+                        tracing::debug!(
+                            error = %e,
+                            "quarantine hold drain: upstream stream error (cache write abandoned)"
+                        );
+                        break;
+                    }
+                }
+            });
+            return Err(AppError::Conflict(
+                "Artifact is quarantined and pending security review".to_string(),
+            ));
+        }
+
+        Ok(StreamHandle {
+            body,
+            headers,
+            cache_published: tee_publish_done(&publish_key),
+        })
     }
 
     /// Apply the buffered path's upstream-error correctness to the streaming
@@ -4703,7 +5991,11 @@ impl ProxyService {
                 content_encoding: metadata.content_encoding.clone(),
                 commit_sha: metadata.upstream_commit_sha.clone(),
             };
-            return Ok(StreamHandle { body, headers });
+            return Ok(StreamHandle {
+                body,
+                headers,
+                cache_published: None,
+            });
         }
 
         Err(upstream_err)
@@ -4719,7 +6011,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
-        expected_checksum: Option<CacheCommitDigest>,
+        expected_checksum: Option<ExpectedCommitDigest>,
     ) -> Result<StreamingFetchResult> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -4748,7 +6040,11 @@ impl ProxyService {
     /// Returns true if upstream has newer content or cache is expired.
     pub async fn check_upstream(&self, repo: &Repository, path: &str) -> Result<bool> {
         // Validate repository type
-        let upstream_url = Self::remote_target(repo)?;
+        // Type check only (keeps the non-remote error ahead of any other
+        // work); the URL itself is built by `gated_upstream_url`.
+        Self::remote_target(repo)?;
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
 
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
@@ -4758,14 +6054,15 @@ impl ProxyService {
             None => return Ok(true), // No cache, definitely need to fetch
         };
 
-        // Check if cache has expired
-        if Utc::now() > metadata.expires_at {
+        // Check if cache has expired under the current TTL (#3832)
+        let mutability = self.effective_mutability(repo, path).await;
+        if Utc::now() > metadata.effective_expires_at(mutability) {
             return Ok(true);
         }
 
         // If we have an ETag, do a conditional request
         if let Some(ref etag) = metadata.upstream_etag {
-            let full_url = Self::build_upstream_url(upstream_url, path);
+            let full_url = self.gated_upstream_url(repo, path).await?;
             // No content negotiation on this probe path (#3290): callers pass
             // a plain artifact path fetched without an `Accept`.
             return self
@@ -4792,9 +6089,9 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>, String)> {
-        let upstream_url = Self::remote_target(repo)?;
-
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
+        let full_url = self.gated_upstream_url(repo, path).await?;
         // #2192 / #1608 Phase 4c: use the 16 MiB LARGE ceiling, not the 8 MiB
         // DEFAULT. The sole caller is the PyPI download-URL-resolution simple-
         // index fetch (`resolve_pypi_remote_fetch_target`); its *primary*
@@ -4831,9 +6128,9 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<DirectUpstreamBody> {
-        let upstream_url = Self::remote_target(repo)?;
-
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
+        let full_url = self.gated_upstream_url(repo, path).await?;
         let resp = self
             .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
             .await?;
@@ -4842,6 +6139,32 @@ impl ProxyService {
             content_type: resp.content_type,
             content_encoding: resp.content_encoding,
             link: resp.link,
+        })
+    }
+
+    /// Ask an upstream Terraform module registry where a module version's
+    /// source lives (#4590), uncached.
+    ///
+    /// The answer is a small location document (usually an empty `204` whose
+    /// `X-Terraform-Get` header carries the address), not the module itself, so
+    /// it is read directly rather than through the proxy cache: the cache
+    /// stores bodies, and the body here is empty. The location may also be a
+    /// short-lived signed URL, which must not be replayed from a cache.
+    pub async fn fetch_upstream_terraform_module_location(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<UpstreamModuleLocation> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
+        let full_url = self.gated_upstream_url(repo, path).await?;
+        let resp = self
+            .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            .await?;
+        Ok(UpstreamModuleLocation {
+            x_terraform_get: resp.terraform_get,
+            content: resp.content,
+            effective_url: resp.effective_url,
         })
     }
 
@@ -4882,6 +6205,71 @@ impl ProxyService {
             );
         }
         self.cache_store.invalidate(&keys).await
+    }
+
+    /// Retention eviction of one cataloged proxy-cache entry (#3734): delete
+    /// its body and `__cache_meta__.json` sidecar from the proxy-cache store.
+    ///
+    /// The lifecycle sweep's sibling of [`Self::invalidate_cache_by_key`]. It
+    /// targets the same keys ([`CacheKeys::derive`] for `(repo_key, path)`),
+    /// plus the keys the catalog row itself recorded when they differ (an
+    /// entry cached before #3454 sits in the unscoped tree). It differs from
+    /// invalidation in two deliberate ways, both so a failure keeps the
+    /// catalogue row (the caller deletes it only after this returns `Ok`) and
+    /// the entry is retried or reported instead of forgotten:
+    ///
+    /// * a storage error is returned instead of swallowed. Storage GC leaves
+    ///   `proxy-cache/*` objects alone, so dropping the row after a failed
+    ///   delete would strand the object where nothing ever reclaims it;
+    /// * a recorded key that [`ProxyCacheScope::owns_entry_key`] does not
+    ///   place in this repository's cache is an error and nothing is deleted.
+    ///   That is a corrupt row, or a repository renamed after the entry was
+    ///   cached (its objects still sit under the old key's root); either way
+    ///   the row is the only record of those objects.
+    ///
+    /// Returns the number of objects that existed and were deleted. Zero is
+    /// not an error: a placeholder row may never have had a body.
+    pub async fn evict_cached_entry(
+        &self,
+        repo_key: &str,
+        path: &str,
+        recorded_keys: [&str; 2],
+    ) -> Result<usize> {
+        let mut keys: Vec<String> = Vec::with_capacity(4);
+        if let Ok(derived) = CacheKeys::derive(&self.cache_scope, repo_key, path) {
+            keys.push(derived.content);
+            keys.push(derived.metadata);
+        }
+        for recorded in recorded_keys {
+            if keys.iter().any(|k| k == recorded) {
+                continue;
+            }
+            if !self.cache_scope.owns_entry_key(repo_key, recorded) {
+                return Err(AppError::Conflict(format!(
+                    "catalogue row records '{recorded}', which is outside the proxy cache of \
+                     '{repo_key}' (renamed repository or corrupt row); entry kept"
+                )));
+            }
+            keys.push(recorded.to_string());
+        }
+        // Bodies before sidecars, as invalidation orders them.
+        keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
+
+        let mut deleted = 0usize;
+        for key in &keys {
+            if !self.storage.exists(key).await? {
+                continue;
+            }
+            match self.storage.delete(key).await {
+                Ok(()) => deleted += 1,
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+            if key.ends_with("__cache_meta__.json") {
+                invalidate_proxy_metadata_lru(key).await;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
@@ -4934,6 +6322,8 @@ impl ProxyService {
         distribution: &str,
         dists_ttl_secs: i64,
     ) -> Result<(Bytes, Option<String>, bool)> {
+        // #4506: the Remote's origin policy, before any cache read or upstream contact.
+        self.ensure_origin_policy_allows(repo).await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
@@ -4951,8 +6341,12 @@ impl ProxyService {
                 ReleaseEpochRead::Unreadable => true,
             };
 
-            // Step 3: Check TTL
-            let ttl_expired = Utc::now() > meta.expires_at;
+            // Step 3: Check TTL, through the shared effective-expiry helper
+            // (#3832) so this gate cannot drift from the others.
+            let dists_policy = cache_classifier::Mutability::Mutable {
+                default_ttl_secs: dists_ttl_secs,
+            };
+            let ttl_expired = Utc::now() > meta.effective_expires_at(dists_policy);
 
             if !epoch_expired && !ttl_expired {
                 // Cache hit — read content and verify
@@ -4975,6 +6369,8 @@ impl ProxyService {
         let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
             AppError::Config("Remote repository missing upstream_url".to_string())
         })?;
+        self.ensure_upstream_allowed(repo, upstream_url, path)
+            .await?;
         let full_url = Self::build_upstream_url(upstream_url, path);
 
         // Try conditional request if we have an ETag
@@ -5040,7 +6436,7 @@ impl ProxyService {
                     if let Ok(content) = self.storage.get(&cache_key).await {
                         tracing::warn!(
                             "Upstream fetch failed for {}; serving stale: {}",
-                            full_url,
+                            redact_url_for_diagnostics(&full_url),
                             upstream_err
                         );
                         let ct = meta.content_type.clone();
@@ -5114,8 +6510,14 @@ impl ProxyService {
         repo_id: Uuid,
         etag: &str,
     ) -> Result<Option<UpstreamResponse>> {
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let upstream_auth = self
+            .upstream_client
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
 
         // Conditional metadata refresh is an outbound upstream request, so it
         // routes through this repository's egress proxy like every other
@@ -5127,7 +6529,7 @@ impl ProxyService {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             // Redact the target URL (may carry `user:pass@` upstream creds) and
             // drop the URL reqwest embeds in its own error (#2926) before this
             // surfaces to a client.
@@ -5145,7 +6547,7 @@ impl ProxyService {
             StatusCode::UNAUTHORIZED => {
                 if let Some(retry_response) = self
                     .upstream_client
-                    .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
+                    .exchange_bearer_then(response, url, repo_id, &upstream_auth, &client, |req| {
                         req.header(IF_NONE_MATCH, etag)
                     })
                     .await?
@@ -5165,7 +6567,8 @@ impl ProxyService {
 
                 Err(AppError::Storage(format!(
                     "Upstream returned error status {}: {}",
-                    status, url
+                    status,
+                    redact_url_for_diagnostics(url)
                 )))
             }
             _ => {
@@ -5389,6 +6792,9 @@ impl ProxyService {
         repo_key: &str,
         cache_path: &str,
     ) -> Result<Option<(BoxStream<'static, Result<Bytes>>, i64)>> {
+        // #4506: the Remote's origin policy applies to its cached content too.
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await?;
         let keys = CacheKeys::derive(&self.cache_scope, repo_key, cache_path)?;
         let Some(meta) = self.load_cache_metadata(&keys.metadata).await? else {
             return Ok(None);
@@ -5654,18 +7060,88 @@ impl ProxyService {
     /// Centralising the decision here keeps the write-time TTL and the
     /// read-time freshness evaluation consistent: both classify the same way.
     pub(crate) async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
-        match cache_classifier::classify(&repo.format, path) {
-            cache_classifier::Mutability::Immutable => {
-                cache_classifier::Mutability::Immutable.write_ttl_secs()
-            }
-            cache_classifier::Mutability::Mutable { default_ttl_secs } => {
-                // A repo-level override still applies to mutable paths; fall
-                // back to the conservative classifier default otherwise.
-                self.get_cache_ttl_override(repo.id)
-                    .await
-                    .unwrap_or(default_ttl_secs)
-            }
+        self.effective_mutability(repo, path).await.write_ttl_secs()
+    }
+
+    /// The classification every cache write AND every freshness gate uses
+    /// for `path` (#3832): the classifier's verdict with the repository's
+    /// `cache_ttl_secs` override folded in by
+    /// [`cache_classifier::Mutability::with_ttl_override`], which is where the
+    /// override-vs-default precedence rule lives. Immutable paths skip the
+    /// override lookup entirely.
+    pub(crate) async fn effective_mutability(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> cache_classifier::Mutability {
+        self.effective_mutability_for(repo.id, &repo.format, path)
+            .await
+    }
+
+    async fn effective_mutability_for(
+        &self,
+        repo_id: Uuid,
+        format: &RepositoryFormat,
+        path: &str,
+    ) -> cache_classifier::Mutability {
+        let classified = cache_classifier::classify(format, path);
+        if classified.is_immutable() {
+            return classified;
         }
+        classified.with_ttl_override(self.get_cache_ttl_override(repo_id).await)
+    }
+
+    /// [`Self::effective_mutability`] for the read paths that only have a
+    /// repository key (`get_cached_artifact_by_path`, `is_cache_fresh`).
+    /// `None` when the key names no repository, in which case those gates
+    /// fall back to the stamped expiry.
+    async fn effective_mutability_by_key(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Option<cache_classifier::Mutability> {
+        let (repo_id, format) = self.repo_identity_by_key(repo_key).await?;
+        Some(self.effective_mutability_for(repo_id, &format, path).await)
+    }
+
+    /// `(id, format)` of the repository named `repo_key`, through a short-TTL
+    /// in-process cache so a key-only cache read does not query the database
+    /// per request. A lookup error is not cached.
+    async fn repo_identity_by_key(&self, repo_key: &str) -> Option<(Uuid, RepositoryFormat)> {
+        if let Some(hit) = self.ttl_policy_cache.repo_by_key.get(repo_key).await {
+            return hit;
+        }
+        let found = sqlx::query_as::<_, (Uuid, RepositoryFormat)>(
+            "SELECT id, format FROM repositories WHERE key = $1",
+        )
+        .bind(repo_key)
+        .fetch_optional(&self.db)
+        .await
+        .ok()?;
+        self.ttl_policy_cache
+            .repo_by_key
+            .insert(repo_key.to_string(), found.clone())
+            .await;
+        found
+    }
+
+    /// The expiry the read path enforces for `metadata` (cached at `path` in
+    /// `repo_key`) under the repository's current TTL (#3832), for surfaces
+    /// that report cache freshness rather than gate on it.
+    pub async fn effective_cache_expires_at(
+        &self,
+        repo_key: &str,
+        path: &str,
+        metadata: &CacheMetadata,
+    ) -> DateTime<Utc> {
+        metadata.expires_under(self.effective_mutability_by_key(repo_key, path).await)
+    }
+
+    /// Drop this process's cached `cache_ttl_secs` override for `repo_id`, so
+    /// a TTL change made through the API applies to the very next read here
+    /// (other replicas pick it up within [`TTL_POLICY_CACHE_TTL`]).
+    pub async fn invalidate_cache_ttl_override(&self, repo_id: Uuid) {
+        self.ttl_policy_cache.overrides.invalidate(&repo_id).await;
     }
 
     /// Resolve the repository's configured `quota_bytes` (#2928).
@@ -5735,8 +7211,15 @@ impl ProxyService {
     /// when unset/unparseable so callers can apply the mutable classifier
     /// default, which is also what `GET /cache-ttl` reports for such a
     /// repository (#3706).
+    ///
+    /// Read on every mutable-path freshness check since #3832, so it goes
+    /// through a short-TTL in-process cache ([`TTL_POLICY_CACHE_TTL`]); a
+    /// database error is not cached and degrades to "no override".
     async fn get_cache_ttl_override(&self, repo_id: Uuid) -> Option<i64> {
-        let result = sqlx::query_scalar!(
+        if let Some(hit) = self.ttl_policy_cache.overrides.get(&repo_id).await {
+            return hit;
+        }
+        let row = sqlx::query_scalar!(
             r#"
             SELECT value FROM repository_config
             WHERE repository_id = $1 AND key = 'cache_ttl_secs'
@@ -5745,8 +7228,13 @@ impl ProxyService {
         )
         .fetch_optional(&self.db)
         .await
-        .ok()??;
-        result.and_then(|v| v.parse().ok())
+        .ok()?;
+        let parsed = row.flatten().and_then(|v| v.parse().ok());
+        self.ttl_policy_cache
+            .overrides
+            .insert(repo_id, parsed)
+            .await;
+        parsed
     }
 
     /// Validate that `repo` is a remote proxy and return its upstream URL.
@@ -5767,6 +7255,128 @@ impl ProxyService {
         repo.upstream_url
             .as_deref()
             .ok_or_else(|| AppError::Config("Remote repository missing upstream_url".to_string()))
+    }
+
+    /// The single upstream-contact gate (#840): validate that `repo` is a
+    /// remote proxy, refuse `fetch_path` with [`AppError::NotFound`] when the
+    /// repository's upstream filter does not admit it, and otherwise return
+    /// the full upstream URL.
+    ///
+    /// Every `ProxyService` code path that sends a request to a repository's
+    /// configured upstream builds its URL here (buffered and streaming
+    /// misses, stale revalidation, the uncached direct fetches, the JSON POST
+    /// and the `check_upstream` probe), so the ~20 public `fetch_*` variants
+    /// and every virtual-member resolver inherit the filter without a
+    /// per-variant check. A refused path never reaches the network and never
+    /// writes a negative-cache entry, so lifting the filter takes effect on
+    /// the next request.
+    async fn gated_upstream_url(&self, repo: &Repository, fetch_path: &str) -> Result<String> {
+        let upstream_url = Self::remote_target(repo)?;
+        self.ensure_upstream_allowed(repo, upstream_url, fetch_path)
+            .await?;
+        Ok(Self::build_upstream_url(upstream_url, fetch_path))
+    }
+
+    /// Filter half of [`Self::gated_upstream_url`], for the one caller that
+    /// resolves the upstream base itself.
+    async fn ensure_upstream_allowed(
+        &self,
+        repo: &Repository,
+        upstream_url: &str,
+        fetch_path: &str,
+    ) -> Result<()> {
+        // #4365 item 3: an ambiguous path never reaches the upstream.
+        check_upstream_fetch_path(fetch_path)?;
+        crate::services::upstream_filter::ensure_upstream_allowed(
+            &self.db,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            fetch_path,
+        )
+        .await
+    }
+
+    /// The origin-policy gate for content a Remote serves (#4506): refuse,
+    /// with the same 403 the hosted download gate answers, when an applicable
+    /// scan policy's origin predicates (`allowed_upstreams`,
+    /// `denied_upstreams`, `allowed_repositories`, `denied_repositories`,
+    /// `allowed_kinds`) reject the Remote's proxied content.
+    ///
+    /// Proxy fetches record a `proxy_cache_artifacts` row, not an `artifacts`
+    /// row, so the hosted download gate never saw an origin for them and an
+    /// upstream deny policy did not gate a Remote at all. The origin is a
+    /// property of the Remote (kind `proxy`, its key, its configured
+    /// upstream), not of the path, so the gate runs once at each public entry
+    /// that serves a Remote's cache or upstream, before the cache is read and
+    /// before the upstream is contacted. A cache entry written before the
+    /// policy was attached is refused like a miss.
+    ///
+    /// A policy lookup error fails closed (the error propagates).
+    async fn ensure_origin_policy_allows(&self, repo: &Repository) -> Result<()> {
+        if !self.origin_policy_gate {
+            return Ok(());
+        }
+        self.origin_policy_gate(repo.id, &repo.key, repo.upstream_url.as_deref())
+            .await
+    }
+
+    async fn origin_policy_gate(
+        &self,
+        repo_id: Uuid,
+        repo_key: &str,
+        upstream_url: Option<&str>,
+    ) -> Result<()> {
+        let violations = crate::services::policy_service::PolicyService::new(self.db.clone())
+            .evaluate_proxy_origin(repo_id, repo_key, upstream_url)
+            .await?;
+        if violations.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            repository_id = %repo_id,
+            repo_key = %repo_key,
+            violations = ?violations,
+            "proxied download refused by the repository's origin policy"
+        );
+        Err(AppError::Authorization(
+            "Artifact download is blocked by the repository's scan policy".to_string(),
+        ))
+    }
+
+    /// [`Self::ensure_origin_policy_allows`] for the cache entry points that
+    /// are keyed by repository key (or id) alone. A key that names no Remote
+    /// has no proxied content to gate.
+    async fn ensure_origin_policy_allows_for(&self, repo_ref: RemoteRef<'_>) -> Result<()> {
+        if !self.origin_policy_gate {
+            return Ok(());
+        }
+        let row: Option<(Uuid, String, Option<String>)> = match repo_ref {
+            RemoteRef::Key(key) => {
+                sqlx::query_as(
+                    "SELECT id, key, upstream_url FROM repositories \
+                 WHERE key = $1 AND repo_type = 'remote'",
+                )
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await
+            }
+            RemoteRef::Id(id) => {
+                sqlx::query_as(
+                    "SELECT id, key, upstream_url FROM repositories \
+                 WHERE id = $1 AND repo_type = 'remote'",
+                )
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await
+            }
+        }
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let Some((id, key, upstream_url)) = row else {
+            return Ok(());
+        };
+        self.origin_policy_gate(id, &key, upstream_url.as_deref())
+            .await
     }
 
     /// Build full upstream URL for an artifact path.
@@ -5846,26 +7456,13 @@ impl ProxyService {
         // the #2047 hazard (a repository recreated with the same key serving
         // the deleted one's upstream content) would survive as long as the
         // legacy tree does. It deletes only; it can never serve bytes.
+        // `repo_roots` also guards the collision where `repo_key` equals THIS
+        // deployment's scope segment: the legacy prefix would then be the root
+        // of the ENTIRE deployment's cache. Repository creation/rename rejects
+        // the collision too (`repositories::validate_key_not_scope_collision`);
+        // the guard is the half that still holds for older repositories.
         let mut deleted = 0usize;
-        let mut prefixes = vec![self.cache_scope.repo_root(repo_key)];
-        // The legacy unscoped sweep (`proxy-cache/<repo_key>/`) reclaims objects
-        // this deployment cached before #3454. But `proxy-cache/<repo_key>/` is
-        // ALSO the shape of a scope root: when `repo_key` equals THIS
-        // deployment's own scope segment the legacy prefix collapses to
-        // `proxy-cache/<scope>/` — the root of the ENTIRE deployment's cache —
-        // and sweeping it would delete every other repository's cached content.
-        // A repository key can legally equal the scope segment (both are drawn
-        // from `[A-Za-z0-9._-]`, so a UUID or a token like `prod-eu` is a valid
-        // key), so guard the collision explicitly and sweep only the scoped
-        // subtree in that case. Repository creation/rename rejects the collision
-        // too (`repositories::validate_key_not_scope_collision`); this guard is
-        // the half that still holds for a repository that predates that check.
-        if self.cache_scope.segment() != Some(repo_key) {
-            let legacy = ProxyCacheScope::unscoped().repo_root(repo_key);
-            if !prefixes.contains(&legacy) {
-                prefixes.push(legacy);
-            }
-        }
+        let prefixes = self.cache_scope.repo_roots(repo_key);
         let mut keys = Vec::new();
         for prefix in &prefixes {
             keys.extend(self.storage.list(Some(prefix)).await?);
@@ -5945,7 +7542,7 @@ impl ProxyService {
     /// suspenders so a future call site that bypasses the storage check
     /// still cannot escape (#1018 R3-7 / #1052).
     fn validate_cache_path(path: &str) -> Result<&str> {
-        let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+        let trimmed = normalize_cache_path(path);
 
         if trimmed.is_empty() {
             return Err(AppError::Validation(
@@ -6026,8 +7623,10 @@ impl ProxyService {
         &self,
         cache_key: &str,
         metadata_key: &str,
+        preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
-        self.get_cached(cache_key, metadata_key, false).await
+        self.get_cached(cache_key, metadata_key, false, preloaded_metadata)
+            .await
     }
 
     /// Up-front cache read with #1611 classification + conditional
@@ -6052,14 +7651,16 @@ impl ProxyService {
         metadata_key: &str,
         accept: Option<&str>,
     ) -> Result<CacheReadOutcome> {
-        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        // #3832: fold in the repository's current TTL override so a lowered
+        // TTL is honoured by entries written under the old one.
+        let mutability = self.effective_mutability(repo, cache_path).await;
 
         // Load the sidecar to evaluate freshness. A read/parse error is treated
         // as "no entry" (Miss) — same B6-safe stance as the fresh read path.
         // Waits (bounded) for an in-flight tail-phase streaming publish of the
         // same key so a just-cached entry is not misread as a miss (#3335).
         let metadata = self
-            .load_cache_metadata_awaiting_publish(metadata_key)
+            .load_cache_metadata_awaiting_publish(metadata_key, mutability)
             .await;
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
 
@@ -6078,8 +7679,14 @@ impl ProxyService {
                 )?;
                 // Serve the body. Immutable hits reach here and never touch
                 // upstream. `get_cached_artifact` re-verifies checksum + body
-                // presence; a missing/poisoned body degrades to Miss (B6).
-                match self.get_cached_artifact(cache_key, metadata_key).await? {
+                // presence against the SAME sidecar the freshness evaluation
+                // just loaded (#3951 — previously a second, LRU-bypassing
+                // storage read of the same `__cache_meta__.json`); a
+                // missing/poisoned body degrades to Miss (B6).
+                match self
+                    .get_cached_artifact(cache_key, metadata_key, metadata.clone())
+                    .await?
+                {
                     Some((content, content_type, content_encoding)) => Ok(CacheReadOutcome::Hit(
                         content,
                         content_type,
@@ -6136,7 +7743,7 @@ impl ProxyService {
     ) -> Result<Option<CachedBody>> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
-        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        let mutability = self.effective_mutability(repo, cache_path).await;
         let metadata = self
             .load_cache_metadata(&metadata_key)
             .await
@@ -6150,7 +7757,8 @@ impl ProxyService {
                         .expect("fresh implies metadata present")
                         .quarantine_until,
                 )?;
-                self.get_cached_artifact(&cache_key, &metadata_key).await
+                self.get_cached_artifact(&cache_key, &metadata_key, metadata)
+                    .await
             }
             // Miss / NegativeHit / Stale: no upstream contact here — the caller
             // falls through to its own (parallel) upstream fetch.
@@ -6186,7 +7794,7 @@ impl ProxyService {
             RevalidationVerdict::Refill => Ok(CacheReadOutcome::Miss),
             RevalidationVerdict::ServeRevalidated => {
                 match self
-                    .get_stale_cached_artifact(cache_key, metadata_key)
+                    .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
                 {
                     Ok(Some((content, content_type, content_encoding))) => {
@@ -6203,7 +7811,7 @@ impl ProxyService {
             }
             RevalidationVerdict::ServeStaleIfError => {
                 if let Ok(Some((content, content_type, content_encoding))) = self
-                    .get_stale_cached_artifact(cache_key, metadata_key)
+                    .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
                 {
                     return Ok(CacheReadOutcome::Hit(
@@ -6254,10 +7862,11 @@ impl ProxyService {
             return RevalidationVerdict::Refill;
         };
 
-        let Ok(upstream_url) = Self::remote_target(repo) else {
+        // A refused path (#840) is not revalidated; the refill it falls to is
+        // refused by the same gate on the miss path.
+        let Ok(full_url) = self.gated_upstream_url(repo, fetch_path).await else {
             return RevalidationVerdict::Refill;
         };
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
 
         match self
             .check_etag_changed(&full_url, &etag, repo.id, accept)
@@ -6275,6 +7884,11 @@ impl ProxyService {
             Err(err) => {
                 // Upstream unreachable mid-revalidation: stale-if-error within
                 // the grace window, else fall through to a refill attempt.
+                // The window is deliberately measured from the STAMPED expiry,
+                // not the #3832 effective one: it is an availability
+                // fallback, and before #3832 this body would have been served
+                // as fresh until that stamp anyway, so lowering a TTL must not
+                // make an outage fail harder than it did.
                 let within_grace = Utc::now()
                     < metadata.expires_at
                         + chrono::Duration::seconds(cache_classifier::STALE_IF_ERROR_GRACE_SECS);
@@ -6302,7 +7916,13 @@ impl ProxyService {
         ttl_secs: i64,
     ) {
         let mut extended = metadata.clone();
-        extended.expires_at = Utc::now() + chrono::Duration::seconds(ttl_secs);
+        // A 304 confirms the body is current as of now, so the read-time TTL
+        // clamp (#3832) is re-anchored here too; without it a lowered TTL
+        // would keep measuring from the original fill and revalidate on every
+        // read once that window passed.
+        let now = Utc::now();
+        extended.cached_at = now;
+        extended.expires_at = now + chrono::Duration::seconds(ttl_secs);
         match serde_json::to_vec(&extended) {
             Ok(json) => {
                 if let Err(e) = self.storage.put(metadata_key, Bytes::from(json)).await {
@@ -6393,9 +8013,16 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
         allow_stale: bool,
+        preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
         self.cache_store
-            .get(cache_key, metadata_key, allow_stale)
+            .get(
+                cache_key,
+                metadata_key,
+                allow_stale,
+                preloaded_metadata,
+                None,
+            )
             .await
     }
 
@@ -6414,18 +8041,41 @@ impl ProxyService {
     /// is still streaming, the single-flight coordinator owns coalescing. The
     /// re-read after the wait drops any memoised `None` from the metadata LRU
     /// first, so the sidecar the writer just published is actually observed.
+    ///
+    /// The same window exists when the key already has an EXPIRED sidecar that
+    /// the in-flight publish is replacing (a stale mutable entry being
+    /// refilled): the reader observes the old sidecar — from storage, or from
+    /// the LRU entry memoised by the request that triggered the refill, which
+    /// the writer only invalidates after its sidecar `put` — classifies it
+    /// Stale, and revalidates / refetches upstream a second time. So an
+    /// expired sidecar gets the same bounded wait. A fresh sidecar never
+    /// consults the registry, keeping the warm-hit path lock-free.
+    ///
+    /// `mutability` is the path's override-applied classification, so
+    /// "expired" here means expired under the current TTL (#3832).
     async fn load_cache_metadata_awaiting_publish(
         &self,
         metadata_key: &str,
+        mutability: cache_classifier::Mutability,
     ) -> Option<CacheMetadata> {
         let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
-        if metadata.is_some() {
-            return metadata;
+        match &metadata {
+            Some(m) if m.effective_expires_at(mutability) > Utc::now() => return metadata,
+            Some(_) => {
+                // Expired: whether we waited or the writer had already
+                // finished (and invalidated the LRU) between our load and the
+                // registry check, one re-read observes its sidecar.
+                if await_tee_publish(metadata_key).await {
+                    invalidate_proxy_metadata_lru(metadata_key).await;
+                }
+            }
+            None => {
+                if !await_tee_publish(metadata_key).await {
+                    return None;
+                }
+                invalidate_proxy_metadata_lru(metadata_key).await;
+            }
         }
-        if !await_tee_publish(metadata_key).await {
-            return None;
-        }
-        invalidate_proxy_metadata_lru(metadata_key).await;
         self.load_cache_metadata(metadata_key).await.unwrap_or(None)
     }
 
@@ -6517,6 +8167,19 @@ impl ProxyService {
         repo_id: Uuid,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
+        // #4506: the Remote's origin policy, before the upstream is contacted.
+        self.ensure_origin_policy_allows_for(RemoteRef::Id(repo_id))
+            .await?;
+        // #4399: the off-host URL is matched as a full absolute URL (there is
+        // no configured-upstream prefix to strip on another host).
+        crate::services::upstream_filter::ensure_upstream_allowed(
+            &self.db,
+            repo_id,
+            &repo_id.to_string(),
+            "",
+            url,
+        )
+        .await?;
         let resp = self
             .upstream_client
             .fetch_buffered(
@@ -6749,8 +8412,10 @@ impl ProxyService {
         &self,
         cache_key: &str,
         metadata_key: &str,
+        preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
-        self.get_cached(cache_key, metadata_key, true).await
+        self.get_cached(cache_key, metadata_key, true, preloaded_metadata)
+            .await
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer).
@@ -6785,8 +8450,13 @@ impl ProxyService {
 /// local-upload path stores) keeps proxy package names globally unambiguous and
 /// lets the remote component-grouping branch reconstruct the `groupId` /
 /// `artifactId` split without consulting the storage path.
+///
+/// Derived from [`normalize_cache_path`], the spelling the proxy cache keys
+/// the file on and the scan gate classifies (#4365 item 6). Trimming only the
+/// leading `/` let `.../widget-1.0.jar/` (empty file name, no coordinate)
+/// skip a curation rule while being served from `.../widget-1.0.jar`'s entry.
 pub(crate) fn maven_proxy_package_name(path: &str) -> Option<String> {
-    let path = path.trim_start_matches('/');
+    let path = normalize_cache_path(path);
     let filename = path.rsplit('/').next().unwrap_or(path);
     let lower = filename.to_ascii_lowercase();
 
@@ -6912,6 +8582,7 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
     headers
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8877,6 +10548,28 @@ mod tests {
         assert!(maven_proxy_package_name("org/junit/something.jar").is_none());
     }
 
+    /// #4365 item 6: every spelling the proxy cache keys as one entry names
+    /// the same curated package, so a trailing `/` cannot skip a rule.
+    #[test]
+    fn test_maven_proxy_package_name_uses_the_cache_normalized_path() {
+        let canonical = "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar";
+        let expected = maven_proxy_package_name(canonical);
+        assert!(expected.is_some());
+        for alias in [
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar/",
+            "/org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar//",
+            "//org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar",
+        ] {
+            assert_eq!(normalize_cache_path(alias), canonical, "{alias}");
+            assert_eq!(maven_proxy_package_name(alias), expected, "{alias}");
+        }
+        // A trailing slash on a sidecar still names no package.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha1/")
+                .is_none()
+        );
+    }
+
     #[test]
     fn test_catalog_indexable_format_maven_family() {
         assert_eq!(
@@ -9224,12 +10917,14 @@ mod tests {
     }
 
     /// Build a `ProxyService` whose storage is the supplied mock. The DB
-    /// pool is a lazy connection that is never dialed because
-    /// `is_cache_fresh` does not touch the database.
+    /// pool is a lazy connection to an unresolvable host: `is_cache_fresh`
+    /// looks the repository's TTL policy up by key (#3832), and that lookup
+    /// must fail fast (falling back to the stamped expiry) rather than wait
+    /// out the pool's acquire timeout against a real local server.
     fn build_proxy_service_with_storage(
         storage: Arc<dyn crate::services::storage_service::StorageBackend>,
     ) -> ProxyService {
-        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/")
             .expect("connect_lazy should not fail");
         ProxyService::new(
             pool,
@@ -10505,6 +12200,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             etag: None,
             last_modified: None,
+            quarantine_until: None,
             ttl_secs: 60,
             expected_checksum: None,
             repository_id: Uuid::nil(),
@@ -11886,8 +13582,10 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha256Hex(
-            "0000000000000000000000000000000000000000000000000000000000000".to_string(),
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha256Hex(
+                "0000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ),
         ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
@@ -11934,9 +13632,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
-            sha2::Sha512::digest(b"some other body"),
-        )));
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"some other body"))),
+        ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -11973,9 +13671,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"some other body"),
-        )));
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"some other body"))),
+        ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -12010,9 +13708,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
-            sha2::Sha512::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"first-chunk"))),
+        ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -12042,6 +13740,207 @@ mod tests {
             "a matching SHA-512 gate must publish onto the live key"
         );
         assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// #3982: a DEFERRED commit digest — one resolving concurrently with the
+    /// body stream — still gates the cache commit. The digest future here is
+    /// completed only AFTER the client has drained the body, proving the
+    /// commit arm truly awaits the late-resolving value instead of deciding
+    /// without it: a late MISMATCH degrades exactly like the up-front gate's
+    /// reject (served to the client, never cached).
+    #[tokio::test]
+    async fn test_tee_deferred_digest_late_mismatch_is_not_cached() {
+        use futures::FutureExt;
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<CacheCommitDigest>>();
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move { rx.await.unwrap_or(None) }.boxed().shared(),
+        });
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            Some(11),
+            None,
+        );
+        // The client receives the full body while the digest is still
+        // unresolved — serving never waits on it (serve-but-don't-cache).
+        let mut received: Vec<u8> = Vec::new();
+        while let Some(chunk) = client.next().await {
+            received.extend_from_slice(&chunk.expect("client chunk"));
+        }
+        assert_eq!(received, b"first-chunk");
+
+        // The sidecar resolves only now — after streaming — with a MISMATCH.
+        let _ = tx.send(Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"some other body"),
+        ))));
+
+        wait_for_tee_writer_exit(&backend, false).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a late-resolving digest mismatch must not write a metadata sidecar (#3982)"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a late-resolving digest mismatch must never publish onto the live key (#3982)"
+        );
+    }
+
+    /// #3982: a deferred digest that resolves to the body's true SHA-1 —
+    /// again only after streaming has finished — commits exactly like the
+    /// up-front gate: good bytes must never become a permanent cache miss.
+    #[tokio::test]
+    async fn test_tee_deferred_digest_late_match_commits() {
+        use futures::FutureExt;
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<CacheCommitDigest>>();
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move { rx.await.unwrap_or(None) }.boxed().shared(),
+        });
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            Some(11),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+        let _ = tx.send(Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"first-chunk"),
+        ))));
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(
+            writes.len(),
+            1,
+            "a late-resolving digest match must commit the metadata sidecar (#3982)"
+        );
+        assert_eq!(writes[0].0, "meta-key");
+        let copies = backend.copies.lock().await;
+        assert_eq!(
+            copies.len(),
+            1,
+            "a late-resolving digest match must publish onto the live key (#3982)"
+        );
+        assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// #3982: the deferred future resolving to `None` — the sender dropped
+    /// without a digest, i.e. sidecar absent / unparseable / upstream error —
+    /// commits UNVERIFIED, identical to the up-front `None` posture: the
+    /// download proceeds unverified exactly as before, GHSA-qxv7-p3mq-88fv
+    /// only gates when a digest actually exists.
+    #[tokio::test]
+    async fn test_tee_deferred_digest_none_commits_unverified() {
+        use futures::FutureExt;
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<CacheCommitDigest>>();
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move { rx.await.unwrap_or(None) }.boxed().shared(),
+        });
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            Some(11),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+        // No digest ever arrives: the sidecar resolution failed.
+        drop(tx);
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "no authoritative digest must commit unverified, like the up-front None (#3982)"
+        );
+    }
+
+    /// #3982: the tee must DRIVE the deferred digest future from setup, so the
+    /// sidecar resolution overlaps the body stream instead of starting at
+    /// commit time. Proof: with an upstream stream that never ends, the
+    /// commit arm can never run — so the digest future being polled at all is
+    /// only possible through the tee's own driver.
+    #[tokio::test]
+    async fn test_tee_deferred_digest_is_driven_before_stream_end() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_in_future = Arc::clone(&polled);
+        let mut deferred_template = template();
+        deferred_template.expected_checksum = Some(ExpectedCommitDigest::Deferred {
+            algorithm: CommitDigestAlgorithm::Sha1,
+            digest: async move {
+                polled_in_future.store(true, Ordering::SeqCst);
+                Some(CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(
+                    b"first-chunk",
+                ))))
+            }
+            .boxed()
+            .shared(),
+        });
+
+        // One chunk, then pend forever: the writer can never reach its commit
+        // arm, so a "commit arm polls the digest" implementation would leave
+        // the flag clear forever.
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(
+            futures::stream::once(async { Ok(Bytes::from_static(b"first-chunk")) })
+                .chain(futures::stream::pending()),
+        );
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            deferred_template,
+            None,
+            None,
+        );
+        let first = client.next().await.expect("first chunk").expect("chunk ok");
+        assert_eq!(first.as_ref(), b"first-chunk");
+
+        for _ in 0..200 {
+            if polled.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the deferred digest future was never polled with the stream still open: \
+             the tee is not driving it, so the sidecar fetch would start only at \
+             commit time instead of overlapping the body stream (#3982)"
+        );
     }
 
     /// #3487: drive `client` until exactly `len` bytes have arrived, then drop
@@ -12100,9 +13999,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"first-chunk"))),
+        ));
 
         // Unique metadata key: the #3335 publish registry is process-global
         // and the entry is looked up by key below.
@@ -12176,9 +14075,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
-            sha2::Sha512::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"first-chunk"))),
+        ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
@@ -12204,9 +14103,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"some other body"),
-        )));
+        mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"some other body"))),
+        ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
@@ -12239,9 +14138,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
-            sha1::Sha1::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha1Hex(hex::encode(sha1::Sha1::digest(b"first-chunk"))),
+        ));
 
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
@@ -12275,9 +14174,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut matched_template = template();
-        matched_template.expected_checksum = Some(CacheCommitDigest::Sha256Hex(hex::encode(
-            sha2::Sha256::digest(b"first-chunk"),
-        )));
+        matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
+            CacheCommitDigest::Sha256Hex(hex::encode(sha2::Sha256::digest(b"first-chunk"))),
+        ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
@@ -12385,6 +14284,7 @@ mod tests {
             content_type: Some("application/x-deb".to_string()),
             etag: Some("\"abc123\"".to_string()),
             last_modified: None,
+            quarantine_until: None,
             ttl_secs: 7200,
             expected_checksum: None,
             repository_id: Uuid::nil(),
@@ -12735,6 +14635,194 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_url_userinfo_keeps_everything_but_the_userinfo() {
+        // #4452: the read-back form drops only the userinfo; path, query and
+        // fragment survive byte-for-byte, and the flag reports the strip.
+        for (raw, want, had) in [
+            (
+                "https://alice:s3cret@registry.example.com/simple?x=1#f",
+                "https://registry.example.com/simple?x=1#f",
+                true,
+            ),
+            ("https://token@host:8443", "https://host:8443", true),
+            ("https://u:p@ss@host/a", "https://host/a", true),
+            ("//user:pass@host/path", "//host/path", true),
+            ("user:pass@host/path", "host/path", true),
+            ("https://u:p@[::1]:8443/x", "https://[::1]:8443/x", true),
+            ("https://user%40corp:p%40ss@host/", "https://host/", true),
+            ("https://:pw@host/", "https://host/", true),
+            // WHATWG accepts these slash-less / backslash forms as
+            // credentialed special-scheme URLs; a `://` later in the query
+            // must not be mistaken for the scheme separator.
+            (
+                "https:user:pass@host/x?q=http://z",
+                "https:host/x?q=http://z",
+                true,
+            ),
+            ("https:/user:pass@host", "https:/host", true),
+            ("https:\\\\user:pass@host", "https:\\\\host", true),
+            // `\` ends a special-scheme authority, as in the URL parser: the
+            // host is `host`, and `\x@y/z` is path.
+            ("https://u:p@host\\x@y/z", "https://host\\x@y/z", true),
+            ("https://host\\@evil/", "https://host\\@evil/", false),
+            // Credential-free URLs come back exactly as stored (no parser
+            // normalization such as an added trailing slash).
+            (
+                "https://registry.npmjs.org",
+                "https://registry.npmjs.org",
+                false,
+            ),
+            ("https://host/a@b?c=d@e", "https://host/a@b?c=d@e", false),
+            ("https://host?q=a@b", "https://host?q=a@b", false),
+            ("https://@host/", "https://host/", false),
+            ("not a url", "not a url", false),
+        ] {
+            assert_eq!(strip_url_userinfo(raw), (want.to_string(), had), "{raw}");
+        }
+    }
+
+    /// Point Remote `repo_id` at `upstream_url`, the URL its credentials
+    /// belong to (GHSA-24rf-2gv2-j47c).
+    async fn point_remote_at(pool: &sqlx::PgPool, repo_id: Uuid, upstream_url: &str) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("point the remote at its upstream");
+    }
+
+    /// GHSA-24rf-2gv2-j47c: a Remote's configured upstream credentials go only
+    /// to the configured upstream's origin. Index metadata (a PyPI `href`, a
+    /// Helm `urls` entry, a Cargo `dl` template, a Composer `dist.url`, a
+    /// Terraform `download_url`) can name any absolute URL, and every shared
+    /// fetcher used to attach the credentials to whatever URL it was given.
+    /// Two listeners on different ports are two origins: the foreign one must
+    /// receive no `Authorization` from any fetcher, and the configured one
+    /// still gets the credentials.
+    #[tokio::test]
+    async fn upstream_credentials_only_go_to_the_configured_origin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_auth::UpstreamAuthMode;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let foreign = MockServer::start().await;
+        for server in [&upstream, &foreign] {
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"fresh\"")
+                        .set_body_bytes(b"{}".as_ref()),
+                )
+                .mount(server)
+                .await;
+        }
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        point_remote_at(&pool, repo_id, &format!("{}/simple", upstream.uri())).await;
+        crate::services::upstream_auth::save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            r#"{"username":"ghsa-24rf","password":"not-a-real-secret"}"#,
+        )
+        .await
+        .expect("save upstream credentials");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let client = &proxy.upstream_client;
+        let mode = UpstreamAuthMode::RepoConfigured;
+
+        let off_origin = format!("{}/files/pkg-1.0.tar.gz", foreign.uri());
+        let _ = client
+            .fetch_buffered(&off_origin, repo_id, None, 1 << 20, mode)
+            .await;
+        let _ = client.fetch_stream(&off_origin, repo_id).await;
+        let _ = client
+            .check_etag_changed(&off_origin, "\"stale\"", repo_id, None)
+            .await;
+        let _ = proxy
+            .fetch_from_upstream_conditional(&off_origin, repo_id, "\"stale\"")
+            .await;
+        let _ = client
+            .post_json_buffered(&off_origin, repo_id, Bytes::from_static(b"{}"), 1 << 20)
+            .await;
+
+        // Control: the configured origin still gets the credentials.
+        let on_origin = format!("{}/files/pkg-1.0.tar.gz", upstream.uri());
+        let _ = client
+            .fetch_buffered(&on_origin, repo_id, None, 1 << 20, mode)
+            .await;
+        let _ = client.fetch_stream(&on_origin, repo_id).await;
+
+        let foreign_requests = foreign.received_requests().await.unwrap_or_default();
+        let upstream_requests = upstream.received_requests().await.unwrap_or_default();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            foreign_requests.len(),
+            5,
+            "every fetcher must still reach the off-origin URL, only without credentials"
+        );
+        for r in &foreign_requests {
+            assert!(
+                !r.headers.contains_key("authorization"),
+                "{} {} on another origin received the upstream credentials",
+                r.method,
+                r.url.path()
+            );
+        }
+        assert_eq!(upstream_requests.len(), 2);
+        for r in &upstream_requests {
+            assert!(
+                r.headers.contains_key("authorization"),
+                "the configured upstream must still receive its credentials"
+            );
+        }
+    }
+
+    /// #4452: redacting `upstream_url` on read must not change what the
+    /// proxy sends upstream. Userinfo embedded in a Remote's upstream URL is
+    /// still presented as HTTP Basic auth; the mock only answers 200 when the
+    /// request carries exactly those credentials.
+    #[tokio::test]
+    async fn test_fetch_sends_upstream_url_userinfo_as_basic_auth() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{basic_auth, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/base/pkg/file.txt"))
+            .and(basic_auth("alice", "s3cret"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"authed".as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-4452-basic-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let upstream = server.uri().replacen("://", "://alice:s3cret@", 1) + "/base";
+        let mut repo = remote_repo_for("generic-4452", &upstream, tmp.to_str().unwrap());
+        repo.format = RepositoryFormat::Generic;
+
+        let result = proxy.fetch_artifact(&repo, "pkg/file.txt").await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct) = result.expect(
+            "the upstream only answers when the URL's userinfo arrives as \
+             Basic auth; a failure means the proxy stopped sending it",
+        );
+        assert_eq!(&body[..], b"authed");
+    }
+
+    #[test]
     fn test_redact_url_for_diagnostics_strips_userinfo_unparseable_fallback() {
         // The non-`reqwest::Url` fallback path must strip userinfo too.
         assert_eq!(
@@ -12746,6 +14834,32 @@ mod tests {
             redact_url_for_diagnostics("packages/pkg.zip"),
             "packages/pkg.zip"
         );
+    }
+
+    /// `is_upstream_forbidden` recognises 403 by the message
+    /// `validate_upstream_status` writes (AppError carries no status code, and
+    /// adding a variant would touch every exhaustive match on it). Pin the
+    /// pair against the PRODUCER, not a hand-written string, so a rewording of
+    /// that message fails here instead of silently turning PyPI's #3886 403
+    /// sidecar fallback back into a 502.
+    #[test]
+    fn test_is_upstream_forbidden_tracks_validate_upstream_status_3886() {
+        let err = |s: StatusCode| {
+            validate_upstream_status(s, "https://up.example/x").expect_err("non-2xx must fail")
+        };
+        assert!(is_upstream_forbidden(&err(StatusCode::FORBIDDEN)));
+        for other in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(
+                !is_upstream_forbidden(&err(other)),
+                "{other} must not be classified as an upstream 403"
+            );
+        }
     }
 
     #[test]
@@ -12928,6 +15042,7 @@ mod tests {
             .get_cached_artifact(
                 "proxy-cache/npm-proxy/lodash/__content__",
                 "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+                None,
             )
             .await;
 
@@ -12984,6 +15099,7 @@ mod tests {
             .get_cached_artifact(
                 "proxy-cache/npm-proxy/lodash/__content__",
                 "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+                None,
             )
             .await;
 
@@ -13676,6 +15792,26 @@ mod tests {
         assert!(empty.commit_sha.is_none());
     }
 
+    /// #3912: the streaming path's release-date signal. `Last-Modified` must
+    /// survive header capture verbatim (the Package Age Policy window parses
+    /// it later) and stay absent when upstream sends none.
+    #[test]
+    fn test_extract_streaming_headers_captures_last_modified() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            reqwest::header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let got = extract_streaming_headers(&h);
+        assert_eq!(
+            got.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+
+        let empty = extract_streaming_headers(&HeaderMap::new());
+        assert!(empty.last_modified.is_none());
+    }
+
     #[test]
     fn test_cache_metadata_round_trips_encoding_and_commit() {
         // A cache hit rebuilds the response from the sidecar, so both fields have
@@ -14148,6 +16284,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: tmp.to_string_lossy().to_string(),
             upstream_url: Some(server.uri()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14227,6 +16364,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: tmp.to_string_lossy().to_string(),
             upstream_url: Some(server.uri()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14312,6 +16450,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: tmp.to_string_lossy().to_string(),
             upstream_url: Some(server.uri()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14396,6 +16535,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: tmp.to_string_lossy().to_string(),
             upstream_url: Some(server.uri()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14484,6 +16624,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: tmp.to_string_lossy().to_string(),
             upstream_url: Some(server.uri()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14565,7 +16706,8 @@ mod tests {
         // Build the service with a `lazy` PgPool: we never call any
         // code path that touches the DB on this test.
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
-        let proxy = ProxyService::new(pool, storage, ProxyCacheScope::unscoped());
+        let proxy = ProxyService::new(pool, storage, ProxyCacheScope::unscoped())
+            .without_origin_policy_gate();
 
         let repo_key = "npm-proxy";
         let cache_path = "abbrev/-/abbrev-1.1.1.tgz";
@@ -14636,6 +16778,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: storage_path.to_string(),
             upstream_url: Some(upstream_url.to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14835,6 +16978,95 @@ mod tests {
              refused from the cache (Phase-1 interim single-object guard, \
              bug artifact-keeper-x70), not silently cached over quota"
         );
+    }
+
+    /// #4551: an object larger than a Remote repository's quota is streamed to
+    /// the client without any cache write, so recording that serve must not
+    /// leave a `proxy_cache_artifacts` placeholder (`size_bytes = 0`) that
+    /// listings present as a cached 0-byte object. The download is still
+    /// recorded, keyed on `(repository_id, path)` (#4539), with no catalog row.
+    #[tokio::test]
+    async fn test_over_quota_stream_through_leaves_no_catalog_placeholder_4551() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar_path = "junit/junit/4.13.2/junit-4.13.2.jar";
+        let jar = vec![b'j'; 4096];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{jar_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+        let tmp = std::env::temp_dir().join(format!("ak-4551-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let mut repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
+        repo.id = repo_id;
+
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        for _ in 0..2 {
+            let handle = proxy
+                .fetch_artifact_streaming(&repo, jar_path)
+                .await
+                .expect("an over-quota object is still streamed to the client");
+            assert_eq!(drain_stream(handle.body).await.len(), jar.len());
+            crate::api::handlers::proxy_helpers::record_proxy_download_via(
+                &pool, &proxy, repo_id, &repo_key, jar_path, &ctx,
+            )
+            .await;
+        }
+
+        let catalog_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(jar_path)
+        .fetch_one(&pool)
+        .await
+        .expect("count catalog rows");
+        let downloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_download_statistics WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(jar_path)
+        .fetch_one(&pool)
+        .await
+        .expect("count downloads");
+
+        let _ = sqlx::query("DELETE FROM proxy_download_statistics WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+
+        assert_eq!(
+            catalog_rows, 0,
+            "an object streamed through without a cache write must not get a catalog row"
+        );
+        assert_eq!(downloads, 2, "both serves are still recorded");
     }
 
     #[test]
@@ -15056,6 +17288,152 @@ mod tests {
     }
 
     /// Drain a streaming proxy body into a single `Vec<u8>`.
+    /// #4013 review: the streaming leader's handle carries the tee writer's
+    /// publish signal, which flips only once the cache entry is committed.
+    /// (The cross-replica lock is released on it; without it the lock would
+    /// be released at the client's EOF, before the sidecar exists.)
+    #[tokio::test]
+    async fn test_streaming_leader_handle_carries_the_cache_publish_signal() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"publish-signal-body".to_vec();
+        let artifact = "org/acme/sig/1.0/sig-1.0.jar";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{artifact}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let tmp = std::env::temp_dir().join(format!("ak-4013-sig-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = remote_repo_for(
+            &format!("sig-{}", Uuid::new_v4()),
+            &server.uri(),
+            tmp.to_str().unwrap(),
+        );
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+        let handle = proxy
+            .open_streaming_leader(&repo, artifact, artifact, cache_key, metadata_key, None)
+            .await
+            .expect("leader opens");
+        let mut published = handle
+            .cache_published
+            .clone()
+            .expect("a tee'd leader body must carry its publish signal");
+        assert!(
+            !*published.borrow(),
+            "nothing is published before the body is read"
+        );
+        assert_eq!(drain_stream(handle.body).await, body);
+        tokio::time::timeout(Duration::from_secs(10), published.wait_for(|done| *done))
+            .await
+            .expect("publish finishes")
+            .expect("signal observed");
+        assert!(
+            proxy.is_cache_fresh(&repo.key, artifact).await,
+            "when the signal flips, the entry is committed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #4013 review: a streaming re-enter must forget the miss its own cache
+    /// check memoised. Another replica may have filled the shared cache in
+    /// the meantime, and its publish only invalidated ITS process's LRU.
+    #[tokio::test]
+    async fn test_streaming_reenter_forgets_the_memoised_cache_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use crate::services::proxy_hydration::coordinate_stream_fanout;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("ak-4013-reenter-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        // No upstream is ever contacted: the attempt below falls back.
+        let repo = remote_repo_for(
+            &format!("reenter-{}", Uuid::new_v4()),
+            "http://upstream.invalid",
+            tmp.to_str().unwrap(),
+        );
+        let artifact = "org/acme/re/1.0/re-1.0.jar";
+        let scope = ProxyCacheScope::unscoped();
+        let cache_key = ProxyService::cache_storage_key(&scope, &repo.key, artifact).expect("key");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&scope, &repo.key, artifact).expect("meta key");
+
+        // An in-process leader for the same object that has already started
+        // emitting, so the attempt is a late arrival: it waits for the
+        // leader and then asks the caller to re-enter (`Ok(None)`).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+        let leader_body: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|i| (i, rx))
+            }));
+        let leader = coordinate_stream_fanout(&format!("proxy-stream:{cache_key}"), || async {
+            Ok(StreamHandle {
+                body: leader_body,
+                headers: Default::default(),
+                cache_published: None,
+            })
+        })
+        .await
+        .expect("ok")
+        .expect("leader");
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::spawn(async move {
+            let mut body = leader.body;
+            let _ = body.next().await;
+            let _ = first_tx.send(());
+            while body.next().await.is_some() {}
+        });
+        tx.send(Ok(Bytes::from_static(b"x"))).await.expect("send");
+        first_rx.await.expect("leader started emitting");
+
+        let attempt = {
+            let proxy = Arc::clone(&proxy);
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                proxy
+                    .try_fetch_artifact_streaming_once(&repo, artifact, artifact, None)
+                    .await
+                    .map(|r| r.is_none())
+            })
+        };
+        let lru = proxy_metadata_lru().await;
+        let mut memoised = false;
+        for _ in 0..100 {
+            if matches!(lru.get(&metadata_key).await, Some(None)) {
+                memoised = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(memoised, "the attempt's cache check memoised the miss");
+        drop(tx);
+        let reentered = tokio::time::timeout(Duration::from_secs(10), attempt)
+            .await
+            .expect("attempt finishes with the leader")
+            .expect("join")
+            .expect("no error");
+        drain.await.expect("drain");
+        assert!(reentered, "a late arrival asks the caller to re-enter");
+        assert!(
+            lru.get(&metadata_key).await.is_none(),
+            "the re-enter must re-read the sidecar, not the memoised miss"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
         let mut body = body;
         let mut out = Vec::new();
@@ -15304,7 +17682,7 @@ mod tests {
             entries,
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage.clone());
+        let svc = build_proxy_service_with_storage(storage.clone()).without_origin_policy_gate();
         let repo = pypi_remote_repo("pypi-remote");
 
         let result = svc
@@ -15331,7 +17709,7 @@ mod tests {
             entries: std::collections::HashMap::new(),
             requested: std::sync::Mutex::new(Vec::new()),
         });
-        let svc = build_proxy_service_with_storage(storage);
+        let svc = build_proxy_service_with_storage(storage).without_origin_policy_gate();
         let repo = pypi_remote_repo("pypi-remote");
 
         let probe = svc
@@ -15352,7 +17730,10 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
             KeyResponse::Bytes(Bytes::from_static(body)),
         );
-        let out = svc.get_cached(BODY_KEY, META_KEY, false).await.unwrap();
+        let out = svc
+            .get_cached(BODY_KEY, META_KEY, false, None)
+            .await
+            .unwrap();
         assert!(out.is_none(), "fresh read must reject an expired entry");
     }
 
@@ -15364,7 +17745,10 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
             KeyResponse::Bytes(Bytes::from_static(body)),
         );
-        let out = svc.get_cached(BODY_KEY, META_KEY, true).await.unwrap();
+        let out = svc
+            .get_cached(BODY_KEY, META_KEY, true, None)
+            .await
+            .unwrap();
         let (content, ct, _enc) = out.expect("stale read must serve an expired entry");
         assert_eq!(&content[..], body);
         assert_eq!(ct.as_deref(), Some("application/octet-stream"));
@@ -15386,7 +17770,7 @@ mod tests {
         );
         assert!(
             fresh
-                .get_cached(BODY_KEY, META_KEY, false)
+                .get_cached(BODY_KEY, META_KEY, false, None)
                 .await
                 .unwrap()
                 .is_none(),
@@ -15401,7 +17785,7 @@ mod tests {
         );
         assert!(
             stale
-                .get_cached(BODY_KEY, META_KEY, true)
+                .get_cached(BODY_KEY, META_KEY, true, None)
                 .await
                 .unwrap()
                 .is_none(),
@@ -15416,14 +17800,14 @@ mod tests {
         // A metadata sidecar read error: fresh swallows -> Ok(None); stale
         // propagates -> Err.
         let fresh = service_with(KeyResponse::Error, KeyResponse::Missing);
-        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false).await;
+        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false, None).await;
         assert!(
             matches!(fresh_out, Ok(None)),
             "fresh read must swallow a metadata read error as a cache miss (B6)"
         );
 
         let stale = service_with(KeyResponse::Error, KeyResponse::Missing);
-        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true).await;
+        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true, None).await;
         assert!(
             stale_out.is_err(),
             "stale read must propagate a metadata read error"
@@ -15440,7 +17824,7 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ false)),
             KeyResponse::Error,
         );
-        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false).await;
+        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false, None).await;
         assert!(
             matches!(fresh_out, Ok(None)),
             "fresh read must swallow a body read error as a cache miss (B6)"
@@ -15451,10 +17835,62 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
             KeyResponse::Error,
         );
-        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true).await;
+        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true, None).await;
         assert!(
             stale_out.is_err(),
             "stale read must propagate a body read error"
+        );
+    }
+
+    // --- #3951 item 2: the sidecar is read ONCE per buffered fresh hit -----
+
+    /// A buffered fresh hit used to read the same `__cache_meta__.json`
+    /// twice: once through the in-process sidecar LRU (#2301) to evaluate
+    /// freshness, and once more straight from storage inside
+    /// `CacheStore::get`, which bypassed the LRU even though the metadata was
+    /// already in hand at the call site. The body read now reuses the sidecar
+    /// the freshness evaluation loaded, so the storage backend sees exactly
+    /// one metadata read per hit.
+    #[tokio::test]
+    async fn test_buffered_fresh_hit_reads_metadata_sidecar_once_3951() {
+        // Unique keys per run: the metadata LRU is process-global, and a
+        // memoized entry from another test would make the first read free.
+        let unique = Uuid::new_v4();
+        let repo_key = format!("pypi-remote-3951-{unique}");
+        let cache_path = format!("simple/pkg3951-{unique}/pkg3951-{unique}-1.0.0-py3-none-any.whl");
+        let keys = CacheKeys::derive(&ProxyCacheScope::unscoped(), &repo_key, &cache_path)
+            .expect("valid cache keys");
+        let body = Bytes::from_static(b"wheel bytes for 3951");
+
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            keys.metadata.clone(),
+            get_cached_metadata(b"wheel bytes for 3951", /* expired = */ false),
+        );
+        entries.insert(keys.content.clone(), body.clone());
+        let storage = Arc::new(RecordingMapStorage {
+            entries,
+            requested: std::sync::Mutex::new(Vec::new()),
+        });
+        let svc = build_proxy_service_with_storage(storage.clone()).without_origin_policy_gate();
+        let repo = pypi_remote_repo(&repo_key);
+
+        let (content, _ct, _enc) = svc
+            .fetch_artifact_with_cache_path(&repo, &cache_path, &cache_path)
+            .await
+            .expect("a fresh immutable cache hit must serve without upstream");
+        assert_eq!(content, body);
+
+        let requested = storage.requested.lock().unwrap();
+        let metadata_reads = requested
+            .iter()
+            .filter(|k| k.as_str() == keys.metadata)
+            .count();
+        assert_eq!(
+            metadata_reads, 1,
+            "a buffered fresh hit must read the metadata sidecar exactly once, \
+             not {metadata_reads} times; requested: {:?}",
+            *requested
         );
     }
 
@@ -15469,7 +17905,10 @@ mod tests {
             KeyResponse::Missing,
         );
         assert!(
-            matches!(fresh.get_cached(BODY_KEY, META_KEY, false).await, Ok(None)),
+            matches!(
+                fresh.get_cached(BODY_KEY, META_KEY, false, None).await,
+                Ok(None)
+            ),
             "fresh: missing body is a miss, not an error"
         );
 
@@ -15478,7 +17917,10 @@ mod tests {
             KeyResponse::Missing,
         );
         assert!(
-            matches!(stale.get_cached(BODY_KEY, META_KEY, true).await, Ok(None)),
+            matches!(
+                stale.get_cached(BODY_KEY, META_KEY, true, None).await,
+                Ok(None)
+            ),
             "stale: missing body is a miss, not an error"
         );
     }
@@ -15516,6 +17958,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: storage_path.to_string(),
             upstream_url: Some(upstream.to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -15671,6 +18114,225 @@ mod tests {
             *ttl, MAX_TOKEN_TTL_SECS,
             "an oversized expires_in must be capped at MAX_TOKEN_TTL_SECS",
         );
+    }
+
+    // -- #4453: a token-service 401/403 is an upstream auth failure ----------
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_401_is_upstream_auth_failure_4453() {
+        use crate::services::upstream_auth::UpstreamAuthType;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/forbidden/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/broken/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        // Generated per run so no credential-shaped literal is committed.
+        let secret = Uuid::new_v4().simple().to_string();
+        let creds = Some(UpstreamAuthType::Basic {
+            username: "svc-4453".to_string(),
+            password: secret.clone(),
+        });
+
+        // #4527: only a refusal of credentials actually sent is an upstream
+        // auth failure; both statuses with credentials here.
+        for (realm_path, creds, sent) in [
+            ("/token", &creds, "credentials_sent=true"),
+            ("/forbidden/token", &creds, "credentials_sent=true"),
+        ] {
+            let realm = format!("{}{realm_path}?account=svc-4453", server.uri());
+            let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            let err = client
+                .obtain_bearer_token(
+                    &realm,
+                    "reg.test",
+                    "repository:img:pull",
+                    creds,
+                    &client.http_client,
+                )
+                .await
+                .expect_err("a rejected token request must fail");
+            drop(guard);
+            let redacted = format!("{}{realm_path}", server.uri());
+            match err {
+                AppError::UpstreamAuth(msg) => {
+                    assert!(msg.contains(&redacted), "names the token service: {msg}");
+                    assert!(!msg.contains(&secret) && !msg.contains("svc-4453"), "{msg}");
+                }
+                other => panic!("{realm_path}: expected UpstreamAuth, got {other:?}"),
+            }
+            // The operator-facing line: WARN on the `security` target, the
+            // redacted realm, whether credentials were sent, and no secret.
+            let logs = capture.text();
+            assert!(
+                logs.contains("WARN") && logs.contains("security") && logs.contains(sent),
+                "{logs}"
+            );
+            assert!(logs.contains(&redacted), "{logs}");
+            assert!(
+                !logs.contains(&secret) && !logs.contains("svc-4453"),
+                "{logs}"
+            );
+        }
+
+        // #4527: an anonymous token request that is refused is not a
+        // credentials problem: Storage (a miss for the manifest handlers),
+        // logged at INFO, never on the `security` target.
+        for realm_path in ["/token", "/forbidden/token"] {
+            let realm = format!("{}{realm_path}", server.uri());
+            let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            let err = client
+                .obtain_bearer_token(
+                    &realm,
+                    "reg.test",
+                    "repository:img:pull",
+                    &None,
+                    &client.http_client,
+                )
+                .await
+                .expect_err("a rejected token request must fail");
+            drop(guard);
+            assert!(matches!(err, AppError::Storage(_)), "{realm_path}: {err:?}");
+            let logs = capture.text();
+            assert!(!logs.contains("security"), "{logs}");
+            assert!(
+                logs.contains("refused an anonymous token request"),
+                "{logs}"
+            );
+        }
+
+        let realm = format!("{}/broken/token", server.uri());
+        let err = client
+            .obtain_bearer_token(
+                &realm,
+                "reg.test",
+                "repository:img:pull",
+                &creds,
+                &client.http_client,
+            )
+            .await
+            .expect_err("a 500 token response must fail");
+        assert!(matches!(err, AppError::Storage(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_token_endpoint_status_error_redacts_the_realm_4453() {
+        let err = token_endpoint_status_error(
+            "https://bob:pw@auth.example.test/token?account=bob",
+            StatusCode::UNAUTHORIZED,
+            true,
+            None,
+        );
+        let AppError::UpstreamAuth(msg) = err else {
+            panic!("expected UpstreamAuth");
+        };
+        assert!(msg.contains("https://auth.example.test/token"), "{msg}");
+        assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        assert!(matches!(
+            token_endpoint_status_error("https://a.test/t", StatusCode::BAD_REQUEST, false, None),
+            AppError::Storage(_)
+        ));
+        // #4527: nothing was sent, so a refusal is not an auth failure.
+        assert!(matches!(
+            token_endpoint_status_error("https://a.test/t", StatusCode::UNAUTHORIZED, false, None),
+            AppError::Storage(_)
+        ));
+        let anon =
+            anonymous_token_refused_error(StatusCode::UNAUTHORIZED, "https://u:p@r.test/v2/x");
+        assert!(upstream_request_auth_refusal(&anon).is_none(), "{anon:?}");
+        assert!(!format!("{anon:?}").contains("u:p"), "{anon:?}");
+    }
+
+    /// #4518: only an upstream 401/403 on the request itself becomes an
+    /// upstream auth failure, only when credentials were sent, and the error
+    /// names the redacted URL only.
+    #[test]
+    fn test_oci_registry_auth_error_classifies_request_refusals_4518() {
+        let url = "https://bob:pw@reg.example.test/v2/img/manifests/v1";
+        let refused = || {
+            [
+                validate_upstream_status(StatusCode::UNAUTHORIZED, url).unwrap_err(),
+                validate_upstream_status(StatusCode::FORBIDDEN, url).unwrap_err(),
+                AppError::Storage(format!(
+                    "Upstream returned error status {}: {url}",
+                    StatusCode::UNAUTHORIZED
+                )),
+            ]
+        };
+        for err in refused() {
+            assert!(upstream_request_auth_refusal(&err).is_some(), "{err:?}");
+            let AppError::UpstreamAuth(msg) =
+                oci_registry_auth_error(err, Uuid::new_v4(), url, true)
+            else {
+                panic!("expected UpstreamAuth");
+            };
+            assert!(
+                msg.contains("https://reg.example.test/v2/img/manifests/v1"),
+                "{msg}"
+            );
+            assert!(!msg.contains("pw") && !msg.contains("bob"), "{msg}");
+        }
+        // Anonymous: unchanged, so the manifest handlers keep the miss.
+        for err in refused() {
+            let before = format!("{err:?}");
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, false);
+            assert_eq!(format!("{after:?}"), before);
+        }
+        let unchanged = [
+            validate_upstream_status(StatusCode::NOT_FOUND, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_REQUEST, url).unwrap_err(),
+            validate_upstream_status(StatusCode::TOO_MANY_REQUESTS, url).unwrap_err(),
+            validate_upstream_status(StatusCode::BAD_GATEWAY, url).unwrap_err(),
+            AppError::Storage("Token endpoint x returned status 401 Unauthorized".into()),
+        ];
+        for err in unchanged {
+            assert!(upstream_request_auth_refusal(&err).is_none(), "{err:?}");
+            let before = format!("{err:?}");
+            let after = oci_registry_auth_error(err, Uuid::new_v4(), url, true);
+            assert_eq!(format!("{after:?}"), before);
+        }
+    }
+
+    /// #4518: the registry-auth WARN is sampled per Remote: one per
+    /// interval, the rest counted and reported on the next one.
+    #[test]
+    fn test_admit_sampled_warn_4518() {
+        let mut state = HashMap::new();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Instant::now();
+        let every = Duration::from_secs(60);
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), Some(0));
+        assert_eq!(admit_sampled_warn(&mut state, a, t0, every, 8), None);
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(admit_sampled_warn(&mut state, a, later, every, 8), None);
+        // Another Remote is not throttled by the first.
+        assert_eq!(admit_sampled_warn(&mut state, b, later, every, 8), Some(0));
+        let next = t0 + every;
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), Some(2));
+        assert_eq!(admit_sampled_warn(&mut state, a, next, every, 8), None);
+        // Bounded: a full table is reset rather than grown.
+        let mut full = HashMap::new();
+        assert_eq!(admit_sampled_warn(&mut full, a, t0, every, 1), Some(0));
+        assert_eq!(admit_sampled_warn(&mut full, b, t0, every, 1), Some(0));
+        assert_eq!(full.len(), 1);
     }
 
     // -- #3606: the token cache is scoped to the credential ------------------
@@ -15885,6 +18547,440 @@ mod tests {
         ));
     }
 
+    // -- #3591: explicitly trusted cross-origin realms ------------------------
+    //
+    // The per-repository `oci_trusted_bearer_realms` allowlist is the ONLY
+    // cross-origin allowance. These pin the decision `exchange_bearer_then`
+    // acts on: same origin forwards, a listed exact https origin forwards,
+    // everything else (unlisted, http downgrade, lookalike hosts, port
+    // mismatch) withholds the credentials exactly as before.
+
+    fn trusted(origins: &[&str]) -> Vec<String> {
+        origins.iter().map(|o| o.to_string()).collect()
+    }
+
+    const DOCKER_HUB_MANIFEST: &str =
+        "https://registry-1.docker.io/v2/acme/private/manifests/latest";
+
+    #[test]
+    fn test_realm_forwarding_same_origin_needs_no_allowlist() {
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://registry.example.com/token",
+                "https://registry.example.com/v2/x",
+                &[]
+            ),
+            RealmCredentialForwarding::SameOrigin
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_trusted_cross_origin_realm() {
+        // Docker Hub private repositories: the documented configuration.
+        let docker = trusted(&["https://auth.docker.io"]);
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &docker
+            ),
+            RealmCredentialForwarding::TrustedRealm
+        );
+        // Split-host GitLab, with an explicit non-default port.
+        let gitlab = trusted(&["https://gitlab.example.com:8443"]);
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://gitlab.example.com:8443/jwt/auth",
+                "https://registry.example.com/v2/group/project/manifests/1",
+                &gitlab
+            ),
+            RealmCredentialForwarding::TrustedRealm
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_untrusted_cross_origin_realm() {
+        // Nothing is trusted implicitly: the Docker Hub pair without an
+        // allowlist entry keeps the GHSA-78h6-3wp8-2542 behavior.
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &[]
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+        // An allowlist for a different origin does not help an attacker realm.
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "https://attacker.example/token",
+                DOCKER_HUB_MANIFEST,
+                &trusted(&["https://auth.docker.io"])
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_http_realm_even_when_host_is_trusted() {
+        assert_eq!(
+            UpstreamClient::realm_credential_forwarding(
+                "http://auth.docker.io/token",
+                DOCKER_HUB_MANIFEST,
+                &trusted(&["https://auth.docker.io"])
+            ),
+            RealmCredentialForwarding::Withheld
+        );
+    }
+
+    #[test]
+    fn test_realm_forwarding_withholds_lookalike_hosts_and_ports() {
+        let list = trusted(&["https://auth.docker.io"]);
+        for realm in [
+            "https://auth.docker.io.attacker.example/token",
+            "https://evilauth.docker.io/token",
+            "https://sub.auth.docker.io/token",
+            "https://auth.docker.io@attacker.example/token",
+            "https://auth-docker.io/token",
+            "https://auth.docker.io:8443/token",
+            "not a url",
+        ] {
+            assert_eq!(
+                UpstreamClient::realm_credential_forwarding(realm, DOCKER_HUB_MANIFEST, &list),
+                RealmCredentialForwarding::Withheld,
+                "{realm} must not receive the upstream credentials"
+            );
+        }
+    }
+
+    /// End-to-end over the seam `exchange_bearer_then` calls: the stored
+    /// per-repository allowlist decides whether the configured credentials
+    /// follow a cross-origin realm (#3591), and nothing else does.
+    #[tokio::test]
+    async fn test_realm_credentials_reads_the_repository_allowlist_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::save_trusted_realms;
+        use crate::services::upstream_auth::UpstreamAuthType;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let client = UpstreamClient::new(pool.clone(), Client::new());
+        let creds = Some(UpstreamAuthType::Basic {
+            username: "svc".to_string(),
+            password: "s3cret".to_string(),
+        });
+        let realm = "https://auth.docker.io/token";
+        // Each call returns the forwarded credentials and the INFO+ log lines
+        // it emitted, so the security logging is pinned alongside the decision.
+        let call = |realm: &'static str, auth: Option<UpstreamAuthType>| {
+            let client = &client;
+            async move {
+                let capture = tdh::LogCapture::default();
+                let guard = capture.install(tracing::Level::INFO);
+                let out = client
+                    .realm_credentials(realm, DOCKER_HUB_MANIFEST, repo_id, &auth)
+                    .await
+                    .expect("realm_credentials");
+                drop(guard);
+                (out, capture.text())
+            }
+        };
+        let get = |realm: &'static str, auth: Option<UpstreamAuthType>| {
+            let call = &call;
+            async move { call(realm, auth).await.0 }
+        };
+
+        // No allowlist: cross-origin realm gets no credentials (GHSA-78h6),
+        // and the security WARN names the setting.
+        let (out, logs) = call(realm, creds.clone()).await;
+        assert!(out.is_none());
+        assert!(
+            logs.contains("WARN")
+                && logs.contains("WITHOUT")
+                && logs.contains("oci_trusted_bearer_realms"),
+            "withheld credentials must log the security warning: {logs}"
+        );
+        // Anonymous remotes: nothing withheld, so no WARN (debug only).
+        let (out, logs) = call(realm, None).await;
+        assert!(out.is_none());
+        assert!(
+            !logs.contains("WARN"),
+            "anonymous remote must not warn: {logs}"
+        );
+        // Same origin forwards without any allowlist.
+        assert!(get("https://registry-1.docker.io/token", creds.clone()).await == creds);
+
+        save_trusted_realms(&pool, repo_id, &trusted(&["https://auth.docker.io"]))
+            .await
+            .expect("save allowlist");
+        // Trusted: forwarded, with an INFO audit line and no warning.
+        let (out, logs) = call(realm, creds.clone()).await;
+        assert!(out == creds);
+        assert!(
+            logs.contains("INFO") && logs.contains("forwarding") && !logs.contains("WARN"),
+            "trusted forwarding must leave an INFO audit line: {logs}"
+        );
+        // Still withheld: http downgrade, lookalike host.
+        assert!(get("http://auth.docker.io/token", creds.clone())
+            .await
+            .is_none());
+        assert!(get(
+            "https://auth.docker.io.attacker.example/token",
+            creds.clone()
+        )
+        .await
+        .is_none());
+        // Anonymous remotes stay anonymous even when the realm is listed.
+        assert!(get(realm, None).await.is_none());
+
+        // Clearing restores the strict default.
+        save_trusted_realms(&pool, repo_id, &[])
+            .await
+            .expect("clear");
+        assert!(get(realm, creds.clone()).await.is_none());
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #4518 follow-up (W6 verify FAIL 2): repeated pulls through a Remote
+    /// with wrong credentials log each upstream-auth `security` WARN once
+    /// per Remote per interval, not once per pull: the token-service
+    /// rejection of credentials actually sent (#4453, same-origin realm) and
+    /// the cross-origin "credentials withheld" line (#3591), through the real
+    /// `exchange_bearer_then` wiring. With the credentials withheld, the
+    /// refused anonymous token is not an auth failure at all (#4527).
+    #[tokio::test]
+    async fn test_upstream_auth_security_warns_are_sampled_per_remote_4518() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (registry, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let token_listener = std::net::TcpListener::bind((registry.address().ip(), 0))
+            .expect("bind token-service listener");
+        let token_service = MockServer::builder().listener(token_listener).start().await;
+        // Both token services refuse.
+        for server in [&registry, &token_service] {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(server)
+                .await;
+        }
+        let challenge = |realm_origin: String| {
+            ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!("Bearer realm=\"{realm_origin}/token\",service=\"registry\"").as_str(),
+            )
+        };
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/cross/manifests/1"))
+            .respond_with(challenge(token_service.uri()))
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/same/manifests/1"))
+            .respond_with(challenge(registry.uri()))
+            .mount(&registry)
+            .await;
+
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+            // The registry is this Remote's configured upstream, so its
+            // credentials belong there (GHSA-24rf-2gv2-j47c).
+            point_remote_at(&pool, repo_id, &registry.uri()).await;
+            save_upstream_auth(
+                &pool,
+                repo_id,
+                "basic",
+                &build_credentials_json(&UpstreamAuthType::Basic {
+                    username: "svc-sampled".to_string(),
+                    password: Uuid::new_v4().simple().to_string(),
+                }),
+            )
+            .await
+            .expect("save upstream auth");
+            repos.push((repo_id, storage_dir));
+        }
+
+        let mut logs = Vec::new();
+        let mut outcomes = Vec::new();
+        for ((repo_id, storage_dir), image) in repos.iter().zip(["cross", "same"]) {
+            let proxy =
+                tdh::build_proxy_service_with_fs(pool.clone(), storage_dir.to_str().unwrap());
+            let url = format!("{}/v2/acme/{image}/manifests/1", registry.uri());
+            let capture = tdh::LogCapture::default();
+            let guard = capture.install(tracing::Level::INFO);
+            for _ in 0..3 {
+                let result = proxy.fetch_from_upstream(&url, *repo_id, 1 << 20).await;
+                let Err(err) = result else {
+                    panic!("{image}: the token service refuses");
+                };
+                outcomes.push((image, format!("{err:?}")));
+            }
+            drop(guard);
+            logs.push(capture.text());
+        }
+        for (repo_id, storage_dir) in &repos {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .ok();
+            let _ = std::fs::remove_dir_all(storage_dir);
+        }
+
+        let count = |logs: &str, needle: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("security") && l.contains(needle))
+                .count()
+        };
+        let (cross, same) = (&logs[0], &logs[1]);
+        // Cross-origin realm: credentials withheld (one sampled WARN across
+        // three pulls); the anonymous token request is then refused, which is
+        // not a credentials problem (#4527): INFO only, and a miss.
+        assert_eq!(
+            count(cross, "WITHOUT the upstream's Basic credentials"),
+            1,
+            "{cross}"
+        );
+        assert_eq!(count(cross, "token service rejected"), 0, "{cross}");
+        assert!(
+            cross.contains("refused an anonymous token request"),
+            "{cross}"
+        );
+        for (image, err) in &outcomes {
+            let auth = err.starts_with("UpstreamAuth");
+            assert_eq!(auth, *image == "same", "{image}: {err}");
+        }
+        // Same-origin realm: credentials sent and refused, once.
+        assert_eq!(count(same, "token service rejected"), 1, "{same}");
+        assert_eq!(
+            count(same, "WITHOUT the upstream's Basic credentials"),
+            0,
+            "{same}"
+        );
+        assert!(same.contains("credentials_sent=true"), "{same}");
+    }
+
+    /// End to end through `fetch_from_upstream` (pins the call site in
+    /// `exchange_bearer_then`): a credentialed remote whose registry names a
+    /// cross-origin realm that is NOT in its allowlist must request the token
+    /// with no `Authorization` header, while the registry itself still gets
+    /// the Basic credentials. Two non-loopback wiremock origins (different
+    /// ports) stand in for registry and token service. The trusted-forwarding
+    /// counterpart cannot run here: trusted entries are https-only and
+    /// wiremock serves http, so that side is pinned by
+    /// `test_realm_credentials_reads_the_repository_allowlist_db`.
+    #[tokio::test]
+    async fn test_fetch_from_upstream_withholds_credentials_from_unlisted_realm_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::oci_trusted_realms::save_trusted_realms;
+        use crate::services::upstream_auth::{
+            build_credentials_json, save_upstream_auth, UpstreamAuthType,
+        };
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (registry, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let token_listener = std::net::TcpListener::bind((registry.address().ip(), 0))
+            .expect("bind token-service listener");
+        let token_service = MockServer::builder().listener(token_listener).start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "anon-token",
+            })))
+            .mount(&token_service)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/app/manifests/1"))
+            .and(header("authorization", "Bearer anon-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"manifest".as_ref()))
+            .with_priority(1)
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acme/app/manifests/1"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                format!(
+                    "Bearer realm=\"{}/token\",service=\"registry\",scope=\"repository:acme/app:pull\"",
+                    token_service.uri()
+                )
+                .as_str(),
+            ))
+            .with_priority(10)
+            .mount(&registry)
+            .await;
+
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        // The registry is this Remote's configured upstream, so its
+        // credentials belong there (GHSA-24rf-2gv2-j47c).
+        point_remote_at(&pool, repo_id, &registry.uri()).await;
+        save_upstream_auth(
+            &pool,
+            repo_id,
+            "basic",
+            &build_credentials_json(&UpstreamAuthType::Basic {
+                username: "svc".to_string(),
+                password: "s3cret".to_string(),
+            }),
+        )
+        .await
+        .expect("save upstream auth");
+        // An allowlist that does not name the token service.
+        save_trusted_realms(&pool, repo_id, &trusted(&["https://auth.docker.io"]))
+            .await
+            .expect("save allowlist");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), storage_dir.to_str().unwrap());
+        let url = format!("{}/v2/acme/app/manifests/1", registry.uri());
+        let fetched = proxy.fetch_from_upstream(&url, repo_id, 1 << 20).await;
+
+        let token_requests = token_service.received_requests().await.expect("recorded");
+        let registry_requests = registry.received_requests().await.expect("recorded");
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let fetched = fetched.expect("anonymous token exchange must complete the fetch");
+        assert_eq!(fetched.content.as_ref(), b"manifest");
+        assert_eq!(token_requests.len(), 1, "exactly one token exchange");
+        assert!(
+            token_requests[0].headers.get("authorization").is_none(),
+            "an unlisted cross-origin realm must NOT receive the upstream credentials"
+        );
+        assert!(
+            registry_requests[0]
+                .headers
+                .get("authorization")
+                .is_some_and(|v| v.to_str().unwrap_or("").starts_with("Basic ")),
+            "the registry itself is same-origin and still gets the Basic credentials"
+        );
+    }
+
     #[tokio::test]
     async fn test_obtain_bearer_token_attaches_basic_credentials_only_when_given() {
         use wiremock::matchers::{method, path};
@@ -15993,7 +19089,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/token"))
-            .respond_with(ResponseTemplate::new(403))
+            .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
 
@@ -16004,10 +19100,12 @@ mod tests {
         let err = client
             .obtain_bearer_token(&realm, "", "", &None, &client.http_client)
             .await
-            .expect_err("a 403 from the token endpoint must surface as an error");
+            .expect_err("a 404 from the token endpoint must surface as an error");
+        // 401/403 are upstream auth failures (#4453, tested separately); any
+        // other non-2xx status stays a Storage error.
         assert!(
             matches!(err, AppError::Storage(_)),
-            "non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
+            "non-auth non-2xx token endpoint status maps to AppError::Storage, got {err:?}",
         );
     }
 
@@ -16557,6 +19655,256 @@ mod tests {
         assert!(matches!(err, AppError::ServiceUnavailable(_)), "{err:?}");
     }
 
+    // -----------------------------------------------------------------------
+    // #3912: Package Age Policy on the streaming path — the release-date
+    // window must be honoured against the streaming response's own
+    // `Last-Modified`, and a held entry must be cached under its hold (not
+    // re-fetched per poll) with a releasable catalog identity.
+    // -----------------------------------------------------------------------
+
+    /// A remote Repository backed by a REAL DB row (so the quarantine config
+    /// lookups in `repository_config` resolve), with `upstream_url` pointed at
+    /// the wiremock server. Returns the model value the proxy calls take.
+    async fn quarantined_remote_repo(
+        pool: &PgPool,
+        upstream: &str,
+        storage_path: &str,
+        duration_minutes: i64,
+    ) -> Repository {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(pool, "remote", "generic").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("point upstream_url at wiremock");
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'quarantine_enabled', 'true'), \
+                    ($1, 'quarantine_duration_minutes', $2)",
+        )
+        .bind(repo_id)
+        .bind(duration_minutes.to_string())
+        .execute(pool)
+        .await
+        .expect("enable quarantine config");
+        crate::services::quarantine_service::invalidate_config_cache(repo_id);
+        let mut repo = wiremock_remote_repo(&repo_key, upstream, storage_path);
+        repo.id = repo_id;
+        repo
+    }
+
+    /// Read the committed cache sidecar from the filesystem backend, polling
+    /// briefly: the streaming tee commits it from a background writer task.
+    async fn read_sidecar(
+        tmp: &std::path::Path,
+        repo_key: &str,
+        path: &str,
+    ) -> Option<CacheMetadata> {
+        let sidecar = tmp.join(format!("proxy-cache/{repo_key}/{path}/__cache_meta__.json"));
+        for _ in 0..100 {
+            if let Ok(json) = std::fs::read(&sidecar) {
+                if let Ok(meta) = serde_json::from_slice::<CacheMetadata>(&json) {
+                    return Some(meta);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// A catalog row's quarantine columns as observed by [`read_catalog_hold`]
+    /// (a named pair, not a nested `Option` tuple).
+    struct CatalogHold {
+        quarantine_until: Option<DateTime<Utc>>,
+        quarantine_released_at: Option<DateTime<Utc>>,
+    }
+
+    /// Raw `proxy_cache_artifacts` hold columns as read by [`read_catalog_hold`].
+    type HoldRow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+    /// Poll for the catalog row's quarantine columns. The tee's writer task
+    /// commits the catalog upsert AFTER the sidecar put, so a read right after
+    /// the sidecar appears can still miss the row.
+    async fn read_catalog_hold(pool: &PgPool, repo_id: Uuid, path: &str) -> Option<CatalogHold> {
+        for _ in 0..100 {
+            let row: Option<HoldRow> = sqlx::query_as(
+                "SELECT quarantine_until, quarantine_released_at FROM proxy_cache_artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .expect("catalog hold query");
+            if let Some((quarantine_until, quarantine_released_at)) = row {
+                return Some(CatalogHold {
+                    quarantine_until,
+                    quarantine_released_at,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// A package released upstream LONG before the hold window must be served
+    /// on first fetch even with the policy on — before #3912 the streaming
+    /// path refused it outright (the release date never reached the hold
+    /// computation).
+    #[tokio::test]
+    async fn test_streaming_quarantine_serves_package_older_than_window() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/old.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .set_body_bytes(b"old-package-body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-qold-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let repo = quarantined_remote_repo(&pool, &server.uri(), tmp.to_str().unwrap(), 60).await;
+
+        let result = proxy.fetch_artifact_streaming(&repo, "pkg/old.bin").await;
+        let served = result.expect(
+            "a package released years before the 60-minute window must be served on first fetch",
+        );
+        assert_eq!(drain_stream(served.body).await, b"old-package-body");
+
+        // The cache entry records the (already-elapsed) hold for audit parity
+        // with the buffered path, and the catalog row mirrors it.
+        let meta = read_sidecar(&tmp, &repo.key, "pkg/old.bin")
+            .await
+            .expect("the streamed body must be cached with its sidecar");
+        let until = meta
+            .quarantine_until
+            .expect("an enabled policy records the hold timestamp");
+        assert!(
+            until <= Utc::now(),
+            "a 2015 release date yields an elapsed hold, not a future one: {until}"
+        );
+        let hold = read_catalog_hold(&pool, repo.id, "pkg/old.bin")
+            .await
+            .expect("catalog row for the cached object");
+        let db_until = hold.quarantine_until;
+        // Postgres `timestamptz` stores microseconds while the sidecar JSON
+        // keeps nanoseconds, so compare at second precision.
+        assert_eq!(
+            db_until.map(|d| d.timestamp()),
+            Some(until.timestamp()),
+            "the catalog row mirrors the sidecar hold (#3912)"
+        );
+
+        tdh::cleanup(&pool, repo.id, repo.id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A package released upstream INSIDE the hold window is refused with 409
+    /// — but the body is still cached under its hold, so the polling client
+    /// never re-fetches upstream, and the catalog row carries the releasable
+    /// hold (#3912).
+    #[tokio::test]
+    async fn test_streaming_quarantine_holds_fresh_package_and_caches_it() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Released "now": comfortably inside a 60-minute window.
+        let released_now = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        Mock::given(method("GET"))
+            .and(path("/pkg/fresh.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", released_now.as_str())
+                    .set_body_bytes(b"fresh-package-body".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-qfresh-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let repo = quarantined_remote_repo(&pool, &server.uri(), tmp.to_str().unwrap(), 60).await;
+
+        let err = proxy
+            .fetch_artifact_streaming(&repo, "pkg/fresh.bin")
+            .await
+            .expect_err("a package inside the hold window must be refused");
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "the hold refusal is a 409, got {err:?}"
+        );
+
+        // Cache-but-hold: the background drain commits the body + sidecar
+        // under the hold.
+        let meta = read_sidecar(&tmp, &repo.key, "pkg/fresh.bin")
+            .await
+            .expect("the held entry must still be cached (cache-but-hold)");
+        let until = meta
+            .quarantine_until
+            .expect("the hold is recorded on the sidecar");
+        assert!(until > Utc::now(), "the hold is in the future: {until}");
+        let cached_body = std::fs::read(tmp.join(format!(
+            "proxy-cache/{}/pkg/fresh.bin/__content__",
+            repo.key
+        )))
+        .expect("the held body is cached");
+        assert_eq!(cached_body, b"fresh-package-body");
+
+        // The catalog row carries the same hold — the releasable identity.
+        let hold = read_catalog_hold(&pool, repo.id, "pkg/fresh.bin")
+            .await
+            .expect("catalog row for the held object");
+        let db_until = hold.quarantine_until;
+        let db_released = hold.quarantine_released_at;
+        assert_eq!(
+            db_until.map(|d| d.timestamp()),
+            Some(until.timestamp()),
+            "the catalog row mirrors the sidecar hold (second precision; \
+             timestamptz truncates the nanoseconds the sidecar keeps)"
+        );
+        assert!(db_released.is_none());
+
+        // A poll during the window is refused by the SIDECAR, without any
+        // second upstream fetch.
+        let err = proxy
+            .fetch_artifact_streaming(&repo, "pkg/fresh.bin")
+            .await
+            .expect_err("a held entry keeps refusing until the window elapses");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+        let upstream_hits = server
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .len();
+        assert_eq!(
+            upstream_hits, 1,
+            "the second refusal must come from the cached hold, not a re-fetch"
+        );
+
+        tdh::cleanup(&pool, repo.id, repo.id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// PyPI-shaped split (#895 follow-up): the upstream download URL
     /// (files.pythonhosted.org-style `packages/...` path) differs from the
     /// stable cache key (`simple/{project}/{file}`). The streaming leader
@@ -17033,6 +20381,78 @@ mod tests {
         assert_eq!(&b2[..], b"tarball", "cached bytes must match upstream");
     }
 
+    /// #4455: a buffered proxy fetch runs in a `proxy_fetch` phase span under
+    /// the request span, the upstream `CLIENT` span sits inside it, and the
+    /// cache lookup's outcome lands on the request span (last write wins:
+    /// the second, cached fetch is a `hit`).
+    #[tokio::test]
+    async fn test_buffered_fetch_traces_phase_span_and_cache_outcome() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::request_span::{with_request_span, CACHE_OUTCOME_FIELD};
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use tracing::Instrument;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dl/traced.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball".as_ref()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let tmp = std::env::temp_dir().join(format!("traced-fetch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("traced-fetch", &server.uri(), tmp.to_str().unwrap());
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let request = axum::http::Request::builder().uri("/x").body(()).unwrap();
+        let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
+        with_request_span(span.clone(), async {
+            for _ in 0..2 {
+                proxy
+                    .fetch_artifact_with_cache_path(&repo, "dl/traced.tgz", "dl/traced.tgz")
+                    .await
+                    .expect("fetch (upstream, then cache)");
+            }
+        })
+        .instrument(span)
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let root = exported.one("http_request");
+        assert_eq!(
+            attr(&root, CACHE_OUTCOME_FIELD),
+            Some(opentelemetry::Value::from("hit"))
+        );
+        let phases = exported.named("proxy_fetch");
+        assert_eq!(phases.len(), 2, "one proxy_fetch span per fetch");
+        for phase in &phases {
+            assert_eq!(phase.parent_span_id, root.span_context.span_id());
+            assert_eq!(
+                attr(phase, "artifact_keeper.repository.key"),
+                Some(opentelemetry::Value::from("traced-fetch"))
+            );
+            assert_eq!(
+                attr(phase, "artifact_keeper.proxy.mode"),
+                Some(opentelemetry::Value::from("buffered"))
+            );
+        }
+        let upstream = exported.one("GET");
+        assert_eq!(upstream.span_kind, opentelemetry::trace::SpanKind::Client);
+        assert!(
+            phases
+                .iter()
+                .any(|p| p.span_context.span_id() == upstream.parent_span_id),
+            "the upstream CLIENT span is a child of a proxy_fetch span"
+        );
+    }
+
     // -- parse_bearer_challenge: unquoted-value and trailing branches --------
 
     #[test]
@@ -17151,6 +20571,302 @@ mod tests {
             std::fs::create_dir_all(full.parent().unwrap()).unwrap();
             std::fs::write(&full, &bytes).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn github_mirror_expired_assets_revalidate_and_refresh() {
+        check_github_mirror_refresh(false).await;
+    }
+
+    #[tokio::test]
+    async fn github_mirror_streaming_assets_revalidate_and_refresh() {
+        check_github_mirror_refresh(true).await;
+    }
+
+    async fn fetch_github_mirror_test_body(
+        proxy: &ProxyService,
+        repo: &Repository,
+        asset: &str,
+        streaming: bool,
+    ) -> Bytes {
+        if streaming {
+            drain_stream(
+                proxy
+                    .fetch_artifact_streaming(repo, asset)
+                    .await
+                    .unwrap()
+                    .body,
+            )
+            .await
+            .into()
+        } else {
+            proxy
+                .fetch_artifact_with_cache_path(repo, asset, asset)
+                .await
+                .unwrap()
+                .0
+        }
+    }
+
+    async fn check_github_mirror_refresh(streaming: bool) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let asset = "owner/repo/releases/download/v1/asset.tar.gz";
+        for format in [
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            for (status, validator) in [
+                (304, Some("\"v1\"")),
+                (200, Some("\"v1\"")),
+                (200, None),
+                (503, Some("\"v1\"")),
+            ] {
+                let server = MockServer::start().await;
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path().to_str().unwrap();
+                let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+                let key = format!("github-{}", Uuid::new_v4());
+                let repo = wiremock_remote_repo_fmt(&key, &server.uri(), root, format.clone());
+                if validator.is_some() {
+                    Mock::given(method("HEAD"))
+                        .and(path(format!("/{asset}")))
+                        .and(header("if-none-match", "\"v1\""))
+                        .respond_with(ResponseTemplate::new(status).insert_header("etag", "\"v2\""))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                }
+                let changed = status == 200;
+                Mock::given(method("GET"))
+                    .and(path(format!("/{asset}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("etag", "\"v2\"")
+                            .set_body_bytes(b"replacement".as_ref()),
+                    )
+                    .expect(if changed { 1 } else { 0 })
+                    .mount(&server)
+                    .await;
+                prime_stale_cache_entry(root, &key, asset, b"original", validator);
+                let body = fetch_github_mirror_test_body(&proxy, &repo, asset, streaming).await;
+                assert_eq!(
+                    &body[..],
+                    if changed {
+                        &b"replacement"[..]
+                    } else {
+                        &b"original"[..]
+                    }
+                );
+                let meta_key =
+                    ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), &key, asset)
+                        .unwrap();
+                let metadata_path = tmp.path().join(meta_key);
+                let read_metadata = || -> CacheMetadata {
+                    serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap()
+                };
+                if streaming && changed {
+                    // The primed sidecar already exists, so existence/size alone
+                    // cannot prove that the tee committed the replacement.
+                    let checksum = StorageService::calculate_hash(&body);
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while read_metadata().checksum_sha256 != checksum {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("replacement sidecar committed");
+                }
+                let meta = read_metadata();
+                if status == 503 {
+                    assert!(
+                        meta.expires_at < Utc::now(),
+                        "serving stale must not reset freshness"
+                    );
+                } else {
+                    let remaining = (meta.expires_at - Utc::now()).num_seconds();
+                    assert!((cache_classifier::GITHUB_RELEASE_TTL_SECS - 10
+                        ..=cache_classifier::GITHUB_RELEASE_TTL_SECS)
+                        .contains(&remaining), "format={format:?}, streaming={streaming}, status={status}, remaining={remaining}");
+                    // The new finite lifetime absorbs another request without a probe.
+                    assert_eq!(
+                        fetch_github_mirror_test_body(&proxy, &repo, asset, streaming).await,
+                        body
+                    );
+                }
+                server.verify().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn github_mirror_cache_ttl_override_is_respected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "github").await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), tmp.path().to_str().unwrap());
+        let mut repo = wiremock_remote_repo_fmt(
+            &fx.repo_key,
+            "https://github.com",
+            tmp.path().to_str().unwrap(),
+            RepositoryFormat::Github,
+        );
+        repo.id = fx.repo_id;
+        let asset = "owner/repo/releases/download/v1/asset";
+        // #3658: the API release-by-tag lookup shares the release lifetime.
+        let tag_lookup = "repos/owner/repo/releases/tags/v1";
+        assert_eq!(
+            proxy.cache_ttl_for_path(&repo, asset).await,
+            cache_classifier::GITHUB_RELEASE_TTL_SECS
+        );
+        assert_eq!(
+            proxy.cache_ttl_for_path(&repo, tag_lookup).await,
+            cache_classifier::GITHUB_RELEASE_TTL_SECS
+        );
+        sqlx::query("INSERT INTO repository_config (repository_id, key, value) VALUES ($1, 'cache_ttl_secs', '60') ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value")
+            .bind(repo.id).execute(&fx.pool).await.unwrap();
+        proxy.invalidate_cache_ttl_override(repo.id).await;
+        // Precedence: the operator override wins on every mutable path.
+        assert_eq!(proxy.cache_ttl_for_path(&repo, asset).await, 60);
+        assert_eq!(proxy.cache_ttl_for_path(&repo, tag_lookup).await, 60);
+        fx.teardown().await;
+    }
+
+    /// Upsert a repository's `cache_ttl_secs` row and drop the proxy's
+    /// memoised copy, the two things `PUT /cache-ttl` does.
+    async fn set_ttl_override(proxy: &ProxyService, pool: &PgPool, repo_id: Uuid, secs: i64) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', $2) ON CONFLICT (repository_id, key) \
+             DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(repo_id)
+        .bind(secs.to_string())
+        .execute(pool)
+        .await
+        .expect("store cache_ttl_secs");
+        proxy.invalidate_cache_ttl_override(repo_id).await;
+    }
+
+    /// #3832 regression: lowering a remote's TTL is retroactive. An index
+    /// cached two hours ago under a 30-day TTL (stamped `expires_at` four
+    /// weeks out) is fresh while the TTL is 30 days, but once the TTL is
+    /// lowered to 300 s every gate — the buffered read, the presign probe and
+    /// the key-only read — treats it as expired, the read revalidates
+    /// upstream, and the 304 re-anchors it so the next read is fresh again
+    /// without another upstream request.
+    ///
+    /// Revert-proof: with the stamped `expires_at` trusted (pre-#3832) the
+    /// HEAD is never sent and `server.verify()` fails on `expect(1)`.
+    #[tokio::test]
+    async fn lowering_the_cache_ttl_applies_to_already_cached_entries_3832() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const INDEX: &str = "simple/ruff/index.v1+json";
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // The one revalidation the lowered TTL must trigger. No GET is
+        // mounted: the cached body must be served after the 304.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{INDEX}")))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), root);
+        let mut repo =
+            wiremock_remote_repo_fmt(&fx.repo_key, &server.uri(), root, RepositoryFormat::Generic);
+        repo.id = fx.repo_id;
+
+        let now = Utc::now();
+        let body = b"index-cached-under-30-days";
+        let cached_at = now - chrono::Duration::hours(2);
+        let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at,
+            upstream_etag: Some("\"v1\"".to_string()),
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: cached_at + chrono::Duration::days(30),
+            content_type: Some("application/json".to_string()),
+            size_bytes: body.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(&Bytes::copy_from_slice(body)),
+        };
+        write_primed_cache_files(root, &fx.repo_key, INDEX, Some(body), &metadata);
+
+        // 30-day TTL: fresh on every gate, upstream untouched.
+        set_ttl_override(&proxy, &fx.pool, fx.repo_id, 30 * 86_400).await;
+        let fresh_under_old_ttl = proxy.is_cache_fresh(&fx.repo_key, INDEX).await;
+        let reported_under_old_ttl = proxy
+            .effective_cache_expires_at(&fx.repo_key, INDEX, &metadata)
+            .await;
+        let fresh_body = proxy
+            .fetch_artifact_with_cache_path(&repo, INDEX, INDEX)
+            .await
+            .expect("fresh read");
+
+        // Lower it to 300 s: the entry is 2 h old, so it is expired now.
+        set_ttl_override(&proxy, &fx.pool, fx.repo_id, 300).await;
+        let fresh_after_lowering = proxy.is_cache_fresh(&fx.repo_key, INDEX).await;
+        let reported_after_lowering = proxy
+            .effective_cache_expires_at(&fx.repo_key, INDEX, &metadata)
+            .await;
+        let by_path_after_lowering = proxy
+            .get_cached_artifact_by_path(&fx.repo_key, INDEX)
+            .await
+            .expect("key-only read");
+        let revalidated = proxy
+            .fetch_artifact_with_cache_path(&repo, INDEX, INDEX)
+            .await
+            .expect("lowered TTL must revalidate and serve the 304'd body");
+        // The 304 re-anchored the entry: fresh again, no second HEAD.
+        let fresh_after_304 = proxy.is_cache_fresh(&fx.repo_key, INDEX).await;
+        let again = proxy
+            .fetch_artifact_with_cache_path(&repo, INDEX, INDEX)
+            .await
+            .expect("re-anchored read");
+
+        fx.teardown().await;
+        server.verify().await;
+        assert!(
+            fresh_under_old_ttl,
+            "fresh under the TTL it was written with"
+        );
+        assert_eq!(reported_under_old_ttl, metadata.expires_at);
+        assert_eq!(
+            reported_after_lowering,
+            cached_at + chrono::Duration::seconds(300),
+            "the reported expiry must be the one the read path enforces"
+        );
+        assert_eq!(&fresh_body.0[..], body);
+        assert!(
+            !fresh_after_lowering,
+            "presign probe must not hand out an entry the lowered TTL expired"
+        );
+        assert!(
+            by_path_after_lowering.is_none(),
+            "key-only read must treat the entry as expired under the lowered TTL"
+        );
+        assert_eq!(&revalidated.0[..], body);
+        assert!(fresh_after_304, "the 304 must re-anchor the entry");
+        assert_eq!(&again.0[..], body);
     }
 
     #[tokio::test]
@@ -19040,6 +22756,55 @@ mod tests {
         );
     }
 
+    /// #4013: a re-enter drops a memoised MISS (another replica may have just
+    /// filled the shared cache) but keeps a memoised hit.
+    #[tokio::test]
+    async fn test_forget_cached_sidecar_miss_drops_only_a_memoised_miss() {
+        let miss = format!(
+            "proxy-cache/{}/_test_/reenter-miss/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let hit = format!(
+            "proxy-cache/{}/_test_/reenter-hit/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let lru = proxy_metadata_lru().await;
+        lru.insert(miss.clone(), None).await;
+        lru.insert(hit.clone(), Some(sample_cache_metadata("kept")))
+            .await;
+        forget_cached_sidecar_miss(&miss).await;
+        forget_cached_sidecar_miss(&hit).await;
+        assert!(
+            lru.get(&miss).await.is_none(),
+            "the stale miss must be re-read from storage on re-enter"
+        );
+        assert!(
+            matches!(lru.get(&hit).await, Some(Some(_))),
+            "a memoised hit is still valid and is kept"
+        );
+        lru.invalidate(&hit).await;
+    }
+
+    /// #4013: the streaming leader's publish signal is the writer's #3335
+    /// registration: absent before, `false` while writing, `true` after.
+    #[tokio::test]
+    async fn test_tee_publish_done_tracks_the_writer_registration() {
+        let key = format!(
+            "proxy-cache/{}/_test_/publish-done/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        assert!(tee_publish_done(&key).is_none());
+        let guard = TeePublishGuard::register(&key);
+        let mut done = tee_publish_done(&key).expect("registered");
+        assert!(!*done.borrow());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), done.wait_for(|d| *d))
+            .await
+            .expect("flips on writer exit")
+            .expect("value observed");
+        assert!(tee_publish_done(&key).is_none(), "deregistered on exit");
+    }
+
     #[tokio::test]
     async fn test_load_cache_metadata_uses_lru_after_first_load() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -19463,12 +23228,75 @@ mod tests {
         });
 
         let metadata = svc
-            .load_cache_metadata_awaiting_publish(&keys.metadata)
+            .load_cache_metadata_awaiting_publish(
+                &keys.metadata,
+                cache_classifier::Mutability::Immutable,
+            )
             .await;
         assert!(
             metadata.is_some(),
             "the reader must observe the sidecar published while it waited (#3335), \
              not the memoised miss"
+        );
+    }
+
+    /// Refill half of #3335: when the key already holds an EXPIRED sidecar
+    /// (memoised in the LRU by the request that triggered the refill) and a
+    /// tail-phase publish is replacing it, the reader must wait for the writer
+    /// and observe the new sidecar — not classify the old one as Stale and go
+    /// upstream a second time. This was the root of the flaky
+    /// `github_mirror_streaming_assets_revalidate_and_refresh` (a second GET
+    /// in the window between the tee's sidecar `put` and its LRU invalidate).
+    #[tokio::test]
+    async fn test_load_cache_metadata_awaiting_publish_replaces_expired_sidecar() {
+        let repo_key = format!("tee-refill-{}", Uuid::new_v4());
+        let keys = CacheKeys::derive(&ProxyCacheScope::unscoped(), &repo_key, "some/artifact.bin")
+            .unwrap();
+        let storage = Arc::new(MutableMapStorage {
+            entries: std::sync::Mutex::new(std::collections::HashMap::from([(
+                keys.metadata.clone(),
+                expired_metadata_bytes(),
+            )])),
+        });
+        let svc = build_proxy_service_with_storage(storage.clone());
+
+        // The refill-triggering request memoises the expired sidecar.
+        let stale = svc.load_cache_metadata(&keys.metadata).await.unwrap();
+        assert!(stale.is_some_and(|m| m.expires_at < Utc::now()));
+
+        let guard = TeePublishGuard::register(&keys.metadata);
+        guard
+            .entry_handle()
+            .tail
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Writer publishes the replacement sidecar, then finishes. It does not
+        // invalidate the LRU: the reader must not depend on winning that race.
+        let writer_storage = storage.clone();
+        let metadata_key = keys.metadata.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            crate::services::storage_service::StorageBackend::put(
+                writer_storage.as_ref(),
+                &metadata_key,
+                fresh_metadata_bytes(),
+            )
+            .await
+            .unwrap();
+            drop(guard);
+        });
+
+        let metadata = svc
+            .load_cache_metadata_awaiting_publish(
+                &keys.metadata,
+                cache_classifier::Mutability::Immutable,
+            )
+            .await
+            .expect("sidecar present");
+        assert!(
+            metadata.expires_at > Utc::now(),
+            "the reader must observe the replacement sidecar published while it \
+             waited, not the memoised expired one"
         );
     }
 
@@ -19618,6 +23446,7 @@ mod tests {
         /// A deployment addressing this bucket under `scope`.
         fn deployment(&self, scope: ProxyCacheScope) -> ProxyService {
             ProxyService::new(test_catalog_pool(), self.storage(), scope)
+                .without_origin_policy_gate()
         }
     }
 
@@ -20078,5 +23907,342 @@ mod tests {
             vec!["mine".to_string()],
             "PyPI simple index advertised another deployment's cached projects"
         );
+    }
+}
+
+/// #840 / #4399: what an upstream filter does to a proxy-cache entry for a
+/// path it refuses.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod upstream_filter_cache_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+
+    /// Write a committed cache entry (body + sidecar) for `path` straight to
+    /// the filesystem store, expiring `expires_in_secs` from now.
+    fn seed_entry(dir: &std::path::Path, repo_key: &str, path: &str, expires_in_secs: i64) {
+        let scope = ProxyCacheScope::unscoped();
+        let body = Bytes::from_static(b"<metadata><versioning/></metadata>");
+        let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            // Filled one minute ago: inside the 5-minute mutable default TTL,
+            // so the #3832 read-time clamp (`min(stamp, cached_at + TTL)`)
+            // leaves the stamped `expires_at` in charge of freshness.
+            cached_at: Utc::now() - chrono::Duration::seconds(60),
+            // A validator, so an unfiltered expired entry WOULD revalidate.
+            upstream_etag: Some("\"etag-840\"".to_string()),
+            storage_etag: None,
+            last_modified: None,
+            quarantine_until: None,
+            negative_cached_until: None,
+            expires_at: Utc::now() + chrono::Duration::seconds(expires_in_secs),
+            content_type: Some("text/xml".to_string()),
+            size_bytes: body.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(&body),
+        };
+        for (key, bytes) in [
+            (
+                ProxyService::cache_storage_key(&scope, repo_key, path).unwrap(),
+                body.to_vec(),
+            ),
+            (
+                ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap(),
+                serde_json::to_vec(&metadata).unwrap(),
+            ),
+        ] {
+            let file = dir.join(key);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+    }
+
+    /// A FRESH entry for a refused path is still served; an EXPIRED one is
+    /// neither revalidated nor served stale-if-error: it answers 404 like a
+    /// miss, on both the buffered and the streaming path, and the upstream
+    /// receives zero requests throughout.
+    #[tokio::test]
+    async fn refused_path_is_served_while_fresh_and_404_once_expired_840() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"etag-840\"")
+                    .set_body_string("<metadata/>"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &upstream.uri(),
+            RepositoryFormat::Maven,
+        );
+        save_upstream_filter(
+            &pool,
+            repo_id,
+            &UpstreamFilter {
+                include_patterns: vec!["^com/fringe/".to_string()],
+                exclude_patterns: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let fresh = "org/acme/fresh/maven-metadata.xml";
+        let expired = "org/acme/expired/maven-metadata.xml";
+        seed_entry(&dir, &repo_key, fresh, 600);
+        seed_entry(&dir, &repo_key, expired, -600);
+        let svc = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+
+        let fresh_buffered = svc.fetch_artifact(&repo, fresh).await;
+        let expired_buffered = svc.fetch_artifact(&repo, expired).await;
+        let expired_streaming = svc.fetch_artifact_streaming(&repo, expired).await;
+        let hits = upstream.received_requests().await.unwrap().len();
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        assert!(
+            fresh_buffered.is_ok(),
+            "a fresh cached entry is served: {:?}",
+            fresh_buffered.err()
+        );
+        assert!(
+            matches!(expired_buffered, Err(AppError::NotFound(_))),
+            "buffered: {:?}",
+            expired_buffered.err()
+        );
+        assert!(
+            matches!(expired_streaming, Err(AppError::NotFound(_))),
+            "streaming: {:?}",
+            expired_streaming.err()
+        );
+        assert_eq!(hits, 0, "a refused path must never reach the upstream");
+    }
+
+    /// #4365 item 3: an ambiguous fetch path is a 400 (`Validation`) on the
+    /// buffered and the streaming fetch, before any upstream request.
+    #[tokio::test]
+    async fn ambiguous_fetch_path_is_refused_before_the_upstream_4365() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("jar"))
+            .mount(&upstream)
+            .await;
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &upstream.uri(),
+            RepositoryFormat::Maven,
+        );
+        let svc = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let mut outcomes = Vec::new();
+        for path in [
+            "org/acme/w/1.0/w-1.0.jar;x.pom",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+        ] {
+            outcomes.push((path, svc.fetch_artifact(&repo, path).await.err()));
+            outcomes.push((path, svc.fetch_artifact_streaming(&repo, path).await.err()));
+        }
+        let hits = upstream.received_requests().await.unwrap().len();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        for (path, err) in outcomes {
+            assert!(
+                matches!(err, Some(AppError::Validation(_))),
+                "{path}: {err:?}"
+            );
+        }
+        assert_eq!(hits, 0, "an ambiguous path must never reach the upstream");
+    }
+}
+
+/// #4365 item 1: the shared `(cache_key, scannable)` helper.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod proxy_serve_key_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_is_the_normalized_path_and_the_decision_is_on_its_file_name() {
+        let is_jar = |f: &str| f.ends_with(".jar");
+        for (path, key, scannable) in [
+            ("a/b/c.jar", "a/b/c.jar", true),
+            ("/a/b/c.jar/", "a/b/c.jar", true),
+            ("//a/b/c.jar//", "a/b/c.jar", true),
+            ("a/b/c.pom", "a/b/c.pom", false),
+            ("a/b/c.pom/", "a/b/c.pom", false),
+            // Nothing to serve as a package.
+            ("", "", false),
+            ("/", "", false),
+            // Ambiguous keys always reach the gate, whatever the name says.
+            ("a/b/c.jar?.pom", "a/b/c.jar?.pom", true),
+            ("a/b/c.jar#.pom", "a/b/c.jar#.pom", true),
+            ("a/b/c.jar;.pom", "a/b/c.jar;.pom", true),
+            ("a/b/c.jar%.pom", "a/b/c.jar%.pom", true),
+            ("a/b/c\t.pom", "a/b/c\t.pom", true),
+            // A valid escape is not ambiguous.
+            ("a/b%20c/d.pom", "a/b%20c/d.pom", false),
+        ] {
+            assert_eq!(
+                proxy_serve_key(path, is_jar),
+                ProxyServeKey {
+                    cache_key: key.to_string(),
+                    scannable
+                },
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            route_package_serve_key("/pkg/-/pkg-1.0.0.tgz"),
+            ProxyServeKey {
+                cache_key: "pkg/-/pkg-1.0.0.tgz".to_string(),
+                scannable: true
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_path_chars() {
+        for ambiguous in [
+            "a?b", "a#b", "a;b", "a%", "a%2", "a%zz", "a%2g", "a\nb", "a\u{7f}b",
+        ] {
+            assert!(has_ambiguous_path_chars(ambiguous), "{ambiguous:?}");
+        }
+        for plain in [
+            "@scope%2Fname",
+            "@scope%2fname/-/name-1.0.0.tgz",
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            "a/b%20c%2Bd/e",
+            "pkg+1.0~rc1.tar.gz",
+            "sha256:abc",
+        ] {
+            assert!(!has_ambiguous_path_chars(plain), "{plain:?}");
+        }
+    }
+}
+
+/// #4365 item 3: reject, do not encode. Every format's legitimate upstream
+/// path shape passes unchanged; a path an upstream could read as another
+/// resource is refused.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod upstream_fetch_path_tests {
+    use super::*;
+
+    #[test]
+    fn legitimate_upstream_paths_pass_unchanged() {
+        for ok in [
+            // npm scoped packument and tarball.
+            "@types%2Fnode",
+            "@types/node/-/node-20.0.0.tgz",
+            // Go module proxy `!`-case escaping.
+            "github.com/!azure/azure-sdk-for-go/@v/v1.0.0.zip",
+            // Helm `urls` entries and index-resolved file URLs are absolute.
+            "https://github.com/org/chart/releases/download/v1/chart-1.0.0.tgz",
+            "https://files.example/pkg.whl?token=a/b#sha256=abc",
+            // Handler-built queries (Ansible, Conan search, OCI tags/list).
+            "api/v3/collections/ns/name/versions/?limit=100&offset=0",
+            "v2/conans/search?q=zlib%2A",
+            "library/alpine/tags/list?n=101&last=3.19",
+            // Maven, PyPI, Cargo, VS Code legacy paths.
+            "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
+            "packages/requests/2.31.0/requests-2.31.0+local~rc1.tar.gz",
+            "api/v1/crates/serde/1.0.0/download",
+            "extensions/Publisher%20Name/My%20Extension/1.0.0%2Bbuild/download",
+            "sha256:0123abcd",
+        ] {
+            assert!(check_upstream_fetch_path(ok).is_ok(), "{ok}");
+        }
+        // The handler-built relative queries, from the handlers' own builders,
+        // with inputs that would put a `/` or a `#` in a naive query.
+        for built in [
+            crate::api::handlers::ansible::upstream_versions_page_path("ns", "name", 3),
+            crate::api::handlers::conan::upstream_search_path("zlib/1.*#rev"),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(100, Some("v1/+build#x")),
+            crate::api::handlers::oci_v2::build_remote_tags_list_path(10, None),
+        ] {
+            assert!(check_upstream_fetch_path(&built).is_ok(), "{built}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_upstream_paths_are_400() {
+        for bad in [
+            "org/acme/w/1.0/w-1.0.jar#/x.pom",
+            "pkg/-/pkg-1.0.0.tgz#",
+            "org/acme/w/1.0/w-1.0.jar;jsessionid=1",
+            "org/acme/w/1.0/w-1.0.jar%",
+            "org/acme/w/1.0/w-1.0.jar%2",
+            "org/acme/w/1.0/w-1.0.jar%zz",
+            "org/acme/w/1.0/w-1.0.ja\tr",
+            "org/acme/w/1.0/w-1.0.ja\u{7f}r",
+            "org/acme/w/1.0/w-1.0.jar?",
+            "org/acme/w/1.0/w-1.0.jar?/../w-1.0.pom",
+            "org/acme/w/1.0/w-1.0.jar\\..\\x.pom",
+            "org/acme/w/1.0/w-1.0.jar ",
+        ] {
+            assert!(
+                matches!(check_upstream_fetch_path(bad), Err(AppError::Validation(_))),
+                "{bad:?}"
+            );
+        }
+    }
+}
+
+/// #4365 item 3 (strict form): what a client may put in a proxied path.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod client_path_tests {
+    use super::*;
+
+    #[test]
+    fn client_paths_with_query_fragment_or_stray_escapes_are_400() {
+        for bad in [
+            "pkg/-/x.tgz?versionId=abc",
+            "x.tgz?acl",
+            "x.tgz#frag",
+            "x.jar;jsessionid=1",
+            "x\\y.jar",
+            "x.jar%",
+            "x.jar%zz",
+            "x\tjar",
+        ] {
+            for allow_spaces in [false, true] {
+                assert!(
+                    matches!(
+                        reject_ambiguous_client_path(bad, allow_spaces),
+                        Err(AppError::Validation(_))
+                    ),
+                    "{bad:?}"
+                );
+            }
+        }
+        // A raw space is refused on format routes, allowed on the generic one.
+        assert!(reject_ambiguous_client_path("my file.txt", false).is_err());
+        assert!(reject_ambiguous_client_path("my file.txt", true).is_ok());
+        for ok in [
+            "@scope/name",
+            "pkg/-/pkg-1.0.0.tgz",
+            "serde",
+            "1.0.0+build.1",
+            "a%2Fb",
+        ] {
+            assert!(reject_ambiguous_client_path(ok, false).is_ok(), "{ok}");
+        }
     }
 }

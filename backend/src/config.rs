@@ -43,6 +43,37 @@ const _: () = assert!(
     DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES < MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
 );
 
+/// Default freshness window for the npm virtual-member negative cache
+/// (#3951).
+pub const DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
+
+/// Default maximum entry count for the npm virtual-member negative cache.
+pub const DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Ceiling for [`Config::npm_virtual_negative_cache_ttl_ms`], tied to the
+/// proxy layer's own negative-cache window
+/// ([`crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS`], 45 s) —
+/// the same reasoning as [`MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`]: the
+/// virtual member walk's entry records "this member did not have the
+/// package", which is weaker than the proxy layer's status-gated upstream
+/// 404, so it must not outlive that window.
+pub const MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 =
+    crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000;
+
+/// Ceiling for [`Config::npm_virtual_negative_cache_max_entries`]. The cap
+/// is the cache's memory bound, and the key holds a caller-supplied package
+/// name on a path an unauthenticated `npm install` reaches, so it stays
+/// bounded: 65 536 is 16x the default and a few tens of MiB.
+pub const MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 65_536;
+
+// Each default must stay strictly inside its ceiling, or the clamp would
+// silently change the behaviour an untouched deployment has today.
+const _: () =
+    assert!(DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS < MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+const _: () = assert!(
+    DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES < MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+);
+
 #[cfg(test)]
 mod test_env {
     //! Thread-local overlay over the process environment, compiled only into
@@ -113,11 +144,93 @@ mod test_env {
 }
 
 /// Read an environment variable and parse it, falling back to a default on missing or invalid values.
+/// `SMTP_TLS_CA_CERT` (path or inline PEM), falling back to the shared
+/// `CUSTOM_CA_CERT_PATH`. Returns the value and the variable it came from.
+fn smtp_tls_ca_cert_from_env() -> Option<(String, &'static str)> {
+    let non_empty = |k: &str| env::var(k).ok().filter(|v| !v.trim().is_empty());
+    non_empty("SMTP_TLS_CA_CERT")
+        .map(|v| (v, "SMTP_TLS_CA_CERT"))
+        .or_else(|| non_empty("CUSTOM_CA_CERT_PATH").map(|v| (v, "CUSTOM_CA_CERT_PATH")))
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Default listen IP for the gRPC and metrics listeners (#2161): every
+/// interface, which is what both listeners hard-coded before they were
+/// configurable.
+pub const DEFAULT_LISTENER_BIND_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// Parse the listen IP for a secondary listener from env var `key` (#2161).
+///
+/// Unset or blank means [`DEFAULT_LISTENER_BIND_IP`]. IPv6 literals are
+/// accepted bare (`::1`) or bracketed (`[::1]`), since operators copy them out
+/// of `host:port` strings. Anything else is a hard startup error rather than
+/// a silent fall-back to `0.0.0.0`: an operator who asked for loopback-only
+/// and got every interface would be exposed without knowing it.
+fn parse_bind_ip(key: &str, raw: Option<&str>) -> Result<std::net::IpAddr> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_LISTENER_BIND_IP);
+    };
+    let unbracketed = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    unbracketed.parse().map_err(|_| {
+        AppError::Config(format!(
+            "{key} must be an IP address such as 127.0.0.1 or ::1 (no port), got {value:?}"
+        ))
+    })
+}
+
+/// Clamp `BLOB_GC_MIN_AGE_SECS` (#2906) and warn when the result is shorter
+/// than a slow real-world push can take. The clamp keeps a typo from either
+/// deleting a blob seconds after upload (floor) or disabling blob GC in
+/// practice (ceiling).
+fn resolve_blob_gc_min_age_secs(raw: u64) -> u64 {
+    use crate::services::storage_gc_service as gc;
+    let secs = gc::clamp_min_blob_age_secs(raw);
+    if secs != raw {
+        tracing::warn!(
+            requested = raw,
+            effective = secs,
+            "BLOB_GC_MIN_AGE_SECS is outside [{}, {}] seconds and was clamped",
+            gc::MIN_BLOB_AGE_FLOOR_SECS,
+            gc::MIN_BLOB_AGE_CEILING_SECS,
+        );
+    }
+    if secs < gc::MIN_BLOB_AGE_RECOMMENDED_SECS {
+        tracing::warn!(
+            min_age_secs = secs,
+            "BLOB_GC_MIN_AGE_SECS is under one hour: a push whose manifest lands \
+             later than this after its blobs can lose a blob to GC; use only on \
+             short-lived test deployments"
+        );
+    }
+    secs
+}
+
+/// Parse a comma-separated environment variable into its trimmed, non-empty
+/// entries. Unset or empty yields an empty list.
+fn parse_comma_list_env(key: &str) -> Vec<String> {
+    parse_comma_list(env::var(key).ok().as_deref())
+}
+
+/// The pure half of [`parse_comma_list_env`].
+fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Parse a comma-separated list of CIDR ranges from env var `key`.
@@ -324,6 +437,19 @@ pub struct Config {
     /// [`crate::services::signing_service::signature_expiry_duration`].
     pub signature_expiry_seconds: u64,
 
+    /// Rotation overlap window, in seconds (`SIGNING_KEY_ROTATION_OVERLAP_SECS`,
+    /// #1329). For this long after a signing key is rotated, Debian/RPM
+    /// metadata is signed by both the old and the new key and the public-key
+    /// endpoints serve both, so clients that still trust only the old key keep
+    /// verifying. Defaults to 14 days; `0` retires the old key immediately.
+    pub signing_key_rotation_overlap_secs: u64,
+
+    /// Replace legacy signing keys that are bound to Debian/RPM metadata
+    /// signing but cannot produce OpenPGP signatures with fresh
+    /// `key_type='gpg'` keys at startup (`SIGNING_AUTO_MIGRATE_LEGACY_KEYS`,
+    /// #1331). Off by default: the startup scan then only WARNs.
+    pub signing_auto_migrate_legacy_keys: bool,
+
     /// JWT token expiration in seconds (legacy, use jwt_access_token_expiry_minutes)
     pub jwt_expiration_secs: u64,
 
@@ -432,6 +558,14 @@ pub struct Config {
     /// token itself while this is `false`.
     pub guest_access_enabled: bool,
 
+    /// True when `AK_GUEST_ACCESS_ENABLED` was set explicitly to `true`, `1`,
+    /// `false` or `0` (#867). The env value then pins the effective setting
+    /// and the runtime `security.guest_access_enabled` row in
+    /// `system_settings` has no effect (break-glass, like `TOTP_POLICY`).
+    /// Otherwise `guest_access_enabled` is only the default the stored row
+    /// overrides; see `services::guest_access_policy`.
+    pub guest_access_env_pinned: bool,
+
     /// When true, the unauthenticated `/health` (and `/healthz`) response
     /// includes operator-only detail: the exact git commit SHA (`commit`),
     /// the prerelease/`dirty` flag, and live connection-pool internals
@@ -443,6 +577,13 @@ pub struct Config {
     /// still get pool detail from the authenticated `/metrics` /memory-stats
     /// endpoints regardless of this flag.
     pub expose_detailed_health: bool,
+
+    /// When true, `/readyz` answers 503 while OpenSearch is unhealthy (or not
+    /// configured), naming it under `failing`. Default false: ready means
+    /// "can serve artifacts" (database + migrations), and search status is
+    /// only reported under `dependencies` (#4610). Set it where search is part
+    /// of what a replica must provide before it takes traffic.
+    pub readyz_require_search: bool,
 
     /// Optional operator-supplied instruction for retrieving the generated
     /// initial admin password, shown on the first-time-setup login screen. The
@@ -502,6 +643,22 @@ pub struct Config {
     /// `0` to accept unverified attestations in a trusted/dev environment.
     pub conda_attestation_require_verified: bool,
 
+    /// OIDC issuers a keyless CEP-27 bundle's certificate may name
+    /// (`CONDA_ATTESTATION_ISSUERS`, comma list). Empty means the default,
+    /// the GitHub Actions issuer.
+    pub conda_attestation_issuers: Vec<String>,
+
+    /// Certificate identity (SAN) patterns a keyless CEP-27 bundle must match
+    /// (`CONDA_ATTESTATION_IDENTITIES`, comma list, `*` wildcard). Empty
+    /// means any identity the issuer vouches for.
+    pub conda_attestation_identities: Vec<String>,
+
+    /// Public keys for key-based CEP-27 bundles
+    /// (`CONDA_ATTESTATION_PUBLIC_KEYS`, comma list of PEM file paths or
+    /// inline PEMs, each optionally `name=`-prefixed). See
+    /// `services::curation::attestation_verify::policy`.
+    pub conda_attestation_public_keys: Vec<String>,
+
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
 
@@ -531,6 +688,14 @@ pub struct Config {
 
     /// OpenTelemetry service name (default: "artifact-keeper").
     pub otel_service_name: String,
+
+    /// Days a soft-deleted artifact stays in the trash, restorable through
+    /// `POST /api/v1/admin/trash/{id}/restore`, before storage GC may reclaim
+    /// its row and object (#2072). Env `GC_TRASH_RETENTION_DAYS`, default `0`:
+    /// reclaimable on the next GC pass, exactly the behaviour before this
+    /// setting existed, so an upgrade never silently stops reclaiming storage.
+    /// Clamped to [0, 3650].
+    pub gc_trash_retention_days: u32,
 
     /// Cron expression (6-field) for storage garbage collection (default: hourly).
     pub gc_schedule: String,
@@ -573,6 +738,16 @@ pub struct Config {
     /// `BLOB_GC_SWEEP_GRACE_SECS` to tune. `0` sweeps a marked blob on the
     /// next pass with no extra delay.
     pub blob_gc_sweep_grace_secs: u64,
+
+    /// Minimum age (seconds) before an unreferenced OCI blob, or an OCI object
+    /// recorded as a GC candidate by a repository delete, may be reclaimed
+    /// (#2906). Shields an in-flight push whose blobs land before the manifest
+    /// that references them. Env `BLOB_GC_MIN_AGE_SECS`, default 86400 (24
+    /// hours, `storage_gc_service::MIN_BLOB_AGE_SECS`), clamped to
+    /// [60 s, 7 days]; a value under one hour is logged as a warning at
+    /// startup. Lowering it is for short-lived test deployments that need to
+    /// observe blob mark-and-sweep end to end.
+    pub blob_gc_min_age_secs: u64,
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
@@ -668,6 +843,17 @@ pub struct Config {
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
 
+    /// IP address the gRPC listener (`GRPC_PORT`) binds (#2161). Env
+    /// `GRPC_BIND_IP`, default `0.0.0.0` (every interface). Set `127.0.0.1`
+    /// (or `::1`) to keep the listener off the network, e.g. behind a
+    /// service-mesh sidecar. An invalid value fails startup.
+    pub grpc_bind_ip: std::net::IpAddr,
+
+    /// IP address the unauthenticated metrics listener ([`Self::metrics_port`])
+    /// binds (#2161). Env `METRICS_BIND_IP`, default `0.0.0.0`. An invalid
+    /// value fails startup.
+    pub metrics_bind_ip: std::net::IpAddr,
+
     /// Maximum number of connections in the PostgreSQL pool.
     /// Defaults to 20. Increase for higher concurrency, decrease for
     /// databases with restricted connection budgets (e.g., shared RDS).
@@ -716,13 +902,37 @@ pub struct Config {
     /// uploads and downloads turns a duration cap into an effective size cap —
     /// a ~90 MB upload over a slow link was aborted mid-body and the client saw
     /// only a connection reset. See `api::routes::is_byte_transfer_path` for the
-    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE` and
-    /// their concurrency by `GLOBAL_MAX_CONCURRENCY`.
+    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE`, their
+    /// concurrency by `GLOBAL_MAX_CONCURRENCY` and
+    /// `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`, and a stalled upload body by
+    /// `UPLOAD_PROGRESS_WINDOW_SECS` (GHSA-9f9r-c4w8-rjv9).
     ///
     /// This value therefore only has to exceed the slowest legitimate
     /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
+
+    /// Progress window, in seconds, for artifact upload bodies on the
+    /// byte-transfer routes that `global_request_timeout_secs` exempts
+    /// (GHSA-9f9r-c4w8-rjv9). An upload body that delivers fewer than
+    /// `upload_min_progress_bytes` during one window spent waiting for data is
+    /// aborted with 408, so a stalled or trickling client cannot hold a global
+    /// request permit indefinitely. Env var: `UPLOAD_PROGRESS_WINDOW_SECS`.
+    /// Default 60. Set to 0 to disable the deadline.
+    pub upload_progress_window_secs: u64,
+
+    /// Bytes an upload body must deliver per `upload_progress_window_secs`.
+    /// The default (16 KiB per 60 s, about 270 B/s) is far below any real
+    /// link. Env var: `UPLOAD_MIN_PROGRESS_BYTES`. Default 16384.
+    pub upload_min_progress_bytes: u64,
+
+    /// Concurrent artifact uploads one principal (an authenticated user, or a
+    /// client address for an anonymous caller) may have in flight on the
+    /// byte-transfer routes; further ones get 429 with `Retry-After`, so one
+    /// credential cannot hold the whole `global_max_concurrency` pool
+    /// (GHSA-9f9r-c4w8-rjv9). Env var: `UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`.
+    /// Default 64. Set to 0 to disable the cap.
+    pub upload_max_in_flight_per_principal: usize,
 
     /// Idle timeout in seconds. Connections idle longer than this will be
     /// closed. Defaults to 600 (10 minutes).
@@ -921,6 +1131,25 @@ pub struct Config {
     /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
     pub presigned_download_expiry_secs: u64,
 
+    /// Verify a stored artifact's bytes against its recorded SHA-256 while the
+    /// generic download route streams them (#3919). The digest is computed
+    /// incrementally (one chunk held back, no buffering); on a mismatch the
+    /// response is aborted before the final bytes, so a corrupted object is
+    /// never delivered in full under the original `X-Checksum-Sha256`.
+    /// Default: true. Set `DOWNLOAD_VERIFY_CHECKSUMS=false` to skip the
+    /// per-download hash (integrity is then the client's responsibility).
+    pub download_verify_checksums: bool,
+
+    /// Interval between scheduled storage scrub passes (#3910), in seconds.
+    /// `0` (default) disables the scheduled scrub; the admin endpoint
+    /// `POST /api/v1/admin/storage-scrub` works either way. Each pass is
+    /// report-only and bounded by the two budgets below.
+    pub storage_scrub_interval_secs: u64,
+    /// Objects checked per scrub pass (default 500).
+    pub storage_scrub_max_objects: u64,
+    /// Bytes read per scrub pass (default 2 GiB).
+    pub storage_scrub_max_bytes: u64,
+
     // -- Proxy pull-through cache cross-replica single-flight (#1609) --
     /// Enable the cross-replica single-flight coordinator for pull-through cache
     /// fills: a PostgreSQL advisory lock keyed on the cache key so exactly ONE
@@ -932,13 +1161,29 @@ pub struct Config {
     /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
     pub proxy_singleflight_advisory_locks_enabled: bool,
 
-    /// Follower poll cadence (milliseconds) while the cluster leader fetches,
-    /// when `proxy_singleflight_advisory_locks_enabled` is true. Default: 200.
+    /// Follower poll cadence (milliseconds) for the BUFFERED proxy path while
+    /// the cluster leader fetches, when `proxy_singleflight_advisory_locks_enabled`
+    /// is true. The streaming path does not poll (it blocks on the lock, see
+    /// below). Default: 200.
     pub proxy_singleflight_lock_poll_interval_ms: u64,
 
     /// Upper bound (seconds) a follower waits for the leader's commit before
     /// falling back to its own bounded fetch, when advisory locks are enabled.
-    /// Default: 65.
+    /// On the streaming path (#4013) only one request per replica waits: that
+    /// replica's in-process leader blocks on the advisory lock with this as its
+    /// `lock_timeout`, and the cluster leader releases the lock after its cache
+    /// publish, so the waiter wakes exactly when the object is readable and
+    /// serves it (and its local followers) from cache. If the leader is still
+    /// filling at the deadline the waiter fetches once for its replica, so a
+    /// cold object costs 1 upstream fetch, or at most one per replica when the
+    /// fill outlives this. Each waiting replica holds one database connection
+    /// per cold key while it waits (the server drops a waiter whose client went
+    /// away within about a second, PG 14+). Keep it BELOW the ingress / load
+    /// balancer read timeout (nginx-ingress: 60 s): a client cut off first
+    /// retries into a fresh wait, so the per-replica fallback never fires.
+    /// Default: 65. Concurrent waits per replica are capped by
+    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` (default 32, read by
+    /// `HydrationCoordinator::from_env`); past the cap a replica fetches at once.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
     // -- OCI virtual-resolution negative cache (#1424) --
@@ -953,6 +1198,20 @@ pub struct Config {
     /// [`MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`]. Set to 0 to disable
     /// negative-cache inserts.
     pub oci_virtual_negative_cache_max_entries: usize,
+
+    /// Freshness window in milliseconds for negative npm virtual-member
+    /// resolution cache entries (#3951): a member whose upstream just
+    /// definitively 404'd a package is not re-asked within this window.
+    /// Env `NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000, clamped to
+    /// [`MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS`]. Set to 0 to disable
+    /// negative-cache hits.
+    pub npm_virtual_negative_cache_ttl_ms: u64,
+
+    /// Maximum number of npm virtual-member negative-cache entries. Env
+    /// `NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`, default 4096, clamped to
+    /// [`MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`]. Set to 0 to disable
+    /// negative-cache inserts.
+    pub npm_virtual_negative_cache_max_entries: usize,
 
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
@@ -971,8 +1230,25 @@ pub struct Config {
     /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
     pub smtp_from_address: String,
 
-    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    /// TLS mode for the SMTP connection: "starttls" (default, STARTTLS
+    /// required), "starttls-opportunistic" (STARTTLS when the server offers
+    /// it, plaintext otherwise), "tls" (implicit TLS), or "none".
     pub smtp_tls_mode: String,
+
+    /// Extra CA certificate(s) trusted for the SMTP server's TLS certificate,
+    /// added to the system trust store. Either a path to a PEM file or the
+    /// PEM text itself. `SMTP_TLS_CA_CERT` wins; when it is unset the shared
+    /// `CUSTOM_CA_CERT_PATH` (also used by the outbound HTTP clients) applies.
+    pub smtp_tls_ca_cert: Option<String>,
+
+    /// Where `smtp_tls_ca_cert` came from: `SMTP_TLS_CA_CERT` or
+    /// `CUSTOM_CA_CERT_PATH`. Used for log and error messages only.
+    pub smtp_tls_ca_cert_source: Option<&'static str>,
+
+    /// Skip verification of the SMTP server's certificate and hostname
+    /// (`SMTP_TLS_SKIP_VERIFY`, default false). Testing only: it lets anyone
+    /// on the path read the SMTP credentials.
+    pub smtp_tls_skip_verify: bool,
 
     // -- npm computed-packument cache (#2162) --
     /// Whether the npm computed-packument response cache (with
@@ -1073,13 +1349,18 @@ redacted_debug!(Config {
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
+    show guest_access_env_pinned,
     show expose_detailed_health,
+    show readyz_require_search,
     show setup_password_hint,
     show grpc_reflection_enabled,
     show swagger_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show conda_attestation_require_verified,
+    show conda_attestation_issuers,
+    show conda_attestation_identities,
+    show conda_attestation_public_keys,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
@@ -1087,11 +1368,13 @@ redacted_debug!(Config {
     show dependency_track_enabled,
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
+    show gc_trash_retention_days,
     show gc_schedule,
     show storage_stats_schedule,
     show blob_gc_enabled,
     show maven_flat_gc_enabled,
     show blob_gc_sweep_grace_secs,
+    show blob_gc_min_age_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -1103,6 +1386,8 @@ redacted_debug!(Config {
     show totp_policy,
     show api_token_expiry_policy,
     show metrics_port,
+    show grpc_bind_ip,
+    show metrics_bind_ip,
     show database_max_connections,
     show database_min_connections,
     show database_acquire_timeout_secs,
@@ -1111,6 +1396,9 @@ redacted_debug!(Config {
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show upload_progress_window_secs,
+    show upload_min_progress_bytes,
+    show upload_max_in_flight_per_principal,
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
@@ -1142,17 +1430,25 @@ redacted_debug!(Config {
     show password_min_strength,
     show presigned_downloads_enabled,
     show presigned_download_expiry_secs,
+    show download_verify_checksums,
+    show storage_scrub_interval_secs,
+    show storage_scrub_max_objects,
+    show storage_scrub_max_bytes,
     show proxy_singleflight_advisory_locks_enabled,
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
     show oci_virtual_negative_cache_ttl_ms,
     show oci_virtual_negative_cache_max_entries,
+    show npm_virtual_negative_cache_ttl_ms,
+    show npm_virtual_negative_cache_max_entries,
     show smtp_host,
     show smtp_port,
     show smtp_username,
     redact_option smtp_password,
     show smtp_from_address,
     show smtp_tls_mode,
+    show smtp_tls_ca_cert_source,
+    show smtp_tls_skip_verify,
     show npm_packument_cache_enabled,
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
@@ -1180,6 +1476,9 @@ impl Default for Config {
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             signature_expiry_seconds:
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            signing_key_rotation_overlap_secs:
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            signing_auto_migrate_legacy_keys: false,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -1202,13 +1501,18 @@ impl Default for Config {
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            guest_access_env_pinned: false,
             expose_detailed_health: false,
+            readyz_require_search: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
+            conda_attestation_issuers: Vec::new(),
+            conda_attestation_identities: Vec::new(),
+            conda_attestation_public_keys: Vec::new(),
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
@@ -1216,11 +1520,13 @@ impl Default for Config {
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
+            gc_trash_retention_days: 0,
             gc_schedule: "0 0 * * * *".into(),
             storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
+            blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -1232,6 +1538,8 @@ impl Default for Config {
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
+            grpc_bind_ip: DEFAULT_LISTENER_BIND_IP,
+            metrics_bind_ip: DEFAULT_LISTENER_BIND_IP,
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
@@ -1240,6 +1548,9 @@ impl Default for Config {
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            upload_progress_window_secs: 60,
+            upload_min_progress_bytes: 16 * 1024,
+            upload_max_in_flight_per_principal: 64,
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
@@ -1274,17 +1585,26 @@ impl Default for Config {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            download_verify_checksums: true,
+            storage_scrub_interval_secs: 0,
+            storage_scrub_max_objects: 500,
+            storage_scrub_max_bytes: 2 << 30,
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
             oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            npm_virtual_negative_cache_ttl_ms: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            npm_virtual_negative_cache_max_entries: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".into(),
             smtp_tls_mode: "starttls".into(),
+            smtp_tls_ca_cert: None,
+            smtp_tls_ca_cert_source: None,
+            smtp_tls_skip_verify: false,
             npm_packument_cache_enabled: true,
             npm_packument_cache_fresh_ttl_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
@@ -1312,6 +1632,11 @@ impl Config {
 
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
+        let guest_access_pin = crate::services::guest_access_policy::parse_env_pin(
+            env::var(crate::services::guest_access_policy::GUEST_ACCESS_ENV_VAR)
+                .ok()
+                .as_deref(),
+        );
         let config = Self {
             database_url: env::var("DATABASE_URL")
                 .map_err(|_| AppError::Config("DATABASE_URL not set".into()))?,
@@ -1336,6 +1661,13 @@ impl Config {
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            ),
+            signing_key_rotation_overlap_secs: env_parse(
+                "SIGNING_KEY_ROTATION_OVERLAP_SECS",
+                crate::services::signing_service::DEFAULT_ROTATION_OVERLAP_SECONDS,
+            ),
+            signing_auto_migrate_legacy_keys: parse_opt_in_flag(
+                env::var("SIGNING_AUTO_MIGRATE_LEGACY_KEYS").ok().as_deref(),
             ),
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
             jwt_access_token_expiry_minutes: env_parse("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", 30),
@@ -1376,15 +1708,22 @@ impl Config {
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
             // Default to true for zero-impact upgrades; only "false"/"0" disables guests.
             // Any other value (including unset, garbage, or empty) keeps guests enabled.
-            guest_access_enabled: !matches!(
-                env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
-                Ok("false" | "0")
-            ),
+            // One parse (#867): only `false`/`0` disable guests, as before; the
+            // four explicit spellings also pin the runtime setting.
+            guest_access_enabled: guest_access_pin.unwrap_or(true),
+            guest_access_env_pinned: guest_access_pin.is_some(),
+            storage_scrub_interval_secs: env_parse("STORAGE_SCRUB_INTERVAL_SECS", 0),
+            storage_scrub_max_objects: env_parse("STORAGE_SCRUB_MAX_OBJECTS", 500),
+            storage_scrub_max_bytes: env_parse("STORAGE_SCRUB_MAX_BYTES", 2 << 30),
             // Info-disclosure hardening (#2226): the public /health response
             // hides the git commit SHA and live db-pool internals unless an
             // operator explicitly opts in. Default OFF; only "true"/"1" enables.
             expose_detailed_health: parse_opt_in_flag(
                 env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
+            ),
+            // #4610: OpenSearch gates /readyz only when an operator opts in.
+            readyz_require_search: parse_opt_in_flag(
+                env::var("READYZ_REQUIRE_SEARCH").ok().as_deref(),
             ),
             // Deployment-aware first-run instruction (#2802): the default
             // setup screen text assumes Docker Compose. Operators on
@@ -1424,6 +1763,9 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            conda_attestation_issuers: parse_comma_list_env("CONDA_ATTESTATION_ISSUERS"),
+            conda_attestation_identities: parse_comma_list_env("CONDA_ATTESTATION_IDENTITIES"),
+            conda_attestation_public_keys: parse_comma_list_env("CONDA_ATTESTATION_PUBLIC_KEYS"),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
@@ -1450,6 +1792,11 @@ impl Config {
             otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
+            gc_trash_retention_days:
+                crate::services::storage_gc_service::clamp_trash_retention_days(env_parse(
+                    "GC_TRASH_RETENTION_DAYS",
+                    0u32,
+                )),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             storage_stats_schedule: env::var("STORAGE_STATS_SCHEDULE")
                 .unwrap_or_else(|_| "0 0 */4 * * *".into()),
@@ -1470,6 +1817,10 @@ impl Config {
             // sweep forever; `0` is allowed (sweep on the next pass).
             blob_gc_sweep_grace_secs: env_parse("BLOB_GC_SWEEP_GRACE_SECS", 3600u64)
                 .min(7 * 24 * 60 * 60),
+            blob_gc_min_age_secs: resolve_blob_gc_min_age_secs(env_parse(
+                "BLOB_GC_MIN_AGE_SECS",
+                crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
+            )),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",
@@ -1529,6 +1880,11 @@ impl Config {
                 },
                 Err(_) => None,
             },
+            grpc_bind_ip: parse_bind_ip("GRPC_BIND_IP", env::var("GRPC_BIND_IP").ok().as_deref())?,
+            metrics_bind_ip: parse_bind_ip(
+                "METRICS_BIND_IP",
+                env::var("METRICS_BIND_IP").ok().as_deref(),
+            )?,
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
@@ -1537,6 +1893,12 @@ impl Config {
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            upload_progress_window_secs: env_parse("UPLOAD_PROGRESS_WINDOW_SECS", 60_u64),
+            upload_min_progress_bytes: env_parse("UPLOAD_MIN_PROGRESS_BYTES", 16_384_u64),
+            upload_max_in_flight_per_principal: env_parse(
+                "UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL",
+                64_usize,
+            ),
             rate_limit_enabled: parse_opt_out_flag(env::var("RATE_LIMIT_ENABLED").ok().as_deref()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
@@ -1632,6 +1994,10 @@ impl Config {
                 Ok("true" | "1")
             ),
             presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            download_verify_checksums: !matches!(
+                env::var("DOWNLOAD_VERIFY_CHECKSUMS").as_deref(),
+                Ok("false" | "0")
+            ),
             proxy_singleflight_advisory_locks_enabled: matches!(
                 env::var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED").as_deref(),
                 Ok("true" | "1")
@@ -1660,6 +2026,21 @@ impl Config {
                 DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             )
             .min(MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES),
+            // Same clamp discipline as the OCI knobs above: an oversized TTL
+            // would pin "member does not have the package" past the proxy
+            // layer's own 45 s negative window (a package newly published
+            // upstream would stay invisible), and an oversized cap would
+            // unbound the cache's memory. `0` is allowed and disables it.
+            npm_virtual_negative_cache_ttl_ms: env_parse(
+                "NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS",
+                DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            )
+            .min(MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS),
+            npm_virtual_negative_cache_max_entries: env_parse(
+                "NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES",
+                DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            )
+            .min(MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
@@ -1671,7 +2052,7 @@ impl Config {
                     .unwrap_or_else(|_| "starttls".into())
                     .to_lowercase();
                 match mode.as_str() {
-                    "starttls" | "tls" | "none" => mode,
+                    "starttls" | "starttls-opportunistic" | "tls" | "none" => mode,
                     _ => {
                         tracing::warn!(
                             value = %mode,
@@ -1681,6 +2062,14 @@ impl Config {
                     }
                 }
             },
+            smtp_tls_ca_cert: smtp_tls_ca_cert_from_env().map(|(v, _)| v),
+            smtp_tls_ca_cert_source: smtp_tls_ca_cert_from_env().map(|(_, src)| src),
+            smtp_tls_skip_verify: env::var("SMTP_TLS_SKIP_VERIFY")
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(false),
             // On by default; only an explicit, recognized negative disables
             // the npm computed-packument cache (#2162).
             npm_packument_cache_enabled: parse_opt_out_flag(
@@ -1744,7 +2133,8 @@ impl Config {
         if let Some(reason) = jwt_secret_strength_error(&self.jwt_secret) {
             return Err(AppError::Config(format!(
                 "JWT_SECRET is unsuitable: {reason} \
-                 Generate a secure random secret (e.g. `openssl rand -base64 48`)."
+                 Generate a secure random secret (e.g. `openssl rand -base64 48`; \
+                 a 64-character hex secret from `openssl rand -hex 32` is also accepted)."
             )));
         }
         Ok(())
@@ -1852,7 +2242,8 @@ pub(crate) enum JwtSecretWarning {
     TooShort,
     /// Matches a well-known placeholder/throwaway value.
     KnownPlaceholder,
-    /// Low entropy: too few distinct characters or an obvious repeat/sequence.
+    /// Low entropy: under [`MIN_JWT_SECRET_ENTROPY_BITS`] estimated bits, or
+    /// an obvious repeat/sequence.
     LowEntropy,
 }
 
@@ -1862,7 +2253,7 @@ impl JwtSecretWarning {
             JwtSecretWarning::TooShort => "it is shorter than 32 characters.",
             JwtSecretWarning::KnownPlaceholder => "it is a known placeholder/default value.",
             JwtSecretWarning::LowEntropy => {
-                "it has low entropy (too few distinct characters or an obvious pattern)."
+                "it has low entropy (under 128 estimated bits, or an obvious repeat or sequence)."
             }
         }
     }
@@ -1973,24 +2364,30 @@ pub(crate) fn storage_path_error(
     None
 }
 
+/// Minimum estimated entropy, in bits, of a JWT signing secret.
+///
+/// 128 bits is what 32 hex characters (`openssl rand -hex 16`) carry, and is
+/// far beyond brute force for an HMAC key. `openssl rand -hex 32` (256 bits)
+/// and `openssl rand -base64 48` (384 bits) clear it comfortably.
+const MIN_JWT_SECRET_ENTROPY_BITS: f64 = 128.0;
+
 /// Heuristic low-entropy detector for JWT secrets.
 ///
-/// Flags secrets that are clearly low-entropy regardless of length: fewer than
-/// 16 distinct characters, a single repeated character, or an obvious
-/// monotonic character sequence (e.g. "abcdefgh...", "12345678..."). It is
-/// intentionally conservative — a genuinely random secret of reasonable length
-/// will comfortably clear these bars and produce no warning.
+/// Estimates the secret's entropy as `length × log2(alphabet)` (see
+/// [`estimated_entropy_bits`]) and flags it below
+/// [`MIN_JWT_SECRET_ENTROPY_BITS`]. Two structural patterns the estimate cannot
+/// see are flagged as well: an obvious monotonic character sequence over the
+/// whole string (e.g. "abcdefgh...", "12345678..."), and a short unit repeated
+/// ("aaaa...", "abab...", "0123456789abcdef" four times), which carries no more
+/// entropy than one copy of the unit and so is estimated over that unit alone.
+///
+/// Before #4211 this rejected any secret with fewer than 16 distinct
+/// characters. A hex secret can have at most 16, and a random 64-character one
+/// misses at least one hex digit about a quarter of the time, so roughly one in
+/// four `openssl rand -hex 32` secrets stopped the backend from starting.
 fn is_low_entropy(secret: &str) -> bool {
-    if secret.is_empty() {
-        return true;
-    }
-
     let chars: Vec<char> = secret.chars().collect();
-
-    // Distinct-character count: a strong random secret of 32+ bytes will have
-    // many distinct characters; fewer than 16 is suspiciously low.
-    let distinct = chars.iter().collect::<std::collections::HashSet<_>>().len();
-    if distinct < 16 {
+    if chars.is_empty() {
         return true;
     }
 
@@ -2005,9 +2402,83 @@ fn is_low_entropy(secret: &str) -> bool {
         return true;
     }
 
-    false
+    let unit = &chars[..repeating_unit_len(&chars)];
+    estimated_entropy_bits(unit) < MIN_JWT_SECRET_ENTROPY_BITS
 }
 
+/// Length of the shortest unit whose repetition (at least twice, the last copy
+/// possibly truncated) spells out `chars`, or `chars.len()` when there is none.
+/// A single repeated character has unit length 1.
+fn repeating_unit_len(chars: &[char]) -> usize {
+    (1..=chars.len() / 2)
+        .find(|&period| chars[period..].iter().zip(chars).all(|(a, b)| a == b))
+        .unwrap_or(chars.len())
+}
+
+/// Estimated entropy of `chars`, in bits, assuming each character was drawn
+/// uniformly and independently from the alphabet its character classes imply
+/// ([`secret_alphabet_size`]): 4 bits per character for hex, 6 for base64 or
+/// base64url, up to log2(95) for printable ASCII.
+///
+/// The class alone would over-credit a string drawn from a handful of symbols
+/// that happen to fall in a large class (40 characters from "abcde" are all
+/// hex digits). So when the number of distinct characters is under half of
+/// what uniform draws from the class would be expected to show, the observed
+/// distinct count is used as the alphabet instead. For genuinely random
+/// secrets of 32+ characters that fallback fires with probability below 1e-9.
+fn estimated_entropy_bits(chars: &[char]) -> f64 {
+    let len = chars.len() as f64;
+    let alphabet = secret_alphabet_size(chars) as f64;
+    let distinct = chars.iter().collect::<std::collections::HashSet<_>>().len() as f64;
+    let expected_distinct = alphabet * (1.0 - (1.0 - 1.0 / alphabet).powf(len));
+    let effective = if distinct * 2.0 < expected_distinct {
+        distinct
+    } else {
+        alphabet
+    };
+    len * effective.log2()
+}
+
+/// Size of the alphabet the characters of a secret were plausibly drawn from,
+/// judged by the character classes it uses: 10 for decimal digits only, 16 for
+/// hex only (either case), otherwise the sum of the classes present —
+/// lowercase (26), uppercase (26), digits (10), plus 2 when the only other
+/// characters are base64/base64url symbols (`+ / - _`, with `=` padding), or
+/// 33 for any other punctuation or non-ASCII character. Base64 therefore
+/// comes out at 64 and printable ASCII at 95.
+fn secret_alphabet_size(chars: &[char]) -> usize {
+    if chars.iter().all(char::is_ascii_digit) {
+        return 10;
+    }
+    if chars.iter().all(char::is_ascii_hexdigit) {
+        return 16;
+    }
+
+    let mut size = 0;
+    if chars.iter().any(char::is_ascii_lowercase) {
+        size += 26;
+    }
+    if chars.iter().any(char::is_ascii_uppercase) {
+        size += 26;
+    }
+    if chars.iter().any(char::is_ascii_digit) {
+        size += 10;
+    }
+    let mut symbols = chars
+        .iter()
+        .filter(|c| !c.is_ascii_alphanumeric())
+        .peekable();
+    if symbols.peek().is_some() {
+        if symbols.all(|c| matches!(c, '+' | '/' | '-' | '_' | '=')) {
+            size += 2;
+        } else {
+            size += 33;
+        }
+    }
+    size
+}
+
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2825,6 +3296,7 @@ mod tests {
 
         let config = Config::from_env().unwrap();
         assert!(config.guest_access_enabled);
+        assert!(!config.guest_access_env_pinned, "unset never pins (#867)");
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -2924,6 +3396,24 @@ mod tests {
 
         env::set_var("AK_GUEST_ACCESS_ENABLED", "");
         assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        // #867: only the four explicit spellings pin the runtime setting;
+        // garbage and empty leave it to the admin-managed stored value.
+        for (raw, pinned) in [
+            ("false", true),
+            ("0", true),
+            ("true", true),
+            ("1", true),
+            ("yes", false),
+            ("", false),
+        ] {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", raw);
+            assert_eq!(
+                Config::from_env().unwrap().guest_access_env_pinned,
+                pinned,
+                "{raw:?}"
+            );
+        }
 
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -3720,6 +4210,119 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // BLOB_GC_MIN_AGE_SECS (#2906)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_blob_gc_min_age_from_env() {
+        use crate::services::storage_gc_service::MIN_BLOB_AGE_SECS;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let cases: [(Option<&str>, u64); 6] = [
+            (None, MIN_BLOB_AGE_SECS),
+            (Some("garbage"), MIN_BLOB_AGE_SECS),
+            (Some("120"), 120),
+            (Some("3600"), 3600),
+            (Some("1"), 60),
+            (Some("99999999"), 7 * 24 * 60 * 60),
+        ];
+        for (raw, want) in cases {
+            match raw {
+                Some(v) => env::set_var("BLOB_GC_MIN_AGE_SECS", v),
+                None => env::remove_var("BLOB_GC_MIN_AGE_SECS"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(
+                config.blob_gc_min_age_secs, want,
+                "BLOB_GC_MIN_AGE_SECS={raw:?}"
+            );
+        }
+        env::remove_var("BLOB_GC_MIN_AGE_SECS");
+        assert_eq!(Config::default().blob_gc_min_age_secs, MIN_BLOB_AGE_SECS);
+    }
+
+    // -----------------------------------------------------------------------
+    // GRPC_BIND_IP / METRICS_BIND_IP (#2161)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_bind_ip_defaults_to_every_interface_when_unset_or_blank() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_bind_ip("GRPC_BIND_IP", raw).unwrap(),
+                DEFAULT_LISTENER_BIND_IP,
+                "{raw:?} must keep the historical 0.0.0.0 bind"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_accepts_ipv4_and_ipv6_literals() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let cases: [(&str, IpAddr); 5] = [
+            ("127.0.0.1", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            (" 10.1.2.3 ", IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))),
+            ("::1", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("[::1]", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("::", IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(parse_bind_ip("METRICS_BIND_IP", Some(raw)).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn parse_bind_ip_rejects_garbage_ports_and_hostnames() {
+        for raw in [
+            "localhost",
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "999.0.0.1",
+            "[::1",
+        ] {
+            let err = parse_bind_ip("GRPC_BIND_IP", Some(raw))
+                .expect_err(&format!("{raw:?} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("GRPC_BIND_IP"), "error names the var: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_config_listener_bind_ips_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
+
+        let config = Config::from_env().expect("defaults load");
+        assert_eq!(config.grpc_bind_ip, DEFAULT_LISTENER_BIND_IP);
+        assert_eq!(config.metrics_bind_ip, DEFAULT_LISTENER_BIND_IP);
+
+        env::set_var("GRPC_BIND_IP", "127.0.0.1");
+        env::set_var("METRICS_BIND_IP", "::1");
+        let config = Config::from_env().expect("valid bind IPs load");
+        assert_eq!(config.grpc_bind_ip.to_string(), "127.0.0.1");
+        assert_eq!(config.metrics_bind_ip.to_string(), "::1");
+        assert_eq!(
+            std::net::SocketAddr::new(config.metrics_bind_ip, 9091).to_string(),
+            "[::1]:9091",
+            "an IPv6 bind IP must combine with the port without manual brackets"
+        );
+
+        // An invalid value fails startup instead of silently binding 0.0.0.0.
+        env::set_var("METRICS_BIND_IP", "not-an-ip");
+        assert!(Config::from_env().is_err());
+        env::set_var("METRICS_BIND_IP", "::1");
+        env::set_var("GRPC_BIND_IP", "127.0.0.1:9090");
+        assert!(Config::from_env().is_err());
+
+        env::remove_var("GRPC_BIND_IP");
+        env::remove_var("METRICS_BIND_IP");
+    }
+
     #[test]
     fn test_config_metrics_port_unset_is_none() {
         let _lock = ENV_MUTEX.lock().unwrap();
@@ -4081,6 +4684,64 @@ mod tests {
         // `NEGATIVE_CACHE_TTL_SECS` moves, this moves with it on purpose.
         assert_eq!(
             MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000
+        );
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_defaults() {
+        let config = Config::default();
+        assert_eq!(config.npm_virtual_negative_cache_ttl_ms, 5_000);
+        assert_eq!(config.npm_virtual_negative_cache_max_entries, 4096);
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_config_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "1234");
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "17");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.npm_virtual_negative_cache_ttl_ms, 1234);
+        assert_eq!(config.npm_virtual_negative_cache_max_entries, 17);
+
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_enormous_values_are_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "3600000");
+        env::set_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "100000000");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(
+            config.npm_virtual_negative_cache_ttl_ms,
+            MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.npm_virtual_negative_cache_max_entries,
+            MAX_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+        );
+
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_npm_virtual_negative_cache_ttl_ceiling_tracks_proxy_negative_window() {
+        // The member walk's negative entry records "this member did not have
+        // the package" — weaker than the proxy layer's status-gated 404 — so
+        // its ceiling must stay tied to that window (#3951).
+        assert_eq!(
+            MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000
         );
     }
@@ -4698,6 +5359,151 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Entropy estimate (#4211): hex secrets are 4 bits/char, not "too few
+    // distinct characters"
+    // -----------------------------------------------------------------------
+
+    /// Seeded RNG so the generated secrets are identical on every run.
+    fn seeded_rng() -> rand08::rngs::StdRng {
+        use rand08::SeedableRng;
+        rand08::rngs::StdRng::seed_from_u64(4211)
+    }
+
+    /// Equivalent of Python's `secrets.token_hex(n_bytes)` /
+    /// `openssl rand -hex n_bytes`.
+    fn token_hex(rng: &mut rand08::rngs::StdRng, n_bytes: usize) -> String {
+        use rand08::RngCore;
+        let mut bytes = vec![0u8; n_bytes];
+        rng.fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    #[test]
+    fn hex_secret_missing_a_digit_is_accepted() {
+        // The #4211 deployment: 64 hex chars with only 15 distinct. Take a
+        // random 64-char hex secret and replace every '0' with '1' so exactly
+        // the digit 0 is absent, whatever the draw.
+        let mut rng = seeded_rng();
+        let secret = token_hex(&mut rng, 32).replace('0', "1");
+        assert_eq!(secret.len(), 64);
+        assert!(!secret.contains('0'));
+        let distinct = secret.chars().collect::<std::collections::HashSet<_>>();
+        assert!(distinct.len() < 16, "fixture must miss a hex digit");
+        assert!(
+            jwt_secret_warnings(&secret).is_empty(),
+            "a 64-char hex secret missing one digit must be accepted: {secret}"
+        );
+    }
+
+    #[test]
+    fn hex_secret_of_128_bits_is_accepted() {
+        let mut rng = seeded_rng();
+        let secret = token_hex(&mut rng, 16);
+        assert_eq!(secret.len(), 32);
+        assert!(jwt_secret_warnings(&secret).is_empty(), "{secret}");
+    }
+
+    #[test]
+    fn hex_secret_of_31_chars_is_too_short() {
+        let mut rng = seeded_rng();
+        let mut secret = token_hex(&mut rng, 16);
+        secret.pop();
+        assert_eq!(secret.len(), 31);
+        assert!(jwt_secret_warnings(&secret).contains(&JwtSecretWarning::TooShort));
+        assert!(jwt_secret_strength_error(&secret).is_some());
+    }
+
+    #[test]
+    fn random_hex_secrets_are_never_rejected() {
+        // Under the old distinct-count rule about 23% of these were refused.
+        let mut rng = seeded_rng();
+        let rejected: Vec<String> = (0..2_000)
+            .map(|_| token_hex(&mut rng, 32))
+            .filter(|secret| jwt_secret_strength_error(secret).is_some())
+            .collect();
+        assert!(
+            rejected.is_empty(),
+            "{} of 2000 random 64-char hex secrets rejected, e.g. {:?}",
+            rejected.len(),
+            rejected.first()
+        );
+    }
+
+    #[test]
+    fn base64_secret_of_48_random_bytes_is_accepted() {
+        use base64::Engine;
+        use rand08::RngCore;
+        let mut rng = seeded_rng();
+        for _ in 0..200 {
+            let mut bytes = [0u8; 48];
+            rng.fill_bytes(&mut bytes);
+            for secret in [
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+            ] {
+                assert!(jwt_secret_strength_error(&secret).is_none(), "{secret}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_units_are_low_entropy() {
+        for weak in [
+            "a".repeat(36),
+            "ab".repeat(20),
+            "abc".repeat(14),
+            "k3x9".repeat(10),
+            // 16 distinct hex digits, but a period of 16: 64 bits at most.
+            "0123456789abcdef".repeat(4),
+            // A repeat whose last copy is truncated is still a repeat.
+            "Zq8-Lm2_Wx".repeat(4)[..37].to_string(),
+        ] {
+            assert!(
+                jwt_secret_warnings(&weak).contains(&JwtSecretWarning::LowEntropy),
+                "expected `{weak}` to be flagged low-entropy"
+            );
+        }
+    }
+
+    #[test]
+    fn few_symbols_from_a_large_class_are_low_entropy() {
+        // 40 characters drawn from 5 letters are ~93 bits whether or not the
+        // letters happen to be hex digits; the class must not over-credit them.
+        use rand08::seq::SliceRandom;
+        let mut rng = seeded_rng();
+        for letters in [b"abcde", b"vwxyz", b"QRSTU"] {
+            let secret: String = (0..40)
+                .map(|_| *letters.choose(&mut rng).unwrap() as char)
+                .collect();
+            assert_eq!(repeating_unit_len(&secret.chars().collect::<Vec<_>>()), 40);
+            assert!(
+                jwt_secret_warnings(&secret).contains(&JwtSecretWarning::LowEntropy),
+                "expected `{secret}` to be flagged low-entropy"
+            );
+        }
+    }
+
+    #[test]
+    fn alphabet_size_by_character_class() {
+        let size = |s: &str| secret_alphabet_size(&s.chars().collect::<Vec<_>>());
+        assert_eq!(size("0123456789"), 10);
+        assert_eq!(size("deadBEEF0123"), 16);
+        assert_eq!(size("abcxyz"), 26);
+        assert_eq!(size("aZ09+/=="), 64);
+        assert_eq!(size("aZ09-_"), 64);
+        assert_eq!(size("aZ09!"), 95);
+    }
+
+    #[test]
+    fn validate_jwt_secret_error_recommends_base64_and_mentions_hex() {
+        let mut config = Config::test_config();
+        config.jwt_secret = "ab".repeat(20);
+        let message = config.validate_jwt_secret().unwrap_err().to_string();
+        assert!(message.contains("openssl rand -base64 48"), "{message}");
+        assert!(message.contains("openssl rand -hex 32"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
     // storage_path_error (pure; filesystem absolute-path gate, #2025)
     // -----------------------------------------------------------------------
 
@@ -5297,12 +6103,13 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor, grpc override from, grpc override
-        // to) per Dockerfile that builds grype. The override ARGs are part of
-        // the pin: two images built from the same grype tag with different
-        // overrides ship different binaries, and .trivyignore describes only
-        // one of them (#3465 drifted exactly this way before it was retired).
-        let mut builds: Vec<(String, String, String, String, String, String)> = Vec::new();
+        // (file, version, commit, go floor, [grpc from, grpc to, x/net from,
+        // x/net to]) per Dockerfile that builds grype. The override ARGs are
+        // part of the pin: two images built from the same grype tag with
+        // different overrides ship different binaries, and .trivyignore
+        // describes only one of them (#3465 drifted exactly this way before it
+        // was retired).
+        let mut builds: Vec<(String, String, String, String, [String; 4])> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -5324,8 +6131,12 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
-                arg("GRPC_FROM"),
-                arg("GRPC_TO"),
+                [
+                    arg("GRPC_FROM"),
+                    arg("GRPC_TO"),
+                    arg("XNET_FROM"),
+                    arg("XNET_TO"),
+                ],
             ));
         }
 
@@ -5335,15 +6146,15 @@ mod tests {
              to build grype from source, found: {builds:?}"
         );
 
-        let (_, version, commit, go_min, grpc_from, grpc_to) = builds[0].clone();
-        for (file_name, v, c, g, gf, gt) in &builds {
+        let (_, version, commit, go_min, overrides) = builds[0].clone();
+        for (file_name, v, c, g, o) in &builds {
             assert_eq!(
-                (v, c, g, gf, gt),
-                (&version, &commit, &go_min, &grpc_from, &grpc_to),
+                (v, c, g, o),
+                (&version, &commit, &go_min, &overrides),
                 "grype source-build pin drift in {file_name}: it builds \
-                 v{v} @ {c} on go>={g} (grpc {gf}->{gt}) while another \
+                 v{v} @ {c} on go>={g} (overrides {o:?}) while another \
                  Dockerfile builds v{version} @ {commit} on go>={go_min} \
-                 (grpc {grpc_from}->{grpc_to}). Every image must ship the \
+                 (overrides {overrides:?}). Every image must ship the \
                  same grype build, otherwise .trivyignore's rationale \
                  describes a binary only some images carry. All: {builds:?}"
             );

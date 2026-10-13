@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity};
+use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity, VulnDbProvenance};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::environment_reeval::{AdvisoryDelta, AdvisoryDeltaSink};
@@ -243,6 +243,7 @@ fn format_to_purl_type(format: &str) -> &'static str {
         "rpm" => "rpm",
         "deb" | "debian" | "apt" => "deb",
         "apk" | "alpine" => "apk",
+        "pacman" => "alpm",
         _ => "generic",
     }
 }
@@ -1064,6 +1065,26 @@ pub(crate) fn is_within_dedup_ttl(
 // scan_type) advisory lock, so there is no longer a database-free branch to
 // unit-test in isolation.
 
+/// Whether `scan_artifact_inner` must look up the artifact's OWN completed
+/// row before acting on a cross-artifact dedup match (#4425).
+///
+/// `find_reusable_scan` returns only original scans (`source_scan_id IS
+/// NULL`), so when this artifact's own completed row is a reused copy the
+/// match points at another artifact. With a prepared placeholder
+/// (`Reuse`) that is harmless: the prepare step already short-circuited to
+/// the artifact's own completed row and `convert_to_reused` no-ops on it.
+/// With `InsertFresh` there is no such guard and the reuse path would
+/// INSERT a second completed row for the same artifact and scan type, so
+/// the caller checks for an existing own row first.
+pub(crate) fn needs_own_scan_lookup(
+    source_artifact_id: Uuid,
+    current_artifact_id: Uuid,
+    prepared_action: &PreparedScanAction,
+) -> bool {
+    !should_skip_reuse_for_same_artifact(source_artifact_id, current_artifact_id)
+        && matches!(prepared_action, PreparedScanAction::InsertFresh)
+}
+
 /// Outcome of the same-artifact branch inside `scan_artifact_inner` when
 /// `find_reusable_scan` returns a row whose `artifact_id` matches the
 /// artifact currently being scanned.
@@ -1355,6 +1376,11 @@ impl ScanWorkspace {
             // `info/index.json` before use and recorded as the scan's
             // `pin_identity`, and an empty catalog keeps failing closed.
             ComponentEcosystem::Conda => Ok(()),
+            // Maven (#4100): deliberately NO pin file either. The archive's
+            // own `pom.properties` — which the serve path has already checked
+            // agrees with the pin — is what the engine catalogs it from; see
+            // [`ComponentEcosystem::Maven`].
+            ComponentEcosystem::Maven => Ok(()),
         }
     }
 
@@ -2224,10 +2250,17 @@ pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> boo
 /// nothing remains `not_cataloged` — that fail-closed signal is exactly
 /// what materializing a conda pin file would suppress, which is why the
 /// conda pin writes nothing (see [`ComponentEcosystem::Conda`]).
-/// Generic/raw blobs return false: a plain text
-/// file legitimately catalogs nothing, so only `Some(vec![])` results for
-/// an expecting format trigger the `NotCataloged` downgrade, and `None`
-/// (a scanner that reports no catalog at all) never does.
+/// In a GENERIC repository an archive the scan workspace extracts expects a
+/// catalog too (#4154, see [`generic_archive_expects_catalog`]); a
+/// non-archive generic blob (a plain text file) legitimately catalogs
+/// nothing and returns false, as does every non-package file in a typed
+/// repository.
+///
+/// For an expecting artifact, `not_cataloged` is recorded two ways: per
+/// scanner, when a catalog-reporting engine returns `Some(vec![])` with no
+/// findings or packages (#4036/#4094), and for the whole scan set, when no
+/// scanner at all -- including those that report no catalog (`None`) --
+/// found a finding, a package or a component (#4154, [`CatalogSetTally`]).
 pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) -> bool {
     let Some(format) = crate::models::repository::RepositoryFormat::ALL
         .iter()
@@ -2246,7 +2279,133 @@ pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) ->
         "maven" | "gradle" => lower.ends_with(".jar"),
         "debian" => lower.ends_with(".deb"),
         "rpm" => lower.ends_with(".rpm"),
+        "generic" => generic_archive_expects_catalog(&lower),
         _ => false,
+    }
+}
+
+/// Whether an archive in a GENERIC repository expects a catalog (#4154, grace
+/// A3). It is exactly as inventoriable as one in a typed repository -- the
+/// scan workspace extracts it -- so an empty result means "nothing was
+/// assessed", not "clean". Scoped to generic only: typed formats whose
+/// archives legitimately ship no packages (a Helm chart `.tgz`, a Terraform
+/// module `.zip`) keep their prior behavior.
+///
+/// Every such archive is scanned and gets a `not_cataloged` row (with its
+/// reason, surfacing as `has_uncataloged_scan`) when nothing catalogs it. Only
+/// package-shaped ones also floor the repository grade; see
+/// [`uncataloged_floors_grade`].
+fn generic_archive_expects_catalog(lower_filename: &str) -> bool {
+    ScanWorkspace::is_archive(lower_filename)
+}
+
+/// Package-shaped archive extensions: files that are packages by
+/// construction, so an empty catalog means a package nobody could read.
+const PACKAGE_SHAPED_ARCHIVE_SUFFIXES: &[&str] = &[
+    ".whl", ".jar", ".war", ".ear", ".gem", ".crate", ".nupkg", ".egg", ".conda",
+];
+
+/// Whether an unsuperseded `not_cataloged` scan of this artifact floors its
+/// repository's grade letter to F (#4036/#4091, narrowed by #4154).
+///
+/// Typed repositories keep the #4091 behaviour: every catalog-expecting
+/// artifact there is a package. In a GENERIC repository only package-shaped
+/// archives floor; a plain `.zip`/`.tar.gz`/`.tgz`/`.tar.bz2` (docs bundles,
+/// build outputs, installers, firmware) is flagged -- the row stays
+/// `not_cataloged` with its reason and the repository reports
+/// `has_uncataloged_scan` -- without changing the grade. Replacing these
+/// floors with an explicit incomplete/unrated status is #4336.
+pub(crate) fn uncataloged_floors_grade(repository_format: &str, filename: &str) -> bool {
+    if repository_format != "generic" {
+        return true;
+    }
+    let lower = filename.to_ascii_lowercase();
+    PACKAGE_SHAPED_ARCHIVE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// The reason recorded on a row the #4154 set-level gate marks `not_cataloged`.
+pub(crate) const SET_NOT_CATALOGED_REASON: &str =
+    "no scanner cataloged any component; artifact contents were not recognized";
+
+/// What the whole scan SET (every applicable scanner for one artifact) said
+/// about the artifact's contents (#4154).
+///
+/// The per-scanner #4036 check only fires on a scanner that REPORTS a catalog
+/// (`cataloged: Some(..)`), and grype is the only one that does. Without grype
+/// -- or with grype failed -- the remaining scanners (Trivy filesystem,
+/// dependency) complete with zero findings and zero packages over an archive
+/// nobody inventoried, and the artifact read as clean. The set-level gate
+/// derives the same signal from what the set actually produced:
+///
+/// * A completed scanner that contributed nothing (no finding, no package, no
+///   cataloged component) for a catalog-expecting artifact is written
+///   `not_cataloged` straight away -- PROVISIONALLY -- rather than `complete`
+///   or `partial`. Writing the pessimistic value first means the row is never
+///   visible (to the dedup reuse path, or to a concurrent score recompute) as
+///   an authoritative clean while the rest of the set is still running.
+/// * When the set finishes, if ANY scanner assessed something, the provisional
+///   rows get back `complete`. If nothing in the set assessed anything they
+///   stay `not_cataloged`. A #3604 pin `partial` row is never written
+///   provisionally and keeps `partial` either way.
+/// * A row reused from an earlier scan counts by its copied completeness:
+///   `complete`/`partial` were decided by a finished set that assessed the
+///   bytes. `not_cataloged` rows are never reused (see
+///   `ScanResultService::find_reusable_scan`).
+#[derive(Debug, Default)]
+pub(crate) struct CatalogSetTally {
+    provisional: Vec<(Uuid, ScanCompleteness, Option<String>)>,
+    assessed_something: bool,
+}
+
+impl CatalogSetTally {
+    /// Whether a completed row must be written `not_cataloged` provisionally.
+    pub(crate) fn is_provisional(
+        expects_catalog: bool,
+        contributed: bool,
+        effective: ScanCompleteness,
+    ) -> bool {
+        // Only a would-be `complete` row is written provisionally. A #3604 pin
+        // `partial` keeps its own verdict even when nothing else in the set
+        // assessed the bytes: escalating it would floor more grades to F, which
+        // #4336 is redesigning.
+        expects_catalog && !contributed && effective == ScanCompleteness::Complete
+    }
+
+    /// Record a completed scanner. `restore_to` is the completeness (and
+    /// reason) the row gets back if the set turns out to have assessed
+    /// something; `Some` exactly when the row was written provisionally.
+    pub(crate) fn record_completed(
+        &mut self,
+        scan_id: Uuid,
+        contributed: bool,
+        restore_to: Option<(ScanCompleteness, Option<String>)>,
+    ) {
+        if contributed {
+            self.assessed_something = true;
+        }
+        if let Some((completeness, reason)) = restore_to {
+            self.provisional.push((scan_id, completeness, reason));
+        }
+    }
+
+    /// Record a scan whose result was copied from (or already exists as) an
+    /// earlier scan of the same bytes, by its stored completeness.
+    pub(crate) fn record_reused(&mut self, completeness: &str) {
+        if completeness != ScanCompleteness::NotCataloged.as_str() {
+            self.assessed_something = true;
+        }
+    }
+
+    /// The provisional rows to restore once the set has finished: all of them
+    /// when something was assessed, none when nothing was.
+    pub(crate) fn rows_to_restore(&self) -> &[(Uuid, ScanCompleteness, Option<String>)] {
+        if self.assessed_something {
+            &self.provisional
+        } else {
+            &[]
+        }
     }
 }
 
@@ -2359,7 +2518,11 @@ pub(crate) fn python_requirements_pin(name: &str, version: &str) -> String {
 /// bombs and already under test, so this adds a call and no parsing. Bytes
 /// that are not a readable package of that kind at all fail closed the same
 /// way a mismatch does: the caller drops the pin and records the scan PARTIAL.
-fn pin_agrees_with_content(content: &Bytes, pin: &ExpectedComponent, filename: &str) -> bool {
+pub(crate) fn pin_agrees_with_content(
+    content: &Bytes,
+    pin: &ExpectedComponent,
+    filename: &str,
+) -> bool {
     use crate::formats::cargo::CargoHandler;
     use crate::formats::nuget::NugetHandler;
     use crate::formats::rubygems::RubygemsHandler;
@@ -2389,6 +2552,106 @@ fn pin_agrees_with_content(content: &Bytes, pin: &ExpectedComponent, filename: &
             Some((name, version)) => pin_agrees_with(pin, &name, &version),
             None => false,
         },
+        ComponentEcosystem::Maven => {
+            let Some((group_id, artifact_id)) = pin.name.rsplit_once(':') else {
+                return false;
+            };
+            matches!(
+                maven_archive_claim(content, group_id, artifact_id),
+                MavenArchiveClaim::Declares { group_id: g, artifact_id: a, version: v }
+                    if g == group_id && a == artifact_id && pin_agrees_with(pin, &pin.name, &v)
+            )
+        }
+    }
+}
+
+/// Entry-count ceiling for [`maven_archive_claim`]. Far above the ingest
+/// readers' 10,000: ordinary JVM archives legitimately carry tens of thousands
+/// of class entries (an SDK bundle jar well over 100,000), and the archive is
+/// already buffered under the proxy scan byte cap, so the count only bounds
+/// the central-directory walk. Refusing a real jar here would read as
+/// "unreadable" and withhold it under fail-closed.
+const MAVEN_ARCHIVE_MAX_ENTRIES: u64 = 1_000_000;
+
+/// Read ceiling for the one `pom.properties` entry (a few hundred bytes in
+/// practice).
+const MAVEN_POM_PROPERTIES_MAX_BYTES: u64 = 64 * 1024;
+
+/// What a Maven-layout JVM archive says about ITSELF (#4100): the
+/// `META-INF/maven/<groupId>/<artifactId>/pom.properties` entry Maven's
+/// archiver writes for the project being packaged, which is also what syft's
+/// java-archive cataloger names the component from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MavenArchiveClaim {
+    /// The archive carries the requested coordinate's own `pom.properties`,
+    /// which declares this `(groupId, artifactId, version)`.
+    Declares {
+        group_id: String,
+        artifact_id: String,
+        version: String,
+    },
+    /// A readable archive with no `pom.properties` for the requested
+    /// `groupId:artifactId` — typical of Gradle- and sbt-built jars, which do
+    /// not write one. Nothing in the bytes names the coordinate.
+    Absent,
+    /// Not a readable ZIP (or over the bounded-reader caps), or the entry is
+    /// present but does not parse into all three fields.
+    Unreadable,
+}
+
+/// Read the requested coordinate's own `pom.properties` out of a JVM archive
+/// (#4100), through the shared bounded ZIP reader (unmatched entries are never
+/// inflated; the matched one is read under [`MAVEN_POM_PROPERTIES_MAX_BYTES`]).
+/// Only the EXACT entry for `group_id`/`artifact_id` is consulted: a shaded
+/// jar also carries the `pom.properties` of every dependency it bundles, and
+/// none of those says what the archive itself is.
+pub(crate) fn maven_archive_claim(
+    content: &Bytes,
+    group_id: &str,
+    artifact_id: &str,
+) -> MavenArchiveClaim {
+    let entry = format!("META-INF/maven/{group_id}/{artifact_id}/pom.properties");
+    let body = match bounded_archive::read_metadata_from_zip_limited(
+        std::io::Cursor::new(&content[..]),
+        |n| n == entry,
+        MAVEN_ARCHIVE_MAX_ENTRIES,
+        MAVEN_POM_PROPERTIES_MAX_BYTES,
+    ) {
+        Ok(Some(body)) => body,
+        Ok(None) => return MavenArchiveClaim::Absent,
+        Err(_) => return MavenArchiveClaim::Unreadable,
+    };
+    let Ok(text) = String::from_utf8(body) else {
+        return MavenArchiveClaim::Unreadable;
+    };
+    let (mut g, mut a, mut v) = (None, None, None);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(['=', ':']) else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "groupId" => g = Some(value),
+            "artifactId" => a = Some(value),
+            "version" => v = Some(value),
+            _ => {}
+        }
+    }
+    match (g, a, v) {
+        (Some(group_id), Some(artifact_id), Some(version))
+            if !group_id.is_empty() && !artifact_id.is_empty() && !version.is_empty() =>
+        {
+            MavenArchiveClaim::Declares {
+                group_id,
+                artifact_id,
+                version,
+            }
+        }
+        _ => MavenArchiveClaim::Unreadable,
     }
 }
 
@@ -2476,13 +2739,15 @@ fn pin_agrees_with(pin: &ExpectedComponent, name: &str, version: &str) -> bool {
     if declared.eq_ignore_ascii_case(pinned) {
         return true;
     }
-    if pin.ecosystem != ComponentEcosystem::Python {
-        return false;
-    }
-    match (
-        PypiHandler::canonical_version(declared),
-        PypiHandler::canonical_version(pinned),
-    ) {
+    // One version has several spellings in these two ecosystems. NuGet: the
+    // flat container addresses a package by its NORMALIZED version (`1.0.0`)
+    // while its `.nuspec` may say `1.0` or `1.0.0.0` (#4102).
+    let canonical: fn(&str) -> Option<String> = match pin.ecosystem {
+        ComponentEcosystem::Python => PypiHandler::canonical_version,
+        ComponentEcosystem::NuGet => crate::formats::nuget::NugetHandler::normalized_version,
+        _ => return false,
+    };
+    match (canonical(declared), canonical(pinned)) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
@@ -3341,6 +3606,7 @@ pub(crate) fn convert_trivy_findings(
                     fixed_version: vuln.fixed_version.clone(),
                     source: Some(source_label.to_string()),
                     source_url: vuln.primary_url.clone(),
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 })
         })
         .collect()
@@ -3393,7 +3659,13 @@ pub(crate) fn validate_trivy_purl(raw: &str) -> Option<String> {
 /// Reduce a Trivy `Licenses` array to a SPDX-safe joined expression.
 ///
 /// Each input element is run through [`crate::services::spdx_licenses::sanitize_license_term`]
-/// before joining with ` OR `. Known SPDX identifiers (case-insensitive)
+/// before joining with ` AND `. A scanner's license list is conjunctive —
+/// every license it detected in the package applies (a Debian copyright file
+/// listing GPL and MIT means both) — and it carries no evidence of a choice
+/// between them, so inferring ` OR ` would let a package carrying GPL or a
+/// proprietary `LicenseRef-` pass any policy that approves its other arm once
+/// the value is exported as an evaluable CycloneDX `expression` (#3866).
+/// Known SPDX identifiers (case-insensitive)
 /// pass through in their canonical case; unknown terms and single-element
 /// pre-joined expressions like `"MIT OR Apache-2.0"` are wrapped as
 /// `LicenseRef-<sanitised>` so a downstream policy engine cannot silently
@@ -3406,7 +3678,7 @@ pub(crate) fn sanitize_trivy_licenses(raw: &[String]) -> Option<String> {
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" OR "))
+        Some(terms.join(" AND "))
     }
 }
 
@@ -3463,8 +3735,9 @@ pub(crate) fn convert_trivy_packages(
                         .and_then(|id| id.purl.as_deref())
                         .and_then(validate_trivy_purl),
                     // #1152: validate each license element against the SPDX
-                    // identifier list before joining with " OR ". Multi-
-                    // license packages still produce a SPDX OR expression;
+                    // identifier list before joining with " AND " (#3866:
+                    // every detected license applies, so the join is a
+                    // conjunction, never an inferred choice);
                     // hostile elements (unknown terms, smuggled pre-joined
                     // expressions) are wrapped as LicenseRef-... so a
                     // permissive-license policy check cannot green-light
@@ -3656,6 +3929,13 @@ pub struct ScanOutput {
     /// engine ran and cataloged NOTHING, so a zero-finding result means
     /// "nothing was assessed", not "clean".
     pub cataloged: Option<Vec<CatalogedComponent>>,
+    /// The vulnerability database THIS scan graded against (#3014), when the
+    /// engine reported it alongside the findings (the scanner-adapter's
+    /// `vulnerability_db`). Carried per scan rather than read back from a
+    /// shared "last scan" slot, so concurrent scans, or adapter replicas on
+    /// different DB vintages, can never stamp one scan with another's DB.
+    /// `None` falls back to [`Scanner::vuln_db`] in the orchestrator.
+    pub vuln_db: Option<VulnDbProvenance>,
 }
 
 impl ScanOutput {
@@ -3668,6 +3948,7 @@ impl ScanOutput {
             packages: Vec::new(),
             scan_completeness: ScanCompleteness::Complete,
             cataloged: None,
+            vuln_db: None,
         }
     }
 
@@ -3687,6 +3968,7 @@ impl ScanOutput {
             packages: convert_trivy_packages(report),
             scan_completeness: ScanCompleteness::Complete,
             cataloged: None,
+            vuln_db: None,
         }
     }
 
@@ -3708,6 +3990,7 @@ impl ScanOutput {
             packages: convert_trivy_packages(report),
             scan_completeness: classify_trivy_completeness(report, stderr, known_targets),
             cataloged: None,
+            vuln_db: None,
         }
     }
 
@@ -3801,6 +4084,49 @@ pub enum ComponentEcosystem {
     /// `format_expects_pin` answers honestly for conda and an untrustworthy
     /// pin downgrades the scan to PARTIAL.
     Conda,
+    /// Maven-layout JVM archive (`.jar` / `.war` / `.ear`), served through a
+    /// Maven or sbt proxy (#4100). The pin is the component identity only —
+    /// no pin file is written, because the archive catalogs ITSELF: syft's
+    /// java-archive cataloger reads the archive's own
+    /// `META-INF/maven/<groupId>/<artifactId>/pom.properties` and reports the
+    /// component as `artifactId@version` (the groupId goes in a separate
+    /// CycloneDX field). A written record would only duplicate that entry.
+    /// The serve path pins ONLY when that very `pom.properties` agrees with
+    /// the requested `groupId:artifactId:version`
+    /// ([`maven_archive_claim`]), so the assessment gate then demands the
+    /// engine actually graded the served coordinate. `name` is
+    /// `groupId:artifactId`; catalog matching compares the `artifactId` half
+    /// (see [`ExpectedComponent::normalize_name`]).
+    Maven,
+}
+
+impl ComponentEcosystem {
+    /// Whether the CVE engine is expected to catalog a package of this
+    /// ecosystem AS ITSELF, so that an empty catalog means the engine could
+    /// not see the package (#4594).
+    ///
+    /// True for every ecosystem the engine has a cataloger for: the pin file
+    /// (npm, Python, RubyGems, Cargo, NuGet) or the archive's own metadata
+    /// (Maven) puts the package in the catalog, and an empty catalog means
+    /// the engine graded nothing, which is inconclusive.
+    ///
+    /// False for conda. No bundled engine catalogs a conda package as a conda
+    /// component (see [`ComponentEcosystem::Conda`]); what it catalogs is the
+    /// content the package installs (a `.dist-info`, a recognised binary).
+    /// For a compiled library or a data package (`tzdata`, `ca-certificates`)
+    /// there is nothing of that kind, and an empty catalog is the expected
+    /// result of a scan that ran to completion over the unpacked archive.
+    /// The inline gate grades such a scan on its findings, records
+    /// `components_cataloged = 0`, and still withholds a scan that could not
+    /// run. The same holds when the engine cataloged only components that are
+    /// not the conda `name@version` (#4600): a compiled package is cataloged
+    /// under the upstream component it vendors (`libzlib` as `zlib`), so that
+    /// scan is graded on its findings too. What the bytes are served as is
+    /// established from the package's own `info/index.json` before the scan
+    /// runs, and bytes that disagree with the file name are still withheld.
+    pub fn engine_catalogs_the_package(self) -> bool {
+        !matches!(self, ComponentEcosystem::Conda)
+    }
 }
 
 /// The identity a proxied artifact is being SERVED AS — derived from the
@@ -3864,9 +4190,19 @@ impl ExpectedComponent {
     ///   on upload, so the fold only protects against a mixed-case registry
     ///   row; `-`, `_` and `.` are all distinct (`py-opencv` and `py_opencv`
     ///   are different packages on a channel).
+    /// * **Maven** — the `artifactId` half of `groupId:artifactId`, lowercased
+    ///   (#4100). syft's CycloneDX catalog names a jar by its `artifactId` and
+    ///   carries the groupId in a separate field the catalog side channel
+    ///   does not keep, so the comparable part of the pin is the artifactId.
+    ///   The groupId is still checked, against the archive's own
+    ///   `pom.properties`, before the pin is ever established.
     pub fn normalize_name(ecosystem: ComponentEcosystem, name: &str) -> String {
         let lower = name.trim().to_lowercase();
         match ecosystem {
+            ComponentEcosystem::Maven => match lower.rsplit_once(':') {
+                Some((_, artifact)) => artifact.to_string(),
+                None => lower,
+            },
             ComponentEcosystem::Npm
             | ComponentEcosystem::RubyGems
             | ComponentEcosystem::NuGet
@@ -3922,6 +4258,7 @@ impl ExpectedComponent {
             ComponentEcosystem::Cargo => "cargo",
             ComponentEcosystem::NuGet => "nuget",
             ComponentEcosystem::Conda => "conda",
+            ComponentEcosystem::Maven => "maven",
         };
         format!(
             "{}|{}|{}",
@@ -3975,6 +4312,15 @@ pub struct ProxyScanVerdict {
     /// no CVE id), so `findings.len()` is a LOWER BOUND on `findings_count` and
     /// the two must not be asserted equal.
     pub findings: Vec<ProxyFinding>,
+    /// How many distinct components the CVE-authoritative engine cataloged
+    /// for these bytes (#4594), or `None` when no engine reported a catalog.
+    /// Persisted on the verdict row as `components_cataloged` and shown in
+    /// the proxy-scans view. `Some(0)` on a `clean` verdict means the package
+    /// was graded on its file contents only: the engine unpacked and read it,
+    /// recognised no component, and matched no advisory (a conda package
+    /// with no Python or recognised binary content). Like `packages`, it is
+    /// attached after aggregation and never moves the counts.
+    pub components_cataloged: Option<i32>,
 }
 
 impl ProxyScanVerdict {
@@ -4251,6 +4597,7 @@ pub fn aggregate_proxy_verdict(
         packages: Vec::new(),
         scan_completeness: None,
         findings: Vec::new(),
+        components_cataloged: None,
     }
 }
 
@@ -4322,9 +4669,18 @@ pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
 ///    abort the scan — only the CVE engine is load-bearing.
 /// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
 ///    an `expected_component`. `is_vulnerable()` counts findings above `Info`,
-///    so an engine that ran but had nothing to grade reports "clean".
+///    so an engine that ran but had nothing to grade reports "clean". The one
+///    exception is an ecosystem the engine never catalogs as itself (conda,
+///    see [`ComponentEcosystem::engine_catalogs_the_package`], #4594): there
+///    an empty catalog from a completed scan is graded on its findings and
+///    recorded with `components_cataloged = 0`.
 /// 3. **What it cataloged is what we are serving** (#3003). A clean grade of
-///    some other identity says nothing about these bytes.
+///    some other identity says nothing about these bytes. Conda is again the
+///    exception (#4600): the engine grades a conda package's contents, not
+///    the package, and a compiled one is cataloged under the upstream
+///    component it vendors, so a completed scan whose catalog names other
+///    components is graded on its findings. The served identity is checked
+///    against the package's own `info/index.json` before the scan instead.
 ///
 /// All three return the same inconclusive `Err`, which the caller maps onto the
 /// repo's action (fail-closed → 423, fail-open → serve + loud pending), and no
@@ -4441,7 +4797,22 @@ async fn run_inline_proxy_scanners_target(
     // skipping the gate as "no signal" — the designed semantics finally
     // firing for exactly the case the gate was built for.
     if let (Some(expected), Some(cataloged)) = (target.expected_component, cve_cataloged.as_ref()) {
-        if cataloged.is_empty() {
+        let graded_on_contents = !expected.ecosystem.engine_catalogs_the_package();
+        if cataloged.is_empty() && graded_on_contents {
+            // #4594: the engine is not expected to catalog this package as
+            // itself (conda), and it completed `Ok` over the unpacked archive
+            // (an archive it cannot unpack is a scanner error, handled above).
+            // Nothing cataloged is then the normal result for a package with
+            // no Python or recognised binary content, so the verdict is graded
+            // on the findings alone and carries `components_cataloged = 0`.
+            info!(
+                artifact = %synthetic.name,
+                expected = %format!("{}@{}", expected.name, expected.version),
+                findings = findings.len(),
+                "inline proxy scan: CVE engine cataloged no components for a package \
+                 it does not catalog as itself; graded on file contents only"
+            );
+        } else if cataloged.is_empty() {
             warn!(
                 artifact = %synthetic.name,
                 expected = %format!("{}@{}", expected.name, expected.version),
@@ -4454,8 +4825,28 @@ async fn run_inline_proxy_scanners_target(
                  not a clean verdict)"
                     .to_string(),
             ));
-        }
-        if !cataloged.iter().any(|c| expected.matches(c)) {
+        } else if !cataloged.iter().any(|c| expected.matches(c)) && graded_on_contents {
+            // #4600: the same rule when the engine cataloged components but
+            // none is the conda package itself. That is the normal result for
+            // a compiled package (`libzlib` cataloged as `zlib`, `pillow` with
+            // its vendored `libjpeg-turbo`): the scan completed over the
+            // package's contents, so it is graded on its findings, and the
+            // verdict records how many components the grade rests on. The
+            // identity being served was already checked against the
+            // package's own `info/index.json` before the scan (bytes that
+            // disagree with the file name never reach the engine).
+            info!(
+                artifact = %synthetic.name,
+                expected = %format!("{}@{}", expected.name, expected.version),
+                cataloged = ?cataloged
+                    .iter()
+                    .map(|c| format!("{}@{}", c.name, c.version))
+                    .collect::<Vec<_>>(),
+                findings = findings.len(),
+                "inline proxy scan: CVE engine cataloged other components than a package it \
+                 does not catalog as itself (vendored content); graded on its findings"
+            );
+        } else if !cataloged.iter().any(|c| expected.matches(c)) {
             warn!(
                 artifact = %synthetic.name,
                 expected = %format!("{}@{}", expected.name, expected.version),
@@ -4545,6 +4936,16 @@ async fn run_inline_proxy_scanners_target(
     // Same contract as `packages`: attached after aggregation so the counts are
     // computed from the raw findings and this projection cannot move them.
     verdict.findings = retain_proxy_findings(&findings);
+    // #4594: what the engine cataloged, counted once per distinct
+    // `name@version`, so the stored verdict says whether it graded any
+    // component or only the file contents.
+    verdict.components_cataloged = cve_cataloged.as_ref().map(|c| {
+        let distinct: std::collections::HashSet<(&str, &str)> = c
+            .iter()
+            .map(|c| (c.name.as_str(), c.version.as_str()))
+            .collect();
+        i32::try_from(distinct.len()).unwrap_or(i32::MAX)
+    });
     Ok(verdict)
 }
 
@@ -4689,6 +5090,20 @@ pub trait Scanner: Send + Sync {
     async fn version(&self) -> Option<String> {
         None
     }
+
+    /// Best-effort identity of the vulnerability database this scanner
+    /// graded against (#3014), persisted on `scan_results.vuln_db_version` /
+    /// `vuln_db_published_at`. Distinct from [`Scanner::version`]: the same
+    /// binary returns different answers about identical bytes depending on
+    /// how old its database is.
+    ///
+    /// Called by the orchestrator right after a successful scan, like
+    /// `version()`. The default `None` is correct for scanners with no
+    /// vulnerability database (OpenSCAP) and is persisted as NULL, which
+    /// means "unknown", never "fresh".
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        None
+    }
 }
 
 /// Maximum wall-clock time we will wait for a scanner CLI's `--version`
@@ -4732,7 +5147,7 @@ pub(crate) async fn capture_cli_version_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<String> {
-    let full = capture_cli_output_with_timeout(binary, args, timeout).await?;
+    let full = capture_cli_output_with_timeout(binary, args, timeout, &[]).await?;
     let line = full.lines().next()?.trim();
     if line.is_empty() {
         None
@@ -4746,7 +5161,19 @@ pub(crate) async fn capture_cli_version_with_timeout(
 /// safety properties as [`capture_cli_version`]: 64 KiB stdout cap, wall-clock
 /// timeout, kill+reap on every failure path, `None` on a non-zero exit.
 pub(crate) async fn capture_cli_output(binary: &str, args: &[&str]) -> Option<String> {
-    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
+    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT, &[]).await
+}
+
+/// [`capture_cli_output`] with extra child-process env vars, for probes that
+/// must see the same configuration as the scan they describe (#3014: a
+/// `grype db status` probe has to look at the DB directory the scan child
+/// is pointed at, not the backend's own `$HOME`).
+pub(crate) async fn capture_cli_output_with_env(
+    binary: &str,
+    args: &[&str],
+    env: &[(&str, String)],
+) -> Option<String> {
+    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT, env).await
 }
 
 /// Shared child-process capture behind [`capture_cli_version_with_timeout`]
@@ -4755,6 +5182,7 @@ pub(crate) async fn capture_cli_output_with_timeout(
     binary: &str,
     args: &[&str],
     timeout: Duration,
+    env: &[(&str, String)],
 ) -> Option<String> {
     // Always kill+reap a child before returning so we never leave a
     // zombie. `child.kill()` on Unix sends SIGKILL but does not reap;
@@ -4774,6 +5202,9 @@ pub(crate) async fn capture_cli_output_with_timeout(
     // outlive its caller, so cancellation must own the child just as it does
     // for scanner and cleanup subprocesses (#3455).
     command.kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
     let mut child = match command
         .args(args)
         .stdout(Stdio::piped())
@@ -4936,12 +5367,28 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
+    cached_cli_version_with_hit_ttl(cell, VERSION_CACHE_HIT_TTL, probe).await
+}
+
+/// [`cached_cli_version`] with a caller-chosen TTL for successful probes.
+/// Used where the probed fact changes far more often than a binary does,
+/// e.g. the vulnerability-DB status (#3014), which an air-gapped operator
+/// can swap without restarting the backend.
+pub(crate) async fn cached_cli_version_with_hit_ttl<F, Fut>(
+    cell: &VersionCache,
+    hit_ttl: Duration,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
     // Fast path: read lock, check TTL, return cached clone.
     {
         let guard = cell.inner.read().await;
         if let Some((stored_at, ref value)) = *guard {
             let ttl = if value.is_some() {
-                VERSION_CACHE_HIT_TTL
+                hit_ttl
             } else {
                 VERSION_CACHE_MISS_TTL
             };
@@ -4962,7 +5409,7 @@ where
     // value to keep the TTL window stable.
     if let Some((stored_at, ref value)) = *guard {
         let ttl = if value.is_some() {
-            VERSION_CACHE_HIT_TTL
+            hit_ttl
         } else {
             VERSION_CACHE_MISS_TTL
         };
@@ -5120,6 +5567,118 @@ pub(crate) fn format_grype_db_build(raw: &str) -> Option<String> {
         .and_then(db_build_date_token)
 }
 
+/// Parse a vulnerability-database timestamp as scanners print it (#3014):
+/// RFC 3339 (`2026-10-04T08:11:47Z`, grype v6 / trivy metadata) or grype v5's
+/// `2024-06-01 01:31:31 +0000 UTC`. Go's zero time (`0001-01-01T00:00:00Z`,
+/// what grype prints when no DB is installed) and anything else before the
+/// Unix epoch is rejected as "no date" rather than stored as a bogus vintage.
+pub(crate) fn parse_db_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let t = raw.trim();
+    let parsed = chrono::DateTime::parse_from_rfc3339(t)
+        .or_else(|_| {
+            chrono::DateTime::parse_from_str(
+                t.strip_suffix(" UTC").unwrap_or(t).trim(),
+                "%Y-%m-%d %H:%M:%S %z",
+            )
+        })
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    (parsed.timestamp() > 0).then_some(parsed)
+}
+
+/// `grype db status -o json` (grype >= 0.88, DB schema v6), verified against
+/// grype 0.118.0:
+/// `{"schemaVersion":"v6.1.10","from":"…","built":"2026-10-04T08:11:47Z",
+/// "path":"…","valid":true}`. With no DB installed grype prints
+/// `"schemaVersion":"","valid":false,"error":"database does not exist"`.
+#[derive(Debug, Deserialize)]
+struct GrypeDbStatusJson {
+    #[serde(default, rename = "schemaVersion")]
+    schema_version: String,
+    #[serde(default)]
+    built: String,
+    #[serde(default)]
+    valid: Option<bool>,
+}
+
+/// Parse `grype db status` output (JSON or the text form) into the scan's
+/// vulnerability-database provenance (#3014): `grype-db-<schema>` built at
+/// the DB's `built` timestamp.
+///
+/// The text form (all grype releases; `-o json` is newer) is
+/// `Schema:    v6.1.10` / `Built:     2026-10-04T08:11:47Z` /
+/// `Status:    valid`, with v5 printing `Schema: 5` and
+/// `Built: 2024-06-01 01:31:31 +0000 UTC`. Returns `None` for an invalid or
+/// missing DB (no schema, or `valid: false` / `Status: invalid`): a scan
+/// against no database must not be recorded as having had one.
+pub(crate) fn parse_grype_db_status(raw: &str) -> Option<VulnDbProvenance> {
+    let (schema, built, valid) = match serde_json::from_str::<GrypeDbStatusJson>(raw.trim()) {
+        Ok(json) => (json.schema_version, json.built, json.valid.unwrap_or(true)),
+        Err(_) => {
+            let field = |name: &str| {
+                raw.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| v.trim().to_string())
+                })
+            };
+            let valid = field("Status").is_none_or(|s| s.eq_ignore_ascii_case("valid"));
+            (
+                field("Schema").unwrap_or_default(),
+                field("Built").unwrap_or_default(),
+                valid,
+            )
+        }
+    };
+    let schema = schema.trim();
+    if !valid || schema.is_empty() {
+        return None;
+    }
+    let schema = if schema.starts_with('v') {
+        schema.to_string()
+    } else {
+        format!("v{schema}")
+    };
+    VulnDbProvenance::new(format!("grype-db-{schema}"), parse_db_timestamp(&built))
+}
+
+/// Trivy's vulnerability-DB metadata as the scanner-adapter reports it
+/// (#3014): the `VulnerabilityDB` block of `trivy version --format json`,
+/// which is the content of `<cache>/db/metadata.json`, verified against
+/// trivy 0.71.2: `{"Version":2,"NextUpdate":"…","UpdatedAt":
+/// "2026-10-04T19:39:34.715623444Z","DownloadedAt":"…"}`. The adapter
+/// forwards it under `vulnerability_db` with snake_case keys.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdapterVulnDb {
+    #[serde(default)]
+    pub version: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl AdapterVulnDb {
+    /// Parse the adapter's `vulnerability_db` field leniently (#3014): any
+    /// shape that is not the expected object (a third-party Harbor scanner
+    /// reusing the key, a string-typed version) yields `None` instead of
+    /// failing deserialization of the whole report, and with it the scan.
+    pub fn lenient(raw: Option<&serde_json::Value>) -> Option<VulnDbProvenance> {
+        serde_json::from_value::<AdapterVulnDb>(raw?.clone())
+            .ok()?
+            .provenance()
+    }
+
+    /// `trivy-db-v<schema>` updated at `UpdatedAt`. `None` when the adapter
+    /// sent no schema version (an older adapter, or no DB metadata).
+    pub fn provenance(&self) -> Option<VulnDbProvenance> {
+        let version = self.version.filter(|v| *v > 0)?;
+        VulnDbProvenance::new(
+            format!("trivy-db-v{version}"),
+            self.updated_at.as_deref().and_then(parse_db_timestamp),
+        )
+    }
+}
+
 /// Parse a `grype --version` first stdout line into a `grype-X.Y.Z` token.
 /// Grype's `--version` (single dash-dash flag) emits a single line like
 /// `grype 0.83.0`, which we normalize to `grype-<version>` for consistency with
@@ -5164,6 +5723,8 @@ pub struct AdvisoryClient {
     /// scanning works without environment re-evaluation wired (tests, and
     /// deployments before main connects the sink).
     delta_sink: Option<Arc<dyn AdvisoryDeltaSink>>,
+    /// Wall-clock budget for fetching full OSV records after a batch (#4150).
+    osv_hydrate_budget: Duration,
 }
 
 struct CachedAdvisory {
@@ -5297,6 +5858,16 @@ pub struct Dependency {
 
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 const OSV_BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
+/// Default wall-clock budget for hydrating one OSV batch's matches from their
+/// full records (#4150). Kept well inside `PROXY_SCAN_INLINE_BUDGET`, since
+/// the dependency scan runs within it on the inline proxy path. Overridable
+/// with `OSV_RECORD_FETCH_BUDGET_SECS`.
+const OSV_HYDRATE_BUDGET: Duration = Duration::from_secs(5);
+/// Consecutive record-fetch failures after which hydration stops for the
+/// batch: a feed that has failed this many times in a row is down or does
+/// not serve `/v1/vulns`, and asking about every remaining id only adds
+/// latency.
+const OSV_HYDRATE_MAX_CONSECUTIVE_FAILURES: usize = 5;
 const GITHUB_ADVISORY_URL: &str = "https://api.github.com/advisories";
 
 impl AdvisoryClient {
@@ -5313,6 +5884,10 @@ impl AdvisoryClient {
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl: CACHE_TTL,
             delta_sink: None,
+            osv_hydrate_budget: std::env::var("OSV_RECORD_FETCH_BUDGET_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(OSV_HYDRATE_BUDGET, Duration::from_secs),
         }
     }
 
@@ -5344,6 +5919,7 @@ impl AdvisoryClient {
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: None,
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         }
     }
 
@@ -5485,7 +6061,7 @@ impl AdvisoryClient {
                 }
             };
 
-            let Some((grouped, answered)) = parsed else {
+            let Some((mut grouped, answered)) = parsed else {
                 // Nothing recorded and nothing cached. An unanswered query has
                 // to stay unanswered: writing an empty result here would cache
                 // "clean" for an hour and hand the caller a list it cannot
@@ -5493,6 +6069,11 @@ impl AdvisoryClient {
                 out.degraded = true;
                 continue;
             };
+
+            // #4150: the batch endpoint returns bare ids; fetch the records
+            // so matches carry their CVE alias, fixed version and summary.
+            // Before the cache write, so the cached answer is the full one.
+            self.hydrate_osv_matches(&mut grouped, &batch).await;
 
             if answered < batch.len() {
                 // A short response answered a PREFIX of the batch. The queries
@@ -5736,81 +6317,348 @@ impl AdvisoryClient {
             };
 
             for vuln in vulns {
-                let id = vuln
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("UNKNOWN")
-                    .to_string();
-
-                let summary = vuln
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-
-                let details = vuln
-                    .get("details")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-
-                // Extract severity from database_specific or severity array
-                let severity = vuln
-                    .get("database_specific")
-                    .and_then(|d| d.get("severity"))
-                    .and_then(|s| s.as_str())
-                    .or_else(|| {
-                        vuln.get("severity")
-                            .and_then(|s| s.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|s| s.get("type"))
-                            .and_then(|t| t.as_str())
-                    })
-                    .unwrap_or("medium")
-                    .to_lowercase();
-
-                // Extract aliases (CVE IDs)
-                let aliases: Vec<String> = vuln
-                    .get("aliases")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // Extract fixed version from affected ranges
-                let fixed_version = vuln
-                    .get("affected")
-                    .and_then(|a| a.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|a| a.get("ranges"))
-                    .and_then(|r| r.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|r| r.get("events"))
-                    .and_then(|e| e.as_array())
-                    .and_then(|events| {
-                        events
-                            .iter()
-                            .find_map(|e| e.get("fixed").and_then(|f| f.as_str().map(String::from)))
-                    });
-
-                let dep = deps.get(i);
-
-                grouped[i].push(AdvisoryMatch {
-                    id: id.clone(),
-                    summary,
-                    details,
-                    severity,
-                    aliases,
-                    affected_version: dep.and_then(|d| d.version.clone()),
-                    fixed_version,
-                    source: "osv.dev".to_string(),
-                    source_url: Some(format!("https://osv.dev/vulnerability/{}", id)),
-                });
+                grouped[i].push(Self::parse_osv_vuln(vuln, deps.get(i)));
             }
         }
 
         grouped
+    }
+
+    /// Parse one OSV vulnerability record into a match for `dep`.
+    ///
+    /// Shared by the batch parse and by
+    /// [`hydrate_osv_matches`](Self::hydrate_osv_matches), which re-parses the
+    /// FULL record fetched from `/v1/vulns/{id}`: `/v1/querybatch` answers with only `id` and
+    /// `modified` per vulnerability, so a batch-parsed match carries no CVE
+    /// alias, no fixed version and no summary until it is hydrated (#4150).
+    fn parse_osv_vuln(vuln: &serde_json::Value, dep: Option<&Dependency>) -> AdvisoryMatch {
+        let id = vuln
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN")
+            .to_string();
+
+        let details = vuln
+            .get("details")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // The record's own summary; failing that, the first line of its
+        // details, which is what a GHSA/PYSEC record without a summary leads
+        // with. Only a record with neither falls back to the bare id (#4150).
+        let summary = vuln
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| details.as_deref().and_then(Self::summary_from_details));
+
+        // Extract severity from database_specific or severity array
+        let severity = vuln
+            .get("database_specific")
+            .and_then(|d| d.get("severity"))
+            .and_then(|s| s.as_str())
+            .or_else(|| {
+                vuln.get("severity")
+                    .and_then(|s| s.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|s| s.get("type"))
+                    .and_then(|t| t.as_str())
+            })
+            .unwrap_or("medium")
+            .to_lowercase();
+
+        // Extract aliases (CVE IDs)
+        let aliases: Vec<String> = vuln
+            .get("aliases")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let fixed_version = Self::osv_fixed_version(vuln, dep);
+
+        AdvisoryMatch {
+            id: id.clone(),
+            summary,
+            details,
+            severity,
+            aliases,
+            affected_version: dep.and_then(|d| d.version.clone()),
+            fixed_version,
+            source: "osv.dev".to_string(),
+            source_url: Some(format!("https://osv.dev/vulnerability/{}", id)),
+        }
+    }
+
+    /// First prose line of an advisory's `details`, bounded, as a stand-in
+    /// title. GHSA details usually open with a markdown heading (`### Impact`),
+    /// which says nothing about the vulnerability, so headings are skipped.
+    fn summary_from_details(details: &str) -> Option<String> {
+        const MAX_CHARS: usize = 200;
+        let line = details
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+        Some(line.chars().take(MAX_CHARS).collect())
+    }
+
+    /// The `fixed` event of the `affected` entry that describes `dep`.
+    ///
+    /// A full OSV record lists every package the advisory touches, often
+    /// across ecosystems (a PyPI package and its conda or Debian rebuilds), so
+    /// taking the first entry reports another package's fix. The entry whose
+    /// package name matches `dep` (PEP 503-style normalized, and in the same
+    /// ecosystem when both sides name one) wins; with no such entry, or no
+    /// `dep`, the first entry is used, which is also the only one a
+    /// single-package record has.
+    ///
+    /// Within the entry, `GIT` ranges are skipped (their events are commit
+    /// SHAs, not versions). When the installed version is known, the fix that
+    /// closes the `[introduced, fixed)` interval containing it wins, so a
+    /// split advisory (`0..1.2`, `2.0..2.3`) reports `2.3` for `2.1`. Otherwise
+    /// the first fix event is reported.
+    fn osv_fixed_version(vuln: &serde_json::Value, dep: Option<&Dependency>) -> Option<String> {
+        let affected = vuln.get("affected")?.as_array()?;
+        let matching = dep.and_then(|d| {
+            let want = Self::normalize_package_name(&d.name);
+            affected.iter().find(|a| {
+                let pkg = a.get("package");
+                let name = pkg.and_then(|p| p.get("name")).and_then(|n| n.as_str());
+                let eco = pkg
+                    .and_then(|p| p.get("ecosystem"))
+                    .and_then(|e| e.as_str());
+                let same_eco = match eco {
+                    Some(e) if d.ecosystem != ECOSYSTEM_UNSCOPED => {
+                        e.eq_ignore_ascii_case(&d.ecosystem)
+                    }
+                    _ => true,
+                };
+                name.is_some_and(|n| Self::normalize_package_name(n) == want) && same_eco
+            })
+        });
+        let entry = matching.or_else(|| affected.first())?;
+        let ranges: Vec<&Vec<serde_json::Value>> = entry
+            .get("ranges")?
+            .as_array()?
+            .iter()
+            .filter(|r| {
+                r.get("type")
+                    .and_then(|t| t.as_str())
+                    .is_none_or(|t| !t.eq_ignore_ascii_case("GIT"))
+            })
+            .filter_map(|r| r.get("events").and_then(|e| e.as_array()))
+            .collect();
+
+        let installed = dep.and_then(|d| d.version.as_deref());
+        if let Some(installed) = installed {
+            use crate::services::cpe_candidates::compare_versions;
+            use std::cmp::Ordering;
+            for events in &ranges {
+                let mut introduced: Option<&str> = None;
+                for event in events.iter() {
+                    if let Some(i) = event.get("introduced").and_then(|v| v.as_str()) {
+                        introduced = Some(i);
+                    } else if let Some(fixed) = event.get("fixed").and_then(|v| v.as_str()) {
+                        let at_or_after_start = match introduced {
+                            None | Some("0") => true,
+                            Some(i) => compare_versions(installed, i) != Ordering::Less,
+                        };
+                        if at_or_after_start && compare_versions(installed, fixed) == Ordering::Less
+                        {
+                            return Some(fixed.to_string());
+                        }
+                        introduced = None;
+                    }
+                }
+            }
+        }
+
+        ranges
+            .iter()
+            .flat_map(|events| events.iter())
+            .find_map(|e| e.get("fixed").and_then(|f| f.as_str()).map(String::from))
+    }
+
+    /// PEP 503 name normalization: lowercase, runs of `-`, `_` and `.`
+    /// collapsed to a single `-`.
+    fn normalize_package_name(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        let mut in_separator_run = false;
+        for c in name.chars() {
+            if matches!(c, '-' | '_' | '.') {
+                if !in_separator_run {
+                    out.push('-');
+                }
+                in_separator_run = true;
+            } else {
+                out.push(c.to_ascii_lowercase());
+                in_separator_run = false;
+            }
+        }
+        out
+    }
+
+    /// Whether a match came from a bare batch entry (`id` + `modified` only)
+    /// and so still needs its full record.
+    fn osv_match_is_skeletal(m: &AdvisoryMatch) -> bool {
+        m.summary.is_none()
+            && m.details.is_none()
+            && m.aliases.is_empty()
+            && m.fixed_version.is_none()
+    }
+
+    /// An OSV identifier safe to put in a URL path (`GHSA-xxxx-xxxx-xxxx`,
+    /// `PYSEC-2023-1`, `CVE-2024-1`, ...). The ids come from the feed's own
+    /// response, so anything else is skipped rather than escaped.
+    fn is_plain_osv_id(id: &str) -> bool {
+        // `UNKNOWN` is what `parse_osv_vuln` substitutes for a missing id;
+        // `.` and `..` are path segments, not identifiers.
+        !matches!(id, "" | "." | ".." | "UNKNOWN")
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    }
+
+    /// `/v1/vulns` beside the configured `/v1/querybatch`. `None` for a batch
+    /// URL of any other shape, in which case matches stay unhydrated.
+    fn osv_vulns_url(&self) -> Option<String> {
+        self.osv_batch_url()
+            .strip_suffix("/querybatch")
+            .map(|base| format!("{base}/vulns"))
+    }
+
+    /// Fetch one full OSV record. A failure yields the reason instead: a
+    /// finding without its detail is still a finding, so hydration never
+    /// degrades or drops a match. Failures are summarized once per batch by
+    /// the caller rather than logged per id, so a mirror that lacks the
+    /// records endpoint does not produce one warning per advisory.
+    async fn fetch_osv_vuln(
+        &self,
+        vulns_url: &str,
+        id: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let url = format!("{vulns_url}/{id}");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("status {}", resp.status()));
+        }
+        let record = resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("unparseable body: {e}"))?;
+        // The record must be the one asked for: a body naming another id
+        // would attach a different advisory's CVE and fix to this finding.
+        if record.get("id").and_then(|v| v.as_str()) != Some(id) {
+            return Err("record names a different id".to_string());
+        }
+        Ok(record)
+    }
+
+    /// Replace every skeletal batch match with its full record (#4150).
+    ///
+    /// Without this, every OSV-sourced finding (declared, vendored and conda
+    /// alias alike) is stored with no CVE id, no fixed version and the
+    /// placeholder title `Vulnerability <id>`, which also defeats the
+    /// CVE-keyed dedup against the cataloging scanner's rows
+    /// ([`crate::services::component_dedup`]). Each distinct id is fetched
+    /// once per batch, with bounded concurrency; ids that are not a plain
+    /// OSV identifier are never interpolated into a URL.
+    ///
+    /// Bounded in time as well as concurrency: the dependency scan runs
+    /// inside the inline proxy scan budget, where a slow records endpoint
+    /// must not turn a pull inconclusive. Fetching stops at the
+    /// `osv_hydrate_budget` deadline or after
+    /// [`OSV_HYDRATE_MAX_CONSECUTIVE_FAILURES`] failures in a row; whatever
+    /// was not fetched by then keeps its bare match, and the lookup is not
+    /// degraded (the feed did answer the question that decides cleanliness).
+    async fn hydrate_osv_matches(&self, grouped: &mut [Vec<AdvisoryMatch>], deps: &[Dependency]) {
+        const CONCURRENCY: usize = 8;
+        let Some(vulns_url) = self.osv_vulns_url() else {
+            return;
+        };
+        let ids: BTreeSet<String> = grouped
+            .iter()
+            .flatten()
+            .filter(|m| Self::osv_match_is_skeletal(m))
+            .map(|m| m.id.clone())
+            .filter(|id| Self::is_plain_osv_id(id))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+
+        let requested = ids.len();
+        let vulns_url = vulns_url.as_str();
+        let deadline = tokio::time::Instant::now() + self.osv_hydrate_budget;
+        let mut fetches = futures::stream::iter(ids)
+            .map(|id| async move {
+                let record = self.fetch_osv_vuln(vulns_url, &id).await;
+                (id, record)
+            })
+            .buffer_unordered(CONCURRENCY);
+        let mut records: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut failures = 0usize;
+        let mut consecutive_failures = 0usize;
+        let mut last_failure: Option<String> = None;
+        let mut stopped_early: Option<&str> = None;
+        loop {
+            match tokio::time::timeout_at(deadline, fetches.next()).await {
+                Err(_) => {
+                    stopped_early = Some("time budget exhausted");
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some((id, Ok(record)))) => {
+                    consecutive_failures = 0;
+                    records.insert(id, record);
+                }
+                Ok(Some((id, Err(reason)))) => {
+                    tracing::debug!(osv_id = %id, reason = %reason, "OSV record fetch failed");
+                    failures += 1;
+                    consecutive_failures += 1;
+                    last_failure = Some(format!("{id}: {reason}"));
+                    if consecutive_failures >= OSV_HYDRATE_MAX_CONSECUTIVE_FAILURES {
+                        stopped_early = Some("too many consecutive failures");
+                        break;
+                    }
+                }
+            }
+        }
+        // Dropping the stream cancels any fetch still in flight.
+        drop(fetches);
+
+        if failures > 0 || stopped_early.is_some() {
+            warn!(
+                requested,
+                hydrated = records.len(),
+                failed = failures,
+                stopped_early = stopped_early.unwrap_or("no"),
+                last_failure = last_failure.as_deref().unwrap_or("none"),
+                "OSV.dev records could not all be fetched; the affected findings keep \
+                 their bare advisory id (no CVE, fixed version or summary)"
+            );
+        }
+
+        for (i, matches) in grouped.iter_mut().enumerate() {
+            for m in matches.iter_mut() {
+                if !Self::osv_match_is_skeletal(m) {
+                    continue;
+                }
+                if let Some(record) = records.get(&m.id) {
+                    *m = Self::parse_osv_vuln(record, deps.get(i));
+                }
+            }
+        }
     }
 
     fn parse_github_advisory(adv: &serde_json::Value, dep: &Dependency) -> Option<AdvisoryMatch> {
@@ -5935,6 +6783,27 @@ struct CondaCoverageGap {
 }
 
 impl DependencyScanner {
+    /// The CVE an advisory is about: its first `CVE-` alias, or its own id
+    /// when that is a CVE.
+    fn cve_of(advisory: &AdvisoryMatch) -> Option<String> {
+        advisory
+            .aliases
+            .iter()
+            .find(|a| a.starts_with("CVE-"))
+            .cloned()
+            .or_else(|| advisory.id.starts_with("CVE-").then(|| advisory.id.clone()))
+    }
+
+    /// What kind of finding an advisory produces (#3013): `malicious` when
+    /// its id or an alias is an OSV malicious-package record (`MAL-*`, the
+    /// ossf/malicious-packages feed OSV ingests), `vulnerability` otherwise.
+    fn class_of(advisory: &AdvisoryMatch) -> crate::models::security::FindingClass {
+        crate::models::security::FindingClass::from_advisory_ids(
+            std::iter::once(advisory.id.as_str())
+                .chain(advisory.aliases.iter().map(String::as_str)),
+        )
+    }
+
     pub fn new(advisory: Arc<AdvisoryClient>) -> Self {
         Self { advisory, db: None }
     }
@@ -6477,6 +7346,17 @@ impl Scanner for DependencyScanner {
         "dependency"
     }
 
+    /// The advisory feeds are live APIs, not a local snapshot, so the honest
+    /// database "version" is which feeds were consulted and the honest date
+    /// is the query time (#3014). Answers served from the advisory cache are
+    /// at most `CACHE_TTL` older than this.
+    async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        Some(live_advisory_provenance(
+            self.advisory.github_token.is_some(),
+            chrono::Utc::now(),
+        ))
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
@@ -6605,9 +7485,17 @@ impl Scanner for DependencyScanner {
             );
         }
 
-        // Merge and deduplicate by CVE/GHSA ID
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut findings = Vec::new();
+        // Merge and deduplicate by advisory id and alias, PER DEPENDENCY: the
+        // same CVE reached through different advisory ids for the SAME
+        // package is one finding, but the same CVE in two different packages
+        // (libwebp's CVE-2023-4863 in both pillow and opencv-python) is two,
+        // and a batch-wide set would silently drop the second (#4150).
+        //
+        // Value: index of the surviving finding, so a collapsed duplicate can
+        // still raise its severity (GHSA grades explicitly; a PYSEC record
+        // for the same CVE often carries no grade and falls back to Medium).
+        let mut seen_ids: HashMap<(String, Option<String>, String), usize> = HashMap::new();
+        let mut findings: Vec<RawFinding> = Vec::new();
 
         let mut osv_by_dep = osv_results.per_dep.into_iter();
         let mut gh_by_dep = gh_results.per_dep.into_iter();
@@ -6616,17 +7504,8 @@ impl Scanner for DependencyScanner {
             let osv = osv_by_dep.next().unwrap_or_default();
             let gh = gh_by_dep.next().unwrap_or_default();
 
+            let dep_key = |id: &str| (dep.name.clone(), dep.version.clone(), id.to_string());
             for advisory_match in osv.into_iter().chain(gh) {
-                // Skip if we have already seen this advisory or any of its aliases
-                let dominated = seen_ids.contains(&advisory_match.id)
-                    || advisory_match.aliases.iter().any(|a| seen_ids.contains(a));
-                if dominated {
-                    continue;
-                }
-
-                seen_ids.insert(advisory_match.id.clone());
-                seen_ids.extend(advisory_match.aliases.iter().cloned());
-
                 // Deliberately independent of `Severity::UNRECOGNIZED_SCANNER_SEVERITY`
                 // (#3306): advisory feeds (OSV/GHSA) are a graded vocabulary that
                 // rarely omits severity, so `Medium` is a neutral guess for a
@@ -6635,18 +7514,43 @@ impl Scanner for DependencyScanner {
                 let severity =
                     Severity::from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium);
 
-                let cve_id = advisory_match
-                    .aliases
-                    .iter()
-                    .find(|a| a.starts_with("CVE-"))
-                    .cloned()
-                    .or_else(|| {
-                        if advisory_match.id.starts_with("CVE-") {
-                            Some(advisory_match.id.clone())
-                        } else {
-                            None
-                        }
-                    });
+                // Already reported for this dependency under this id or one of
+                // its aliases: keep the existing finding, but never let the
+                // collapse lower the grade (`Severity` orders most severe
+                // first) or lose a fix the survivor did not know.
+                let existing = std::iter::once(&advisory_match.id)
+                    .chain(advisory_match.aliases.iter())
+                    .find_map(|id| seen_ids.get(&dep_key(id)).copied());
+                if let Some(idx) = existing {
+                    let survivor = &mut findings[idx];
+                    survivor.severity = survivor.severity.min(severity);
+                    if survivor.fixed_version.is_none() {
+                        survivor.fixed_version = advisory_match.fixed_version.clone();
+                    }
+                    if survivor.cve_id.is_none() {
+                        survivor.cve_id = Self::cve_of(&advisory_match);
+                    }
+                    // #3013: a duplicate that is a `MAL-` record must still
+                    // mark the surviving finding malicious.
+                    survivor.finding_class = survivor
+                        .finding_class
+                        .most_severe(Self::class_of(&advisory_match));
+                    survivor.severity = survivor.finding_class.graded_severity(survivor.severity);
+                    for id in std::iter::once(&advisory_match.id).chain(&advisory_match.aliases) {
+                        seen_ids.entry(dep_key(id)).or_insert(idx);
+                    }
+                    continue;
+                }
+                let idx = findings.len();
+                for id in std::iter::once(&advisory_match.id).chain(&advisory_match.aliases) {
+                    seen_ids.insert(dep_key(id), idx);
+                }
+
+                let cve_id = Self::cve_of(&advisory_match);
+                let finding_class = Self::class_of(&advisory_match);
+                // #3013: a known-malicious package is Critical, whatever (or
+                // however little) severity its advisory carries.
+                let severity = finding_class.graded_severity(severity);
 
                 let title = advisory_match
                     .summary
@@ -6719,6 +7623,7 @@ impl Scanner for DependencyScanner {
                     fixed_version: advisory_match.fixed_version,
                     source: Some(source),
                     source_url: advisory_match.source_url,
+                    finding_class,
                 });
             }
         }
@@ -6728,7 +7633,25 @@ impl Scanner for DependencyScanner {
             packages,
             scan_completeness: completeness_for_feeds(feeds_degraded),
             cataloged: None,
+            vuln_db: None,
         })
+    }
+}
+
+/// Database provenance for the live-API dependency scanner (#3014): which
+/// feeds answered (`live:osv`, plus `+ghsa` when the GitHub Advisory feed is
+/// configured) stamped with the query time.
+pub(crate) fn live_advisory_provenance(
+    github_feed: bool,
+    queried_at: chrono::DateTime<chrono::Utc>,
+) -> crate::models::security::VulnDbProvenance {
+    crate::models::security::VulnDbProvenance {
+        version: if github_feed {
+            "live:osv+ghsa".to_string()
+        } else {
+            "live:osv".to_string()
+        },
+        published_at: Some(queried_at),
     }
 }
 
@@ -7375,6 +8298,8 @@ impl ScannerService {
             expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
         };
+        let mut catalog_set = CatalogSetTally::default();
+        let expects_catalog = format_expects_catalog(&repository_format, upload_filename);
 
         for scanner in &self.scanners {
             // Take any pre-allocated row id committed by the trigger handler.
@@ -7474,7 +8399,41 @@ impl ScannerService {
                     .ok()
                     .flatten()
             };
-            if let Some(source_scan) = reusable {
+            if let Some(mut source_scan) = reusable {
+                // #4425: `find_reusable_scan` only returns ORIGINAL scans, so
+                // an artifact whose own row is a reused copy is handed the
+                // original (another artifact's) row. Without this check the
+                // InsertFresh path (auto-scan, repository scan) would copy it
+                // into a SECOND completed row for this artifact. Prefer the
+                // artifact's own row when it passes the same reuse filters
+                // (pin, not_cataloged, TTL), so the #1373 branch below treats
+                // it as already scanned. A lookup error falls through to the
+                // copy, the pre-#4425 behaviour.
+                if needs_own_scan_lookup(source_scan.artifact_id, artifact_id, &prepared_action) {
+                    match self
+                        .scan_result_service
+                        .find_own_reusable_scan(
+                            artifact_id,
+                            checksum,
+                            scanner.scan_type(),
+                            DEDUP_TTL_DAYS,
+                            ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                            pin_identity.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(Some(own)) => source_scan = own,
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            "Own-scan lookup failed for artifact {} (scanner={}): {}; \
+                             reusing {} by copy",
+                            artifact_id,
+                            scanner.name(),
+                            e,
+                            source_scan.id
+                        ),
+                    }
+                }
                 // #1373: when the matched source scan is for THIS artifact,
                 // a completed scan for these exact bytes already exists. We
                 // must not run a fresh scan or copy results into a new row;
@@ -7556,6 +8515,7 @@ impl ScannerService {
                             artifact_id, e
                         );
                     }
+                    catalog_set.record_reused(&source_scan.scan_completeness);
                     continue;
                 }
 
@@ -7595,6 +8555,7 @@ impl ScannerService {
                             scanner.name(),
                             checksum_log_prefix(checksum),
                         );
+                        catalog_set.record_reused(&reused.scan_completeness);
                         // Update quarantine status based on copied findings
                         self.update_quarantine_status(artifact_id, reused.findings_count)
                             .await?;
@@ -7642,6 +8603,7 @@ impl ScannerService {
                     packages,
                     scan_completeness,
                     cataloged,
+                    vuln_db: output_vuln_db,
                 }) => {
                     // #4036 fail-closed: a catalog-reporting scanner that RAN
                     // successfully over a package-archive artifact whose format
@@ -7669,6 +8631,11 @@ impl ScannerService {
                         && matches!(&cataloged, Some(c) if c.is_empty())
                         && findings.is_empty()
                         && packages.is_empty();
+                    // #4154: what this scanner contributed to the set-level
+                    // tally, captured before dedup/persistence consume the vecs.
+                    let contributed = !findings.is_empty()
+                        || !packages.is_empty()
+                        || matches!(&cataloged, Some(c) if !c.is_empty());
                     // Dedup ONLY when this upload carried a component pin
                     // (#3442). The inflation is caused by the pin itself:
                     // `prepare_pinned` writes a synthetic `package-lock.json`
@@ -7827,6 +8794,13 @@ impl ScannerService {
                     // nullable and the silent-success migration (075) treats
                     // NULL as "legacy / unknown" rather than as a hard error.
                     let scanner_version = scanner.version().await;
+                    // #3014: and the vulnerability database it graded
+                    // against: as reported with THIS scan's findings when the
+                    // engine reports it (the adapter), else probed now.
+                    let vuln_db = match output_vuln_db {
+                        Some(db) => Some(db),
+                        None => scanner.vuln_db().await,
+                    };
 
                     // Persist findings
                     self.scan_result_service
@@ -7934,6 +8908,20 @@ impl ScannerService {
                     } else {
                         (scan_completeness, None)
                     };
+                    // #4154: provisional pessimistic write, see CatalogSetTally.
+                    let provisional = CatalogSetTally::is_provisional(
+                        expects_catalog,
+                        contributed,
+                        effective_completeness,
+                    );
+                    let (written_completeness, written_reason) = if provisional {
+                        (
+                            ScanCompleteness::NotCataloged,
+                            Some(SET_NOT_CATALOGED_REASON.to_string()),
+                        )
+                    } else {
+                        (effective_completeness, completeness_reason.clone())
+                    };
                     self.scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -7945,13 +8933,19 @@ impl ScannerService {
                             info,
                             scanner_version.as_deref(),
                             started_at,
-                            effective_completeness.as_str(),
+                            written_completeness.as_str(),
                             // #3604: persist the pin identity that produced this
                             // verdict so future reuse can require a match.
                             pin_identity.as_deref(),
-                            completeness_reason.as_deref(),
+                            written_reason.as_deref(),
+                            vuln_db.as_ref(),
                         )
                         .await?;
+                    catalog_set.record_completed(
+                        scan_result.id,
+                        contributed,
+                        provisional.then_some((effective_completeness, completeness_reason)),
+                    );
 
                     // #4036: `uncataloged` now implies zero `packages` rows
                     // (#4094's corroboration guard), which skips the
@@ -7961,7 +8955,7 @@ impl ScannerService {
                     // attestation consumers do not read the artifact as fully
                     // inventoried. The scan row itself still completes
                     // normally (status='completed', real counts).
-                    if uncataloged {
+                    if uncataloged || provisional {
                         if let Err(set_err) = self
                             .scan_result_service
                             .set_inventory_status(
@@ -7978,14 +8972,15 @@ impl ScannerService {
                     }
 
                     info!(
-                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}, completeness={}",
+                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}, vuln_db={:?}, completeness={}",
                         scanner.name(),
                         artifact_id,
                         total,
                         critical,
                         high,
                         scanner_version,
-                        effective_completeness.as_str(),
+                        vuln_db.as_ref().map(|p| p.version.as_str()),
+                        written_completeness.as_str(),
                     );
 
                     // Update quarantine status
@@ -8097,6 +9092,20 @@ impl ScannerService {
                     // update_quarantine_status (#2912).
                     self.enforce_policy_after_failed_scan(artifact_id).await;
                 }
+            }
+        }
+
+        // #4154: the set has finished. If anything in it assessed the
+        // artifact, the provisionally `not_cataloged` rows get their own
+        // completeness back; otherwise they stay `not_cataloged` (see
+        // CatalogSetTally). Must run before the score is recalculated.
+        for (scan_id, completeness, reason) in catalog_set.rows_to_restore() {
+            if let Err(e) = self
+                .scan_result_service
+                .restore_completeness(*scan_id, completeness.as_str(), reason.as_deref())
+                .await
+            {
+                error!("Failed to restore completeness on scan {}: {}", scan_id, e);
             }
         }
 
@@ -9081,6 +10090,16 @@ pub(crate) mod test_helpers {
         Clean,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
+        /// The engine ran to completion, found nothing, and reported an EMPTY
+        /// catalog (#4594): what grype reports for a conda package with no
+        /// Python or recognised binary content.
+        CatalogedNothing,
+        /// The engine ran to completion, found nothing, and cataloged exactly
+        /// this `name@version` (#4594).
+        Cataloged(&'static str, &'static str),
+        /// The engine ran to completion, cataloged exactly this
+        /// `name@version`, and reported one `High` finding against it (#4600).
+        CatalogedVulnerable(&'static str, &'static str),
         /// Re-scan never finishes inside the caller's `tokio::time::timeout`
         /// budget: sleeps for the given duration (longer than the budget
         /// under test) before completing. Proves the BudgetExceeded arm
@@ -9187,6 +10206,46 @@ pub(crate) mod test_helpers {
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
+                MockCveRescan::CatalogedNothing => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(Vec::new()),
+                        ..Default::default()
+                    })
+                }
+                MockCveRescan::Cataloged(name, version) => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(vec![
+                            crate::services::scanner_service::CatalogedComponent {
+                                name: name.to_string(),
+                                version: version.to_string(),
+                            },
+                        ]),
+                        ..Default::default()
+                    })
+                }
+                MockCveRescan::CatalogedVulnerable(name, version) => {
+                    Ok(crate::services::scanner_service::ScanOutput {
+                        cataloged: Some(vec![
+                            crate::services::scanner_service::CatalogedComponent {
+                                name: name.to_string(),
+                                version: version.to_string(),
+                            },
+                        ]),
+                        findings: vec![crate::models::security::RawFinding {
+                            severity: crate::models::security::Severity::High,
+                            title: "CVE-2026-4600 test".to_string(),
+                            description: None,
+                            cve_id: Some("CVE-2026-4600".to_string()),
+                            affected_component: Some(name.to_string()),
+                            affected_version: Some(version.to_string()),
+                            fixed_version: None,
+                            source: Some("grype".to_string()),
+                            source_url: None,
+                            finding_class: crate::models::security::FindingClass::Vulnerability,
+                        }],
+                        ..Default::default()
+                    })
+                }
                 MockCveRescan::Hang(d) => {
                     tokio::time::sleep(d).await;
                     Ok(crate::services::scanner_service::ScanOutput::default())
@@ -9203,6 +10262,7 @@ pub(crate) mod test_helpers {
                             fixed_version: None,
                             source: Some("grype".to_string()),
                             source_url: None,
+                            finding_class: crate::models::security::FindingClass::Vulnerability,
                         }],
                     ))
                 }
@@ -9254,6 +10314,52 @@ where
     true
 }
 
+/// Whether `repository_id` has scanning enabled with `scan_on_upload` on.
+/// A missing config row or a read error is "no" -- the same default
+/// `ArtifactService::finalize_upload` applies.
+pub async fn scan_on_upload_enabled(db: &PgPool, repository_id: Uuid) -> bool {
+    sqlx::query_scalar!(
+        "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+        repository_id
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// The scan-on-upload trigger for every upload path that inserts its own
+/// `artifacts` row instead of going through `ArtifactService::finalize_upload`
+/// (#4159 for conda, #4166 for the other format-native handlers).
+///
+/// Mirrors finalize_upload's gate: no scanner configured, scanning disabled,
+/// or `scan_on_upload = false` is a no-op. Otherwise the scan is spawned so
+/// the upload response is not delayed. Call it AFTER the row is committed
+/// (and after format metadata is written, where the handler writes any), so
+/// the scan sees the finished artifact. Returns whether a scan was spawned.
+///
+/// The `every_format_upload_triggers_scan_on_upload` ratchet test in
+/// `api::handlers::proxy_helpers` requires every handler that inserts an
+/// artifact to reach this function.
+pub async fn trigger_scan_on_upload(
+    db: &PgPool,
+    scanner: Option<Arc<ScannerService>>,
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> bool {
+    let Some(scanner) = scanner else {
+        return false;
+    };
+    let should_scan = scan_on_upload_enabled(db, repository_id).await;
+    spawn_scan_on_upload(should_scan, artifact_id, move |aid| async move {
+        if let Err(e) = scanner.scan_artifact(aid).await {
+            tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
+        }
+    })
+}
+
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12383,6 +13489,11 @@ mod tests {
             ("gradle", "commons-collections-3.2.1.jar"),
             ("debian", "openssl_3.0.2-0ubuntu1_amd64.deb"),
             ("rpm", "openssl-3.0.7-18.el9.x86_64.rpm"),
+            // #4154 (grace A3): an archive in a GENERIC repository is extracted
+            // and inventoried like any other, so it expects a catalog too.
+            ("generic", "bundle.tar.gz"),
+            ("generic", "bundle.zip"),
+            ("generic", "numpy-1.26.0-py311_0.tar.bz2"),
         ] {
             assert!(
                 format_expects_catalog(f, filename),
@@ -12390,11 +13501,11 @@ mod tests {
             );
         }
 
-        // Extension-gated per format, and false for generic/raw repositories
+        // Extension-gated per format, and false for non-archive generic blobs
         // and non-package artifacts — those legitimately catalog nothing.
         for (f, filename) in [
             ("generic", "blob.bin"),
-            ("generic", "numpy-1.26.0-py311_0.tar.bz2"),
+            ("generic", "notes.txt"),
             ("conda", "notes.txt"),
             ("npm", "notes.txt"),
             ("npm", "left-pad-1.3.0.tar.gz"),
@@ -12413,6 +13524,70 @@ mod tests {
         // Filename matching is case-insensitive.
         assert!(format_expects_catalog("cargo", "SMALLVEC-1.6.0.CRATE"));
         assert!(format_expects_catalog("conda", "NUMPY-1.26.0.TAR.BZ2"));
+    }
+
+    /// #4154: which uncataloged artifacts floor the repository grade. Every
+    /// catalog-expecting artifact in a typed repository does (#4091); in a
+    /// generic repository only package-shaped archives do.
+    #[test]
+    fn test_uncataloged_floors_grade_only_for_packages() {
+        assert!(uncataloged_floors_grade("maven", "commons-1.0.jar"));
+        assert!(uncataloged_floors_grade("npm", "left-pad-1.3.0.tgz"));
+        assert!(uncataloged_floors_grade("pypi", "pkg-1.0.tar.gz"));
+        for name in [
+            "a.whl", "b.JAR", "c.war", "d.ear", "e.gem", "f.crate", "g.nupkg", "h.egg", "i.conda",
+        ] {
+            assert!(uncataloged_floors_grade("generic", name), "{name} floors");
+        }
+        for name in [
+            "docs.zip",
+            "site.tar.gz",
+            "chart.tgz",
+            "fw.tar.bz2",
+            "BUILD.ZIP",
+        ] {
+            assert!(
+                !uncataloged_floors_grade("generic", name),
+                "{name} must not floor"
+            );
+        }
+    }
+
+    /// #4154: a row is written `not_cataloged` provisionally only when the
+    /// format expects a catalog, the scanner contributed nothing, and the row
+    /// is not already `not_cataloged`; the finished set restores provisional
+    /// rows only if something in it assessed the artifact.
+    #[test]
+    fn test_catalog_set_tally_restores_only_when_the_set_assessed_something() {
+        use ScanCompleteness::{Complete, NotCataloged, Partial};
+        assert!(CatalogSetTally::is_provisional(true, false, Complete));
+        // A pin `partial` keeps its verdict; it is never written provisionally.
+        assert!(!CatalogSetTally::is_provisional(true, false, Partial));
+        assert!(!CatalogSetTally::is_provisional(true, false, NotCataloged));
+        assert!(!CatalogSetTally::is_provisional(true, true, Complete));
+        assert!(!CatalogSetTally::is_provisional(false, false, Complete));
+
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+
+        // Nothing assessed: provisional rows stay not_cataloged.
+        let mut empty = CatalogSetTally::default();
+        empty.record_completed(a, false, Some((Complete, None)));
+        empty.record_completed(b, false, Some((Complete, None)));
+        assert!(empty.rows_to_restore().is_empty());
+
+        // Something assessed: every provisional row gets `complete` back.
+        let mut assessed = CatalogSetTally::default();
+        assessed.record_completed(a, false, Some((Complete, None)));
+        assessed.record_completed(b, true, None);
+        assert_eq!(assessed.rows_to_restore(), &[(a, Complete, None)]);
+
+        // A reused row counts by its copied completeness.
+        let mut reused = CatalogSetTally::default();
+        reused.record_completed(a, false, Some((Complete, None)));
+        reused.record_reused("not_cataloged");
+        assert!(reused.rows_to_restore().is_empty());
+        reused.record_reused("complete");
+        assert_eq!(reused.rows_to_restore().len(), 1);
     }
 
     /// #4036: the persisted strings must match the `scan_completeness` CHECK
@@ -13211,6 +14386,88 @@ mod tests {
         ]))
     }
 
+    /// A Maven-built jar (#4100): a zip carrying the project's own
+    /// `META-INF/maven/<g>/<a>/pom.properties` beside a class file.
+    fn maven_jar_fixture(group: &str, artifact: &str, version: &str) -> Bytes {
+        let props = format!(
+            "#Generated by Maven\nartifactId={artifact}\ngroupId={group}\nversion={version}\n"
+        );
+        Bytes::from(build_zip(&[
+            (
+                &format!("META-INF/maven/{group}/{artifact}/pom.properties"),
+                props.into_bytes(),
+            ),
+            ("com/example/Lib.class", b"\xca\xfe\xba\xbe".to_vec()),
+        ]))
+    }
+
+    /// #4100: what a JVM archive says about itself is read from the
+    /// requested coordinate's OWN `pom.properties` only.
+    #[test]
+    fn test_maven_archive_claim() {
+        let jar = maven_jar_fixture("org.apache.logging.log4j", "log4j-core", "2.14.1");
+        assert_eq!(
+            maven_archive_claim(&jar, "org.apache.logging.log4j", "log4j-core"),
+            MavenArchiveClaim::Declares {
+                group_id: "org.apache.logging.log4j".into(),
+                artifact_id: "log4j-core".into(),
+                version: "2.14.1".into(),
+            }
+        );
+        // A shaded dependency's entry is not the archive's own: asking for a
+        // different coordinate finds nothing.
+        assert_eq!(
+            maven_archive_claim(&jar, "org.apache.logging.log4j", "log4j-api"),
+            MavenArchiveClaim::Absent
+        );
+        // A Gradle-built jar writes no pom.properties at all.
+        let gradle = Bytes::from(build_zip(&[(
+            "META-INF/MANIFEST.MF",
+            b"Manifest-Version: 1.0\n".to_vec(),
+        )]));
+        assert_eq!(
+            maven_archive_claim(&gradle, "com.squareup.okhttp3", "okhttp"),
+            MavenArchiveClaim::Absent
+        );
+        // Not an archive at all, and an entry missing a field.
+        assert_eq!(
+            maven_archive_claim(&Bytes::from_static(b"<html>"), "g", "a"),
+            MavenArchiveClaim::Unreadable
+        );
+        let partial = Bytes::from(build_zip(&[(
+            "META-INF/maven/g/a/pom.properties",
+            b"groupId=g\nartifactId=a\n".to_vec(),
+        )]));
+        assert_eq!(
+            maven_archive_claim(&partial, "g", "a"),
+            MavenArchiveClaim::Unreadable
+        );
+    }
+
+    /// #4100: a Maven pin names `groupId:artifactId`, but the engine's
+    /// CycloneDX catalog names a jar by its artifactId alone.
+    #[test]
+    fn test_maven_pin_matches_the_artifact_id_in_the_catalog() {
+        let pin = ExpectedComponent::new(
+            ComponentEcosystem::Maven,
+            "org.apache.logging.log4j:log4j-core",
+            "2.14.1",
+        );
+        assert!(pin.matches(&CatalogedComponent {
+            name: "log4j-core".into(),
+            version: "2.14.1".into(),
+        }));
+        assert!(!pin.matches(&CatalogedComponent {
+            name: "log4j-api".into(),
+            version: "2.14.1".into(),
+        }));
+        assert!(!pin.matches(&CatalogedComponent {
+            name: "log4j-core".into(),
+            version: "2.17.1".into(),
+        }));
+        assert_eq!(pin.pin_identity(), "maven|log4j-core|2.14.1");
+    }
+
     /// A conda v1 `.tar.bz2`: a bzip2 tar whose `info/index.json` declares the
     /// package's own `(name, version, build)` — the file the conda upload
     /// validator cross-checks the filename against, and the file
@@ -13438,6 +14695,13 @@ mod tests {
                 "1.26.4",
                 conda_v2_fixture("numpy", "1.26.4", "py312_0"),
             ),
+            (
+                ComponentEcosystem::Maven,
+                "log4j-core-2.14.1.jar",
+                "org.apache.logging.log4j:log4j-core",
+                "2.14.1",
+                maven_jar_fixture("org.apache.logging.log4j", "log4j-core", "2.14.1"),
+            ),
         ];
 
         for (eco, filename, name, version, content) in &cases {
@@ -13476,6 +14740,61 @@ mod tests {
             &nupkg,
             &ExpectedComponent::new(ComponentEcosystem::NuGet, "Newtonsoft-Json", "12.0.1"),
             "Newtonsoft.Json.12.0.1.nupkg"
+        ));
+
+        // #4102: a real manifest (BOM, `<?xml ...?>` declaration, CRLF), as
+        // `nuget pack` writes it. The hosted pin above (`hosted_upload_pin` +
+        // this function) read it through the same parser, which used to fail
+        // on the declaration, so real hosted NuGet packages lost their pin.
+        let real = Bytes::from(build_zip(&[(
+            "Newtonsoft.Json.nuspec",
+            crate::formats::nuget::real_world_nuspec().into_bytes(),
+        )]));
+        assert!(pin_agrees_with_content(
+            &real,
+            &ExpectedComponent::new(ComponentEcosystem::NuGet, "newtonsoft.json", "12.0.1"),
+            "newtonsoft.json.12.0.1.nupkg"
+        ));
+        assert_eq!(
+            hosted_upload_pin(
+                "nuget",
+                "newtonsoft.json.12.0.1.nupkg",
+                "newtonsoft.json",
+                Some("12.0.1")
+            )
+            .filter(|pin| pin_agrees_with_content(
+                &real,
+                pin,
+                "newtonsoft.json.12.0.1.nupkg"
+            )),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::NuGet,
+                "newtonsoft.json",
+                "12.0.1"
+            )),
+            "a real hosted package keeps its pin"
+        );
+
+        // #4102: the flat container addresses a package by its NORMALIZED
+        // version, which need not be the `.nuspec`'s own spelling. Different
+        // versions still disagree after normalization.
+        let short = nupkg_fixture("Widget", "1.0");
+        for (pinned, agrees) in [("1.0.0", true), ("1.0.0.0", true), ("1.0.1", false)] {
+            assert_eq!(
+                pin_agrees_with_content(
+                    &short,
+                    &ExpectedComponent::new(ComponentEcosystem::NuGet, "widget", pinned),
+                    "widget.1.0.0.nupkg"
+                ),
+                agrees,
+                "{pinned}"
+            );
+        }
+        // Normalization is NuGet's own: a Cargo version is not padded.
+        assert!(!pin_agrees_with_content(
+            &crate_fixture("smallvec", "1.6"),
+            &ExpectedComponent::new(ComponentEcosystem::Cargo, "smallvec", "1.6.0"),
+            "smallvec-1.6.0.crate"
         ));
 
         // PEP 440 spellings that mean one version agree, so a row recorded as
@@ -15280,6 +16599,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: None,
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
 
         let deps: Vec<_> = (0..1001)
@@ -15371,6 +16691,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: None,
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
 
         let deps = vec![Dependency {
@@ -15476,6 +16797,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
             delta_sink: Some(sink.clone()),
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
         (server, client, sink)
     }
@@ -15543,6 +16865,7 @@ tonic-build = "0.12"
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl: Duration::from_secs(3600),
             delta_sink: Some(sink.clone()),
+            osv_hydrate_budget: OSV_HYDRATE_BUDGET,
         };
         let deps = vec![Dependency {
             name: "never-seen-pkg".to_string(),
@@ -15599,6 +16922,7 @@ tonic-build = "0.12"
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
+                osv_hydrate_budget: OSV_HYDRATE_BUDGET,
             })
         }
 
@@ -15809,6 +17133,106 @@ tonic-build = "0.12"
             );
             assert_eq!(out.findings[0].affected_version.as_deref(), Some("2.0.0"));
             assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
+        }
+
+        /// #3013: an OSV `MAL-*` record (ossf/malicious-packages) is a
+        /// malicious package, not a weakness, and must be persisted as such;
+        /// an ordinary advisory in the same batch stays a vulnerability.
+        #[tokio::test]
+        async fn test_mal_advisory_is_classed_malicious() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [{
+                            "id": "MAL-2024-1234",
+                            "summary": "Malicious code in evil-pkg (PyPI)",
+                            "affected": [{ "ranges": [{ "events": [{ "introduced": "0" }] }] }]
+                        }] },
+                        { "vulns": [pillow_advisory()] }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"evil-pkg==1.0.0\npillow==10.0.0\n");
+
+            let out = scanner.scan(&artifact, None, &content).await.expect("scan");
+
+            assert_eq!(out.findings.len(), 2);
+            let class_of = |component: &str| {
+                out.findings
+                    .iter()
+                    .find(|f| f.affected_component.as_deref() == Some(component))
+                    .map(|f| f.finding_class)
+            };
+            assert_eq!(
+                class_of("evil-pkg"),
+                Some(crate::models::security::FindingClass::Malicious)
+            );
+            assert_eq!(
+                class_of("pillow"),
+                Some(crate::models::security::FindingClass::Vulnerability)
+            );
+            let severity_of = |component: &str| {
+                out.findings
+                    .iter()
+                    .find(|f| f.affected_component.as_deref() == Some(component))
+                    .map(|f| f.severity)
+            };
+            assert_eq!(
+                severity_of("evil-pkg"),
+                Some(Severity::Critical),
+                "an ungraded MAL record must not fall back to Medium"
+            );
+            assert_eq!(severity_of("pillow"), Some(Severity::Critical));
+        }
+
+        /// #3013: when the `MAL-` record arrives as a duplicate of an advisory
+        /// already reported for the same dependency (it aliases it), the
+        /// surviving finding must still become malicious; the collapse must
+        /// not launder it back into an ordinary vulnerability.
+        #[tokio::test]
+        async fn test_mal_duplicate_marks_the_surviving_finding_malicious() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [
+                            { "id": "GHSA-aaaa-bbbb-cccc", "summary": "Embedded malware" },
+                            {
+                                "id": "MAL-2025-42",
+                                "summary": "Malicious code in typo-pkg (PyPI)",
+                                "aliases": ["GHSA-aaaa-bbbb-cccc"]
+                            }
+                        ] }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"typo-pkg==0.0.1\n");
+
+            let out = scanner.scan(&artifact, None, &content).await.expect("scan");
+
+            assert_eq!(out.findings.len(), 1, "the alias collapses to one finding");
+            assert_eq!(
+                out.findings[0].finding_class,
+                crate::models::security::FindingClass::Malicious
+            );
+            assert_eq!(out.findings[0].severity, Severity::Critical);
         }
 
         /// The same positional discipline in the cache. Caching a whole
@@ -16562,6 +17986,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }
     }
 
@@ -16709,6 +18134,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: source.map(str::to_string),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }
     }
 
@@ -17991,6 +19417,7 @@ tonic-build = "0.12"
             fixed_version: Some("1.0.1".to_string()),
             source: Some("trivy".to_string()),
             source_url: Some("https://trivy.dev/vuln/CVE-2024-0001".to_string()),
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["severity"], "critical");
@@ -18015,6 +19442,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["severity"], "info");
@@ -18059,6 +19487,7 @@ tonic-build = "0.12"
             fixed_version: Some("2.0.1".to_string()),
             source: Some("grype".to_string()),
             source_url: Some("https://example.com".to_string()),
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         let cloned = finding.clone();
         assert_eq!(cloned.severity, finding.severity);
@@ -18689,7 +20118,12 @@ tonic-build = "0.12"
         });
         let matches = AdvisoryClient::parse_osv_response(&body, &deps);
         assert_eq!(matches.len(), 1);
-        assert!(matches[0].summary.is_none());
+        // #4150: a record with no `summary` takes the first prose line of its
+        // `details` as its title, so the finding is never untitled.
+        assert_eq!(
+            matches[0].summary.as_deref(),
+            Some("A detailed description without summary")
+        );
         assert_eq!(
             matches[0].details.as_deref(),
             Some("A detailed description without summary")
@@ -20465,6 +21899,7 @@ tonic-build = "0.12"
         assert_eq!(format_to_purl_type("alpine"), "apk");
         assert_eq!(format_to_purl_type("APK"), "apk");
         assert_eq!(format_to_purl_type("Alpine"), "apk");
+        assert_eq!(format_to_purl_type("pacman"), "alpm");
     }
 
     #[test]
@@ -21372,6 +22807,35 @@ tonic-build = "0.12"
     }
 
     #[test]
+    fn test_needs_own_scan_lookup_only_for_foreign_match_without_placeholder() {
+        // #4425: only a match on ANOTHER artifact under InsertFresh can turn
+        // into a duplicate completed row, so only that case looks up the
+        // artifact's own row first.
+        let current = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(needs_own_scan_lookup(
+            other,
+            current,
+            &PreparedScanAction::InsertFresh
+        ));
+        assert!(!needs_own_scan_lookup(
+            current,
+            current,
+            &PreparedScanAction::InsertFresh
+        ));
+        assert!(!needs_own_scan_lookup(
+            other,
+            current,
+            &PreparedScanAction::Reuse(Uuid::new_v4())
+        ));
+        assert!(!needs_own_scan_lookup(
+            current,
+            current,
+            &PreparedScanAction::Reuse(Uuid::new_v4())
+        ));
+    }
+
+    #[test]
     fn test_decide_same_artifact_action_insert_fresh_is_noop() {
         // Auto-scan-on-upload path: no placeholder was committed, so we
         // simply skip. The existing completed row already represents
@@ -21698,8 +23162,8 @@ tonic-build = "0.12"
     }
 
     /// Trivy emits `Licenses` as an array; multi-license packages must be
-    /// joined with " OR " per CycloneDX convention. Empty licenses must
-    /// not produce empty strings.
+    /// joined with " AND " (#3866: a detected list is conjunctive, never an
+    /// inferred choice). Empty licenses must not produce empty strings.
     #[test]
     fn test_convert_trivy_packages_license_join_and_empty_handling() {
         use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
@@ -21736,7 +23200,7 @@ tonic-build = "0.12"
         let pkgs = convert_trivy_packages(&report);
 
         let log4j = pkgs.iter().find(|p| p.name == "log4j-core").unwrap();
-        assert_eq!(log4j.license.as_deref(), Some("Apache-2.0 OR MIT"));
+        assert_eq!(log4j.license.as_deref(), Some("Apache-2.0 AND MIT"));
 
         let no_lic = pkgs.iter().find(|p| p.name == "no-license-pkg").unwrap();
         assert!(
@@ -21806,6 +23270,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: None,
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         }];
         let out = ScanOutput::findings_only(findings);
         assert_eq!(out.findings.len(), 1);
@@ -22599,6 +24064,7 @@ tonic-build = "0.12"
                         fixed_version: Some("5.4".to_string()),
                         source: Some("grype".to_string()),
                         source_url: None,
+                        finding_class: crate::models::security::FindingClass::Vulnerability,
                     }])),
                 }
             }
@@ -22806,6 +24272,7 @@ tonic-build = "0.12"
                 packages: Vec::new(),
                 scan_completeness: ScanCompleteness::Complete,
                 cataloged: self.cataloged.clone(),
+                vuln_db: None,
             })
         }
     }
@@ -22966,6 +24433,229 @@ tonic-build = "0.12"
             .await
             .expect("an assessed, finding-free scan is a clean verdict");
         assert!(!verdict.is_vulnerable());
+    }
+
+    fn tzdata_expected() -> ExpectedComponent {
+        ExpectedComponent::new(ComponentEcosystem::Conda, "tzdata", "2026c")
+    }
+
+    /// The CVE engine as it behaves on a conda package (#4594): ran to
+    /// completion, cataloged `cataloged`, and reported `findings`.
+    struct CondaGradingCveScanner {
+        cataloged: Vec<CatalogedComponent>,
+        findings: Vec<RawFinding>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scanner for CondaGradingCveScanner {
+        fn name(&self) -> &str {
+            "conda-grading-cve-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&ArtifactMetadata>,
+            _: &Bytes,
+        ) -> Result<ScanOutput> {
+            Ok(ScanOutput {
+                findings: self.findings.clone(),
+                packages: Vec::new(),
+                scan_completeness: ScanCompleteness::Complete,
+                cataloged: Some(self.cataloged.clone()),
+                vuln_db: None,
+            })
+        }
+    }
+
+    fn conda_artifact() -> Artifact {
+        test_helpers::make_test_artifact(
+            "tzdata-2026c-h151e31d_0.conda",
+            "application/octet-stream",
+            "noarch/tzdata-2026c-h151e31d_0.conda",
+        )
+    }
+
+    /// #4594: only conda is graded without cataloging itself; every
+    /// ecosystem with a pin file or a self-describing archive keeps the
+    /// empty-catalog-is-inconclusive rule.
+    #[test]
+    fn test_only_conda_is_graded_without_cataloging_itself() {
+        for eco in [
+            ComponentEcosystem::Npm,
+            ComponentEcosystem::Python,
+            ComponentEcosystem::RubyGems,
+            ComponentEcosystem::Cargo,
+            ComponentEcosystem::NuGet,
+            ComponentEcosystem::Maven,
+        ] {
+            assert!(eco.engine_catalogs_the_package(), "{eco:?}");
+        }
+        assert!(!ComponentEcosystem::Conda.engine_catalogs_the_package());
+    }
+
+    /// #4594: a conda package the engine scanned to completion and cataloged
+    /// nothing for is a clean verdict graded on file contents, with
+    /// `components_cataloged = 0`.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_zero_catalog_is_clean_on_contents() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: Vec::new(),
+        })];
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a completed conda scan that cataloged nothing is conclusive");
+        assert!(!verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "clean");
+        assert_eq!(verdict.components_cataloged, Some(0));
+        assert_eq!(verdict.findings_count, 0);
+    }
+
+    /// #4594: the same conda scan WITH findings is vulnerable; nothing
+    /// cataloged never hides a finding.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_zero_catalog_with_findings_is_vulnerable() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: vec![RawFinding {
+                severity: Severity::High,
+                title: "CVE-2026-4594 test".to_string(),
+                description: None,
+                cve_id: Some("CVE-2026-4594".to_string()),
+                affected_component: Some("libfoo".to_string()),
+                affected_version: Some("1.0".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
+            }],
+        })];
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("findings make the scan conclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.high_count, 1);
+        assert_eq!(verdict.components_cataloged, Some(0));
+    }
+
+    /// #4600: a conda scan that cataloged only components other than the
+    /// conda `name@version` (the upstream component a compiled package
+    /// vendors) is graded on its findings like an empty catalog: clean
+    /// without findings, vulnerable with one, and the verdict counts what was
+    /// cataloged. A matching catalog is clean with its count. (Before #4600
+    /// the first two were inconclusive.)
+    #[tokio::test]
+    async fn test_inline_proxy_scan_conda_vendored_catalog_is_graded_on_findings() {
+        use std::sync::Arc;
+        let artifact = conda_artifact();
+        let expected = tzdata_expected();
+        for (name, version) in [("zlib", "1.3.1"), ("tzdata", "2025a")] {
+            let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+                cataloged: vec![CatalogedComponent {
+                    name: name.into(),
+                    version: version.into(),
+                }],
+                findings: Vec::new(),
+            })];
+            let verdict = run_inline_proxy_scanners_target(
+                &scanners,
+                &expecting_target(&artifact, &expected),
+                &Bytes::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}@{version}: a completed scan is conclusive: {e}"));
+            assert_eq!(verdict.verdict_token(), "clean", "{name}@{version}");
+            assert_eq!(verdict.components_cataloged, Some(1), "{name}@{version}");
+        }
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: vec![CatalogedComponent {
+                name: "zlib".into(),
+                version: "1.3.1".into(),
+            }],
+            findings: vec![RawFinding {
+                severity: Severity::High,
+                title: "CVE-2026-4600 test".to_string(),
+                description: None,
+                cve_id: Some("CVE-2026-4600".to_string()),
+                affected_component: Some("zlib".to_string()),
+                affected_version: Some("1.3.1".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
+            }],
+        })];
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("findings make the scan conclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.high_count, 1);
+        assert_eq!(verdict.components_cataloged, Some(1));
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: vec![
+                CatalogedComponent {
+                    name: "tzdata".into(),
+                    version: "2026c".into(),
+                },
+                CatalogedComponent {
+                    name: "tzdata".into(),
+                    version: "2026c".into(),
+                },
+            ],
+            findings: Vec::new(),
+        })];
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a matching catalog is clean");
+        assert_eq!(verdict.components_cataloged, Some(1), "counted once");
+    }
+
+    /// #4594 does not reach the Python rule: a PyPI wheel the engine
+    /// cataloged nothing for stays inconclusive.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_python_zero_catalog_stays_inconclusive() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CondaGradingCveScanner {
+            cataloged: Vec::new(),
+            findings: Vec::new(),
+        })];
+        let artifact = inline_scan_artifact();
+        let expected = ExpectedComponent::new(ComponentEcosystem::Python, "pyyaml", "5.3.1");
+        assert!(run_inline_proxy_scanners_target(
+            &scanners,
+            &expecting_target(&artifact, &expected),
+            &Bytes::new(),
+        )
+        .await
+        .is_err());
     }
 
     /// Blast-radius control: a scanner that reports NO catalog signal
@@ -23802,6 +25492,7 @@ tonic-build = "0.12"
                     ScanCompleteness::Partial
                 },
                 cataloged: None,
+                vuln_db: None,
             })
         }
     }
@@ -24089,7 +25780,21 @@ tonic-build = "0.12"
                 .lock()
                 .unwrap()
                 .push(target.expected_component.cloned());
-            Ok(ScanOutput::findings_only(self.findings.clone()))
+            // Inventory the artifact itself, as a real engine does for a real
+            // package (from the pin file or the package's own metadata). A
+            // scan set that inventories nothing is `not_cataloged` (#4154),
+            // which is not what these pin tests are about.
+            Ok(ScanOutput {
+                findings: self.findings.clone(),
+                packages: vec![RawPackage {
+                    name: target.artifact.name.clone(),
+                    version: target.artifact.version.clone(),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                }],
+                ..Default::default()
+            })
         }
     }
 
@@ -24471,6 +26176,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: Some("grype".to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
         // Three catalog entries for the uploaded component (pin + shipped
         // lockfile + staged shrinkwrap) plus one genuine transitive at a
@@ -24554,6 +26260,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: Some("grype".to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         };
 
         let scanner = Arc::new(PinRecordingScanner::new(vec![dup(), dup(), dup()]));
@@ -24685,6 +26392,7 @@ tonic-build = "0.12"
             fixed_version: None,
             source: Some("grype".to_string()),
             source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
         })
         .collect();
 
@@ -24851,6 +26559,7 @@ tonic-build = "0.12"
                 fixed_version: None,
                 source: Some("grype".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }],
         });
         let service = scanner_service_with(&fx, scanner.clone());
@@ -25308,6 +27017,100 @@ tonic-build = "0.12"
             .bind(repo_id)
             .execute(pool)
             .await;
+    }
+
+    /// #4425 end to end: `find_reusable_scan` now returns only original
+    /// scans, so for an artifact whose own completed row is a reused copy it
+    /// hands back the ORIGINAL artifact's row. A rescan without a prepared
+    /// placeholder (auto-scan, repository scan) must still see that the
+    /// artifact is already scanned, not copy the original into a second
+    /// completed row (the release-gate assertion "Per-artifact scan list
+    /// contains exactly one completed scan", #1373). A third byte-identical
+    /// artifact copies from the original, never from the copy.
+    #[tokio::test]
+    async fn test_rescan_of_a_reused_artifact_keeps_one_completed_row() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+        let scanner = Arc::new(PinRecordingScanner::new(Vec::new()));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let ck = fresh_checksum();
+        let bytes = Bytes::from_static(b"reused-bytes-4425");
+
+        // The original: a real scan.
+        let orig = insert_artifact_with(&fx, "orig", None, "orig", &ck, bytes.clone()).await;
+        service
+            .scan_artifact_with_options(orig, true, false)
+            .await
+            .expect("scan original");
+        let original: Uuid = sqlx::query_scalar(
+            "SELECT id FROM scan_results WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(orig)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("original row");
+
+        // A byte-identical artifact gets a reused copy through the
+        // prepare-then-convert path, which stamps the copy completed NOW().
+        let copy = insert_artifact_with(&fx, "copy", None, "copy", &ck, bytes.clone()).await;
+        let srs = ScanResultService::new(fx.pool.clone());
+        let placeholder = srs
+            .create_scan_result_with_checksum(copy, fx.repo_id, "grype", Some(&ck))
+            .await
+            .expect("placeholder");
+        srs.convert_to_reused(placeholder.id, original, copy, None)
+            .await
+            .expect("convert");
+
+        // Rescan the copy with no prepared placeholder.
+        service
+            .scan_artifact_with_options(copy, true, false)
+            .await
+            .expect("rescan copy");
+        let copy_rows: Vec<(Uuid, bool, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, is_reused, source_scan_id FROM scan_results \
+             WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(copy)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("copy rows");
+        assert_eq!(
+            copy_rows,
+            vec![(placeholder.id, true, Some(original))],
+            "a rescan of an already-reused artifact must leave exactly its one completed row"
+        );
+
+        // A third artifact copies from the original, not from the copy.
+        let third = insert_artifact_with(&fx, "third", None, "third", &ck, bytes).await;
+        service
+            .scan_artifact_with_options(third, true, false)
+            .await
+            .expect("scan third");
+        let third_source: Option<Uuid> = sqlx::query_scalar(
+            "SELECT source_scan_id FROM scan_results \
+             WHERE artifact_id = $1 AND status = 'completed'",
+        )
+        .bind(third)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("third row");
+        assert_eq!(
+            third_source,
+            Some(original),
+            "a reused row must never be the source of another reuse"
+        );
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().len(),
+            1,
+            "only the original ran a real scan"
+        );
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
     }
 
     /// 64-hex checksum (unique per call so two parallel tests don't share a
@@ -25904,6 +27707,7 @@ tonic-build = "0.12"
                         packages: packages.clone(),
                         scan_completeness: ScanCompleteness::Complete,
                         cataloged: None,
+                        vuln_db: None,
                     }),
                     FakeOutcome::CompleteWithCatalog {
                         findings,
@@ -25914,6 +27718,7 @@ tonic-build = "0.12"
                         packages: packages.clone(),
                         scan_completeness: ScanCompleteness::Complete,
                         cataloged: cataloged.clone(),
+                        vuln_db: None,
                     }),
                     // Displays as "Internal error: <reason>" so the reason is
                     // preserved in scan_results.error_message via fail_scan.
@@ -25935,6 +27740,7 @@ tonic-build = "0.12"
                 fixed_version: Some("1.0.1".to_string()),
                 source: Some("test".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }
         }
 
@@ -26234,7 +28040,12 @@ tonic-build = "0.12"
 
             // Findings retrievable via the same read path the API uses.
             let (findings, total) = ScanResultService::new(fx.pool.clone())
-                .list_findings(scan_id, None, None, None, 0, 50)
+                .list_findings(
+                    scan_id,
+                    &crate::services::scan_result_service::FindingListFilter::default(),
+                    0,
+                    50,
+                )
                 .await
                 .expect("list findings");
             assert_eq!(total, 2);
@@ -26322,8 +28133,17 @@ tonic-build = "0.12"
         /// repository format (via the fixture) and the artifact filename,
         /// which is what `format_expects_catalog` keys on.
         async fn seed_named_scannable_artifact(fx: &tdh::Fixture, name: &str) -> Uuid {
+            seed_named_artifact_with_checksum(fx, name, &fresh_checksum()).await
+        }
+
+        /// [`seed_named_scannable_artifact`] with a caller-chosen checksum, so
+        /// two artifacts can share bytes for the dedup-reuse path.
+        async fn seed_named_artifact_with_checksum(
+            fx: &tdh::Fixture,
+            name: &str,
+            checksum: &str,
+        ) -> Uuid {
             let artifact_id = Uuid::new_v4();
-            let checksum = fresh_checksum();
             let storage_key = format!("catalog/{artifact_id}/{name}");
             fx.state
                 .storage
@@ -26343,7 +28163,7 @@ tonic-build = "0.12"
             .bind(artifact_id)
             .bind(fx.repo_id)
             .bind(name)
-            .bind(&checksum)
+            .bind(checksum)
             .bind(&storage_key)
             .execute(&fx.pool)
             .await
@@ -26510,6 +28330,193 @@ tonic-build = "0.12"
             finish(fx).await;
         }
 
+        /// Scan `name` in a fresh `format` repository with `scanners`, and
+        /// return the fixture, the artifact id and the repo's score row.
+        async fn scan_named_with(
+            format: &str,
+            name: &str,
+            scanners: Vec<Arc<dyn Scanner>>,
+        ) -> Option<(
+            tdh::Fixture,
+            Uuid,
+            crate::models::security::RepoSecurityScore,
+        )> {
+            let fx = tdh::Fixture::setup("local", format).await?;
+            let artifact_id = seed_named_scannable_artifact(&fx, name).await;
+            make_scanner_service_with(&fx, scanners, None)
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            Some((fx, artifact_id, score))
+        }
+
+        /// #4154: the not-cataloged gate must not depend on grype. A package
+        /// archive scanned ONLY by scanners that report no catalog (Trivy
+        /// filesystem / dependency, `cataloged: None`) and that together found
+        /// nothing at all was never assessed -- before the set-level tally it
+        /// completed `complete` with grade A.
+        #[tokio::test]
+        async fn test_not_cataloged_without_grype_floors_repo_grade() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "maven",
+                "commons-collections-3.2.1.jar",
+                vec![
+                    FakeScanner::completed("filesystem", vec![], vec![]),
+                    FakeScanner::completed("dependency", vec![], vec![]),
+                ],
+            )
+            .await
+            else {
+                return;
+            };
+            for scan_type in ["filesystem", "dependency"] {
+                let row = latest_scan_row(&fx.pool, artifact_id, scan_type).await;
+                assert_eq!(row.status, "completed");
+                assert_eq!(
+                    row.scan_completeness, "not_cataloged",
+                    "{scan_type}: a set that cataloged nothing is not_cataloged without grype"
+                );
+                assert_eq!(row.inventory_status, "partial");
+            }
+            assert_eq!(score.grade, "F");
+            assert!(score.has_uncataloged_scan);
+            finish(fx).await;
+        }
+
+        /// #4154 negative control: one scanner in the set inventoried the
+        /// artifact, so another scanner's zero row is a real clean result.
+        #[tokio::test]
+        async fn test_set_with_inventory_is_not_flagged_not_cataloged() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "maven",
+                "commons-collections-3.2.1.jar",
+                vec![
+                    FakeScanner::completed("filesystem", vec![], two_packages()),
+                    FakeScanner::completed("dependency", vec![], vec![]),
+                ],
+            )
+            .await
+            else {
+                return;
+            };
+            let row = latest_scan_row(&fx.pool, artifact_id, "dependency").await;
+            assert_eq!(row.scan_completeness, "complete");
+            assert!(!score.has_uncataloged_scan);
+            assert_eq!(score.grade, "A");
+            finish(fx).await;
+        }
+
+        /// #4154 / grace A3: an empty `tar.gz` in a GENERIC repository scanned
+        /// `completed, 0 findings, 0 components, 0 cataloged` and silently read
+        /// as clean because `format_expects_catalog` excluded generic. It is now
+        /// recorded `not_cataloged` and flags the repository, but a plain
+        /// archive does not floor the grade (only package-shaped ones do, see
+        /// `test_empty_package_shaped_generic_archive_floors_grade`).
+        #[tokio::test]
+        async fn test_empty_generic_archive_is_not_cataloged() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "generic",
+                "bundle.tar.gz",
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+            )
+            .await
+            else {
+                return;
+            };
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.scan_completeness, "not_cataloged");
+            assert!(
+                row.scan_completeness_reason.is_some(),
+                "the not_cataloged row must say why"
+            );
+            assert!(
+                score.has_uncataloged_scan,
+                "a plain generic archive nobody could inventory flags the repository"
+            );
+            assert_eq!(
+                score.grade, "A",
+                "a plain generic archive must not floor the repository grade"
+            );
+            finish(fx).await;
+        }
+
+        /// #4154: a package-shaped archive in a GENERIC repository (here an
+        /// empty wheel) that no scanner could inventory floors the grade, as
+        /// the same package does in a typed repository (#4091).
+        #[tokio::test]
+        async fn test_empty_package_shaped_generic_archive_floors_grade() {
+            let Some((fx, artifact_id, score)) = scan_named_with(
+                "generic",
+                "tool-1.0-py3-none-any.whl",
+                vec![FakeScanner::completed("filesystem", vec![], vec![])],
+            )
+            .await
+            else {
+                return;
+            };
+            let row = latest_scan_row(&fx.pool, artifact_id, "filesystem").await;
+            assert_eq!(row.scan_completeness, "not_cataloged");
+            assert!(score.has_uncataloged_scan);
+            assert_eq!(score.grade, "F");
+            finish(fx).await;
+        }
+
+        /// #4154 dedup fail-open: the SAME empty package archive pushed to
+        /// generic repo X (floored F) and then to repo Y inside the zero-findings
+        /// reuse TTL used to copy X's rows into Y as `complete` -> grade A. A
+        /// not_cataloged row is never reused, so Y scans for itself and is F.
+        #[tokio::test]
+        async fn test_not_cataloged_is_not_reused_across_repositories() {
+            let _serial = tdh::scan_dedup_serial_lock().await;
+            let Some(x) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let Some(y) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let checksum = fresh_checksum();
+            let mut grades = Vec::new();
+            for fx in [&x, &y] {
+                let artifact_id =
+                    seed_named_artifact_with_checksum(fx, "bundle-1.0-py3-none-any.whl", &checksum)
+                        .await;
+                make_scanner_service_with(
+                    fx,
+                    vec![FakeScanner::completed("filesystem", vec![], vec![])],
+                    None,
+                )
+                // bypass_dedup = false: the reuse path is what is under test.
+                .scan_artifact_with_options(artifact_id, true, false)
+                .await
+                .expect("scan orchestration must return Ok");
+                let row = latest_scan_row(&fx.pool, artifact_id, "filesystem").await;
+                assert_eq!(row.scan_completeness, "not_cataloged");
+                let score = ScanResultService::new(fx.pool.clone())
+                    .get_score(fx.repo_id)
+                    .await
+                    .expect("score query")
+                    .expect("score row");
+                grades.push((score.grade, score.has_uncataloged_scan));
+            }
+            assert_eq!(
+                grades,
+                vec![("F".to_string(), true), ("F".to_string(), true)],
+                "repo Y must not inherit a clean grade from X's not-cataloged scan"
+            );
+            finish(y).await;
+            finish(x).await;
+        }
+
         /// #4094 false-positive regression, the xz case: an empty `library`
         /// catalog with a REAL finding means "no libraries", not "never
         /// read" — verified live against grype 0.118, which catalogs an xz
@@ -26638,7 +28645,11 @@ tonic-build = "0.12"
 
         /// Negative control 2: `cataloged: None` means "this scanner reports
         /// no catalog" (the trivy family, OCI registry mode) and NEVER
-        /// triggers the downgrade — only `Some(vec![])` does. The seeded
+        /// triggers the per-scanner downgrade — only `Some(vec![])` does. The
+        /// scanner here still inventories packages, so the #4154 set-level
+        /// tally sees an assessed artifact too (a `None` scanner that
+        /// inventories NOTHING is covered by
+        /// `test_not_cataloged_without_grype_floors_repo_grade`). The seeded
         /// bytes are a real minimal conda package whose `info/index.json`
         /// agrees with the registry coordinate, so the #4039 hosted-upload
         /// pin is produced and the pin path stays out of the way of the
@@ -26661,7 +28672,7 @@ tonic-build = "0.12"
                 vec![FakeScanner::completed_with_catalog(
                     "grype",
                     vec![],
-                    vec![],
+                    two_packages(),
                     None,
                 )],
                 None,
@@ -27309,6 +29320,7 @@ tonic-build = "0.12"
                 fixed_version: Some("1.26.5".to_string()),
                 source: Some("osv (conda alias)".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }
         }
 
@@ -27325,6 +29337,7 @@ tonic-build = "0.12"
                 fixed_version: Some("1.26.5".to_string()),
                 source: Some("grype".to_string()),
                 source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
             }
         }
 
@@ -27567,6 +29580,7 @@ tonic-build = "0.12"
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
+                osv_hydrate_budget: OSV_HYDRATE_BUDGET,
             })
         }
 
@@ -28060,6 +30074,65 @@ tonic-build = "0.12"
             fx.teardown().await;
         }
 
+        /// #4150: OSV's batch endpoint answers with bare ids. A vendored
+        /// finding built from that alone is stored with no CVE, no fix and the
+        /// title `Vulnerability <id>`; the full record has all three.
+        #[tokio::test]
+        async fn test_vendored_finding_is_hydrated_from_the_full_osv_record() {
+            let Some(fx) =
+                crate::api::handlers::test_db_helpers::Fixture::setup("local", "pypi").await
+            else {
+                return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+            };
+
+            let id = "OSV-2023-libwebp";
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{ "id": id, "modified": "2024-01-01T00:00:00Z" }] }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(libwebp_advisory()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let artifact = artifact_with_components(
+                &fx,
+                "vend-hydrate",
+                &[("libwebp", Some("1.3.1"), Some("pkg:generic/libwebp@1.3.1"))],
+            )
+            .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )))
+            .with_db(fx.pool.clone());
+
+            let out = scanner
+                .scan(
+                    &artifact,
+                    None,
+                    &Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04]),
+                )
+                .await
+                .expect("scan");
+            fx.teardown().await;
+
+            assert_eq!(out.findings.len(), 1);
+            let finding = &out.findings[0];
+            assert_eq!(finding.source.as_deref(), Some("osv.dev (vendored)"));
+            assert_eq!(finding.cve_id.as_deref(), Some("CVE-2023-4863"));
+            assert_eq!(finding.fixed_version.as_deref(), Some("1.3.2"));
+            assert_eq!(finding.title, "Heap buffer overflow in libwebp");
+            assert_eq!(finding.severity, Severity::Critical);
+        }
+
         /// A version-less component must never reach the feed. A query without
         /// a version matches every advisory ever filed against the name,
         /// regardless of whether this build is affected -- confident findings
@@ -28356,6 +30429,7 @@ tonic-build = "0.12"
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
+                osv_hydrate_budget: OSV_HYDRATE_BUDGET,
             })
         }
 
@@ -28540,6 +30614,66 @@ tonic-build = "0.12"
                 description.contains("opencv-python"),
                 "the description must disclose the alias the match rests on; got {description:?}"
             );
+        }
+
+        // -------------------------------------------------------------------
+        // #4089: alias false-positive bounding — the version-line guard
+        // -------------------------------------------------------------------
+
+        /// The alias claims "same project at the same upstream version" —
+        /// no more. The query therefore has to carry the CONDA package's
+        /// exact version, because OSV's own range matching is what keeps an
+        /// advisory for a different version line from becoming a false
+        /// positive against the conda package. For both renamed builtins
+        /// (`py-opencv` -> `opencv-python`, `matplotlib-base` ->
+        /// `matplotlib`): the query goes out under the alias name at the
+        /// conda's exact version, and the finding comes back naming the
+        /// shipped package on that same version line, with the alias the
+        /// claim rests on disclosed.
+        #[tokio::test]
+        async fn test_alias_query_and_finding_stay_on_the_conda_version_line_4089() {
+            for (conda_name, version, pypi_name) in [
+                ("py-opencv", "4.9.0", "opencv-python"),
+                ("matplotlib-base", "3.8.4", "matplotlib"),
+            ] {
+                let (server, scanner) =
+                    osv_backed_scanner(answered_with("OSV-line-1", "line check"), 1).await;
+                let out = scan_conda(&scanner, conda_name, version, &Bytes::new()).await;
+
+                let body = sent_osv_body(&server).await;
+                assert_eq!(
+                    body["queries"][0]["package"]["name"], pypi_name,
+                    "{conda_name} is queried as its PyPI alias"
+                );
+                assert_eq!(body["queries"][0]["package"]["ecosystem"], "PyPI");
+                assert_eq!(
+                    body["queries"][0]["version"], version,
+                    "the version line is the conda package's own — OSV's \
+                     range matching is the guard that keeps a different \
+                     line's advisory from matching {conda_name}"
+                );
+
+                assert_eq!(out.findings.len(), 1, "{conda_name}");
+                let finding = &out.findings[0];
+                assert_eq!(
+                    finding.affected_component.as_deref(),
+                    Some(conda_name),
+                    "the finding names the package the reader shipped, not the alias"
+                );
+                assert_eq!(
+                    finding.affected_version.as_deref(),
+                    Some(version),
+                    "the finding stays on the shipped package's version line"
+                );
+                let description = finding
+                    .description
+                    .as_deref()
+                    .expect("an aliased finding carries its provenance");
+                assert!(
+                    description.contains(pypi_name),
+                    "the alias the claim rests on is disclosed: {description:?}"
+                );
+            }
         }
 
         /// The GitHub feed keys PyPI advisories under `pip`. A mapped conda
@@ -28887,6 +31021,438 @@ tonic-build = "0.12"
             );
         }
 
+        // -------------------------------------------------------------------
+        // #4150: OSV batch answers are bare ids; findings need the record
+        // -------------------------------------------------------------------
+
+        /// What `/v1/querybatch` really returns per vulnerability: the id and
+        /// a timestamp, nothing else.
+        fn skeletal_batch(ids: &[&str]) -> serde_json::Value {
+            let vulns: Vec<serde_json::Value> = ids
+                .iter()
+                .map(|id| serde_json::json!({ "id": id, "modified": "2024-01-01T00:00:00Z" }))
+                .collect();
+            serde_json::json!({ "results": [{ "vulns": vulns }] })
+        }
+
+        /// A full `/v1/vulns/{id}` record for an opencv advisory. The FIRST
+        /// `affected` entry is a sibling distribution with a different fix,
+        /// so reading `affected[0]` would report the wrong fixed version.
+        fn opencv_record(id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "modified": "2024-01-01T00:00:00Z",
+                "summary": "opencv-python bundles a vulnerable libwebp",
+                "details": "The bundled libwebp is affected by CVE-2023-4863.",
+                "aliases": ["PYSEC-2023-0001", "CVE-2023-4863"],
+                "database_specific": { "severity": "HIGH" },
+                "affected": [
+                    {
+                        "package": { "name": "opencv-contrib-python", "ecosystem": "PyPI" },
+                        "ranges": [{ "type": "ECOSYSTEM", "events": [
+                            { "introduced": "0" }, { "fixed": "9.9.9" }
+                        ]}]
+                    },
+                    {
+                        "package": { "name": "opencv-python", "ecosystem": "PyPI" },
+                        "ranges": [{ "type": "ECOSYSTEM", "events": [
+                            { "introduced": "0" }, { "fixed": "4.8.1.78" }
+                        ]}]
+                    }
+                ]
+            })
+        }
+
+        async fn mount_skeletal_batch(server: &MockServer, ids: &[&str]) {
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(skeletal_batch(ids)))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        /// The issue as reported: a conda-alias finding stored with no CVE id,
+        /// no fixed version and the title `Vulnerability <id>`, because the
+        /// batch answer carries none of them. After hydration the finding
+        /// carries the record's CVE alias, the fix for the matching package,
+        /// its summary and its graded severity.
+        #[tokio::test]
+        async fn test_conda_alias_finding_is_hydrated_from_the_full_osv_record() {
+            let server = MockServer::start().await;
+            let id = "GHSA-cv41-0000-0001";
+            mount_skeletal_batch(&server, &[id]).await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(opencv_record(id)))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+
+            let out = scan_conda(&scanner, "py-opencv", "4.9.0", &Bytes::new()).await;
+
+            assert_eq!(out.findings.len(), 1);
+            let finding = &out.findings[0];
+            assert_eq!(
+                finding.cve_id.as_deref(),
+                Some("CVE-2023-4863"),
+                "the CVE comes from the record's aliases"
+            );
+            assert_eq!(
+                finding.fixed_version.as_deref(),
+                Some("4.8.1.78"),
+                "the fix of the affected entry for the queried package, not affected[0]"
+            );
+            assert_eq!(finding.title, "opencv-python bundles a vulnerable libwebp");
+            assert_ne!(finding.title, format!("Vulnerability {id}"));
+            assert_eq!(finding.severity, Severity::High);
+            assert_eq!(finding.source.as_deref(), Some("osv.dev (conda alias)"));
+            assert_eq!(finding.affected_component.as_deref(), Some("py-opencv"));
+            assert!(finding
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("CVE-2023-4863")));
+        }
+
+        /// A record that cannot be fetched leaves the match as the batch gave
+        /// it. The finding is still reported, and the lookup is NOT degraded:
+        /// the feed answered the question that decides whether the artifact is
+        /// clean; only the decoration is missing.
+        #[tokio::test]
+        async fn test_unfetchable_osv_record_keeps_the_bare_match() {
+            let server = MockServer::start().await;
+            mount_skeletal_batch(&server, &["GHSA-gone-0000-0001"]).await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-gone-0000-0001"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+
+            let lookup = client
+                .query_osv_detailed(&[dep("opencv-python", "4.9.0", "PyPI")])
+                .await;
+
+            assert!(!lookup.degraded, "the batch itself was answered");
+            assert_eq!(lookup.per_dep[0].len(), 1, "the match is never dropped");
+            let m = &lookup.per_dep[0][0];
+            assert_eq!(m.id, "GHSA-gone-0000-0001");
+            assert!(m.aliases.is_empty() && m.summary.is_none());
+        }
+
+        /// Each distinct advisory is fetched once per batch however many
+        /// dependencies it matched, and a record answering with a different
+        /// id is not attached to the match.
+        #[tokio::test]
+        async fn test_osv_records_are_fetched_once_and_must_match_the_id() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [
+                            { "id": "GHSA-same-0000-0001" },
+                            { "id": "GHSA-lies-0000-0001" }
+                        ] },
+                        { "vulns": [{ "id": "GHSA-same-0000-0001" }] }
+                    ]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-same-0000-0001"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(opencv_record("GHSA-same-0000-0001")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-lies-0000-0001"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(opencv_record("GHSA-other-0000-0001")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+
+            let lookup = client
+                .query_osv_detailed(&[
+                    dep("opencv-python", "4.9.0", "PyPI"),
+                    dep("opencv-contrib-python", "4.9.0", "PyPI"),
+                ])
+                .await;
+
+            let first = &lookup.per_dep[0];
+            assert_eq!(first[0].fixed_version.as_deref(), Some("4.8.1.78"));
+            assert!(
+                first[1].aliases.is_empty(),
+                "a record for another id must not decorate this match"
+            );
+            // Same advisory, other dependency: its own affected entry's fix.
+            assert_eq!(lookup.per_dep[1][0].fixed_version.as_deref(), Some("9.9.9"));
+        }
+
+        /// A full OSV record for `id`, reaching CVE-2023-4863, affecting `pkg`.
+        fn cve_record(id: &str, pkg: &str, severity: Option<&str>) -> serde_json::Value {
+            let mut record = serde_json::json!({
+                "id": id,
+                "summary": format!("{pkg} bundles a vulnerable libwebp"),
+                "aliases": ["CVE-2023-4863"],
+                "severity": [{ "type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H" }],
+                "affected": [{
+                    "package": { "name": pkg, "ecosystem": "PyPI" },
+                    "ranges": [{ "type": "ECOSYSTEM", "events": [
+                        { "introduced": "0" }, { "fixed": "99.0" }
+                    ]}]
+                }]
+            });
+            if let Some(sev) = severity {
+                record["database_specific"] = serde_json::json!({ "severity": sev });
+            }
+            record
+        }
+
+        async fn scan_requirements(
+            results: serde_json::Value,
+            content: &'static [u8],
+        ) -> ScanOutput {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(results))
+                .mount(&server)
+                .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            scanner
+                .scan(&artifact, None, &Bytes::from_static(content))
+                .await
+                .expect("scan")
+        }
+
+        /// The same CVE in two DIFFERENT packages is two findings. Once
+        /// hydration gives every OSV match its CVE alias, a batch-wide
+        /// seen-set would report libwebp's CVE for pillow and silently drop
+        /// it for opencv-python.
+        #[tokio::test]
+        async fn test_same_cve_in_two_packages_is_reported_for_each() {
+            let out = scan_requirements(
+                serde_json::json!({ "results": [
+                    { "vulns": [cve_record("GHSA-pill-0000-0001", "pillow", Some("HIGH"))] },
+                    { "vulns": [cve_record("GHSA-ocv0-0000-0001", "opencv-python", Some("HIGH"))] }
+                ]}),
+                b"pillow==9.4.0\nopencv-python==4.6.0\n",
+            )
+            .await;
+
+            let mut components: Vec<&str> = out
+                .findings
+                .iter()
+                .filter(|f| f.cve_id.as_deref() == Some("CVE-2023-4863"))
+                .filter_map(|f| f.affected_component.as_deref())
+                .collect();
+            components.sort_unstable();
+            assert_eq!(components, vec!["opencv-python", "pillow"]);
+        }
+
+        /// GHSA and PYSEC records for one CVE in one package collapse to one
+        /// finding, and the collapse keeps the HIGHER grade: the PYSEC record
+        /// has no `database_specific.severity` and reads as Medium, so whichever
+        /// arrives first must not pin the finding there.
+        #[tokio::test]
+        async fn test_collapsed_aliases_keep_the_higher_severity() {
+            let mut pysec = cve_record("PYSEC-2023-0099", "pillow", None);
+            pysec["aliases"] = serde_json::json!(["CVE-2023-4863", "GHSA-pill-0000-0001"]);
+            let out = scan_requirements(
+                serde_json::json!({ "results": [{ "vulns": [
+                    pysec,
+                    cve_record("GHSA-pill-0000-0001", "pillow", Some("CRITICAL"))
+                ]}]}),
+                b"pillow==9.4.0\n",
+            )
+            .await;
+
+            assert_eq!(out.findings.len(), 1, "one CVE, one package, one finding");
+            assert_eq!(out.findings[0].severity, Severity::Critical);
+            assert_eq!(out.findings[0].cve_id.as_deref(), Some("CVE-2023-4863"));
+        }
+
+        /// A records endpoint slower than the hydration budget must not hold
+        /// the scan: on the inline proxy path it runs inside a 30 s budget,
+        /// and blowing it turns a pull inconclusive. The bare match survives
+        /// and the lookup is not degraded.
+        #[tokio::test]
+        async fn test_slow_osv_records_endpoint_is_bounded_by_the_budget() {
+            let server = MockServer::start().await;
+            mount_skeletal_batch(&server, &["GHSA-slow-0000-0001"]).await;
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/GHSA-slow-0000-0001"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(opencv_record("GHSA-slow-0000-0001"))
+                        .set_delay(Duration::from_secs(4)),
+                )
+                .mount(&server)
+                .await;
+            let mut client = AdvisoryClient::for_test(
+                format!("{}/v1/querybatch", server.uri()),
+                Duration::from_secs(3600),
+            );
+            client.osv_hydrate_budget = Duration::from_millis(300);
+
+            let started = Instant::now();
+            let lookup = client
+                .query_osv_detailed(&[dep("opencv-python", "4.9.0", "PyPI")])
+                .await;
+
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "hydration must stop at its budget, took {:?}",
+                started.elapsed()
+            );
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.per_dep[0].len(), 1);
+            assert!(lookup.per_dep[0][0].aliases.is_empty(), "left bare");
+        }
+
+        /// A records endpoint that fails every request stops being asked after
+        /// a few consecutive failures instead of once per advisory.
+        #[tokio::test]
+        async fn test_failing_osv_records_endpoint_trips_the_breaker() {
+            let ids: Vec<String> = (0..30).map(|i| format!("GHSA-down-0000-{i:04}")).collect();
+            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let server = MockServer::start().await;
+            mount_skeletal_batch(&server, &id_refs).await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+
+            let lookup = client
+                .query_osv_detailed(&[dep("opencv-python", "4.9.0", "PyPI")])
+                .await;
+
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.per_dep[0].len(), 30, "every match is kept");
+            let gets = server
+                .received_requests()
+                .await
+                .expect("mock records requests")
+                .iter()
+                .filter(|r| r.method == wiremock::http::Method::GET)
+                .count();
+            assert!(
+                gets < 30,
+                "the breaker must stop asking after consecutive failures, sent {gets}"
+            );
+        }
+
+        fn ranged(pkg: &str, ranges: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "id": "GHSA-rang-0000-0001",
+                "affected": [{ "package": { "name": pkg, "ecosystem": "PyPI" }, "ranges": ranges }]
+            })
+        }
+
+        /// A split advisory reports the fix that closes the interval holding
+        /// the installed version, not the first fix listed.
+        #[test]
+        fn test_fixed_version_comes_from_the_interval_holding_the_installed_version() {
+            let record = ranged(
+                "pillow",
+                serde_json::json!([{ "type": "ECOSYSTEM", "events": [
+                    { "introduced": "0" }, { "fixed": "1.2" },
+                    { "introduced": "2.0" }, { "fixed": "2.3" }
+                ]}]),
+            );
+            let fixed = |v: &str| {
+                AdvisoryClient::osv_fixed_version(&record, Some(&dep("pillow", v, "PyPI")))
+            };
+            assert_eq!(fixed("2.1").as_deref(), Some("2.3"));
+            assert_eq!(fixed("1.0").as_deref(), Some("1.2"));
+            // Outside every interval: fall back to the first fix listed.
+            assert_eq!(fixed("1.5").as_deref(), Some("1.2"));
+            assert_eq!(
+                AdvisoryClient::osv_fixed_version(&record, None).as_deref(),
+                Some("1.2")
+            );
+        }
+
+        /// GIT ranges carry commit SHAs, which are not versions anyone can
+        /// upgrade to.
+        #[test]
+        fn test_fixed_version_skips_git_ranges() {
+            let record = ranged(
+                "pillow",
+                serde_json::json!([
+                    { "type": "GIT", "repo": "https://github.com/python-pillow/Pillow",
+                      "events": [{ "introduced": "0" }, { "fixed": "0123456789abcdef0123456789abcdef01234567" }] },
+                    { "type": "ECOSYSTEM", "events": [{ "introduced": "0" }, { "fixed": "10.0.1" }] }
+                ]),
+            );
+            assert_eq!(
+                AdvisoryClient::osv_fixed_version(&record, Some(&dep("pillow", "9.4.0", "PyPI")))
+                    .as_deref(),
+                Some("10.0.1")
+            );
+            let git_only = ranged(
+                "pillow",
+                serde_json::json!([{ "type": "GIT", "events": [{ "fixed": "deadbeef" }] }]),
+            );
+            assert_eq!(AdvisoryClient::osv_fixed_version(&git_only, None), None);
+        }
+
+        #[test]
+        fn test_package_names_normalize_per_pep_503() {
+            assert_eq!(
+                AdvisoryClient::normalize_package_name("Opencv__Contrib.-Python"),
+                "opencv-contrib-python"
+            );
+        }
+
+        #[test]
+        fn test_osv_ids_that_are_not_identifiers_are_never_fetched() {
+            for id in ["", ".", "..", "UNKNOWN", "GHSA-x/../y", "a b"] {
+                assert!(!AdvisoryClient::is_plain_osv_id(id), "{id:?}");
+            }
+            for id in [
+                "GHSA-abcd-1234-efgh",
+                "PYSEC-2023-1",
+                "CVE-2024-1",
+                "OSV-2023-libwebp",
+            ] {
+                assert!(AdvisoryClient::is_plain_osv_id(id), "{id:?}");
+            }
+        }
+
+        /// The first line of `details` stands in for a missing summary, so a
+        /// record without one still gets a readable title.
+        #[test]
+        fn test_osv_details_stand_in_for_a_missing_summary() {
+            let record = serde_json::json!({
+                "id": "PYSEC-2023-0002",
+                "details": "\n### Impact\nHeap overflow in the bundled decoder.\n\nMore text.",
+            });
+            let m = AdvisoryClient::parse_osv_vuln(&record, None);
+            assert_eq!(
+                m.summary.as_deref(),
+                Some("Heap overflow in the bundled decoder.")
+            );
+            let bare = AdvisoryClient::parse_osv_vuln(&serde_json::json!({ "id": "X-1" }), None);
+            assert!(bare.summary.is_none(), "no details, no invented title");
+        }
+
         fn dep(name: &str, version: &str, ecosystem: &str) -> Dependency {
             Dependency {
                 name: name.to_string(),
@@ -28894,5 +31460,203 @@ tonic-build = "0.12"
                 ecosystem: ecosystem.to_string(),
             }
         }
+    }
+}
+
+/// Vulnerability-database provenance parsing (#3014). Fixtures are verbatim
+/// output of grype 0.118.0 and trivy 0.71.2.
+#[cfg(test)]
+mod vuln_db_provenance_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    const GRYPE_STATUS_JSON: &str = r#"{
+ "schemaVersion": "v6.1.10",
+ "from": "https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.10_2026-10-04T01:12:18Z_1791101507.tar.zst?checksum=sha256%3A2bd8",
+ "built": "2026-10-04T08:11:47Z",
+ "path": "/gc/6/vulnerability.db",
+ "valid": true
+}"#;
+
+    const GRYPE_STATUS_TEXT: &str = "Path:      /gc/6/vulnerability.db\n\
+Schema:    v6.1.10\n\
+Built:     2026-10-04T08:11:47Z\n\
+From:      https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.10.tar.zst\n\
+Status:    valid\n";
+
+    const GRYPE_NO_DB_JSON: &str = r#"{
+ "schemaVersion": "",
+ "path": "/.cache/grype/db/6/vulnerability.db",
+ "valid": false,
+ "error": "database does not exist"
+}"#;
+
+    const GRYPE_NO_DB_TEXT: &str = "Path:      /.cache/grype/db/6/vulnerability.db\n\
+Schema:    \n\
+Built:     0001-01-01T00:00:00Z\n\
+Status:    invalid\n";
+
+    fn built() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 4, 8, 11, 47)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn grype_json_status_yields_schema_and_build_date() {
+        let p = parse_grype_db_status(GRYPE_STATUS_JSON).expect("valid DB");
+        assert_eq!(p.version, "grype-db-v6.1.10");
+        assert_eq!(p.published_at, Some(built()));
+    }
+
+    #[test]
+    fn grype_text_status_matches_json_status() {
+        assert_eq!(
+            parse_grype_db_status(GRYPE_STATUS_TEXT),
+            parse_grype_db_status(GRYPE_STATUS_JSON)
+        );
+    }
+
+    #[test]
+    fn grype_v5_text_status_is_understood() {
+        let raw = "Location:  /root/.cache/grype/db/5\n\
+Built:     2024-06-01 01:31:31 +0000 UTC\n\
+Schema:    5\n\
+Checksum:  sha256:abc\n\
+Status:    valid\n";
+        let p = parse_grype_db_status(raw).expect("valid v5 DB");
+        assert_eq!(p.version, "grype-db-v5");
+        assert_eq!(
+            p.published_at,
+            chrono::Utc.with_ymd_and_hms(2024, 6, 1, 1, 31, 31).single()
+        );
+    }
+
+    #[test]
+    fn grype_without_a_db_records_no_provenance() {
+        assert_eq!(parse_grype_db_status(GRYPE_NO_DB_JSON), None);
+        assert_eq!(parse_grype_db_status(GRYPE_NO_DB_TEXT), None);
+        assert_eq!(parse_grype_db_status(""), None);
+    }
+
+    #[test]
+    fn grype_db_with_unparseable_date_keeps_the_identity() {
+        let raw = r#"{"schemaVersion":"v6.0.2","built":"yesterday","valid":true}"#;
+        let p = parse_grype_db_status(raw).expect("schema present");
+        assert_eq!(p.version, "grype-db-v6.0.2");
+        assert_eq!(p.published_at, None);
+    }
+
+    #[test]
+    fn db_timestamp_rejects_zero_time_and_garbage() {
+        assert_eq!(parse_db_timestamp("0001-01-01T00:00:00Z"), None);
+        assert_eq!(parse_db_timestamp("not a date"), None);
+        assert_eq!(parse_db_timestamp(""), None);
+        assert_eq!(parse_db_timestamp(" 2026-10-04T08:11:47Z "), Some(built()));
+    }
+
+    #[test]
+    fn adapter_trivy_metadata_becomes_trivy_db_provenance() {
+        // The `vulnerability_db` block the scanner-adapter attaches, built
+        // from trivy 0.71.2's metadata.json.
+        let db: AdapterVulnDb = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "updated_at": "2026-10-04T19:39:34.715623444Z",
+            "next_update": "2026-10-05T19:39:34.715623193Z",
+            "downloaded_at": "2026-10-04T20:29:13.47226236Z"
+        }))
+        .unwrap();
+        let p = db.provenance().expect("schema present");
+        assert_eq!(p.version, "trivy-db-v2");
+        let ts = p.published_at.expect("updated_at parsed");
+        assert_eq!(ts.to_rfc3339(), "2026-10-04T19:39:34.715623444+00:00");
+    }
+
+    #[test]
+    fn adapter_vulnerability_db_is_parsed_leniently() {
+        let ok = serde_json::json!({"version": 2, "updated_at": "2026-10-04T19:39:34Z"});
+        assert_eq!(
+            AdapterVulnDb::lenient(Some(&ok)).map(|p| p.version),
+            Some("trivy-db-v2".to_string())
+        );
+        for bad in [
+            serde_json::json!({"version": "2"}),
+            serde_json::json!("trivy-db"),
+            serde_json::json!(null),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(AdapterVulnDb::lenient(Some(&bad)), None, "{bad}");
+        }
+        assert_eq!(AdapterVulnDb::lenient(None), None);
+    }
+
+    #[test]
+    fn adapter_metadata_without_schema_is_no_provenance() {
+        assert_eq!(AdapterVulnDb::default().provenance(), None);
+        let zero = AdapterVulnDb {
+            version: Some(0),
+            updated_at: Some("2026-10-04T19:39:34Z".into()),
+        };
+        assert_eq!(zero.provenance(), None);
+    }
+
+    #[test]
+    fn live_advisory_provenance_names_the_feeds_and_the_query_time() {
+        let at = built();
+        let osv = live_advisory_provenance(false, at);
+        assert_eq!(osv.version, "live:osv");
+        assert_eq!(osv.published_at, Some(at));
+        assert_eq!(live_advisory_provenance(true, at).version, "live:osv+ghsa");
+    }
+
+    #[tokio::test]
+    async fn dependency_scanner_reports_live_provenance() {
+        let before = chrono::Utc::now();
+        let scanner = DependencyScanner::new(Arc::new(AdvisoryClient::new(None)));
+        let p = scanner.vuln_db().await.expect("live feeds always report");
+        assert_eq!(p.version, "live:osv");
+        assert!(p.published_at.expect("query time") >= before);
+
+        let with_gh =
+            DependencyScanner::new(Arc::new(AdvisoryClient::new(Some("ghp_test".into()))));
+        assert_eq!(
+            with_gh.vuln_db().await.map(|p| p.version),
+            Some("live:osv+ghsa".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_with_env_hands_the_env_to_the_child() {
+        let out = capture_cli_output_with_env(
+            "sh",
+            &["-c", "printf %s \"$AK_PROBE_ENV_3014\""],
+            &[("AK_PROBE_ENV_3014", "/seeded/grype".to_string())],
+        )
+        .await;
+        assert_eq!(out.as_deref(), Some("/seeded/grype"));
+    }
+
+    #[tokio::test]
+    async fn scanners_without_a_database_default_to_none() {
+        struct NoDb;
+        #[async_trait]
+        impl Scanner for NoDb {
+            fn name(&self) -> &str {
+                "no-db"
+            }
+            fn scan_type(&self) -> &str {
+                "openscap"
+            }
+            async fn scan(
+                &self,
+                _artifact: &Artifact,
+                _metadata: Option<&ArtifactMetadata>,
+                _content: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+        }
+        assert_eq!(NoDb.vuln_db().await, None);
     }
 }

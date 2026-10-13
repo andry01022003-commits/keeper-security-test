@@ -12,6 +12,7 @@
 //!   PUT  /composer/{repo_key}/api/packages                            - Upload/register package
 //!   POST /composer/{repo_key}/api/packages                            - Upload/register package
 
+use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -904,6 +905,11 @@ fn v1_provider_hash(doc: &serde_json::Value, package: &str) -> Option<String> {
 /// original 404 unchanged. Discovery-step failures degrade to `Ok(None)` for
 /// the same reason; only a non-404 failure fetching the final package
 /// document is propagated.
+///
+/// Every fetch here reserves from the shared buffered-metadata budget (#2684),
+/// and each reservation is scoped so it is released before the next one is
+/// requested: a request holds at most ONE slice of that budget at a time
+/// (#4162).
 async fn resolve_v1_provider_metadata(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -914,21 +920,39 @@ async fn resolve_v1_provider_metadata(
     let package = composer_v1_base_name(full_name);
 
     // The upstream's own root index decides the protocol.
-    let Ok((root_bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        "packages.json",
-        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-        RepositoryFormat::Composer,
-    )
-    .await
-    else {
-        return Ok(None);
-    };
-    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&root_bytes) else {
-        return Ok(None);
+    //
+    // The reservation and the buffered bytes are scoped to the parse and
+    // released here, BEFORE any of the fetches below exists (#4162). Every
+    // fetch in this function reserves `LARGE_METADATA_MAX_BYTES` from the SAME
+    // process-wide buffered-metadata budget, so holding this permit across one
+    // of them is hold-and-wait with no preemption and no timeout: the shipped
+    // 1 GiB default is exactly eight such buffers, so eight concurrent
+    // (anonymous, un-rate-limited) v1 fallbacks reserved the whole budget and
+    // then each awaited bytes only the others could release — stalling the
+    // shared buffered-metadata path for EVERY format (RPM repodata, npm
+    // packuments, the PyPI simple index, Debian dists) until the 120 s global
+    // request timeout or a client disconnect dropped them. This is the
+    // Composer instance of the conda hazard fixed in #4145; the pin
+    // `composer_v1_provider_fallback_takes_no_nested_budget_reservation_4162`
+    // keeps every fetch here scoped this way.
+    let root = {
+        let Ok((root_bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            "packages.json",
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            RepositoryFormat::Composer,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        let Ok(root) = serde_json::from_slice::<serde_json::Value>(&root_bytes) else {
+            return Ok(None);
+        };
+        root
     };
 
     // v2 upstream: the direct `p2/...` (or `p/...`) 404 was authoritative.
@@ -946,21 +970,29 @@ async fn resolve_v1_provider_metadata(
                 let Some(include_path) = v1_template_path(template, None, include_hash) else {
                     continue;
                 };
-                let Ok((bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
-                    proxy,
-                    repo_id,
-                    repo_key,
-                    upstream_url,
-                    &include_path,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    RepositoryFormat::Composer,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                    continue;
+                // Scoped like the root fetch: this permit is released before
+                // the next iteration reserves and before the per-package
+                // document fetch below, so the request never holds two slices
+                // of the shared budget at once (#4162).
+                let index = {
+                    let Ok((bytes, _ct, _budget_permit)) =
+                        proxy_helpers::proxy_fetch_capped_budgeted(
+                            proxy,
+                            repo_id,
+                            repo_key,
+                            upstream_url,
+                            &include_path,
+                            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                            RepositoryFormat::Composer,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                        continue;
+                    };
+                    index
                 };
                 hash = v1_provider_hash(&index, package);
                 if hash.is_some() {
@@ -1367,6 +1399,7 @@ async fn download_archive(
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
+                    Some(&ctx),
                     |member_id, location| {
                         let db = db.clone();
                         let state = state.clone();
@@ -1601,7 +1634,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    body: Bytes,
+    UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1692,6 +1725,13 @@ async fn upload(
     .await
     .map_err(|e| e.into_response())?;
 
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(&artifact_path),
+        body.len() as i64,
+    )
+    .await?;
     // Store the archive
     let storage_key = format!("composer/{}/{}/{}.zip", full_name, version, sha256);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
@@ -1710,6 +1750,13 @@ async fn upload(
     let size_bytes = body.len() as i64;
 
     // Insert artifact record
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await?;
     let artifact_id = sqlx::query_scalar!(
         r#"
         INSERT INTO artifacts (
@@ -1729,12 +1776,20 @@ async fn upload(
         storage_key,
         user_id,
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Store metadata
     let composer_metadata = serde_json::json!({
@@ -1807,6 +1862,7 @@ async fn upload(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
 
@@ -3432,6 +3488,7 @@ mod tests {
 // a database they no-op cleanly via `tdh::Fixture::setup` returning None.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod upload_db_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -3760,6 +3817,7 @@ mod upload_db_tests {
 // gracefully when `DATABASE_URL` is unset (CI provides one).
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod metadata_db_tests {
     use super::*;

@@ -1,6 +1,7 @@
 //! API middleware.
 
 pub mod auth;
+pub mod client_ip;
 pub mod demo;
 pub mod download_telemetry;
 pub mod guest_access;
@@ -8,6 +9,8 @@ pub mod metrics;
 pub mod nul_path;
 pub(crate) mod oci_errors;
 pub mod rate_limit;
+pub mod request_span;
 pub mod security_headers;
 pub mod setup;
 pub mod tracing;
+pub mod upload_guard;

@@ -237,6 +237,31 @@ pub struct TokenPair {
     pub expires_in: u64,
 }
 
+/// An access token minted without a refresh token
+/// ([`AuthService::generate_access_token_capped`]).
+#[derive(Debug, Serialize)]
+pub struct AccessToken {
+    pub access_token: String,
+    pub expires_in: u64,
+}
+
+impl From<TokenPair> for AccessToken {
+    fn from(pair: TokenPair) -> Self {
+        Self {
+            access_token: pair.access_token,
+            expires_in: pair.expires_in,
+        }
+    }
+}
+
+/// An [`AccessToken`] plus the instants a paired refresh token must share.
+struct MintedAccess {
+    token: AccessToken,
+    now: DateTime<Utc>,
+    iat_secs: i64,
+    iat_ms: i64,
+}
+
 /// How long a validated API token result is kept in the in-memory cache before
 /// the full DB + bcrypt verification is repeated.  Five minutes balances
 /// performance (cargo makes ~40 authenticated requests per build) against
@@ -1769,6 +1794,66 @@ impl AuthService {
         refresh_token_type: &str,
         credential_exp: Option<DateTime<Utc>>,
     ) -> Result<TokenPair> {
+        let access =
+            self.mint_access_token(user, allowed_repo_ids, scopes.clone(), credential_exp)?;
+        let refresh_exp = access.now + Duration::days(self.config.jwt_refresh_token_expiry_days);
+
+        let refresh_jti = Uuid::new_v4();
+        let refresh_claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            allowed_repo_ids: None,
+            iat: access.iat_secs,
+            iat_ms: Some(access.iat_ms),
+            exp: refresh_exp.timestamp(),
+            token_type: refresh_token_type.to_string(),
+            jti: Some(refresh_jti),
+            family_id: Some(family_id),
+            scan_pull_repo: None,
+            scopes,
+        };
+
+        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
+
+        Ok(TokenPair {
+            access_token: access.token.access_token,
+            refresh_token,
+            expires_in: access.token.expires_in,
+        })
+    }
+
+    /// Mint an ACCESS token only, with the same expiry cap and claims as the
+    /// access half of [`AuthService::generate_tokens_with_scope_capped`], and
+    /// no refresh token at all.
+    ///
+    /// For exchanges whose credential must not be renewable, such as a
+    /// Kubernetes CI OIDC exchange whose result a kubelet caches on a node:
+    /// no refresh JWT is signed, so there is nothing to persist, leak or
+    /// replay, rather than one minted and then discarded.
+    pub fn generate_access_token_capped(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<AccessToken> {
+        Ok(self
+            .mint_access_token(user, allowed_repo_ids, scopes, credential_exp)?
+            .token)
+    }
+
+    /// The access half of every token mint: claims, the exchange cap on
+    /// `exp`, and the `iat`/`iat_ms` anchor a paired refresh token shares.
+    fn mint_access_token(
+        &self,
+        user: &User,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<MintedAccess> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
@@ -1793,7 +1878,6 @@ impl AuthService {
             now + Duration::minutes(self.config.jwt_access_token_expiry_minutes),
             credential_exp,
         );
-        let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
         let access_claims = Claims {
             sub: user.id,
@@ -1808,38 +1892,22 @@ impl AuthService {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
-            scopes: scopes.clone(),
-        };
-
-        let refresh_jti = Uuid::new_v4();
-        let refresh_claims = Claims {
-            sub: user.id,
-            username: user.username.clone(),
-            email: user.email.clone(),
-            is_admin: user.is_admin,
-            allowed_repo_ids: None,
-            iat: iat_secs,
-            iat_ms: Some(now_ms),
-            exp: refresh_exp.timestamp(),
-            token_type: refresh_token_type.to_string(),
-            jti: Some(refresh_jti),
-            family_id: Some(family_id),
-            scan_pull_repo: None,
             scopes,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
 
-        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
-            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
-
-        Ok(TokenPair {
-            access_token,
-            refresh_token,
-            // Reflect the (possibly capped) real expiry so exchange clients
-            // schedule renewal correctly.
-            expires_in: (access_exp - now).num_seconds().max(0) as u64,
+        Ok(MintedAccess {
+            token: AccessToken {
+                access_token,
+                // Reflect the (possibly capped) real expiry so exchange
+                // clients schedule renewal correctly.
+                expires_in: (access_exp - now).num_seconds().max(0) as u64,
+            },
+            now,
+            iat_secs,
+            iat_ms: now_ms,
         })
     }
 
@@ -2698,7 +2766,8 @@ impl AuthService {
         let stored_token_opt = sqlx::query!(
             r#"
             SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,
-                   at.repo_selector, at.revoked_at, at.last_used_at
+                   at.repo_selector, at.revoked_at, at.last_used_at,
+                   at.repository_restricted
             FROM api_tokens at
             WHERE at.token_prefix = $1
             "#,
@@ -2772,36 +2841,60 @@ impl AuthService {
         // Fetch repository restrictions for this token.
         // If a repo_selector is set, resolve it dynamically. Otherwise fall
         // back to the explicit api_token_repositories join table.
-        let allowed_repo_ids = if let Some(selector_json) = &stored_token.repo_selector {
-            use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
-            let selector: RepoSelector =
-                serde_json::from_value(selector_json.clone()).unwrap_or_default();
-            if RepoSelectorService::is_empty(&selector) {
-                None // empty selector = unrestricted
-            } else {
-                let svc = RepoSelectorService::new(self.db.clone());
-                let ids = svc.resolve_ids(&selector).await?;
-                if ids.is_empty() {
-                    Some(vec![]) // selector matched nothing, deny all
-                } else {
-                    Some(ids)
-                }
-            }
-        } else {
-            let repo_rows = sqlx::query!(
+        use crate::services::repo_selector_service::{RepoSelectorService, TokenScopeError};
+        let explicit = if stored_token.repo_selector.is_none() {
+            sqlx::query!(
                 "SELECT repo_id FROM api_token_repositories WHERE token_id = $1",
                 stored_token.id
             )
             .fetch_all(&self.db)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-            if repo_rows.is_empty() {
-                None // unrestricted
-            } else {
-                Some(repo_rows.into_iter().map(|r| r.repo_id).collect())
-            }
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .into_iter()
+            .map(|row| row.repo_id)
+            .collect()
+        } else {
+            Vec::new()
         };
+        // An explicitly empty selector (`{}` or only empty criteria)
+        // keeps its legacy meaning of unrestricted. Every mint now
+        // refuses one, so only rows written before that carry it.
+        let resolved = RepoSelectorService::new(self.db.clone())
+            .resolve_token_scope(
+                stored_token.repo_selector.as_ref(),
+                explicit,
+                stored_token.repository_restricted,
+            )
+            .await?;
+        match resolved.scope_error {
+            // Fail closed (#4226): a stored selector that does not parse,
+            // or that carries a key `RepoSelector` does not know, used to
+            // become an empty selector here, i.e. unrestricted. It now
+            // grants no repository at all.
+            Some(TokenScopeError::InvalidSelector) => {
+                tracing::warn!(
+                    token_id = %stored_token.id,
+                    error = %resolved.selector_error.as_deref().unwrap_or("invalid selector"),
+                    "API token has an unparseable repo_selector; denying all repositories"
+                );
+            }
+            // #4228: the join rows are `ON DELETE CASCADE`, so an empty
+            // set has two meanings -- "never restricted" and "restricted
+            // at mint, every repository since deleted". The marker
+            // written at pin time tells them apart: a restricted token
+            // whose allow-list emptied out denies every repository
+            // (`Restricted(vec![])`, deny-by-default) instead of falling
+            // open to the whole instance. Deleting repositories can only
+            // ever narrow a token, never widen it.
+            Some(TokenScopeError::DeletedPinnedRepositories) => {
+                tracing::warn!(
+                    token_id = %stored_token.id,
+                    "API token's repository allow-list is empty (repositories deleted); denying all repositories"
+                );
+            }
+            _ => {}
+        }
+        let allowed_repo_ids = resolved.allowed_repo_ids;
 
         let validation = ApiTokenValidation {
             user,
@@ -3402,7 +3495,14 @@ impl AuthService {
         guard_federated_provisioning(existing_user.is_some(), credentials.auto_create_users)?;
 
         let user = if let Some(existing) = existing_user {
-            // Update existing user with latest information from provider
+            // Update existing user with latest information from provider.
+            //
+            // A CI service account keeps its `is_active` (#4031): it is
+            // deactivated when its identity mapping is deleted, or by an
+            // administrator as a kill switch, and a pipeline exchange must
+            // never switch it back on. Other federated accounts are
+            // reactivated by a successful login at their identity provider,
+            // as before.
             sqlx::query_as!(
                 User,
                 r#"
@@ -3412,7 +3512,7 @@ impl AuthService {
                     email = $3,
                     display_name = $4,
                     is_admin = COALESCE($5, is_admin),
-                    is_active = true,
+                    is_active = CASE WHEN auth_provider = 'ci' THEN is_active ELSE true END,
                     updated_at = NOW()
                 WHERE id = $1
                 RETURNING
@@ -3528,7 +3628,46 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        for user_id in &deactivated_ids {
+        self.revoke_deactivated_federated_users(&deactivated_ids)
+            .await;
+        Ok(deactivated_ids.len() as u64)
+    }
+
+    /// Deactivate specific federated users the directory reconcile found
+    /// gone (#3830), with the same credential revocation as
+    /// [`Self::deactivate_missing_users`]. Only rows still active and still
+    /// owned by `provider` are touched; returns the ids actually deactivated.
+    pub async fn deactivate_federated_users(
+        &self,
+        provider: AuthProvider,
+        user_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deactivated_ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE users
+            SET is_active = false, updated_at = NOW()
+            WHERE id = ANY($1) AND auth_provider = $2 AND is_active = true
+            RETURNING id
+            "#,
+        )
+        .bind(user_ids)
+        .bind(provider)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        self.revoke_deactivated_federated_users(&deactivated_ids)
+            .await;
+        Ok(deactivated_ids)
+    }
+
+    /// Revoke every credential of freshly deactivated federated users: the
+    /// API-token cache, access tokens, and refresh-token families.
+    async fn revoke_deactivated_federated_users(&self, deactivated_ids: &[Uuid]) {
+        for user_id in deactivated_ids {
             invalidate_user_token_cache_entries(*user_id);
             invalidate_user_tokens(*user_id);
 
@@ -3543,8 +3682,6 @@ impl AuthService {
                 );
             }
         }
-
-        Ok(deactivated_ids.len() as u64)
     }
 
     /// Reactivate a previously deactivated federated user.
@@ -3777,6 +3914,7 @@ fn check_token_validation_result(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4207,6 +4345,8 @@ mod tests {
             s3_endpoint: None,
             jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
             signature_expiry_seconds: 604_800,
+            signing_key_rotation_overlap_secs: 1_209_600,
+            signing_auto_migrate_legacy_keys: false,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -4228,13 +4368,18 @@ mod tests {
             scan_workspace_path: "/tmp".to_string(),
             demo_mode: false,
             guest_access_enabled: true,
+            guest_access_env_pinned: false,
             expose_detailed_health: false,
+            readyz_require_search: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
+            conda_attestation_issuers: Vec::new(),
+            conda_attestation_identities: Vec::new(),
+            conda_attestation_public_keys: Vec::new(),
             peer_instance_name: "test".to_string(),
             peer_public_endpoint: "http://localhost:8080".to_string(),
             peer_api_key: "test-key".to_string(),
@@ -4242,11 +4387,13 @@ mod tests {
             dependency_track_enabled: false,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".to_string(),
+            gc_trash_retention_days: 0,
             gc_schedule: "0 0 * * * *".to_string(),
             storage_stats_schedule: "0 0 */4 * * *".to_string(),
             blob_gc_enabled: false,
             maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
+            blob_gc_min_age_secs: crate::services::storage_gc_service::MIN_BLOB_AGE_SECS,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -4258,6 +4405,8 @@ mod tests {
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
+            grpc_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
+            metrics_bind_ip: crate::config::DEFAULT_LISTENER_BIND_IP,
             database_max_connections: 20,
             database_min_connections: 5,
             database_acquire_timeout_secs: 30,
@@ -4266,6 +4415,9 @@ mod tests {
             auth_max_concurrency: TEST_AUTH_MAX_CONCURRENCY,
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            upload_progress_window_secs: 60,
+            upload_min_progress_bytes: 16 * 1024,
+            upload_max_in_flight_per_principal: 64,
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 5000,
@@ -4301,19 +4453,30 @@ mod tests {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            download_verify_checksums: true,
+            storage_scrub_interval_secs: 0,
+            storage_scrub_max_objects: 500,
+            storage_scrub_max_bytes: 2 << 30,
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
             oci_virtual_negative_cache_ttl_ms:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            npm_virtual_negative_cache_ttl_ms:
+                crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries:
                 crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            npm_virtual_negative_cache_max_entries:
+                crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            smtp_tls_ca_cert: None,
+            smtp_tls_ca_cert_source: None,
+            smtp_tls_skip_verify: false,
             npm_packument_cache_enabled: true,
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
@@ -4402,6 +4565,132 @@ mod tests {
         assert_eq!(empty.allowed_repo_ids, AccessScope::Restricted(vec![]));
         assert!(!empty.allowed_repo_ids.grants(repo_a));
         assert!(!empty.allowed_repo_ids.grants(repo_b));
+    }
+
+    /// #4228: deleting repositories must only ever NARROW a restricted
+    /// token, never widen it. `api_token_repositories.repo_id` is
+    /// `ON DELETE CASCADE`; before the restriction marker, a token whose
+    /// rows all cascaded away looked exactly like a never-restricted token
+    /// and became unrestricted.
+    ///
+    /// DB-backed; no-op when DATABASE_URL is unset (CI seeds Postgres).
+    #[tokio::test]
+    async fn test_deleted_repositories_never_widen_a_restricted_token() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, _pa) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _kb, _pb) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = svc
+            .generate_api_token(
+                user_id,
+                "scoped-4228",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+
+        // Pin the token to both repositories through the same join-table
+        // store the repo-token and service-account mint paths write.
+        for repo in [repo_a, repo_b] {
+            sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+                .bind(token_id)
+                .bind(repo)
+                .execute(&pool)
+                .await
+                .expect("pin token to repo");
+        }
+
+        // The trigger must have stamped the restriction marker at pin time.
+        let marked: bool =
+            sqlx::query_scalar("SELECT repository_restricted FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read restriction marker");
+        assert!(marked, "pinning rows must mark the token restricted");
+
+        // A fresh service per validation: `validate_api_token` caches per
+        // instance, and the point here is what the STORED state resolves to.
+        let fresh = || AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+
+        // The allow-list query has no ORDER BY, so compare as sets.
+        let sorted = |scope: &AccessScope| match scope {
+            AccessScope::Restricted(ids) => {
+                let mut ids = ids.clone();
+                ids.sort();
+                Some(ids)
+            }
+            AccessScope::Admin => None,
+        };
+        let v = fresh().validate_api_token(&token).await.expect("validates");
+        let mut expected = vec![repo_a, repo_b];
+        expected.sort();
+        assert_eq!(sorted(&v.allowed_repo_ids), Some(expected));
+
+        // Deleting ONE repository narrows the token to the survivor...
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("delete repo A");
+        let v = fresh().validate_api_token(&token).await.expect("validates");
+        assert_eq!(
+            v.allowed_repo_ids,
+            AccessScope::Restricted(vec![repo_b]),
+            "deleting one repository must narrow the token to the survivor"
+        );
+
+        // ...and deleting the LAST one denies everything. This is the
+        // regression pin: pre-fix this came back `AccessScope::Admin`.
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&pool)
+            .await
+            .expect("delete repo B");
+        let v = fresh().validate_api_token(&token).await.expect("validates");
+        assert_eq!(
+            v.allowed_repo_ids,
+            AccessScope::Restricted(vec![]),
+            "a restricted token whose repositories were all deleted must deny every repository"
+        );
+        assert!(!v.allowed_repo_ids.grants(Uuid::new_v4()));
+
+        // Control: a never-restricted token (no join rows ever) stays
+        // unrestricted -- the marker is what tells the two empty-row cases
+        // apart.
+        let (open_token, open_id) = svc
+            .generate_api_token(
+                user_id,
+                "unscoped-4228",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint unscoped token");
+        let v = fresh()
+            .validate_api_token(&open_token)
+            .await
+            .expect("validates");
+        assert_eq!(
+            v.allowed_repo_ids,
+            AccessScope::Admin,
+            "a token that never had join rows must stay unrestricted"
+        );
+
+        // Cleanup: tokens cascade away with the user; repos are gone.
+        sqlx::query("DELETE FROM api_tokens WHERE id = ANY($1)")
+            .bind(vec![token_id, open_id])
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup_user(&pool, user_id).await;
     }
 
     // We cannot create a PgPool without a real database, so for unit tests that
@@ -9530,5 +9819,54 @@ mod tests {
             .generate_tokens_with_scope_capped(&user, None, None, Some(far))
             .expect("mint far-capped");
         assert_eq!(far_pair.expires_in as i64, base_secs);
+    }
+
+    /// The access-only mint (add-ci-oidc-kubernetes-provider 4.1): the same
+    /// expiry cap and scopes as the paired mint, and nothing to refresh
+    /// with — `AccessToken` has no refresh field, so the check left is that
+    /// the token itself is an access token capped at the credential.
+    #[tokio::test]
+    async fn test_generate_access_token_capped_signs_no_refresh_and_honours_the_cap() {
+        let svc = make_lazy_auth_service();
+        let user = make_test_user();
+        let base_secs = make_test_config().jwt_access_token_expiry_minutes * 60;
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "read:repositories".to_string(),
+        ];
+        let decode_access = |token: &str| {
+            decode::<Claims>(
+                token,
+                &DecodingKey::from_secret(make_test_config().jwt_secret.as_bytes()),
+                &Validation::new(Algorithm::HS256),
+            )
+            .expect("decode access token")
+            .claims
+        };
+
+        let cap = Utc::now() + Duration::minutes(5);
+        let token = svc
+            .generate_access_token_capped(&user, Some(scopes.clone()), None, Some(cap))
+            .expect("mint access-only");
+        let claims = decode_access(&token.access_token);
+        assert!(
+            claims.exp <= cap.timestamp(),
+            "exp must not outlive the credential"
+        );
+        assert!(
+            (295..=300).contains(&token.expires_in),
+            "{}",
+            token.expires_in
+        );
+        assert_eq!(claims.token_type, "access");
+        assert_eq!(claims.jti, None, "no refresh-token identity on it");
+        assert_eq!(claims.family_id, None);
+        assert_eq!(claims.scopes, Some(scopes));
+
+        // The same cap as the paired mint: a far credential leaves the base TTL.
+        let far = svc
+            .generate_access_token_capped(&user, None, None, Some(Utc::now() + Duration::days(30)))
+            .expect("mint far");
+        assert_eq!(far.expires_in as i64, base_secs);
     }
 }

@@ -149,7 +149,11 @@ pub struct DebianRepositoryConfig {
 /// preserved; provided fields (including an explicit empty list) replace the
 /// stored value. Applied on top of the currently stored config, or on top of
 /// the default when none exists yet.
-#[derive(Clone, Debug, Default, Deserialize, utoipa::ToSchema)]
+///
+/// `PartialEq` is what lets the update handler tell an all-absent patch (an
+/// untouched web-UI form, equal to [`DebianConfigPatch::default`]) from a patch
+/// that actually sets something.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct DebianConfigPatch {
     #[serde(default, alias = "distributions")]
     pub distribution_paths: Option<Vec<String>>,
@@ -953,6 +957,7 @@ fn insert_package_stanza(
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,6 +27,9 @@
 
 use sqlx::PgPool;
 
+#[cfg(test)]
+pub(crate) mod otel;
+
 /// Environment variable that marks the database as **required**. When set to a
 /// truthy value, a missing `DATABASE_URL` or a connect failure becomes a hard
 /// test failure instead of a silent skip. The CI DB-backed jobs set it so the
@@ -357,6 +360,7 @@ pub async fn try_isolated_pool() -> Option<IsolatedDb> {
     })
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -74,6 +74,12 @@ pub enum ProxySeverityGate {
     /// Opted-in posture: findings at or above this severity block; a verdict
     /// whose highest severity is known and strictly below it serves.
     Threshold(Severity),
+    /// Record-only posture (#3645, `proxy_scan_action = 'record_only'`): the
+    /// verdict is scanned and recorded exactly as under enforcement, but no
+    /// verdict ever blocks a pull. Only a repository that explicitly selects
+    /// the record-only action resolves to this gate; it is the WEAKEST gate,
+    /// so any enforcing side of a stricter-of-two combination wins.
+    RecordOnly,
 }
 
 impl ProxySeverityGate {
@@ -96,6 +102,7 @@ impl ProxySeverityGate {
     /// gate: an ungraded vulnerable verdict is fail-closed, never fail-open.
     pub fn blocks(self, max_severity: Option<Severity>) -> bool {
         match self {
+            Self::RecordOnly => false,
             Self::BlockOnAny => true,
             Self::Threshold(t) => match max_severity {
                 None => true,
@@ -110,11 +117,19 @@ impl ProxySeverityGate {
     /// severities wins (`Severity` is ordered Critical=0 .. Info=4, and a
     /// threshold blocks everything at-or-above it, so the numerically larger
     /// variant is the stricter gate).
+    /// `RecordOnly` is the weakest gate: it yields to anything that enforces.
     pub fn stricter(a: Self, b: Self) -> Self {
         match (a, b) {
             (Self::BlockOnAny, _) | (_, Self::BlockOnAny) => Self::BlockOnAny,
+            (Self::RecordOnly, other) | (other, Self::RecordOnly) => other,
             (Self::Threshold(x), Self::Threshold(y)) => Self::Threshold(x.max(y)),
         }
+    }
+
+    /// True for the record-only gate (#3645): verdicts are recorded, never
+    /// enforced.
+    pub fn is_record_only(self) -> bool {
+        matches!(self, Self::RecordOnly)
     }
 }
 
@@ -154,6 +169,12 @@ pub enum ProxyScanAction {
     /// verdict is a 403, and an over-cap / budget-exceeded / scan-error object
     /// returns 423 rather than a 200 of unscanned bytes.
     FailClosed,
+    /// Record-only (#3645): scan and record exactly as fail-open does (serve
+    /// the first pull with `X-AK-Scan: pending`, scan asynchronously), but
+    /// never withhold a pull: a vulnerable verdict is served with
+    /// `X-AK-Scan: recorded`, and an over-cap / inconclusive scan serves
+    /// pending. Visibility without enforcement.
+    RecordOnly,
 }
 
 impl ProxyScanAction {
@@ -163,12 +184,26 @@ impl ProxyScanAction {
     pub fn from_db(value: &str) -> Self {
         match value {
             "fail_closed" => ProxyScanAction::FailClosed,
+            "record_only" => ProxyScanAction::RecordOnly,
             _ => ProxyScanAction::FailOpen,
+        }
+    }
+
+    /// The `scan_configs.proxy_scan_action` token for this action.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            ProxyScanAction::FailOpen => "fail_open",
+            ProxyScanAction::FailClosed => "fail_closed",
+            ProxyScanAction::RecordOnly => "record_only",
         }
     }
 
     pub fn is_fail_closed(self) -> bool {
         matches!(self, ProxyScanAction::FailClosed)
+    }
+
+    pub fn is_record_only(self) -> bool {
+        matches!(self, ProxyScanAction::RecordOnly)
     }
 }
 
@@ -237,10 +272,13 @@ pub enum InconclusiveOutcome {
 }
 
 /// Pure decision for the inconclusive branch (over-cap / budget / scan error):
-/// fail-open serves-with-pending, fail-closed locks.
+/// fail-open serves-with-pending, fail-closed locks. Record-only (#3645)
+/// never withholds, so it serves pending like fail-open.
 pub fn decide_inconclusive(action: ProxyScanAction) -> InconclusiveOutcome {
     match action {
-        ProxyScanAction::FailOpen => InconclusiveOutcome::ServePending,
+        ProxyScanAction::FailOpen | ProxyScanAction::RecordOnly => {
+            InconclusiveOutcome::ServePending
+        }
         ProxyScanAction::FailClosed => InconclusiveOutcome::Locked,
     }
 }
@@ -439,6 +477,9 @@ impl ProxyScanService {
 
     /// Upsert a verdict keyed on `(checksum_sha256, scan_type)`. A newer scan of
     /// the same bytes (e.g. against a bumped CVE-DB) replaces the prior row.
+    /// Leaves `components_cataloged` as it was; the inline gate records through
+    /// [`record_verdict_with_catalog`](Self::record_verdict_with_catalog),
+    /// which writes it with the verdict (#4594).
     #[allow(clippy::too_many_arguments)]
     pub async fn record_verdict(
         &self,
@@ -600,6 +641,139 @@ impl ProxyScanService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Record how complete the inventory just written by
+    /// [`record_packages`](Self::record_packages) is (#4096), on the verdict row
+    /// for `(checksum_sha256, scan_type)`.
+    ///
+    /// `None` means the CVE-authoritative scanner read every target it found;
+    /// `Some("partial")` means it saw at least one it could not parse (#1153).
+    /// Written unconditionally (a later complete scan clears an earlier
+    /// `partial`), but only by the caller that also wrote the inventory, so the
+    /// marker always describes the scan whose packages the SBOM is built from:
+    /// a rescan that reports no packages leaves both the inventory and its
+    /// completeness alone.
+    ///
+    /// A no-op when no verdict row exists (its upsert failed); the SBOM then
+    /// renders without a marker until the digest is scanned again, exactly as
+    /// for a verdict recorded before migration 252. Runtime query (no macro)
+    /// so this adds no offline sqlx data.
+    pub async fn record_inventory_completeness(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        scan_completeness: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE proxy_scan_results
+            SET scan_completeness = $3
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(scan_completeness)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// [`record_verdict`](Self::record_verdict) plus the number of components
+    /// the CVE engine cataloged (#4594), in ONE upsert, so a reader never
+    /// sees the new verdict with the previous scan's count. `Some(0)` on a
+    /// clean verdict means it was graded on file contents only; `None` means
+    /// the engine reported no catalog. The inline gate and the rescan
+    /// endpoint record through this. Runtime query (no macro) so this adds
+    /// no offline sqlx data.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_verdict_with_catalog(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings_count: i32,
+        critical_count: i32,
+        high_count: i32,
+        medium_count: i32,
+        low_count: i32,
+        max_severity: Option<&str>,
+        scanner_version: Option<&str>,
+        repository_id: Option<Uuid>,
+        components_cataloged: Option<i32>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_scan_results (
+                checksum_sha256, scan_type, verdict,
+                findings_count, critical_count, high_count, medium_count, low_count,
+                max_severity, scanner_version, repository_id, components_cataloged,
+                scanned_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+            ON CONFLICT (checksum_sha256, scan_type) DO UPDATE SET
+                verdict = EXCLUDED.verdict,
+                findings_count = EXCLUDED.findings_count,
+                critical_count = EXCLUDED.critical_count,
+                high_count = EXCLUDED.high_count,
+                medium_count = EXCLUDED.medium_count,
+                low_count = EXCLUDED.low_count,
+                max_severity = EXCLUDED.max_severity,
+                scanner_version = EXCLUDED.scanner_version,
+                repository_id = EXCLUDED.repository_id,
+                components_cataloged = EXCLUDED.components_cataloged,
+                scanned_at = now()
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(verdict)
+        .bind(findings_count)
+        .bind(critical_count)
+        .bind(high_count)
+        .bind(medium_count)
+        .bind(low_count)
+        .bind(max_severity)
+        .bind(scanner_version)
+        .bind(repository_id)
+        .bind(components_cataloged)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// The completeness recorded by
+    /// [`record_inventory_completeness`](Self::record_inventory_completeness)
+    /// for a digest's inventory, for the proxy SBOM's completeness marker.
+    ///
+    /// `None` when complete, when no verdict row exists, and for verdicts
+    /// recorded before migration 252. `complete` is also folded to `None` so
+    /// a complete inventory renders byte-identically to the hosted path's
+    /// complete SBOMs (no marker).
+    pub async fn fetch_inventory_completeness(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<String>> {
+        let value: Option<Option<String>> = sqlx::query_scalar(
+            r#"
+            SELECT scan_completeness
+            FROM proxy_scan_results
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(value.flatten().filter(|c| c != "complete"))
     }
 
     /// Read back the inventory for a digest, for SBOM generation.
@@ -784,6 +958,7 @@ impl ProxyScanService {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +992,52 @@ mod tests {
             ProxySeverityGate::from_config(true, "garbage"),
             ProxySeverityGate::BlockOnAny,
             "an unparseable configured threshold must fail closed"
+        );
+    }
+
+    /// #3645: the record-only gate never blocks -- not even an ungraded
+    /// verdict -- and is the weakest gate in a stricter-of-two combination.
+    #[test]
+    fn record_only_gate_never_blocks_and_yields_to_any_enforcing_gate() {
+        let ro = ProxySeverityGate::RecordOnly;
+        for sev in [
+            Some(Severity::Critical),
+            Some(Severity::High),
+            Some(Severity::Info),
+            None,
+        ] {
+            assert!(!ro.blocks(sev), "record-only must not block {sev:?}");
+        }
+        let high = ProxySeverityGate::Threshold(Severity::High);
+        assert_eq!(ProxySeverityGate::stricter(ro, high), high);
+        assert_eq!(ProxySeverityGate::stricter(high, ro), high);
+        assert_eq!(
+            ProxySeverityGate::stricter(ro, ProxySeverityGate::BlockOnAny),
+            ProxySeverityGate::BlockOnAny
+        );
+        assert_eq!(ProxySeverityGate::stricter(ro, ro), ro);
+        assert!(ro.is_record_only());
+        assert!(!high.is_record_only());
+    }
+
+    /// #3645: the record-only action round-trips through the column, never
+    /// scans inline (so it can never 423 on a first pull), and serves an
+    /// inconclusive / over-cap outcome pending rather than locking.
+    #[test]
+    fn record_only_action_scans_async_and_never_locks() {
+        for a in [
+            ProxyScanAction::FailOpen,
+            ProxyScanAction::FailClosed,
+            ProxyScanAction::RecordOnly,
+        ] {
+            assert_eq!(ProxyScanAction::from_db(a.as_db_str()), a);
+        }
+        let ro = ProxyScanAction::RecordOnly;
+        assert!(ro.is_record_only() && !ro.is_fail_closed());
+        assert_eq!(decide_inconclusive(ro), InconclusiveOutcome::ServePending);
+        assert_eq!(
+            decide_serve(None, Some("grype-1"), ro, 30, Utc::now()),
+            ServeDecision::ServePendingScanAsync
         );
     }
 
@@ -1143,6 +1364,124 @@ mod tests {
             .await
             .expect("lookup other type")
             .is_none());
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// #4096: the inventory completeness round-trips through the verdict row,
+    /// a later complete scan clears an earlier `partial`, `complete` reads back
+    /// as `None` (no marker), and a digest with no verdict row reads `None`
+    /// instead of erroring.
+    #[tokio::test]
+    async fn inventory_completeness_roundtrip_and_clear() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = ProxyScanService::new(pool.clone());
+        let digest = format!("{:0>64}", uuid::Uuid::new_v4().simple());
+
+        // No verdict row: the write is a no-op and the read is None.
+        svc.record_inventory_completeness(&digest, "grype", Some("partial"))
+            .await
+            .expect("no-op write");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch missing"),
+            None
+        );
+
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-0.99.0-test"),
+            None,
+        )
+        .await
+        .expect("record verdict");
+        // A verdict recorded without a completeness (pre-252 shape) is None.
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch unset"),
+            None
+        );
+
+        svc.record_inventory_completeness(&digest, "grype", Some("partial"))
+            .await
+            .expect("record partial");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch partial")
+                .as_deref(),
+            Some("partial")
+        );
+        // Scoped by scan type like the inventory itself.
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "trivy")
+                .await
+                .expect("fetch other type"),
+            None
+        );
+
+        // A re-upserted verdict does not erase it: only the inventory writer
+        // owns this column.
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-0.99.1-test"),
+            None,
+        )
+        .await
+        .expect("re-record verdict");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch after upsert")
+                .as_deref(),
+            Some("partial")
+        );
+
+        // A later complete inventory clears it; an explicit "complete" also
+        // reads back as None so the SBOM carries no marker.
+        svc.record_inventory_completeness(&digest, "grype", None)
+            .await
+            .expect("record complete");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch cleared"),
+            None
+        );
+        svc.record_inventory_completeness(&digest, "grype", Some("complete"))
+            .await
+            .expect("record explicit complete");
+        assert_eq!(
+            svc.fetch_inventory_completeness(&digest, "grype")
+                .await
+                .expect("fetch explicit complete"),
+            None
+        );
 
         sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
             .bind(&digest)

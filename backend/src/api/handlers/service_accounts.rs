@@ -23,7 +23,9 @@ use crate::services::audit_service::{
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
-use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
+use crate::services::repo_selector_service::{
+    parse_token_selector_strict, RepoSelectorService, ResolvedTokenScope, TokenScopeError,
+};
 use crate::services::service_account_service::{ServiceAccountService, ServiceAccountSummary};
 use crate::services::token_scope_service::{self, UnreachableVirtual};
 use crate::services::token_service::TokenService;
@@ -108,7 +110,10 @@ pub struct UpdateServiceAccountRequest {
     pub is_active: Option<bool>,
 }
 
+/// Unknown fields are refused (400) rather than dropped (#4226): a misspelled
+/// `repo_selector` used to mint an unrestricted token.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
@@ -144,6 +149,8 @@ pub struct TokenInfoResponse {
     /// `GET /{id}/tokens/{token_id}/scope-analysis`, and a row only needs the
     /// number to flag itself.
     pub unreachable_member_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_error: Option<TokenScopeError>,
     pub id: Uuid,
     pub name: String,
     pub token_prefix: String,
@@ -191,6 +198,8 @@ pub struct TokenScopeAnalysisResponse {
     /// Sum of the members across `unreachable`, matching
     /// `TokenInfoResponse::unreachable_member_count`.
     pub unreachable_member_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_error: Option<TokenScopeError>,
 }
 
 /// A single matched repository in the preview response.
@@ -230,41 +239,39 @@ fn resolved_token_scope(
     _state: &SharedState,
     explicit: Vec<Uuid>,
     selector: Option<serde_json::Value>,
+    repository_restricted: bool,
 ) -> PendingScope {
-    if !explicit.is_empty() {
-        return PendingScope::Fixed(Some(explicit));
-    }
-    match selector {
-        Some(value) => PendingScope::Selector(value),
-        None => PendingScope::Fixed(None),
+    PendingScope {
+        explicit,
+        selector,
+        repository_restricted,
     }
 }
 
 /// A token scope that may still need the selector service to resolve it.
-enum PendingScope {
-    Fixed(token_scope_service::TokenScope),
-    Selector(serde_json::Value),
+struct PendingScope {
+    explicit: Vec<Uuid>,
+    selector: Option<serde_json::Value>,
+    repository_restricted: bool,
 }
 
 /// Resolve every pending selector once, so the caller ends up with concrete
-/// scopes it can analyse. A selector that fails to parse or resolve is treated
-/// as unrestricted, which is what `validate_api_token` does with it.
+/// scopes it can analyse. Authentication and diagnostics share the resolver:
+/// malformed and empty-ended restrictions deny all, and lookup errors propagate.
 async fn resolve_scopes(
     state: &SharedState,
     subjects: Vec<(Uuid, PendingScope)>,
-) -> Result<Vec<(Uuid, token_scope_service::TokenScope)>> {
+) -> Result<Vec<(Uuid, ResolvedTokenScope)>> {
     let svc = RepoSelectorService::new(state.db.clone());
     let mut out = Vec::with_capacity(subjects.len());
     for (key, pending) in subjects {
-        let scope = match pending {
-            PendingScope::Fixed(scope) => scope,
-            PendingScope::Selector(value) => match serde_json::from_value::<RepoSelector>(value) {
-                Ok(selector) if !RepoSelectorService::is_empty(&selector) => {
-                    Some(svc.resolve_ids(&selector).await.unwrap_or_default())
-                }
-                _ => None,
-            },
-        };
+        let scope = svc
+            .resolve_token_scope(
+                pending.selector.as_ref(),
+                pending.explicit,
+                pending.repository_restricted,
+            )
+            .await?;
         out.push((key, scope));
     }
     Ok(out)
@@ -294,6 +301,7 @@ pub(crate) fn build_selector_map(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_token_info_response(
     unreachable_member_count: usize,
+    scope_error: Option<TokenScopeError>,
     id: Uuid,
     name: String,
     token_prefix: String,
@@ -307,6 +315,7 @@ pub(crate) fn build_token_info_response(
 ) -> TokenInfoResponse {
     TokenInfoResponse {
         unreachable_member_count,
+        scope_error,
         id,
         name,
         token_prefix,
@@ -560,50 +569,66 @@ pub async fn list_tokens(
     );
 
     // Fetch repo_selector values from the tokens table
-    let selector_rows = sqlx::query!(
-        "SELECT id, repo_selector FROM api_tokens WHERE id = ANY($1)",
-        &token_ids
+    let selector_rows = sqlx::query_as::<_, (Uuid, Option<serde_json::Value>, bool)>(
+        "SELECT id, repo_selector, repository_restricted FROM api_tokens WHERE id = ANY($1)",
     )
+    .bind(&token_ids)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
-
+    let restrictions: std::collections::HashMap<_, _> =
+        selector_rows.iter().map(|r| (r.0, r.2)).collect();
     let selector_map = build_selector_map(
         selector_rows
             .into_iter()
-            .map(|r| (r.id, r.repo_selector))
+            .map(|(id, selector, _)| (id, selector))
             .collect(),
     );
 
-    // #4215: one analysis for every token on the page, three queries in total,
-    // so a row can be flagged without a fan-out.
+    // #4215: the page shares recursive member and entitlement work across
+    // tokens; each distinct virtual is evaluated once rather than per row.
     let subjects: Vec<(Uuid, PendingScope)> = tokens
         .iter()
         .map(|t| {
             let explicit = repo_map.get(&t.id).cloned().unwrap_or_default();
             let selector = selector_map.get(&t.id).and_then(|s| s.clone());
-            (t.id, resolved_token_scope(&state, explicit, selector))
+            (
+                t.id,
+                resolved_token_scope(
+                    &state,
+                    explicit,
+                    selector,
+                    restrictions.get(&t.id).copied().unwrap_or(false),
+                ),
+            )
         })
         .collect();
     let subjects = resolve_scopes(&state, subjects).await?;
+    let scope_errors: std::collections::HashMap<_, _> = subjects
+        .iter()
+        .map(|(id, scope)| (*id, scope.scope_error))
+        .collect();
+    let subjects = subjects
+        .into_iter()
+        .map(|(id, scope)| (id, scope.allowed_repo_ids))
+        .collect();
     let unreachable_counts = token_scope_service::analyze_many(&state.db, Some(id), subjects)
-        .await
-        .map(|m| {
-            m.into_iter()
-                .map(|(token_id, v)| (token_id, token_scope_service::total_members(&v)))
-                .collect::<std::collections::HashMap<_, _>>()
-        })
-        .unwrap_or_default();
+        .await?
+        .into_iter()
+        .map(|(token_id, v)| (token_id, token_scope_service::total_members(&v)))
+        .collect::<std::collections::HashMap<_, _>>();
 
     Ok(Json(TokenListResponse {
         items: tokens
             .into_iter()
+            .filter(|t| selector_map.contains_key(&t.id))
             .map(|t| {
                 let repo_ids = repo_map.remove(&t.id).unwrap_or_default();
                 let selector = selector_map.get(&t.id).and_then(|s| s.clone());
                 let unreachable_member_count = unreachable_counts.get(&t.id).copied().unwrap_or(0);
                 build_token_info_response(
                     unreachable_member_count,
+                    scope_errors.get(&t.id).copied().flatten(),
                     t.id,
                     t.name,
                     t.token_prefix,
@@ -630,6 +655,8 @@ pub async fn list_tokens(
     request_body = CreateTokenRequest,
     responses(
         (status = 200, description = "Token created (value shown once)", body = CreateTokenResponse),
+        (status = 400, description = "Unknown field, or a repo_selector / repository_ids that does not restrict"),
+        (status = 403, description = "Not admin, or a repository restriction the presenting credential may not delegate"),
         (status = 404, description = "Service account not found"),
     ),
     security(("bearer_auth" = []))
@@ -638,12 +665,36 @@ pub async fn create_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreateTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateTokenRequest>,
 ) -> Result<Json<CreateTokenResponse>> {
     auth.require_admin()?;
 
     // Validate mutual exclusivity
     validate_create_token_exclusivity(&payload.repo_selector, &payload.repository_ids)?;
+    // The same validator personal tokens use (#4219, #4226): a selector that
+    // does not parse, misspells a criterion or names none was stored as given
+    // and read back at authentication as unrestricted.
+    if let Some(selector) = &payload.repo_selector {
+        crate::services::repo_selector_service::validate_token_repo_selector(selector)?;
+    }
+    // Likewise an empty `repository_ids` stores no rows, which is unrestricted.
+    if payload
+        .repository_ids
+        .as_ref()
+        .is_some_and(|ids| ids.is_empty())
+    {
+        return Err(AppError::Validation(
+            "repository_ids names no repositories; list at least one, or omit it for an \
+             unrestricted token"
+                .to_string(),
+        ));
+    }
+    // Repository ceiling (#4225): an admin credential that is itself
+    // repository-restricted passes that restriction on, and may not name a
+    // different one.
+    let inherited = auth
+        .mint_repo_ceiling(payload.repo_selector.is_some() || payload.repository_ids.is_some())?;
 
     // Verify the service account exists
     let svc = ServiceAccountService::new(state.db.clone());
@@ -655,17 +706,29 @@ pub async fn create_token(
         .await?;
     let token_id = minted.id;
 
-    // Store repo_selector or explicit repository_ids (mutually exclusive)
-    if let Some(selector) = &payload.repo_selector {
-        sqlx::query!(
-            "UPDATE api_tokens SET repo_selector = $1 WHERE id = $2",
-            selector,
-            token_id
+    // Store the inherited restriction, or the requested repo_selector or
+    // explicit repository_ids (mutually exclusive; refused above when a
+    // restriction is inherited).
+    if let Some(ids) = inherited {
+        crate::services::repo_selector_service::store_token_selector(
+            &state.db,
+            token_id,
+            &crate::services::repo_selector_service::inherited_token_selector(&ids),
         )
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .await?;
+    } else if let Some(selector) = &payload.repo_selector {
+        crate::services::repo_selector_service::store_token_selector(&state.db, token_id, selector)
+            .await?;
     } else if let Some(repo_ids) = &payload.repository_ids {
+        // Mark restricted BEFORE pinning (#4228, #4265 follow-up): a crash
+        // between the mint and the first pin row must leave a deny-all
+        // token, not an unrestricted one the backfill cannot tell apart from
+        // a never-restricted token. See `repo_tokens::create_repo_token`.
+        sqlx::query("UPDATE api_tokens SET repository_restricted = true WHERE id = $1")
+            .bind(token_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         for repo_id in repo_ids {
             sqlx::query!(
                 "INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)",
@@ -736,7 +799,7 @@ pub async fn preview_repo_selector(
     auth.require_admin()?;
 
     let service_account_id = payload.service_account_id;
-    let selector: RepoSelector = serde_json::from_value(payload.repo_selector)
+    let selector = parse_token_selector_strict(&payload.repo_selector)
         .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
 
     let svc = RepoSelectorService::new(state.db.clone());
@@ -758,9 +821,7 @@ pub async fn preview_repo_selector(
     // the entitlement half is unknowable, so the preview stays as it was.
     let unreachable = match service_account_id {
         Some(account_id) => {
-            token_scope_service::analyze(&state.db, Some(account_id), Some(matched_ids))
-                .await
-                .unwrap_or_default()
+            token_scope_service::analyze(&state.db, Some(account_id), Some(matched_ids)).await?
         }
         None => Vec::new(),
     };
@@ -797,9 +858,9 @@ pub async fn token_scope_analysis(
 
     // The token must belong to the account in the path, or one account's id
     // would answer for another's token.
-    let token_selector: Option<serde_json::Value> =
-        sqlx::query_scalar::<_, Option<serde_json::Value>>(
-            "SELECT repo_selector FROM api_tokens WHERE id = $1 AND user_id = $2",
+    let (token_selector, repository_restricted) =
+        sqlx::query_as::<_, (Option<serde_json::Value>, bool)>(
+            "SELECT repo_selector, repository_restricted FROM api_tokens WHERE id = $1 AND user_id = $2",
         )
         .bind(token_id)
         .bind(id)
@@ -816,16 +877,18 @@ pub async fn token_scope_analysis(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let pending = resolved_token_scope(&state, explicit, token_selector);
-    let mut resolved = resolve_scopes(&state, vec![(token_id, pending)]).await?;
-    let scope = resolved.pop().map(|(_, scope)| scope).unwrap_or(None);
-
-    let unreachable = token_scope_service::analyze(&state.db, Some(id), scope).await?;
+    let resolved = RepoSelectorService::new(state.db.clone())
+        .resolve_token_scope(token_selector.as_ref(), explicit, repository_restricted)
+        .await?;
+    let scope_error = resolved.scope_error;
+    let unreachable =
+        token_scope_service::analyze(&state.db, Some(id), resolved.allowed_repo_ids).await?;
     let unreachable_member_count = token_scope_service::total_members(&unreachable);
 
     Ok(Json(TokenScopeAnalysisResponse {
         unreachable,
         unreachable_member_count,
+        scope_error,
     }))
 }
 
@@ -890,6 +953,7 @@ pub async fn revoke_token(
         create_token,
         revoke_token,
         preview_repo_selector,
+        token_scope_analysis,
     ),
     components(schemas(
         CreateServiceAccountRequest,
@@ -904,6 +968,11 @@ pub async fn revoke_token(
         PreviewRepoSelectorRequest,
         PreviewRepoSelectorResponse,
         MatchedRepoResponse,
+        TokenScopeAnalysisResponse,
+        TokenScopeError,
+        UnreachableVirtual,
+        token_scope_service::UnreachableMember,
+        token_scope_service::UnreachableReason,
     )),
     tags(
         (name = "service_accounts", description = "Service account management"),
@@ -911,10 +980,99 @@ pub async fn revoke_token(
 )]
 pub struct ServiceAccountsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[tokio::test]
+    async fn scope_analysis_and_token_rows_flag_invalid_or_deleted_restrictions() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        sqlx::query("UPDATE users SET is_service_account = true WHERE id = $1")
+            .bind(f.user_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let mut actor = tdh::make_auth(f.user_id, &f.username);
+        actor.is_admin = true;
+        let auth_service = AuthService::new(f.pool.clone(), Arc::new(f.state.config.clone()));
+        for (name, selector, restricted, error) in [
+            (
+                "invalid",
+                Some(serde_json::json!({"match_repoz": [f.repo_id]})),
+                false,
+                "invalid_selector",
+            ),
+            ("deleted", None, true, "deleted_pinned_repositories"),
+            (
+                "unmatched",
+                Some(serde_json::json!({"match_repos": [Uuid::new_v4()]})),
+                false,
+                "selector_matches_nothing",
+            ),
+        ] {
+            auth_service
+                .generate_api_token(f.user_id, name, vec!["read:artifacts".to_string()], None)
+                .await
+                .unwrap();
+            let token_id: Uuid = sqlx::query_scalar("UPDATE api_tokens SET repo_selector = $1, repository_restricted = $2 WHERE user_id = $3 AND name = $4 RETURNING id")
+                .bind(&selector).bind(restricted).bind(f.user_id).bind(name).fetch_one(&f.pool).await.unwrap();
+            let (status, body) = tdh::send(
+                super::router()
+                    .with_state(f.state.clone())
+                    .layer(axum::Extension(actor.clone())),
+                tdh::get(format!("/{}/tokens/{token_id}/scope-analysis", f.user_id)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(detail["scope_error"], error);
+            assert_eq!(detail["unreachable_member_count"], 0);
+            let (status, body) = tdh::send(
+                super::router()
+                    .with_state(f.state.clone())
+                    .layer(axum::Extension(actor.clone())),
+                tdh::get(format!("/{}/tokens", f.user_id)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == token_id.to_string() && t["scope_error"] == error));
+        }
+        let (status, _) = tdh::send(
+            super::router()
+                .with_state(f.state.clone())
+                .layer(axum::Extension(actor)),
+            tdh::post(
+                "/repo-selector/preview".to_string(),
+                "application/json",
+                serde_json::to_vec(&serde_json::json!({"repo_selector": {"match_paterrn": "*"}}))
+                    .unwrap()
+                    .into(),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        f.teardown().await;
+    }
 
     fn admin_auth() -> AuthExtension {
         AuthExtension {
@@ -1035,7 +1193,7 @@ mod tests {
                 State(state.clone()),
                 Extension(auth.clone()),
                 Path(id),
-                Json(
+                crate::api::extractors::Json(
                     serde_json::from_value(serde_json::json!({"name": "t", "scopes": ["read"]}))
                         .unwrap(),
                 ),
@@ -1221,6 +1379,7 @@ mod tests {
         let selector = serde_json::json!({"match_labels": {"env": "prod"}});
         let resp = build_token_info_response(
             0,
+            None,
             id,
             "deploy-token".to_string(),
             "ak_abc".to_string(),
@@ -1251,6 +1410,7 @@ mod tests {
         let now = Utc::now();
         let resp = build_token_info_response(
             0,
+            None,
             id,
             "ci-token".to_string(),
             "ak_xyz".to_string(),
@@ -1496,6 +1656,7 @@ mod tests {
         let repo_id = Uuid::new_v4();
         let resp = TokenInfoResponse {
             unreachable_member_count: 0,
+            scope_error: None,
             id: Uuid::nil(),
             name: "deploy-token".to_string(),
             token_prefix: "ak_abc".to_string(),
@@ -1521,6 +1682,7 @@ mod tests {
         let now = Utc::now();
         let resp = TokenInfoResponse {
             unreachable_member_count: 0,
+            scope_error: None,
             id: Uuid::nil(),
             name: "read-only".to_string(),
             token_prefix: "ak_xyz".to_string(),
@@ -1901,6 +2063,11 @@ mod tests {
             "PreviewRepoSelectorRequest",
             "PreviewRepoSelectorResponse",
             "MatchedRepoResponse",
+            "TokenScopeAnalysisResponse",
+            "TokenScopeError",
+            "UnreachableVirtual",
+            "UnreachableMember",
+            "UnreachableReason",
         ];
         for name in &expected {
             assert!(
@@ -1917,8 +2084,8 @@ mod tests {
         let doc = ServiceAccountsApiDoc::openapi();
         assert_eq!(
             doc.paths.paths.len(),
-            5,
-            "Expected exactly 5 paths in OpenAPI doc"
+            6,
+            "Expected exactly 6 paths including scope analysis"
         );
     }
 
@@ -1943,10 +2110,7 @@ mod tests {
                 count += 1;
             }
         }
-        assert_eq!(
-            count, 9,
-            "Expected 9 operations total (matches 9 handler fns)"
-        );
+        assert_eq!(count, 10, "Expected 10 operations including scope analysis");
     }
 
     // -----------------------------------------------------------------------
@@ -1965,6 +2129,7 @@ mod tests {
         ];
         let resp = build_token_info_response(
             0,
+            None,
             id,
             "multi-scope".to_string(),
             "ak_ms".to_string(),
@@ -1989,6 +2154,7 @@ mod tests {
         let r3 = Uuid::new_v4();
         let resp = build_token_info_response(
             0,
+            None,
             id,
             "multi-repo".to_string(),
             "ak_mr".to_string(),
@@ -2115,6 +2281,7 @@ mod tests {
             items: vec![
                 TokenInfoResponse {
                     unreachable_member_count: 0,
+                    scope_error: None,
                     id: Uuid::new_v4(),
                     name: "token-a".to_string(),
                     token_prefix: "ak_aaa".to_string(),
@@ -2128,6 +2295,7 @@ mod tests {
                 },
                 TokenInfoResponse {
                     unreachable_member_count: 0,
+                    scope_error: None,
                     id: Uuid::new_v4(),
                     name: "token-b".to_string(),
                     token_prefix: "ak_bbb".to_string(),
@@ -2276,6 +2444,7 @@ mod tests {
 }
 
 /// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod audit_db_tests {
     use super::*;

@@ -51,6 +51,14 @@ pub const REPO_CACHE_TTL_SECS: u64 = 60;
 
 /// Cached repository metadata populated by the repo-visibility middleware
 /// and reused by format-handler resolvers to avoid a second DB round-trip.
+///
+/// The enforcement flags (`promotion_only`, `age_gate_*`, `curation_*`) ride
+/// the same entry so a cache-built [`RepoInfo`](crate::api::handlers::proxy_helpers::RepoInfo)
+/// is a faithful snapshot of the `repositories` row — a resolver that served
+/// defaults instead would silently fail those gates open (#3778). Writes to
+/// any of these columns fire the `ak_repository_changed_notify` trigger
+/// (migration 239), which evicts the entry fleet-wide; the 60-second TTL is
+/// the fallback bound.
 #[derive(Clone, Debug)]
 pub struct CachedRepo {
     pub id: Uuid,
@@ -59,10 +67,22 @@ pub struct CachedRepo {
     pub upstream_url: Option<String>,
     pub storage_path: String,
     pub storage_backend: String,
-    pub is_public: bool,
+    /// Baseline read audience. Carried instead of the deprecated `is_public`
+    /// mirror so a cache hit and a cache miss reach the same decision, and so
+    /// that narrowing a repository from `internal` to `private` is a real
+    /// change to this field -- which is what the NOTIFY trigger keys off to
+    /// evict this entry across instances (migration 245).
+    pub visibility: crate::models::repository::RepositoryVisibility,
     /// The `index_upstream_url` config value (cargo-specific; `None` for
     /// other formats or when not configured).
     pub index_upstream_url: Option<String>,
+    pub promotion_only: bool,
+    pub age_gate_enabled: bool,
+    pub age_gate_min_age_days: i32,
+    /// Age-source mode wire value (migration 191).
+    pub age_gate_mode: String,
+    pub curation_enabled: bool,
+    pub curation_default_action: String,
 }
 
 /// Thread-safe in-process cache for `CachedRepo` entries, keyed by repo key.
@@ -201,6 +221,10 @@ pub struct AppState {
     /// invalidation: npm forbids republishing a version, so entries are
     /// immutable facts that age out.
     pub npm_attestation_cache: Option<Arc<NpmAttestationCache>>,
+    /// Live state of this replica's npm upstream change-feed consumer
+    /// (#3069): written by the `FeedConsumer` (`main.rs` hands it this
+    /// handle), read by `GET /api/v1/admin/npm/upstream-feed/status`.
+    pub upstream_feed_status: Arc<crate::services::upstream_feed::FeedStatus>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
@@ -224,6 +248,11 @@ pub struct AppState {
     /// extra concurrent login starves the blocking-thread pool and the rest
     /// of the API degrades along with it (#991, #1088).
     pub auth_semaphore: Option<Arc<Semaphore>>,
+    /// Runtime guest-access setting (#867): env pin, else the
+    /// `system_settings` row, else the default; cached with a short TTL,
+    /// refreshed with the written value on write, closed when unreadable. Every consumer of "is anonymous access allowed"
+    /// asks this instead of `config.guest_access_enabled`.
+    pub guest_access_policy: Arc<crate::services::guest_access_policy::GuestAccessPolicy>,
 }
 
 /// Build an auth-concurrency semaphore from a config value, or `None` when
@@ -234,6 +263,20 @@ fn build_auth_semaphore(max: usize) -> Option<Arc<Semaphore>> {
     } else {
         Some(Arc::new(Semaphore::new(max)))
     }
+}
+
+/// The runtime guest-access handle every `AppState` constructor installs
+/// (#867): env pin and default from `config`, stored value from `db`.
+fn build_guest_access_policy(
+    db: &PgPool,
+    config: &Config,
+) -> Arc<crate::services::guest_access_policy::GuestAccessPolicy> {
+    Arc::new(
+        crate::services::guest_access_policy::GuestAccessPolicy::from_config(
+            Some(db.clone()),
+            config,
+        ),
+    )
 }
 
 impl AppState {
@@ -259,6 +302,7 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -282,10 +326,12 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 
@@ -308,6 +354,7 @@ impl AppState {
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
         let npm_attestation_cache = NpmAttestationCache::from_config(&config);
+        let guest_access_policy = build_guest_access_policy(&db, &config);
         Self {
             config,
             db,
@@ -331,10 +378,12 @@ impl AppState {
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
+            upstream_feed_status: Arc::default(),
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+            guest_access_policy,
         }
     }
 
@@ -518,11 +567,15 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
-/// Redact sensitive query-string parameters from a URI path for safe logging.
+/// Redact credentials from a request path and query string for safe logging.
 ///
-/// Parameters named `token`, `key`, `api_key`, `password`, or `secret`
-/// (case-insensitive) have their values replaced with `[REDACTED]`.
+/// Query parameters named `token`, `key`, `api_key`, `password`, or `secret`
+/// (case-insensitive) have their values replaced with `[REDACTED]` (#544).
+///
+/// The path is passed through [`redact_token_path_segment`], which hides the
+/// bearer token the two conda token-channel layouts carry in the path itself.
 pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
+    let path = redact_token_path_segment(path);
     match query {
         Some(q) => {
             let redacted: String = q
@@ -545,10 +598,53 @@ pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
                 .join("&");
             format!("{}?{}", path, redacted)
         }
-        None => path.to_string(),
+        None => path.into_owned(),
     }
 }
 
+/// Replace the token segment of a conda token-channel path with `[REDACTED]`.
+///
+/// Two layouts put a bearer token in the path rather than a header:
+///
+/// - `/conda/t/<TOKEN>/<repo_key>/...` (conda's `.condarc` token channel)
+/// - `/t/<TOKEN>/conda/<repo_key>/...` (rattler / pixi `--conda-token`)
+///
+/// Only a path that STARTS with one of those prefixes is touched; a `/t/`
+/// deeper in the path (a repository or package path that happens to contain
+/// one) is left alone. Leading slashes are skipped the same way
+/// `extract_conda_url_token` skips them, so `//conda/t/<TOKEN>/...` is
+/// redacted too. Under `/conda/t/` the segment is only treated as a token when
+/// more path follows it, so `/conda/t/channeldata.json` (a repository whose
+/// key is literally `t`) stays readable, matching what the auth middleware
+/// accepts as a credential. Everything around the token is kept verbatim.
+pub fn redact_token_path_segment(path: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    let trimmed = path.trim_start_matches('/');
+    let lead = &path[..path.len() - trimmed.len()];
+    let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("t/") {
+        ("t/", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("conda/t/") {
+        // A token channel needs a path after the token; without one the
+        // segment is a route under a repository named `t`.
+        if !rest.contains('/') {
+            return Cow::Borrowed(path);
+        }
+        ("conda/t/", rest)
+    } else {
+        return Cow::Borrowed(path);
+    };
+    let (token, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if token.is_empty() {
+        return Cow::Borrowed(path);
+    }
+    Cow::Owned(format!("{lead}{prefix}[REDACTED]{tail}"))
+}
+
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,8 +657,14 @@ mod tests {
             upstream_url: None,
             storage_path: "/data/repos/my-repo".to_string(),
             storage_backend: "filesystem".to_string(),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             index_upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -572,7 +674,10 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(cloned.id, original.id);
         assert_eq!(cloned.format, original.format);
-        assert_eq!(cloned.is_public, original.is_public);
+        assert_eq!(
+            cloned.visibility.allows_anonymous_read(),
+            original.visibility.allows_anonymous_read()
+        );
         assert_eq!(cloned.storage_path, original.storage_path);
     }
 
@@ -661,10 +766,10 @@ mod tests {
     #[test]
     fn test_cached_repo_private_visibility() {
         let repo = CachedRepo {
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             ..make_cached_repo()
         };
-        assert!(!repo.is_public);
+        assert!(!repo.visibility.allows_anonymous_read());
     }
 
     #[tokio::test]
@@ -711,7 +816,7 @@ mod tests {
     async fn test_repo_cache_visibility_toggle() {
         let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
         let private_repo = CachedRepo {
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             ..make_cached_repo()
         };
         cache
@@ -723,13 +828,13 @@ mod tests {
         {
             let guard = cache.read().await;
             let (entry, _) = guard.get("my-cache").unwrap();
-            assert!(!entry.is_public);
+            assert!(!entry.visibility.allows_anonymous_read());
         }
 
         // Simulate update: remove old entry, insert updated one.
         cache.write().await.remove("my-cache");
         let public_repo = CachedRepo {
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             ..make_cached_repo()
         };
         cache
@@ -742,7 +847,7 @@ mod tests {
             let guard = cache.read().await;
             let (entry, _) = guard.get("my-cache").unwrap();
             assert!(
-                entry.is_public,
+                entry.visibility.allows_anonymous_read(),
                 "cache should reflect the updated visibility immediately"
             );
         }
@@ -769,8 +874,18 @@ mod tests {
                     upstream_url: None,
                     storage_path: format!("/data/{}", key),
                     storage_backend: "filesystem".to_string(),
-                    is_public: i % 2 == 0,
+                    visibility: if i % 2 == 0 {
+                        crate::models::repository::RepositoryVisibility::Public
+                    } else {
+                        crate::models::repository::RepositoryVisibility::Private
+                    },
                     index_upstream_url: None,
+                    promotion_only: false,
+                    age_gate_enabled: false,
+                    age_gate_min_age_days: 7,
+                    age_gate_mode: "upstream_publish_time".to_string(),
+                    curation_enabled: false,
+                    curation_default_action: "allow".to_string(),
                 };
                 c.write().await.insert(key.clone(), (repo, Instant::now()));
                 // Hold a read guard briefly to interleave readers + writers.
@@ -845,6 +960,70 @@ mod tests {
             result,
             "/endpoint?token=[REDACTED]&password=[REDACTED]&secret=[REDACTED]&key=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn test_redact_conda_token_channel_path() {
+        let result =
+            redact_sensitive_params("/conda/t/ak_secret123/my-repo/noarch/repodata.json", None);
+        assert_eq!(result, "/conda/t/[REDACTED]/my-repo/noarch/repodata.json");
+    }
+
+    #[test]
+    fn test_redact_rattler_token_path() {
+        let result = redact_sensitive_params(
+            "/t/ak_secret123/conda/my-repo/linux-64/pkg-1.0-0.conda",
+            None,
+        );
+        assert_eq!(
+            result,
+            "/t/[REDACTED]/conda/my-repo/linux-64/pkg-1.0-0.conda"
+        );
+    }
+
+    #[test]
+    fn test_redact_token_path_with_sensitive_query() {
+        let result = redact_sensitive_params(
+            "/t/ak_secret123/conda/my-repo/noarch/repodata.json",
+            Some("token=abc&x=1"),
+        );
+        assert_eq!(
+            result,
+            "/t/[REDACTED]/conda/my-repo/noarch/repodata.json?token=[REDACTED]&x=1"
+        );
+    }
+
+    #[test]
+    fn test_redact_token_path_extra_leading_slashes() {
+        let result = redact_sensitive_params("//conda/t/ak_secret123/my-repo/", None);
+        assert_eq!(result, "//conda/t/[REDACTED]/my-repo/");
+    }
+
+    #[test]
+    fn test_redact_token_path_nested_t_untouched() {
+        for path in [
+            "/conda/my-repo/t/noarch/repodata.json",
+            "/npm/some-repo/t/x",
+            "/api/v1/repositories/t/artifacts",
+            "/maven/repo/org/t/1.0/t-1.0.jar",
+        ] {
+            assert_eq!(redact_sensitive_params(path, None), path);
+        }
+    }
+
+    #[test]
+    fn test_redact_token_path_repo_named_t_untouched() {
+        // `/conda/t/<doc>` with nothing after is the plain route for a
+        // repository whose key is `t`, not a token channel.
+        for path in ["/conda/t/channeldata.json", "/conda/t/upload", "/conda/t"] {
+            assert_eq!(redact_sensitive_params(path, None), path);
+        }
+    }
+
+    #[test]
+    fn test_redact_token_path_empty_token_untouched() {
+        assert_eq!(redact_sensitive_params("/t//conda/x", None), "/t//conda/x");
+        assert_eq!(redact_sensitive_params("/t/", None), "/t/");
     }
 
     // -----------------------------------------------------------------------
