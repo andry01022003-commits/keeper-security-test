@@ -6789,6 +6789,11 @@ pub struct DependencyScanner {
 enum DepOrigin {
     /// The artifact's own manifest names it.
     Declared,
+    /// The artifact ITSELF, under the identity the orchestrator pinned it as
+    /// (#4669). Queried like a declared dependency and reported the same way,
+    /// but kept out of the dependency inventory: a package is not one of its
+    /// own dependencies.
+    Own,
     /// Recovered from the artifact's bytes by package analysis. The string is
     /// the containing package as a reader would name it (`pillow 10.0.1`).
     Vendored { inside: String },
@@ -6874,6 +6879,39 @@ impl DependencyScanner {
             Some(v) if !v.is_empty() => format!("{} {}", artifact.name, v),
             _ => artifact.name.clone(),
         }
+    }
+
+    /// The advisory-feed identity of the artifact being scanned, from the
+    /// component pin the orchestrator derived for it (#4669).
+    ///
+    /// The pin is the registry's own `name@version` for a hosted upload
+    /// ([`hosted_upload_pin`]) or the request coordinate on a proxy serve
+    /// path, and it has already been cross-checked against what the bytes
+    /// claim. `None` for conda, whose own identity
+    /// [`Self::conda_dependencies`] already puts in the batch through the
+    /// alias graph, and for every artifact without a pin.
+    fn own_identity(pin: Option<&ExpectedComponent>) -> Option<Dependency> {
+        let pin = pin?;
+        let ecosystem = match pin.ecosystem {
+            ComponentEcosystem::Npm => "npm",
+            ComponentEcosystem::Python => "PyPI",
+            ComponentEcosystem::RubyGems => "RubyGems",
+            ComponentEcosystem::Cargo => "crates.io",
+            ComponentEcosystem::NuGet => "NuGet",
+            // `groupId:artifactId`, which is exactly OSV's Maven package name.
+            ComponentEcosystem::Maven => "Maven",
+            ComponentEcosystem::Conda => return None,
+        };
+        let name = pin.name.trim();
+        let version = pin.version.trim();
+        if name.is_empty() || version.is_empty() {
+            return None;
+        }
+        Some(Dependency {
+            name: name.to_string(),
+            version: Some(version.to_string()),
+            ecosystem: ecosystem.to_string(),
+        })
     }
 
     /// The provenance sentence that makes a vendored finding locatable.
@@ -7416,6 +7454,38 @@ impl Scanner for DependencyScanner {
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
+        self.scan_with_identity(artifact, metadata, content, None)
+            .await
+    }
+
+    /// #4669: the orchestrator's pin is the artifact's own identity, and it
+    /// joins the advisory batch. The trait default drops the target, so a
+    /// leaf package with no dependencies (`lodash@4.17.20`) sent the feeds
+    /// nothing and graded `complete`, 0 findings, without one OSV request.
+    async fn scan_target(
+        &self,
+        target: &ScanTarget<'_>,
+        metadata: Option<&ArtifactMetadata>,
+        content: &Bytes,
+    ) -> Result<ScanOutput> {
+        self.scan_with_identity(
+            target.artifact,
+            metadata,
+            content,
+            target.expected_component,
+        )
+        .await
+    }
+}
+
+impl DependencyScanner {
+    async fn scan_with_identity(
+        &self,
+        artifact: &Artifact,
+        metadata: Option<&ArtifactMetadata>,
+        content: &Bytes,
+        pin: Option<&ExpectedComponent>,
+    ) -> Result<ScanOutput> {
         let declared = Self::extract_dependencies(artifact, metadata, content);
 
         // The native libraries compiled INTO this artifact (#4043). A conda
@@ -7432,6 +7502,17 @@ impl Scanner for DependencyScanner {
             .into_iter()
             .map(|d| (d, DepOrigin::Declared))
             .collect();
+        // The artifact itself, unless its manifest already names it (a Linux
+        // package's inferred self-dependency, say): asking twice would only
+        // report every advisory twice.
+        if let Some(own) = Self::own_identity(pin) {
+            let already = batch.iter().any(|(d, _)| {
+                d.ecosystem == own.ecosystem && d.name == own.name && d.version == own.version
+            });
+            if !already {
+                batch.insert(0, (own, DepOrigin::Own));
+            }
+        }
         batch.extend(vendored.into_iter().map(|d| {
             (
                 d,
@@ -7623,7 +7704,7 @@ impl Scanner for DependencyScanner {
                 // and naming a distribution they do not have sends them
                 // looking for something that was never installed.
                 let (component, source, description) = match origin {
-                    DepOrigin::Declared => (
+                    DepOrigin::Declared | DepOrigin::Own => (
                         dep.name.clone(),
                         advisory_match.source,
                         advisory_match.details,
@@ -17249,6 +17330,167 @@ tonic-build = "0.12"
             );
             assert_eq!(out.findings[0].affected_version.as_deref(), Some("2.0.0"));
             assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
+        }
+
+        /// #4669: a leaf package with no dependencies (`lodash@4.17.20`, a
+        /// gzip tarball no manifest parser reads) put nothing in the batch,
+        /// so the scanner graded `complete`, 0 findings, without sending OSV
+        /// a single request. The artifact's own pinned identity is now part
+        /// of the batch, so the feed is asked about the package itself.
+        #[tokio::test]
+        async fn test_scan_target_queries_the_artifact_own_identity() {
+            use wiremock::matchers::body_partial_json;
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_partial_json(serde_json::json!({
+                    "queries": [{
+                        "package": { "name": "lodash", "ecosystem": "npm" },
+                        "version": "4.17.20"
+                    }]
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{
+                        "id": "GHSA-35jh-r3h4-6jhm",
+                        "summary": "Command Injection in lodash",
+                        "aliases": ["CVE-2021-23337"],
+                        "database_specific": { "severity": "HIGH" },
+                        "affected": [{ "ranges": [{ "events": [{ "fixed": "4.17.21" }] }] }]
+                    }] }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("lodash", "lodash/-/lodash-4.17.20.tgz", Some("4.17.20"));
+            let content = Bytes::from_static(b"\x1f\x8b\x08\x00\xff\xfe not utf-8");
+            let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.20");
+            let target = ScanTarget {
+                artifact: &artifact,
+                repository_key: "npm-local",
+                repository_type: "local",
+                db: None,
+                storage: None,
+                manifest_body: None,
+                expected_component: Some(&pin),
+                require_nonempty_catalog: false,
+            };
+
+            let out = scanner
+                .scan_target(&target, None, &content)
+                .await
+                .expect("scan");
+
+            assert_eq!(
+                out.findings.len(),
+                1,
+                "the package's own advisory must be reported, got {:?}",
+                out.findings
+            );
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("lodash")
+            );
+            assert_eq!(out.findings[0].cve_id.as_deref(), Some("CVE-2021-23337"));
+            assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
+            assert!(
+                out.packages.is_empty(),
+                "a package is not one of its own dependencies: the inventory \
+                 must not list it"
+            );
+        }
+
+        #[test]
+        fn test_own_identity_maps_each_pinned_ecosystem_to_its_osv_name() {
+            let own = |eco, name: &str| {
+                DependencyScanner::own_identity(Some(&ExpectedComponent::new(eco, name, "1.0.0")))
+                    .map(|d| (d.ecosystem, d.name, d.version))
+            };
+            let v = Some("1.0.0".to_string());
+            assert_eq!(
+                own(ComponentEcosystem::Npm, "@acme/w"),
+                Some(("npm".into(), "@acme/w".into(), v.clone()))
+            );
+            assert_eq!(
+                own(ComponentEcosystem::Python, "PyYAML").map(|t| t.0),
+                Some("PyPI".into())
+            );
+            assert_eq!(
+                own(ComponentEcosystem::RubyGems, "rack").map(|t| t.0),
+                Some("RubyGems".into())
+            );
+            assert_eq!(
+                own(ComponentEcosystem::Cargo, "smol_str").map(|t| t.0),
+                Some("crates.io".into())
+            );
+            assert_eq!(
+                own(ComponentEcosystem::NuGet, "Newtonsoft.Json").map(|t| t.0),
+                Some("NuGet".into())
+            );
+            assert_eq!(
+                own(ComponentEcosystem::Maven, "org.example:lib"),
+                Some(("Maven".into(), "org.example:lib".into(), v))
+            );
+            assert_eq!(
+                own(ComponentEcosystem::Conda, "numpy"),
+                None,
+                "conda's own identity already reaches the batch through the alias graph"
+            );
+            assert!(DependencyScanner::own_identity(None).is_none());
+        }
+
+        /// An artifact whose manifest already names itself (a Linux package's
+        /// inferred self-dependency) is asked about once, not twice.
+        #[tokio::test]
+        async fn test_own_identity_is_not_queried_twice() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{}]
+                })))
+                .mount(&server)
+                .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact =
+                make_artifact("requirements.txt", "/app/requirements.txt", Some("1.0.0"));
+            let content = Bytes::from_static(b"widget==1.0.0\n");
+            let pin = ExpectedComponent::new(ComponentEcosystem::Python, "widget", "1.0.0");
+            let target = ScanTarget {
+                artifact: &artifact,
+                repository_key: "pypi-local",
+                repository_type: "local",
+                db: None,
+                storage: None,
+                manifest_body: None,
+                expected_component: Some(&pin),
+                require_nonempty_catalog: false,
+            };
+            let out = scanner
+                .scan_target(&target, None, &content)
+                .await
+                .expect("scan");
+            let requests = server.received_requests().await.expect("recorded");
+            assert_eq!(requests.len(), 1);
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("json body");
+            assert_eq!(
+                body["queries"].as_array().map(Vec::len),
+                Some(1),
+                "the declared dependency and the pin are the same query: {body}"
+            );
+            assert_eq!(
+                out.packages.len(),
+                1,
+                "the declared dependency stays inventoried"
+            );
         }
 
         /// #3013: an OSV `MAL-*` record (ossf/malicious-packages) is a
