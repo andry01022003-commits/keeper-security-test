@@ -164,7 +164,14 @@ struct ScrubTarget {
     repository_id: Uuid,
     storage_key: String,
     checksum: String,
-    size_bytes: i64,
+    /// Length the stored object must have, or `None` to verify by digest
+    /// alone. Not `artifacts.size_bytes` for an OCI manifest row: that column
+    /// holds the IMAGE size there (#3601), so the length comes from
+    /// `oci_manifests.size_bytes`, the manifest body length (#4666). See
+    /// [`artifact_page_sql`]. Defaults to `None` for donor rows, which are
+    /// only read, never judged by length.
+    #[sqlx(default)]
+    stored_len: Option<i64>,
     storage_backend: String,
     storage_path: String,
     /// Repository format key and artifact path, for
@@ -200,11 +207,23 @@ pub struct StorageScrubService {
 }
 
 fn artifact_page_sql(scoped: bool) -> String {
+    // `size_bytes` of an OCI manifest row (`oci-manifests/<digest>` key) is
+    // the image size -- config plus layers -- not the length of the stored
+    // manifest body (#3601), so it can never be the expected object length
+    // (#4666). The body length is recorded in `oci_manifests.size_bytes`
+    // (#4433); a manifest with no record yet (the startup backfill has not
+    // reached it) is verified by digest alone, which already catches a
+    // truncated or altered body.
     format!(
         "SELECT a.id, a.repository_id, a.storage_key, a.checksum_sha256 AS checksum, \
-                a.size_bytes, r.storage_backend, r.storage_path, r.format::text AS format, \
+                CASE WHEN a.storage_key LIKE 'oci-manifests/%' THEN om.size_bytes \
+                     ELSE a.size_bytes END AS stored_len, \
+                r.storage_backend, r.storage_path, r.format::text AS format, \
                 a.path \
          FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+         LEFT JOIN oci_manifests om ON a.storage_key LIKE 'oci-manifests/%' \
+              AND om.repository_id = a.repository_id \
+              AND om.digest = substr(a.storage_key, length('oci-manifests/') + 1) \
          WHERE a.is_deleted = false AND ($1::uuid IS NULL OR a.id > $1) {} \
          ORDER BY a.id LIMIT $2",
         if scoped {
@@ -214,12 +233,13 @@ fn artifact_page_sql(scoped: bool) -> String {
         }
     )
 }
+const _: () = assert!(crate::storage::keys::prefix_matches("oci-manifests/"));
 
 fn oci_blob_page_sql(scoped: bool) -> String {
     format!(
         "SELECT b.id, b.repository_id, b.storage_key, b.digest AS checksum, \
-                b.size_bytes, r.storage_backend, r.storage_path, 'oci' AS format, \
-                b.storage_key AS path \
+                b.size_bytes AS stored_len, r.storage_backend, r.storage_path, \
+                'oci' AS format, b.storage_key AS path \
          FROM oci_blobs b JOIN repositories r ON r.id = b.repository_id \
          WHERE ($1::uuid IS NULL OR b.id > $1) {} \
          ORDER BY b.id LIMIT $2",
@@ -415,7 +435,7 @@ impl StorageScrubService {
             Err(AppError::NotFound(_)) => return Ok((ObjectCheck::Missing, 0)),
             Err(e) => return Err(e),
         };
-        let expected_len = u64::try_from(t.size_bytes).ok();
+        let expected_len = t.stored_len.and_then(|l| u64::try_from(l).ok());
         let check = match crate::storage::verify::verdict(
             &expected,
             expected_len,
@@ -550,16 +570,16 @@ impl StorageScrubService {
         };
         let hex_digest = hex::encode(expected);
         let donors: Vec<ScrubTarget> = sqlx::query_as(
-            "SELECT id, repository_id, storage_key, checksum, size_bytes, storage_backend, \
+            "SELECT id, repository_id, storage_key, checksum, storage_backend, \
                     storage_path, format, path FROM ( \
                SELECT a.id, a.repository_id, a.storage_key, a.checksum_sha256 AS checksum, \
-                      a.size_bytes, r.storage_backend, r.storage_path, \
+                      r.storage_backend, r.storage_path, \
                       r.format::text AS format, a.path \
                FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
                WHERE a.is_deleted = false AND a.checksum_sha256 = $1 AND a.id <> $3 \
                UNION ALL \
                SELECT b.id, b.repository_id, b.storage_key, b.digest AS checksum, \
-                      b.size_bytes, r.storage_backend, r.storage_path, 'oci' AS format, \
+                      r.storage_backend, r.storage_path, 'oci' AS format, \
                       b.storage_key AS path \
                FROM oci_blobs b JOIN repositories r ON r.id = b.repository_id \
                WHERE b.digest = $2 AND b.id <> $3 \
@@ -648,7 +668,7 @@ impl StorageScrubService {
         .bind(&t.storage_key)
         .bind(t.checksum.trim())
         .bind(&actual_sha256)
-        .bind(t.size_bytes)
+        .bind(t.stored_len)
         .bind(actual_size)
         .bind(status)
         .bind(&detail)
@@ -662,7 +682,7 @@ impl StorageScrubService {
             storage_key: t.storage_key.clone(),
             expected_sha256: t.checksum.trim().to_string(),
             actual_sha256,
-            expected_size: Some(t.size_bytes),
+            expected_size: t.stored_len,
             actual_size,
             status: status.to_string(),
             detail,
@@ -771,6 +791,11 @@ mod tests {
         assert!(artifact_page_sql(true).contains("a.repository_id = $3"));
         assert!(oci_blob_page_sql(true).contains("b.repository_id = $3"));
         assert!(artifact_page_sql(false).contains("is_deleted = false"));
+        // #4666: an OCI manifest row is judged by its body length, never by
+        // the image size `artifacts.size_bytes` carries for it (#3601).
+        assert!(artifact_page_sql(false).contains("LEFT JOIN oci_manifests om"));
+        assert!(artifact_page_sql(false)
+            .contains("WHEN a.storage_key LIKE 'oci-manifests/%' THEN om.size_bytes"));
     }
 
     #[test]
@@ -1006,6 +1031,118 @@ mod db_tests {
         assert_eq!(res.corrupt, 1, "{res:?}");
         assert_eq!(status.as_deref(), Some("corrupt"));
         assert_eq!(&still[..], b"scrub-sha-named-byteX");
+    }
+
+    /// A multi-layer image manifest: its image size (config + layers, what
+    /// `artifacts.size_bytes` records since #3601) is far larger than the body.
+    fn multi_layer_manifest() -> (Vec<u8>, i64) {
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 1_469
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{}", "1".repeat(64)),
+                    "size": 3_623_807
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{}", "2".repeat(64)),
+                    "size": 29_126_484
+                }
+            ]
+        })
+        .to_string()
+        .into_bytes();
+        (body, 1_469 + 3_623_807 + 29_126_484)
+    }
+
+    /// Seed an OCI manifest row as the push path writes it: key
+    /// `oci-manifests/<digest>`, `size_bytes` = image size, and (when
+    /// `recorded`) an `oci_manifests` record of the body length.
+    async fn seed_manifest(
+        fx: &tdh::Fixture,
+        body: &[u8],
+        image_size: i64,
+        stored: &[u8],
+        recorded: bool,
+    ) -> Uuid {
+        let hex = sha_hex(body);
+        let digest = format!("sha256:{hex}");
+        let (id, _) = seed_at(
+            fx,
+            &format!("oci-manifests/{digest}"),
+            &format!("v2/img/manifests/{digest}"),
+            body,
+            stored,
+        )
+        .await;
+        sqlx::query("UPDATE artifacts SET size_bytes = $1 WHERE id = $2")
+            .bind(image_size)
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .expect("record image size");
+        if recorded {
+            sqlx::query(
+                "INSERT INTO oci_manifests (repository_id, digest, content_type, size_bytes) \
+                 VALUES ($1, $2, 'application/vnd.oci.image.manifest.v1+json', $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(&digest)
+            .bind(body.len() as i64)
+            .execute(&fx.pool)
+            .await
+            .expect("record manifest");
+        }
+        id
+    }
+
+    /// #4666: an intact OCI manifest whose image size (`size_bytes`, #3601)
+    /// differs from its body length verifies clean, with and without an
+    /// `oci_manifests` record; a truncated manifest body is still corrupt and
+    /// the finding reports the body length, not the image size.
+    #[tokio::test]
+    async fn scrub_verifies_oci_manifest_by_stored_length() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (body, image_size) = multi_layer_manifest();
+        assert_ne!(image_size, body.len() as i64);
+        let recorded = seed_manifest(&fx, &body, image_size, &body, true).await;
+
+        let mut other = body.clone();
+        other.extend_from_slice(b"\n");
+        let unrecorded = seed_manifest(&fx, &other, image_size, &other, false).await;
+
+        let mut third = body.clone();
+        third.extend_from_slice(b"\n\n");
+        let truncated =
+            seed_manifest(&fx, &third, image_size, &third[..third.len() - 7], true).await;
+
+        let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        let res = svc.run(&opts(&fx, false)).await.expect("scrub run");
+        let statuses = (
+            finding_status(&fx.pool, recorded).await,
+            finding_status(&fx.pool, unrecorded).await,
+            finding_status(&fx.pool, truncated).await,
+        );
+        fx.teardown().await;
+
+        assert_eq!(res.intact, 2, "{res:?}");
+        assert_eq!(res.corrupt, 1, "{res:?}");
+        assert_eq!(statuses.0, None);
+        assert_eq!(statuses.1, None);
+        assert_eq!(statuses.2.as_deref(), Some("corrupt"));
+        let f = &res.findings[0];
+        assert_eq!(f.object_id, truncated);
+        assert_eq!(f.expected_size, Some(third.len() as i64));
+        assert_eq!(f.actual_size, Some(third.len() as i64 - 7));
     }
 
     /// #3910 review (S3): the cursor is persisted per object, so consecutive
