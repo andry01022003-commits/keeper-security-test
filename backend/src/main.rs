@@ -1157,6 +1157,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         [artifact_keeper_backend::api::middleware::rate_limit::CidrRange],
     > = config.rate_limit_trusted_proxy_cidrs.clone().into();
 
+    // With trusted proxies configured but no XFF_TRUSTED_FOR_AUTHZ
+    // assertion, authorization-grade client-IP resolution fails closed:
+    // IP-conditioned permission rules (#1849) deny every proxied request and
+    // auth-audit rows record NULL for the client IP. That is the safe
+    // default — a proxy that does not append XFF leaves the chain wholly
+    // attacker-controlled — but it surprises operators whose topology IS
+    // appending, so say so loudly at startup.
+    if !config.rate_limit_trusted_proxy_cidrs.is_empty() && !config.xff_trusted_for_authz {
+        tracing::warn!(
+            "RATE_LIMIT_TRUSTED_PROXY_CIDRS is set but XFF_TRUSTED_FOR_AUTHZ is not: \
+             IP-conditioned permission rules (allowed_cidrs) and auth-audit IP attribution \
+             resolve the client as UNKNOWN for requests arriving through trusted proxies \
+             (fail closed). Set XFF_TRUSTED_FOR_AUTHZ=true only after confirming every \
+             trusted proxy APPENDS X-Forwarded-For (Caddy and ingress-nginx do; Envoy \
+             Gateway passes inbound XFF through unsanitized)."
+        );
+    }
+
     // Build router
     let app = Router::new()
         .merge(api::routes::create_router(state))
