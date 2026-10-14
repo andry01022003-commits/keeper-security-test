@@ -225,6 +225,21 @@ impl Claims {
     }
 }
 
+/// JWT validation for tokens this server signed itself (HS256 sessions,
+/// refresh tokens, TOTP tickets), on the HTTP and gRPC paths alike.
+///
+/// No expiry leeway: the library default of 60 s exists for clock skew
+/// between an issuer and a verifier, and here both are this deployment. A
+/// leeway would extend every minted token past the `exp` it was stamped
+/// with, and chain with the leeway an exchanged credential was accepted
+/// under (#4663): a CI assertion accepted 59 s past its `exp` used to yield
+/// a token that was then accepted for another 60 s.
+pub fn self_minted_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
+    validation
+}
+
 /// `token_type` claim of a forced-TOTP-enrollment ticket (#2805). Kept distinct
 /// from `totp_pending` so an enrollment ticket can never be redeemed at
 /// `/auth/totp/verify` for a session, and vice versa.
@@ -2660,8 +2675,7 @@ impl AuthService {
     }
 
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
-        let validation = Validation::new(Algorithm::HS256);
-        decode::<Claims>(token, &self.decoding_key, &validation)
+        decode::<Claims>(token, &self.decoding_key, &self_minted_validation())
             .map_err(|e| AppError::Authentication(format!("Invalid token: {}", e)))
     }
 
@@ -5042,6 +5056,47 @@ mod tests {
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
         let result = decode::<Claims>(&token, &decoding_key, &Validation::new(Algorithm::HS256));
         assert!(result.is_err());
+    }
+
+    /// #4663: a token this server minted gets no expiry leeway. With the
+    /// library's default 60 s, an access token 30 s past its `exp` was still
+    /// accepted, which is how a CI assertion accepted inside its own leeway
+    /// chained into a second leeway window.
+    #[tokio::test]
+    async fn test_self_minted_token_has_no_expiry_leeway() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+        assert_eq!(self_minted_validation().leeway, 0);
+
+        let now = Utc::now();
+        let token_expiring_at = |exp: DateTime<Utc>| {
+            let claims = Claims {
+                sub: Uuid::new_v4(),
+                username: "leeway".to_string(),
+                email: "leeway@test.com".to_string(),
+                is_admin: false,
+                allowed_repo_ids: None,
+                iat: (now - Duration::minutes(5)).timestamp(),
+                iat_ms: None,
+                exp: exp.timestamp(),
+                token_type: "access".to_string(),
+                jti: None,
+                family_id: None,
+                scan_pull_repo: None,
+                scopes: None,
+            };
+            encode(&Header::default(), &claims, &encoding_key).unwrap()
+        };
+
+        let just_expired = token_expiring_at(now - Duration::seconds(30));
+        let err = service
+            .validate_access_token(&just_expired)
+            .expect_err("a token 30 s past exp must be rejected");
+        assert!(matches!(err, AppError::Authentication(_)), "{err}");
+
+        let live = token_expiring_at(now + Duration::seconds(30));
+        assert!(service.validate_access_token(&live).is_ok());
     }
 
     #[test]

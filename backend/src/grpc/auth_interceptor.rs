@@ -15,7 +15,7 @@
 //! cannot see the gRPC method path, so the required scope must be selected
 //! per-method at the handler, not in the interceptor.
 
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, DecodingKey};
 use sqlx::PgPool;
 use tonic::{Request, Status};
 
@@ -114,7 +114,7 @@ impl AuthInterceptor {
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| Status::unauthenticated("Missing or invalid authorization token"))?;
 
-        let validation = Validation::new(Algorithm::HS256);
+        let validation = crate::services::auth_service::self_minted_validation();
         let mut token_data = decode::<Claims>(token, &self.decoding_key, &validation)
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
 

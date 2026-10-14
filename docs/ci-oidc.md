@@ -222,7 +222,10 @@ publish:
 - The access token lives for the configured access-token TTL (15 minutes by
   default), and never longer than the ID token that bought it. Docker does not
   refresh credentials, so a job that runs longer must exchange again before
-  its next push. `expires_in` gives the real lifetime.
+  its next push. `expires_in` gives the real lifetime. An ID token that has
+  already expired is refused with 401, even inside the 60 s clock-skew leeway
+  its signature check allows, rather than exchanged for an access token that
+  is born expired (#4663).
 
 GitHub Actions uses the same exchange. Request `permissions: id-token: write`,
 fetch the token from `$ACTIONS_ID_TOKEN_REQUEST_URL` with the provider's
