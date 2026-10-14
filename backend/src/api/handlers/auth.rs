@@ -2723,7 +2723,10 @@ mod tests {
         let app = login_router()
             .with_state(state)
             .layer(axum::middleware::from_fn_with_state(
-                Arc::new(Vec::new()),
+                Arc::new(crate::api::middleware::client_ip::ClientIpConfig {
+                    trusted_proxies: Vec::new(),
+                    xff_trusted_for_authz: false,
+                }),
                 crate::api::middleware::client_ip::client_ip_context_middleware,
             ));
 

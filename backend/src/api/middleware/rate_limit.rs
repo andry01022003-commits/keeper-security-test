@@ -907,6 +907,19 @@ fn first_xff_token_in(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// Rightmost `X-Forwarded-For` token that is NOT itself a trusted proxy —
 /// the right-side-aware client-IP selection for GHSA-8jm4-4x6c-6787.
 ///
+/// ⚠️ This walk is sound ONLY when every trusted proxy APPENDS the
+/// downstream peer it observed (Caddy in the default compose deployment
+/// does). Behind a proxy that passes client-supplied XFF through untouched
+/// — or a SNAT that destroyed the real peer before the proxy saw it — the
+/// selected token is attacker-controlled, and nothing in the request can
+/// detect that. The result therefore feeds availability/attribution
+/// consumers ONLY (rate-limit keying, upload guard, telemetry). It MUST
+/// NOT feed authorization (permission `allowed_cidrs`, #1849) or
+/// auth-audit IP attribution: those consume
+/// [`super::client_ip::current_verified_client_ip`], which fails closed
+/// unless the operator asserts the appending topology via
+/// `XFF_TRUSTED_FOR_AUTHZ`.
+///
 /// Trusted appending proxies (Caddy in the default compose deployment)
 /// preserve any client-supplied `XFF` prefix and append the address they
 /// actually observed, so the LEFTMOST token is attacker-controlled while the
@@ -1053,6 +1066,16 @@ fn extract_client_ip_addr(request: &Request, trusted_proxies: &[CidrRange]) -> O
 /// at all (test harness / pre-`ConnectInfo` topology), a parseable `XFF`
 /// first token is a last-resort fallback. Returns `None` when nothing
 /// resolves — callers must record "unknown", never a sentinel.
+///
+/// ⚠️ The XFF walk is sound ONLY behind proxies confirmed to APPEND the
+/// downstream peer they observed; otherwise the result can be
+/// attacker-controlled (see [`rightmost_untrusted_xff_token`]). This
+/// function feeds availability/attribution consumers (rate-limit keying,
+/// upload guard, telemetry) and MUST NOT feed authorization (permission
+/// `allowed_cidrs`, #1849) or auth-audit IP attribution — use
+/// [`super::client_ip::current_verified_client_ip`] there, which fails
+/// closed behind trusted proxies unless the operator sets
+/// `XFF_TRUSTED_FOR_AUTHZ`.
 pub(crate) fn resolve_client_ip_addr(
     headers: &axum::http::HeaderMap,
     peer: Option<IpAddr>,

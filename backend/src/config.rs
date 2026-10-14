@@ -1061,6 +1061,24 @@ pub struct Config {
     /// Example (single reverse proxy on loopback): `127.0.0.0/8`.
     pub rate_limit_trusted_proxy_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
 
+    /// When true, `X-Forwarded-For`-derived client IPs (resolved under the
+    /// `rate_limit_trusted_proxy_cidrs` policy) may feed authorization —
+    /// the permission `allowed_cidrs` conditions (#1849) — and auth-audit
+    /// IP attribution. When false (the default, fail closed), those
+    /// consumers treat the client IP as unknown whenever the request
+    /// arrived through a trusted proxy: a proxy that does NOT append the
+    /// downstream peer it observed leaves the XFF chain wholly attacker-
+    /// controlled, and no static configuration can detect that at request
+    /// time.
+    ///
+    /// Enable ONLY behind proxies confirmed to APPEND `X-Forwarded-For`
+    /// (Caddy and ingress-nginx do; Envoy Gateway passes inbound XFF
+    /// through unsanitized). Rate-limit keying is unaffected by this flag
+    /// and keeps the existing resolution either way.
+    ///
+    /// Env var: `XFF_TRUSTED_FOR_AUTHZ`. Default: false.
+    pub xff_trusted_for_authz: bool,
+
     /// Number of consecutive failed login attempts before a local account is
     /// locked. Set to 0 to disable account lockout. Default: 5.
     pub account_lockout_threshold: u32,
@@ -1568,6 +1586,7 @@ impl Default for Config {
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
             rate_limit_trusted_proxy_cidrs: Vec::new(),
+            xff_trusted_for_authz: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -1942,6 +1961,10 @@ impl Config {
             ),
             rate_limit_trusted_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_CIDRS"),
             rate_limit_trusted_proxy_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_PROXY_CIDRS"),
+            xff_trusted_for_authz: matches!(
+                env::var("XFF_TRUSTED_FOR_AUTHZ").as_deref(),
+                Ok("true" | "1")
+            ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
             quarantine_enabled: matches!(
