@@ -27,6 +27,43 @@ pub struct PublishedArtifact<'a> {
     pub created_at: DateTime<Utc>,
 }
 
+const REARM_SUPERSEDED_PUSH_SQL: &str = r#"
+    UPDATE sync_tasks st
+    SET status = 'pending',
+        retry_count = 0,
+        error_message = NULL,
+        started_at = NULL,
+        completed_at = NULL,
+        claimed_by = NULL,
+        claim_token = NULL,
+        claim_expires_at = NULL
+    FROM artifacts a
+    JOIN repositories r ON r.id = a.repository_id
+    WHERE st.id = $1
+      AND st.task_type = 'push'
+      AND st.status IN ('completed', 'failed', 'cancelled')
+      AND a.id = st.artifact_id
+      AND a.is_deleted = false
+      AND (
+          (
+              r.versioning_enabled
+              AND r.format::text IN ('generic', 'mlmodel')
+              AND a.checksum_sha256 IS DISTINCT FROM $2::bpchar
+          )
+          OR EXISTS (
+              SELECT 1
+              FROM sync_tasks d
+              WHERE d.peer_instance_id = st.peer_instance_id
+                AND d.artifact_id = st.artifact_id
+                AND d.task_type = 'delete'
+                AND (
+                    d.status IN ('pending', 'in_progress')
+                    OR (d.status <> 'cancelled' AND d.completed_at > st.completed_at)
+                )
+          )
+      )
+"#;
+
 /// Peer instance status
 #[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
 #[sqlx(type_name = "instance_status", rename_all = "lowercase")]
@@ -702,6 +739,8 @@ impl PeerInstanceService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        self.rearm_superseded_push(id, None).await?;
+
         Ok(id)
     }
 
@@ -767,6 +806,20 @@ impl PeerInstanceService {
             );
         }
         queued
+    }
+
+    pub async fn rearm_superseded_push(
+        &self,
+        task_id: Uuid,
+        sent_checksum: Option<&str>,
+    ) -> Result<bool> {
+        let result = sqlx::query(REARM_SUPERSEDED_PUSH_SQL)
+            .bind(task_id)
+            .bind(sent_checksum)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Get pending sync tasks for a peer instance
@@ -2107,5 +2160,168 @@ mod tests {
             last_replicated_at: Some(Utc::now()),
         };
         assert!(repo.schedule.is_some());
+    }
+
+    async fn completed_push_fixture(
+        pool: &sqlx::PgPool,
+        svc: &PeerInstanceService,
+        versioning_enabled: bool,
+    ) -> (Uuid, Uuid, Uuid, Uuid) {
+        let suffix = Uuid::new_v4();
+        let repo_id = insert_test_repo(pool, &suffix).await;
+        sqlx::query("UPDATE repositories SET versioning_enabled = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(versioning_enabled)
+            .execute(pool)
+            .await
+            .unwrap();
+        let peer_id = register_test_peer(svc, &suffix).await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) \
+             VALUES ($1, 'ansible-master.tar.gz', 'ansible-master.tar.gz', 1, $2, \
+             'application/gzip', $3) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 1))
+        .bind(format!("rearm/{suffix}"))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let task_id = svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() - INTERVAL '1 hour', \
+             retry_count = 2, error_message = 'old' WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (repo_id, peer_id, artifact_id, task_id)
+    }
+
+    async fn push_task_state(pool: &sqlx::PgPool, task_id: Uuid) -> (String, i32, Option<Uuid>) {
+        sqlx::query_as(
+            "SELECT status::TEXT, retry_count, claim_token FROM sync_tasks WHERE id = $1",
+        )
+        .bind(task_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn queue_sync_task_requeues_completed_push_after_versioned_reupload() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let (repo_id, peer_id, artifact_id, task_id) =
+            completed_push_fixture(&pool, &svc, true).await;
+
+        assert_eq!(
+            svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap(),
+            task_id
+        );
+
+        let pending: Vec<Uuid> = svc
+            .get_pending_sync_tasks(peer_id, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(pending, vec![task_id]);
+        assert_eq!(
+            push_task_state(&pool, task_id).await,
+            ("pending".to_string(), 0, None)
+        );
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn queue_sync_task_requeues_completed_push_after_delete_and_reupload() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let (repo_id, peer_id, artifact_id, task_id) =
+            completed_push_fixture(&pool, &svc, false).await;
+        sqlx::query(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, completed_at) \
+             VALUES ($1, $2, 'delete', 'completed', NOW() - INTERVAL '30 minutes')",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        assert_eq!(
+            push_task_state(&pool, task_id).await,
+            ("pending".to_string(), 0, None)
+        );
+
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!svc
+            .rearm_superseded_push(task_id, Some(&format!("{:064x}", 1)))
+            .await
+            .unwrap());
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn queue_sync_task_keeps_completed_push_on_unversioned_reupload() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let (repo_id, peer_id, artifact_id, task_id) =
+            completed_push_fixture(&pool, &svc, false).await;
+
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+
+        assert_eq!(
+            push_task_state(&pool, task_id).await,
+            ("completed".to_string(), 2, None)
+        );
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
+    #[tokio::test]
+    async fn queue_sync_task_leaves_claimed_push_alone() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let (repo_id, peer_id, artifact_id, task_id) =
+            completed_push_fixture(&pool, &svc, true).await;
+        let token = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'in_progress', claim_token = $2, claimed_by = 'worker-a', \
+             claim_expires_at = NOW() + INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(task_id)
+        .bind(token)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap(),
+            task_id
+        );
+        assert_eq!(
+            push_task_state(&pool, task_id).await,
+            ("in_progress".to_string(), 2, Some(token))
+        );
+        cleanup_assign(&pool, peer_id, repo_id).await;
     }
 }

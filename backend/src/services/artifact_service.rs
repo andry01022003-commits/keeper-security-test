@@ -46,7 +46,16 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                   AND pi.status IN ('online', 'syncing')
                   AND prs.replication_mode::text IN ('push', 'mirror')
                   AND prs.sync_enabled = true
-                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
+                    status = 'pending',
+                    retry_count = 0,
+                    error_message = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
+                WHERE sync_tasks.status <> 'in_progress'
                 "#;
 
 /// The three content digests persisted on every artifact row.
@@ -4372,6 +4381,96 @@ mod tests {
         assert!(sql.contains("sync_enabled"));
         assert!(sql.contains("is_local = false"));
         assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("WHERE sync_tasks.status <> 'in_progress'"));
+    }
+
+    #[tokio::test]
+    async fn delete_enqueue_requeues_finished_delete_task() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{PeerInstanceService, ReplicationMode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "delete-requeue", "t").await;
+        sqlx::query("UPDATE peer_instances SET status = 'online' WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        PeerInstanceService::new(pool.clone())
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted) \
+             VALUES ($1, 'a/b/c.bin', 'c.bin', 1, $2, 'application/octet-stream', $2, true) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 1))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let delete_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, \
+             retry_count, completed_at) \
+             VALUES ($1, $2, 'delete', 'completed', 3, NOW()) RETURNING id",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state: (String, i32) =
+            sqlx::query_as("SELECT status::TEXT, retry_count FROM sync_tasks WHERE id = $1")
+                .bind(delete_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, ("pending".to_string(), 0));
+
+        let token = Uuid::new_v4();
+        sqlx::query("UPDATE sync_tasks SET status = 'in_progress', claim_token = $2 WHERE id = $1")
+            .bind(delete_id)
+            .bind(token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed: (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status::TEXT, claim_token FROM sync_tasks WHERE id = $1")
+                .bind(delete_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(claimed, ("in_progress".to_string(), Some(token)));
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
