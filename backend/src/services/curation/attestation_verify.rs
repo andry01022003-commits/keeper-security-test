@@ -41,6 +41,7 @@
 //! | **Certificate identity extraction** | **us** ([`identity`]) — the crate exposes only assertion policies, never the parsed identity, and reads only Fulcio's deprecated `1.1` extensions |
 //! | **Subject-digest binding** | **us** — the crate reports a misleading `Transparency` error; our compare distinguishes replay from a bad signature |
 //! | **Claimed-publisher owner binding** | **us** — cert-bound owner must equal the self-asserted `publisher.repository` owner |
+//! | **Rekor `envelopeHash` serialization** | **us** ([`rekor_glue::dsse_envelope_hash_form`]) — the crate hashes only the compact envelope JSON; Rekor hashed it as submitted, which PyPI's tooling spaced until ~2026-05 (#4082). We accept either serialization of the same envelope and report any other disagreement as a transparency log entry mismatch, not a signature failure |
 //!
 //! Both `verify_digest` **and** the Rekor inclusion glue must pass. A structural
 //! guard ([`AttestationVerdict::from_mask`]) makes "every check actually ran" an
@@ -320,13 +321,19 @@ impl AttestationVerdict {
 
     /// A failure verdict for the given check with a specific reason.
     fn failed(check: Check, mask: u16, reason: impl Into<String>) -> Self {
+        Self::failed_as(check.reason_label(), mask, reason)
+    }
+
+    /// [`Self::failed`] under an explicit operator-facing label, for a failure
+    /// inside a check that is not what the check's own label names (#4082).
+    fn failed_as(label: &str, mask: u16, reason: impl Into<String>) -> Self {
         Self {
             state: AttestationState::Failed,
             identity: None,
             owner: None,
             repository: None,
             issuer: None,
-            error: Some(format!("{}: {}", check.reason_label(), reason.into())),
+            error: Some(format!("{label}: {}", reason.into())),
             checks_passed: mask,
             method: None,
             key_fingerprint: None,
@@ -586,7 +593,29 @@ async fn verify_bundle_core(
             ))
         }
     };
-    let bundle = match serde_json::from_value::<sigstore::bundle::Bundle>(bundle_json.clone()) {
+    // #4082: Rekor recorded `envelopeHash` over the envelope as submitted, and
+    // PyPI submitted Python's spaced JSON until ~2026-05; the crate compares
+    // against the compact form only. When the recorded hash is the spaced
+    // serialization of this same envelope, hand the crate a copy whose body
+    // carries the compact hash. The SET and inclusion checks below still run
+    // on the unmodified bundle, so the log vouches for the body we read.
+    let envelope_hash_form = rekor_glue::dsse_envelope_hash_form(bundle_json);
+    let crate_bundle_json = match &envelope_hash_form {
+        rekor_glue::EnvelopeHashForm::Spaced { compact_sha256 } => {
+            match rekor_glue::with_envelope_hash(bundle_json, compact_sha256) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(AttestationVerdict::failed_as(
+                        TLOG_ENTRY_MISMATCH_LABEL,
+                        mask,
+                        format!("{e:#}"),
+                    ))
+                }
+            }
+        }
+        _ => bundle_json.clone(),
+    };
+    let bundle = match serde_json::from_value::<sigstore::bundle::Bundle>(crate_bundle_json) {
         Ok(b) => b,
         Err(e) => {
             return Err(AttestationVerdict::failed(
@@ -605,6 +634,16 @@ async fn verify_bundle_core(
         )
         .await
     {
+        // The crate reports a Rekor entry that disagrees with the bundle as a
+        // `signature` error. The signature and chain verified before it got
+        // there, so name what actually failed (#4082).
+        if is_tlog_inconsistency(&e) {
+            return Err(AttestationVerdict::failed_as(
+                TLOG_ENTRY_MISMATCH_LABEL,
+                mask,
+                tlog_mismatch_reason(&envelope_hash_form, &e),
+            ));
+        }
         return Err(AttestationVerdict::failed(
             Check::CryptoAndChain,
             mask,
@@ -945,6 +984,48 @@ fn verification_error_class(e: &sigstore::bundle::verify::VerificationError) -> 
         V::Certificate(_) => "certificate",
         V::Signature(_) => "signature",
         V::Policy(_) => "policy",
+    }
+}
+
+/// Operator-facing label for a Rekor entry that does not describe the
+/// bundle it came with (#4082). The signature and certificate chain are fine
+/// when this is reported; auditing them is the wrong investigation.
+pub const TLOG_ENTRY_MISMATCH_LABEL: &str = "transparency log entry mismatch";
+
+/// `sigstore` 0.14.0's `SignatureErrorKind::Transparency` message: the tlog
+/// entry is inconsistent with the bundle (envelopeHash, payloadHash, signature
+/// or verifier certificate). The kind lives in a private module and cannot be
+/// named, so it is recognised by its message; the crate is pinned with `=`.
+const CRATE_TLOG_INCONSISTENT: &str = "signature transparency materials are inconsistent";
+
+fn is_tlog_inconsistency(e: &sigstore::bundle::verify::VerificationError) -> bool {
+    use sigstore::bundle::verify::VerificationError as V;
+    matches!(e, V::Signature(kind) if kind.to_string() == CRATE_TLOG_INCONSISTENT)
+}
+
+/// The reason text for a [`TLOG_ENTRY_MISMATCH_LABEL`] failure: the precise
+/// envelopeHash comparison when that is what disagrees, otherwise the crate's.
+fn tlog_mismatch_reason(
+    form: &rekor_glue::EnvelopeHashForm,
+    e: &sigstore::bundle::verify::VerificationError,
+) -> String {
+    match form {
+        rekor_glue::EnvelopeHashForm::Neither {
+            recorded,
+            compact,
+            spaced,
+        } => format!(
+            "Rekor dsse envelopeHash {} matches neither the compact ({}) nor the spaced ({}) \
+             serialization of the bundle's DSSE envelope",
+            short(recorded),
+            short(compact),
+            short(spaced)
+        ),
+        _ => format!(
+            "the Rekor entry body disagrees with the bundle (payloadHash, signature or \
+             verifier certificate): {}",
+            err_chain(e)
+        ),
     }
 }
 
