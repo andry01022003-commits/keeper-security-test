@@ -115,6 +115,7 @@ fn test_config(storage_path: &str) -> Config {
         auth_max_concurrency: 8,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        http_header_read_timeout_secs: 10,
         upload_progress_window_secs: 60,
         upload_min_progress_bytes: 16 * 1024,
         upload_max_in_flight_per_principal: 64,

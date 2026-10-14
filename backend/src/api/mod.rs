@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;
+pub mod serve;
 pub mod validation;
 
 use crate::config::Config;

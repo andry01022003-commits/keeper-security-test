@@ -1396,6 +1396,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         );
         let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
+        let header_read_timeout = config.http_header_read_timeout();
         tokio::spawn(async move {
             let metrics_app = Router::new()
                 .route(
@@ -1406,9 +1407,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             match tokio::net::TcpListener::bind(metrics_addr).await {
                 Ok(listener) => {
                     tracing::info!("Metrics listener on {}", metrics_addr);
-                    if let Err(e) = axum::serve(listener, metrics_app)
-                        .with_graceful_shutdown(async move { metrics_shutdown.cancelled().await })
-                        .await
+                    if let Err(e) = artifact_keeper_backend::api::serve::serve(
+                        listener,
+                        metrics_app.into_make_service(),
+                        header_read_timeout,
+                        async move { metrics_shutdown.cancelled().await },
+                    )
+                    .await
                     {
                         tracing::error!("Metrics listener error: {}", e);
                     }
@@ -1442,9 +1447,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // injecting `ConnectInfo` fails here at startup. Gated to the serve path
     // so unit tests that build the Router directly never trip it.
     assert_connect_info_wired(app.clone()).await;
-    axum::serve(listener, connect_info_make_service(app))
-        .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
-        .await?;
+    //
+    // Served through `api::serve` rather than `axum::serve` so slow clients
+    // are bounded by HTTP_HEADER_READ_TIMEOUT_SECS (#4665): axum 0.7 sets no
+    // hyper timer, so a client trickling its request head held the socket
+    // indefinitely.
+    artifact_keeper_backend::api::serve::serve(
+        listener,
+        connect_info_make_service(app),
+        config.http_header_read_timeout(),
+        async move { http_shutdown_token.cancelled().await },
+    )
+    .await?;
 
     tracing::info!("HTTP server shut down");
 
@@ -1452,7 +1466,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 }
 
 /// The single source of truth for installing `ConnectInfo<SocketAddr>` on the
-/// HTTP serve path (#2023). Both the real `axum::serve` call and the boot-time
+/// HTTP serve path (#2023). Both the real `api::serve::serve` call and the boot-time
 /// guard route through this adapter, so the guard validates exactly the wiring
 /// that is served — reverting it (e.g. to a plain `into_make_service()`) is a
 /// one-line change here that the guard then catches at startup.
