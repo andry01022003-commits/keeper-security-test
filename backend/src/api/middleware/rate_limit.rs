@@ -234,7 +234,18 @@ fn tag_exempt(mut response: Response, tag: &str) -> Response {
 
 /// Attach the `X-RateLimit-Limit` / `X-RateLimit-Remaining` headers to an
 /// allowed response.
+///
+/// Limiters nest: the general API limiter wraps every route, including ones
+/// that carry their own tighter limiter (login, presigned download). When an
+/// INNER limiter refused the request, the response is its 429 with its own
+/// bucket's headers, and this outer limiter -- which allowed the request --
+/// must not overwrite them: otherwise a login 429 (10 per 900 s) reported the
+/// general bucket's `X-RateLimit-Limit: 10000` beside the login bucket's
+/// `Retry-After`, telling clients the wrong limiter fired (#4664).
 fn tag_allowed(mut response: Response, max_requests: u32, remaining: u32) -> Response {
+    if inner_limiter_refused(&response) {
+        return response;
+    }
     let headers = response.headers_mut();
     if let Ok(value) = HeaderValue::from_str(&max_requests.to_string()) {
         headers.insert("X-RateLimit-Limit", value);
@@ -243,6 +254,13 @@ fn tag_allowed(mut response: Response, max_requests: u32, remaining: u32) -> Res
         headers.insert("X-RateLimit-Remaining", value);
     }
     response
+}
+
+/// Whether `response` is a 429 already describing the limiter that refused it
+/// (see [`tag_allowed`], #4664).
+fn inner_limiter_refused(response: &Response) -> bool {
+    response.status() == StatusCode::TOO_MANY_REQUESTS
+        && response.headers().contains_key("X-RateLimit-Limit")
 }
 
 /// Per-instance, in-memory rate limiter that tracks requests per key (IP or user ID).
@@ -2305,6 +2323,60 @@ mod tests {
             login_once(&app, "x", "10.0.0.9").await,
             StatusCode::OK,
             "the same user from another IP must have an independent bucket"
+        );
+    }
+
+    /// #4664: the login limiter sits INSIDE the general API limiter. When the
+    /// login bucket refuses, the 429 must keep the login bucket's
+    /// `X-RateLimit-*` headers; the outer limiter, which allowed the request,
+    /// used to overwrite them with its own (`X-RateLimit-Limit: 10000`).
+    #[tokio::test]
+    async fn test_4664_login_429_reports_the_login_bucket_not_the_api_bucket() {
+        use tower::ServiceExt;
+        let api_state = RateLimitState {
+            limiter: Arc::new(RateLimiter::new(10_000, 60)),
+            exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+            enabled: true,
+            trusted_proxies: Arc::new(Vec::new()),
+        };
+        let app = login_app(2, 10_000).layer(axum::middleware::from_fn_with_state(
+            api_state,
+            rate_limit_middleware,
+        ));
+        let attempt = || {
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("X-Forwarded-For", "10.0.0.1")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"username":"x","password":"x"}"#))
+                .unwrap()
+        };
+        for _ in 0..2 {
+            let resp = app.clone().oneshot(attempt()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let resp = app.clone().oneshot(attempt()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header("X-RateLimit-Limit").as_deref(),
+            Some("2"),
+            "a login 429 must report the login bucket's limit, not the API bucket's"
+        );
+        assert_eq!(header("X-RateLimit-Remaining").as_deref(), Some("0"));
+        let retry_after: u64 = header("Retry-After")
+            .expect("Retry-After present")
+            .parse()
+            .expect("numeric Retry-After");
+        assert!(
+            (1..=60).contains(&retry_after),
+            "Retry-After must come from the login window"
         );
     }
 
