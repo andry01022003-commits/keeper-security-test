@@ -1151,6 +1151,40 @@ pub(crate) fn build_repository_scan_message(repository_id: Uuid, artifact_count:
     )
 }
 
+/// A fresh per-scan-job suffix for [`ScanWorkspace::job_workspace_dir`]
+/// (#4668).
+#[cfg(not(test))]
+pub(crate) fn scan_job_suffix() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+/// Test build of [`scan_job_suffix`]: a test that has to know the job
+/// directory in advance (to obstruct a path inside it) fixes the suffix for
+/// the current thread with [`test_scan_job_suffix::fix`]; everything else gets
+/// a fresh one exactly as in production.
+#[cfg(test)]
+pub(crate) fn scan_job_suffix() -> String {
+    test_scan_job_suffix::get().unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+}
+
+#[cfg(test)]
+pub(crate) mod test_scan_job_suffix {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FIXED: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Make every job directory created on this thread use `suffix`.
+    pub(crate) fn fix(suffix: &str) {
+        FIXED.with(|f| *f.borrow_mut() = Some(suffix.to_string()));
+    }
+
+    pub(super) fn get() -> Option<String> {
+        FIXED.with(|f| f.borrow().clone())
+    }
+}
+
 /// Shared scan workspace utilities for scanners that need to write artifact
 /// content to disk, optionally extract archives, and clean up after scanning.
 pub(crate) struct ScanWorkspace;
@@ -1164,6 +1198,25 @@ impl ScanWorkspace {
             None => artifact.id.to_string(),
         };
         Path::new(base).join(dir_name)
+    }
+
+    /// The directory ONE scan job extracts into (#4668):
+    /// `<base>/[<prefix>-]<artifact.id>-<job>`, where `<job>` is fresh for
+    /// every call.
+    ///
+    /// [`Self::workspace_dir`] alone is a function of the artifact id, so two
+    /// scans of the same artifact running at once (a re-scan while the first
+    /// is still extracting, a repository-wide rescan, a scan flood) shared one
+    /// tree: one job's cleanup or re-extraction deleted or overwrote the files
+    /// the other was reading, and that scan failed. The job suffix gives each
+    /// scan a tree nobody else writes to. Flat rather than nested under the
+    /// artifact directory so the guard's removal of the job directory leaves
+    /// nothing behind (#3565).
+    pub fn job_workspace_dir(base: &str, prefix: Option<&str>, artifact: &Artifact) -> PathBuf {
+        let mut dir = Self::workspace_dir(base, prefix, artifact).into_os_string();
+        dir.push("-");
+        dir.push(scan_job_suffix());
+        PathBuf::from(dir)
     }
 
     /// Prepare the scan workspace: create directories, write artifact content,
@@ -1204,7 +1257,7 @@ impl ScanWorkspace {
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
     ) -> Result<WorkspaceGuard> {
-        let workspace = Self::workspace_dir(base, prefix, artifact);
+        let workspace = Self::job_workspace_dir(base, prefix, artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
@@ -10670,6 +10723,65 @@ mod tests {
         );
     }
 
+    /// #4668: two scans of the SAME artifact running at once shared
+    /// `<base>/<artifact_id>/`, so the first to finish deleted (or the second
+    /// to start re-extracted over) the tree the other was still reading, and
+    /// that scan failed. Each job now gets its own directory: finishing one
+    /// leaves the other's input intact, and once both are done nothing is
+    /// left behind (#3565).
+    #[tokio::test]
+    async fn concurrent_scans_of_one_artifact_get_disjoint_workspaces() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let first_bytes = Bytes::from_static(b"first job input");
+        let second_bytes = Bytes::from_static(b"second job input");
+
+        let (first, second) = tokio::join!(
+            ScanWorkspace::prepare_pinned(
+                base.to_str().unwrap(),
+                None,
+                &artifact,
+                &first_bytes,
+                None
+            ),
+            ScanWorkspace::prepare_pinned(
+                base.to_str().unwrap(),
+                None,
+                &artifact,
+                &second_bytes,
+                None
+            ),
+        );
+        let mut first = first.expect("prepare first");
+        let mut second = second.expect("prepare second");
+        assert_ne!(
+            first.to_path_buf(),
+            second.to_path_buf(),
+            "two scan jobs of one artifact must not share a workspace"
+        );
+        assert_eq!(
+            std::fs::read(first.join("app.bin")).expect("first input"),
+            b"first job input",
+            "the second job must not overwrite the first job's input"
+        );
+
+        first.cleanup().await;
+        assert_eq!(
+            std::fs::read(second.join("app.bin")).expect("second input survives"),
+            b"second job input",
+            "finishing one scan must not delete the tree another scan is reading"
+        );
+
+        second.cleanup().await;
+        assert_eq!(
+            std::fs::read_dir(&base).expect("base exists").count(),
+            0,
+            "both job directories must be removed once their scans finish"
+        );
+    }
+
     /// #3565, review follow-up: `cleanup()` itself awaits — a `chmod` child,
     /// then `remove_dir_all` — and the budget can expire at either point.
     /// Disarming the guard before that await left a cancelled cleanup with
@@ -10864,7 +10976,8 @@ mod tests {
         let artifact = test_helpers::make_test_artifact(name, content_type, name);
 
         let base = tmp.path().join("ws-base");
-        let path = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
+        test_scan_job_suffix::fix("cancelled-job");
+        let path = ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), None, &artifact);
 
         let mut prepare = Box::pin(ScanWorkspace::prepare_pinned(
             base.to_str().unwrap(),
@@ -13988,8 +14101,11 @@ mod tests {
 
         // Pre-create the workspace with the staging path occupied by a file the
         // copy cannot overwrite (a directory in the destination's place).
+        // The job directory is unique per scan (#4668); fix this thread's
+        // suffix so the path to occupy is known in advance.
         let base = tmp.path().join("ws-base");
-        let workspace = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
+        test_scan_job_suffix::fix("staging-job");
+        let workspace = ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), None, &artifact);
         tokio::fs::create_dir_all(
             workspace
                 .join(NPM_SHRINKWRAP_SUBDIR)

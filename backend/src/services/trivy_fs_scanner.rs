@@ -401,8 +401,10 @@ mod tests {
         );
         let content = Bytes::from_static(b"not a real gem");
 
-        // Obstruct exactly the path the RubyGems pin wants.
-        let obstruction = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact)
+        // Obstruct exactly the path the RubyGems pin wants. The job directory
+        // is unique per scan (#4668), so fix this thread's job suffix first.
+        crate::services::scanner_service::test_scan_job_suffix::fix("pinned-job");
+        let obstruction = ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), None, &artifact)
             .join(SCAN_PIN_SUBDIR)
             .join(GEMFILE_LOCK_NAME);
         std::fs::create_dir_all(&obstruction).expect("obstruct the pin path");

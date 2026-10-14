@@ -1298,18 +1298,15 @@ impl GrypeScanner {
             return Ok(None);
         };
 
+        // Per scan job, not per artifact (#4668): a second scan of the same
+        // image used to `remove_dir_all` the layout the first was reading.
         let layout_dir = PathBuf::from(&self.scan_workspace)
             .join("grype-oci")
-            .join(artifact.id.to_string());
-        if tokio::fs::metadata(&layout_dir).await.is_ok() {
-            tokio::fs::remove_dir_all(&layout_dir).await.map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to reset Grype OCI layout workspace {}: {}",
-                    layout_dir.display(),
-                    e
-                ))
-            })?;
-        }
+            .join(format!(
+                "{}-{}",
+                artifact.id,
+                crate::services::scanner_service::scan_job_suffix()
+            ));
 
         let blob_dir = layout_dir.join("blobs").join("sha256");
         tokio::fs::create_dir_all(&blob_dir).await.map_err(|e| {
