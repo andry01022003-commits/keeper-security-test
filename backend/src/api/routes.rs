@@ -19,7 +19,7 @@ use super::middleware::auth::{
     admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
     repo_visibility_middleware, RepoVisibilityState,
 };
-use super::middleware::client_ip::client_ip_context_middleware;
+use super::middleware::client_ip::{self, client_ip_context_middleware};
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
@@ -187,6 +187,10 @@ pub fn create_router(state: SharedState) -> Router {
         state.config.rate_limit_trusted_cidrs.clone(),
     ));
     let rate_limit_trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
+    let client_ip_config = Arc::new(client_ip::ClientIpConfig {
+        trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        xff_trusted_for_authz: state.config.xff_trusted_for_authz,
+    });
     let login_rate_limit_state = build_login_rate_limit_state(
         &state.config,
         &rate_limit_exemptions,
@@ -283,14 +287,19 @@ pub fn create_router(state: SharedState) -> Router {
     // X-Correlation-ID response header.
     router = router.layer(middleware::from_fn(correlation_id_middleware));
 
-    // Client-IP context (#3888/#1849). Resolves the request's client address
-    // once — TCP peer authoritative, `X-Forwarded-For` believed only for
-    // trusted-proxy peers (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the same policy
-    // the rate limiter keys on) — and scopes it as a request task-local so
-    // audit emission and IP-conditioned permission gates observe the same
-    // address without signature threading. Runs on every route.
+    // Client-IP context (#3888/#1849). Resolves the request's client
+    // address once, in two trust grades, and scopes them as a request
+    // task-local so consumers observe the same address without signature
+    // threading: the best-effort grade (rate-limit keying, upload guard,
+    // telemetry — TCP peer authoritative, `X-Forwarded-For` believed only
+    // for trusted-proxy peers per `RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the
+    // same policy the rate limiter keys on) and the authorization grade
+    // (IP-conditioned permission gates, auth-audit attribution — XFF-derived
+    // ONLY under the operator's `XFF_TRUSTED_FOR_AUTHZ` assertion, failing
+    // closed to "unknown" behind trusted proxies without it). Runs on every
+    // route.
     router = router.layer(middleware::from_fn_with_state(
-        rate_limit_trusted_proxies,
+        client_ip_config,
         client_ip_context_middleware,
     ));
 

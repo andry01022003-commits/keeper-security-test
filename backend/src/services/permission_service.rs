@@ -120,14 +120,17 @@ pub(crate) fn ip_condition_sql(alias: &str, ip_ref: &str) -> String {
     )
 }
 
-/// The current request's client IP as a SQL expression for the listing
-/// fragments (#1849): a quoted `IpAddr` literal inside a request scope, or
-/// `NULL` outside one (background jobs, detached tasks) — where the fail-
-/// closed semantics of [`ip_condition_sql`] exclude every conditioned rule.
-/// `IpAddr`'s `Display` contains only digits, dots and colons, so quoting it
-/// is injection-safe.
+/// The current request's VERIFIED client IP as a SQL expression for the
+/// listing fragments (#1849): a quoted `IpAddr` literal when
+/// [`crate::api::middleware::client_ip::current_verified_client_ip`]
+/// yields one, or `NULL` when it does not — outside a request scope
+/// (background jobs, detached tasks) AND behind a trusted proxy without
+/// the operator's `XFF_TRUSTED_FOR_AUTHZ` assertion — where the
+/// fail-closed semantics of [`ip_condition_sql`] exclude every conditioned
+/// rule. `IpAddr`'s `Display` contains only digits, dots and colons,
+/// so quoting it is injection-safe.
 pub(crate) fn request_ip_sql_ref() -> String {
-    match crate::api::middleware::client_ip::current_client_ip() {
+    match crate::api::middleware::client_ip::current_verified_client_ip() {
         Some(ip) => format!("'{ip}'"),
         None => "NULL".to_string(),
     }
@@ -141,7 +144,12 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// The client IP is part of the key because `allowed_cidrs` conditions
 /// (#1849) make the granted action set IP-dependent: caching a result
 /// resolved under one source address and serving it to the same principal
-/// arriving from another would leak the grant for the 30 s TTL.
+/// arriving from another would leak the grant for the 30 s TTL. The IP is
+/// the VERIFIED grade
+/// ([`crate::api::middleware::client_ip::current_verified_client_ip`]):
+/// behind a trusted proxy without `XFF_TRUSTED_FOR_AUTHZ` it is `None`, so
+/// a result resolved under a spoofed XFF can never alias a verified-IP
+/// entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     user_id: Uuid,
@@ -156,7 +164,7 @@ impl CacheKey {
             user_id,
             target_type: target_type.to_string(),
             target_id,
-            client_ip: crate::api::middleware::client_ip::current_client_ip(),
+            client_ip: crate::api::middleware::client_ip::current_verified_client_ip(),
         }
     }
 }
@@ -288,10 +296,13 @@ impl PermissionService {
         }
         // #1849: a rule carrying `conditions.allowed_cidrs` is applicable
         // only to requests whose client IP falls inside it. The IP is the
-        // in-flight request's (`client_ip_context_middleware`); outside a
-        // request scope (background jobs, detached tasks) it is None, which
-        // matches nothing — conditioned grants fail closed there.
-        let client_ip = crate::api::middleware::client_ip::current_client_ip();
+        // in-flight request's VERIFIED address (the authorization grade
+        // `client_ip_context_middleware` scopes): outside a request scope
+        // (background jobs, detached tasks) — and behind a trusted proxy
+        // without the operator's `XFF_TRUSTED_FOR_AUTHZ` assertion — it is
+        // None, which matches nothing: conditioned grants fail closed
+        // rather than trust an unverifiable XFF chain.
+        let client_ip = crate::api::middleware::client_ip::current_verified_client_ip();
         let query = format!(
             r#"
             WITH applicable_rules AS (
@@ -375,16 +386,18 @@ impl PermissionService {
     /// `read` on `repository`/`project` targets, and every gate only ever
     /// asks this resolver about `read`.
     ///
-    /// The client IP is the in-flight request's, exactly as in
-    /// [`Self::check_repository_action`]: `None` outside a request scope
-    /// fails closed (conditioned rules match nothing; an unconditioned
-    /// anonymous rule still applies, since it names no CIDR).
+    /// The client IP is the in-flight request's VERIFIED address, exactly
+    /// as in [`Self::check_repository_action`]: `None` — outside a request
+    /// scope, or behind a trusted proxy without the operator's
+    /// `XFF_TRUSTED_FOR_AUTHZ` assertion — fails closed (conditioned rules
+    /// match nothing; an unconditioned anonymous rule still applies, since
+    /// it names no CIDR).
     pub async fn check_anonymous_repository_action(
         &self,
         repository_id: Uuid,
         action: &str,
     ) -> Result<bool> {
-        let client_ip = crate::api::middleware::client_ip::current_client_ip();
+        let client_ip = crate::api::middleware::client_ip::current_verified_client_ip();
         let query = format!(
             r#"
             SELECT EXISTS (
@@ -671,10 +684,11 @@ impl PermissionService {
         // targets; for a project-less repository the subquery yields NULL and
         // the project arm never matches, so behavior is unchanged.
         // #1849: `allowed_cidrs`-conditioned rules resolve to no actions
-        // unless the in-flight request's client IP falls inside the range
-        // (None outside a request scope fails closed), exactly as in
-        // `check_repository_action`.
-        let client_ip = crate::api::middleware::client_ip::current_client_ip();
+        // unless the in-flight request's VERIFIED client IP falls inside
+        // the range (None — outside a request scope, or behind a trusted
+        // proxy without `XFF_TRUSTED_FOR_AUTHZ` — fails closed), exactly
+        // as in `check_repository_action`.
+        let client_ip = crate::api::middleware::client_ip::current_verified_client_ip();
         let query = format!(
             r#"
             SELECT DISTINCT unnest(actions) as action
@@ -2423,6 +2437,150 @@ mod tests {
                 .execute(&pool)
                 .await;
             let _ = std::fs::remove_dir_all(&open_dir);
+        }
+
+        // -----------------------------------------------------------
+        // Authorization consumes the VERIFIED grade only. A
+        // best-effort (XFF-derived, unverifiable) address must NOT open a
+        // conditioned grant: with verified = None the rule fails closed
+        // even though a best-effort address exists — the topology behind a
+        // trusted proxy without `XFF_TRUSTED_FOR_AUTHZ`.
+        // -----------------------------------------------------------
+
+        #[tokio::test]
+        async fn conditioned_grant_denies_when_verified_ip_is_unknown() {
+            use crate::api::handlers::test_db_helpers as tdh;
+            use crate::api::middleware::client_ip::with_client_ip_context;
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = PermissionService::new(pool.clone());
+            let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let (user_id, _) = tdh::create_user(&pool).await;
+
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions, conditions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'], $3)",
+            )
+            .bind(user_id)
+            .bind(repo_id)
+            .bind(serde_json::json!({"allowed_cidrs": ["10.20.0.0/16"]}))
+            .execute(&pool)
+            .await
+            .expect("insert conditioned rule");
+
+            // Best-effort says 10.20.3.4 (INSIDE the range — e.g. spoofed
+            // XFF behind a trusted proxy), verified says unknown: deny.
+            let denied = with_client_ip_context(
+                Some("10.20.3.4".parse().unwrap()),
+                None,
+                service.check_repository_action(user_id, repo_id, "read", false),
+            )
+            .await
+            .expect("decision with unknown verified IP");
+            assert!(
+                !denied,
+                "a conditioned grant must fail closed when the verified client IP is unknown, \
+                 even with a matching best-effort (XFF-derived) address"
+            );
+
+            // The cached fast path answers the same way.
+            let cached_denied = with_client_ip_context(
+                Some("10.20.3.4".parse().unwrap()),
+                None,
+                service.check_permission(user_id, "repository", repo_id, "read", false),
+            )
+            .await
+            .expect("cached decision with unknown verified IP");
+            assert!(
+                !cached_denied,
+                "the cached fast path must not serve a conditioned grant without a verified IP"
+            );
+
+            cleanup_action_fixture(&pool, repo_id, &[user_id], &storage_dir).await;
+        }
+
+        #[tokio::test]
+        async fn conditioned_grant_allows_a_matching_verified_ip() {
+            use crate::api::handlers::test_db_helpers as tdh;
+            use crate::api::middleware::client_ip::with_client_ip_context;
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = PermissionService::new(pool.clone());
+            let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let (user_id, _) = tdh::create_user(&pool).await;
+
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions, conditions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'], $3)",
+            )
+            .bind(user_id)
+            .bind(repo_id)
+            .bind(serde_json::json!({"allowed_cidrs": ["10.20.0.0/16"]}))
+            .execute(&pool)
+            .await
+            .expect("insert conditioned rule");
+
+            // Verified inside the range (best-effort disagrees — only the
+            // verified grade may feed the authz decision): allow.
+            let allowed = with_client_ip_context(
+                Some("192.0.2.9".parse().unwrap()),
+                Some("10.20.3.4".parse().unwrap()),
+                service.check_repository_action(user_id, repo_id, "read", false),
+            )
+            .await
+            .expect("decision with matching verified IP");
+            assert!(
+                allowed,
+                "a request whose verified IP falls inside allowed_cidrs must be granted"
+            );
+
+            cleanup_action_fixture(&pool, repo_id, &[user_id], &storage_dir).await;
+        }
+
+        #[tokio::test]
+        async fn unconditioned_grant_is_unaffected_by_unknown_verified_ip() {
+            use crate::api::handlers::test_db_helpers as tdh;
+            use crate::api::middleware::client_ip::with_client_ip_context;
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = PermissionService::new(pool.clone());
+            let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let (user_id, _) = tdh::create_user(&pool).await;
+
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(user_id)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("insert unconditioned rule");
+
+            // Fail-closed narrows only rules that carry the condition: an
+            // unconditioned grant still applies with verified = None.
+            let allowed = with_client_ip_context(
+                Some("192.0.2.9".parse().unwrap()),
+                None,
+                service.check_repository_action(user_id, repo_id, "read", false),
+            )
+            .await
+            .expect("unconditioned decision with unknown verified IP");
+            assert!(
+                allowed,
+                "an unconditioned rule applies regardless of the verified client IP"
+            );
+
+            cleanup_action_fixture(&pool, repo_id, &[user_id], &storage_dir).await;
         }
     }
 

@@ -1468,6 +1468,7 @@ pub(crate) mod tests {
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
             rate_limit_trusted_proxy_cidrs: Vec::new(),
+            xff_trusted_for_authz: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
