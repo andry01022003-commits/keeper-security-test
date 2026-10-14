@@ -4309,6 +4309,13 @@ async fn publish_extension(
         return Err((StatusCode::BAD_REQUEST, "Empty VSIX file").into_response());
     }
 
+    // #4673: entry names that would escape a client's extraction directory
+    // are refused before anything else, as a 400 VALIDATION_ERROR, whether or
+    // not the archive carries a usable manifest.
+    bounded_archive::with_ingest_extraction(|| vscode_extensions::reject_unsafe_entry_names(&body))
+        .and_then(|checked| checked)
+        .map_err(|e| e.into_response())?;
+
     // The archive is the source of truth (#3961); the `x-*` headers only assert.
     let manifest = match bounded_archive::with_ingest_extraction(|| {
         vscode_extensions::extract_vsix_metadata(&body)
@@ -10049,6 +10056,17 @@ mod vsix_manifest_publish_tests {
 
     /// A `vsce package` archive, minus the compiled extension itself.
     fn vsix(publisher: &str, name: &str, version: &str, target_platform: &str) -> Vec<u8> {
+        vsix_with(publisher, name, version, target_platform, &[])
+    }
+
+    /// [`vsix`] plus `extra` entries.
+    fn vsix_with(
+        publisher: &str,
+        name: &str,
+        version: &str,
+        target_platform: &str,
+        extra: &[&str],
+    ) -> Vec<u8> {
         use std::io::Write;
         let package_json = serde_json::json!({
             "publisher": publisher,
@@ -10080,9 +10098,84 @@ mod vsix_manifest_publish_tests {
                 writer.start_file(entry, options).unwrap();
                 writer.write_all(bytes).unwrap();
             }
+            for entry in extra {
+                writer.start_file(*entry, options).unwrap();
+                writer.write_all(b"payload").unwrap();
+            }
             writer.finish().unwrap();
         }
         cursor.into_inner()
+    }
+
+    /// #4673: an otherwise valid VSIX carrying a hostile entry name is refused
+    /// with 400 VALIDATION_ERROR and nothing is stored; a `..` inside a name
+    /// (not a whole segment) is not hostile and still publishes.
+    #[tokio::test]
+    async fn publish_rejects_traversal_entry_names() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let mut refused = Vec::new();
+        for hostile in [
+            "../../etc/passwd",
+            "extension/../../escape.js",
+            "/tmp/x",
+            "\\windows\\system32\\x.dll",
+            "extension\\..\\..\\x.js",
+            "C:/x.js",
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/api/extensions", fx.repo_key))
+                .body(axum::body::Body::from(vsix_with(
+                    "acme",
+                    "widget-tools",
+                    "3.1.4",
+                    "universal",
+                    &[hostile],
+                )))
+                .unwrap();
+            let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+            refused.push((hostile, status, String::from_utf8_lossy(&body).into_owned()));
+        }
+        let stored = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .body(axum::body::Body::from(vsix_with(
+                "acme",
+                "widget-tools",
+                "3.1.5",
+                "universal",
+                &["extension/dist/a..b.js"],
+            )))
+            .unwrap();
+        let (ok_status, ok_body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        fx.teardown().await;
+
+        for (hostile, status, body) in refused {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{hostile}: {body}"
+            );
+            assert!(body.contains("VALIDATION_ERROR"), "{hostile}: {body}");
+            assert!(
+                body.contains("escapes the archive root"),
+                "{hostile}: {body}"
+            );
+        }
+        assert_eq!(stored.expect("count artifacts"), 0, "nothing may be stored");
+        assert!(
+            ok_status.is_success(),
+            "a benign name must still publish: {ok_status} {}",
+            String::from_utf8_lossy(&ok_body)
+        );
     }
 
     /// `vsce package` output publishes with no `x-*` header and its fields are

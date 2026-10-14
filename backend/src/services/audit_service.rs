@@ -489,17 +489,19 @@ impl AuditEntry {
         self
     }
 
-    /// Attach the in-flight request's client IP, resolved by
-    /// `client_ip_context_middleware` (#3888): the TCP peer, with
-    /// `X-Forwarded-For` believed only under the configured trusted-proxy
-    /// policy (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`). Outside a request scope —
-    /// background jobs, startup, detached tasks — or when the address could
-    /// not be resolved, the entry keeps `ip_address: NULL`: the audit row
-    /// records "unknown", never a sentinel. Authentication emitters call this
-    /// so login/logout/refresh events carry the address the credential was
-    /// presented from.
+    /// Attach the in-flight request's VERIFIED client IP, resolved by
+    /// `client_ip_context_middleware` (#3888): the kernel-verified TCP
+    /// peer, or an `X-Forwarded-For`-derived address ONLY under the
+    /// operator's `XFF_TRUSTED_FOR_AUTHZ` assertion. Outside a
+    /// request scope — background jobs, startup, detached tasks — or when
+    /// the address could not be verified (unresolvable, or behind a
+    /// trusted proxy without the assertion), the entry keeps
+    /// `ip_address: NULL`: the audit row records an honest "unknown",
+    /// never a sentinel and never an unverifiable attacker-supplied
+    /// address. Authentication emitters call this so login/logout/refresh
+    /// events carry the address the credential was presented from.
     pub fn with_request_client_ip(mut self) -> Self {
-        if let Some(ip) = crate::api::middleware::client_ip::current_client_ip() {
+        if let Some(ip) = crate::api::middleware::client_ip::current_verified_client_ip() {
             self.ip_address = Some(ip);
         }
         self
@@ -1591,6 +1593,33 @@ mod tests {
         let entry =
             AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip();
         assert!(entry.ip_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn with_request_client_ip_records_null_when_verified_ip_is_unknown() {
+        // A best-effort (XFF-derived, unverifiable) address with NO
+        // verified grade — the topology behind a trusted proxy without
+        // XFF_TRUSTED_FOR_AUTHZ — must NOT be attributed in the audit row:
+        // NULL is the honest record.
+        let best = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33));
+        let entry =
+            crate::api::middleware::client_ip::with_client_ip_context(Some(best), None, async {
+                AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+            })
+            .await;
+        assert_eq!(entry.ip_address, None);
+
+        // And the verified grade, when present, is the one attributed.
+        let verified = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
+        let entry = crate::api::middleware::client_ip::with_client_ip_context(
+            Some(best),
+            Some(verified),
+            async {
+                AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+            },
+        )
+        .await;
+        assert_eq!(entry.ip_address, Some(verified));
     }
 
     #[test]

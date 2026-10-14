@@ -275,6 +275,18 @@ services:
       # keying on the real client IP. Override for bare-metal / custom bridge
       # subnets; keep it in sync with the actual proxy network.
       RATE_LIMIT_TRUSTED_PROXY_CIDRS: ${RATE_LIMIT_TRUSTED_PROXY_CIDRS:-172.30.0.0/24}
+      # Whether the XFF-derived client IP may also be used for IP-conditioned
+      # permission rules (allowed_cidrs, #1849) and audit-row client IPs.
+      # Default false: requests that arrive through a trusted proxy have an
+      # unknown client IP for those purposes (conditioned grants do not match,
+      # audit rows record no IP). Set true only after confirming every proxy
+      # in RATE_LIMIT_TRUSTED_PROXY_CIDRS appends or overwrites XFF with its
+      # own peer address. The bundled Caddy does, so this is safe when Caddy is
+      # the only way in; it is not when another proxy or load balancer in front
+      # of Caddy forwards a client-supplied XFF unchanged. Behind SNAT no XFF
+      # setting recovers the client IP, and an allowed_cidrs condition that
+      # covers the proxy network is meaningless. See .env.example.
+      XFF_TRUSTED_FOR_AUTHZ: ${XFF_TRUSTED_FOR_AUTHZ:-false}
       TRIVY_URL: http://trivy:8090
       # Trivy scanner-adapter URL (container-image scanning, #2471 / #2305).
       # TRIVY_URL above only wires the legacy trivy *server* used for

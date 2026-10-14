@@ -810,8 +810,12 @@ async fn upsert_index_upstream_url(
 
 /// Sub-router holding ONLY the artifact download route. Split out from
 /// the main `router()` so the caller can apply a stricter per-IP rate
-/// limit to it without touching the rest of the repository CRUD.
-/// See [`router_with_presign_layer`] and #1053.
+/// limit to it without touching the rest of the repository CRUD
+/// (see [`router_with_presign_layer`] and #1053), and so it can carry its
+/// own authentication layer: `repository_download_auth_middleware`, which
+/// accepts an API token as the Basic password and challenges anonymous
+/// callers with 401, the format-route contract rather than the
+/// `/api/v1` management one (#4654).
 pub fn download_router() -> Router<SharedState> {
     Router::new().route("/:key/download/*path", get(download_artifact))
 }
@@ -904,7 +908,8 @@ pub fn router() -> Router<SharedState> {
         // Immutable revision history for versioned artifacts (#2367).
         .route("/:key/versions/*path", get(list_artifact_versions))
         // Note: `/:key/download/*path` lives in `download_router()` so it
-        // can carry a stricter per-IP presign-mint rate limit (#1053).
+        // can carry a stricter per-IP presign-mint rate limit (#1053) and
+        // its own authentication layer (#4654).
         // Security routes nested under repository
         .merge(super::security::repo_security_router())
         // Label routes nested under repository
