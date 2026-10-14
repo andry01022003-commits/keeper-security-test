@@ -987,11 +987,71 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
     Ok(None)
 }
 
+/// Whether an archive entry name would escape, or not be relative to, the
+/// directory a client extracts into (#4673): an absolute path (`/x`), a
+/// backslash-rooted path (`\\x`, a UNC `\\\\host\\share`), a drive-qualified
+/// path (`C:...`), or any `..` segment, with either separator.
+pub fn is_unsafe_archive_entry_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    name.starts_with(['/', '\\'])
+        || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+        || name.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Walk a zip's central directory (names only, nothing is opened or
+/// inflated) and refuse it if any entry name is unsafe to extract
+/// ([`is_unsafe_archive_entry_name`]). Bounded like
+/// [`read_metadata_from_zip`]: the entry-count cap is checked first.
+/// Formats that store an archive verbatim after only inspecting it use this
+/// so a client that later unzips the stored bytes naively is not handed a
+/// path-traversal entry (#4673).
+pub fn reject_unsafe_zip_entry_names<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Result<()> {
+    if archive.len() as u64 > MAX_INGEST_ARCHIVE_ENTRIES {
+        return Err(AppError::Validation(format!(
+            "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
+            MAX_INGEST_ARCHIVE_ENTRIES
+        )));
+    }
+    for i in 0..archive.len() {
+        if let Some(name) = archive.name_for_index(i) {
+            if is_unsafe_archive_entry_name(name) {
+                let shown: String = name.chars().take(200).collect();
+                return Err(AppError::Validation(format!(
+                    "ZIP archive entry {shown:?} is an absolute path or escapes the archive root"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// #4673: names a naive unzip would resolve outside its target directory.
+    #[test]
+    fn unsafe_archive_entry_names() {
+        for name in [
+            "..",
+            "../x",
+            "a/../b",
+            "a/..",
+            "/etc/passwd",
+            "\\x",
+            "\\\\host\\share\\x",
+            "a\\..\\b",
+            "C:\\x",
+            "z:x",
+        ] {
+            assert!(is_unsafe_archive_entry_name(name), "{name}");
+        }
+        for name in ["a/b", "a..b", "..a/b..", "dir/", "./a", "1:x", ""] {
+            assert!(!is_unsafe_archive_entry_name(name), "{name}");
+        }
+    }
 
     /// Tests using only local semaphores need not take these.
     use super::test_support::{lock_singletons, lock_singletons_async};

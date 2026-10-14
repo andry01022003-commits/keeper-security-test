@@ -335,6 +335,24 @@ pub fn extract_vsix_metadata(content: &[u8]) -> Result<VsixMetadata> {
     Ok(metadata)
 }
 
+/// Refuse a `.vsix` whose entry names contain a `..` segment or are
+/// absolute, backslash-rooted or drive-qualified (#4673). The server never
+/// extracts the archive, but it stores and serves it verbatim, and a client
+/// that unzips it naively would write outside its target directory. A body
+/// that is not a zip at all is left to [`extract_vsix_metadata`] and the
+/// legacy-header fallback; any zip, VSIX manifest or not, is checked, since
+/// the fallback stores it all the same. Callers hold an ingest-extraction
+/// permit.
+pub fn reject_unsafe_entry_names(content: &[u8]) -> Result<()> {
+    let Ok(archive) = zip::ZipArchive::new(std::io::Cursor::new(content)) else {
+        return Ok(());
+    };
+    bounded_archive::reject_unsafe_zip_entry_names(&archive).map_err(|e| match e {
+        AppError::Validation(msg) => invalid_vsix(&msg),
+        other => other,
+    })
+}
+
 /// Whether `content` is a zip carrying `extension/package.json`, i.e. a VSIX,
 /// however broken its manifest. Only a body that is *not* one may fall back to
 /// the legacy header identity: a readable manifest that fails validation is a
@@ -659,6 +677,37 @@ mod tests {
 
     /// Only a body that is not a VSIX at all may fall back to the legacy
     /// header identity; a VSIX with a broken manifest is still a VSIX.
+    /// #4673: hostile entry names are refused whether or not the archive has
+    /// a manifest; a non-zip body and benign names pass.
+    #[test]
+    fn unsafe_entry_names_are_rejected() {
+        for hostile in [
+            "../x",
+            "a/../../x",
+            "/abs",
+            "\\\\host\\share",
+            "a\\..\\x",
+            "c:x",
+        ] {
+            let with_manifest = vsix_bytes(&[("extension/package.json", b"{}"), (hostile, b"x")]);
+            let err = reject_unsafe_entry_names(&with_manifest).expect_err(hostile);
+            assert!(
+                err.to_string().contains("Invalid VSIX archive"),
+                "{hostile}: {err}"
+            );
+            assert!(matches!(err, AppError::Validation(_)), "{hostile}: {err}");
+            let bare = vsix_bytes(&[(hostile, b"x")]);
+            assert!(reject_unsafe_entry_names(&bare).is_err(), "{hostile}");
+        }
+        assert!(reject_unsafe_entry_names(b"not-a-zip").is_ok());
+        let benign = vsix_bytes(&[
+            ("extension/package.json", b"{}"),
+            ("extension/a..b/..c", b"x"),
+            ("[Content_Types].xml", b"x"),
+        ]);
+        assert!(reject_unsafe_entry_names(&benign).is_ok());
+    }
+
     #[test]
     fn has_extension_manifest_separates_non_vsix_from_broken_vsix() {
         assert!(!has_extension_manifest(b"vsix-bytes"));
