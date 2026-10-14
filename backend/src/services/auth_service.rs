@@ -158,9 +158,10 @@ pub struct Claims {
     pub email: String,
     /// Is admin
     pub is_admin: bool,
-    /// Repository IDs this access token is restricted to (None = unrestricted).
+    /// Repository IDs this token is restricted to (None = unrestricted).
     ///
-    /// Access-token only. Refresh tokens leave this unset.
+    /// Stamped on refresh tokens too, so a refresh re-mints the access token
+    /// under the same restriction (#4261).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     /// Issued at (Unix timestamp)
@@ -222,6 +223,21 @@ impl Claims {
     pub fn effective_iat_ms(&self) -> i64 {
         self.iat_ms.unwrap_or_else(|| self.iat.saturating_mul(1000))
     }
+}
+
+/// JWT validation for tokens this server signed itself (HS256 sessions,
+/// refresh tokens, TOTP tickets), on the HTTP and gRPC paths alike.
+///
+/// No expiry leeway: the library default of 60 s exists for clock skew
+/// between an issuer and a verifier, and here both are this deployment. A
+/// leeway would extend every minted token past the `exp` it was stamped
+/// with, and chain with the leeway an exchanged credential was accepted
+/// under (#4663): a CI assertion accepted 59 s past its `exp` used to yield
+/// a token that was then accepted for another 60 s.
+pub fn self_minted_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
+    validation
 }
 
 /// `token_type` claim of a forced-TOTP-enrollment ticket (#2805). Kept distinct
@@ -1794,8 +1810,16 @@ impl AuthService {
         refresh_token_type: &str,
         credential_exp: Option<DateTime<Utc>>,
     ) -> Result<TokenPair> {
-        let access =
-            self.mint_access_token(user, allowed_repo_ids, scopes.clone(), credential_exp)?;
+        // The refresh claims carry the same repository allow-list and
+        // action-scope ceiling as the access token: `refresh_tokens` and
+        // `mint_access_from_registry_refresh` re-mint from them, so leaving
+        // either off would widen the grant on refresh (#4261, #2430).
+        let access = self.mint_access_token(
+            user,
+            allowed_repo_ids.clone(),
+            scopes.clone(),
+            credential_exp,
+        )?;
         let refresh_exp = access.now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
         let refresh_jti = Uuid::new_v4();
@@ -1804,7 +1828,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
-            allowed_repo_ids: None,
+            allowed_repo_ids,
             iat: access.iat_secs,
             iat_ms: Some(access.iat_ms),
             exp: refresh_exp.timestamp(),
@@ -2651,8 +2675,7 @@ impl AuthService {
     }
 
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
-        let validation = Validation::new(Algorithm::HS256);
-        decode::<Claims>(token, &self.decoding_key, &validation)
+        decode::<Claims>(token, &self.decoding_key, &self_minted_validation())
             .map_err(|e| AppError::Authentication(format!("Invalid token: {}", e)))
     }
 
@@ -4884,7 +4907,8 @@ mod tests {
         .expect("refresh token should decode")
         .claims;
         assert_eq!(refresh_claims.token_type, "refresh");
-        assert_eq!(refresh_claims.allowed_repo_ids, None);
+        // The refresh token carries the restriction so a refresh keeps it (#4261).
+        assert_eq!(refresh_claims.allowed_repo_ids, expected_scope);
     }
 
     #[tokio::test]
@@ -4947,6 +4971,8 @@ mod tests {
         assert_eq!(refresh_claims.token_type, "refresh");
         // Ceiling rides on the refresh token so rotation cannot widen it.
         assert_eq!(refresh_claims.scopes, ceiling);
+        // So does the repository allow-list (#4261).
+        assert_eq!(refresh_claims.allowed_repo_ids, Some(vec![repo]));
     }
 
     #[tokio::test]
@@ -5031,6 +5057,47 @@ mod tests {
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
         let result = decode::<Claims>(&token, &decoding_key, &Validation::new(Algorithm::HS256));
         assert!(result.is_err());
+    }
+
+    /// #4663: a token this server minted gets no expiry leeway. With the
+    /// library's default 60 s, an access token 30 s past its `exp` was still
+    /// accepted, which is how a CI assertion accepted inside its own leeway
+    /// chained into a second leeway window.
+    #[tokio::test]
+    async fn test_self_minted_token_has_no_expiry_leeway() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+        assert_eq!(self_minted_validation().leeway, 0);
+
+        let now = Utc::now();
+        let token_expiring_at = |exp: DateTime<Utc>| {
+            let claims = Claims {
+                sub: Uuid::new_v4(),
+                username: "leeway".to_string(),
+                email: "leeway@test.com".to_string(),
+                is_admin: false,
+                allowed_repo_ids: None,
+                iat: (now - Duration::minutes(5)).timestamp(),
+                iat_ms: None,
+                exp: exp.timestamp(),
+                token_type: "access".to_string(),
+                jti: None,
+                family_id: None,
+                scan_pull_repo: None,
+                scopes: None,
+            };
+            encode(&Header::default(), &claims, &encoding_key).unwrap()
+        };
+
+        let just_expired = token_expiring_at(now - Duration::seconds(30));
+        let err = service
+            .validate_access_token(&just_expired)
+            .expect_err("a token 30 s past exp must be rejected");
+        assert!(matches!(err, AppError::Authentication(_)), "{err}");
+
+        let live = token_expiring_at(now + Duration::seconds(30));
+        assert!(service.validate_access_token(&live).is_ok());
     }
 
     #[test]
@@ -7188,7 +7255,8 @@ mod tests {
             .expect("decode refresh")
             .claims;
         assert_eq!(refresh_claims.token_type, "refresh");
-        assert_eq!(refresh_claims.allowed_repo_ids, None);
+        // The refresh token carries the restriction so a refresh keeps it (#4261).
+        assert_eq!(refresh_claims.allowed_repo_ids, expected_scope);
 
         let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
             .execute(&pool)
@@ -8860,14 +8928,102 @@ mod tests {
         // The action-scope ceiling rides on BOTH the access and refresh claims
         // (see generate_tokens_with_family_and_scope), so it survives rotation:
         // a refresh cannot launder a read-only token up to full access (#2430).
-        // (Repository allow-lists are access-token-only and are deliberately not
-        // carried on refresh tokens, so they are out of scope for this check.)
         assert_eq!(rotated.scopes, ceiling);
 
         let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
             .execute(&pool)
             .await;
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #4261: a repository-restricted token keeps its restriction through
+    /// refresh. The refresh claims used to carry `allowed_repo_ids: None`, and
+    /// `refresh_tokens` re-mints from them, so the rotated access token came
+    /// back unrestricted. Rotates twice to check the successor refresh token
+    /// carries the restriction as well, and checks the registry refresh path.
+    #[tokio::test]
+    async fn test_refresh_tokens_preserves_repo_restriction() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg.clone());
+
+        let username = format!("reporot_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let repo = Uuid::new_v4();
+        let ceiling = Some(vec!["read:artifacts".to_string()]);
+        let decoding_key = DecodingKey::from_secret(cfg.jwt_secret.as_bytes());
+        let claims_of = |token: &str| {
+            decode::<Claims>(token, &decoding_key, &Validation::new(Algorithm::HS256))
+                .expect("token should decode")
+                .claims
+        };
+
+        let t0 = service
+            .generate_tokens_with_repo_scope(&user, Some(vec![repo]))
+            .expect("repo-scoped mint");
+        service
+            .persist_refresh_jti_from_pair(&t0, user_id)
+            .await
+            .expect("persist t0");
+        assert_eq!(
+            claims_of(&t0.access_token).allowed_repo_ids,
+            Some(vec![repo])
+        );
+
+        let (_, t1) = service
+            .refresh_tokens(&t0.refresh_token)
+            .await
+            .expect("t0 -> t1");
+        assert_eq!(
+            claims_of(&t1.access_token).allowed_repo_ids,
+            Some(vec![repo]),
+            "first refresh must keep the repository restriction"
+        );
+        assert_eq!(
+            claims_of(&t1.refresh_token).allowed_repo_ids,
+            Some(vec![repo])
+        );
+
+        let (_, t2) = service
+            .refresh_tokens(&t1.refresh_token)
+            .await
+            .expect("t1 -> t2");
+        assert_eq!(
+            claims_of(&t2.access_token).allowed_repo_ids,
+            Some(vec![repo]),
+            "second refresh must keep the repository restriction"
+        );
+
+        // The registry offline token (non-rotating /v2/token refresh) carries
+        // both the restriction and the scope ceiling into the minted token.
+        let offline = service
+            .generate_registry_offline_token(&user, Some(vec![repo]), ceiling.clone())
+            .await
+            .expect("mint registry offline token");
+        let (_, minted) = service
+            .mint_access_from_registry_refresh(&offline)
+            .await
+            .expect("registry refresh");
+        let minted = claims_of(&minted.access_token);
+        assert_eq!(minted.allowed_repo_ids, Some(vec![repo]));
+        assert_eq!(minted.scopes, ceiling);
+
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await;
     }

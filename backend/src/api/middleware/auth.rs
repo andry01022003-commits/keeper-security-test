@@ -298,6 +298,23 @@ impl AuthExtension {
         }
     }
 
+    /// Admin gate for instance-wide listings that span every repository
+    /// (hold queues, download attribution, system stats). On top of
+    /// [`require_admin`](Self::require_admin), refuses a repository-scoped
+    /// token (API token or JWT) with 403: token scope binds ahead of admin
+    /// (#3901, #3174), and such a token must not read rows of repositories
+    /// outside its allow-list (#4273, #4550). `what` names the listing in
+    /// the error message.
+    pub fn require_unscoped_admin(&self, what: &str) -> crate::error::Result<()> {
+        self.require_admin()?;
+        if matches!(self.allowed_repo_ids, AccessScope::Restricted(_)) {
+            return Err(AppError::Authorization(format!(
+                "Repository-scoped tokens cannot read {what}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Self-or-admin gate: allow the call when the caller is acting on their
     /// own resource (`self.user_id == target_user_id`) **or** the caller is an
     /// admin. Otherwise return a 403 Forbidden carrying `deny_msg`.

@@ -3340,3 +3340,123 @@ impl AuthzQueryOutage {
         self.pool.close().await;
     }
 }
+
+pub use admin_gate::assert_admin_routes_refuse_repo_scoped_tokens;
+
+// In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
+// #1315 token-mint surface gate, which skips test modules, does not count the
+// API-token mint below as a production endpoint.
+#[cfg(test)]
+mod admin_gate {
+    use super::*;
+
+    /// Router-level check for instance-wide admin listings gated by
+    /// [`AuthExtension::require_unscoped_admin`] (#4273, #4550): every route in
+    /// `routes`, sent through the full router, answers 401 anonymous, 403 to a
+    /// non-admin JWT, 200 to an admin JWT and to an unrestricted admin API token,
+    /// and 403 to a repository-scoped admin API token and a repository-scoped
+    /// admin JWT. Creates and removes its own admin user and tokens.
+    pub async fn assert_admin_routes_refuse_repo_scoped_tokens(fx: &Fixture, routes: &[&str]) {
+        async fn statuses(
+            state: &SharedState,
+            routes: &[&str],
+            cred: Option<&str>,
+        ) -> Vec<StatusCode> {
+            let mut out = Vec::new();
+            for uri in routes {
+                let mut req = get(uri.to_string());
+                if let Some(c) = cred {
+                    req.headers_mut().insert(
+                        "authorization",
+                        c.parse::<axum::http::HeaderValue>().expect("auth header"),
+                    );
+                }
+                let (status, _) = send(crate::api::routes::create_router(state.clone()), req).await;
+                out.push(status);
+            }
+            out
+        }
+
+        let (admin_id, _) = create_user(&fx.pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin_id)
+            .execute(&fx.pool)
+            .await
+            .expect("promote admin");
+
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            Arc::new(fx.state.config.clone()),
+        );
+        // Admin-owned API tokens carrying the `admin` scope: one unrestricted,
+        // one pinned to the fixture repository through `api_token_repositories`.
+        let (open_token, _) = auth_service
+            .generate_api_token(admin_id, "gate-open", vec!["admin".into()], None)
+            .await
+            .expect("mint unrestricted admin token");
+        let (pinned_token, pinned_id) = auth_service
+            .generate_api_token(admin_id, "gate-pinned", vec!["admin".into()], None)
+            .await
+            .expect("mint repo-scoped admin token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(pinned_id)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("pin token to the fixture repository");
+        // A repository-scoped JWT for the same admin.
+        let admin_user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("load admin");
+        let scoped_jwt = auth_service
+            .generate_tokens_with_repo_scope(&admin_user, Some(vec![fx.repo_id]))
+            .expect("mint repo-scoped JWT")
+            .access_token;
+
+        let user_bearer = bearer_for(&fx.state, fx.user_id).await;
+        let admin_bearer = bearer_for(&fx.state, admin_id).await;
+
+        let anonymous = statuses(&fx.state, routes, None).await;
+        let non_admin = statuses(&fx.state, routes, Some(&user_bearer)).await;
+        let admin = statuses(&fx.state, routes, Some(&admin_bearer)).await;
+        let open = statuses(&fx.state, routes, Some(&format!("Bearer {open_token}"))).await;
+        let pinned = statuses(&fx.state, routes, Some(&format!("Bearer {pinned_token}"))).await;
+        let scoped = statuses(&fx.state, routes, Some(&format!("Bearer {scoped_jwt}"))).await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(admin_id)
+            .execute(&fx.pool)
+            .await;
+        cleanup_user(&fx.pool, admin_id).await;
+
+        let all = |s: StatusCode| vec![s; routes.len()];
+        assert_eq!(
+            anonymous,
+            all(StatusCode::UNAUTHORIZED),
+            "anonymous {routes:?}"
+        );
+        assert_eq!(
+            non_admin,
+            all(StatusCode::FORBIDDEN),
+            "non-admin JWT {routes:?}"
+        );
+        assert_eq!(admin, all(StatusCode::OK), "admin JWT {routes:?}");
+        assert_eq!(
+            open,
+            all(StatusCode::OK),
+            "unrestricted admin API token {routes:?}"
+        );
+        assert_eq!(
+            pinned,
+            all(StatusCode::FORBIDDEN),
+            "repo-pinned admin API token {routes:?}"
+        );
+        assert_eq!(
+            scoped,
+            all(StatusCode::FORBIDDEN),
+            "repo-scoped admin JWT {routes:?}"
+        );
+    }
+}

@@ -741,6 +741,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #4133: a CI OIDC provider whose audience is a Kubernetes API server's
+    // accepts every pod's default ServiceAccount token. Create and update
+    // refuse one now; name those stored before, once per boot, unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::ci_oidc_service::warn_kubernetes_api_server_audiences(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // #1331: name every signing key that is bound to Debian/RPM metadata
     // signing but cannot produce OpenPGP signatures (legacy PEM / X.509 keys),
     // once per boot; with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true, replace each
