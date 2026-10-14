@@ -6504,6 +6504,20 @@ async fn handle_start_upload(
         }
     }
 
+    // #4672: a declared body over the cap is refused with 413 before anything
+    // is registered or a byte is read, exactly as PATCH does. Streaming it
+    // first only failed once the cap was crossed, and a client that declared
+    // more than it sent sat until the stall watchdog's 408. Answering before
+    // the body is polled also lets HTTP/2 deliver the status and then reset
+    // the request stream, instead of the client seeing a bare stream error.
+    if let Some(resp) = reject_oversized_content_length(
+        headers,
+        upload_session_body_limit(0, state.config.max_upload_size_bytes),
+        state.config.max_upload_size_bytes,
+    ) {
+        return resp;
+    }
+
     let storage = match state.storage_for_repo(&location) {
         Ok(s) => s,
         Err(e) => {
@@ -23615,6 +23629,82 @@ mod oci_blob_upload_streaming_tests {
         assert_eq!(sessions, 0);
 
         f.teardown().await;
+    }
+
+    /// Upload-session and journal rows a refused start must not leave behind.
+    async fn upload_rows(f: &OciUploadFixture) -> (i64, i64) {
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(f.inner.repo_id)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count upload sessions");
+        let journal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE repository_id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup keys");
+        (sessions, journal)
+    }
+
+    /// #4672: `POST /blobs/uploads/` (session create with a body, and the
+    /// monolithic `?digest=` form) refuses an over-limit declared
+    /// Content-Length with 413 before polling the body or registering
+    /// anything, like PATCH. It used to stream until the cap or, for a client
+    /// that declared more than it sent, until the stall watchdog's 408.
+    #[tokio::test]
+    async fn start_upload_rejects_oversized_content_length_before_reading_body() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+        let digest = compute_sha256(b"12345");
+        for uri in [
+            format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+            format!(
+                "/{}/image/blobs/uploads/?digest={}",
+                f.inner.repo_key, digest
+            ),
+        ] {
+            let chunks_read = Arc::new(AtomicUsize::new(0));
+            let body = counted_body(Arc::clone(&chunks_read), vec![Bytes::from_static(b"12345")]);
+            let (status, _headers, body) = send(
+                app.clone(),
+                request_with_body(Method::POST, uri.clone(), &f.authorization, 5, body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}: {body:?}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("BLOB_UPLOAD_INVALID"),
+                "{uri}: {body:?}"
+            );
+            assert_eq!(
+                chunks_read.load(AtomicOrdering::SeqCst),
+                0,
+                "{uri}: oversized start should be rejected from Content-Length before polling body"
+            );
+        }
+        let rows = upload_rows(&f).await;
+        assert_eq!(oci_blob_count(&f, &digest).await, 0);
+
+        // A declared length within the cap is still accepted.
+        let (status, _headers, body) = send(
+            app,
+            request_with_body(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                4,
+                Body::from(Bytes::from_static(b"1234")),
+            ),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(rows, (0, 0), "a refused start must register nothing");
+        assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
     }
 
     #[tokio::test]
