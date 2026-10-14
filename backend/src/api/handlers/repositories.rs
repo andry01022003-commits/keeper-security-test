@@ -1004,6 +1004,18 @@ pub struct CreateRepositoryRequest {
     pub upstream_username: Option<String>,
     /// Password (basic) or token (bearer). Write-only, never returned in responses.
     pub upstream_password: Option<String>,
+    /// Accept a public repository that carries upstream credentials (#4662).
+    ///
+    /// A public Remote serves anonymous callers, and every upstream request it
+    /// makes on their behalf carries the repository's upstream credentials
+    /// (upstream-auth, or userinfo embedded in `upstream_url`). Making a
+    /// repository public while it has upstream credentials, or adding
+    /// credentials to a public repository, is refused with 400
+    /// `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS` unless this is `true`. The choice
+    /// is stored with the repository, so a later toggle back to public does
+    /// not need it again; send `false` to withdraw it. Accepting it is logged
+    /// at WARN and recorded in the audit log.
+    pub allow_public_with_upstream_credentials: Option<bool>,
     /// Custom User-Agent sent on outbound HTTP requests to the upstream for
     /// this repository. Only valid for remote repositories. Max 256 characters.
     pub custom_user_agent: Option<String>,
@@ -1210,6 +1222,18 @@ pub struct UpdateRepositoryRequest {
     /// `allow_anonymous_access` takes precedence.
     #[schema(deprecated)]
     pub allow_anonymous_access: Option<bool>,
+    /// Accept a public repository that carries upstream credentials (#4662).
+    ///
+    /// A public Remote serves anonymous callers, and every upstream request it
+    /// makes on their behalf carries the repository's upstream credentials
+    /// (upstream-auth, or userinfo embedded in `upstream_url`). Making a
+    /// repository public while it has upstream credentials, or adding
+    /// credentials to a public repository, is refused with 400
+    /// `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS` unless this is `true`. The choice
+    /// is stored with the repository, so a later toggle back to public does
+    /// not need it again; send `false` to withdraw it. Accepting it is logged
+    /// at WARN and recorded in the audit log.
+    pub allow_public_with_upstream_credentials: Option<bool>,
     pub quota_bytes: Option<i64>,
     /// When provided, enables/disables the `promotion_only` policy for this
     /// repository (admin-only). When omitted, the flag is left unchanged.
@@ -1441,6 +1465,15 @@ pub struct RepositoryResponse {
     pub upstream_url_has_credentials: bool,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
+    /// `true` when this repository is public AND carries upstream credentials
+    /// (upstream-auth or userinfo in `upstream_url`), so anonymous callers
+    /// make it spend those credentials upstream (#4662). A UI should flag it.
+    pub public_with_upstream_credentials: bool,
+    /// Whether an administrator accepted that state by sending
+    /// `allow_public_with_upstream_credentials: true` (#4662). A repository
+    /// that was already public with credentials before the guardrail existed
+    /// reports `public_with_upstream_credentials: true` with this `false`.
+    pub allow_public_with_upstream_credentials: bool,
     /// Whether the Package Age / quarantine policy is enabled for this
     /// repository, read back from `repository_config` (#1770 B). `None` when
     /// the repository has no explicit setting (the global default applies).
@@ -1592,6 +1625,173 @@ fn upstream_url_for_response(stored: Option<&str>) -> (Option<String>, bool) {
     }
 }
 
+/// `repository_config` key holding an administrator's acceptance of a public
+/// repository that carries upstream credentials (#4662).
+const PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY: &str = "allow_public_with_upstream_credentials";
+
+/// Error code of the #4662 refusal, so a client can recognise it and offer
+/// the override instead of parsing the message.
+pub const PUBLIC_REMOTE_UPSTREAM_CREDENTIALS: &str = "PUBLIC_REMOTE_UPSTREAM_CREDENTIALS";
+
+/// Whether a stored `upstream_url` carries embedded userinfo credentials.
+fn upstream_url_has_credentials(url: Option<&str>) -> bool {
+    upstream_url_for_response(url).1
+}
+
+/// Outcome of the #4662 public-with-upstream-credentials guardrail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicCredentialsCheck {
+    /// The write does not newly expose upstream credentials to anonymous callers.
+    Allowed,
+    /// It does, and the caller (or a stored earlier decision) accepted it.
+    AllowedByOverride,
+    /// It does, and nobody accepted it.
+    Refused,
+}
+
+/// Decide whether a write may leave a repository public while it carries
+/// upstream credentials (#4662).
+///
+/// Only a write that moves the repository INTO that state is checked: making
+/// a credentialed repository public, or adding credentials to a public one.
+/// A repository that was already in it (created before the guardrail existed)
+/// is not refused on an unrelated update -- a Terraform apply re-sends
+/// `is_public: true` on every run -- but its responses report the state.
+fn check_public_upstream_credentials(
+    exposed_before: bool,
+    public_after: bool,
+    credentials_after: bool,
+    accepted: bool,
+) -> PublicCredentialsCheck {
+    if !(public_after && credentials_after) || exposed_before {
+        PublicCredentialsCheck::Allowed
+    } else if accepted {
+        PublicCredentialsCheck::AllowedByOverride
+    } else {
+        PublicCredentialsCheck::Refused
+    }
+}
+
+/// Apply [`check_public_upstream_credentials`]: refuse with 400
+/// `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`, or log the accepted override at WARN.
+/// Returns whether the override is what allowed the write, which the caller
+/// records in its audit row.
+fn enforce_public_upstream_credentials(
+    repo_key: &str,
+    exposed_before: bool,
+    public_after: bool,
+    credentials_after: bool,
+    accepted: bool,
+) -> Result<bool> {
+    match check_public_upstream_credentials(
+        exposed_before,
+        public_after,
+        credentials_after,
+        accepted,
+    ) {
+        PublicCredentialsCheck::Allowed => Ok(false),
+        PublicCredentialsCheck::AllowedByOverride => {
+            tracing::warn!(
+                repository = %repo_key,
+                "repository is public and carries upstream credentials; anonymous \
+                 callers will spend those credentials upstream. Accepted via \
+                 allow_public_with_upstream_credentials (#4662)"
+            );
+            Ok(true)
+        }
+        PublicCredentialsCheck::Refused => Err(AppError::CodedValidation {
+            code: PUBLIC_REMOTE_UPSTREAM_CREDENTIALS,
+            message: format!(
+                "Repository '{repo_key}' would be public while it carries upstream \
+                 credentials, so anonymous callers would spend those credentials \
+                 upstream. Make the repository internal or private, remove the \
+                 upstream credentials, or send \
+                 allow_public_with_upstream_credentials: true to accept this."
+            ),
+        }),
+    }
+}
+
+/// The upstream-auth and override halves of the #4662 state, read from
+/// `repository_config` in one query: `(upstream_auth_configured, accepted)`.
+async fn public_credentials_config(db: &sqlx::PgPool, repo_id: Uuid) -> Result<(bool, bool)> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM repository_config \
+         WHERE repository_id = $1 AND key IN ('upstream_auth_type', $2)",
+    )
+    .bind(repo_id)
+    .bind(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(public_credentials_flags(rows))
+}
+
+/// Fold `repository_config` rows into `(upstream_auth_configured, accepted)`.
+fn public_credentials_flags(
+    rows: impl IntoIterator<Item = (String, Option<String>)>,
+) -> (bool, bool) {
+    let mut flags = (false, false);
+    for (key, value) in rows {
+        if key == PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY {
+            flags.1 = value.as_deref() == Some("true");
+        } else {
+            flags.0 = crate::services::upstream_auth::filter_auth_type(value).is_some();
+        }
+    }
+    flags
+}
+
+/// Store (`Some(true)`) or withdraw (`Some(false)`) the #4662 acceptance;
+/// `None` leaves it as it is.
+async fn persist_public_credentials_override(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    accepted: Option<bool>,
+) -> Result<()> {
+    match accepted {
+        Some(true) => {
+            upsert_repo_config(
+                db,
+                repo_id,
+                PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY,
+                "true",
+            )
+            .await
+        }
+        Some(false) => {
+            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                .bind(repo_id)
+                .bind(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY)
+                .execute(db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Populate the #4662 fields of a single-repository response.
+async fn with_public_upstream_credentials(
+    db: &sqlx::PgPool,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    let (auth_configured, accepted) = public_credentials_config(db, response.id).await?;
+    apply_public_credentials_flags(&mut response, auth_configured, accepted);
+    Ok(response)
+}
+
+fn apply_public_credentials_flags(
+    response: &mut RepositoryResponse,
+    auth_configured: bool,
+    accepted: bool,
+) {
+    response.public_with_upstream_credentials =
+        response.is_public && (auth_configured || response.upstream_url_has_credentials);
+    response.allow_public_with_upstream_credentials = accepted;
+}
+
 /// [`repo_to_response`] with both display storage figures (#4423): the
 /// repository's own bytes, and for a virtual repository its members' bytes.
 fn repo_to_display_response(
@@ -1647,9 +1847,13 @@ fn repo_to_response(
         // and the listing sets it from a batch presence query (#2568).
         has_trusted_gpg_key: false,
         upstream_url,
+        // db-less: only the URL half is known here; the handlers with a DB
+        // handle OR in the upstream-auth half (#4662).
+        public_with_upstream_credentials: repo.is_public && upstream_url_has_credentials,
         upstream_url_has_credentials,
         upstream_auth_type: None,
         upstream_auth_configured: false,
+        allow_public_with_upstream_credentials: false,
         // Populated by the handlers that have a DB handle (see
         // `with_quarantine_settings`); `repo_to_response` itself is sync and
         // db-less, mirroring `upstream_auth_*` above (#1770 B).
@@ -3364,6 +3568,25 @@ pub async fn list_repositories(
             std::collections::HashMap::new()
         };
 
+    // #4662: upstream-auth presence and the public-with-credentials
+    // acceptance, batched like the row fields above.
+    let mut credential_rows: std::collections::HashMap<Uuid, Vec<(String, Option<String>)>> =
+        std::collections::HashMap::new();
+    if !repo_ids.is_empty() {
+        for (id, key, value) in sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+            "SELECT repository_id, key, value FROM repository_config \
+             WHERE repository_id = ANY($1) AND key IN ('upstream_auth_type', $2)",
+        )
+        .bind(&repo_ids)
+        .bind(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        {
+            credential_rows.entry(id).or_default().push((key, value));
+        }
+    }
+
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
@@ -3373,6 +3596,9 @@ pub async fn list_repositories(
             let mut resp = repo_to_display_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
             resp.format_key = custom_format_key(&resp.format, format_key);
+            let (auth_configured, accepted) =
+                public_credentials_flags(credential_rows.remove(&resp.id).unwrap_or_default());
+            apply_public_credentials_flags(&mut resp, auth_configured, accepted);
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
@@ -3640,6 +3866,17 @@ pub async fn create_repository(
         visibility.allows_anonymous_read(),
         state.guest_access_policy.is_enabled().await,
     )?;
+    // #4662: a public repository with upstream credentials spends them for
+    // anonymous callers. Refused before the row exists unless accepted.
+    let public_credentials_override = enforce_public_upstream_credentials(
+        &payload.key,
+        false,
+        visibility.allows_anonymous_read(),
+        crate::services::upstream_auth::filter_auth_type(payload.upstream_auth_type.clone())
+            .is_some()
+            || upstream_url_has_credentials(payload.upstream_url.as_deref()),
+        payload.allow_public_with_upstream_credentials == Some(true),
+    )?;
 
     let repo = service
         .create_with_options(
@@ -3848,6 +4085,12 @@ pub async fn create_repository(
         )
         .await?;
     }
+    persist_public_credentials_override(
+        &state.db,
+        repo.id,
+        payload.allow_public_with_upstream_credentials,
+    )
+    .await?;
 
     // #3750: a caller may have probed this key while it did not exist, leaving
     // a "no such repository" tombstone in the negative cache. Drop it so the
@@ -3894,6 +4137,7 @@ pub async fn create_repository(
                 previous_scan_config: None,
                 scan_config_changed: None,
                 upstream_change: None,
+                allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
             }),
     )
     .await;
@@ -3955,6 +4199,7 @@ pub async fn create_repository(
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
+    let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -4020,6 +4265,7 @@ pub async fn get_repository(
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
+    let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -4605,6 +4851,35 @@ pub async fn update_repository(
     )?;
     let (effective_visibility, effective_is_public) = visibility_update.binds();
 
+    // #4662: refuse making a credentialed repository public, or giving a
+    // public one credentials through `upstream_url`, unless accepted. A
+    // repository already in that state is not refused on unrelated updates.
+    let (upstream_auth_configured, stored_override) =
+        public_credentials_config(&state.db, existing.id).await?;
+    let public_before = existing.visibility.allows_anonymous_read();
+    let public_after = match visibility_update {
+        VisibilityUpdate::Unchanged => public_before,
+        VisibilityUpdate::Set(v) => v.allows_anonymous_read(),
+        VisibilityUpdate::ClearPublic => false,
+    };
+    let public_credentials_override = enforce_public_upstream_credentials(
+        &existing.key,
+        public_before
+            && (upstream_auth_configured
+                || upstream_url_has_credentials(existing.upstream_url.as_deref())),
+        public_after,
+        upstream_auth_configured
+            || upstream_url_has_credentials(
+                payload
+                    .upstream_url
+                    .as_deref()
+                    .or(existing.upstream_url.as_deref()),
+            ),
+        payload
+            .allow_public_with_upstream_credentials
+            .unwrap_or(stored_override),
+    )?;
+
     // npm Virtual isolate mode (#3767): validated before the update so a
     // rejected toggle cannot leave the other fields half-applied. Repository
     // type and format are immutable here, so `existing` decides.
@@ -4671,6 +4946,13 @@ pub async fn update_repository(
     if reassigned_to.is_some() {
         state.permission_service.invalidate_cache();
     }
+
+    persist_public_credentials_override(
+        &state.db,
+        repo.id,
+        payload.allow_public_with_upstream_credentials,
+    )
+    .await?;
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
@@ -4987,6 +5269,7 @@ pub async fn update_repository(
                     existing.upstream_url.as_deref(),
                     payload.upstream_url.as_deref(),
                 ),
+                allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
             }),
     )
     .await;
@@ -5021,6 +5304,7 @@ pub async fn update_repository(
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
+    let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
 }
@@ -5705,6 +5989,7 @@ pub async fn delete_repository(
                 previous_scan_config: None,
                 scan_config_changed: None,
                 upstream_change: None,
+                allow_public_with_upstream_credentials: None,
             }),
     )
     .await;
@@ -11450,6 +11735,11 @@ pub struct UpstreamAuthRequest {
     /// credential chain (IRSA / EKS Pod Identity / instance profile / static
     /// `AWS_*` environment keys), never from this request.
     pub aws: Option<AwsUpstreamAuthRequest>,
+    /// Accept upstream credentials on a public repository (#4662); see
+    /// `allow_public_with_upstream_credentials` on the repository update
+    /// request. Without it, configuring credentials on a public repository is
+    /// refused with 400 `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`.
+    pub allow_public_with_upstream_credentials: Option<bool>,
 }
 
 /// Non-secret provider settings for an `aws_ecr` / `aws_codeartifact` upstream
@@ -11501,7 +11791,7 @@ async fn load_remote_repo(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Upstream auth updated"),
-        (status = 400, description = "Invalid auth type or missing fields"),
+        (status = 400, description = "Invalid auth type or missing fields, or `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`: the repository is public and `allow_public_with_upstream_credentials` was not sent (#4662)"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found"),
     )
@@ -11522,11 +11812,37 @@ pub async fn set_upstream_auth(
     // same tier as `update_repository` / `set_cache_ttl` (#2603).
     require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
+    // #4662: credentials on a public repository are spent for anonymous
+    // callers. Configuring them on one is refused unless accepted; a
+    // repository that already had them is not refused on a rotation.
+    let (auth_configured_before, stored_override) =
+        public_credentials_config(&state.db, repo.id).await?;
+    let is_public = repo.visibility.allows_anonymous_read();
+    let url_credentials = upstream_url_has_credentials(repo.upstream_url.as_deref());
+    let credentials_after = payload.auth_type != "none" || url_credentials;
+    let public_credentials_override = enforce_public_upstream_credentials(
+        &repo.key,
+        is_public && (auth_configured_before || url_credentials),
+        is_public,
+        credentials_after,
+        payload
+            .allow_public_with_upstream_credentials
+            .unwrap_or(stored_override),
+    )?;
+    let public_with_upstream_credentials = is_public && credentials_after;
+
     if payload.auth_type == "none" {
         crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
-        return Ok(Json(
-            serde_json::json!({"message": "Upstream auth removed"}),
-        ));
+        persist_public_credentials_override(
+            &state.db,
+            repo.id,
+            payload.allow_public_with_upstream_credentials,
+        )
+        .await?;
+        return Ok(Json(serde_json::json!({
+            "message": "Upstream auth removed",
+            "public_with_upstream_credentials": public_with_upstream_credentials,
+        })));
     }
 
     let credentials_json = build_upstream_credentials(
@@ -11559,10 +11875,46 @@ pub async fn set_upstream_auth(
         &credentials_json,
     )
     .await?;
+    persist_public_credentials_override(
+        &state.db,
+        repo.id,
+        payload.allow_public_with_upstream_credentials,
+    )
+    .await?;
 
-    Ok(Json(
-        serde_json::json!({"message": "Upstream auth configured"}),
-    ))
+    // #4662: accepting credentials on a public repository is audited. Only
+    // the auth type is recorded, never the credential.
+    if public_credentials_override {
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+                .user(auth.user_id)
+                .resource(repo.id)
+                .actor_name(auth.username.clone())
+                .resource_name(repo.key.clone())
+                .details_typed(audit_details::RepositoryDetails {
+                    actor_id: auth.user_id,
+                    key: repo.key.clone(),
+                    is_public: repo.is_public,
+                    format: Some(derive_format_key(&repo.format)),
+                    visibility: Some(repo.visibility.as_str().to_owned()),
+                    age_gate_enabled: None,
+                    age_gate_min_age_days: None,
+                    age_gate_mode: None,
+                    scan_config: None,
+                    previous_scan_config: None,
+                    scan_config_changed: None,
+                    upstream_change: None,
+                    allow_public_with_upstream_credentials: Some(true),
+                }),
+        )
+        .await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "message": "Upstream auth configured",
+        "public_with_upstream_credentials": public_with_upstream_credentials,
+    })))
 }
 
 /// Per-repository egress proxy settings (#2469, #2811).
@@ -15639,6 +15991,8 @@ mod tests {
             upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
+            public_with_upstream_credentials: false,
+            allow_public_with_upstream_credentials: false,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             custom_user_agent: None,
@@ -17052,6 +17406,8 @@ mod tests {
             upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
+            public_with_upstream_credentials: false,
+            allow_public_with_upstream_credentials: false,
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
             custom_user_agent: None,
@@ -27976,6 +28332,350 @@ mod tests {
         assert!(req.upstream_url.is_none());
     }
 
+    #[test]
+    fn public_upstream_credentials_check_refuses_only_new_exposure_4662() {
+        use PublicCredentialsCheck::*;
+        // (exposed_before, public_after, credentials_after, accepted)
+        assert_eq!(
+            check_public_upstream_credentials(false, true, true, false),
+            Refused
+        );
+        assert_eq!(
+            check_public_upstream_credentials(false, true, true, true),
+            AllowedByOverride
+        );
+        // Not public, or no credentials: nothing is exposed.
+        assert_eq!(
+            check_public_upstream_credentials(false, false, true, false),
+            Allowed
+        );
+        assert_eq!(
+            check_public_upstream_credentials(false, true, false, false),
+            Allowed
+        );
+        // Already exposed before this write (pre-guardrail repository): an
+        // unrelated update is not refused.
+        assert_eq!(
+            check_public_upstream_credentials(true, true, true, false),
+            Allowed
+        );
+    }
+
+    #[test]
+    fn public_upstream_credentials_refusal_carries_its_code_4662() {
+        let err = enforce_public_upstream_credentials("r", false, true, true, false)
+            .expect_err("must refuse");
+        assert!(
+            matches!(
+                err,
+                AppError::CodedValidation { code: PUBLIC_REMOTE_UPSTREAM_CREDENTIALS, ref message }
+                    if message.contains("allow_public_with_upstream_credentials")
+            ),
+            "{err:?}"
+        );
+        assert!(enforce_public_upstream_credentials("r", false, true, true, true).unwrap());
+        assert!(!enforce_public_upstream_credentials("r", false, false, true, false).unwrap());
+    }
+
+    #[test]
+    fn public_credentials_flags_reads_both_keys_4662() {
+        let row = |k: &str, v: Option<&str>| (k.to_string(), v.map(str::to_string));
+        assert_eq!(public_credentials_flags(Vec::new()), (false, false));
+        assert_eq!(
+            public_credentials_flags(vec![
+                row("upstream_auth_type", Some("bearer")),
+                row(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY, Some("true")),
+            ]),
+            (true, true)
+        );
+        assert_eq!(
+            public_credentials_flags(vec![
+                row("upstream_auth_type", Some("none")),
+                row(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY, Some("false")),
+            ]),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn request_types_accept_the_override_field_4662() {
+        let c: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "k", "name": "n", "format": "generic", "repo_type": "remote",
+            "allow_public_with_upstream_credentials": true
+        }))
+        .expect("create");
+        assert_eq!(c.allow_public_with_upstream_credentials, Some(true));
+        let u: UpdateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "allow_public_with_upstream_credentials": false
+        }))
+        .expect("update");
+        assert_eq!(u.allow_public_with_upstream_credentials, Some(false));
+        let a: UpstreamAuthRequest = serde_json::from_value(serde_json::json!({
+            "auth_type": "bearer", "password": "t",
+            "allow_public_with_upstream_credentials": true
+        }))
+        .expect("upstream-auth");
+        assert_eq!(a.allow_public_with_upstream_credentials, Some(true));
+    }
+
+    /// Poll for the detached audit row of `action` on `repo_id` that records
+    /// the #4662 override.
+    async fn override_audit_rows_4662(pool: &sqlx::PgPool, repo_id: Uuid, action: &str) -> i64 {
+        let mut count = 0;
+        for _ in 0..40 {
+            count = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2 \
+                 AND details->>'allow_public_with_upstream_credentials' = 'true'",
+            )
+            .bind(repo_id)
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .expect("count audit rows");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        count
+    }
+
+    fn is_public_credentials_refusal(err: &AppError) -> bool {
+        matches!(
+            err,
+            AppError::CodedValidation {
+                code: PUBLIC_REMOTE_UPSTREAM_CREDENTIALS,
+                ..
+            }
+        )
+    }
+
+    #[tokio::test]
+    async fn test_public_remote_with_upstream_credentials_is_guarded_db_4662() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("public-4662-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let update = |json: serde_json::Value| -> Json<UpdateRepositoryRequest> {
+            Json(serde_json::from_value(json).expect("deserialize update payload"))
+        };
+        let upstream_auth = |json: serde_json::Value| -> Json<UpstreamAuthRequest> {
+            Json(serde_json::from_value(json).expect("deserialize upstream-auth payload"))
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let remote = |key: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            make_create_request(key, key, "generic", body)
+        };
+        let mut created_ids = Vec::new();
+
+        // Create: public + bearer token, or public + userinfo in the URL, is
+        // refused with the dedicated code and leaves no repository behind.
+        let refused_key = format!("pub-4662-r-{suffix}");
+        for extra in [
+            serde_json::json!({
+                "is_public": true, "upstream_auth_type": "bearer", "upstream_password": "canary"
+            }),
+            serde_json::json!({
+                "visibility": "public",
+                "upstream_url": "https://u:canary@upstream.example.com/api"
+            }),
+        ] {
+            let err = create_repository(State(state.clone()), auth(), remote(&refused_key, extra))
+                .await
+                .expect_err("public remote with upstream credentials must be refused");
+            assert!(is_public_credentials_refusal(&err), "{err:?}");
+        }
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repositories WHERE key = $1)")
+                .bind(&refused_key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!exists, "a refused create must not leave a row");
+
+        // Create with the override: accepted, reported and audited.
+        let Json(accepted) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &format!("pub-4662-a-{suffix}"),
+                serde_json::json!({
+                    "is_public": true, "upstream_auth_type": "bearer",
+                    "upstream_password": "canary",
+                    "allow_public_with_upstream_credentials": true
+                }),
+            ),
+        )
+        .await
+        .expect("override must allow the create");
+        created_ids.push(accepted.id);
+        assert!(accepted.public_with_upstream_credentials);
+        assert!(accepted.allow_public_with_upstream_credentials);
+        assert_eq!(
+            override_audit_rows_4662(&pool, accepted.id, "REPOSITORY_CREATED").await,
+            1
+        );
+
+        // Toggling is_public on a credentialed private repository is refused.
+        let private_key = format!("pub-4662-p-{suffix}");
+        let Json(private) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &private_key,
+                serde_json::json!({ "upstream_auth_type": "bearer", "upstream_password": "t" }),
+            ),
+        )
+        .await
+        .expect("private remote with credentials is fine");
+        created_ids.push(private.id);
+        assert!(!private.public_with_upstream_credentials);
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(private_key.clone()),
+            update(serde_json::json!({ "is_public": true })),
+        )
+        .await
+        .expect_err("making a credentialed repository public must be refused");
+        assert!(is_public_credentials_refusal(&err), "{err:?}");
+        let Json(still_private) =
+            get_repository(State(state.clone()), auth(), Path(private_key.clone()))
+                .await
+                .expect("get");
+        assert!(
+            !still_private.is_public,
+            "a refused update must change nothing"
+        );
+
+        // ... and accepted with the override, which is stored and audited.
+        let Json(made_public) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(private_key.clone()),
+            update(serde_json::json!({
+                "visibility": "public", "allow_public_with_upstream_credentials": true
+            })),
+        )
+        .await
+        .expect("override must allow the toggle");
+        assert!(made_public.public_with_upstream_credentials);
+        assert!(made_public.allow_public_with_upstream_credentials);
+        assert_eq!(
+            override_audit_rows_4662(&pool, private.id, "REPOSITORY_UPDATED").await,
+            1
+        );
+        // Re-sending is_public (a Terraform apply) on a repository already in
+        // that state is not a new exposure.
+        update_repository(
+            State(state.clone()),
+            auth(),
+            Path(private_key.clone()),
+            update(serde_json::json!({ "is_public": true, "description": "x" })),
+        )
+        .await
+        .expect("re-applying the same state must succeed");
+
+        // A public repository without credentials: adding them through
+        // PUT upstream-auth, or through userinfo in upstream_url, is refused.
+        let open_key = format!("pub-4662-o-{suffix}");
+        let Json(open) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(&open_key, serde_json::json!({ "is_public": true })),
+        )
+        .await
+        .expect("public remote without credentials is fine");
+        created_ids.push(open.id);
+        assert!(!open.public_with_upstream_credentials);
+        let err = set_upstream_auth(
+            State(state.clone()),
+            auth(),
+            Path(open_key.clone()),
+            upstream_auth(serde_json::json!({ "auth_type": "bearer", "password": "canary" })),
+        )
+        .await
+        .expect_err("credentials on a public repository must be refused");
+        assert!(is_public_credentials_refusal(&err), "{err:?}");
+        let err = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(open_key.clone()),
+            update(serde_json::json!({
+                "upstream_url": "https://u:canary@upstream.example.com/api"
+            })),
+        )
+        .await
+        .expect_err("userinfo credentials on a public repository must be refused");
+        assert!(is_public_credentials_refusal(&err), "{err:?}");
+        assert_eq!(
+            crate::services::upstream_auth::get_upstream_auth_type(&pool, open.id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let Json(body) = set_upstream_auth(
+            State(state.clone()),
+            auth(),
+            Path(open_key.clone()),
+            upstream_auth(serde_json::json!({
+                "auth_type": "bearer", "password": "canary",
+                "allow_public_with_upstream_credentials": true
+            })),
+        )
+        .await
+        .expect("override must allow upstream-auth on a public repository");
+        assert_eq!(body["public_with_upstream_credentials"], true);
+        assert_eq!(
+            override_audit_rows_4662(&pool, open.id, "REPOSITORY_UPDATED").await,
+            1
+        );
+        let Json(got) = get_repository(State(state.clone()), auth(), Path(open_key.clone()))
+            .await
+            .expect("get");
+        assert!(got.public_with_upstream_credentials);
+        assert!(got.allow_public_with_upstream_credentials);
+
+        // Withdrawing the acceptance clears the stored flag.
+        let Json(withdrawn) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(open_key.clone()),
+            update(serde_json::json!({
+                "visibility": "private", "allow_public_with_upstream_credentials": false
+            })),
+        )
+        .await
+        .expect("going private needs no override");
+        assert!(!withdrawn.public_with_upstream_credentials);
+        assert!(!withdrawn.allow_public_with_upstream_credentials);
+
+        for id in created_ids {
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
     async fn stored_upstream_4467(pool: &sqlx::PgPool, id: Uuid) -> Option<String> {
         sqlx::query_scalar("SELECT upstream_url FROM repositories WHERE id = $1")
             .bind(id)
@@ -28864,6 +29564,8 @@ mod tests {
             upstream_url_has_credentials: false,
             upstream_auth_type: None,
             upstream_auth_configured: false,
+            public_with_upstream_credentials: false,
+            allow_public_with_upstream_credentials: false,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             custom_user_agent: None,
