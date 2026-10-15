@@ -28,6 +28,8 @@ use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
@@ -1168,22 +1170,218 @@ fn npm_advertised_tarball_filename(
     Some(build_npm_tarball_filename(package_name, version))
 }
 
+#[derive(Debug, Default)]
+struct NpmPackumentDists<'a> {
+    name: Option<Cow<'a, str>>,
+    versions: BTreeMap<Cow<'a, str>, NpmVersionDist<'a>>,
+}
+
+#[derive(Debug, Default)]
+struct NpmVersionDist<'a> {
+    name: Option<Cow<'a, str>>,
+    version: Option<Cow<'a, str>>,
+    dist: Option<NpmDist<'a>>,
+}
+
+#[derive(Debug, Default)]
+struct NpmDist<'a> {
+    tarball: Option<Cow<'a, str>>,
+    integrity: Option<Cow<'a, str>>,
+    shasum: Option<Cow<'a, str>>,
+}
+
+fn parse_npm_packument_dists(content: &[u8]) -> Option<NpmPackumentDists<'_>> {
+    serde_json::from_slice::<NpmLenient<NpmPackumentDists<'_>>>(content)
+        .ok()?
+        .0
+}
+
+trait NpmPackumentPart<'de>: Sized {
+    fn from_text(_text: Cow<'de, str>) -> Option<Self> {
+        None
+    }
+
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(None)
+    }
+}
+
+struct NpmLenient<T>(Option<T>);
+
+impl<'de, T: NpmPackumentPart<'de>> serde::Deserialize<'de> for NpmLenient<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(NpmLenientVisitor(std::marker::PhantomData))
+            .map(NpmLenient)
+    }
+}
+
+struct NpmLenientVisitor<T>(std::marker::PhantomData<T>);
+
+impl<'de, T: NpmPackumentPart<'de>> serde::de::Visitor<'de> for NpmLenientVisitor<T> {
+    type Value = Option<T>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(T::from_text(Cow::Borrowed(v)))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(T::from_text(Cow::Owned(v.to_owned())))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(T::from_text(Cow::Owned(v)))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        T::from_object(map)
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for Cow<'de, str> {
+    fn from_text(text: Cow<'de, str>) -> Option<Self> {
+        Some(text)
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for NpmPackumentDists<'de> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut packument = Self::default();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            match key.as_deref() {
+                Some("name") => packument.name = map.next_value::<NpmLenient<_>>()?.0,
+                Some("versions") => {
+                    packument.versions = map.next_value::<NpmLenient<_>>()?.0.unwrap_or_default()
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Some(packument))
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for BTreeMap<Cow<'de, str>, NpmVersionDist<'de>> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut versions = Self::new();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            let entry = map
+                .next_value::<NpmLenient<NpmVersionDist<'de>>>()?
+                .0
+                .unwrap_or_default();
+            if let Some(key) = key {
+                versions.insert(key, entry);
+            }
+        }
+        Ok(Some(versions))
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for NpmVersionDist<'de> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut entry = Self::default();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            match key.as_deref() {
+                Some("name") => entry.name = map.next_value::<NpmLenient<_>>()?.0,
+                Some("version") => entry.version = map.next_value::<NpmLenient<_>>()?.0,
+                Some("dist") => entry.dist = map.next_value::<NpmLenient<_>>()?.0,
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Some(entry))
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for NpmDist<'de> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut dist = Self::default();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            match key.as_deref() {
+                Some("tarball") => dist.tarball = map.next_value::<NpmLenient<_>>()?.0,
+                Some("integrity") => dist.integrity = map.next_value::<NpmLenient<_>>()?.0,
+                Some("shasum") => dist.shasum = map.next_value::<NpmLenient<_>>()?.0,
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Some(dist))
+    }
+}
+
 /// Package name and version of one packument version entry: the entry's own
 /// `name` / `version`, falling back to the document name and the map key.
 fn npm_version_identity<'a>(
-    packument: &'a serde_json::Value,
+    packument: &'a NpmPackumentDists<'_>,
     version_key: &'a str,
-    version_data: &'a serde_json::Value,
+    version_data: &'a NpmVersionDist<'_>,
 ) -> (&'a str, &'a str) {
     let name = version_data
-        .get("name")
-        .and_then(|n| n.as_str())
-        .or_else(|| packument.get("name").and_then(|n| n.as_str()))
+        .name
+        .as_deref()
+        .or(packument.name.as_deref())
         .unwrap_or("_unknown");
-    let version = version_data
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or(version_key);
+    let version = version_data.version.as_deref().unwrap_or(version_key);
     (name, version)
 }
 
@@ -1194,17 +1392,16 @@ fn npm_version_identity<'a>(
 /// #3785 (never by parsing a version out of the requested filename). URLs in
 /// a non-standard layout on the upstream's origin match on the canonical
 /// filename `npm_advertised_tarball_filename` rewrote them to.
-fn npm_dist_for_filename<'a>(
-    packument: &'a serde_json::Value,
+fn npm_dist_for_filename<'p, 'a>(
+    packument: &'p NpmPackumentDists<'a>,
     filename: &str,
     upstream_url: Option<&str>,
-) -> Option<(&'a serde_json::Value, &'a str)> {
-    let versions = packument.get("versions")?.as_object()?;
-    for (version_key, version_data) in versions {
-        let Some(dist) = version_data.get("dist") else {
+) -> Option<(&'p NpmDist<'a>, &'p str)> {
+    for (version_key, version_data) in &packument.versions {
+        let Some(dist) = &version_data.dist else {
             continue;
         };
-        let tarball = dist.get("tarball").and_then(|t| t.as_str()).unwrap_or("");
+        let tarball = dist.tarball.as_deref().unwrap_or("");
         let tarball_name = if tarball.contains("/-/") {
             tarball
                 .split(['#', '?'])
@@ -1231,7 +1428,7 @@ fn npm_dist_for_filename<'a>(
 /// repository's upstream credentials may accompany it). `None` means "use the
 /// canonical path".
 fn npm_tarball_source_for_filename(
-    packument: &serde_json::Value,
+    packument: &NpmPackumentDists<'_>,
     filename: &str,
     upstream_url: &str,
 ) -> Option<String> {
@@ -1311,7 +1508,7 @@ fn normalize_npm_shasum(raw: &str) -> Option<String> {
 /// (SRI) is preferred over the legacy `dist.shasum` (SHA-1 hex).
 #[cfg(test)]
 fn npm_integrity_for_filename(
-    packument: &serde_json::Value,
+    packument: &NpmPackumentDists<'_>,
     filename: &str,
 ) -> Option<crate::services::proxy_service::CacheCommitDigest> {
     npm_integrity_for_filename_on_upstream(packument, filename, None)
@@ -1321,22 +1518,18 @@ fn npm_integrity_for_filename(
 /// non-standard layout on `upstream_url`'s origin by the canonical filename
 /// they are advertised under (#3785).
 fn npm_integrity_for_filename_on_upstream(
-    packument: &serde_json::Value,
+    packument: &NpmPackumentDists<'_>,
     filename: &str,
     upstream_url: Option<&str>,
 ) -> Option<crate::services::proxy_service::CacheCommitDigest> {
     use crate::services::proxy_service::CacheCommitDigest;
 
     let (dist, _) = npm_dist_for_filename(packument, filename, upstream_url)?;
-    if let Some(digest) = dist
-        .get("integrity")
-        .and_then(|i| i.as_str())
-        .and_then(parse_npm_sri)
-    {
+    if let Some(digest) = dist.integrity.as_deref().and_then(parse_npm_sri) {
         return Some(digest);
     }
-    dist.get("shasum")
-        .and_then(|s| s.as_str())
+    dist.shasum
+        .as_deref()
         .and_then(normalize_npm_shasum)
         .map(CacheCommitDigest::Sha1Hex)
 }
@@ -1401,7 +1594,7 @@ async fn resolve_npm_tarball_upstream(
     else {
         return NpmTarballUpstream::default();
     };
-    let Ok(packument) = serde_json::from_slice::<serde_json::Value>(&content) else {
+    let Some(packument) = parse_npm_packument_dists(&content) else {
         return NpmTarballUpstream::default();
     };
     NpmTarballUpstream {
@@ -4495,19 +4688,16 @@ async fn serve_tarball(
             // an upstream outside the registry-standard `/-/` layout (GitHub
             // Packages, #3785) — the URL the upstream really serves it at.
             // The proxy cache key stays the canonical `fetch_path` either way.
-            let tarball_upstream = resolve_npm_tarball_upstream(
-                proxy,
-                repo.id,
-                repo_key,
-                upstream_url,
-                package_name,
-                &response_filename,
-            )
-            .await;
-            let source_path = tarball_upstream
-                .source
-                .clone()
-                .unwrap_or_else(|| fetch_path.clone());
+            let resolve_tarball_upstream = || {
+                resolve_npm_tarball_upstream(
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    package_name,
+                    &response_filename,
+                )
+            };
 
             // #3003: when scan-on-proxy is enabled, route through the inline
             // scan-and-block path (buffered capped fetch + digest-keyed
@@ -4520,6 +4710,10 @@ async fn serve_tarball(
             if let Some((action, severity_gate)) =
                 proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
             {
+                let source_path = resolve_tarball_upstream()
+                    .await
+                    .source
+                    .unwrap_or_else(|| fetch_path.clone());
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -4553,22 +4747,39 @@ async fn serve_tarball(
             // variant rather than the SHA-256-only proxy_helpers wrapper; a
             // mismatch is served to the client (npm verifies the SRI itself)
             // but never cached.
-            let expected_integrity = tarball_upstream.integrity;
-            let gated_repo = proxy_helpers::build_remote_repo_with_format(
+            let result = match proxy_helpers::proxy_check_cache_streaming(
+                proxy,
                 repo.id,
                 repo_key,
                 upstream_url,
+                &fetch_path,
                 RepositoryFormat::Npm,
-            );
-            let result = proxy
-                .fetch_artifact_streaming_with_cache_path_gated_digest(
-                    &gated_repo,
-                    &source_path,
-                    &fetch_path,
-                    expected_integrity,
-                )
-                .await
-                .map_err(IntoResponse::into_response)?;
+            )
+            .await
+            {
+                Some(hit) => hit,
+                None => {
+                    let tarball_upstream = resolve_tarball_upstream().await;
+                    let source_path = tarball_upstream
+                        .source
+                        .unwrap_or_else(|| fetch_path.clone());
+                    let gated_repo = proxy_helpers::build_remote_repo_with_format(
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        RepositoryFormat::Npm,
+                    );
+                    proxy
+                        .fetch_artifact_streaming_with_cache_path_gated_digest(
+                            &gated_repo,
+                            &source_path,
+                            &fetch_path,
+                            tarball_upstream.integrity,
+                        )
+                        .await
+                        .map_err(IntoResponse::into_response)?
+                }
+            };
 
             // The upstream registry may return application/octet-stream for
             // npm tarballs, which also gets persisted by the proxy cache.
@@ -5165,7 +5376,7 @@ async fn npm_cached_tarball_source(
         .await
         .ok()
         .flatten()?;
-    let packument: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    let packument = parse_npm_packument_dists(&content)?;
     npm_tarball_source_for_filename(&packument, filename, upstream_url)
 }
 
@@ -7751,12 +7962,12 @@ mod tests {
             }
         });
         assert_eq!(
-            npm_integrity_for_filename(&packument, "my-pkg-1.0.0.tgz"),
+            npm_integrity_for_filename(&dists(&packument), "my-pkg-1.0.0.tgz"),
             Some(CacheCommitDigest::Sha1Hex(shasum.clone()))
         );
         // A filename no version serves resolves to no gate.
         assert_eq!(
-            npm_integrity_for_filename(&packument, "my-pkg-9.9.9.tgz"),
+            npm_integrity_for_filename(&dists(&packument), "my-pkg-9.9.9.tgz"),
             None
         );
         // Scoped tarball URL shapes match by basename too.
@@ -7766,7 +7977,7 @@ mod tests {
                 "shasum": &shasum}}}}
         );
         assert_eq!(
-            npm_integrity_for_filename(&scoped, "pkg-1.0.0.tgz"),
+            npm_integrity_for_filename(&dists(&scoped), "pkg-1.0.0.tgz"),
             Some(CacheCommitDigest::Sha1Hex(shasum))
         );
     }
@@ -7785,11 +7996,117 @@ mod tests {
                 "shasum": "0000000000000000000000000000000000000000"}}}}
         );
         assert_eq!(
-            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            npm_integrity_for_filename(&dists(&packument), "p-1.0.0.tgz"),
             Some(CacheCommitDigest::Sha512Hex(hex::encode(
                 sha2::Sha512::digest(b"real")
             )))
         );
+    }
+
+    fn dists(packument: &serde_json::Value) -> NpmPackumentDists<'_> {
+        <NpmLenient<NpmPackumentDists<'_>> as serde::Deserialize>::deserialize(packument)
+            .expect("packument deserializes")
+            .0
+            .expect("packument is an object")
+    }
+
+    #[test]
+    fn test_npm_packument_dists_reads_escaped_strings() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"escaped"));
+        let body = format!(
+            r#"{{"versions":{{"1.0.0":{{"dist":{{"tarball":"https:\/\/reg.example\/p\/-\/p-1.0.0.tgz","shasum":"{shasum}"}}}}}}}}"#
+        );
+        let packument = parse_npm_packument_dists(body.as_bytes()).expect("packument parses");
+        assert!(matches!(
+            packument.versions.keys().next(),
+            Some(Cow::Borrowed("1.0.0"))
+        ));
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+    }
+
+    #[test]
+    fn test_npm_packument_dists_tolerates_lone_surrogate_in_skipped_field() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"surrogate"));
+        let body = format!(
+            r#"{{"readme":"\ud800","versions":{{"1.0.0":{{"description":"\udfff","dist":{{"tarball":"https://reg.example/p/-/p-1.0.0.tgz","shasum":"{shasum}"}}}}}}}}"#
+        );
+        assert!(serde_json::from_slice::<serde_json::Value>(body.as_bytes()).is_err());
+        let packument = parse_npm_packument_dists(body.as_bytes()).expect("packument parses");
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+    }
+
+    #[test]
+    fn test_npm_packument_dists_ignores_mismatched_types() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"fallback"));
+        let body = serde_json::json!({
+            "name": 42,
+            "time": {"1.0.0": "2020-01-01T00:00:00.000Z"},
+            "versions": {
+                "0.0.1": "not-an-object",
+                "0.0.2": ["p-0.0.2.tgz"],
+                "0.0.3": {"dist": "https://reg.example/p/-/p-0.0.3.tgz"},
+                "0.0.4": {"dist": {"tarball": {"url": "https://reg.example/p/-/p-0.0.4.tgz"}}},
+                "1.0.0": {"name": null, "version": 1, "dist": {
+                    "tarball": "https://reg.example/p/-/p-1.0.0.tgz",
+                    "integrity": 7,
+                    "shasum": &shasum,
+                    "signatures": [{"keyid": "k", "sig": "s"}]}},
+            }
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let packument = parse_npm_packument_dists(&bytes).expect("packument parses");
+        assert!(packument.name.is_none());
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+        for file in ["p-0.0.2.tgz", "p-0.0.3.tgz", "p-0.0.4.tgz"] {
+            assert!(npm_dist_for_filename(&packument, file, None).is_none());
+        }
+    }
+
+    #[test]
+    fn test_npm_packument_dists_identity_falls_back_to_document_name_and_key() {
+        let origin = "https://npm.pkg.github.com";
+        let body = format!(
+            r#"{{"versions":{{"1.2.3":{{"version":["x"],"dist":{{"tarball":"{origin}/download/{GHP_SCOPED}/1.2.3/abc"}}}}}},"name":"{GHP_SCOPED}"}}"#
+        );
+        let packument = parse_npm_packument_dists(body.as_bytes()).expect("packument parses");
+        assert_eq!(
+            npm_tarball_source_for_filename(&packument, "example-package-1.2.3.tgz", origin)
+                .as_deref(),
+            Some("https://npm.pkg.github.com/download/@example-org/example-package/1.2.3/abc")
+        );
+    }
+
+    #[test]
+    fn test_npm_packument_dists_last_duplicate_wins_and_non_objects_match_nothing() {
+        let body = br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://reg.example/p/-/p-1.0.0.tgz"},"dist":{"tarball":"https://reg.example/p/-/p-1.0.1.tgz"}}}}"#;
+        let packument = parse_npm_packument_dists(body).expect("packument parses");
+        assert!(npm_dist_for_filename(&packument, "p-1.0.0.tgz", None).is_none());
+        assert_eq!(
+            npm_dist_for_filename(&packument, "p-1.0.1.tgz", None).map(|(_, url)| url),
+            Some("https://reg.example/p/-/p-1.0.1.tgz")
+        );
+        assert!(parse_npm_packument_dists(b"[]").is_none());
+        assert!(parse_npm_packument_dists(b"<html>not json</html>").is_none());
+        assert!(parse_npm_packument_dists(br#"{"versions":{}} trailing"#).is_none());
+        assert!(parse_npm_packument_dists(br#"{"versions":[1]}"#)
+            .expect("packument parses")
+            .versions
+            .is_empty());
     }
 
     /// DB-backed (#2327 secondary): a virtual repo with two Remote members —
@@ -11577,27 +11894,30 @@ mod tests {
         let packument = ghp_packument(origin, &format!("sha512-{sha512_b64}"));
         let file = "example-package-1.2.3.tgz";
         assert_eq!(
-            npm_tarball_source_for_filename(&packument, file, origin).as_deref(),
+            npm_tarball_source_for_filename(&dists(&packument), file, origin).as_deref(),
             Some("https://npm.pkg.github.com/download/@example-org/example-package/1.2.3/0123456789abcdef")
         );
         assert_eq!(
-            npm_integrity_for_filename_on_upstream(&packument, file, Some(origin)),
+            npm_integrity_for_filename_on_upstream(&dists(&packument), file, Some(origin)),
             Some(CacheCommitDigest::Sha512Hex(hex::encode(
                 sha2::Sha512::digest(b"ghp")
             )))
         );
         // A different upstream origin neither relocates nor matches.
         assert_eq!(
-            npm_tarball_source_for_filename(&packument, file, "https://other.example"),
+            npm_tarball_source_for_filename(&dists(&packument), file, "https://other.example"),
             None
         );
-        assert!(npm_dist_for_filename(&packument, file, Some("https://other.example")).is_none());
+        assert!(
+            npm_dist_for_filename(&dists(&packument), file, Some("https://other.example"))
+                .is_none()
+        );
         // A registry-standard layout keeps the canonical fetch path.
         let standard = serde_json::json!({"versions": {"1.0.0": {"name": "p", "version": "1.0.0",
             "dist": {"tarball": format!("{origin}/p/-/p-1.0.0.tgz")}}}});
-        assert!(npm_dist_for_filename(&standard, "p-1.0.0.tgz", Some(origin)).is_some());
+        assert!(npm_dist_for_filename(&dists(&standard), "p-1.0.0.tgz", Some(origin)).is_some());
         assert_eq!(
-            npm_tarball_source_for_filename(&standard, "p-1.0.0.tgz", origin),
+            npm_tarball_source_for_filename(&dists(&standard), "p-1.0.0.tgz", origin),
             None
         );
     }
@@ -11772,6 +12092,52 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(&body[..], bytes);
         }
+    }
+
+    #[tokio::test]
+    async fn test_remote_warm_tarball_hit_does_not_read_packument_4692_db() {
+        let upstream = wiremock::MockServer::start().await;
+        let Some((fx, state)) = remote_on(&upstream).await else {
+            return;
+        };
+        let bytes = mount_ghp_upstream(&upstream, None, 1..=1).await;
+        let proxy = state.proxy_service.clone().expect("proxy service");
+        let tarball_path = format!("{GHP_SCOPED}/-/example-package-1.2.3.tgz");
+
+        let cold = drain_download(ghp_download(&state, &fx.repo_key).await).await;
+        let mut committed = false;
+        for _ in 0..2400 {
+            if let Ok(Some(_)) = proxy
+                .get_cached_artifact_by_path(&fx.repo_key, &tarball_path)
+                .await
+            {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(committed, "tarball never committed to the proxy cache");
+        proxy
+            .invalidate_cache_by_key(&fx.repo_key, GHP_SCOPED)
+            .await
+            .expect("evict cached packument");
+        let warm = drain_download(ghp_download(&state, &fx.repo_key).await).await;
+        let packument_fetches = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/@example-org%2Fexample-package")
+            .count();
+        fx.teardown().await;
+
+        for served in [cold, warm] {
+            let (status, body) =
+                served.unwrap_or_else(|status| panic!("tarball must be served: {status}"));
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], bytes);
+        }
+        assert_eq!(packument_fetches, 1);
     }
 
     /// #3785, Virtual-over-Remote: a virtual repo whose Remote member is
