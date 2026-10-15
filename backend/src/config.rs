@@ -160,6 +160,9 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Default for [`Config::http_header_read_timeout_secs`] (#4665).
+pub const DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS: u64 = 10;
+
 /// Default listen IP for the gRPC and metrics listeners (#2161): every
 /// interface, which is what both listeners hard-coded before they were
 /// configurable.
@@ -912,6 +915,18 @@ pub struct Config {
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
 
+    /// How long, in seconds, an HTTP/1 connection may take to deliver a
+    /// complete request head (request line plus headers) on the API and
+    /// metrics listeners (#4665). A client that connects and trickles header
+    /// bytes is disconnected when it expires, and
+    /// `ak_http_header_read_timeouts_total` is incremented, instead of
+    /// holding a socket open for as long as it likes. The clock restarts for
+    /// each request on a keep-alive connection, so an idle keep-alive
+    /// connection is closed after the same interval. HTTP/2 connections are
+    /// unaffected. Env var: `HTTP_HEADER_READ_TIMEOUT_SECS`. Default 10. Set
+    /// to 0 to disable the timeout.
+    pub http_header_read_timeout_secs: u64,
+
     /// Progress window, in seconds, for artifact upload bodies on the
     /// byte-transfer routes that `global_request_timeout_secs` exempts
     /// (GHSA-9f9r-c4w8-rjv9). An upload body that delivers fewer than
@@ -1414,6 +1429,7 @@ redacted_debug!(Config {
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show http_header_read_timeout_secs,
     show upload_progress_window_secs,
     show upload_min_progress_bytes,
     show upload_max_in_flight_per_principal,
@@ -1566,6 +1582,7 @@ impl Default for Config {
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            http_header_read_timeout_secs: DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
             upload_progress_window_secs: 60,
             upload_min_progress_bytes: 16 * 1024,
             upload_max_in_flight_per_principal: 64,
@@ -1641,6 +1658,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The HTTP/1 header-read timeout to hand the server (#4665); `None`
+    /// when `HTTP_HEADER_READ_TIMEOUT_SECS=0` turned it off.
+    pub fn http_header_read_timeout(&self) -> Option<std::time::Duration> {
+        (self.http_header_read_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.http_header_read_timeout_secs))
+    }
+
     /// Return a `Config` with sensible defaults for unit tests. Equivalent to
     /// `Config::default()` today, but kept as a named constructor so tests read
     /// clearly and any future test-specific tweaks live in one place.
@@ -1912,6 +1936,10 @@ impl Config {
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            http_header_read_timeout_secs: env_parse(
+                "HTTP_HEADER_READ_TIMEOUT_SECS",
+                DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
+            ),
             upload_progress_window_secs: env_parse("UPLOAD_PROGRESS_WINDOW_SECS", 60_u64),
             upload_min_progress_bytes: env_parse("UPLOAD_MIN_PROGRESS_BYTES", 16_384_u64),
             upload_max_in_flight_per_principal: env_parse(
@@ -2857,6 +2885,50 @@ mod tests {
             env::set_var("DATABASE_URL", v);
         } else {
             env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        }
+    }
+
+    /// #4665: the header-read timeout defaults to 10 s, honours a custom
+    /// value, treats 0 as "off", and falls back to the default on garbage.
+    #[test]
+    fn test_http_header_read_timeout_parsing() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved = env::var("HTTP_HEADER_READ_TIMEOUT_SECS").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        let cases: [(Option<&str>, u64, Option<std::time::Duration>); 4] = [
+            (None, 10, Some(std::time::Duration::from_secs(10))),
+            (Some("3"), 3, Some(std::time::Duration::from_secs(3))),
+            (Some("0"), 0, None),
+            (Some("ten"), 10, Some(std::time::Duration::from_secs(10))),
+        ];
+        for (raw, secs, timeout) in cases {
+            match raw {
+                Some(v) => env::set_var("HTTP_HEADER_READ_TIMEOUT_SECS", v),
+                None => env::remove_var("HTTP_HEADER_READ_TIMEOUT_SECS"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(config.http_header_read_timeout_secs, secs, "{raw:?}");
+            assert_eq!(config.http_header_read_timeout(), timeout, "{raw:?}");
+        }
+        assert_eq!(
+            Config::default().http_header_read_timeout_secs,
+            DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS
+        );
+
+        match saved {
+            Some(v) => env::set_var("HTTP_HEADER_READ_TIMEOUT_SECS", v),
+            None => env::remove_var("HTTP_HEADER_READ_TIMEOUT_SECS"),
+        }
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
         }
         if let Some(v) = saved_jwt {
             env::set_var("JWT_SECRET", v);

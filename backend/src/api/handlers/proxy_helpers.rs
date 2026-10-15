@@ -15235,6 +15235,7 @@ mod tests {
                 auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
+                http_header_read_timeout_secs: 10,
                 upload_progress_window_secs: 60,
                 upload_min_progress_bytes: 16 * 1024,
                 upload_max_in_flight_per_principal: 64,

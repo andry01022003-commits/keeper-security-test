@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4665]
+---
+- **A client that trickles its request headers, or connects and sends nothing, is now disconnected after `HTTP_HEADER_READ_TIMEOUT_SECS` (default 10)** (#4665). The API and metrics listeners were served with `axum::serve`, which builds hyper connections without a timer, so hyper applied no header-read timeout at all: a slow-loris client held a socket and a task for as long as it kept trickling bytes, and nothing recorded it. The listeners now run an equivalent accept loop (same `ConnectInfo` peer wiring, HTTP/1 with upgrades, HTTP/2 prior knowledge, graceful shutdown) that sets hyper's HTTP/1 `header_read_timeout` and applies the same deadline to the protocol-detection read hyper does before it. Each connection closed with a request head outstanding increments the new counter `ak_http_header_read_timeouts_total`. The same timer also closes an idle HTTP/1 keep-alive connection after the interval (not counted), so a reverse proxy that pools upstream connections to the backend should use an upstream idle timeout below this value. `0` disables the timeout. HTTP/2 and gRPC are unchanged.

@@ -46,6 +46,14 @@ pub fn init_metrics() -> PrometheusHandle {
         .expect("failed to install Prometheus recorder")
 }
 
+/// Count one HTTP connection closed because the client did not deliver a
+/// complete request head within `HTTP_HEADER_READ_TIMEOUT_SECS` (#4665): a
+/// slow or stalled client, the slow-loris shape. Idle keep-alive connections
+/// closed by the same timer are not counted.
+pub fn record_http_header_read_timeout() {
+    counter!("ak_http_header_read_timeouts_total").increment(1);
+}
+
 /// Record an artifact upload event.
 pub fn record_artifact_upload(repo_key: &str, format: &str, size_bytes: u64) {
     counter!("ak_artifact_uploads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);

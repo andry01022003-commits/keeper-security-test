@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;
+pub mod serve;
 pub mod validation;
 
 use crate::config::Config;
@@ -567,10 +568,56 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// Query parameter names whose value is a credential and must never reach a
+/// log line, compared case-insensitively after percent-decoding the key.
+///
+/// - `token`, `key`, `api_key`, `password`, `secret`: the original set (#544).
+/// - `ticket`: the single-use download ticket (`?ticket=`) the auth
+///   middleware accepts in place of a header (#4675).
+/// - `access_token`, `refresh_token`, `id_token`, `client_secret`, `code`:
+///   OAuth2 / OCI `/v2/token` style credentials and the OIDC authorization
+///   code on the SSO callback, should a client put them in the URL (#4675).
+/// - `x-amz-signature`, `x-amz-credential`, `x-amz-security-token`,
+///   `x-goog-signature`, `x-goog-credential`, `signature`, `sig`:
+///   presigned-URL signatures and session tokens (S3, GCS, CloudFront,
+///   Azure SAS) (#4675).
+const SENSITIVE_QUERY_PARAMS: &[&str] = &[
+    "token",
+    "key",
+    "api_key",
+    "password",
+    "secret",
+    "ticket",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "client_secret",
+    "code",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "x-goog-signature",
+    "x-goog-credential",
+    "signature",
+    "sig",
+];
+
+/// Whether a raw (possibly percent-encoded) query key names a credential.
+/// The key is decoded first so `%74icket=` or `access%5Ftoken=` is caught
+/// the same as the plain spelling.
+fn is_sensitive_query_key(raw_key: &str) -> bool {
+    let decoded = urlencoding::decode(&raw_key.replace('+', " "))
+        .map(|k| k.into_owned())
+        .unwrap_or_else(|_| raw_key.to_string());
+    let k = decoded.trim().to_ascii_lowercase();
+    SENSITIVE_QUERY_PARAMS.contains(&k.as_str())
+}
+
 /// Redact credentials from a request path and query string for safe logging.
 ///
-/// Query parameters named `token`, `key`, `api_key`, `password`, or `secret`
-/// (case-insensitive) have their values replaced with `[REDACTED]` (#544).
+/// Query parameters named in [`SENSITIVE_QUERY_PARAMS`] (case-insensitive,
+/// percent-decoded) have their values replaced with `[REDACTED]` (#544,
+/// #4675). This is what the `http_request` span records as `uri`.
 ///
 /// The path is passed through [`redact_token_path_segment`], which hides the
 /// bearer token the two conda token-channel layouts carry in the path itself.
@@ -582,13 +629,7 @@ pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
                 .split('&')
                 .map(|pair| {
                     if let Some((key, _)) = pair.split_once('=') {
-                        let k = key.to_lowercase();
-                        if k == "token"
-                            || k == "key"
-                            || k == "api_key"
-                            || k == "password"
-                            || k == "secret"
-                        {
+                        if is_sensitive_query_key(key) {
                             return format!("{}=[REDACTED]", key);
                         }
                     }
@@ -960,6 +1001,96 @@ mod tests {
             result,
             "/endpoint?token=[REDACTED]&password=[REDACTED]&secret=[REDACTED]&key=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn test_redact_download_ticket_param() {
+        // #4675: the single-use download ticket must not reach the log plane.
+        let result = redact_sensitive_params(
+            "/api/v1/repositories/r/download/pkg.tgz",
+            Some("ticket=0123456789abcdef0123456789abcdef"),
+        );
+        assert_eq!(
+            result,
+            "/api/v1/repositories/r/download/pkg.tgz?ticket=[REDACTED]"
+        );
+        let result = redact_sensitive_params(
+            "/terraform/v1/providers/x/y/1.0.0/download/linux/amd64",
+            Some("foo=1&TICKET=abc&bar=2"),
+        );
+        assert_eq!(
+            result,
+            "/terraform/v1/providers/x/y/1.0.0/download/linux/amd64?foo=1&TICKET=[REDACTED]&bar=2"
+        );
+    }
+
+    #[test]
+    fn test_redact_percent_encoded_ticket_key() {
+        let result = redact_sensitive_params("/d", Some("%74icket=abc&x=1"));
+        assert_eq!(result, "/d?%74icket=[REDACTED]&x=1");
+    }
+
+    #[test]
+    fn test_redact_oauth_token_query_params() {
+        // OCI `/v2/token` and OAuth2-style credentials carried in the URL.
+        let result = redact_sensitive_params(
+            "/v2/token",
+            Some(
+                "service=artifact-keeper&scope=repository:a/b:pull&account=bob\
+                 &refresh_token=rt&access_token=at&id_token=it&client_secret=cs",
+            ),
+        );
+        assert_eq!(
+            result,
+            "/v2/token?service=artifact-keeper&scope=repository:a/b:pull&account=bob\
+             &refresh_token=[REDACTED]&access_token=[REDACTED]&id_token=[REDACTED]\
+             &client_secret=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_redact_oidc_callback_code() {
+        let result = redact_sensitive_params(
+            "/api/v1/auth/sso/oidc/abc/callback",
+            Some("code=authcode123&state=s1"),
+        );
+        assert_eq!(
+            result,
+            "/api/v1/auth/sso/oidc/abc/callback?code=[REDACTED]&state=s1"
+        );
+    }
+
+    #[test]
+    fn test_redact_presigned_style_params() {
+        let result = redact_sensitive_params(
+            "/blob",
+            Some(
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20260101\
+                 &X-Amz-Signature=deadbeef&X-Amz-Security-Token=st&sig=azsig\
+                 &Signature=cfsig&X-Goog-Signature=gsig&Expires=1",
+            ),
+        );
+        assert_eq!(
+            result,
+            "/blob?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=[REDACTED]\
+             &X-Amz-Signature=[REDACTED]&X-Amz-Security-Token=[REDACTED]&sig=[REDACTED]\
+             &Signature=[REDACTED]&X-Goog-Signature=[REDACTED]&Expires=1"
+        );
+    }
+
+    #[test]
+    fn test_redact_uri_without_secrets_unchanged() {
+        let q = "q=ticket&page=2&sort=name&tickets=3&codec=h264&signed=true&key_id=k";
+        assert_eq!(
+            redact_sensitive_params("/api/v1/search", Some(q)),
+            format!("/api/v1/search?{q}")
+        );
+        assert_eq!(
+            redact_sensitive_params("/api/v1/repositories/r/download/ticket", None),
+            "/api/v1/repositories/r/download/ticket"
+        );
+        // A bare key with no value has nothing to hide.
+        assert_eq!(redact_sensitive_params("/d", Some("ticket")), "/d?ticket");
     }
 
     #[test]

@@ -266,6 +266,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
  "hyper-util",
  "jsonwebtoken 11.1.0",
  "ldap3",
