@@ -412,6 +412,12 @@ pub mod details {
         /// An `upstream_url` change on update (#4467), userinfo redacted.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub upstream_change: Option<UpstreamChangeAudit>,
+        /// `true` when this write made (or kept) a repository public while it
+        /// carries upstream credentials, accepted only because the caller sent
+        /// `allow_public_with_upstream_credentials` (#4662): anonymous reads
+        /// spend those credentials upstream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub allow_public_with_upstream_credentials: Option<bool>,
     }
 
     /// Before/after of a repository's upstream URL, with userinfo stripped
@@ -1184,6 +1190,7 @@ mod tests {
             previous_scan_config: None,
             scan_config_changed: None,
             upstream_change: None,
+            allow_public_with_upstream_credentials: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

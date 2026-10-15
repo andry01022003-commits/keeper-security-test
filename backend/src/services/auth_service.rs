@@ -160,8 +160,8 @@ pub struct Claims {
     pub is_admin: bool,
     /// Repository IDs this token is restricted to (None = unrestricted).
     ///
-    /// Stamped on refresh tokens too, so a refresh re-mints the access token
-    /// under the same restriction (#4261).
+    /// Stamped on both access and refresh tokens: the refresh token must carry
+    /// the same allow-list so a refresh cannot widen the grant (#4261, #2430).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     /// Issued at (Unix timestamp)
@@ -4910,6 +4910,33 @@ mod tests {
         assert_eq!(refresh_claims.token_type, "refresh");
         // The refresh token carries the restriction so a refresh keeps it (#4261).
         assert_eq!(refresh_claims.allowed_repo_ids, expected_scope);
+    }
+
+    /// Regression for #4261: the refresh token must carry the same repository
+    /// allow-list as the access token. On `main` the refresh claims were minted
+    /// with `allowed_repo_ids: None`, so rotating a scoped token silently
+    /// widened it back to unrestricted.
+    #[tokio::test]
+    async fn test_generate_tokens_with_repo_scope_refresh_keeps_scope() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let user = make_test_user();
+        let scope = Some(vec![Uuid::new_v4(), Uuid::new_v4()]);
+
+        let tokens = service
+            .generate_tokens_with_repo_scope(&user, scope.clone())
+            .expect("scoped token generation should succeed");
+
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let refresh_claims = decode::<Claims>(
+            &tokens.refresh_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("refresh token should decode")
+        .claims;
+        assert_eq!(refresh_claims.token_type, "refresh");
+        assert_eq!(refresh_claims.allowed_repo_ids, scope);
     }
 
     #[tokio::test]

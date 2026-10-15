@@ -133,6 +133,33 @@ it.
 
 Visibility itself is never changed by toggling the policy.
 
+## Public Remotes with upstream credentials
+
+A public Remote serves anonymous callers, and every upstream request it makes
+for them carries the repository's upstream credentials: upstream-auth (basic,
+bearer, AWS) or userinfo embedded in `upstream_url`. An anonymous caller then
+reads whatever those credentials can read upstream (#4662).
+
+Moving a repository into that state is **refused with a 400** whose `code` is
+`PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`, on every path that can do it: creating a
+public repository with credentials, making a credentialed repository public,
+adding userinfo to a public repository's `upstream_url`, and
+`PUT /api/v1/repositories/{key}/upstream-auth` on a public repository.
+
+An administrator who means it sends `allow_public_with_upstream_credentials:
+true` on the same request. The acceptance is stored with the repository (a later
+toggle back to public does not need it again; `false` withdraws it), logged at
+`WARN`, and recorded in the audit log as
+`allow_public_with_upstream_credentials: true` in the `REPOSITORY_CREATED` /
+`REPOSITORY_UPDATED` details.
+
+Repository responses carry `public_with_upstream_credentials` (the state) and
+`allow_public_with_upstream_credentials` (whether it was accepted). A repository
+that was already public with credentials before the guardrail existed is not
+refused on unrelated updates, so a Terraform apply that re-sends
+`is_public: true` keeps working, but it reports
+`public_with_upstream_credentials: true` with the acceptance `false`.
+
 ## API representation
 
 `visibility` is the authoritative field on the create, update and read shapes.

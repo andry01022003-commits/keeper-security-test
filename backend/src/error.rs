@@ -149,6 +149,13 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// A 400 that carries its own machine-readable `code` instead of the
+    /// generic `VALIDATION_ERROR`, for a refusal a client is expected to
+    /// recognise and act on (e.g. `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`,
+    /// #4662, which a client answers by sending an explicit override).
+    #[error("Validation error ({code}): {message}")]
+    CodedValidation { code: &'static str, message: String },
+
     /// The request was well-formed and syntactically valid but asks for a
     /// configuration that is semantically unsupported in this release (e.g. a
     /// Debian proxy filter that requests metadata regeneration/re-signing, or
@@ -278,6 +285,7 @@ impl AppError {
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
+            Self::CodedValidation { code, .. } => (StatusCode::BAD_REQUEST, code),
             Self::UnprocessableEntity(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY")
             }
@@ -393,6 +401,7 @@ impl AppError {
             | Self::ServiceUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg)
             | Self::NotImplemented(msg) => msg.clone(),
+            Self::CodedValidation { message, .. } => message.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -707,6 +716,23 @@ mod tests {
             (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED")
         );
         assert_eq!(err.user_message(), "token service rejected");
+    }
+
+    #[test]
+    fn test_coded_validation_is_a_400_with_its_own_code_4662() {
+        let err = AppError::CodedValidation {
+            code: "PUBLIC_REMOTE_UPSTREAM_CREDENTIALS",
+            message: "refused".into(),
+        };
+        assert_eq!(
+            err.status_and_code(),
+            (
+                StatusCode::BAD_REQUEST,
+                "PUBLIC_REMOTE_UPSTREAM_CREDENTIALS"
+            )
+        );
+        assert_eq!(err.user_message(), "refused");
+        assert_eq!(err.log_level(), tracing::Level::INFO);
     }
 
     #[test]
