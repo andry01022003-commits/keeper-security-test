@@ -54,6 +54,26 @@ pub fn record_http_header_read_timeout() {
     counter!("ak_http_header_read_timeouts_total").increment(1);
 }
 
+/// Count one database pool connection failure (#4549), labelled by `stage`:
+///
+///   * `startup` — an initial pool-connect attempt failed at boot: Postgres
+///     refusing sessions (`FATAL: sorry, too many clients already` seen from
+///     this side as a connect error) or the attempt hitting
+///     `DATABASE_ACQUIRE_TIMEOUT_SECS`. Each of the bounded startup retries
+///     increments once, so a refusal storm shows its shape before the process
+///     exits or recovers.
+///   * `request` — a pool acquire timed out while serving a request and the
+///     caller was answered `503 POOL_EXHAUSTED`.
+///
+/// The server-side `FATAL` lines themselves are only visible in the Postgres
+/// log: a pool growth attempt that fails is absorbed by sqlx's internal
+/// retry-until-acquire-timeout loop and leaves no other client-side trace.
+/// Together the two stages cover the two places #4549's saturation became
+/// visible — a replacement pod dying at startup and requests shedding load.
+pub fn record_db_pool_connection_failure(stage: &'static str) {
+    counter!("ak_db_pool_connection_failures_total", "stage" => stage.to_string()).increment(1);
+}
+
 /// Record one committed artifact upload: `ak_artifact_uploads_total` and the
 /// `ak_artifact_upload_size_bytes` histogram. Called from
 /// `scanner_service::trigger_scan_on_upload`, the post-commit step every

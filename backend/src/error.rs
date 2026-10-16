@@ -471,6 +471,15 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // A pool acquire that timed out is about to become a client-visible
+        // `503 POOL_EXHAUSTED`: count it (#4549) so saturation is visible as
+        // `rate(ak_db_pool_connection_failures_total{stage="request"})` before
+        // operators have to correlate scattered response logs. Counted here,
+        // on the response path, so every handler error conversion is covered
+        // exactly once.
+        if self.is_pool_timeout() {
+            crate::services::metrics_service::record_db_pool_connection_failure("request");
+        }
         let layout_error = match &self {
             Self::Database(message) => crate::services::rpm_layout::database_error(message),
             Self::Sqlx(error) => crate::services::rpm_layout::database_error(&error.to_string()),
@@ -588,6 +597,53 @@ mod tests {
         let (status, code) = err.status_and_code();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "POOL_EXHAUSTED");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4549: a pool acquire timeout that reaches a client response is counted,
+    // so saturation shows up in Prometheus as
+    // `ak_db_pool_connection_failures_total{stage="request"}` and not only as
+    // scattered 503s in the logs.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pool_timeout_response_counts_the_failure_4549() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // Read the counter once at the end: a `DebuggingRecorder` snapshot
+        // *resets* counters on read (`swap(0)`), so calling it mid-test would
+        // return only the increment since the previous call.
+        fn counted(snapshotter: &Snapshotter) -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, ..)| key.key().name() == "ak_db_pool_connection_failures_total")
+                .map(|(.., value)| match value {
+                    DebugValue::Counter(n) => n,
+                    other => panic!("expected a counter, got {other:?}"),
+                })
+                .unwrap_or(0)
+        }
+
+        let response = AppError::Sqlx(sqlx::Error::PoolTimedOut).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The stringified form the proxy hot path produces counts too: it is
+        // the same saturation, seen one layer further from sqlx.
+        let response = AppError::Database(sqlx::Error::PoolTimedOut.to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Errors that are not pool exhaustion leave the counter alone, so the
+        // total after all three responses is exactly the two pool timeouts.
+        let _ = AppError::NotFound("nope".into()).into_response();
+        assert_eq!(
+            counted(&snapshotter),
+            2,
+            "each pool timeout reaching the client increments the failure counter once"
+        );
     }
 
     #[test]

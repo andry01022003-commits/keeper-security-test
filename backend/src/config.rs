@@ -857,9 +857,17 @@ pub struct Config {
     /// value fails startup.
     pub metrics_bind_ip: std::net::IpAddr,
 
-    /// Maximum number of connections in the PostgreSQL pool.
-    /// Defaults to 20. Increase for higher concurrency, decrease for
+    /// Maximum number of connections in the PostgreSQL pool, per replica.
+    /// Defaults to 50. Increase for higher concurrency, decrease for
     /// databases with restricted connection budgets (e.g., shared RDS).
+    ///
+    /// Size the whole fleet, not one replica (#4549):
+    /// `DATABASE_MAX_CONNECTIONS × replicas` + the single-flight lock/wait
+    /// connections held outside the pool (capped per replica by
+    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`) + headroom for one
+    /// rolling-update surge replica must stay below Postgres
+    /// `max_connections`. The defaults give 3 × 50 = 150 against a stock
+    /// server's 100; see the Database section of `.env.example`.
     pub database_max_connections: u32,
 
     /// Minimum number of idle connections kept in the PostgreSQL pool.

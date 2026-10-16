@@ -18,6 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::PgPool;
 
+use crate::db::TCP_KEEPALIVES as LOCK_SESSION_KEEPALIVES;
 use crate::error::Result;
 
 /// Dedicated advisory-lock namespace (`classid`) for proxy cache hydration.
@@ -123,21 +124,24 @@ pub trait ClusterLock: Send + Sync {
 /// Poll cadence of the provided [`ClusterLock::acquire_blocking`] body.
 pub const BLOCKING_ACQUIRE_POLL: Duration = Duration::from_millis(5);
 
-/// Server-side TCP keepalives for a session that holds or waits on an advisory
-/// lock (#4013): idle seconds, probe interval seconds, probe count.
+/// Arm [`LOCK_SESSION_KEEPALIVES`] on a dedicated lock session.
 ///
-/// When a replica's node disappears (force-deleted pod, node loss) its
-/// sockets close silently: no FIN, no RST. Postgres then keeps the dead
-/// session, and the advisory lock it holds, until the kernel's default
-/// keepalive gives up (about two hours on Linux). With these the server
-/// declares the peer dead after about `idle + interval * count` = 30 s and
-/// ends the session, which releases the lock and wakes the waiters on the
-/// other replicas. Only the dedicated lock sessions get them, never the pool.
-const LOCK_SESSION_KEEPALIVES: (&str, &str, &str) = ("15", "5", "3");
-
-/// Arm [`LOCK_SESSION_KEEPALIVES`] on a dedicated lock session. Best-effort:
-/// a Unix-socket session ignores them and a failure only keeps the server's
-/// defaults, so errors are not surfaced.
+/// The values are shared with the pool (#4549), one source of truth for the
+/// ~30 s dead-peer reclaim, so a lock session can never diverge from the
+/// connections around it. When a replica's node disappears (force-deleted
+/// pod, node loss) its sockets close silently — no FIN, no RST — and
+/// Postgres keeps the dead session, and the advisory lock it holds, until the
+/// kernel's default keepalive gives up (about two hours on Linux). With
+/// these the server declares the peer dead after about
+/// `idle + interval * count` = 30 s and ends the session, which releases the
+/// lock and wakes the waiters on the other replicas. Since #4549 the pool
+/// arms them at connect time too; the explicit re-arm here keeps #4013's
+/// guarantee independent of how the session was obtained (tests build pools
+/// without the pool's connect options), so a stale lock can never outlive a
+/// stale connection.
+///
+/// Best-effort: a Unix-socket session ignores them and a failure only keeps
+/// the server's defaults, so errors are not surfaced.
 async fn arm_dead_peer_keepalives(conn: &mut sqlx::PgConnection) {
     let (idle, interval, count) = LOCK_SESSION_KEEPALIVES;
     let _ = sqlx::query(
