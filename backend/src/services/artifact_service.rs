@@ -1309,6 +1309,19 @@ impl ArtifactService {
         // through it too would double-deliver every generic upload.
         self.emit_artifact_event("artifact.uploaded", &artifact);
 
+        // #4642: nothing was calling record_artifact_upload, so neither
+        // ak_artifact_uploads_total nor the size histogram ever showed up in a
+        // scrape. Here rather than in the callers because both upload paths
+        // come through this function, and after the commit so a failed upload
+        // doesn't get counted.
+        if let Some(repo) = repo_for_upload.as_ref() {
+            crate::services::metrics_service::record_artifact_upload(
+                &repo.key,
+                repo.format.as_key(),
+                u64::try_from(artifact.size_bytes).unwrap_or(0),
+            );
+        }
+
         Ok(artifact)
     }
 
