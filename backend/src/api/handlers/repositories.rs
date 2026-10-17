@@ -29224,15 +29224,24 @@ mod tests {
             "one audit row per upstream-auth write: {details:?}"
         );
 
+        // Each row is written by its own detached task, so the two inserts can
+        // land in either order; pick each transition out by its content.
+        let set = changes
+            .iter()
+            .find(|c| c["auth_type"] == "basic")
+            .unwrap_or_else(|| panic!("no none -> basic row: {changes:?}"));
+        let removed = changes
+            .iter()
+            .find(|c| c["auth_type"].is_null())
+            .unwrap_or_else(|| panic!("no basic -> none row: {changes:?}"));
+
         // none -> basic: credentials set.
-        assert!(changes[0]["previous_auth_type"].is_null(), "{}", changes[0]);
-        assert_eq!(changes[0]["auth_type"], "basic");
-        assert_eq!(changes[0]["credentials_changed"], true);
+        assert!(set["previous_auth_type"].is_null(), "{set}");
+        assert_eq!(set["credentials_changed"], true);
 
         // basic -> none: credentials removed.
-        assert_eq!(changes[1]["previous_auth_type"], "basic");
-        assert!(changes[1]["auth_type"].is_null(), "{}", changes[1]);
-        assert_eq!(changes[1]["credentials_changed"], true);
+        assert_eq!(removed["previous_auth_type"], "basic");
+        assert_eq!(removed["credentials_changed"], true);
 
         // Neither row may carry the credential values.
         let serialized = serde_json::to_string(&details).unwrap();
