@@ -118,7 +118,13 @@ fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> 
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(e) => {
+                tracing::debug!(index = i, error = %e, "swift manifest extraction: skipped entry with undecodable name");
+                continue;
+            }
+        };
         let is_top_level = name == "Package.swift";
         let is_nested = name.ends_with("/Package.swift");
         if !is_top_level && !is_nested {
@@ -2371,7 +2377,7 @@ mod catalog_registration_tests {
         let mut buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
             writer.start_file("Package.swift", opts).unwrap();
             writer.write_all(b"// swift-tools-version:5.9\n").unwrap();
             writer.finish().unwrap();

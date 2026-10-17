@@ -741,6 +741,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #4133: a CI OIDC provider whose audience is a Kubernetes API server's
+    // accepts every pod's default ServiceAccount token. Create and update
+    // refuse one now; name those stored before, once per boot, unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::ci_oidc_service::warn_kubernetes_api_server_audiences(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // #1331: name every signing key that is bound to Debian/RPM metadata
     // signing but cannot produce OpenPGP signatures (legacy PEM / X.509 keys),
     // once per boot; with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true, replace each
@@ -1157,6 +1170,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         [artifact_keeper_backend::api::middleware::rate_limit::CidrRange],
     > = config.rate_limit_trusted_proxy_cidrs.clone().into();
 
+    // With trusted proxies configured but no XFF_TRUSTED_FOR_AUTHZ
+    // assertion, authorization-grade client-IP resolution fails closed:
+    // IP-conditioned permission rules (#1849) deny every proxied request and
+    // auth-audit rows record NULL for the client IP. That is the safe
+    // default — a proxy that does not append XFF leaves the chain wholly
+    // attacker-controlled — but it surprises operators whose topology IS
+    // appending, so say so loudly at startup.
+    if !config.rate_limit_trusted_proxy_cidrs.is_empty() && !config.xff_trusted_for_authz {
+        tracing::warn!(
+            "RATE_LIMIT_TRUSTED_PROXY_CIDRS is set but XFF_TRUSTED_FOR_AUTHZ is not: \
+             IP-conditioned permission rules (allowed_cidrs) and auth-audit IP attribution \
+             resolve the client as UNKNOWN for requests arriving through trusted proxies \
+             (fail closed). Set XFF_TRUSTED_FOR_AUTHZ=true only after confirming every \
+             trusted proxy APPENDS X-Forwarded-For (Caddy and ingress-nginx do; Envoy \
+             Gateway passes inbound XFF through unsanitized)."
+        );
+    }
+
     // Build router
     let app = Router::new()
         .merge(api::routes::create_router(state))
@@ -1365,6 +1396,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         );
         let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
+        let header_read_timeout = config.http_header_read_timeout();
         tokio::spawn(async move {
             let metrics_app = Router::new()
                 .route(
@@ -1375,9 +1407,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             match tokio::net::TcpListener::bind(metrics_addr).await {
                 Ok(listener) => {
                     tracing::info!("Metrics listener on {}", metrics_addr);
-                    if let Err(e) = axum::serve(listener, metrics_app)
-                        .with_graceful_shutdown(async move { metrics_shutdown.cancelled().await })
-                        .await
+                    if let Err(e) = artifact_keeper_backend::api::serve::serve(
+                        listener,
+                        metrics_app.into_make_service(),
+                        header_read_timeout,
+                        async move { metrics_shutdown.cancelled().await },
+                    )
+                    .await
                     {
                         tracing::error!("Metrics listener error: {}", e);
                     }
@@ -1411,9 +1447,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // injecting `ConnectInfo` fails here at startup. Gated to the serve path
     // so unit tests that build the Router directly never trip it.
     assert_connect_info_wired(app.clone()).await;
-    axum::serve(listener, connect_info_make_service(app))
-        .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
-        .await?;
+    //
+    // Served through `api::serve` rather than `axum::serve` so slow clients
+    // are bounded by HTTP_HEADER_READ_TIMEOUT_SECS (#4665): axum 0.7 sets no
+    // hyper timer, so a client trickling its request head held the socket
+    // indefinitely.
+    artifact_keeper_backend::api::serve::serve(
+        listener,
+        connect_info_make_service(app),
+        config.http_header_read_timeout(),
+        async move { http_shutdown_token.cancelled().await },
+    )
+    .await?;
 
     tracing::info!("HTTP server shut down");
 
@@ -1421,7 +1466,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 }
 
 /// The single source of truth for installing `ConnectInfo<SocketAddr>` on the
-/// HTTP serve path (#2023). Both the real `axum::serve` call and the boot-time
+/// HTTP serve path (#2023). Both the real `api::serve::serve` call and the boot-time
 /// guard route through this adapter, so the guard validates exactly the wiring
 /// that is served — reverting it (e.g. to a plain `into_make_service()`) is a
 /// one-line change here that the guard then catches at startup.

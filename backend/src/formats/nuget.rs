@@ -291,7 +291,12 @@ impl NugetHandler {
                 .by_index(i)
                 .map_err(|e| AppError::Validation(format!("Failed to read nupkg entry: {}", e)))?;
 
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|e| {
+                    AppError::Validation(format!("Failed to read nupkg entry name: {}", e))
+                })?
+                .into_owned();
 
             if name.ends_with(".nuspec") {
                 // Bounded (#4102): the proxy scan gate parses UPSTREAM bytes

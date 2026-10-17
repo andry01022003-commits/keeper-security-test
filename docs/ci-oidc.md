@@ -222,7 +222,10 @@ publish:
 - The access token lives for the configured access-token TTL (15 minutes by
   default), and never longer than the ID token that bought it. Docker does not
   refresh credentials, so a job that runs longer must exchange again before
-  its next push. `expires_in` gives the real lifetime.
+  its next push. `expires_in` gives the real lifetime. An ID token that has
+  already expired is refused with 401, even inside the 60 s clock-skew leeway
+  its signature check allows, rather than exchanged for an access token that
+  is born expired (#4663).
 
 GitHub Actions uses the same exchange. Request `permissions: id-token: write`,
 fetch the token from `$ACTIONS_ID_TOKEN_REQUEST_URL` with the provider's
@@ -396,8 +399,12 @@ provider to request tokens for it. Never use the API server's own audience
 - a token presented to Artifact Keeper would also be valid against the API
   server.
 
-Artifact Keeper does not yet refuse such an audience when a provider is
-created (#4133), so check it yourself.
+Creating or updating a provider with `https://kubernetes.default.svc` or
+`https://kubernetes.default.svc.cluster.local` as its audience is refused with
+400 (#4133). A provider stored with one before that check is kept, and named
+in a `security` warning at every startup until its audience is changed. Values
+your cluster adds with `--api-audiences` are not known to Artifact Keeper, so
+check those yourself.
 
 ### Mappings for namespaces and ServiceAccounts
 

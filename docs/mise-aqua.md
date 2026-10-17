@@ -32,7 +32,9 @@ If you configure a GitHub token as upstream authentication, **every reader of th
 mirror must be trusted to access everything that token can read**. These formats
 reuse generic forwarding and do not impose a GitHub path allow-list. Repository
 access protects cached responses as well as cache misses, but does not reproduce
-GitHub's per-user permissions. Do not make a token-backed mirror public.
+GitHub's per-user permissions. Do not make a token-backed mirror public: the
+server refuses it unless `allow_public_with_upstream_credentials: true` is sent
+(see [repository visibility](repository-visibility.md#public-remotes-with-upstream-credentials)).
 
 Use separate mirrors and narrowly scoped upstream tokens for separate trust
 groups. Artifact Keeper credentials authenticate clients to the mirror; a

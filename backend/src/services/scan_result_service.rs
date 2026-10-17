@@ -773,15 +773,26 @@ impl ScanResultService {
     /// the verdict was received, which is the only instant this side of the
     /// seam can attest to. A scanner's own timing is its business and is not
     /// trusted into columns the janitor and the dedup window read.
-    pub async fn create_completed_scan_result(
+    ///
+    /// #4667: the row and its findings are written in ONE transaction. They
+    /// used to be two autocommit statements, so a findings insert that failed
+    /// (a NUL byte in a text field was the observed case) left a `completed`
+    /// row behind with no findings under it: a clean verdict nobody issued,
+    /// which every gate that reads the latest scan would honour.
+    pub async fn create_completed_scan_with_findings(
         &self,
         artifact_id: Uuid,
         repository_id: Uuid,
         scan_type: &str,
-        findings_count: i32,
         counts: [i32; 5],
         scanner_version: Option<&str>,
+        findings: &[RawFinding],
     ) -> Result<ScanResult> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         let result = sqlx::query_as!(
             ScanResult,
             r#"
@@ -799,7 +810,7 @@ impl ScanResultService {
             artifact_id,
             repository_id,
             scan_type,
-            findings_count,
+            findings.len() as i32,
             counts[0],
             counts[1],
             counts[2],
@@ -807,9 +818,14 @@ impl ScanResultService {
             counts[4],
             scanner_version,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        insert_findings(&mut *tx, result.id, artifact_id, findings).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
     }
@@ -1826,76 +1842,7 @@ impl ScanResultService {
         artifact_id: Uuid,
         findings: &[RawFinding],
     ) -> Result<()> {
-        if findings.is_empty() {
-            return Ok(());
-        }
-
-        let severities: Vec<String> = findings
-            .iter()
-            .map(|f| severity_to_db_string(f.severity))
-            .collect();
-        let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
-        let descriptions: Vec<Option<&str>> =
-            findings.iter().map(|f| f.description.as_deref()).collect();
-        let cve_ids: Vec<Option<&str>> = findings.iter().map(|f| f.cve_id.as_deref()).collect();
-        let affected_components: Vec<Option<&str>> = findings
-            .iter()
-            .map(|f| f.affected_component.as_deref())
-            .collect();
-        let affected_versions: Vec<Option<&str>> = findings
-            .iter()
-            .map(|f| f.affected_version.as_deref())
-            .collect();
-        let fixed_versions: Vec<Option<&str>> = findings
-            .iter()
-            .map(|f| f.fixed_version.as_deref())
-            .collect();
-        let sources: Vec<Option<&str>> = findings.iter().map(|f| f.source.as_deref()).collect();
-        let source_urls: Vec<Option<&str>> =
-            findings.iter().map(|f| f.source_url.as_deref()).collect();
-        let finding_classes: Vec<&str> =
-            findings.iter().map(|f| f.finding_class.as_str()).collect();
-
-        sqlx::query!(
-            r#"
-            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
-                description, cve_id, affected_component, affected_version, fixed_version,
-                source, source_url, finding_class)
-            SELECT $1, $2, severity, title, description,
-                   cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url, finding_class
-            FROM UNNEST(
-                $3::text[],
-                $4::text[],
-                $5::text[],
-                $6::text[],
-                $7::text[],
-                $8::text[],
-                $9::text[],
-                $10::text[],
-                $11::text[],
-                $12::text[]
-            ) AS t(severity, title, description, cve_id, affected_component,
-                   affected_version, fixed_version, source, source_url, finding_class)
-            "#,
-            scan_result_id,
-            artifact_id,
-            &severities as &[String],
-            &titles as &[&str],
-            &descriptions as &[Option<&str>],
-            &cve_ids as &[Option<&str>],
-            &affected_components as &[Option<&str>],
-            &affected_versions as &[Option<&str>],
-            &fixed_versions as &[Option<&str>],
-            &sources as &[Option<&str>],
-            &source_urls as &[Option<&str>],
-            &finding_classes as &[&str],
-        )
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(())
+        insert_findings(&self.db, scan_result_id, artifact_id, findings).await
     }
 
     /// Finding identities from the LATEST completed `dependency` scan of one
@@ -2592,6 +2539,89 @@ impl ScanResultService {
 
         Ok(hosted + count_blocked_proxy_digests(&rows))
     }
+}
+
+/// The single-statement UNNEST insert behind
+/// [`ScanResultService::create_findings`], generic over the executor so
+/// [`ScanResultService::create_completed_scan_with_findings`] can run it
+/// inside the transaction that wrote the scan row (#4667).
+async fn insert_findings<'e, E>(
+    executor: E,
+    scan_result_id: Uuid,
+    artifact_id: Uuid,
+    findings: &[RawFinding],
+) -> Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    let severities: Vec<String> = findings
+        .iter()
+        .map(|f| severity_to_db_string(f.severity))
+        .collect();
+    let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+    let descriptions: Vec<Option<&str>> =
+        findings.iter().map(|f| f.description.as_deref()).collect();
+    let cve_ids: Vec<Option<&str>> = findings.iter().map(|f| f.cve_id.as_deref()).collect();
+    let affected_components: Vec<Option<&str>> = findings
+        .iter()
+        .map(|f| f.affected_component.as_deref())
+        .collect();
+    let affected_versions: Vec<Option<&str>> = findings
+        .iter()
+        .map(|f| f.affected_version.as_deref())
+        .collect();
+    let fixed_versions: Vec<Option<&str>> = findings
+        .iter()
+        .map(|f| f.fixed_version.as_deref())
+        .collect();
+    let sources: Vec<Option<&str>> = findings.iter().map(|f| f.source.as_deref()).collect();
+    let source_urls: Vec<Option<&str>> = findings.iter().map(|f| f.source_url.as_deref()).collect();
+    let finding_classes: Vec<&str> = findings.iter().map(|f| f.finding_class.as_str()).collect();
+
+    sqlx::query!(
+        r#"
+            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
+                description, cve_id, affected_component, affected_version, fixed_version,
+                source, source_url, finding_class)
+            SELECT $1, $2, severity, title, description,
+                   cve_id, affected_component, affected_version, fixed_version,
+                   source, source_url, finding_class
+            FROM UNNEST(
+                $3::text[],
+                $4::text[],
+                $5::text[],
+                $6::text[],
+                $7::text[],
+                $8::text[],
+                $9::text[],
+                $10::text[],
+                $11::text[],
+                $12::text[]
+            ) AS t(severity, title, description, cve_id, affected_component,
+                   affected_version, fixed_version, source, source_url, finding_class)
+            "#,
+        scan_result_id,
+        artifact_id,
+        &severities as &[String],
+        &titles as &[&str],
+        &descriptions as &[Option<&str>],
+        &cve_ids as &[Option<&str>],
+        &affected_components as &[Option<&str>],
+        &affected_versions as &[Option<&str>],
+        &fixed_versions as &[Option<&str>],
+        &sources as &[Option<&str>],
+        &source_urls as &[Option<&str>],
+        &finding_classes as &[&str],
+    )
+    .execute(executor)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
 }
 
 #[cfg(ak_test_shard = "services-2")]

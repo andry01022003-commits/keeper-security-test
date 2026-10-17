@@ -1298,18 +1298,15 @@ impl GrypeScanner {
             return Ok(None);
         };
 
+        // Per scan job, not per artifact (#4668): a second scan of the same
+        // image used to `remove_dir_all` the layout the first was reading.
         let layout_dir = PathBuf::from(&self.scan_workspace)
             .join("grype-oci")
-            .join(artifact.id.to_string());
-        if tokio::fs::metadata(&layout_dir).await.is_ok() {
-            tokio::fs::remove_dir_all(&layout_dir).await.map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to reset Grype OCI layout workspace {}: {}",
-                    layout_dir.display(),
-                    e
-                ))
-            })?;
-        }
+            .join(format!(
+                "{}-{}",
+                artifact.id,
+                crate::services::scanner_service::scan_job_suffix()
+            ));
 
         let blob_dir = layout_dir.join("blobs").join("sha256");
         tokio::fs::create_dir_all(&blob_dir).await.map_err(|e| {
@@ -4069,7 +4066,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
             zip.start_file("acme_widget-1.2.3.dist-info/METADATA", opts)
                 .unwrap();
             zip.write_all(

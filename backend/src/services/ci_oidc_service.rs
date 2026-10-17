@@ -349,6 +349,65 @@ pub struct ProviderUpdate {
     pub previous_provider_type: Option<String>,
 }
 
+/// Audiences a Kubernetes API server accepts by default (#4133). A provider
+/// with one of these accepts every pod's default projected ServiceAccount
+/// token, and a token presented to Artifact Keeper is then also valid
+/// against the API server.
+pub const KUBERNETES_API_SERVER_AUDIENCES: &[&str] = &[
+    "https://kubernetes.default.svc",
+    "https://kubernetes.default.svc.cluster.local",
+];
+
+/// Whether `audience` is one of [`KUBERNETES_API_SERVER_AUDIENCES`], ignoring
+/// case, surrounding whitespace, trailing slashes and an explicit `:443`.
+pub fn is_kubernetes_api_server_audience(audience: &str) -> bool {
+    let normalized = audience.trim().to_ascii_lowercase();
+    let normalized = normalized.trim_end_matches('/');
+    let normalized = normalized.strip_suffix(":443").unwrap_or(normalized);
+    KUBERNETES_API_SERVER_AUDIENCES.contains(&normalized)
+}
+
+/// Refuse a requested provider `audience` that a Kubernetes API server also
+/// accepts (#4133), with a 400 naming it. Applies to every provider type:
+/// the risk comes from the audience, not the type label.
+fn validate_provider_audience(audience: &str) -> Result<()> {
+    if is_kubernetes_api_server_audience(audience) {
+        return Err(AppError::Validation(format!(
+            "audience '{audience}' is a Kubernetes API server audience: a provider with it \
+             accepts every pod's default ServiceAccount token, and those tokens are also valid \
+             against the API server. Use a dedicated audience such as 'artifact-keeper'"
+        )));
+    }
+    Ok(())
+}
+
+/// Log, once per boot, every stored provider whose audience a Kubernetes API
+/// server also accepts (#4133). Providers created before the audience was
+/// checked are kept as they are; this names them so an operator can fix
+/// them with `PUT /api/v1/admin/ci-oidc/{id}`.
+pub async fn warn_kubernetes_api_server_audiences(db: &PgPool) {
+    match CiOidcService::new(db.clone()).list().await {
+        Ok(providers) => {
+            for p in providers
+                .iter()
+                .filter(|p| is_kubernetes_api_server_audience(&p.audience))
+            {
+                tracing::warn!(
+                    target: "security",
+                    provider_id = %p.id,
+                    provider_name = %p.name,
+                    audience = %p.audience,
+                    is_enabled = p.is_enabled,
+                    "CI OIDC provider uses a Kubernetes API server audience: it accepts every \
+                     pod's default ServiceAccount token; change it to a dedicated audience \
+                     (PUT /api/v1/admin/ci-oidc/{{id}})"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("CI OIDC audience startup check failed: {e}"),
+    }
+}
+
 /// Provider types a create or update accepts. Only `kubernetes` changes the
 /// credentials minted (read-only, no refresh token), so an unrecognised value
 /// is refused instead of silently behaving as `generic`.
@@ -860,6 +919,7 @@ impl CiOidcService {
             None => "generic".to_string(),
         };
         let audience = req.audience.unwrap_or_else(|| "artifact-keeper".into());
+        validate_provider_audience(&audience)?;
         let is_enabled = req.is_enabled.unwrap_or(true);
         let (key_source, static_jwks) =
             resolve_key_material(req.key_source, req.static_jwks, None)?;
@@ -898,6 +958,9 @@ impl CiOidcService {
         req: UpdateCiOidcProviderRequest,
     ) -> Result<ProviderUpdate> {
         let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        if let Some(audience) = req.audience.as_deref() {
+            validate_provider_audience(audience)?;
+        }
         let mut tx = self.db.begin().await.map_err(db_err)?;
         let existing = sqlx::query_as::<_, CiOidcProvider>(concat!(
             "SELECT ",
@@ -2738,6 +2801,128 @@ mod tests {
             "with the toggle on, a private-IP issuer must get past SSRF validation \
              and fail at the connection layer, got: {msg}"
         );
+    }
+
+    /// #4133: the API server's own audiences are recognised in the forms an
+    /// operator is likely to paste; a dedicated audience is not.
+    #[test]
+    fn kubernetes_api_server_audiences_are_recognised() {
+        for aud in [
+            "https://kubernetes.default.svc",
+            "https://kubernetes.default.svc.cluster.local",
+            " HTTPS://Kubernetes.Default.Svc/ ",
+            "https://kubernetes.default.svc:443",
+            "https://kubernetes.default.svc.cluster.local:443/",
+        ] {
+            assert!(super::is_kubernetes_api_server_audience(aud), "{aud}");
+            let err = super::validate_provider_audience(aud).expect_err(aud);
+            assert!(
+                matches!(err, crate::error::AppError::Validation(_)),
+                "{err}"
+            );
+            assert!(err.to_string().contains(aud), "names the audience: {err}");
+        }
+        for aud in [
+            "artifact-keeper",
+            "https://artifact-keeper.example.com",
+            "https://kubernetes.default.svc.example.com",
+        ] {
+            assert!(!super::is_kubernetes_api_server_audience(aud), "{aud}");
+            assert!(super::validate_provider_audience(aud).is_ok(), "{aud}");
+        }
+    }
+
+    /// #4133: create and update refuse an API-server audience with a 400 and
+    /// write nothing; a provider stored with one before the check is named
+    /// by the startup warning.
+    #[tokio::test]
+    async fn provider_audience_equal_to_the_api_servers_is_refused() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let bad = "https://kubernetes.default.svc";
+        let name = format!("k8s-aud-{}", uuid::Uuid::new_v4());
+
+        let err = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: name.clone(),
+                provider_type: Some("kubernetes".to_string()),
+                issuer_url: "https://kubernetes.default.svc.cluster.local".to_string(),
+                audience: Some(bad.to_string()),
+                is_enabled: None,
+                key_source: None,
+                static_jwks: None,
+            })
+            .await
+            .expect_err("an API server audience must be refused on create");
+        assert!(
+            matches!(err, crate::error::AppError::Validation(_)),
+            "{err}"
+        );
+        assert!(err.to_string().contains(bad), "{err}");
+        let written: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ci_oidc_providers WHERE name = $1")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(written, 0, "a refused create writes nothing");
+
+        // A provider stored with one before the check existed.
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO ci_oidc_providers (name, provider_type, issuer_url, audience) \
+             VALUES ($1, 'kubernetes', 'https://k8s-aud.example.com', $2) RETURNING id",
+        )
+        .bind(&name)
+        .bind(format!("{bad}.cluster.local"))
+        .fetch_one(&pool)
+        .await
+        .expect("seed a legacy provider");
+
+        let logs = tdh::LogCapture::default();
+        {
+            let _guard = logs.install(tracing::Level::WARN);
+            super::warn_kubernetes_api_server_audiences(&pool).await;
+        }
+        let text = logs.text();
+        assert!(
+            text.lines().any(
+                |l| l.contains(&id.to_string()) && l.contains("Kubernetes API server audience")
+            ),
+            "the startup check names the provider: {text}"
+        );
+
+        let update = |audience: &str| super::UpdateCiOidcProviderRequest {
+            name: None,
+            provider_type: None,
+            issuer_url: None,
+            audience: Some(audience.to_string()),
+            is_enabled: Some(false),
+            key_source: None,
+            static_jwks: None,
+        };
+        let err = svc
+            .update(id, update(bad))
+            .await
+            .err()
+            .expect("an API server audience must be refused on update");
+        assert!(
+            matches!(err, crate::error::AppError::Validation(_)),
+            "{err}"
+        );
+        let stored = svc.get(id).await.expect("provider");
+        assert!(stored.is_enabled, "a refused update writes nothing");
+
+        let fixed = svc
+            .update(id, update("artifact-keeper"))
+            .await
+            .expect("a dedicated audience is accepted")
+            .provider;
+        assert_eq!(fixed.audience, "artifact-keeper");
+        assert!(!fixed.is_enabled);
+
+        svc.delete(id).await.expect("cleanup");
     }
 
     #[tokio::test]

@@ -1439,4 +1439,23 @@ mod make_http_request_span_tests {
             assert_eq!(uri, want);
         }
     }
+
+    /// A download ticket in the query string must not reach the span (#4675):
+    /// the `ticket` key was not in the #544 redaction list.
+    #[test]
+    fn a_download_ticket_is_redacted_before_it_reaches_the_span() {
+        let request = Request::builder()
+            .uri("/api/v1/repositories/r/download/pkg.tgz?ticket=tkt_livesecret&x=1")
+            .body(())
+            .expect("request builds");
+        let uri = captured_span_uri(&request);
+        assert!(
+            !uri.contains("tkt_livesecret"),
+            "the span's uri must not carry the download ticket, got {uri}"
+        );
+        assert_eq!(
+            uri,
+            "/api/v1/repositories/r/download/pkg.tgz?ticket=[REDACTED]&x=1"
+        );
+    }
 }

@@ -1943,25 +1943,6 @@ impl WasmPluginService {
     }
 
     // =========================================================================
-    // T063: Install from Local Path (Development)
-    // =========================================================================
-
-    /// Install a plugin from a local filesystem path.
-    /// Intended for development and testing purposes.
-    ///
-    /// Note: This is a placeholder - full implementation requires additional
-    /// method implementations for local path handling.
-    pub async fn install_from_local(&self, local_path: &str) -> Result<PluginInstallResult> {
-        info!("Installing plugin from local path: {}", local_path);
-
-        // For now, return an error - local installation not yet fully implemented
-        Err(AppError::Internal(
-            "Local plugin installation not yet implemented. Use Git or ZIP installation."
-                .to_string(),
-        ))
-    }
-
-    // =========================================================================
     // Helper Methods
     // =========================================================================
 

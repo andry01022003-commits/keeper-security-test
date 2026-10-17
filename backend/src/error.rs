@@ -149,6 +149,13 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// A 400 that carries its own machine-readable `code` instead of the
+    /// generic `VALIDATION_ERROR`, for a refusal a client is expected to
+    /// recognise and act on (e.g. `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`,
+    /// #4662, which a client answers by sending an explicit override).
+    #[error("Validation error ({code}): {message}")]
+    CodedValidation { code: &'static str, message: String },
+
     /// The request was well-formed and syntactically valid but asks for a
     /// configuration that is semantically unsupported in this release (e.g. a
     /// Debian proxy filter that requests metadata regeneration/re-signing, or
@@ -213,6 +220,13 @@ pub enum AppError {
     /// output) are NOT `NotFound` and stay on the `Internal` -> `failed` path.
     #[error("Scanner engine unavailable: {0}")]
     ScannerEngineUnavailable(String),
+
+    /// A route that exists in the API surface but whose behaviour is a known,
+    /// intentional gap in this release (#4671). 501 with a stable
+    /// `NOT_IMPLEMENTED` code rather than a 500: nothing failed, so it must
+    /// not page anyone, and a client can tell "not built" from "broke".
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 impl AppError {
@@ -271,6 +285,7 @@ impl AppError {
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
+            Self::CodedValidation { code, .. } => (StatusCode::BAD_REQUEST, code),
             Self::UnprocessableEntity(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY")
             }
@@ -304,6 +319,7 @@ impl AppError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SCANNER_ENGINE_UNAVAILABLE",
             ),
+            Self::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED"),
         }
     }
 
@@ -338,6 +354,9 @@ impl AppError {
                 tracing::Level::WARN
             }
             Self::QuotaExceeded(_) => tracing::Level::INFO,
+            // A 5xx by status, but an intentional, documented gap: nothing
+            // failed, so it must not read as a server fault in the logs.
+            Self::NotImplemented(_) => tracing::Level::INFO,
             _ if self.status_and_code().0.is_client_error() => tracing::Level::INFO,
             _ => tracing::Level::ERROR,
         }
@@ -380,7 +399,9 @@ impl AppError {
             | Self::BadGateway(msg)
             | Self::UpstreamAuth(msg)
             | Self::ServiceUnavailable(msg)
-            | Self::ScannerEngineUnavailable(msg) => msg.clone(),
+            | Self::ScannerEngineUnavailable(msg)
+            | Self::NotImplemented(msg) => msg.clone(),
+            Self::CodedValidation { message, .. } => message.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -621,6 +642,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_not_implemented_is_501_with_a_stable_code() {
+        let err = AppError::NotImplemented("Local plugin installation is not implemented".into());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED")
+        );
+        assert_eq!(
+            err.user_message(),
+            "Local plugin installation is not implemented"
+        );
+        assert_eq!(err.log_level(), tracing::Level::INFO);
+    }
+
     // -----------------------------------------------------------------------
     // HTTP status codes
     // -----------------------------------------------------------------------
@@ -681,6 +716,23 @@ mod tests {
             (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED")
         );
         assert_eq!(err.user_message(), "token service rejected");
+    }
+
+    #[test]
+    fn test_coded_validation_is_a_400_with_its_own_code_4662() {
+        let err = AppError::CodedValidation {
+            code: "PUBLIC_REMOTE_UPSTREAM_CREDENTIALS",
+            message: "refused".into(),
+        };
+        assert_eq!(
+            err.status_and_code(),
+            (
+                StatusCode::BAD_REQUEST,
+                "PUBLIC_REMOTE_UPSTREAM_CREDENTIALS"
+            )
+        );
+        assert_eq!(err.user_message(), "refused");
+        assert_eq!(err.log_level(), tracing::Level::INFO);
     }
 
     #[test]

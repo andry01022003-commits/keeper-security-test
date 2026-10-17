@@ -4055,6 +4055,7 @@ fn shard_index_info(
             created_at: None,
             repodata_revisions: Default::default(),
             channel_relations: None,
+            virtual_package_detectors: None,
         });
     info.subdir = subdir.to_string();
     info.base_url = PACKAGES_BASE_URL.to_string();
@@ -5813,7 +5814,12 @@ fn validate_conda_package(content: &[u8], filename: &str) -> Result<(), String> 
 
         // Check for info-*.tar.zst
         let file_names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+            .filter_map(|i| {
+                archive
+                    .by_index(i)
+                    .ok()
+                    .and_then(|f| f.name().ok().map(|n| n.into_owned()))
+            })
             .collect();
 
         let has_info = file_names
@@ -6659,7 +6665,7 @@ fn collect_conda_v2_scripts(content: &[u8]) -> CondaScriptHarvest {
         .filter(|idx| {
             archive
                 .by_index(*idx)
-                .is_ok_and(|f| is_conda_v2_scannable_member(f.name()))
+                .is_ok_and(|f| f.name().is_ok_and(|n| is_conda_v2_scannable_member(&n)))
         })
         .collect();
 
@@ -6667,7 +6673,10 @@ fn collect_conda_v2_scripts(content: &[u8]) -> CondaScriptHarvest {
         let Ok(file) = archive.by_index(idx) else {
             continue;
         };
-        let what = format!("conda member {}", file.name());
+        let what = match file.name() {
+            Ok(name) => format!("conda member {name}"),
+            Err(_) => format!("conda member #{idx}"),
+        };
         match zstd::Decoder::new(file) {
             Ok(decoder) => harvest.absorb(collect_conda_scripts_from_tar(decoder, &what)),
             Err(e) => {
@@ -20370,6 +20379,7 @@ mod cep16_proxy_tests {
             created_at: None,
             repodata_revisions: Default::default(),
             channel_relations: None,
+            virtual_package_detectors: None,
         };
         let digests: Vec<(String, Vec<u8>)> = shards
             .iter()

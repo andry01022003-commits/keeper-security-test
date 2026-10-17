@@ -1433,11 +1433,17 @@ pub struct SystemStats {
     tag = "admin",
     responses(
         (status = 200, description = "System statistics", body = SystemStats),
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<SystemStats>> {
+pub async fn get_system_stats(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<SystemStats>> {
+    // Instance-wide totals across every repository (#4550).
+    auth.require_unscoped_admin("instance-wide system statistics")?;
     let mut conn = state
         .db
         .acquire()
@@ -1894,6 +1900,13 @@ async fn query_downloads(
     })
 }
 
+/// Gate for the `/downloads*` listings: they return client IPs, users and
+/// paths from every repository, hosted and proxy, so a repository-scoped
+/// admin token is refused like on the hold queues (#4550, #4273).
+fn require_download_attribution_admin(auth: &AuthExtension) -> Result<()> {
+    auth.require_unscoped_admin("download attribution across repositories")
+}
+
 /// List attributed downloads (client IP + user), filterable by artifact,
 /// user, IP, and time range (#2365). Covers hosted artifact downloads and
 /// proxy pull-through serves alike, each row marked with its `source`
@@ -1907,14 +1920,16 @@ async fn query_downloads(
     responses(
         (status = 200, description = "Attributed download events", body = DownloadListResponse),
         (status = 400, description = "Invalid filter parameter"),
-        (status = 403, description = "Admin privileges required")
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_downloads(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListDownloadsQuery>,
 ) -> Result<Json<DownloadListResponse>> {
+    require_download_attribution_admin(&auth)?;
     Ok(Json(query_downloads(&state.db, &query).await?))
 }
 
@@ -1946,15 +1961,17 @@ pub async fn list_downloads(
     responses(
         (status = 200, description = "Downloads from the IP", body = DownloadListResponse),
         (status = 400, description = "Invalid IP address"),
-        (status = 403, description = "Admin privileges required")
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_downloads_by_ip(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(ip): Path<String>,
     Query(query): Query<ListDownloadsQuery>,
 ) -> Result<Json<DownloadListResponse>> {
+    require_download_attribution_admin(&auth)?;
     let ip: std::net::IpAddr = ip
         .parse()
         .map_err(|_| AppError::Validation("invalid IP address".to_string()))?;
@@ -1988,15 +2005,17 @@ pub async fn list_downloads_by_ip(
     ),
     responses(
         (status = 200, description = "Downloads by the user", body = DownloadListResponse),
-        (status = 403, description = "Admin privileges required")
+        (status = 403, description = "Admin privileges required, or the token is repository-scoped")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_downloads_by_user(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(user_id): Path<Uuid>,
     Query(query): Query<ListDownloadsQuery>,
 ) -> Result<Json<DownloadListResponse>> {
+    require_download_attribution_admin(&auth)?;
     let query = ListDownloadsQuery {
         user_id: Some(user_id),
         ..query
@@ -2660,6 +2679,29 @@ pub struct AdminApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4550: the `/downloads*` gate refuses a non-admin and a
+    /// repository-scoped admin, and admits an unrestricted admin.
+    #[test]
+    fn download_attribution_gate_refuses_repo_scoped_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+
+        let admin = tdh::admin_auth(Uuid::new_v4(), "dl-admin");
+        assert!(require_download_attribution_admin(&admin).is_ok());
+        let user = tdh::make_auth(Uuid::new_v4(), "dl-user");
+        assert!(matches!(
+            require_download_attribution_admin(&user),
+            Err(AppError::Authorization(_))
+        ));
+        let scoped = AuthExtension {
+            allowed_repo_ids: AccessScope::Restricted(vec![Uuid::new_v4()]),
+            ..admin
+        };
+        let err = require_download_attribution_admin(&scoped).expect_err("repo-scoped admin");
+        assert!(matches!(err, AppError::Authorization(_)), "{err}");
+        assert!(err.to_string().contains("Repository-scoped"), "{err}");
+    }
 
     // -----------------------------------------------------------------------
     // audit_page_bounds (#2366) — pure pagination arithmetic, no DB required so
@@ -3971,7 +4013,12 @@ mod tests {
 
         let mut matched = false;
         for _attempt in 0..5 {
-            let Json(before) = get_system_stats(State(state.clone())).await.unwrap();
+            let Json(before) = get_system_stats(
+                State(state.clone()),
+                Extension(tdh::admin_auth(Uuid::new_v4(), "stats-admin")),
+            )
+            .await
+            .unwrap();
 
             let digest_shared = format!("sha256:{:0>64}", Uuid::new_v4().simple());
             let digest_solo = format!("sha256:{:0>64}", Uuid::new_v4().simple());
@@ -4075,7 +4122,12 @@ mod tests {
                     .expect("reconcile usage ledger");
             }
 
-            let Json(after) = get_system_stats(State(state.clone())).await.unwrap();
+            let Json(after) = get_system_stats(
+                State(state.clone()),
+                Extension(tdh::admin_auth(Uuid::new_v4(), "stats-admin")),
+            )
+            .await
+            .unwrap();
 
             // Remove this attempt's rows before deciding, so a retry re-seeds
             // from a clean slate.
@@ -5085,5 +5137,29 @@ mod tests {
             matches!(patch_err, Some(AppError::ServiceUnavailable(_))),
             "{patch_err:?}"
         );
+    }
+}
+
+/// Through the real router: the `/admin` nest's `admin_middleware` plus the
+/// handler gate on the instance-wide listings (#4550).
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod router_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn downloads_and_stats_refuse_repo_scoped_admin_tokens() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let by_user = format!("/api/v1/admin/downloads/by-user/{}", fx.user_id);
+        let routes = [
+            "/api/v1/admin/downloads",
+            "/api/v1/admin/downloads/by-ip/127.0.0.1",
+            by_user.as_str(),
+            "/api/v1/admin/stats",
+        ];
+        tdh::assert_admin_routes_refuse_repo_scoped_tokens(&fx, &routes).await;
+        fx.teardown().await;
     }
 }

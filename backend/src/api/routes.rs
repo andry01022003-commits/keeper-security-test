@@ -17,9 +17,9 @@ use crate::error::AppError;
 use super::handlers;
 use super::middleware::auth::{
     admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
-    repo_visibility_middleware, RepoVisibilityState,
+    repo_visibility_middleware, repository_download_auth_middleware, RepoVisibilityState,
 };
-use super::middleware::client_ip::client_ip_context_middleware;
+use super::middleware::client_ip::{self, client_ip_context_middleware};
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
@@ -187,6 +187,10 @@ pub fn create_router(state: SharedState) -> Router {
         state.config.rate_limit_trusted_cidrs.clone(),
     ));
     let rate_limit_trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
+    let client_ip_config = Arc::new(client_ip::ClientIpConfig {
+        trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        xff_trusted_for_authz: state.config.xff_trusted_for_authz,
+    });
     let login_rate_limit_state = build_login_rate_limit_state(
         &state.config,
         &rate_limit_exemptions,
@@ -283,14 +287,19 @@ pub fn create_router(state: SharedState) -> Router {
     // X-Correlation-ID response header.
     router = router.layer(middleware::from_fn(correlation_id_middleware));
 
-    // Client-IP context (#3888/#1849). Resolves the request's client address
-    // once — TCP peer authoritative, `X-Forwarded-For` believed only for
-    // trusted-proxy peers (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the same policy
-    // the rate limiter keys on) — and scopes it as a request task-local so
-    // audit emission and IP-conditioned permission gates observe the same
-    // address without signature threading. Runs on every route.
+    // Client-IP context (#3888/#1849). Resolves the request's client
+    // address once, in two trust grades, and scopes them as a request
+    // task-local so consumers observe the same address without signature
+    // threading: the best-effort grade (rate-limit keying, upload guard,
+    // telemetry — TCP peer authoritative, `X-Forwarded-For` believed only
+    // for trusted-proxy peers per `RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the
+    // same policy the rate limiter keys on) and the authorization grade
+    // (IP-conditioned permission gates, auth-audit attribution — XFF-derived
+    // ONLY under the operator's `XFF_TRUSTED_FOR_AUTHZ` assertion, failing
+    // closed to "unknown" behind trusted proxies without it). Runs on every
+    // route.
     router = router.layer(middleware::from_fn_with_state(
-        rate_limit_trusted_proxies,
+        client_ip_config,
         client_ip_context_middleware,
     ));
 
@@ -859,12 +868,9 @@ fn api_v1_routes(
                 // Bulk artifact presence check for air-gap imports (#3427):
                 // POST /repositories/{key}/artifacts-missing.
                 .merge(handlers::artifact_presence::repo_router())
-                .merge(handlers::repositories::download_router().layer(
-                    middleware::from_fn_with_state(
-                        presign_rate_limit_state,
-                        rate_limit_by_ip_middleware,
-                    ),
-                ))
+                // `GET /repositories/{key}/download/{path}` is NOT merged
+                // here: it is nested separately below with its own
+                // authentication layer (#4654).
                 // Inside the auth layer below, so it sees the caller
                 // (GHSA-9f9r-c4w8-rjv9).
                 .layer(middleware::from_fn_with_state(
@@ -879,6 +885,34 @@ fn api_v1_routes(
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     optional_auth_middleware,
+                )),
+        )
+        // The generic download route, `GET /repositories/{key}/download/{path}`,
+        // takes the format routes' authentication contract rather than the
+        // management API's (#4654): an API token is accepted as the Basic
+        // password, and an anonymous request on a non-public repository is
+        // challenged with 401 so wget / curl / Maven send the credential on
+        // their retry. It is nested at the same prefix as a SEPARATE router so
+        // it does not sit under the `optional_auth_middleware` layer above,
+        // which would refuse the token-as-Basic-password (#2809) before this
+        // layer ran. The stricter per-IP presign-mint limiter (#1053) stays
+        // with it.
+        .nest(
+            "/repositories",
+            handlers::repositories::download_router()
+                .layer(middleware::from_fn_with_state(
+                    presign_rate_limit_state,
+                    rate_limit_by_ip_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    RepoVisibilityState {
+                        auth_service: auth_service.clone(),
+                        db: state.db.clone(),
+                        repo_cache: state.repo_cache.clone(),
+                        repo_miss_cache: state.repo_miss_cache.clone(),
+                        permission_service: state.permission_service.clone(),
+                    },
+                    repository_download_auth_middleware,
                 )),
         )
         // Artifact routes (standalone by ID) with optional auth.
@@ -1508,6 +1542,57 @@ mod tests {
         assert!(
             nest_body.contains("rate_limit_middleware"),
             "/auth/logout must keep the plain IP-keyed rate limiter"
+        );
+    }
+
+    #[test]
+    fn download_router_carries_its_own_auth_layer_not_optional_auth() {
+        // #4654: `GET /repositories/{key}/download/{path}` must be mounted
+        // under `repository_download_auth_middleware` (token-as-Basic-password
+        // accepted, anonymous callers challenged with 401) and must NOT sit
+        // under the `/repositories` nest's `optional_auth_middleware`, which
+        // would refuse the Basic token (#2809) before the download layer ran.
+        // The per-IP presign-mint limiter (#1053) has to move with it. A
+        // runtime test needs full app state; pin the routing decision in
+        // source like `logout_route_runs_through_optional_auth_middleware`.
+        // Only the production half of the file: this test's own text names
+        // the function too.
+        let production_src = ROUTES_RS_SRC
+            .split("#[cfg(test)]")
+            .next()
+            .expect("routes.rs has a test module");
+        assert_eq!(
+            production_src
+                .matches("handlers::repositories::download_router()")
+                .count(),
+            1,
+            "download_router() must be mounted exactly once"
+        );
+        let after = production_src
+            .split("handlers::repositories::download_router()")
+            .nth(1)
+            .expect("download_router() must be mounted");
+        // Code only: the comments around the mount (and on the nest that
+        // follows it) name both middlewares when explaining the split.
+        let mount: String = after
+            .split(".nest(")
+            .next()
+            .expect("download mount must be followed by other route registrations")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            mount.contains("repository_download_auth_middleware"),
+            "the download route must be layered with repository_download_auth_middleware (#4654)"
+        );
+        assert!(
+            !mount.contains("optional_auth_middleware"),
+            "the download route must not be layered with optional_auth_middleware (#4654)"
+        );
+        assert!(
+            mount.contains("rate_limit_by_ip_middleware"),
+            "the download route must keep its per-IP presign-mint limiter (#1053)"
         );
     }
 

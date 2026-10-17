@@ -127,6 +127,7 @@ fn test_config(storage_path: &str) -> Config {
         auth_max_concurrency: 8,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        http_header_read_timeout_secs: 10,
         upload_progress_window_secs: 60,
         upload_min_progress_bytes: 16 * 1024,
         upload_max_in_flight_per_principal: 64,
@@ -147,6 +148,7 @@ fn test_config(storage_path: &str) -> Config {
         rate_limit_exempt_service_accounts: false,
         rate_limit_trusted_cidrs: Vec::new(),
         rate_limit_trusted_proxy_cidrs: Vec::new(),
+        xff_trusted_for_authz: false,
         account_lockout_threshold: 5,
         account_lockout_duration_minutes: 30,
         quarantine_enabled: false,
@@ -263,7 +265,7 @@ fn build_composer_zip(name: &str, version: &str, description: &str) -> Vec<u8> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("composer.json", options)
             .expect("start composer.json");

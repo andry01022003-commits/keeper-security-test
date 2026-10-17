@@ -149,11 +149,29 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # the bump" rule, and it says so in overrides.yaml. The backend's grype and
 # buildctl carry the same x/net override in docker/Dockerfile.backend.
 #
+# 0.74.0-r4 -> 0.74.0-r5 (2026-10-17, #4713) is a dependency override alone,
+# no toolchain move: CVE-2026-95837 (HIGH, containerd's CRI checkpoint restore
+# bypasses the destination security context) was published against
+# github.com/containerd/containerd/v2 v2.3.3, which the r4 binary links for
+# trivy's containerd image source, and failed the gate on every main build
+# from 2026-10-17 with no byte of this repo changing. Upstream's fix is
+# v2.4.1 in trivy 0.75.0 and 0.76.0, and the trivy repo's policy would be to
+# bump TRIVY_VERSION to one of those; it cannot, because this adapter's
+# checkTrivyServer (remote.go) requires the bundled client and the trivy
+# server sidecar to report the same version, and the sidecar is pinned at
+# 0.74.0 in the compose files, the workflows and the chart. So r5 takes the
+# containerd patch-line fix (v2.3.4, plus the k8s.io/client-go and
+# k8s.io/component-base v0.36.3 that MVS moves with it) as a declared
+# exception in that repo's overrides.yaml (artifact-keeper/trivy#17). The
+# coordinated client+server move to 0.76.0, which empties that override list,
+# is #4712. VERSION moves 1.4.1 -> 1.4.2 because this file is part of the
+# adapter's versioned source set (RELEASING.md step 5).
+#
 # Pinned by DIGEST, not tag: that repo rebuilds weekly to pick up RPM errata,
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.74.0-r4 (note: no leading
+# This digest is the manifest-list digest of tag 0.74.0-r5 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -162,7 +180,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # probes the real version at startup (ProbeVersion). The upstream source tag
 # DID move this time — the bundled binary now reports `Version: 0.74.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:29f16523b5bb4cc61532eda0345968e4a0b449db6b20b1881a1133a4abd9c32b AS trivy
+FROM ghcr.io/artifact-keeper/trivy@sha256:91c8e3f6b452e8407479f030a99a1bd2bb30c6b529af720678811acbf0a67647 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
