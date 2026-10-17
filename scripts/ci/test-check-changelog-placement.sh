@@ -355,6 +355,11 @@ else
   fail "the assembler refused the --append fixture"
 fi
 
+# 19. ...but not once the version is tagged: that section is history, and the
+#     entry belongs to the next version.
+git -C "$r" tag v1.9.1 main
+run_case "fragment folded into a TAGGED section -> fail" 1 "already tagged"
+
 # 20. RECOGNITION (#4754): the Sponsors list of a shipped section is a credit,
 #     not a claim about what the release contains, so correcting it after the
 #     tag is allowed. The branch adds a `### Sponsors` block with a bullet to
@@ -384,11 +389,6 @@ open(p, 'w').write(s)
 PY
 commit_pr
 run_case "thank-you bullet added under a released ### Thank You -> pass" 0 "recognition heading of a shipped section"
-
-# 19. ...but not once the version is tagged: that section is history, and the
-#     entry belongs to the next version.
-git -C "$r" tag v1.9.1 main
-run_case "fragment folded into a TAGGED section -> fail" 1 "already tagged"
 
 echo
 if [ "$fails" -gt 0 ]; then
