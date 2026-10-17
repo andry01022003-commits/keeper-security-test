@@ -259,6 +259,15 @@ impl StorageBackend for FilesystemStorage {
             let _ = fs::remove_file(&temp_path).await;
             return Err(e.into());
         }
+        // #4646: `tokio::fs::File::write_all` returns once the last chunk is
+        // handed to a background write, and `sync_all` drains that write but
+        // parks its error instead of returning it. `flush` is what surfaces
+        // it; without it a failed final write (ENOSPC, EIO, EFBIG) left a
+        // truncated temp file that was renamed into place as if complete.
+        if let Err(e) = file.flush().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
         if let Err(e) = file.sync_all().await {
             let _ = fs::remove_file(&temp_path).await;
             return Err(e.into());
@@ -526,7 +535,15 @@ impl StorageBackend for FilesystemStorage {
             }
         }
 
-        // Flush and sync to disk before renaming
+        // Flush and sync to disk before renaming. The explicit `flush` is
+        // load-bearing (#4646): tokio's `sync_all` drains the in-flight final
+        // write but swallows its error, so a failed last write would otherwise
+        // publish a truncated object while this returns the checksum and
+        // length of the full stream.
+        if let Err(e) = file.flush().await {
+            remove_temp_file_best_effort(&temp_path, "filesystem stream flush failed").await;
+            return Err(AppError::Storage(format!("Write error: {}", e)));
+        }
         if let Err(e) = file.sync_all().await {
             remove_temp_file_best_effort(&temp_path, "filesystem stream sync failed").await;
             return Err(AppError::Storage(format!("Sync error: {}", e)));
@@ -1467,6 +1484,91 @@ mod tests {
         match storage.get("lifecycle-key").await.unwrap_err() {
             AppError::NotFound(_) => {}
             other => panic!("post-delete get must be NotFound, got {:?}", other),
+        }
+    }
+
+    /// Cap this process's file size with `RLIMIT_FSIZE` (SIGXFSZ ignored, so an
+    /// over-limit `write(2)` fails with `EFBIG` instead of killing the process)
+    /// for the duration of `body`. The limit is process-wide, so this only runs
+    /// under cargo-nextest, which gives every test its own process; under
+    /// `cargo test` it would fail unrelated tests writing files concurrently.
+    async fn with_file_size_limit<F, Fut>(limit: u64, body: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        if std::env::var_os("NEXTEST_RUN_ID").is_none() {
+            eprintln!("skipping RLIMIT_FSIZE test outside cargo-nextest");
+            return false;
+        }
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: plain libc calls on stack-owned, initialised structs.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut old), 0);
+            let new = libc::rlimit {
+                rlim_cur: limit as libc::rlim_t,
+                rlim_max: old.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &new), 0);
+        }
+        body().await;
+        // SAFETY: as above; restores the limit read before the test.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_FSIZE, &old);
+        }
+        true
+    }
+
+    /// #4646: a write that fails on the LAST buffered `tokio::fs::File` write
+    /// (here EFBIG; in production ENOSPC/EIO on the scratch volume) must fail
+    /// `put_stream`. tokio's `sync_all` drains the in-flight write but parks
+    /// its error instead of returning it, so without an explicit `flush` the
+    /// truncated temp file was renamed into place and `put_stream` returned
+    /// Ok with the checksum and length of the bytes it was *given*. An OCI
+    /// PATCH part stored that way is later concatenated short and the upload
+    /// fails with DIGEST_INVALID on a digest that matches nothing sent.
+    #[tokio::test]
+    async fn put_stream_fails_when_final_buffered_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let ran = with_file_size_limit(4096, || async {
+            let data = Bytes::from(vec![0x5a_u8; 64 * 1024]);
+            let stream: BoxStream<'static, Result<Bytes>> =
+                Box::pin(futures::stream::iter(vec![Ok(data)]));
+            let result = storage.put_stream("oci-uploads/part", stream).await;
+            assert!(
+                result.is_err(),
+                "put_stream must surface the failed final write, got {:?}",
+                result.map(|r| r.bytes_written)
+            );
+        })
+        .await;
+        if ran {
+            assert!(
+                !storage.exists("oci-uploads/part").await.unwrap(),
+                "a failed put_stream must not publish a truncated object"
+            );
+        }
+    }
+
+    /// #4646: the same lost-final-write hole in buffered `put`.
+    #[tokio::test]
+    async fn put_fails_when_final_buffered_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let ran = with_file_size_limit(4096, || async {
+            let result = storage
+                .put("blob", Bytes::from(vec![0x5a_u8; 64 * 1024]))
+                .await;
+            assert!(result.is_err(), "put must surface the failed final write");
+        })
+        .await;
+        if ran {
+            assert!(!storage.exists("blob").await.unwrap());
         }
     }
 }

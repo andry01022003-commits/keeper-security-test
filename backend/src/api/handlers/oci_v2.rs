@@ -1994,8 +1994,28 @@ fn storage_concat_stream(
                 continue;
             }
             let mut stream = storage.get_stream(&part.storage_key).await?;
+            let mut read: i64 = 0;
             while let Some(chunk) = stream.next().await {
-                yield chunk?;
+                let chunk = chunk?;
+                read += chunk.len() as i64;
+                yield chunk;
+            }
+            // #4646: a part whose stored object is not the length its PATCH
+            // recorded is a storage fault, not a client digest error. Fail the
+            // concatenation (500) and say which part, instead of hashing short
+            // bytes and answering DIGEST_INVALID with a digest the client
+            // never sent.
+            if read != part.size_bytes {
+                tracing::error!(
+                    storage_key = %part.storage_key,
+                    expected_bytes = part.size_bytes,
+                    stored_bytes = read,
+                    "OCI upload part length in storage does not match the length recorded at PATCH"
+                );
+                Err(AppError::Storage(format!(
+                    "upload part {} holds {} bytes, expected {}",
+                    part.storage_key, read, part.size_bytes
+                )))?;
             }
         }
     })
@@ -8054,6 +8074,20 @@ async fn handle_complete_upload(
             }
         };
         if computed != requested_digest {
+            // #4646: enough to tell a client that sent other bytes from a
+            // server that assembled the parts wrong, without the client logs.
+            warn!(
+                upload_session_id = %session_id,
+                bytes_received = session.bytes_received,
+                assembled_bytes = put_result.bytes_written,
+                parts = ?parts
+                    .iter()
+                    .map(|p| (p.storage_key.as_str(), p.size_bytes))
+                    .collect::<Vec<_>>(),
+                computed = %computed.as_prefixed(),
+                provided = %digest,
+                "OCI chunked upload digest mismatch"
+            );
             delete_storage_key_best_effort(
                 &storage,
                 &completion_temp_key,
@@ -26003,6 +26037,311 @@ mod oci_blob_upload_streaming_tests {
         .expect("heartbeat must invalidate the lease when its token no longer owns the row");
         assert!(!heartbeat.lease_is_valid());
 
+        f.teardown().await;
+    }
+
+    fn patch_request(
+        uri: String,
+        authorization: &str,
+        start: usize,
+        chunk: Bytes,
+        with_range: bool,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::PATCH)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .header(CONTENT_LENGTH, chunk.len().to_string());
+        if with_range {
+            builder = builder.header(
+                "Content-Range",
+                format!("{}-{}", start, start + chunk.len() - 1),
+            );
+        }
+        builder.body(Body::from(chunk)).expect("build PATCH")
+    }
+
+    async fn start_session(f: &OciUploadFixture, app: &Router) -> Uuid {
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "start upload: {:?}", body);
+        headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID")
+    }
+
+    fn patterned_chunk(seed: u64, len: usize) -> Bytes {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        Bytes::from(out)
+    }
+
+    /// One session of the #4646 stress: two PATCH chunks, each raced against a
+    /// duplicate of itself (a client/proxy retry while the first is still
+    /// streaming), a replayed PATCH of chunk 0 after it landed, an out-of-order
+    /// chunk, then the commit. Whatever wins each race, the committed blob must
+    /// be exactly chunk0 || chunk1.
+    async fn chunked_upload_under_retries(
+        f: Arc<OciUploadFixture>,
+        app: Router,
+        seed: u64,
+        chunk_len: usize,
+        with_range: bool,
+    ) {
+        let chunk0 = patterned_chunk(seed, chunk_len);
+        let chunk1 = patterned_chunk(seed + 1_000_000, chunk_len);
+        let mut whole = chunk0.to_vec();
+        whole.extend_from_slice(&chunk1);
+        let digest = compute_sha256(&whole);
+        let uuid = start_session(&f, &app).await;
+        let uri = format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, uuid);
+
+        for (start, chunk) in [(0, &chunk0), (chunk_len, &chunk1)] {
+            if start > 0 && with_range {
+                // Out-of-order: a chunk that skips ahead is refused, not appended.
+                let (status, _, _) = send(
+                    app.clone(),
+                    patch_request(
+                        uri.clone(),
+                        &f.authorization,
+                        start + chunk_len,
+                        chunk.clone(),
+                        true,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+            }
+            let (a, b) = tokio::join!(
+                send(
+                    app.clone(),
+                    patch_request(
+                        uri.clone(),
+                        &f.authorization,
+                        start,
+                        chunk.clone(),
+                        with_range
+                    )
+                ),
+                send(
+                    app.clone(),
+                    patch_request(
+                        uri.clone(),
+                        &f.authorization,
+                        start,
+                        chunk.clone(),
+                        with_range
+                    )
+                ),
+            );
+            let accepted = [a.0, b.0]
+                .iter()
+                .filter(|s| **s == StatusCode::ACCEPTED)
+                .count();
+            if with_range {
+                assert_eq!(
+                    accepted, 1,
+                    "exactly one of two racing PATCHes for the same range may land: {} / {}",
+                    a.0, b.0
+                );
+            } else if accepted == 2 {
+                // Without Content-Range a PATCH is a plain append (the OCI
+                // streaming upload); a duplicate that lands after the first is
+                // appended by design. That session cannot commit chunk0||chunk1,
+                // so stop here; the race itself must still not corrupt state.
+                let (status, _, _) = send(
+                    app.clone(),
+                    request(
+                        Method::PUT,
+                        format!("{}?digest={}", uri, digest),
+                        &f.authorization,
+                        Bytes::new(),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                return;
+            }
+            for (status, _, body) in [&a, &b] {
+                assert!(
+                    *status == StatusCode::ACCEPTED
+                        || *status == StatusCode::CONFLICT
+                        || *status == StatusCode::RANGE_NOT_SATISFIABLE,
+                    "unexpected PATCH status {}: {:?}",
+                    status,
+                    body
+                );
+            }
+            if with_range {
+                // A replay of the range that already landed is refused.
+                let (status, _, _) = send(
+                    app.clone(),
+                    patch_request(uri.clone(), &f.authorization, start, chunk.clone(), true),
+                )
+                .await;
+                assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+            }
+        }
+
+        let (status, _, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!("{}?digest={}", uri, digest),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "commit of chunk0||chunk1 refused: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            f.storage().get(&blob_storage_key(&digest)).await.unwrap(),
+            Bytes::from(whole)
+        );
+    }
+
+    /// #4646: many concurrent chunked sessions with racing, replayed and
+    /// out-of-order PATCHes, interleaved with monolithic pushes to the same
+    /// repository, must never commit or reject on a wrong digest.
+    /// `AK_OCI_4646_SESSIONS` / `AK_OCI_4646_CHUNK_BYTES` scale it up locally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunked_upload_stress_retries_and_races_keep_digest_exact() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let f = Arc::new(f);
+        let app = f.app();
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let sessions = env("AK_OCI_4646_SESSIONS", 8);
+        let chunk_len = env("AK_OCI_4646_CHUNK_BYTES", 256 * 1024);
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..sessions {
+            tasks.spawn(chunked_upload_under_retries(
+                Arc::clone(&f),
+                app.clone(),
+                i as u64,
+                chunk_len,
+                i % 4 != 3,
+            ));
+            if i % 3 == 0 {
+                let (f, app) = (Arc::clone(&f), app.clone());
+                tasks.spawn(async move {
+                    let blob = patterned_chunk(7_000_000 + i as u64, 2 * chunk_len);
+                    let digest = compute_sha256(&blob);
+                    let (status, _, body) = send(
+                        app,
+                        request(
+                            Method::POST,
+                            format!(
+                                "/{}/image/blobs/uploads/?digest={}",
+                                f.inner.repo_key, digest
+                            ),
+                            &f.authorization,
+                            blob,
+                        ),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "monolithic: {:?}", body);
+                });
+            }
+        }
+        let mut failure = None;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
+                failure.get_or_insert(e);
+            }
+        }
+        f.teardown().await;
+        if let Some(e) = failure {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+
+    /// #4646: a PATCH part whose stored object is shorter than the length the
+    /// PATCH recorded (what a silently failed final write left behind) must
+    /// fail the commit as a server-side storage error, not answer the client
+    /// DIGEST_INVALID with the digest of bytes it never sent.
+    #[tokio::test]
+    async fn truncated_stored_part_fails_commit_as_storage_error_not_digest_invalid() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let chunk0 = patterned_chunk(1, 64 * 1024);
+        let chunk1 = patterned_chunk(2, 64 * 1024);
+        let mut whole = chunk0.to_vec();
+        whole.extend_from_slice(&chunk1);
+        let digest = compute_sha256(&whole);
+        let uuid = start_session(&f, &app).await;
+        let uri = format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, uuid);
+        for (start, chunk) in [(0, &chunk0), (chunk0.len(), &chunk1)] {
+            let (status, _, body) = send(
+                app.clone(),
+                patch_request(uri.clone(), &f.authorization, start, chunk.clone(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "PATCH: {:?}", body);
+        }
+
+        let part0_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM oci_upload_parts WHERE upload_session_id = $1 AND part_index = 0",
+        )
+        .bind(uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("part 0 key");
+        f.storage()
+            .put(&part0_key, chunk0.slice(..chunk0.len() - 4096))
+            .await
+            .expect("truncate part 0");
+
+        let (status, _, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!("{}?digest={}", uri, digest),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a short stored part is a storage fault: {}",
+            body
+        );
+        assert!(!body.contains("DIGEST_INVALID"), "{}", body);
+        assert!(body.contains(&part0_key), "names the bad part: {}", body);
         f.teardown().await;
     }
 }

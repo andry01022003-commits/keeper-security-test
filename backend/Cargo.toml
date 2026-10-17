@@ -257,6 +257,9 @@ prost-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+# setrlimit(RLIMIT_FSIZE) in the filesystem storage tests, to make a write
+# fail on demand (#4646). Already in the tree transitively.
+libc = "0.2"
 axum-test = "19"
 wiremock = "0.6"
 metrics-util = "0.20"

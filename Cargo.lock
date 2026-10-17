@@ -271,6 +271,7 @@ dependencies = [
  "jsonwebtoken 11.1.0",
  "ldap3",
  "lettre",
+ "libc",
  "md-5 0.10.6",
  "memmap2",
  "metrics",
