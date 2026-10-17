@@ -325,6 +325,41 @@ PY2
 commit_pr
 run_case "bullet directly under a released heading -> fail" 1 "no subheading"
 
+# 18. THE FOLD-IN (RELEASING.md step 3): main already carries this cut's
+#     untagged `## [1.9.1]` section and a fragment that merged after the prep;
+#     the branch runs the assembler with --append, which deletes the fragment
+#     and adds its bullet under the EXISTING heading. Told apart from #3570 by
+#     the deleted fragment naming the same issue, and by v1.9.1 having no tag.
+make_repo
+git -C "$r" checkout -q main
+python3 - "$r/CHANGELOG.md" << 'PY2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+# After a prep, [Unreleased] holds only its pointer line; the cut's own
+# section sits below it, untagged until the promote.
+s = s.replace("### Fixed\n\n- **a fix that is already pending** (#1000)\n\n### Changed\n\n- **a change that is already pending** (#1001)\n",
+              "New entries go in changes/unreleased/, one file per PR.\n")
+s = s.replace("## [1.9.0] - 2026-09-01\n",
+              "## [1.9.1] - 2026-09-20\n\n### Fixed\n\n- **the cut's own entry** (#4300)\n\n## [1.9.0] - 2026-09-01\n")
+open(p, 'w').write(s)
+PY2
+frag changes/unreleased/4301-landed-after-the-prep.md Fixed 4301 "landed after the prep"
+git -C "$r" add -A && git -C "$r" commit -qm "prep section plus a late fragment on main" > /dev/null
+git -C "$r" checkout -q -B pr main
+if python3 "$FRAGMENT_TOOL" assemble 1.9.1 --date 2026-09-20 --append \
+    --changelog "$r/CHANGELOG.md" --dir "$r/changes/unreleased" 2> /dev/null; then
+  commit_pr
+  run_case "fragment folded into the untagged cut section with --append -> pass" 0 "folded into an untagged version section"
+else
+  fail "the assembler refused the --append fixture"
+fi
+
+# 19. ...but not once the version is tagged: that section is history, and the
+#     entry belongs to the next version.
+git -C "$r" tag v1.9.1 main
+run_case "fragment folded into a TAGGED section -> fail" 1 "already tagged"
+
 echo
 if [ "$fails" -gt 0 ]; then
   echo "$fails case(s) failed"

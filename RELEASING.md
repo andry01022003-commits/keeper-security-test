@@ -208,7 +208,12 @@ names the same commit.
    If PRs merge after the prep and before the tag, their fragments are not in
    the section; preflight check 5 says so. Fold them in with
    `scripts/release/assemble-changelog.sh --append` in a
-   `docs(changelog):` commit (exempt, see the table above). Without
+   `docs(changelog):` commit (exempt, see the table above). That commit is
+   its own PR, opened after the fragment is on `main`: the CHANGELOG
+   placement gate (`check-changelog-placement.sh`) recognises a fold-in by
+   the fragment the diff deletes and the section's version having no tag
+   yet, so a fix PR that adds its fragment and folds it in the same diff is
+   refused as a stranded bullet. Without
    `--append` the assembler refuses a version that already has a section,
    because a `Cargo.toml` nobody bumped names the version that already
    shipped; `--append` itself is refused once the tag exists.
