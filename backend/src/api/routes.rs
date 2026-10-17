@@ -25,10 +25,10 @@ use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
     login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware, CidrRange,
-    LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
+    LoginRateLimitAudit, LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
 };
 use super::middleware::setup::setup_guard;
-use super::middleware::tracing::correlation_id_middleware;
+use super::middleware::tracing::correlation_id_with_proxies_middleware;
 use super::middleware::upload_guard::{
     per_principal_upload_admission, upload_progress_deadline, ProgressPolicy, UploadAdmission,
 };
@@ -191,11 +191,14 @@ pub fn create_router(state: SharedState) -> Router {
         trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
         xff_trusted_for_authz: state.config.xff_trusted_for_authz,
     });
-    let login_rate_limit_state = build_login_rate_limit_state(
+    let mut login_rate_limit_state = build_login_rate_limit_state(
         &state.config,
         &rate_limit_exemptions,
         &rate_limit_trusted_proxies,
     );
+    // #4677: a refused login leaves a `LOGIN_RATE_LIMITED` audit row (once
+    // per source IP per window) instead of no trace at all.
+    login_rate_limit_state.audit = Some(Arc::new(LoginRateLimitAudit::new(state.db.clone())));
 
     let mut router = router
         // API v1 routes
@@ -284,8 +287,12 @@ pub fn create_router(state: SharedState) -> Router {
 
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
-    // X-Correlation-ID response header.
-    router = router.layer(middleware::from_fn(correlation_id_middleware));
+    // X-Correlation-ID response header. A gateway's `x-request-id` becomes the
+    // correlation ID only from a trusted-proxy peer (#4677).
+    router = router.layer(middleware::from_fn_with_state(
+        rate_limit_trusted_proxies.clone(),
+        correlation_id_with_proxies_middleware,
+    ));
 
     // Client-IP context (#3888/#1849). Resolves the request's client
     // address once, in two trust grades, and scopes them as a request
@@ -569,6 +576,8 @@ fn build_login_rate_limit_state(
         },
         backstop,
         failed_by_ip,
+        // Wired by `create_router`, which owns the database pool (#4677).
+        audit: None,
     }
 }
 
@@ -615,6 +624,12 @@ fn build_token_exchange_rate_limit_state(
     }
     let mut state = login.clone();
     state.inner.limiter = limiter;
+    // Its own once-per-window audit memory (#4677), so a `/v2/token` refusal
+    // is not swallowed by a login refusal from the same address.
+    state.audit = login
+        .audit
+        .as_ref()
+        .map(|audit| Arc::new(audit.for_another_surface()));
     state
 }
 

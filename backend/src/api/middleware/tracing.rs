@@ -16,6 +16,75 @@ pub const CORRELATION_ID_HEADER: &str = "X-Correlation-ID";
 /// W3C Trace Context header.
 const TRACEPARENT_HEADER: &str = "traceparent";
 
+/// The request id a gateway (Envoy, NGINX, an ingress) stamps on the request
+/// and writes to its own access log (#4677).
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest inbound `x-request-id` adopted as the correlation ID (#4677).
+/// Gateway ids are UUIDs (36) or similar; anything longer is not one.
+pub const REQUEST_ID_MAX_LEN: usize = 128;
+
+/// The inbound `x-request-id`, when it may be believed (#4677): the TCP
+/// `peer` is inside `trusted_proxies` (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the
+/// same list #4195 consults for `traceparent` and #4681 for
+/// `X-Forwarded-For`) and the value is 1 to [`REQUEST_ID_MAX_LEN`] visible
+/// ASCII characters. Unlike `traceparent`, an EMPTY list trusts nobody: the
+/// header is new to this code path, so there is no accept-all behaviour to
+/// keep, and a direct client must not be able to choose the correlation ID
+/// an audit row carries by sending a header every proxy also sets.
+pub fn trusted_request_id(
+    headers: &axum::http::HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_proxies: &[CidrRange],
+) -> Option<String> {
+    let peer = peer?;
+    if !trusted_proxies.iter().any(|cidr| cidr.contains(peer)) {
+        return None;
+    }
+    let value = headers.get(REQUEST_ID_HEADER)?.to_str().ok()?;
+    let valid = !value.is_empty()
+        && value.len() <= REQUEST_ID_MAX_LEN
+        && value.bytes().all(|b| b.is_ascii_graphic());
+    valid.then(|| value.to_string())
+}
+
+/// The request's correlation ID and, when it differs, the trusted gateway
+/// `x-request-id` to record beside it on the request span (#4677).
+///
+/// Priority: `X-Correlation-ID` (explicit), then a trusted `x-request-id`
+/// (so backend logs, traces and audit rows carry the id the gateway's
+/// access log has), then the `trace-id` of `traceparent`, then a generated
+/// UUID.
+pub fn resolve_correlation_id(
+    headers: &axum::http::HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_proxies: &[CidrRange],
+) -> (CorrelationId, Option<String>) {
+    let request_id = trusted_request_id(headers, peer, trusted_proxies);
+    let correlation_id = headers
+        .get(CORRELATION_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .map(CorrelationId::new)
+        .or_else(|| request_id.as_deref().map(CorrelationId::new))
+        .or_else(|| {
+            // Extract trace-id from traceparent header
+            headers
+                .get(TRACEPARENT_HEADER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|tp| {
+                    let parts: Vec<&str> = tp.split('-').collect();
+                    if parts.len() >= 2 {
+                        Some(CorrelationId::new(parts[1]))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .unwrap_or_else(CorrelationId::generate);
+    let request_id = request_id.filter(|id| id != correlation_id.as_str());
+    (correlation_id, request_id)
+}
+
 /// Hard cap on a correlation ID, in bytes (#2414).
 ///
 /// The header is caller-controlled and unauthenticated, and audited public
@@ -313,6 +382,7 @@ pub fn make_http_request_span<B>(
         method = %request.method(),
         uri = %sanitized,
         correlation_id = tracing::field::Empty,
+        request_id = tracing::field::Empty,
         http.route = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         http.response.body.size = tracing::field::Empty,
@@ -400,12 +470,29 @@ pub fn warn_if_trace_context_untrusted(config: &crate::config::Config) {
     }
 }
 
-/// Correlation ID middleware with W3C Trace Context interop.
+/// Correlation ID middleware with W3C Trace Context interop, believing no
+/// proxy's `x-request-id`. The router layers
+/// [`correlation_id_with_proxies_middleware`] instead; this form is for
+/// routers without a trusted-proxy list (tests, tools).
+pub async fn correlation_id_middleware(request: Request, next: Next) -> Response {
+    run_correlation_id(request, next, &[]).await
+}
+
+/// Correlation ID middleware with W3C Trace Context interop and the
+/// trusted-proxy list (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`) that decides
+/// whether a gateway's `x-request-id` is adopted (#4677).
 ///
-/// Priority for correlation ID:
+/// Priority for correlation ID (see [`resolve_correlation_id`]):
 /// 1. `X-Correlation-ID` header (explicit)
-/// 2. `trace-id` extracted from `traceparent` header (W3C format: version-traceid-parentid-flags)
-/// 3. Generate a new UUID
+/// 2. `x-request-id`, only from a trusted-proxy TCP peer and only when it is
+///    1-128 visible ASCII characters
+/// 3. `trace-id` extracted from `traceparent` header (W3C format: version-traceid-parentid-flags)
+/// 4. Generate a new UUID
+///
+/// The backend's correlation ID is always echoed in `X-Correlation-ID`. A
+/// trusted `x-request-id` that is not the correlation ID (because the caller
+/// sent `X-Correlation-ID` too) is recorded on the request span as
+/// `request_id`, so the gateway's log line still joins.
 ///
 /// Records the correlation ID onto the ambient `http_request` span created by
 /// the outer `TraceLayer` (see `main.rs`), rather than opening a second,
@@ -413,28 +500,25 @@ pub fn warn_if_trace_context_untrusted(config: &crate::config::Config) {
 /// `redact_sensitive_params` to the URI (see #544); a second span built from
 /// the raw `request.uri()` would bypass that redaction and double-emit every
 /// request-scoped log line.
-pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Response {
-    let correlation_id = request
-        .headers()
-        .get(CORRELATION_ID_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .map(CorrelationId::new)
-        .or_else(|| {
-            // Extract trace-id from traceparent header
-            request
-                .headers()
-                .get(TRACEPARENT_HEADER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|tp| {
-                    let parts: Vec<&str> = tp.split('-').collect();
-                    if parts.len() >= 2 {
-                        Some(CorrelationId::new(parts[1]))
-                    } else {
-                        None
-                    }
-                })
-        })
-        .unwrap_or_else(CorrelationId::generate);
+pub async fn correlation_id_with_proxies_middleware(
+    axum::extract::State(trusted_proxies): axum::extract::State<std::sync::Arc<Vec<CidrRange>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    run_correlation_id(request, next, &trusted_proxies).await
+}
+
+async fn run_correlation_id(
+    mut request: Request,
+    next: Next,
+    trusted_proxies: &[CidrRange],
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let (correlation_id, request_id) =
+        resolve_correlation_id(request.headers(), peer, trusted_proxies);
 
     request.extensions_mut().insert(correlation_id.clone());
 
@@ -443,6 +527,9 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
     // is known here (#4455); a request no route matched leaves it unset.
     let request_span = tracing::Span::current();
     request_span.record("correlation_id", tracing::field::display(&correlation_id));
+    if let Some(request_id) = &request_id {
+        request_span.record("request_id", request_id.as_str());
+    }
     if let Some(route) = request.extensions().get::<axum::extract::MatchedPath>() {
         request_span.record(
             crate::api::middleware::request_span::HTTP_ROUTE_FIELD,
@@ -785,6 +872,159 @@ mod tests {
         // copied. Truncating an owned String instead would retain the full
         // oversized capacity for the life of the request scope.
         assert!(id.0.capacity() <= CORRELATION_ID_MAX_BYTES);
+    }
+
+    // #4677: a trusted gateway's `x-request-id` becomes the correlation ID.
+
+    fn proxies() -> Vec<CidrRange> {
+        vec![CidrRange::parse("10.0.0.0/8").unwrap()]
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    const PROXY: &str = "10.1.2.3";
+    const CLIENT: &str = "203.0.113.5";
+
+    #[test]
+    fn test_request_id_is_believed_only_from_a_trusted_peer() {
+        let headers = header_map(&[("x-request-id", "envoy-abc-123")]);
+        assert_eq!(
+            trusted_request_id(&headers, Some(PROXY.parse().unwrap()), &proxies()).as_deref(),
+            Some("envoy-abc-123")
+        );
+        assert_eq!(
+            trusted_request_id(&headers, Some(CLIENT.parse().unwrap()), &proxies()),
+            None,
+            "a direct client must not choose the correlation ID"
+        );
+        assert_eq!(
+            trusted_request_id(&headers, None, &proxies()),
+            None,
+            "no peer, nobody to vouch for the header"
+        );
+        assert_eq!(
+            trusted_request_id(&headers, Some(PROXY.parse().unwrap()), &[]),
+            None,
+            "an empty trusted-proxy list trusts nobody"
+        );
+    }
+
+    #[test]
+    fn test_request_id_must_be_short_visible_ascii() {
+        let peer = Some(PROXY.parse().unwrap());
+        let at_cap = "r".repeat(REQUEST_ID_MAX_LEN);
+        assert_eq!(
+            trusted_request_id(&header_map(&[("x-request-id", &at_cap)]), peer, &proxies())
+                .as_deref(),
+            Some(at_cap.as_str())
+        );
+        let over = "r".repeat(REQUEST_ID_MAX_LEN + 1);
+        for bad in [over.as_str(), "", "has space", "tab\there"] {
+            assert_eq!(
+                trusted_request_id(&header_map(&[("x-request-id", bad)]), peer, &proxies()),
+                None,
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_correlation_id_priority() {
+        let peer = Some(PROXY.parse().unwrap());
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+        // Trusted x-request-id wins over traceparent; nothing extra to record.
+        let (id, extra) = resolve_correlation_id(
+            &header_map(&[("x-request-id", "gw-1"), ("traceparent", tp)]),
+            peer,
+            &proxies(),
+        );
+        assert_eq!(id.as_str(), "gw-1");
+        assert_eq!(extra, None);
+
+        // Explicit X-Correlation-ID still wins; the gateway id rides along.
+        let (id, extra) = resolve_correlation_id(
+            &header_map(&[("x-correlation-id", "caller-1"), ("x-request-id", "gw-1")]),
+            peer,
+            &proxies(),
+        );
+        assert_eq!(id.as_str(), "caller-1");
+        assert_eq!(extra.as_deref(), Some("gw-1"));
+
+        // Untrusted peer: ignored, traceparent as before, nothing recorded.
+        let (id, extra) = resolve_correlation_id(
+            &header_map(&[("x-request-id", "gw-1"), ("traceparent", tp)]),
+            Some(CLIENT.parse().unwrap()),
+            &proxies(),
+        );
+        assert_eq!(id.as_str(), "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(extra, None);
+
+        // Untrusted and nothing else: a generated UUID.
+        let (id, _) = resolve_correlation_id(
+            &header_map(&[("x-request-id", "gw-1")]),
+            Some(CLIENT.parse().unwrap()),
+            &proxies(),
+        );
+        assert!(Uuid::parse_str(id.as_str()).is_ok(), "generated: {id}");
+    }
+
+    /// Through the real middleware: the echoed `X-Correlation-ID` is the
+    /// gateway's id from a trusted peer, and NOT the client-sent one
+    /// otherwise.
+    #[tokio::test]
+    async fn test_middleware_echoes_a_trusted_request_id() {
+        use axum::{body::Body, routing::get, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async { current_correlation_id().unwrap().into_string() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(proxies()),
+                correlation_id_with_proxies_middleware,
+            ));
+        let call =
+            |peer: &str| {
+                let mut request = axum::http::Request::builder()
+                    .uri("/")
+                    .header("x-request-id", "gw-echo-1")
+                    .body(Body::empty())
+                    .unwrap();
+                request.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::new(peer.parse().unwrap(), 4000),
+                ));
+                app.clone().oneshot(request)
+            };
+
+        let trusted = call(PROXY).await.unwrap();
+        assert_eq!(trusted.headers()[CORRELATION_ID_HEADER], "gw-echo-1");
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: bounded 1 KiB test-probe body (one correlation
+        // value); not an artifact path (#1608)
+        let body = axum::body::to_bytes(trusted.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"gw-echo-1", "audit rows see the same id");
+
+        let direct = call(CLIENT).await.unwrap();
+        let echoed = direct.headers()[CORRELATION_ID_HEADER].to_str().unwrap();
+        assert_ne!(
+            echoed, "gw-echo-1",
+            "a direct client's x-request-id is ignored"
+        );
+        assert!(Uuid::parse_str(echoed).is_ok());
     }
 
     // #2414: the request-scoped correlation task-local.

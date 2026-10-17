@@ -48,7 +48,7 @@ Every record has this stable, versioned shape:
 | `actor` | object | `{ id, name, type }` — see below. |
 | `source_ip` | string \| null | Source IP when the emitter already captures one; otherwise `null`. |
 | `resource` | object | `{ type, id, name }` — the targeted resource. |
-| `correlation_id` | string | Joins to request logs and traces (#2414). |
+| `correlation_id` | string | Joins to request logs and traces (#2414). Behind a gateway listed in `RATE_LIMIT_TRUSTED_PROXY_CIDRS` it is the gateway's `X-Request-ID` (#4677). |
 | `details` | object \| null | Typed for representative events (below); permissive otherwise. |
 
 `actor.type` is one of `system`, `user`, `anonymous`, or the reserved
@@ -118,7 +118,7 @@ the remaining actions is an incremental follow-up.
 | `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026) |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
-| `LOGIN_FAILED`, `PERMISSION_DENIED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
+| `LOGIN_FAILED`, `PERMISSION_DENIED`, `LOGIN_RATE_LIMITED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
 | `ARTIFACT_UPLOADED` / `_DOWNLOADED` / `_DELETED` | `ArtifactDetails` (`repository_id`, `path`, `name`, `version?`, `size_bytes?`, `digest?`, `uploaded_by?`) |
 | `SETTING_CHANGED` | `SettingDetails` (`key`, `old_value?`, `new_value?`) |
 
@@ -178,6 +178,29 @@ come from the CEP-26 filename and are `null` when it does not parse).
 | `ATTESTATION_REJECTED` | `artifact` | An attestation for an existing package does not verify, or its body is not JSON. Outcome `denied` when refused (the default, `CONDA_ATTESTATION_REQUIRE_VERIFIED=true`); outcome `failure` with `stored: true` when the operator opt-out stored it anyway. | The same fields as `ATTESTATION_VERIFIED`, with `reason`: the failure reason the API returned (the text after `CEP-27 attestation verification failed: `, or `Invalid JSON body`). |
 | `ENVIRONMENT_REGISTERED` | `environment` | A lockfile is ingested as a stored environment (`POST /api/v1/repositories/{key}/environments`), new or replacing one of the same name. | `environment_id`, `name`, `lockfile_format`, `lockfile_filename`, `content_sha256`, `replaced`, `package_count` (distinct packages), `memberships`, `scope` (`count`, `environments`, `platforms`). |
 | `ENVIRONMENT_DELETED` | `environment` | A stored environment is deleted (`DELETE /api/v1/repositories/{key}/environments/{id}`). | `environment_id`, `name`, `lockfile_format`, `content_sha256`, and the stored `summary`. |
+
+## Detection events
+
+Two actions close detection gaps found by the 1.11.0 red team (#4677).
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `LOGIN_RATE_LIMITED` | `user` (no id) | A login limiter refuses `POST /api/v1/auth/login` or an OCI credential exchange on `/v2/token` with 429. At most one row per source IP per limiter window; see below. Outcome `denied`. | `AuthDetails`: `username` (the attempted name, as `LOGIN_FAILED` records it; never the password), `path`, `method`, and `reason`, the limiter: `login_per_account` (the per-username-and-IP bucket) or `login_global_backstop`. |
+| `EXTERNAL_FINDINGS_INGESTED` | `artifact` | An admin (or a token with `write:findings`) ingests an external scanner's findings (`POST /api/v1/security/findings/external`). This is the write that classes a `MAL-*` advisory `malicious`/Critical. Outcome `success`. | `artifact_id`, `repository_id`, `scan_id`, `scanner`, `scanner_version`, `findings_ingested`, `severity_counts` (`critical` .. `info`), `class_counts` (`vulnerability`, `malicious`, `policy`), `malicious_ids` (the `MAL-*` ids, at most 50) and `malicious_ids_truncated`, and the repository `score` and `grade` after the ingest. |
+
+`LOGIN_RATE_LIMITED` rows carry the verified client IP in `source_ip` /
+`ip_address` under the same rules as `LOGIN_FAILED` (`XFF_TRUSTED_FOR_AUTHZ`).
+A refused flood would otherwise become a flood of audit inserts, so the first
+refusal per source IP in each per-account limiter window writes a row and the
+rest of that window does not; the global backstop is not per-client, so it
+writes one row per backstop window whatever address the refusals come from.
+Each written row also logs a `WARN` line on the `security` target; refusals
+that are not audited log at `DEBUG`. `/api/v1/auth/login` and `/v2/token`
+keep separate once-per-window memories.
+
+Each ingest also logs an `INFO` line on the `security` target
+(`external findings ingested`) with the artifact, scan, scanner, acting user,
+finding and malicious counts and the new score.
 
 ## Compatibility policy
 

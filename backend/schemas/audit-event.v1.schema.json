@@ -90,7 +90,7 @@
     {
       "if": {
         "required": ["action"],
-        "properties": { "action": { "enum": ["LOGIN_FAILED", "PERMISSION_DENIED"] } }
+        "properties": { "action": { "enum": ["LOGIN_FAILED", "PERMISSION_DENIED", "LOGIN_RATE_LIMITED"] } }
       },
       "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/AuthDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
     },
@@ -246,7 +246,7 @@
       "type": "object",
       "additionalProperties": true,
       "required": [],
-      "description": "details for LOGIN_FAILED / PERMISSION_DENIED and related authorization events.",
+      "description": "details for LOGIN_FAILED / PERMISSION_DENIED / LOGIN_RATE_LIMITED and related authorization events.",
       "properties": {
         "username": { "type": "string" },
         "path": { "type": "string" },

@@ -2610,6 +2610,7 @@ mod tests {
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
             failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+            audit: None,
         };
         login_router()
             .with_state(state)

@@ -106,8 +106,17 @@ impl PermissionConditions {
 /// trusted fragments (bind placeholders, validated `IpAddr` literals) —
 /// never request-derived text.
 pub(crate) fn ip_condition_sql(alias: &str, ip_ref: &str) -> String {
+    format!("AND {}", ip_condition_expr(alias, ip_ref))
+}
+
+/// The boolean behind [`ip_condition_sql`]: whether the rule `alias` is
+/// applicable to a request from `ip_ref`. Selected as a column (rather than
+/// filtered on) by the resolvers that report condition telemetry (#4677), so
+/// one query yields both the decision and how the condition evaluated. Same
+/// trusted-fragment contract as [`ip_condition_sql`].
+fn ip_condition_expr(alias: &str, ip_ref: &str) -> String {
     format!(
-        "AND (\
+        "(\
              NOT ({alias}.conditions ? 'allowed_cidrs') \
              OR EXISTS ( \
                  SELECT 1 \
@@ -118,6 +127,102 @@ pub(crate) fn ip_condition_sql(alias: &str, ip_ref: &str) -> String {
              )\
          )"
     )
+}
+
+/// Columns a resolver selects per candidate rule so condition telemetry
+/// (#4677) can be read off the same query: `conditioned` (the rule carries
+/// `allowed_cidrs`) and `ip_ok` (the rule is applicable to this request).
+fn condition_columns(alias: &str, ip_ref: &str) -> String {
+    format!(
+        "({alias}.conditions ? 'allowed_cidrs') AS conditioned, {} AS ip_ok",
+        ip_condition_expr(alias, ip_ref)
+    )
+}
+
+/// The two tallies every telemetry-reporting resolver selects over its
+/// `candidate_rules` CTE (#4677).
+const CONDITION_TALLY_SQL: &str = "\
+    (SELECT COUNT(*) FROM candidate_rules WHERE conditioned) AS conditioned_rules, \
+    (SELECT COUNT(*) FROM candidate_rules WHERE conditioned AND ip_ok) AS matched_rules";
+
+/// Name of the counter recording permission-condition evaluations (#4677).
+pub const CONDITION_EVALUATIONS_METRIC: &str = "ak_permission_condition_evaluations_total";
+
+/// How a permission decision's IP conditions evaluated (#4677), the
+/// `outcome` label of [`CONDITION_EVALUATIONS_METRIC`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionOutcome {
+    /// At least one conditioned rule's `allowed_cidrs` contains the
+    /// request's verified client IP.
+    Matched,
+    /// The client IP is known and no conditioned rule's range contains it.
+    NotMatched,
+    /// The client IP is not verified (no request scope, or behind a trusted
+    /// proxy without `XFF_TRUSTED_FOR_AUTHZ`), so every conditioned rule
+    /// failed closed.
+    UnknownIp,
+}
+
+impl ConditionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConditionOutcome::Matched => "matched",
+            ConditionOutcome::NotMatched => "not_matched",
+            ConditionOutcome::UnknownIp => "unknown_ip",
+        }
+    }
+}
+
+/// The outcome of one decision over `conditioned` candidate rules carrying
+/// `allowed_cidrs`, `matched` of which applied; `None` when no candidate
+/// rule carried a condition (nothing was evaluated, nothing is recorded).
+pub fn condition_outcome(
+    client_ip: Option<std::net::IpAddr>,
+    conditioned: i64,
+    matched: i64,
+) -> Option<ConditionOutcome> {
+    if conditioned <= 0 {
+        return None;
+    }
+    Some(match (client_ip, matched > 0) {
+        (None, _) => ConditionOutcome::UnknownIp,
+        (Some(_), true) => ConditionOutcome::Matched,
+        (Some(_), false) => ConditionOutcome::NotMatched,
+    })
+}
+
+/// Count and debug-log one permission decision that evaluated `allowed_cidrs`
+/// conditions (#4677). `site` names the resolver. Decisions over rules that
+/// carry no condition record nothing, so a deployment without conditioned
+/// rules sees no series and no log lines.
+fn record_condition_evaluation(
+    site: &'static str,
+    principal: Option<Uuid>,
+    target_id: Uuid,
+    client_ip: Option<std::net::IpAddr>,
+    conditioned: i64,
+    matched: i64,
+) {
+    let Some(outcome) = condition_outcome(client_ip, conditioned, matched) else {
+        return;
+    };
+    metrics::counter!(
+        CONDITION_EVALUATIONS_METRIC,
+        "condition" => "allowed_cidrs",
+        "outcome" => outcome.as_str()
+    )
+    .increment(1);
+    debug!(
+        condition = "allowed_cidrs",
+        outcome = outcome.as_str(),
+        site,
+        principal = ?principal,
+        %target_id,
+        client_ip = ?client_ip,
+        conditioned_rules = conditioned,
+        matched_rules = matched,
+        "permission condition evaluated"
+    );
 }
 
 /// The current request's VERIFIED client IP as a SQL expression for the
@@ -303,10 +408,13 @@ impl PermissionService {
         // None, which matches nothing: conditioned grants fail closed
         // rather than trust an unverifiable XFF chain.
         let client_ip = crate::api::middleware::client_ip::current_verified_client_ip();
+        // `candidate_rules` are the rules naming this principal and target;
+        // `applicable_rules` the ones whose IP condition holds. Splitting them
+        // lets the same query report how the conditions evaluated (#4677).
         let query = format!(
             r#"
-            WITH applicable_rules AS (
-                SELECT p.actions
+            WITH candidate_rules AS (
+                SELECT p.actions, {condition_columns}
                 FROM permissions p
                 WHERE (
                     (p.principal_type IN ('user', 'service_account') AND p.principal_id = $1)
@@ -330,7 +438,9 @@ impl PermissionService {
                         )
                     )
                 )
-                {ip_condition}
+            ),
+            applicable_rules AS (
+                SELECT actions FROM candidate_rules WHERE ip_ok
             ),
             assigned_roles AS (
                 SELECT r.permissions
@@ -357,18 +467,29 @@ impl PermissionService {
                         FROM assigned_roles
                         WHERE $3 = ANY(permissions) OR 'admin' = ANY(permissions)
                     )
-                END
+                END AS allowed,
+                {tally}
             "#,
-            ip_condition = ip_condition_sql("p", "$4"),
+            condition_columns = condition_columns("p", "$4"),
+            tally = CONDITION_TALLY_SQL,
         );
-        let allowed: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
-            .bind(user_id)
-            .bind(repository_id)
-            .bind(action)
-            .bind(client_ip.map(|ip| ip.to_string()))
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        let (allowed, conditioned, matched): (bool, i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(&*query))
+                .bind(user_id)
+                .bind(repository_id)
+                .bind(action)
+                .bind(client_ip.map(|ip| ip.to_string()))
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        record_condition_evaluation(
+            "repository_action",
+            Some(user_id),
+            repository_id,
+            client_ip,
+            conditioned,
+            matched,
+        );
 
         Ok(allowed)
     }
@@ -400,8 +521,8 @@ impl PermissionService {
         let client_ip = crate::api::middleware::client_ip::current_verified_client_ip();
         let query = format!(
             r#"
-            SELECT EXISTS (
-                SELECT 1
+            WITH candidate_rules AS (
+                SELECT {condition_columns}
                 FROM permissions p
                 WHERE p.principal_type = 'anonymous'
                   AND (
@@ -416,18 +537,31 @@ impl PermissionService {
                       )
                   )
                   AND ($2 = ANY(p.actions) OR 'admin' = ANY(p.actions))
-                  {ip_condition}
             )
+            SELECT
+                EXISTS (SELECT 1 FROM candidate_rules WHERE ip_ok) AS allowed,
+                {tally}
             "#,
-            ip_condition = ip_condition_sql("p", "$3"),
+            condition_columns = condition_columns("p", "$3"),
+            tally = CONDITION_TALLY_SQL,
         );
-        sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
-            .bind(repository_id)
-            .bind(action)
-            .bind(client_ip.map(|ip| ip.to_string()))
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))
+        let (allowed, conditioned, matched): (bool, i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(&*query))
+                .bind(repository_id)
+                .bind(action)
+                .bind(client_ip.map(|ip| ip.to_string()))
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        record_condition_evaluation(
+            "anonymous_repository_action",
+            None,
+            repository_id,
+            client_ip,
+            conditioned,
+            matched,
+        );
+        Ok(allowed)
     }
 
     /// Return true when at least one permission rule exists for the given
@@ -691,7 +825,8 @@ impl PermissionService {
         let client_ip = crate::api::middleware::client_ip::current_verified_client_ip();
         let query = format!(
             r#"
-            SELECT DISTINCT unnest(actions) as action
+            WITH candidate_rules AS (
+            SELECT p.actions, {condition_columns}
             FROM permissions p
             WHERE (
                 (p.principal_type IN ('user', 'service_account') AND p.principal_id = $1)
@@ -706,20 +841,35 @@ impl PermissionService {
                     SELECT project_id FROM repositories WHERE id = $3
                 ))
             )
-            {ip_condition}
+            )
+            SELECT
+                ARRAY(
+                    SELECT DISTINCT unnest(actions) FROM candidate_rules WHERE ip_ok
+                ) AS actions,
+                {tally}
             "#,
-            ip_condition = ip_condition_sql("p", "$4"),
+            condition_columns = condition_columns("p", "$4"),
+            tally = CONDITION_TALLY_SQL,
         );
-        let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(&*query))
-            .bind(user_id)
-            .bind(target_type)
-            .bind(target_id)
-            .bind(client_ip.map(|ip| ip.to_string()))
-            .fetch_all(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        let (actions, conditioned, matched): (Vec<String>, i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(&*query))
+                .bind(user_id)
+                .bind(target_type)
+                .bind(target_id)
+                .bind(client_ip.map(|ip| ip.to_string()))
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        record_condition_evaluation(
+            "resolve_actions",
+            Some(user_id),
+            target_id,
+            client_ip,
+            conditioned,
+            matched,
+        );
 
-        Ok(rows.into_iter().map(|(action,)| action).collect())
+        Ok(actions)
     }
 }
 
@@ -727,6 +877,32 @@ impl PermissionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #4677: permission-condition telemetry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_condition_outcome() {
+        let ip: Option<std::net::IpAddr> = Some("10.0.0.1".parse().unwrap());
+        assert_eq!(
+            condition_outcome(ip, 0, 0),
+            None,
+            "no conditioned rule: nothing was evaluated"
+        );
+        assert_eq!(condition_outcome(ip, 2, 1), Some(ConditionOutcome::Matched));
+        assert_eq!(
+            condition_outcome(ip, 2, 0),
+            Some(ConditionOutcome::NotMatched)
+        );
+        assert_eq!(
+            condition_outcome(None, 1, 0),
+            Some(ConditionOutcome::UnknownIp)
+        );
+        assert_eq!(ConditionOutcome::Matched.as_str(), "matched");
+        assert_eq!(ConditionOutcome::NotMatched.as_str(), "not_matched");
+        assert_eq!(ConditionOutcome::UnknownIp.as_str(), "unknown_ip");
+    }
 
     // -----------------------------------------------------------------------
     // CacheKey construction and equality
@@ -2239,6 +2415,99 @@ mod tests {
         // (background jobs) — the rule is inapplicable (fail closed), exactly
         // as if the grant did not exist for that caller.
         // -------------------------------------------------------------------
+
+        /// #4677: every decision over a conditioned rule counts one
+        /// `ak_permission_condition_evaluations_total{condition,outcome}`;
+        /// a decision over unconditioned rules counts nothing.
+        #[test]
+        fn condition_evaluations_are_counted_by_outcome() {
+            use crate::api::handlers::test_db_helpers as tdh;
+            use crate::api::middleware::client_ip::with_client_ip_scope;
+
+            let (ran, captured) = tdh::capture_metrics(|| async {
+                let Some(pool) = tdh::try_pool().await else {
+                    return false;
+                };
+                let service = PermissionService::new(pool.clone());
+                let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+                let (user_id, _) = tdh::create_user(&pool).await;
+                let (control_id, _) = tdh::create_user(&pool).await;
+                sqlx::query(
+                    "INSERT INTO permissions \
+                       (principal_type, principal_id, target_type, target_id, actions, conditions) \
+                     VALUES ('user', $1, 'repository', $2, ARRAY['read'], $3)",
+                )
+                .bind(user_id)
+                .bind(repo_id)
+                .bind(serde_json::json!({"allowed_cidrs": ["10.20.0.0/16"]}))
+                .execute(&pool)
+                .await
+                .expect("insert conditioned rule");
+                sqlx::query(
+                    "INSERT INTO permissions \
+                       (principal_type, principal_id, target_type, target_id, actions) \
+                     VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+                )
+                .bind(control_id)
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("insert unconditioned control rule");
+
+                let inside: std::net::IpAddr = "10.20.3.4".parse().unwrap();
+                let outside: std::net::IpAddr = "192.0.2.9".parse().unwrap();
+                // matched x2: the uncached resolver and the cached one.
+                assert!(with_client_ip_scope(
+                    Some(inside),
+                    service.check_repository_action(user_id, repo_id, "read", false),
+                )
+                .await
+                .unwrap());
+                assert!(with_client_ip_scope(
+                    Some(inside),
+                    service.check_permission(user_id, "repository", repo_id, "read", false),
+                )
+                .await
+                .unwrap());
+                // not_matched x1.
+                assert!(!with_client_ip_scope(
+                    Some(outside),
+                    service.check_repository_action(user_id, repo_id, "read", false),
+                )
+                .await
+                .unwrap());
+                // unknown_ip x1: no verified client IP.
+                assert!(!service
+                    .check_repository_action(user_id, repo_id, "read", false)
+                    .await
+                    .unwrap());
+                // Nothing for the unconditioned control.
+                assert!(with_client_ip_scope(
+                    Some(outside),
+                    service.check_repository_action(control_id, repo_id, "read", false),
+                )
+                .await
+                .unwrap());
+
+                cleanup_action_fixture(&pool, repo_id, &[user_id, control_id], &storage_dir).await;
+                true
+            });
+            if !ran {
+                return;
+            }
+            let count = |outcome: &str| match tdh::captured_metric(
+                &captured,
+                CONDITION_EVALUATIONS_METRIC,
+                &[("condition", "allowed_cidrs"), ("outcome", outcome)],
+            ) {
+                Some(metrics_util::debugging::DebugValue::Counter(n)) => *n,
+                None => 0,
+                other => panic!("expected a counter, got {other:?}"),
+            };
+            assert_eq!(count("matched"), 2);
+            assert_eq!(count("not_matched"), 1);
+            assert_eq!(count("unknown_ip"), 1);
+        }
 
         #[tokio::test]
         async fn allowed_cidrs_condition_gates_the_rule_by_request_ip() {

@@ -92,6 +92,9 @@ impl AuditAction {
             // was issued) and not a credential failure — it is a policy denial,
             // which is what `Denied` means in this envelope.
             AuditAction::TotpEnrollmentRequired => Outcome::Denied,
+            // #4677: the limiter refused the attempt before any credential
+            // was checked; a refusal of the caller, not a credential failure.
+            AuditAction::LoginRateLimited => Outcome::Denied,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -171,7 +174,8 @@ impl AuditAction {
             | AuditAction::CondaPackageWithdrawn
             | AuditAction::AttestationVerified
             | AuditAction::EnvironmentRegistered
-            | AuditAction::EnvironmentDeleted => Outcome::Success,
+            | AuditAction::EnvironmentDeleted
+            | AuditAction::ExternalFindingsIngested => Outcome::Success,
         }
     }
 }
@@ -642,6 +646,26 @@ pub mod details {
             }
         }
 
+        /// A login refused 429 by a login rate limiter (#4677). `username`
+        /// is the attempted name exactly as `failed_login` records it (never
+        /// a password); `limiter` names the bucket that refused it and goes
+        /// in `reason`.
+        pub fn rate_limited(
+            username: Option<&str>,
+            path: &str,
+            method: &str,
+            limiter: &str,
+        ) -> Self {
+            Self {
+                username: username.map(str::to_owned),
+                path: Some(path.to_owned()),
+                method: Some(method.to_owned()),
+                reason: Some(limiter.to_owned()),
+                provider: None,
+                auth_method: None,
+            }
+        }
+
         /// Authorization denial at an HTTP boundary.
         pub fn permission_denied(path: &str, method: &str, reason: &str) -> Self {
             Self {
@@ -973,6 +997,7 @@ mod tests {
         assert_eq!(AuditAction::PermissionDenied.outcome(), Outcome::Denied);
         assert_eq!(AuditAction::AgeGateRejected.outcome(), Outcome::Denied);
         assert_eq!(AuditAction::AttestationRejected.outcome(), Outcome::Denied);
+        assert_eq!(AuditAction::LoginRateLimited.outcome(), Outcome::Denied);
     }
 
     #[test]
@@ -991,6 +1016,7 @@ mod tests {
             AuditAction::AttestationVerified,
             AuditAction::EnvironmentRegistered,
             AuditAction::EnvironmentDeleted,
+            AuditAction::ExternalFindingsIngested,
         ] {
             assert_eq!(a.outcome(), Outcome::Success, "{}", a.as_str());
         }

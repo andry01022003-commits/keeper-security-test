@@ -209,6 +209,18 @@ pub enum AuditAction {
     EnvironmentRegistered,
     /// A stored environment was deleted.
     EnvironmentDeleted,
+
+    // Detection gaps (#4677). Appended at the END of the enum.
+    /// A login (`POST /api/v1/auth/login`) or OCI credential exchange
+    /// (`/v2/token`) was refused 429 by a login rate limiter. Recorded at most
+    /// once per source IP per limiter window so a flood cannot turn the
+    /// limiter into an audit-table DoS.
+    LoginRateLimited,
+    /// An external scanner's findings were ingested
+    /// (`POST /api/v1/security/findings/external`): a new completed scan row
+    /// that every gate and the repository score read, including any `MAL-*`
+    /// finding classed `malicious`.
+    ExternalFindingsIngested,
 }
 
 impl AuditAction {
@@ -303,6 +315,8 @@ impl AuditAction {
             AuditAction::AttestationRejected => "ATTESTATION_REJECTED",
             AuditAction::EnvironmentRegistered => "ENVIRONMENT_REGISTERED",
             AuditAction::EnvironmentDeleted => "ENVIRONMENT_DELETED",
+            AuditAction::LoginRateLimited => "LOGIN_RATE_LIMITED",
+            AuditAction::ExternalFindingsIngested => "EXTERNAL_FINDINGS_INGESTED",
         }
     }
 }
@@ -1474,6 +1488,16 @@ mod tests {
         assert_eq!(
             AuditAction::EnvironmentDeleted.as_str(),
             "ENVIRONMENT_DELETED"
+        );
+    }
+
+    #[test]
+    fn test_audit_action_as_str_detection_gaps() {
+        // #4677: rate-limited logins and external findings ingest.
+        assert_eq!(AuditAction::LoginRateLimited.as_str(), "LOGIN_RATE_LIMITED");
+        assert_eq!(
+            AuditAction::ExternalFindingsIngested.as_str(),
+            "EXTERNAL_FINDINGS_INGESTED"
         );
     }
 

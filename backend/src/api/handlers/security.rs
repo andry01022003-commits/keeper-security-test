@@ -1379,6 +1379,47 @@ fn build_external_findings(
         .collect()
 }
 
+/// Most `MAL-*` advisory ids one `EXTERNAL_FINDINGS_INGESTED` row lists
+/// (#4677). A submission may carry up to `MAX_EXTERNAL_FINDINGS_PER_SUBMISSION`
+/// findings; the row keeps the count of every class and the first ids, and
+/// says when it cut the list.
+const INGEST_AUDIT_MAX_MALICIOUS_IDS: usize = 50;
+
+/// What an `EXTERNAL_FINDINGS_INGESTED` audit row records about the findings
+/// of one submission (#4677), beyond the severity tally.
+#[derive(Debug, PartialEq)]
+struct IngestAuditSummary {
+    /// Findings per class (`vulnerability`, `malicious`, `policy`).
+    class_counts: std::collections::BTreeMap<&'static str, usize>,
+    /// The advisory ids of the findings classed `malicious`, in submission
+    /// order, at most [`INGEST_AUDIT_MAX_MALICIOUS_IDS`].
+    malicious_ids: Vec<String>,
+    malicious_ids_truncated: bool,
+}
+
+fn ingest_audit_summary(findings: &[crate::models::security::RawFinding]) -> IngestAuditSummary {
+    use crate::models::security::FindingClass;
+    let mut class_counts: std::collections::BTreeMap<&'static str, usize> =
+        FindingClass::ALL.iter().map(|c| (c.as_str(), 0)).collect();
+    let mut malicious_ids = Vec::new();
+    let mut malicious_ids_truncated = false;
+    for f in findings {
+        *class_counts.entry(f.finding_class.as_str()).or_default() += 1;
+        if f.finding_class == FindingClass::Malicious {
+            if malicious_ids.len() < INGEST_AUDIT_MAX_MALICIOUS_IDS {
+                malicious_ids.push(f.cve_id.clone().unwrap_or_default());
+            } else {
+                malicious_ids_truncated = true;
+            }
+        }
+    }
+    IngestAuditSummary {
+        class_counts,
+        malicious_ids,
+        malicious_ids_truncated,
+    }
+}
+
 /// Ingest findings produced by a scanner that does not live in this tree
 /// (#3411).
 ///
@@ -1456,7 +1497,7 @@ async fn ingest_external_findings(
 
     // Existence-hiding gate, then the repository the artifact belongs to. Both
     // reads run before anything is written.
-    check_artifact_visibility(&Some(auth), body.artifact_id, &state.db, "write").await?;
+    check_artifact_visibility(&Some(auth.clone()), body.artifact_id, &state.db, "write").await?;
     let repository_id: Uuid = sqlx::query_scalar(
         "SELECT repository_id FROM artifacts WHERE id = $1 AND is_deleted = false",
     )
@@ -1483,6 +1524,54 @@ async fn ingest_external_findings(
         )
         .await?;
     let score = svc.recalculate_score(repository_id).await?;
+
+    // #4677: a successful ingest changes what every gate reads (and a `MAL-*`
+    // id plants a `malicious`/Critical verdict), so it is recorded like any
+    // other admin mutation instead of being a silent 200.
+    let summary = ingest_audit_summary(&findings);
+    tracing::info!(
+        target: "security",
+        artifact_id = %body.artifact_id,
+        %repository_id,
+        scan_id = %scan.id,
+        scanner = %scanner,
+        user_id = %auth.user_id,
+        username = %auth.username,
+        findings = findings.len(),
+        malicious = summary.malicious_ids.len(),
+        score = score.score,
+        "external findings ingested"
+    );
+    crate::services::audit_service::audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::ExternalFindingsIngested,
+            ResourceType::Artifact,
+            &auth,
+        )
+        .resource(body.artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": body.artifact_id,
+            "repository_id": repository_id,
+            "scan_id": scan.id,
+            "scanner": scanner,
+            "scanner_version": body.scanner_version,
+            "findings_ingested": findings.len(),
+            "severity_counts": {
+                "critical": counts[0],
+                "high": counts[1],
+                "medium": counts[2],
+                "low": counts[3],
+                "info": counts[4],
+            },
+            "class_counts": summary.class_counts,
+            "malicious_ids": summary.malicious_ids,
+            "malicious_ids_truncated": summary.malicious_ids_truncated,
+            "score": score.score,
+            "grade": score.grade,
+        })),
+    )
+    .await;
 
     Ok(Json(IngestExternalFindingsResponse {
         scan_id: scan.id,
@@ -7818,6 +7907,108 @@ mod tests {
         assert_eq!(out[0].severity, Severity::Critical);
         assert_eq!(out[1].finding_class, FindingClass::Vulnerability);
         assert_eq!(out[1].severity, Severity::Low);
+    }
+
+    fn external_input(cve: &str) -> ExternalFindingInput {
+        ExternalFindingInput {
+            severity: "low".to_string(),
+            title: "t".to_string(),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        }
+    }
+
+    /// #4677: the ingest audit row counts every class and lists the `MAL-*`
+    /// ids it planted, bounded.
+    #[test]
+    fn test_ingest_audit_summary_counts_classes_and_lists_malicious_ids() {
+        let out = build_external_findings(
+            "acme",
+            vec![
+                external_input("MAL-2025-7"),
+                external_input("CVE-2024-1"),
+                external_input("MAL-2025-8"),
+            ],
+        )
+        .expect("valid findings");
+        let summary = ingest_audit_summary(&out);
+        assert_eq!(summary.class_counts["malicious"], 2);
+        assert_eq!(summary.class_counts["vulnerability"], 1);
+        assert_eq!(summary.class_counts["policy"], 0);
+        assert_eq!(summary.malicious_ids, vec!["MAL-2025-7", "MAL-2025-8"]);
+        assert!(!summary.malicious_ids_truncated);
+
+        let many = build_external_findings(
+            "acme",
+            (0..INGEST_AUDIT_MAX_MALICIOUS_IDS + 3)
+                .map(|i| external_input(&format!("MAL-2025-{i}")))
+                .collect(),
+        )
+        .expect("valid findings");
+        let summary = ingest_audit_summary(&many);
+        assert_eq!(summary.malicious_ids.len(), INGEST_AUDIT_MAX_MALICIOUS_IDS);
+        assert!(summary.malicious_ids_truncated);
+        assert_eq!(
+            summary.class_counts["malicious"],
+            INGEST_AUDIT_MAX_MALICIOUS_IDS + 3,
+            "the count is exact even when the id list is cut"
+        );
+    }
+
+    /// #4677: a successful ingest, the `MAL-*` classification ledger write,
+    /// records who planted which verdict instead of being a silent 200.
+    #[tokio::test]
+    async fn test_ingest_external_findings_writes_an_audit_row_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let res = ingest_external_findings(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(fx.user_id, &fx.username)),
+            BodyJson(IngestExternalFindingsRequest {
+                artifact_id: art,
+                scanner: "acme-scanner".to_string(),
+                scanner_version: Some("2026.1".to_string()),
+                findings: vec![
+                    external_input("MAL-2024-1234"),
+                    external_input("CVE-2024-1"),
+                ],
+            }),
+        )
+        .await;
+        let row = tdh::audit_row_eventually(&fx.pool, art, "EXTERNAL_FINDINGS_INGESTED").await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        let _ = sqlx::query("DELETE FROM repository_security_scores WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        let res = res.expect("admin ingest must succeed").0;
+        assert_eq!(row.user_id, Some(fx.user_id), "the acting admin");
+        assert_eq!(row.resource_type, "artifact");
+        let d = &row.details;
+        assert_eq!(d["scan_id"], serde_json::json!(res.scan_id));
+        assert_eq!(d["repository_id"], serde_json::json!(fx.repo_id));
+        assert_eq!(d["scanner"], "acme-scanner");
+        assert_eq!(d["scanner_version"], "2026.1");
+        assert_eq!(d["findings_ingested"], 2);
+        assert_eq!(
+            d["severity_counts"]["critical"], 1,
+            "MAL-* is graded Critical"
+        );
+        assert_eq!(d["severity_counts"]["low"], 1);
+        assert_eq!(d["class_counts"]["malicious"], 1);
+        assert_eq!(d["malicious_ids"], serde_json::json!(["MAL-2024-1234"]));
+        assert_eq!(d["score"], res.score);
     }
 
     #[test]
