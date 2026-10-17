@@ -1,5 +1,7 @@
-//! Virtual conda channel merge: `repodata.json` and `channeldata.json` for a
-//! virtual repository, assembled from its members.
+//! Virtual conda channel merge: `repodata.json`, `run_exports.json` and
+//! `channeldata.json` for a virtual repository, assembled from its members
+//! (`current_repodata.json` is derived from the merged `repodata.json`, see
+//! [`super::current_repodata`]).
 //!
 //! The merge order is fixed: every hosted (local/staging) member first, in
 //! member priority order, then every remote member, in member priority order,
@@ -541,18 +543,26 @@ pub(super) struct MergeDrops {
     pub not_allowed: usize,
 }
 
-/// Merge hosted records and remote member documents into one encoded
-/// `repodata.json`. CPU-bound over upstream-sized input: run it on a blocking
-/// thread. A member document that does not parse is reported as that member's
-/// failure; the others still merge.
-pub(super) fn merge_repodata(
+/// The package maps of a merged document (`packages`, `packages.conda`).
+type PackageMaps<'a> = (
+    BTreeMap<&'a str, &'a RawValue>,
+    BTreeMap<&'a str, &'a RawValue>,
+);
+
+/// Merge hosted records and remote member package maps, first writer wins
+/// per filename: hosted records first, then each parsed remote document in
+/// member order, dropping remote records under a name a hosted member owns or
+/// that the allowlist does not admit. Shared by every per-package document a
+/// virtual serves (`repodata.json`, `run_exports.json`, #4708), so the
+/// ownership and allowlist rules cannot drift between them.
+fn merge_package_maps<'a>(
     subdir: &str,
-    hosted: &[HostedRecord],
-    remote: &[MemberDocument],
+    hosted: &'a [HostedRecord],
+    parsed: &'a [UpstreamRepodata<'a>],
     owned: &HashSet<String>,
     allowlist: Option<&CompiledAllowlist>,
-    encoding: super::RepodataEncoding,
-) -> (Result<Vec<u8>, Response>, Vec<MemberFailure>, MergeDrops) {
+    dropped: &mut MergeDrops,
+) -> PackageMaps<'a> {
     let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
     let mut packages_conda: BTreeMap<&str, &RawValue> = BTreeMap::new();
     for h in hosted {
@@ -563,21 +573,7 @@ pub(super) fn merge_repodata(
         };
         target.entry(h.filename.as_str()).or_insert(&h.record);
     }
-
-    let mut failures = Vec::new();
-    let mut dropped = MergeDrops::default();
-    let mut parsed: Vec<UpstreamRepodata<'_>> = Vec::with_capacity(remote.len());
-    for doc in remote {
-        match serde_json::from_slice::<UpstreamRepodata<'_>>(&doc.json) {
-            Ok(p) => parsed.push(p),
-            Err(e) => failures.push(MemberFailure {
-                member: doc.member.clone(),
-                kind: "parse",
-                reason: format!("repodata does not parse: {e}"),
-            }),
-        }
-    }
-    for p in &parsed {
+    for p in parsed {
         for (source, target) in [
             (&p.packages, &mut packages),
             (&p.packages_conda, &mut packages_conda),
@@ -597,7 +593,50 @@ pub(super) fn merge_repodata(
             }
         }
     }
+    (packages, packages_conda)
+}
 
+/// Parse each remote member document's package maps; a document that does not
+/// parse is that member's failure.
+fn parse_member_package_maps<'a>(
+    remote: &'a [MemberDocument],
+    what: &str,
+) -> (Vec<UpstreamRepodata<'a>>, Vec<MemberFailure>) {
+    let mut failures = Vec::new();
+    let mut parsed = Vec::with_capacity(remote.len());
+    for doc in remote {
+        match serde_json::from_slice::<UpstreamRepodata<'_>>(&doc.json) {
+            Ok(p) => parsed.push(p),
+            Err(e) => failures.push(MemberFailure {
+                member: doc.member.clone(),
+                kind: "parse",
+                reason: format!("{what} does not parse: {e}"),
+            }),
+        }
+    }
+    (parsed, failures)
+}
+
+/// The result of a per-package merge: the encoded document, member parse
+/// failures, and the remote records it dropped.
+pub(super) type PackageMerge = (Result<Vec<u8>, Response>, Vec<MemberFailure>, MergeDrops);
+
+/// Merge hosted records and remote member documents into one encoded
+/// `repodata.json`. CPU-bound over upstream-sized input: run it on a blocking
+/// thread. A member document that does not parse is reported as that member's
+/// failure; the others still merge.
+pub(super) fn merge_repodata(
+    subdir: &str,
+    hosted: &[HostedRecord],
+    remote: &[MemberDocument],
+    owned: &HashSet<String>,
+    allowlist: Option<&CompiledAllowlist>,
+    encoding: super::RepodataEncoding,
+) -> PackageMerge {
+    let mut dropped = MergeDrops::default();
+    let (parsed, failures) = parse_member_package_maps(remote, "repodata");
+    let (packages, packages_conda) =
+        merge_package_maps(subdir, hosted, &parsed, owned, allowlist, &mut dropped);
     let merged = MergedRepodata {
         info: RepodataInfo { subdir },
         packages,
@@ -606,6 +645,53 @@ pub(super) fn merge_repodata(
         repodata_version: 1,
     };
     (encoding.encode(&merged), failures, dropped)
+}
+
+// ---------------------------------------------------------------------------
+// run_exports.json (CEP-12, #4708)
+// ---------------------------------------------------------------------------
+
+/// The upstream file that carries `{subdir}/run_exports.json`.
+pub(super) fn run_exports_candidates(subdir: &str) -> Vec<(String, FileCodec)> {
+    vec![(format!("{subdir}/run_exports.json"), FileCodec::Plain)]
+}
+
+/// The merged `run_exports.json`. Field order is the serialized key order.
+#[derive(Serialize)]
+struct MergedRunExports<'a> {
+    info: RepodataInfo<'a>,
+    packages: BTreeMap<&'a str, &'a RawValue>,
+    #[serde(rename = "packages.conda")]
+    packages_conda: BTreeMap<&'a str, &'a RawValue>,
+}
+
+/// Merge hosted run-export entries and remote member `run_exports.json`
+/// documents into one pretty-printed `run_exports.json`, under exactly the
+/// ownership and allowlist rules of [`merge_repodata`]: an entry is keyed by
+/// the package filename, so a remote entry is admitted only when the matching
+/// `repodata.json` record would be. A member whose upstream publishes no
+/// `run_exports.json` arrives as `{}` and contributes nothing.
+pub(super) fn merge_run_exports(
+    subdir: &str,
+    hosted: &[HostedRecord],
+    remote: &[MemberDocument],
+    owned: &HashSet<String>,
+    allowlist: Option<&CompiledAllowlist>,
+) -> PackageMerge {
+    let mut dropped = MergeDrops::default();
+    let (parsed, failures) = parse_member_package_maps(remote, "run_exports");
+    let (packages, packages_conda) =
+        merge_package_maps(subdir, hosted, &parsed, owned, allowlist, &mut dropped);
+    let merged = MergedRunExports {
+        info: RepodataInfo { subdir },
+        packages,
+        packages_conda,
+    };
+    (
+        serde_json::to_vec_pretty(&merged).map_err(internal_error),
+        failures,
+        dropped,
+    )
 }
 
 // ---------------------------------------------------------------------------

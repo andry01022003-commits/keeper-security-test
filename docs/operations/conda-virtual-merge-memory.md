@@ -1,7 +1,9 @@
 # Sizing memory for virtual conda channels
 
 A virtual conda channel serves `repodata.json` (and `.zst`, `.bz2`),
-`channeldata.json` and the CEP-16 shard index by merging its members. For a
+`run_exports.json`, `channeldata.json` and the CEP-16 shard index by merging its
+members, and derives `current_repodata.json` from its merged `repodata.json`
+(#4708). For a
 remote member that mirrors conda-forge this is the most memory-hungry thing the
 backend does: the `linux-64` `repodata.json.zst` is about 60 MB on the wire and
 decodes to about 455 MB of JSON, and the merge works on the decoded document.
@@ -135,7 +137,8 @@ which share one merge.
 | `ak_conda_virtual_merge_rejected_total` | counter | `kind`, `reason` | Merges shed with 503: `reason="queue"` (no slot in time) or `reason="budget"` (no budget in time). |
 | `ak_conda_virtual_merge_bytes_reserved` | gauge | | Buffered-metadata budget bytes held by running merges. |
 
-`kind` is `repodata`, `channeldata` or `shard_index`. A healthy channel under
+`kind` is `repodata`, `current_repodata`, `run_exports`, `channeldata` or
+`shard_index`. A healthy channel under
 load shows misses at roughly one per document per cache TTL and hits for the
 rest. A rising `rejected_total` means the cap or the budget is too small for the
 number of distinct documents being merged at once.

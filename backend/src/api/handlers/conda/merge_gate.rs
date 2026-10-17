@@ -83,6 +83,10 @@ pub(super) enum MergeKind {
     Repodata,
     Channeldata,
     ShardIndex,
+    /// `run_exports.json` (#4708).
+    RunExports,
+    /// `current_repodata.json`, derived from a merged `repodata.json` (#4708).
+    CurrentRepodata,
 }
 
 impl MergeKind {
@@ -91,6 +95,8 @@ impl MergeKind {
             Self::Repodata => "repodata",
             Self::Channeldata => "channeldata",
             Self::ShardIndex => "shard_index",
+            Self::RunExports => "run_exports",
+            Self::CurrentRepodata => "current_repodata",
         }
     }
 }
