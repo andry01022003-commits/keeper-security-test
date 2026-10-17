@@ -420,9 +420,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             target: "security",
             allowlist = %list,
             "AK_SSRF_ALLOW_PRIVATE_CIDRS (or alias UPSTREAM_PRIVATE_IP_ALLOWLIST) \
-             is set; upstream URLs may now target listed private CIDRs. Cloud \
+             is set; outbound targets (upstream and migration URLs, LDAP, \
+             SSO/OIDC, webhooks) may now be in the listed private CIDRs. Cloud \
              metadata IPs and loopback remain blocked. SSRF risk surface \
-             widened (issues #976, #1224)."
+             widened (issues #976, #1224, #4638)."
         );
     } else {
         if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {

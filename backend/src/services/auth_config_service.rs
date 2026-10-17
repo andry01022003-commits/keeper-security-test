@@ -1466,13 +1466,20 @@ impl AuthConfigService {
         // Reject if every resolved address is an internal/private target;
         // otherwise pin the first vetted address (do not re-resolve, to
         // avoid a TOCTOU / DNS-rebind window).
+        let first = resolved.first().map(|sa| sa.ip());
         let vetted = resolved
             .into_iter()
             .find(|sa| !crate::api::validation::is_blocked_resolved_ip(sa.ip()));
         let Some(vetted) = vetted else {
-            return Err(AppError::Validation(
-                "LDAP server URL is not allowed (private/internal network)".to_string(),
-            ));
+            // Name the setting that admits a private LDAP server (#4638).
+            return Err(match first {
+                Some(ip) => {
+                    crate::api::validation::blocked_resolved_ip_error("LDAP server URL", ip)
+                }
+                None => AppError::Validation(
+                    "LDAP server URL is not allowed (private/internal network)".to_string(),
+                ),
+            });
         };
 
         let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&vetted)).await;
@@ -2643,6 +2650,27 @@ mod tests {
             .await
             .expect_err("metadata IP must be rejected before connect");
         assert!(err.to_string().contains("private/internal network"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_ldap_private_ip_refusal_names_allowlist_setting_4638() {
+        // The connectivity test is the call that produced the message in
+        // #4638. A private (relaxable) address must name the setting that
+        // admits it; a metadata address must not advertise it.
+        std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
+        std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
+        std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
+        let err = AuthConfigService::probe_ldap_endpoint("10.10.10.10", 389)
+            .await
+            .expect_err("private IP must be rejected before connect");
+        let msg = err.to_string();
+        assert!(msg.contains("private/internal network"), "msg: {msg}");
+        assert!(msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "msg: {msg}");
+
+        let err = AuthConfigService::probe_ldap_endpoint("169.254.169.254", 389)
+            .await
+            .expect_err("metadata IP must be rejected before connect");
+        assert!(!err.to_string().contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"));
     }
 
     #[tokio::test]
