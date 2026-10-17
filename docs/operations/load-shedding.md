@@ -83,15 +83,24 @@ lock/wait connections held outside the pool (capped per replica by
 `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`), plus one rolling-update surge
 replica, must stay below Postgres `max_connections`. The defaults
 (3 x 50 = 150) do not fit a stock server's 100. Every pool connection arms
-server-side TCP keepalives (15 s idle, 5 s interval, 3 probes), so sessions
-left behind by a force-killed pod are reaped in about 30 s.
+server-side TCP keepalives (15 s idle, 5 s interval, 3 probes) with a query
+right after connect, so sessions left behind by a force-killed pod are
+reaped in about 30 s. `DATABASE_TCP_KEEPALIVES=false` turns this off. Behind
+a pooler in transaction mode (PgBouncer, RDS Proxy) the setting may not
+reach the server session that serves later queries; configure keepalives
+on the pooler or in `postgresql.conf` instead. A failure to set them is
+logged once at warn and never fails the connection.
+
+A database that stays down at startup fails the process after at most five
+connect attempts (each bounded by `DATABASE_ACQUIRE_TIMEOUT_SECS`) and no new
+attempt after about 60 s, roughly 40 s with the defaults.
 
 `ak_db_pool_connection_failures_total{stage}` counts pool connection
 failures:
 
 | `stage` | Counted when |
 |---|---|
-| `startup` | An initial connect attempt failed at boot. Startup retries five times with a jittered 1 to 8 s backoff, so a refusal storm shows several increments before the process exits or recovers. |
+| `startup` | An initial connect attempt failed at boot. Startup retries up to five times with a jittered 1 to 8 s backoff, so a refusal storm shows several increments before the process exits or recovers. |
 | `request` | A pool acquire timed out while serving a request and the client was answered `503 POOL_EXHAUSTED`. |
 
 A sustained non-zero `rate(ak_db_pool_connection_failures_total{stage="request"}[5m])`

@@ -978,6 +978,15 @@ pub struct Config {
     /// idle disconnect.
     pub database_max_lifetime_secs: u64,
 
+    /// Arm server-side TCP keepalives (15 s idle, 5 s interval, 3 probes) on
+    /// every new pool connection with an `after_connect` `set_config` query
+    /// (#4549), so Postgres reaps a force-killed pod's sessions in about 30 s.
+    /// Defaults to `true`; `DATABASE_TCP_KEEPALIVES=false` (or `0`) skips the
+    /// hook. A failure of that query is logged once and never fails the
+    /// connection; a pooler in transaction mode may not carry the setting to
+    /// the server session that ends up serving a query.
+    pub database_tcp_keepalives: bool,
+
     /// Master on/off switch for HTTP rate limiting. When `false`, none of
     /// the per-IP / per-user rate-limit middleware layers are installed, so
     /// no request is ever limited (the limiter is bypassed entirely, not
@@ -1444,6 +1453,7 @@ redacted_debug!(Config {
     show database_acquire_timeout_secs,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
+    show database_tcp_keepalives,
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
@@ -1598,6 +1608,7 @@ impl Default for Config {
             database_acquire_timeout_secs: 5,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            database_tcp_keepalives: true,
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
@@ -1959,6 +1970,12 @@ impl Config {
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
+            database_tcp_keepalives: !matches!(
+                env::var("DATABASE_TCP_KEEPALIVES")
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Ok("false" | "0" | "no" | "off")
+            ),
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),

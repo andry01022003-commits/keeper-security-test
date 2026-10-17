@@ -112,6 +112,7 @@ fn test_config(storage_path: &str) -> Config {
         database_acquire_timeout_secs: 30,
         database_idle_timeout_secs: 600,
         database_max_lifetime_secs: 1800,
+        database_tcp_keepalives: true,
         auth_max_concurrency: 8,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,

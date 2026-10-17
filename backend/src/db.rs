@@ -27,15 +27,70 @@ const IDLE_LIVENESS_THRESHOLD: Duration = Duration::from_secs(30);
 /// `idle + interval * count` = 30 s and ends the session.
 ///
 /// `tcp_keepalives_*` configure the SERVER's end of each connection, so the
-/// connecting client sets them per session: the pool sends them as startup
-/// options (`-c tcp_keepalives_idle=15 ...`) on every connection it opens.
-/// Detached connections are pooled connections taken out of circulation
-/// (`PoolConnection::detach`), so they inherit the same session settings —
-/// "pool and detached" in #4549's words. Postgres accepts and ignores these
-/// settings on a Unix-domain socket (the GUC reads back as `0`), which is
-/// harmless: a local socket closes with its process anyway, so it cannot
-/// leave ghosts behind.
+/// connecting client sets them per session: the pool's `after_connect` hook
+/// ([`arm_tcp_keepalives`]) sets them on every connection it opens, unless
+/// `DATABASE_TCP_KEEPALIVES=false`. They are deliberately NOT sent as
+/// startup `options`: PgBouncer refuses unknown startup parameters by
+/// default, so that would break installs behind it. Detached connections are
+/// pooled connections taken out of circulation (`PoolConnection::detach`),
+/// so they inherit the same session settings — "pool and detached" in
+/// #4549's words. Postgres accepts and ignores these settings on a
+/// Unix-domain socket (the GUC reads back as `0`), which is harmless: a local
+/// socket closes with its process anyway, so it cannot leave ghosts behind.
 pub const TCP_KEEPALIVES: (&str, &str, &str) = ("15", "5", "3");
+
+/// Set [`TCP_KEEPALIVES`] on one session (#4549, #4013). Shared by the pool's
+/// `after_connect` hook and the dedicated advisory-lock sessions in
+/// `cluster_lock`, so the two can never disagree.
+pub(crate) async fn arm_tcp_keepalives(
+    conn: &mut sqlx::PgConnection,
+) -> std::result::Result<(), sqlx::Error> {
+    let (idle, interval, count) = TCP_KEEPALIVES;
+    sqlx::query(
+        "SELECT set_config('tcp_keepalives_idle', $1, false), \
+                set_config('tcp_keepalives_interval', $2, false), \
+                set_config('tcp_keepalives_count', $3, false)",
+    )
+    .bind(idle)
+    .bind(interval)
+    .bind(count)
+    .execute(conn)
+    .await
+    .map(|_| ())
+}
+
+/// Set once the pool's keepalive hook has logged a failure, so a pooler that
+/// refuses the settings on every connection logs one warning, not one per
+/// connection.
+static KEEPALIVE_ARM_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The pool's `after_connect` body: arm the keepalives, and on failure warn
+/// once and keep the connection. A pooler in transaction mode (PgBouncer,
+/// RDS Proxy) may refuse or not carry session settings; the connection is
+/// still perfectly usable, it just keeps the server's keepalive defaults.
+async fn arm_pool_connection_keepalives(conn: &mut sqlx::PgConnection) {
+    if let Err(e) = arm_tcp_keepalives(conn).await {
+        if !KEEPALIVE_ARM_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                error = %e,
+                "database pool: could not set server-side TCP keepalives on a new \
+                 connection; continuing with the server's defaults (a connection \
+                 pooler may not honour session settings; set \
+                 DATABASE_TCP_KEEPALIVES=false to stop trying). Logged once."
+            );
+        }
+    }
+}
+
+/// Wall-clock cap on the whole startup connect window (#4549): no further
+/// attempt starts once the next backoff would end past this, so a database
+/// that stays down fails the process within about a minute even when
+/// `DATABASE_ACQUIRE_TIMEOUT_SECS` is raised (an attempt already running
+/// still finishes its own acquire timeout). With the defaults (5 attempts,
+/// 5 s acquire timeout) the attempt count ends startup first, after about
+/// 40 s.
+const STARTUP_CONNECT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How many times [`create_pool`] attempts the initial connect before startup
 /// gives up (#4549).
@@ -78,19 +133,6 @@ fn connection_budget(config: &Config) -> String {
     )
 }
 
-/// The sqlx connect options for this deployment's `DATABASE_URL`, with
-/// [`TCP_KEEPALIVES`] appended as startup options so every connection the
-/// pool establishes carries them (#4549). `.options` appends to any `options`
-/// already present in the URL rather than replacing them.
-fn pool_connect_options(config: &Config) -> Result<PgConnectOptions> {
-    let (idle, interval, count) = TCP_KEEPALIVES;
-    Ok(PgConnectOptions::from_str(&config.database_url)?.options([
-        ("tcp_keepalives_idle", idle),
-        ("tcp_keepalives_interval", interval),
-        ("tcp_keepalives_count", count),
-    ]))
-}
-
 /// One startup connect attempt: build the pool and establish its first
 /// connection(s). Kept separate from [`create_pool`] so the retry loop can be
 /// exercised without a live database.
@@ -98,7 +140,7 @@ async fn build_pool(
     config: &Config,
     options: &PgConnectOptions,
 ) -> std::result::Result<PgPool, sqlx::Error> {
-    PgPoolOptions::new()
+    let mut pool_options = PgPoolOptions::new()
         .max_connections(config.database_max_connections)
         .min_connections(config.database_min_connections)
         .acquire_timeout(Duration::from_secs(config.database_acquire_timeout_secs))
@@ -123,9 +165,19 @@ async fn build_pool(
                 }
                 Ok(true)
             })
-        })
-        .connect_with(options.clone())
-        .await
+        });
+    if config.database_tcp_keepalives {
+        // #4549: arm the server-side keepalives on every new connection with
+        // a plain query rather than startup `options`, which PgBouncer
+        // refuses by default. Never fails the connection.
+        pool_options = pool_options.after_connect(|conn, _meta| {
+            Box::pin(async move {
+                arm_pool_connection_keepalives(conn).await;
+                Ok(())
+            })
+        });
+    }
+    pool_options.connect_with(options.clone()).await
 }
 
 /// Run `connect` up to `attempts` times with the jittered doubling backoff of
@@ -141,6 +193,7 @@ async fn build_pool(
 async fn retry_initial_connect<T, E, F, Fut>(
     budget: &str,
     attempts: u32,
+    deadline: Duration,
     mut connect: F,
 ) -> std::result::Result<T, E>
 where
@@ -148,6 +201,7 @@ where
     Fut: std::future::Future<Output = std::result::Result<T, E>>,
     E: std::fmt::Display,
 {
+    let started = tokio::time::Instant::now();
     let mut attempt = 1;
     loop {
         match connect().await {
@@ -156,14 +210,15 @@ where
                 // Connection refusals and pool acquire timeouts at startup
                 // were invisible outside the logs (#4549); count them.
                 crate::services::metrics_service::record_db_pool_connection_failure("startup");
-                if attempt >= attempts {
+                let backoff = startup_connect_backoff(attempt);
+                if attempt >= attempts || started.elapsed() + backoff >= deadline {
                     tracing::error!(
                         "database pool: giving up on the initial connect after \
-                         {attempt} attempts: {err} ({budget})"
+                         {attempt} attempts in {}s: {err} ({budget})",
+                        started.elapsed().as_secs()
                     );
                     return Err(err);
                 }
-                let backoff = startup_connect_backoff(attempt);
                 tracing::warn!(
                     "database pool: initial connect attempt {attempt}/{attempts} failed: \
                      {err}; retrying in {}ms",
@@ -184,16 +239,20 @@ where
 /// for the default values and for sizing the fleet against the server's
 /// `max_connections` (#4549).
 ///
-/// Two #4549 behaviours wrap the plain pool build: every connection carries
-/// the [`TCP_KEEPALIVES`] startup options, and the first connect is retried
-/// [`STARTUP_CONNECT_ATTEMPTS`] times with backoff instead of giving up on
-/// the first `PoolTimedOut`.
+/// Two #4549 behaviours wrap the plain pool build: every connection arms
+/// [`TCP_KEEPALIVES`] in an `after_connect` hook (unless
+/// `DATABASE_TCP_KEEPALIVES=false`), and the first connect is retried up to
+/// [`STARTUP_CONNECT_ATTEMPTS`] times, within [`STARTUP_CONNECT_DEADLINE`],
+/// instead of giving up on the first `PoolTimedOut`.
 pub async fn create_pool(config: &Config) -> Result<PgPool> {
-    let options = pool_connect_options(config)?;
+    let options = PgConnectOptions::from_str(&config.database_url)?;
     let budget = connection_budget(config);
-    let pool = retry_initial_connect(&budget, STARTUP_CONNECT_ATTEMPTS, || async {
-        build_pool(config, &options).await
-    })
+    let pool = retry_initial_connect(
+        &budget,
+        STARTUP_CONNECT_ATTEMPTS,
+        STARTUP_CONNECT_DEADLINE,
+        || async { build_pool(config, &options).await },
+    )
     .await?;
     Ok(pool)
 }
@@ -482,8 +541,11 @@ mod tests {
         // Two transient refusals, then success: retried, each failure counted
         // exactly once, and the value handed back untouched.
         let mut calls = 0_u32;
-        let outcome: std::result::Result<u32, sqlx::Error> =
-            retry_initial_connect("budget", STARTUP_CONNECT_ATTEMPTS, || {
+        let outcome: std::result::Result<u32, sqlx::Error> = retry_initial_connect(
+            "budget",
+            STARTUP_CONNECT_ATTEMPTS,
+            STARTUP_CONNECT_DEADLINE,
+            || {
                 calls += 1;
                 let n = calls;
                 async move {
@@ -493,8 +555,9 @@ mod tests {
                         Ok(n)
                     }
                 }
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(outcome.expect("the third attempt succeeds"), 3);
         assert_eq!(calls, 3);
 
@@ -502,12 +565,16 @@ mod tests {
         // attempts, then the underlying error — no unbounded hang, no
         // swallowed failure — and the give-up attempt counted too.
         let mut calls = 0_u32;
-        let outcome: std::result::Result<u32, sqlx::Error> =
-            retry_initial_connect("budget", STARTUP_CONNECT_ATTEMPTS, || {
+        let outcome: std::result::Result<u32, sqlx::Error> = retry_initial_connect(
+            "budget",
+            STARTUP_CONNECT_ATTEMPTS,
+            STARTUP_CONNECT_DEADLINE,
+            || {
                 calls += 1;
                 async { Err(sqlx::Error::PoolTimedOut) }
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(
             matches!(outcome, Err(sqlx::Error::PoolTimedOut)),
             "the last attempt's error is what surfaces"
@@ -520,6 +587,37 @@ mod tests {
             startup_failures(&snapshotter),
             2 + u64::from(STARTUP_CONNECT_ATTEMPTS),
             "each failed attempt increments ak_db_pool_connection_failures_total"
+        );
+    }
+
+    /// #4549: a raised `DATABASE_ACQUIRE_TIMEOUT_SECS` cannot stretch startup
+    /// to minutes: no new attempt starts once the next backoff would end past
+    /// [`STARTUP_CONNECT_DEADLINE`], so the process fails within about a
+    /// minute plus at most one running attempt.
+    #[tokio::test(start_paused = true)]
+    async fn startup_connect_stops_at_the_deadline_4549() {
+        let started = tokio::time::Instant::now();
+        let mut calls = 0_u32;
+        let outcome: std::result::Result<u32, sqlx::Error> = retry_initial_connect(
+            "budget",
+            STARTUP_CONNECT_ATTEMPTS,
+            STARTUP_CONNECT_DEADLINE,
+            || {
+                calls += 1;
+                async {
+                    // An attempt bounded by a 30 s acquire timeout.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Err(sqlx::Error::PoolTimedOut)
+                }
+            },
+        )
+        .await;
+        assert!(matches!(outcome, Err(sqlx::Error::PoolTimedOut)));
+        assert_eq!(calls, 2, "30 s attempts: the third would start past 60 s");
+        assert!(
+            started.elapsed() < STARTUP_CONNECT_DEADLINE + Duration::from_secs(5),
+            "gave up after {:?}",
+            started.elapsed()
         );
     }
 
@@ -584,7 +682,7 @@ mod tests {
         assert_eq!(
             keepalives(&mut pooled).await,
             expected,
-            "a pooled connection must carry the startup keepalive options"
+            "a pooled connection must carry the keepalives armed by after_connect"
         );
         let mut detached = pooled.detach();
         assert_eq!(
@@ -594,5 +692,51 @@ mod tests {
         );
         drop(detached);
         pool.close().await;
+    }
+
+    /// #4549: `DATABASE_TCP_KEEPALIVES=false` skips the `after_connect` hook,
+    /// so a deployment behind a pooler that mishandles session settings can
+    /// turn it off. Skips on a Unix socket, like the test above.
+    #[tokio::test]
+    async fn pool_keepalive_hook_is_skipped_when_disabled_4549() {
+        let Some(url) = crate::testing::require_db_url() else {
+            return;
+        };
+        let probe = crate::testing::bounded_connect(&url).await;
+        let Some(conn) = crate::testing::on_connect_result(probe) else {
+            return;
+        };
+        sqlx::Connection::close(conn)
+            .await
+            .expect("close the probe connection");
+
+        let config = Config {
+            database_url: url,
+            database_max_connections: 1,
+            database_min_connections: 0,
+            database_acquire_timeout_secs: 10,
+            database_tcp_keepalives: false,
+            ..Config::default()
+        };
+        let pool = create_pool(&config)
+            .await
+            .expect("the probe connected, so create_pool must too");
+        let mut conn = pool.acquire().await.expect("acquire a pooled connection");
+        let (tcp, idle, source): (bool, String, String) = sqlx::query_as(
+            "SELECT inet_client_addr() IS NOT NULL, current_setting('tcp_keepalives_idle'), \
+                    (SELECT source FROM pg_settings WHERE name = 'tcp_keepalives_idle')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read the session keepalive setting");
+        drop(conn);
+        pool.close().await;
+        if !tcp {
+            return;
+        }
+        assert_ne!(
+            source, "session",
+            "with the hook disabled nothing sets tcp_keepalives_idle (now {idle})"
+        );
     }
 }

@@ -4443,6 +4443,7 @@ mod tests {
             database_acquire_timeout_secs: 30,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            database_tcp_keepalives: true,
             auth_max_concurrency: TEST_AUTH_MAX_CONCURRENCY,
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,

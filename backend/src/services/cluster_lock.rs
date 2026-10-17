@@ -18,7 +18,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use crate::db::TCP_KEEPALIVES as LOCK_SESSION_KEEPALIVES;
 use crate::error::Result;
 
 /// Dedicated advisory-lock namespace (`classid`) for proxy cache hydration.
@@ -124,7 +123,7 @@ pub trait ClusterLock: Send + Sync {
 /// Poll cadence of the provided [`ClusterLock::acquire_blocking`] body.
 pub const BLOCKING_ACQUIRE_POLL: Duration = Duration::from_millis(5);
 
-/// Arm [`LOCK_SESSION_KEEPALIVES`] on a dedicated lock session.
+/// Arm [`crate::db::TCP_KEEPALIVES`] on a dedicated lock session.
 ///
 /// The values are shared with the pool (#4549), one source of truth for the
 /// ~30 s dead-peer reclaim, so a lock session can never diverge from the
@@ -143,17 +142,7 @@ pub const BLOCKING_ACQUIRE_POLL: Duration = Duration::from_millis(5);
 /// Best-effort: a Unix-socket session ignores them and a failure only keeps
 /// the server's defaults, so errors are not surfaced.
 async fn arm_dead_peer_keepalives(conn: &mut sqlx::PgConnection) {
-    let (idle, interval, count) = LOCK_SESSION_KEEPALIVES;
-    let _ = sqlx::query(
-        "SELECT set_config('tcp_keepalives_idle', $1, false), \
-                set_config('tcp_keepalives_interval', $2, false), \
-                set_config('tcp_keepalives_count', $3, false)",
-    )
-    .bind(idle)
-    .bind(interval)
-    .bind(count)
-    .execute(conn)
-    .await;
+    let _ = crate::db::arm_tcp_keepalives(conn).await;
 }
 
 /// How often the server checks that a blocked waiter's client is still
@@ -824,7 +813,7 @@ mod tests {
             .fetch_one(&mut *conn)
             .await
             .expect("settings");
-            let (idle, interval, count) = LOCK_SESSION_KEEPALIVES;
+            let (idle, interval, count) = crate::db::TCP_KEEPALIVES;
             assert_eq!(
                 settings,
                 (idle.to_string(), interval.to_string(), count.to_string())
