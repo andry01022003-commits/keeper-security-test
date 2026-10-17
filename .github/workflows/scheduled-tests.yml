@@ -32,28 +32,93 @@ permissions:
 jobs:
   nightly-e2e:
     name: 🌙 Nightly E2E Tests
-    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "nightly-e2e"]'), inputs.job)) }}
-    # Self-hosted ak-e2e-runners: the stack runs in the pod's DinD daemon
-    # (docker CLI and compose plugin come with the ak-runner-e2e image), and
-    # every bind mount in the compose file is workspace-relative, which the
-    # runner and DinD containers share.
-    runs-on: ak-e2e-runners
+    # Consumes the backend-image job's image instead of building its own
+    # (#4723). Until then this job ran `docker compose up --build` in the
+    # ak-e2e-runners pod's DinD daemon, which builds docker/Dockerfile.backend
+    # with no build args: the shipped `release` profile (thin LTO, one codegen
+    # unit, #3941), no registry cache. Measured from the job logs:
+    #   - 2026-09-18 / 09-22 (last green): image build 24.5 / 29.2 min of a
+    #     25.5 / 30.6 min job; the artifact-keeper-backend crate alone took
+    #     13m47s / 16m24s, the smoke suites 20-25 s.
+    #   - 2026-09-23 onward (on the rocky pool since #4206): the backend crate
+    #     never finished. Run 38862452466 started it at 06:48:21Z and was
+    #     still compiling it at the 45-min cancel (07:24:51Z, 36.5 min in);
+    #     runs 36980784485 and 37591238149 lost the DinD daemon mid-compile
+    #     ("error reading from server: EOF").
+    # backend-image builds the same Dockerfile on ubuntu-24.04 with the `ci`
+    # profile and the registry cache in 17-27 min (2026-10-13..17), and
+    # mesh-e2e / oci-storage-e2e already run against it.
+    needs: backend-image
+    # Runs even when backend-image failed (its first step then fails), so a
+    # broken image build still reaches the failure notification below; a
+    # skipped job would report nothing.
+    if: ${{ !cancelled() && ((github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "nightly-e2e"]'), inputs.job))) }}
+    # GitHub-hosted, like ci.yml's smoke-e2e, which runs this same smoke
+    # stack from a prebuilt image: 2m24s for that whole job on ubuntu-24.04
+    # (main run 39011451391: stack up 29 s, all four suites done 29 s later).
+    # With the build gone nothing here needs a pool-local daemon.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
+      packages: read
       issues: write
-    timeout-minutes: 45
+    # The suites wait below is capped at 8 min (ci.yml uses the same cap), so
+    # a hung suite fails the step, and is reported, well before this ceiling.
+    timeout-minutes: 20
     steps:
+      - name: Require the backend image
+        env:
+          IMAGE_RESULT: ${{ needs.backend-image.result }}
+        run: |
+          if [ "$IMAGE_RESULT" != "success" ]; then
+            echo "::error::backend-image finished '$IMAGE_RESULT'; there is no image to test (see that job's log)"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Download backend image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scheduled-backend-image
+          path: /tmp
+
+      - name: Load backend image
+        run: gunzip -c /tmp/backend-image.tar.gz | docker load
+
+      # Detached start plus a wait on every suite, as in ci.yml's smoke-e2e.
+      # Not `--abort-on-container-exit`: that stops the stack when the first
+      # container exits and returns only that container's code. In the last
+      # green nightlies (2026-09-18, 09-22) cargo exited first, so pypi and
+      # proxy-virtual were stopped mid-run and never reported.
       - name: Run native client smoke tests
         run: |
-          docker compose -f docker-compose.test.yml --profile smoke up \
-            --build \
-            --abort-on-container-exit
+          docker compose -f docker-compose.test.yml --profile smoke up -d --no-build
+
+          echo "Waiting for test containers to finish..."
+          timeout 480 docker wait e2e-test-pypi e2e-test-npm e2e-test-cargo e2e-test-proxy-virtual || {
+            echo "::error::smoke suites did not finish within 8 minutes"
+            docker ps -a --filter "name=e2e-test" --format "table {{.Names}}\t{{.Status}}"
+            exit 1
+          }
+
+          failed=false
+          for test in pypi npm cargo proxy-virtual; do
+            container="e2e-test-${test}"
+            exit_code=$(docker inspect --format='{{.State.ExitCode}}' "$container" 2>/dev/null || echo "N/A")
+            echo "::group::${test} (exit code ${exit_code})"
+            docker logs "$container" 2>&1 || true
+            echo "::endgroup::"
+            if [ "$exit_code" != "0" ]; then
+              echo "::error::${test} smoke suite exited ${exit_code}"
+              failed=true
+            fi
+          done
+          [ "$failed" = "false" ]
 
       # Capture container logs and migration state when the suite fails so the
       # auto-filed `Nightly E2E Tests Failed` issue (see Notify step below) can
@@ -80,26 +145,18 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans
+        run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans || true
 
       - name: Notify on failure
         if: failure()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+            const notify = require('./scripts/ci/nightly-failure-issue.js');
+            await notify({
+              github, context,
               title: '🚨 Nightly E2E Tests Failed',
-              body: `The nightly E2E test run has failed.
-
-              **Workflow:** ${context.workflow}
-              **Run:** ${context.runId}
-              **SHA:** ${context.sha}
-
-              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
-              `,
-              labels: ['type:bug', 'automated']
+              summary: 'The nightly E2E test run has failed.',
             });
         continue-on-error: true
 
@@ -220,19 +277,11 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+            const notify = require('./scripts/ci/nightly-failure-issue.js');
+            await notify({
+              github, context,
               title: '🚨 Nightly Windows cross-build failed',
-              body: `The nightly x86_64-pc-windows-gnu cross-build of the backend has failed.
-
-              **Workflow:** ${context.workflow}
-              **Run:** ${context.runId}
-              **SHA:** ${context.sha}
-
-              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
-              `,
-              labels: ['type:bug', 'automated']
+              summary: `The nightly x86_64-pc-windows-gnu cross-build of the backend has failed.`,
             });
         continue-on-error: true
 
@@ -283,13 +332,14 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # Backend image for the self-contained e2e stacks below
   # ════════════════════════════════════════════════════════════════════════════
-  # Built once from this checkout and handed to mesh-e2e and oci-storage-e2e as
-  # an artifact, so a dispatch from a branch tests that branch's backend. Same
+  # Built once from this checkout and handed to nightly-e2e, mesh-e2e and
+  # oci-storage-e2e as an artifact, so a dispatch from a branch tests that
+  # branch's backend. Same
   # recipe as ci.yml's build-backend-image (see the rationale there): hosted
   # runner, `ci` cargo profile, read-only registry cache.
   backend-image:
     name: Build backend image (e2e)
-    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "mesh-e2e", "oci-storage-e2e"]'), inputs.job)) }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all", "nightly-e2e", "mesh-e2e", "oci-storage-e2e"]'), inputs.job)) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -384,19 +434,11 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+            const notify = require('./scripts/ci/nightly-failure-issue.js');
+            await notify({
+              github, context,
               title: '🚨 Nightly mesh replication E2E failed',
-              body: `The nightly two-peer mesh replication suite (docker-compose.mesh-e2e.yml, #1936) has failed.
-
-              **Workflow:** ${context.workflow}
-              **Run:** ${context.runId}
-              **SHA:** ${context.sha}
-
-              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
-              `,
-              labels: ['type:bug', 'automated']
+              summary: `The nightly two-peer mesh replication suite (docker-compose.mesh-e2e.yml, #1936) has failed.`,
             });
         continue-on-error: true
 
@@ -485,18 +527,10 @@ jobs:
           STORAGE: ${{ matrix.storage }}
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+            const notify = require('./scripts/ci/nightly-failure-issue.js');
+            await notify({
+              github, context,
               title: `🚨 Nightly OCI push/pull E2E failed (${process.env.STORAGE})`,
-              body: `The nightly OCI push/pull suite against the ${process.env.STORAGE} storage backend (docker-compose.oci-storage-e2e.yml, #1529) has failed.
-
-              **Workflow:** ${context.workflow}
-              **Run:** ${context.runId}
-              **SHA:** ${context.sha}
-
-              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
-              `,
-              labels: ['type:bug', 'automated']
+              summary: `The nightly OCI push/pull suite against the ${process.env.STORAGE} storage backend (docker-compose.oci-storage-e2e.yml, #1529) has failed.`,
             });
         continue-on-error: true

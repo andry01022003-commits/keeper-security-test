@@ -2625,9 +2625,9 @@ jobs:
     # run 35878583014) against 3.5-6.5 min on ak-e2e-runners the same day.
     # The docker daemon and the compose plugin ship with the hosted image;
     # the two steps below that wait for / install them are no-ops there.
-    # The in-cluster suites (e2e.yml, scheduled-tests.yml, mesh, cache-
-    # correctness, concurrency, the scheduled trivy scan) stay on
-    # ak-e2e-runners.
+    # The in-cluster suites (e2e.yml, cache-correctness, concurrency, the
+    # scheduled trivy scan) stay on ak-e2e-runners; scheduled-tests.yml's
+    # nightly smoke moved here too, onto a prebuilt image (#4723).
     runs-on: ubuntu-24.04
     # Depend on the required fast-CI gates as well as the image build so a
     # known-red Check Rust or unit-test run never launches smoke. Smoke only
