@@ -257,7 +257,8 @@ services:
       # visible in `docker inspect`. Weak values abort startup.
       INITIAL_ADMIN_PASSWORD_FILE: ${INITIAL_ADMIN_PASSWORD_FILE:-}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
-      LOG_FORMAT: ${LOG_FORMAT:-pretty}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      LOG_ANSI: ${LOG_ANSI:-auto}
       AUDIT_STREAM: ${AUDIT_STREAM:-off}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}

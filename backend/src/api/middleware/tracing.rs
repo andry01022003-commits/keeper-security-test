@@ -457,6 +457,7 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
     // should_log_completed). Decided after the response so the status is known.
     let is_probe = is_probe_path(request.uri().path());
     let correlation_id_for_scope = correlation_id.clone();
+    let started = std::time::Instant::now();
 
     // Scope the task-locals around the whole downstream future so audit
     // emitters anywhere under this request observe the same correlation ID
@@ -474,9 +475,20 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
             log_probe_requests(),
             response.status().is_success(),
         ) {
+            // `user`, `ip` and `latency_ms` make this line the one a SIEM
+            // rule can key on (#4674); `method` and `uri` come from the
+            // enclosing `http_request` span. `user` is omitted for an
+            // anonymous request, `ip` when no address resolved. `ip` is the
+            // best-effort grade (`RATE_LIMIT_TRUSTED_PROXY_CIDRS` policy).
+            let user = crate::api::middleware::request_span::recorded_user();
+            let ip = crate::api::middleware::client_ip::current_client_ip();
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(
                 correlation_id = %correlation_id,
-                status = %response.status().as_u16(),
+                status = response.status().as_u16(),
+                user = user.as_deref(),
+                ip = ip.map(tracing::field::display),
+                latency_ms,
                 "Request completed"
             );
         }

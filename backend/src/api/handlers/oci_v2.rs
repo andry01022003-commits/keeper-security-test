@@ -401,6 +401,22 @@ async fn authenticate_oci_with_scopes(
     config: &crate::config::Config,
     headers: &HeaderMap,
 ) -> Result<(crate::services::auth_service::Claims, Option<Vec<String>>), OciAuthError> {
+    let result = verify_oci_credential(db, config, headers).await;
+    // The OCI surface authenticates in the handler rather than through the
+    // auth middleware; note the principal for the `Request completed` log
+    // line's `user` field all the same (#4674).
+    if let Ok((claims, _)) = &result {
+        crate::api::middleware::request_span::record_user(&claims.username);
+    }
+    result
+}
+
+/// The credential check behind [`authenticate_oci_with_scopes`].
+async fn verify_oci_credential(
+    db: &PgPool,
+    config: &crate::config::Config,
+    headers: &HeaderMap,
+) -> Result<(crate::services::auth_service::Claims, Option<Vec<String>>), OciAuthError> {
     let credential = extract_oci_credential(headers).ok_or(OciAuthError::Invalid)?;
     // Any attempt that fails because validation could not be completed ends
     // the whole chain with `Unavailable` (#4750): trying the next credential

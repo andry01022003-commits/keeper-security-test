@@ -94,6 +94,14 @@ pub struct AuthExtension {
     pub iat_ms: Option<i64>,
 }
 
+/// Note the authenticated principal for the `user` field of the per-request
+/// `Request completed` log line (#4674). A no-op for an anonymous request.
+fn record_request_user(auth: Option<&AuthExtension>) {
+    if let Some(ext) = auth {
+        crate::api::middleware::request_span::record_user(&ext.username);
+    }
+}
+
 /// Marker request extension inserted alongside [`AuthExtension`] when the
 /// caller authenticated via a single-use download ticket (`?ticket=`).
 ///
@@ -1029,6 +1037,7 @@ pub async fn auth_middleware(
             // That surfaced as a 500 instead of the canonical 403 for a
             // read-scope service-account token on POST /api/v1/permissions.
             // See #1438 (B10).
+            record_request_user(Some(&ext));
             request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             return next.run(request).await;
@@ -1045,6 +1054,7 @@ pub async fn auth_middleware(
             // Same dual-shape insertion as the header-auth path above so
             // `Extension<Option<AuthExtension>>` handlers resolve under a
             // ticket-authenticated request too (#1438 / B10).
+            record_request_user(Some(&ext));
             request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
             request.extensions_mut().insert(DownloadTicketAuth);
@@ -1614,6 +1624,7 @@ pub async fn optional_auth_middleware(
         return unauthorized_response_for(request.headers());
     }
 
+    record_request_user(auth_ext.as_ref());
     request.extensions_mut().insert(auth_ext);
     if authed_via_ticket {
         request.extensions_mut().insert(DownloadTicketAuth);
@@ -1721,6 +1732,7 @@ pub async fn repository_download_auth_middleware(
         return unauthorized_response_for(request.headers());
     }
 
+    record_request_user(auth_ext.as_ref());
     request.extensions_mut().insert(auth_ext);
     if authed_via_ticket {
         request.extensions_mut().insert(DownloadTicketAuth);
@@ -1834,6 +1846,7 @@ pub async fn admin_middleware(
         return must_change_password_response();
     }
 
+    record_request_user(Some(&auth_ext));
     request.extensions_mut().insert(auth_ext);
     next.run(request).await
 }
@@ -2768,6 +2781,7 @@ pub async fn repo_visibility_middleware(
     }
 
     // Insert auth extension for downstream handlers.
+    record_request_user(auth_ext.as_ref());
     request.extensions_mut().insert(auth_ext.clone());
     if authed_via_ticket {
         request.extensions_mut().insert(DownloadTicketAuth);

@@ -18,7 +18,7 @@ loads (like the `OTEL_*` variables):
 | Variable | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `AUDIT_STREAM` | `off`, `stdout` | `off` | Emit audit records as NDJSON on stdout. |
-| `LOG_FORMAT` | `pretty`, `json` | `pretty` | Format of the *diagnostics* log lines. |
+| `LOG_FORMAT` | `text` (alias `pretty`), `json` | `text` | Format of the *diagnostics* log lines; see [operations/logging.md](operations/logging.md). |
 
 The audit stream is **opt-in**. When `AUDIT_STREAM=off` (the default) nothing is
 emitted and the code path short-circuits before the export record is even
