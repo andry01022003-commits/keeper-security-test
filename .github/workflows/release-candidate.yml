@@ -368,7 +368,7 @@ jobs:
     name: Release bookkeeping for the commit
     needs: resolve
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -437,6 +437,75 @@ jobs:
       # which a sha tag is not. So it runs here, on the commit.
       - name: Verify CHANGELOG.md documents this version
         run: scripts/ci/assert-changelog-documents-version.sh "${{ needs.resolve.outputs.version }}"
+
+      # ── will the gate's chart install render? (#4722) ──────────────────────
+      # The Release Gate installs the Helm chart from artifact-keeper-iac with
+      # artifact-keeper-test's values profiles. A chart that refuses those
+      # values is first seen at `helm install` on the cluster: the 1.11.1
+      # candidate died there 14 minutes in (run 39001623001), after iac#380
+      # began refusing ADMIN_PASSWORD in backend.env and every gate profile
+      # still set it. `helm template` of the same chart with the same profiles
+      # gives that verdict in seconds, with no cluster, before an hour of gate
+      # is spent on a stack that will deploy nothing.
+      #
+      # Same inputs the gate uses:
+      #   chart     artifact-keeper-iac at the ref passed as `iac_ref` to the
+      #             release-gate job below (main; keep the two in step)
+      #   profiles  artifact-keeper-test@main moved by its switch-tests-ref.sh
+      #             to the release/X.Y.x branch for this commit's line when one
+      #             exists, exactly as every gate job does
+      #   Helm      v3.22.1, the gate's pin
+      # The profile list and the render are artifact-keeper-test's
+      # (helm/gate-profiles.txt, scripts/render-gate-profiles.sh), shared with
+      # iac's helm-ci.yml so the three cannot drift. Running that repository's
+      # main here trusts it no further than the release-gate job below, which
+      # runs its main with `secrets: inherit`; and nothing from the certified
+      # commit is executed (CODE FROM MAIN, DATA FROM THE COMMIT above).
+      - name: Checkout the gate's chart (artifact-keeper-iac@main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: artifact-keeper/artifact-keeper-iac
+          ref: main
+          path: .gate/iac
+          persist-credentials: false
+
+      - name: Checkout the gate's profiles (artifact-keeper-test@main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: artifact-keeper/artifact-keeper-test
+          ref: main
+          path: .gate/test
+          persist-credentials: false
+
+      - name: Move the profiles to the tests ref the gate will use
+        working-directory: .gate/test
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKEND_TAG: sha-${{ needs.resolve.outputs.short }}
+        run: scripts/switch-tests-ref.sh
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.1
+
+      - name: Render the chart with every gate profile
+        run: |
+          set -euo pipefail
+          if [[ ! -x .gate/test/scripts/render-gate-profiles.sh || ! -f .gate/test/helm/gate-profiles.txt ]]; then
+            # A release/X.Y.x tests branch cut before artifact-keeper-test#450
+            # has no profile manifest. Not a refusal: the gate still runs, it
+            # just runs without this preflight. Backport #450 to the branch.
+            echo "::warning title=Gate profiles not preflighted::the artifact-keeper-test ref the gate will use ($(git -C .gate/test rev-parse --short HEAD)) has no helm/gate-profiles.txt / scripts/render-gate-profiles.sh (artifact-keeper-test#450); the chart render is first checked by the gate's own helm install."
+            exit 0
+          fi
+          rc=0
+          .gate/test/scripts/render-gate-profiles.sh --chart-dir .gate/iac/charts/artifact-keeper || rc=$?
+          case "$rc" in
+            0) ;;
+            1) echo "::error title=The Release Gate would deploy nothing::the chart at artifact-keeper-iac@main refuses the release gate's values (each failing profile is named above). Fix the chart or the profiles in artifact-keeper-test, then dispatch a new candidate; dispatching the gate now would fail at helm install."; exit 1 ;;
+            *) echo "::error title=Gate profile render could not run::render-gate-profiles.sh exited ${rc} (missing chart or values file). Failing closed."; exit 1 ;;
+          esac
 
   # ── the images Docker Publish already built for this commit ─────────────────
   images:
@@ -639,6 +708,9 @@ jobs:
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
       backend_tag: sha-${{ needs.resolve.outputs.short }}
+      # The chart ref the gate deploys. `bookkeeping` renders the chart at this
+      # same ref before the gate is dispatched (#4722): keep the two in step.
+      iac_ref: main
       backend_digest: ${{ needs.images.outputs.backend_digest }}
       web_tag: latest
       test_suite: all
