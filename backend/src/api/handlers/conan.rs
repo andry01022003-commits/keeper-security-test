@@ -189,8 +189,30 @@ fn merge_unique_by<V, K, F>(
     }
 }
 
-/// Build a storage key for a recipe file.
-fn recipe_storage_key(
+/// The storage key a new Conan object is written to, from its path under the
+/// `conan/` prefix ([`recipe_storage_path`] / [`package_storage_path`]).
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `conan/{repository_id}/{path}` of the #2624 scheme, so two repositories
+/// holding the same recipe or package revision write two objects. The flat
+/// `conan/{path}` key every repository used to share made the second
+/// repository's upload fail the cross-repository write guard with 409
+/// "already owned by another repository" (#4694), the defect npm had in
+/// #4293. Filesystem backends (one directory per repository) and
+/// `STORAGE_KEY_SCHEME=flat` keep the flat key. Existing objects are
+/// untouched: every Conan read resolves the object through the
+/// `storage_key` its artifact row recorded.
+fn conan_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    path: &str,
+) -> String {
+    scheme.write_key(storage_backend, "conan", repo_id, path)
+}
+
+/// The path of a recipe file under the `conan/` storage prefix.
+fn recipe_storage_path(
     name: &str,
     version: &str,
     user: &str,
@@ -199,7 +221,7 @@ fn recipe_storage_key(
     file_path: &str,
 ) -> String {
     format!(
-        "conan/{}/{}/{}/{}/recipe/{}/{}",
+        "{}/{}/{}/{}/recipe/{}/{}",
         name,
         version,
         normalize_user(user),
@@ -209,9 +231,9 @@ fn recipe_storage_key(
     )
 }
 
-/// Build a storage key for a package file.
+/// The path of a package file under the `conan/` storage prefix.
 #[allow(clippy::too_many_arguments)]
-fn package_storage_key(
+fn package_storage_path(
     name: &str,
     version: &str,
     user: &str,
@@ -222,7 +244,7 @@ fn package_storage_key(
     file_path: &str,
 ) -> String {
     format!(
-        "conan/{}/{}/{}/{}/package/{}/{}/{}/{}",
+        "{}/{}/{}/{}/package/{}/{}/{}/{}",
         name,
         version,
         normalize_user(user),
@@ -2014,7 +2036,6 @@ async fn recipe_file_download(
 
     let artifact_path =
         recipe_artifact_path(&name, &version, &user, &channel, &revision, &file_path);
-    let _storage_key = recipe_storage_key(&name, &version, &user, &channel, &revision, &file_path);
 
     // Look up artifact
     let artifact = sqlx::query!(
@@ -2190,7 +2211,15 @@ async fn recipe_file_upload(
 
     let artifact_path =
         recipe_artifact_path(&name, &version, &user, &channel, &revision, &file_path);
-    let storage_key = recipe_storage_key(&name, &version, &user, &channel, &revision, &file_path);
+    // Repo-scoped on a shared cloud namespace (#4694), so the guard below only
+    // ever refuses a key another repository could own on the legacy flat
+    // scheme (`STORAGE_KEY_SCHEME=flat`).
+    let storage_key = conan_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &recipe_storage_path(&name, &version, &user, &channel, &revision, &file_path),
+    );
 
     // Compute SHA-256
     let mut hasher = Sha256::new();
@@ -3411,15 +3440,21 @@ async fn package_file_upload(
         &pkg_revision,
         &file_path,
     );
-    let storage_key = package_storage_key(
-        &name,
-        &version,
-        &user,
-        &channel,
-        &revision,
-        &package_id,
-        &pkg_revision,
-        &file_path,
+    // Repo-scoped on a shared cloud namespace (#4694); see `recipe_file_upload`.
+    let storage_key = conan_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &package_storage_path(
+            &name,
+            &version,
+            &user,
+            &channel,
+            &revision,
+            &package_id,
+            &pkg_revision,
+            &file_path,
+        ),
     );
 
     // Compute SHA-256
@@ -4380,15 +4415,96 @@ mod tests {
     // recipe_storage_key
     // -----------------------------------------------------------------------
 
+    /// The key a new object gets on a filesystem backend, where it stays the
+    /// legacy flat `conan/{path}` key whatever the scheme (#4694).
+    fn recipe_storage_key_on_filesystem(
+        name: &str,
+        version: &str,
+        user: &str,
+        channel: &str,
+        revision: &str,
+        file_path: &str,
+    ) -> String {
+        conan_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::nil(),
+            &recipe_storage_path(name, version, user, channel, revision, file_path),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn package_storage_key_on_filesystem(
+        name: &str,
+        version: &str,
+        user: &str,
+        channel: &str,
+        revision: &str,
+        package_id: &str,
+        pkg_revision: &str,
+        file_path: &str,
+    ) -> String {
+        conan_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::nil(),
+            &package_storage_path(
+                name,
+                version,
+                user,
+                channel,
+                revision,
+                package_id,
+                pkg_revision,
+                file_path,
+            ),
+        )
+    }
+
+    /// #4694: a shared cloud namespace gets the repo-scoped key for recipe
+    /// and package files alike, and the `STORAGE_KEY_SCHEME=flat` opt-out
+    /// keeps the legacy shared key.
+    #[test]
+    fn test_conan_storage_key_is_repo_scoped_on_cloud_4694() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = uuid::Uuid::new_v4();
+        let recipe = recipe_storage_path("zlib", "1.2.13", "_", "_", "abc123", "conan_export.tgz");
+        let package = package_storage_path(
+            "zlib",
+            "1.2.13",
+            "_",
+            "_",
+            "abc123",
+            "pkgid",
+            "pkgrev",
+            "conan_package.tgz",
+        );
+        for backend in ["s3", "gcs", "azure"] {
+            for path in [&recipe, &package] {
+                assert_eq!(
+                    conan_storage_key(StorageKeyScheme::RepoScoped, backend, repo_id, path),
+                    format!("conan/{repo_id}/{path}"),
+                    "{backend}"
+                );
+                assert_eq!(
+                    conan_storage_key(StorageKeyScheme::Flat, backend, repo_id, path),
+                    format!("conan/{path}"),
+                    "{backend}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_recipe_storage_key_basic() {
-        let key = recipe_storage_key("zlib", "1.2.13", "_", "_", "abc123", "conanfile.py");
+        let key =
+            recipe_storage_key_on_filesystem("zlib", "1.2.13", "_", "_", "abc123", "conanfile.py");
         assert_eq!(key, "conan/zlib/1.2.13/_/_/recipe/abc123/conanfile.py");
     }
 
     #[test]
     fn test_recipe_storage_key_with_user_and_channel() {
-        let key = recipe_storage_key(
+        let key = recipe_storage_key_on_filesystem(
             "boost",
             "1.80.0",
             "myuser",
@@ -4404,7 +4520,8 @@ mod tests {
 
     #[test]
     fn test_recipe_storage_key_leading_slash_in_path() {
-        let key = recipe_storage_key("zlib", "1.0", "_", "_", "rev1", "/conanfile.py");
+        let key =
+            recipe_storage_key_on_filesystem("zlib", "1.0", "_", "_", "rev1", "/conanfile.py");
         assert_eq!(key, "conan/zlib/1.0/_/_/recipe/rev1/conanfile.py");
     }
 
@@ -4414,7 +4531,7 @@ mod tests {
 
     #[test]
     fn test_package_storage_key_basic() {
-        let key = package_storage_key(
+        let key = package_storage_key_on_filesystem(
             "zlib",
             "1.2.13",
             "_",
@@ -4432,7 +4549,7 @@ mod tests {
 
     #[test]
     fn test_package_storage_key_leading_slash() {
-        let key = package_storage_key(
+        let key = package_storage_key_on_filesystem(
             "zlib",
             "1.0",
             "_",
@@ -11690,5 +11807,224 @@ mod atomic_upload_4329 {
         ] {
             assert!(!is_byte_transfer_path(path), "{path}");
         }
+    }
+}
+
+/// #4694: Conan storage keys are repository-scoped on shared cloud storage.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod repo_scoped_keys_4694 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::storage::StorageBackend;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+
+    const RREV: &str = "4694rrev";
+    const PID: &str = "4694pid";
+    const PREV: &str = "4694prev";
+
+    async fn cloud_conan_repo(pool: &sqlx::PgPool) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, dir) = create_conan_repo(pool, "local").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cloud backend");
+        (repo_id, repo_key, dir)
+    }
+
+    /// Upload one recipe revision and one package revision; every status.
+    async fn publish(
+        state: &crate::api::SharedState,
+        auth: &crate::api::middleware::auth::AuthExtension,
+        repo_key: &str,
+    ) -> Vec<(String, StatusCode)> {
+        let mut statuses = Vec::new();
+        for (file, body) in [
+            ("conanfile.py", sample_conanfile_py().to_vec()),
+            ("conanmanifest.txt", sample_conanmanifest_txt().to_vec()),
+        ] {
+            let s = upload_recipe_file(
+                state, auth, repo_key, "samerev", "1.0", "_", "_", RREV, file, &body,
+            )
+            .await;
+            statuses.push((format!("recipe {file}"), s));
+        }
+        for (file, body) in [
+            ("conan_package.tgz", sample_conan_package_tgz()),
+            ("conaninfo.txt", sample_conaninfo_txt().to_vec()),
+            ("conanmanifest.txt", b"1700000000\nlib/a.txt: 00\n".to_vec()),
+        ] {
+            let s = upload_package_file(
+                state, auth, repo_key, "samerev", "1.0", "_", "_", RREV, PID, PREV, file, &body,
+            )
+            .await;
+            statuses.push((format!("package {file}"), s));
+        }
+        statuses
+    }
+
+    async fn download(state: &crate::api::SharedState, uri: String) -> (StatusCode, bytes::Bytes) {
+        let app = router_anon(state.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request");
+        send(app, req).await
+    }
+
+    fn recipe_uri(repo_key: &str, file: &str) -> String {
+        format!("/{repo_key}/v2/conans/samerev/1.0/_/_/revisions/{RREV}/files/{file}")
+    }
+
+    fn package_uri(repo_key: &str, file: &str) -> String {
+        format!(
+            "/{repo_key}/v2/conans/samerev/1.0/_/_/revisions/{RREV}/packages/{PID}/revisions/{PREV}/files/{file}"
+        )
+    }
+
+    /// The same recipe and package revision publish into two Conan
+    /// repositories on a shared cloud namespace, and each serves its own copy.
+    /// On main the second repository's first upload answered 409 "already
+    /// owned by another repository; refusing cross-repository overwrite".
+    #[tokio::test]
+    async fn same_revision_publishes_to_two_cloud_repositories_4694() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username, _p) = create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let auth = make_auth(user_id, &username);
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            repos.push(cloud_conan_repo(&pool).await);
+        }
+
+        let mut outcomes = Vec::new();
+        for (repo_id, repo_key, _) in &repos {
+            let statuses = publish(&state, &auth, repo_key).await;
+            let recipe = download(&state, recipe_uri(repo_key, "conanfile.py")).await;
+            let package = download(&state, package_uri(repo_key, "conan_package.tgz")).await;
+            let keys: Vec<String> = sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_all(&pool)
+            .await
+            .expect("row keys");
+            outcomes.push((*repo_id, statuses, recipe, package, keys));
+        }
+        let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+
+        for (repo_id, _, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *repo_id, dir).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (repo_id, statuses, recipe, package, keys) in outcomes {
+            for (what, status) in statuses {
+                assert_eq!(
+                    status,
+                    StatusCode::CREATED,
+                    "{what} into repository {repo_id} must be accepted"
+                );
+            }
+            assert_eq!(recipe.0, StatusCode::OK, "recipe download from {repo_id}");
+            assert_eq!(&recipe.1[..], sample_conanfile_py());
+            assert_eq!(package.0, StatusCode::OK, "package download from {repo_id}");
+            assert_eq!(&package.1[..], &sample_conan_package_tgz()[..]);
+            assert_eq!(keys.len(), 5, "{keys:?}");
+            let prefix = format!("conan/{repo_id}/samerev/1.0/_/_/");
+            for key in keys {
+                assert!(key.starts_with(&prefix), "{key} must be repo-scoped");
+                assert!(objects.contains(&key), "{key} must be written");
+            }
+        }
+        assert!(
+            !objects.iter().any(|k| k.starts_with("conan/samerev/")),
+            "the legacy flat key must not be written on a cloud backend: {objects:?}"
+        );
+    }
+
+    /// Existing data keeps serving: a recipe file whose row records the
+    /// legacy flat `conan/{name}/...` key is still downloadable after the
+    /// switch, and a re-upload of the same file moves it to the scoped key.
+    #[tokio::test]
+    async fn legacy_flat_key_recipe_still_downloadable_4694() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username, _p) = create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let auth = make_auth(user_id, &username);
+        let (repo_id, repo_key, dir) = cloud_conan_repo(&pool).await;
+
+        let legacy_key = format!("conan/samerev/1.0/_/_/recipe/{RREV}/conanfile.py");
+        let artifact_id = seed_recipe_row(
+            &pool,
+            repo_id,
+            "samerev",
+            "1.0",
+            "_",
+            "_",
+            RREV,
+            "conanfile.py",
+        )
+        .await;
+        let row_key: String = sqlx::query_scalar("SELECT storage_key FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded row");
+        mem.put(&legacy_key, bytes::Bytes::from_static(b"legacy recipe"))
+            .await
+            .expect("seed legacy object");
+
+        let before = download(&state, recipe_uri(&repo_key, "conanfile.py")).await;
+        let reupload = upload_recipe_file(
+            &state,
+            &auth,
+            &repo_key,
+            "samerev",
+            "1.0",
+            "_",
+            "_",
+            RREV,
+            "conanfile.py",
+            sample_conanfile_py(),
+        )
+        .await;
+        let after = download(&state, recipe_uri(&repo_key, "conanfile.py")).await;
+        let new_key: Option<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("row");
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(row_key, legacy_key, "fixture must record the legacy key");
+        assert_eq!(
+            before.0,
+            StatusCode::OK,
+            "legacy-key recipe must still download"
+        );
+        assert_eq!(&before.1[..], b"legacy recipe");
+        assert_eq!(reupload, StatusCode::CREATED);
+        assert_eq!(after.0, StatusCode::OK);
+        assert_eq!(&after.1[..], sample_conanfile_py());
+        assert_eq!(
+            new_key,
+            Some(format!(
+                "conan/{repo_id}/samerev/1.0/_/_/recipe/{RREV}/conanfile.py"
+            ))
+        );
     }
 }
