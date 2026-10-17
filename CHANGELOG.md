@@ -17,11 +17,15 @@ Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
 
 **Backers**
 
-- Ash A. ([@dragonpaw](https://github.com/dragonpaw))
-- Gabriel Rodriguez ([@injectedfusion](https://github.com/injectedfusion))
+- **Advailo, SIA** ([@advailo](https://github.com/advailo))
+- **stringke** ([@StringKe](https://github.com/StringKe))
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Mike** ([@huylv95](https://github.com/huylv95))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+- **Narek Engibaryan** ([@narek01](https://github.com/narek01))
+- and one sponsor who chose to stay private
 
 [Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
-
 ### Thank You
 
 - **[@mymarche](https://github.com/mymarche)**: reporting that a CI OIDC provider could be given a Kubernetes API server's audience, so every pod's default ServiceAccount token was accepted (#4133).

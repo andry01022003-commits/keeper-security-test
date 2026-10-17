@@ -201,7 +201,10 @@ names the same commit.
    there through verbatim, leaves `## [Unreleased]` holding only its pointer
    line, and deletes the fragments it rendered. Then add the Sponsors and
    Thank You recognition sections to the new section per the "Changelog and
-   Release Notes" policy in [CLAUDE.md](CLAUDE.md), and edit the order or
+   Release Notes" policy in [CLAUDE.md](CLAUDE.md) (`scripts/release/sponsors.sh`
+   prints the Sponsors block from the active GitHub sponsorships, and
+   `scripts/release/sponsors.sh --check .github/release-notes/<version>.md`
+   confirms the notes name every public sponsor), and edit the order or
    wording if the release wants it — the assembler writes a first draft of
    the section, not a verdict on it.
 
