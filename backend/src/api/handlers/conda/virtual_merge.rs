@@ -152,6 +152,18 @@ impl FailurePolicy {
     }
 }
 
+/// Count the remote records one member lost to the virtual's allowlist in one
+/// merge (#4711). Called once per member per merge rather than once per
+/// record: a merge can drop most of an upstream channel, and the merge result
+/// is cached, so a request served from the cache adds nothing.
+pub(super) fn count_allowlist_drops(virtual_repo_key: &str, member: &str, dropped: usize) {
+    crate::services::metrics_service::record_conda_allowlist_dropped(
+        virtual_repo_key,
+        member,
+        dropped as u64,
+    );
+}
+
 /// Count every member failure (both policies) and turn the outcome into the
 /// response the policy calls for. `Ok(None)`: no failures, serve as usual.
 /// `Ok(Some(members))`: degraded, serve with the partial marking.
@@ -554,11 +566,14 @@ type PackageMaps<'a> = (
 /// member order, dropping remote records under a name a hosted member owns or
 /// that the allowlist does not admit. Shared by every per-package document a
 /// virtual serves (`repodata.json`, `run_exports.json`, #4708), so the
-/// ownership and allowlist rules cannot drift between them.
+/// ownership and allowlist rules cannot drift between them. Allowlist drops
+/// are counted per member in `ak_conda_allowlist_dropped_total` under
+/// `virtual_repo_key` (#4711).
 fn merge_package_maps<'a>(
+    virtual_repo_key: &str,
     subdir: &str,
     hosted: &'a [HostedRecord],
-    parsed: &'a [UpstreamRepodata<'a>],
+    parsed: &'a [(&'a str, UpstreamRepodata<'a>)],
     owned: &HashSet<String>,
     allowlist: Option<&CompiledAllowlist>,
     dropped: &mut MergeDrops,
@@ -573,7 +588,8 @@ fn merge_package_maps<'a>(
         };
         target.entry(h.filename.as_str()).or_insert(&h.record);
     }
-    for p in parsed {
+    for (member, p) in parsed {
+        let mut member_not_allowed = 0usize;
         for (source, target) in [
             (&p.packages, &mut packages),
             (&p.packages_conda, &mut packages_conda),
@@ -585,13 +601,15 @@ fn merge_package_maps<'a>(
                 }
                 if let Some(allowlist) = allowlist {
                     if !remote_record_is_admitted(subdir, filename, raw, allowlist) {
-                        dropped.not_allowed += 1;
+                        member_not_allowed += 1;
                         continue;
                     }
                 }
                 target.entry(filename.as_str()).or_insert(*raw);
             }
         }
+        dropped.not_allowed += member_not_allowed;
+        count_allowlist_drops(virtual_repo_key, member, member_not_allowed);
     }
     (packages, packages_conda)
 }
@@ -601,12 +619,12 @@ fn merge_package_maps<'a>(
 fn parse_member_package_maps<'a>(
     remote: &'a [MemberDocument],
     what: &str,
-) -> (Vec<UpstreamRepodata<'a>>, Vec<MemberFailure>) {
+) -> (Vec<(&'a str, UpstreamRepodata<'a>)>, Vec<MemberFailure>) {
     let mut failures = Vec::new();
     let mut parsed = Vec::with_capacity(remote.len());
     for doc in remote {
         match serde_json::from_slice::<UpstreamRepodata<'_>>(&doc.json) {
-            Ok(p) => parsed.push(p),
+            Ok(p) => parsed.push((doc.member.as_str(), p)),
             Err(e) => failures.push(MemberFailure {
                 member: doc.member.clone(),
                 kind: "parse",
@@ -624,8 +642,10 @@ pub(super) type PackageMerge = (Result<Vec<u8>, Response>, Vec<MemberFailure>, M
 /// Merge hosted records and remote member documents into one encoded
 /// `repodata.json`. CPU-bound over upstream-sized input: run it on a blocking
 /// thread. A member document that does not parse is reported as that member's
-/// failure; the others still merge.
+/// failure; the others still merge. Allowlist drops are counted per member in
+/// `ak_conda_allowlist_dropped_total` under `virtual_repo_key` (#4711).
 pub(super) fn merge_repodata(
+    virtual_repo_key: &str,
     subdir: &str,
     hosted: &[HostedRecord],
     remote: &[MemberDocument],
@@ -635,8 +655,15 @@ pub(super) fn merge_repodata(
 ) -> PackageMerge {
     let mut dropped = MergeDrops::default();
     let (parsed, failures) = parse_member_package_maps(remote, "repodata");
-    let (packages, packages_conda) =
-        merge_package_maps(subdir, hosted, &parsed, owned, allowlist, &mut dropped);
+    let (packages, packages_conda) = merge_package_maps(
+        virtual_repo_key,
+        subdir,
+        hosted,
+        &parsed,
+        owned,
+        allowlist,
+        &mut dropped,
+    );
     let merged = MergedRepodata {
         info: RepodataInfo { subdir },
         packages,
@@ -672,6 +699,7 @@ struct MergedRunExports<'a> {
 /// `repodata.json` record would be. A member whose upstream publishes no
 /// `run_exports.json` arrives as `{}` and contributes nothing.
 pub(super) fn merge_run_exports(
+    virtual_repo_key: &str,
     subdir: &str,
     hosted: &[HostedRecord],
     remote: &[MemberDocument],
@@ -680,8 +708,15 @@ pub(super) fn merge_run_exports(
 ) -> PackageMerge {
     let mut dropped = MergeDrops::default();
     let (parsed, failures) = parse_member_package_maps(remote, "run_exports");
-    let (packages, packages_conda) =
-        merge_package_maps(subdir, hosted, &parsed, owned, allowlist, &mut dropped);
+    let (packages, packages_conda) = merge_package_maps(
+        virtual_repo_key,
+        subdir,
+        hosted,
+        &parsed,
+        owned,
+        allowlist,
+        &mut dropped,
+    );
     let merged = MergedRunExports {
         info: RepodataInfo { subdir },
         packages,
@@ -715,8 +750,10 @@ struct MergedChanneldata<'a> {
 /// `channeldata.json`. Remote entries for owned names are dropped, and so are
 /// remote entries whose name the allowlist (when enabled) admits under no
 /// entry; channeldata is a per-name summary, so versions and subdirs do not
-/// enter into it. Returns the number of entries the allowlist dropped.
+/// enter into it. Returns the number of entries the allowlist dropped, which
+/// are also counted per member in `ak_conda_allowlist_dropped_total` (#4711).
 pub(super) fn merge_channeldata(
+    virtual_repo_key: &str,
     hosted: &[(String, Box<RawValue>)],
     remote: &[MemberDocument],
     owned: &HashSet<String>,
@@ -731,7 +768,7 @@ pub(super) fn merge_channeldata(
     let mut parsed = Vec::with_capacity(remote.len());
     for doc in remote {
         match serde_json::from_slice::<UpstreamChanneldata<'_>>(&doc.json) {
-            Ok(p) => parsed.push(p),
+            Ok(p) => parsed.push((doc.member.as_str(), p)),
             Err(e) => failures.push(MemberFailure {
                 member: doc.member.clone(),
                 kind: "parse",
@@ -739,17 +776,20 @@ pub(super) fn merge_channeldata(
             }),
         }
     }
-    for p in &parsed {
+    for (member, p) in &parsed {
+        let mut member_not_allowed = 0usize;
         for (name, raw) in &p.packages {
             if owned.contains(&name.to_ascii_lowercase()) {
                 continue;
             }
             if allowlist.is_some_and(|a| !a.admits_name(name)) {
-                not_allowed += 1;
+                member_not_allowed += 1;
                 continue;
             }
             packages.entry(name.as_str()).or_insert(*raw);
         }
+        not_allowed += member_not_allowed;
+        count_allowlist_drops(virtual_repo_key, member, member_not_allowed);
     }
     let merged = MergedChanneldata {
         channeldata_version: 1,

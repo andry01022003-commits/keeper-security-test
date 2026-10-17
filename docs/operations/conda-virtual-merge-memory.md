@@ -143,6 +143,10 @@ load shows misses at roughly one per document per cache TTL and hits for the
 rest. A rising `rejected_total` means the cap or the budget is too small for the
 number of distinct documents being merged at once.
 
+The counters for the conda security controls (attestation outcomes,
+install-script findings, allowlist drops) are in
+[conda-security-metrics.md](conda-security-metrics.md).
+
 ## Alert on restarts, not only on memory
 
 A container that is OOM-killed and restarted by its restart policy can look

@@ -136,6 +136,60 @@ pub fn set_conda_virtual_merge_bytes_reserved(bytes: usize) {
     gauge!("ak_conda_virtual_merge_bytes_reserved").set(bytes as f64);
 }
 
+/// Outcome of a CEP-27 publish attestation decision (#4711). `outcome` is one
+/// of [`CONDA_ATTESTATION_OUTCOMES`]; `repository` is the repository key.
+///
+/// * `verified`: an attestation PUT whose bundle verified, and was stored.
+/// * `failed`: an attestation PUT whose bundle did not verify, stored anyway
+///   because `CONDA_ATTESTATION_REQUIRE_VERIFIED` is explicitly off.
+/// * `rejected`: an attestation PUT whose bundle did not verify, refused
+///   because verification is required (the default).
+/// * `absent`: a hosted package upload, which carries no attestation of its
+///   own (CEP-27 attestations are attached afterwards by PUT).
+pub fn record_conda_attestation(repo_key: &str, outcome: &'static str) {
+    debug_assert!(CONDA_ATTESTATION_OUTCOMES.contains(&outcome));
+    counter!(
+        "ak_conda_attestation_total",
+        "repository" => repo_key.to_string(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+/// The bounded `outcome` label values of `ak_conda_attestation_total`.
+pub const CONDA_ATTESTATION_OUTCOMES: [&str; 4] = ["verified", "failed", "absent", "rejected"];
+
+/// Install scripts found in an uploaded conda package's payload (#4711).
+/// `kind` is the conda hook the script implements (`pre-link`, `post-link`,
+/// `pre-unlink`), as `conda_scripts::classify_script_path` classifies it.
+pub fn record_conda_install_script_findings(repo_key: &str, kind: &'static str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!(
+        "ak_conda_install_script_findings_total",
+        "repository" => repo_key.to_string(),
+        "kind" => kind,
+    )
+    .increment(count);
+}
+
+/// Remote records a virtual conda channel's package allowlist (#4576)
+/// dropped from one merge, per remote member (#4711). `repository` is the
+/// virtual repository's key and `member` the remote member's key. Counted
+/// once per merge, so cached and single-flighted requests add nothing.
+pub fn record_conda_allowlist_dropped(virtual_repo_key: &str, member: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!(
+        "ak_conda_allowlist_dropped_total",
+        "repository" => virtual_repo_key.to_string(),
+        "member" => member.to_string(),
+    )
+    .increment(count);
+}
+
 /// Record a lookup against the npm attestation negative cache (#3764),
 /// which memoises the `404`s that `npm audit signatures` provokes on the
 /// `/-/npm/v1/attestations/{pkg}@{ver}` proxy path.
@@ -447,6 +501,77 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
     .increment(1);
 }
 
+/// Counters recorded while a test ran, as `(name, labels, value)`; read one
+/// with [`CounterCapture::get`].
+#[cfg(test)]
+pub(crate) struct CounterCapture(Vec<CapturedCounter>);
+
+/// One captured counter series: name, labels, value.
+#[cfg(test)]
+type CapturedCounter = (String, Vec<(String, String)>, u64);
+
+#[cfg(test)]
+impl CounterCapture {
+    /// The sum of every `name` series whose labels include all of `labels`.
+    pub(crate) fn get(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        self.0
+            .iter()
+            .filter(|(n, ls, _)| {
+                n == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| ls.iter().any(|(lk, lv)| lk == k && lv == v))
+            })
+            .map(|(_, _, v)| *v)
+            .sum()
+    }
+}
+
+/// Run `f` against a thread-local debugging recorder and return what it
+/// counted. Async work must run inside `f` on a current-thread runtime, so
+/// the increments happen on this thread.
+#[cfg(test)]
+pub(crate) fn capture_counters<R>(f: impl FnOnce() -> R) -> (R, CounterCapture) {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, f);
+    let counters = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(ck, _, _, value)| match value {
+            DebugValue::Counter(v) => {
+                let key = ck.key();
+                Some((
+                    key.name().to_string(),
+                    key.labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect(),
+                    v,
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    (out, CounterCapture(counters))
+}
+
+/// Run an async test body on a current-thread runtime under
+/// [`capture_counters`].
+#[cfg(test)]
+pub(crate) fn capture_counters_async<F: std::future::Future>(
+    f: impl FnOnce() -> F,
+) -> (F::Output, CounterCapture) {
+    capture_counters(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(f())
+    })
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
@@ -514,6 +639,58 @@ mod tests {
         assert_eq!(b.first(), Some(&0.005));
         assert_eq!(b.last(), Some(&60.0));
         assert!(b.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// #4711: the conda counters carry only bounded labels, and a zero
+    /// count creates no series.
+    #[test]
+    fn test_conda_security_counters_record_bounded_labels_4711() {
+        let ((), c) = capture_counters(|| {
+            for outcome in CONDA_ATTESTATION_OUTCOMES {
+                record_conda_attestation("local", outcome);
+            }
+            record_conda_install_script_findings("local", "post-link", 2);
+            record_conda_install_script_findings("local", "pre-link", 0);
+            record_conda_allowlist_dropped("virt", "remote-a", 5);
+            record_conda_allowlist_dropped("virt", "remote-b", 0);
+        });
+        for outcome in CONDA_ATTESTATION_OUTCOMES {
+            assert_eq!(
+                c.get(
+                    "ak_conda_attestation_total",
+                    &[("repository", "local"), ("outcome", outcome)]
+                ),
+                1
+            );
+        }
+        assert_eq!(
+            c.get(
+                "ak_conda_install_script_findings_total",
+                &[("repository", "local"), ("kind", "post-link")]
+            ),
+            2
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_install_script_findings_total",
+                &[("kind", "pre-link")]
+            ),
+            0
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("repository", "virt"), ("member", "remote-a")]
+            ),
+            5
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("member", "remote-b")]
+            ),
+            0
+        );
     }
 
     #[test]

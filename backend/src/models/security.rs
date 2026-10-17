@@ -394,8 +394,10 @@ pub struct ScanPolicy {
 ///
 /// * `allowed_channels` / `denied_channels` — the channel of origin recorded
 ///   in the artifact's conda identity purl at ingest (a remote repo's upstream
-///   URL, or the owning repository's key for a hosted upload), falling back to
-///   the owning repository's key when no identity was recorded.
+///   URL, or the owning repository's key for a hosted upload). There is
+///   no fallback: when no channel was recorded the origin is unknown, and a
+///   non-empty `allowed_channels` fails closed (the artifact is refused) while
+///   `denied_channels` cannot match it.
 /// * `denied_licenses` / `denied_license_families` — the `license` /
 ///   `license_family` keys `build_conda_metadata` persists from `about.json`.
 /// * `block_install_scripts` / `max_install_script_severity` — the
@@ -410,7 +412,8 @@ pub struct CondaPolicyPredicates {
     /// artifact whose origin is unknown fails closed (the predicate exists to
     /// prove origin, and an unknown origin proves nothing).
     pub allowed_channels: Vec<String>,
-    /// The artifact's channel of origin must not be in this set.
+    /// The artifact's channel of origin must not be in this set. An unknown
+    /// origin matches no entry; restrict origin with `allowed_channels`.
     pub denied_channels: Vec<String>,
     /// SPDX-style license tokens that must not appear as the artifact's
     /// declared `license`. Matching is case-insensitive. An undeclared license

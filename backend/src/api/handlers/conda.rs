@@ -3497,6 +3497,7 @@ async fn build_virtual_shard_index(
                         upstream_url: upstream_url.to_string(),
                         shards_base,
                     });
+                    let mut member_not_allowed = 0usize;
                     for (name, hash) in upstream.shards {
                         if merged.owned.contains(&name.to_ascii_lowercase()) {
                             dropped.owned += 1;
@@ -3508,7 +3509,7 @@ async fn build_virtual_shard_index(
                             .as_deref()
                             .is_some_and(|a| !a.admits_all_versions(&name, subdir))
                         {
-                            dropped.not_allowed += 1;
+                            member_not_allowed += 1;
                             merged.refused.insert(hash.to_vec());
                             continue;
                         }
@@ -3521,6 +3522,12 @@ async fn build_virtual_shard_index(
                                 .insert(name, VirtualShardSource::Remote(position));
                         }
                     }
+                    dropped.not_allowed += member_not_allowed;
+                    virtual_merge::count_allowlist_drops(
+                        &virtual_repo_key,
+                        &member.key,
+                        member_not_allowed,
+                    );
                 }
                 if dropped.owned > 0 {
                     tracing::info!(
@@ -4763,8 +4770,16 @@ async fn build_virtual_repodata(
             plain_json: matches!(encoding, RepodataEncoding::Json),
         },
         build_artifact_entry,
-        move |subdir, hosted, remote, owned, allowlist| {
-            virtual_merge::merge_repodata(subdir, hosted, remote, owned, allowlist, encoding)
+        move |virtual_repo_key, subdir, hosted, remote, owned, allowlist| {
+            virtual_merge::merge_repodata(
+                virtual_repo_key,
+                subdir,
+                hosted,
+                remote,
+                owned,
+                allowlist,
+                encoding,
+            )
         },
     )
     .await
@@ -4834,6 +4849,7 @@ async fn build_virtual_package_document<E, M>(
 where
     E: Fn(&CondaArtifact, &str, &str) -> serde_json::Value,
     M: FnOnce(
+            &str,
             &str,
             &[virtual_merge::HostedRecord],
             &[virtual_merge::MemberDocument],
@@ -4929,8 +4945,10 @@ where
                     .collect();
                 let enforced = allowlist.is_some();
                 let merge_subdir = subdir.clone();
+                let merge_virtual_key = virtual_repo_key.clone();
                 let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
                     merge(
+                        &merge_virtual_key,
                         &merge_subdir,
                         &hosted,
                         &documents,
@@ -5115,6 +5133,7 @@ async fn build_virtual_channeldata(
         key.part(name.as_bytes()).part(entry.get().as_bytes());
     }
 
+    let virtual_repo_key = virtual_repo_key.to_string();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
     merge_gate::gate_for(virtual_repo_id)
@@ -5144,8 +5163,10 @@ async fn build_virtual_channeldata(
                     .filter_map(|d| d.validator.clone())
                     .collect();
                 let enforced = allowlist.is_some();
+                let merge_virtual_key = virtual_repo_key.clone();
                 let (body, parse_failures, not_allowed) = tokio::task::spawn_blocking(move || {
                     virtual_merge::merge_channeldata(
+                        &merge_virtual_key,
                         &hosted,
                         &documents,
                         &owned,
@@ -7074,6 +7095,42 @@ fn collect_conda_v1_scripts(content: &[u8]) -> CondaScriptHarvest {
     collect_conda_scripts_from_tar(bzip2::read::MultiBzDecoder::new(content), "conda v1 tar")
 }
 
+/// Count the install scripts a harvest found in
+/// `ak_conda_install_script_findings_total`, by hook kind (#4711).
+///
+/// A `.conda` carries a script twice when the recipe archived a copy in
+/// `info-*.tar.zst` beside the payload's; like `package_analysis_service`,
+/// identical bodies of one kind count once. A script that matched but could
+/// not be read is still a finding, counted once per path.
+fn count_conda_install_script_findings(repo_key: &str, harvest: &CondaScriptHarvest) {
+    use crate::services::conda_scripts::classify_script_path;
+    let mut bodies: HashSet<(&'static str, &[u8])> = HashSet::new();
+    let mut unreadable: HashSet<(&'static str, &str)> = HashSet::new();
+    for (path, body) in &harvest.scripts {
+        if let Some(kind) = classify_script_path(path) {
+            bodies.insert((kind.as_str(), body.as_slice()));
+        }
+    }
+    for path in &harvest.unreadable {
+        if let Some(kind) = classify_script_path(path) {
+            unreadable.insert((kind.as_str(), path.as_str()));
+        }
+    }
+    let mut per_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for kind in bodies
+        .iter()
+        .map(|(k, _)| *k)
+        .chain(unreadable.iter().map(|(k, _)| *k))
+    {
+        *per_kind.entry(kind).or_default() += 1;
+    }
+    for (kind, count) in per_kind {
+        crate::services::metrics_service::record_conda_install_script_findings(
+            repo_key, kind, count,
+        );
+    }
+}
+
 /// Harvest the install scripts of an uploaded conda package.
 ///
 /// Best-effort throughout, like the metadata enrichment: an unreadable
@@ -7096,6 +7153,18 @@ fn collect_conda_install_scripts(content: &[u8], filename: &str) -> CondaScriptH
 /// Maximum body size for attestation uploads (1 MB). Attestations are small
 /// JSON documents; anything larger is suspicious.
 const ATTESTATION_MAX_BODY_SIZE: usize = 1024 * 1024;
+
+/// The `ak_conda_attestation_total` outcome of one attestation PUT (#4711):
+/// `verified` when the bundle verified, otherwise `rejected` when verification
+/// is required (nothing is stored) or `failed` under the explicit opt-out (the
+/// bundle is stored with its failed record).
+fn attestation_outcome(verified: bool, require_verified: bool) -> &'static str {
+    match (verified, require_verified) {
+        (true, _) => "verified",
+        (false, true) => "rejected",
+        (false, false) => "failed",
+    }
+}
 
 /// Core logic for storing a CEP-27 attestation, shared by both main and
 /// token-authenticated handlers.
@@ -7217,7 +7286,12 @@ async fn store_attestation(
     )
     .await;
 
-    if state.config.conda_attestation_require_verified && !verdict.is_verified() {
+    let outcome = attestation_outcome(
+        verdict.is_verified(),
+        state.config.conda_attestation_require_verified,
+    );
+    if outcome == "rejected" {
+        crate::services::metrics_service::record_conda_attestation(repo_key, outcome);
         info!(
             repo = %repo_key,
             package = %filename,
@@ -7264,6 +7338,7 @@ async fn store_attestation(
             }
         })?;
 
+    crate::services::metrics_service::record_conda_attestation(repo_key, outcome);
     info!(
         repo = %repo_key,
         package = %filename,
@@ -8345,6 +8420,7 @@ async fn store_conda_package(
     .execute(&state.db)
     .await;
 
+    count_conda_install_script_findings(&repo.key, &install_scripts);
     record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
 
     // Surface the package on the Packages page (#3659), keyed on the conda
@@ -8374,6 +8450,10 @@ async fn store_conda_package(
     )
     .execute(&state.db)
     .await;
+
+    // #4711: a package arrives with no attestation of its own; CEP-27
+    // attestations are attached afterwards by PUT and counted there.
+    crate::services::metrics_service::record_conda_attestation(&repo.key, "absent");
 
     info!(
         "Conda upload: {}-{}-{} ({}) to repo {}/{}",
@@ -15948,6 +16028,116 @@ mod tests {
         );
     }
 
+    /// #4711: every install script the harvest finds is counted in
+    /// `ak_conda_install_script_findings_total` by hook kind. The recipe's
+    /// archived copy in `info-*.tar.zst` is the same script, so it counts once.
+    #[test]
+    fn test_install_script_findings_are_counted_by_kind_4711() {
+        let mut info = minimal_info_files();
+        info.push((
+            "info/recipe/parent/post-link.sh",
+            TEST_POST_LINK_SH.to_vec(),
+        ));
+        let package = build_test_conda_v2_package_with_payload(
+            &info,
+            &[
+                ("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec()),
+                ("bin/.numpy-pre-unlink.sh", b"#!/bin/sh\nrm -f x\n".to_vec()),
+                ("Scripts/.numpy-pre-unlink.bat", b"del x\r\n".to_vec()),
+            ],
+        );
+
+        let (harvest, counters) = crate::services::metrics_service::capture_counters(|| {
+            let harvest =
+                collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+            count_conda_install_script_findings("local-conda", &harvest);
+            harvest
+        });
+
+        assert_eq!(harvest.scripts.len(), 4, "fixture precondition");
+        let findings = |kind| {
+            counters.get(
+                "ak_conda_install_script_findings_total",
+                &[("repository", "local-conda"), ("kind", kind)],
+            )
+        };
+        assert_eq!(
+            findings("post-link"),
+            1,
+            "the archived copy is not a second finding"
+        );
+        assert_eq!(findings("pre-unlink"), 2);
+        assert_eq!(findings("pre-link"), 0);
+    }
+
+    /// #4711: a package with no install scripts adds no series.
+    #[test]
+    fn test_install_script_findings_ignore_a_package_without_hooks_4711() {
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[("lib/x.py", b"x = 1\n".to_vec())],
+        );
+        let ((), counters) = crate::services::metrics_service::capture_counters(|| {
+            let harvest =
+                collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+            count_conda_install_script_findings("local-conda", &harvest);
+        });
+        assert_eq!(
+            counters.get("ak_conda_install_script_findings_total", &[]),
+            0
+        );
+    }
+
+    /// #4711: a hosted upload is counted as `outcome="absent"` (an attestation
+    /// arrives later, by PUT), and its install scripts are counted under the
+    /// repository's key — through the real upload handler.
+    #[test]
+    fn test_upload_counts_absent_attestation_and_install_scripts_4711() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec())],
+        );
+        let (repo_key, counters) =
+            crate::services::metrics_service::capture_counters_async(|| async move {
+                let fx = tdh::Fixture::setup("local", "conda").await?;
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/{}/upload", fx.repo_key))
+                    .header("X-Conda-Subdir", "linux-64")
+                    .header("X-Package-Filename", "numpy-1.26.4-py312h02b7e37_0.conda")
+                    .body(axum::body::Body::from(package))
+                    .unwrap();
+                let (status, body) = tdh::send(fx.router_with_auth(router()), req).await;
+                assert_eq!(
+                    status,
+                    StatusCode::CREATED,
+                    "{}",
+                    String::from_utf8_lossy(&body)
+                );
+                let key = fx.repo_key.clone();
+                fx.teardown().await;
+                Some(key)
+            });
+        let Some(repo_key) = repo_key else {
+            return;
+        };
+        assert_eq!(
+            counters.get(
+                "ak_conda_attestation_total",
+                &[("repository", &repo_key), ("outcome", "absent")]
+            ),
+            1
+        );
+        assert_eq!(
+            counters.get(
+                "ak_conda_install_script_findings_total",
+                &[("repository", &repo_key), ("kind", "post-link")]
+            ),
+            1
+        );
+    }
+
     /// The recipe files handed to the analyzer still come out of the extracted
     /// document, and are unaffected by the script work.
     #[test]
@@ -17438,6 +17628,78 @@ mod attestation_verification_tests {
         fx.teardown().await;
     }
 
+    /// #4711: the outcome each verification result maps to.
+    #[test]
+    fn attestation_outcome_covers_every_decision_4711() {
+        assert_eq!(attestation_outcome(true, true), "verified");
+        assert_eq!(attestation_outcome(true, false), "verified");
+        assert_eq!(attestation_outcome(false, true), "rejected");
+        assert_eq!(attestation_outcome(false, false), "failed");
+    }
+
+    /// PUT the captured bundle with verification required (`true`, the
+    /// default) or opted out, and return the status and what was counted.
+    /// `None` when no database is available.
+    fn put_bundle_counting(
+        require_verified: bool,
+    ) -> (
+        Option<(StatusCode, String)>,
+        crate::services::metrics_service::CounterCapture,
+    ) {
+        crate::services::metrics_service::capture_counters_async(|| async move {
+            let fx = tdh::Fixture::setup("local", "conda").await?;
+            seed_wheel(&fx).await;
+            let state =
+                tdh::build_state_with(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), |c| {
+                    c.conda_attestation_require_verified = require_verified
+                });
+            let fx = tdh::Fixture { state, ..fx };
+            let (status, _) =
+                tdh::send(write_router(&fx), put_attestation_req(&fx, &bundle())).await;
+            let key = fx.repo_key.clone();
+            fx.teardown().await;
+            Some((status, key))
+        })
+    }
+
+    /// #4711: a bundle refused because verification is required is counted
+    /// as `outcome="rejected"`, and as nothing else.
+    #[test]
+    fn refused_attestation_counts_as_rejected_4711() {
+        let (result, counters) = put_bundle_counting(true);
+        let Some((status, repo_key)) = result else {
+            return;
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let outcome = |o| {
+            counters.get(
+                "ak_conda_attestation_total",
+                &[("repository", repo_key.as_str()), ("outcome", o)],
+            )
+        };
+        assert_eq!(outcome("rejected"), 1);
+        assert_eq!(outcome("failed") + outcome("verified"), 0);
+    }
+
+    /// #4711: under the explicit opt-out the unverified bundle is stored and
+    /// counted as `outcome="failed"`.
+    #[test]
+    fn opted_out_attestation_counts_as_failed_4711() {
+        let (result, counters) = put_bundle_counting(false);
+        let Some((status, repo_key)) = result else {
+            return;
+        };
+        assert_eq!(status, StatusCode::CREATED);
+        let outcome = |o| {
+            counters.get(
+                "ak_conda_attestation_total",
+                &[("repository", repo_key.as_str()), ("outcome", o)],
+            )
+        };
+        assert_eq!(outcome("failed"), 1);
+        assert_eq!(outcome("rejected") + outcome("verified"), 0);
+    }
+
     // -----------------------------------------------------------------------
     // CEP-50 sidecars
     // -----------------------------------------------------------------------
@@ -18644,6 +18906,7 @@ mod virtual_channel_tests {
             },
         ];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
+            "virtual",
             "noarch",
             &hosted,
             &remote,
@@ -19241,6 +19504,7 @@ mod virtual_channel_tests {
             validator: None,
         }];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
+            "virtual",
             "noarch",
             &hosted,
             &remote,
@@ -19260,6 +19524,117 @@ mod virtual_channel_tests {
         );
         assert_eq!(dropped.not_allowed, 3);
         assert_eq!(dropped.owned, 0);
+    }
+
+    /// #4711: the records a virtual's allowlist drops from a repodata merge
+    /// are counted per remote member, under the virtual's key.
+    #[test]
+    fn merge_repodata_counts_allowlist_drops_per_member_4711() {
+        let allowlist = crate::services::conda_allowlist::CondaAllowlist {
+            enabled: true,
+            entries: vec![crate::services::conda_allowlist::AllowlistEntry {
+                name: "rich".into(),
+                version: None,
+                subdirs: vec![],
+            }],
+        }
+        .compile()
+        .unwrap();
+        let remote = vec![
+            member_doc("remote-a", &["rich-13.0-0.conda", "numpy-2.0-0.conda"]),
+            member_doc(
+                "remote-b",
+                &[
+                    "rich-13.1-0.conda",
+                    "numpy-2.1-0.conda",
+                    "scipy-1.0-0.conda",
+                ],
+            ),
+            member_doc("remote-c", &["rich-12.0-0.conda"]),
+        ];
+        let (dropped, counters) = crate::services::metrics_service::capture_counters(|| {
+            virtual_merge::merge_repodata(
+                "conda-virtual",
+                "noarch",
+                &[],
+                &remote,
+                &Default::default(),
+                Some(&allowlist),
+                RepodataEncoding::Json,
+            )
+            .2
+        });
+        assert_eq!(dropped.not_allowed, 3);
+        let member = |m| {
+            counters.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("repository", "conda-virtual"), ("member", m)],
+            )
+        };
+        assert_eq!(member("remote-a"), 1);
+        assert_eq!(member("remote-b"), 2);
+        assert_eq!(
+            member("remote-c"),
+            0,
+            "a member that lost nothing adds no series"
+        );
+    }
+
+    /// #4711: channeldata allowlist drops are counted per member as well, and
+    /// a virtual without an allowlist counts nothing.
+    #[test]
+    fn merge_channeldata_counts_allowlist_drops_per_member_4711() {
+        let allowlist = crate::services::conda_allowlist::CondaAllowlist {
+            enabled: true,
+            entries: vec![crate::services::conda_allowlist::AllowlistEntry {
+                name: "rich".into(),
+                version: None,
+                subdirs: vec![],
+            }],
+        }
+        .compile()
+        .unwrap();
+        let doc = |member: &str, names: &[&str]| virtual_merge::MemberDocument {
+            member: member.into(),
+            json: serde_json::to_vec(&serde_json::json!({
+                "packages": names
+                    .iter()
+                    .map(|n| (n.to_string(), serde_json::json!({"version": "1.0"})))
+                    .collect::<serde_json::Map<_, _>>(),
+            }))
+            .unwrap(),
+            validator: None,
+        };
+        let remote = vec![doc("remote-a", &["rich", "numpy", "scipy"])];
+        let (not_allowed, counters) = crate::services::metrics_service::capture_counters(|| {
+            virtual_merge::merge_channeldata(
+                "conda-virtual",
+                &[],
+                &remote,
+                &Default::default(),
+                Some(&allowlist),
+            )
+            .2
+        });
+        assert_eq!(not_allowed, 2);
+        assert_eq!(
+            counters.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("repository", "conda-virtual"), ("member", "remote-a")]
+            ),
+            2
+        );
+
+        let ((), unfiltered) = crate::services::metrics_service::capture_counters(|| {
+            let _ = virtual_merge::merge_channeldata(
+                "conda-virtual",
+                &[],
+                &remote,
+                &Default::default(),
+                None,
+            );
+        });
+        assert_eq!(unfiltered.get("ak_conda_allowlist_dropped_total", &[]), 0);
     }
 
     #[test]
