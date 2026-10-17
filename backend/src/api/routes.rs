@@ -1499,8 +1499,8 @@ mod tests {
     use crate::storage::filesystem::FilesystemStorage;
     use crate::storage::{StorageBackend, StorageRegistry};
     use axum::body::Body;
-    use axum::Router;
     use axum::http::{Method, Request, StatusCode};
+    use axum::Router;
     use sqlx::PgPool;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -1591,8 +1591,7 @@ mod tests {
         let trusted_proxies = Arc::new(Vec::new());
         let login = build_login_rate_limit_state(&state.config, &exemptions, &trusted_proxies);
         let uploads = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
-        api_v1_routes(state.clone(), exemptions, trusted_proxies, login, uploads)
-            .with_state(state)
+        api_v1_routes(state.clone(), exemptions, trusted_proxies, login, uploads).with_state(state)
     }
 
     #[test]
@@ -1803,8 +1802,7 @@ mod tests {
         );
         assert!(ROUTES_RS_SRC.contains(".merge(plugin_routes)"));
         assert!(
-            ROUTES_RS_SRC
-                .contains("let wasm_proxy_routes = if state.config.plugins_enabled"),
+            ROUTES_RS_SRC.contains("let wasm_proxy_routes = if state.config.plugins_enabled"),
             "the WASM protocol proxy must be controlled by the same process-level gate"
         );
         assert!(ROUTES_RS_SRC.contains(".merge(wasm_proxy_routes)"));
