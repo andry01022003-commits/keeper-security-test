@@ -1,7 +1,0 @@
----
-section: Security
-issues: [#4662]
----
-- **A public Remote no longer silently spends its upstream credentials for anonymous callers** (#4662). A Remote could be created or updated with `is_public: true` (or `visibility: public`) and an upstream bearer token, basic credentials, AWS upstream auth or userinfo in `upstream_url`; every anonymous request through it then went upstream carrying those credentials, with nothing at configuration time to say so. Moving a repository into that state is now refused with `400 PUBLIC_REMOTE_UPSTREAM_CREDENTIALS` on all three paths that can do it: creating the repository, updating it (making a credentialed repository public, or adding userinfo to a public one's `upstream_url`), and `PUT /api/v1/repositories/{key}/upstream-auth`.
-
-  An administrator who means it sends `allow_public_with_upstream_credentials: true` on the same request. The acceptance is stored with the repository, logged at `WARN` and recorded in the audit log (`allow_public_with_upstream_credentials: true` in the `REPOSITORY_CREATED` / `REPOSITORY_UPDATED` details); sending `false` withdraws it. Repository responses report `public_with_upstream_credentials` and `allow_public_with_upstream_credentials` so the UI can flag such a repository. A repository already public with credentials before this release is not refused on unrelated updates (a Terraform apply that re-sends `is_public: true` keeps working), but now reports `public_with_upstream_credentials: true`.
