@@ -200,6 +200,13 @@ pub enum AppError {
     #[error("Upstream authentication failed: {0}")]
     UpstreamAuth(String),
 
+    /// An OIDC identity provider answered the authorization-code exchange
+    /// without an `id_token` (#4699). A gateway error (502) with its own code
+    /// so an IdP-side configuration problem is not reported as an opaque
+    /// `INTERNAL_ERROR`. The message names the provider, never secrets.
+    #[error("OIDC token response missing id_token: {0}")]
+    OidcNoIdToken(String),
+
     /// A required dependency or feature is not configured / not enabled on
     /// this deployment. Distinct from `Internal` (which is "the server
     /// failed unexpectedly") because operators alert on 500s but not on
@@ -314,6 +321,7 @@ impl AppError {
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
             Self::UpstreamAuth(_) => (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED"),
+            Self::OidcNoIdToken(_) => (StatusCode::BAD_GATEWAY, "OIDC_NO_ID_TOKEN"),
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
             Self::ScannerEngineUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -398,6 +406,7 @@ impl AppError {
             | Self::QuotaExceeded(msg)
             | Self::BadGateway(msg)
             | Self::UpstreamAuth(msg)
+            | Self::OidcNoIdToken(msg)
             | Self::ServiceUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg)
             | Self::NotImplemented(msg) => msg.clone(),
@@ -733,6 +742,17 @@ mod tests {
         );
         assert_eq!(err.user_message(), "refused");
         assert_eq!(err.log_level(), tracing::Level::INFO);
+    }
+
+    #[test]
+    fn test_oidc_no_id_token_is_502_with_its_own_code() {
+        let err = AppError::OidcNoIdToken("provider 'entra' returned no id_token".into());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::BAD_GATEWAY, "OIDC_NO_ID_TOKEN")
+        );
+        assert_eq!(err.user_message(), "provider 'entra' returned no id_token");
+        assert_eq!(err.log_level(), tracing::Level::ERROR);
     }
 
     #[test]

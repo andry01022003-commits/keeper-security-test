@@ -267,11 +267,7 @@ pub async fn oidc_login(
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id, base_url.as_str());
 
     // 5. Build authorization URL
-    let scope = if row.scopes.is_empty() {
-        "openid profile email".to_string()
-    } else {
-        row.scopes.join(" ")
-    };
+    let scope = oidc_request_scope(&row.scopes);
 
     let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}",
@@ -300,6 +296,36 @@ pub async fn oidc_login(
     }
 
     Ok(Redirect::temporary(&auth_url))
+}
+
+/// The space-separated `scope` sent on both the authorization request and the
+/// token request, so the two always agree (#4699).
+pub(crate) fn oidc_request_scope(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "openid profile email".to_string()
+    } else {
+        scopes.join(" ")
+    }
+}
+
+/// The error for a token response that carries no `id_token` (#4699): a 502
+/// naming the provider, plus the IdP's own OAuth `error` code when it sent
+/// one, so an operator can tell an IdP-side misconfiguration from a backend
+/// fault. Only the short `error` code is echoed, never the response body.
+pub(crate) fn missing_id_token_error(
+    provider_name: &str,
+    token_response: &serde_json::Value,
+) -> AppError {
+    let idp_error = token_response["error"]
+        .as_str()
+        .map(|code| code.chars().take(64).collect::<String>())
+        .map(|code| format!(" (IdP error: {code})"))
+        .unwrap_or_default();
+    AppError::OidcNoIdToken(format!(
+        "OIDC provider '{provider_name}' returned no id_token from its token endpoint{idp_error}. \
+         Check that the provider's scopes include 'openid' and that the IdP application \
+         is allowed to issue ID tokens."
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +500,7 @@ async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> R
         (status = 307, description = "Redirect to frontend with exchange code, or to /callback?silent_denied=1 when a prompt=none probe found no IdP session"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
+        (status = 502, description = "The IdP's token response carried no id_token (code OIDC_NO_ID_TOKEN)", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_callback(
@@ -585,12 +612,18 @@ async fn oidc_callback_inner(
         resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, base_url.as_str());
 
     // 4. Exchange authorization code for tokens (with PKCE verifier when present).
+    //    `scope` repeats the authorization request's scopes: Microsoft Entra's
+    //    v2 token endpoint returns an id_token only when the token request
+    //    itself carries `openid` (#4699). RFC 6749 permits it here and other
+    //    IdPs ignore it.
+    let scope = oidc_request_scope(&row.scopes);
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", &authorization_code),
         ("redirect_uri", &redirect_uri),
         ("client_id", &row.client_id),
         ("client_secret", &client_secret),
+        ("scope", &scope),
     ];
     if let Some(verifier) = pkce_code_verifier.as_deref() {
         form.push(("code_verifier", verifier));
@@ -608,7 +641,7 @@ async fn oidc_callback_inner(
 
     let id_token = token_response["id_token"]
         .as_str()
-        .ok_or_else(|| AppError::Internal("Token response missing id_token".into()))?;
+        .ok_or_else(|| missing_id_token_error(&row.name, &token_response))?;
 
     // Capture the access_token for a later userinfo group fetch (#2831). GitLab
     // delivers only DIRECT memberships in the id_token; the effective set incl.
@@ -2391,6 +2424,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // decode_jwt_payload
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oidc_request_scope_defaults_and_joins() {
+        assert_eq!(oidc_request_scope(&[]), "openid profile email");
+        let scopes = vec!["openid".to_string(), "offline_access".to_string()];
+        assert_eq!(oidc_request_scope(&scopes), "openid offline_access");
+    }
+
+    #[test]
+    fn test_missing_id_token_error_names_provider_and_idp_error() {
+        let err = missing_id_token_error(
+            "Entra",
+            &serde_json::json!({"error": "invalid_scope", "error_description": "secret detail"}),
+        );
+        assert!(matches!(err, AppError::OidcNoIdToken(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("'Entra'"), "{msg}");
+        assert!(msg.contains("id_token"), "{msg}");
+        assert!(msg.contains("IdP error: invalid_scope"), "{msg}");
+        assert!(!msg.contains("secret detail"), "{msg}");
+
+        let plain = missing_id_token_error("Entra", &serde_json::json!({"access_token": "x"}));
+        assert!(!plain.to_string().contains("IdP error"));
+    }
 
     #[test]
     fn test_decode_jwt_payload_valid() {

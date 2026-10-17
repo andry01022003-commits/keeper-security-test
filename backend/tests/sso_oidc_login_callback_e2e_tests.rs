@@ -1267,3 +1267,109 @@ async fn test_oidc_generic_callback_login_required_redirects_silent_denied() {
 
     delete_provider(&pool, provider_id).await;
 }
+
+// ===========================================================================
+// Token request carries `scope` (#4699)
+// ===========================================================================
+
+/// The form fields the backend POSTed to the mock token endpoint (the last
+/// token request received).
+async fn last_token_request_form(idp: &MockIdp) -> HashMap<String, String> {
+    let requests = idp
+        .server
+        .received_requests()
+        .await
+        .expect("wiremock request recording is on");
+    let token_req = requests
+        .iter()
+        .rev()
+        .find(|r| r.url.path() == "/token")
+        .expect("backend POSTed to the token endpoint");
+    url::form_urlencoded::parse(&token_req.body)
+        .into_owned()
+        .collect()
+}
+
+/// #4699: Microsoft Entra's v2 token endpoint returns an `id_token` only when
+/// the token request itself carries the `openid` scope, so the code exchange
+/// must repeat the provider's configured scopes (RFC 6749 permits `scope` on
+/// the token request). Before the fix the form had no `scope` field at all.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_token_request_sends_configured_scopes() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+    idp.mount_token_endpoint(&nonce, json!({ "sub": "oidc-sub-4699-scope" }))
+        .await;
+
+    let resp = do_callback_state(&pool, provider_id, &sso_state).await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+
+    let form = last_token_request_form(&idp).await;
+    assert_eq!(
+        form.get("scope").map(String::as_str),
+        Some("openid profile email"),
+        "token request must repeat the configured scopes, got form {form:?}"
+    );
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+
+    delete_user_by_sub(&pool, "oidc-sub-4699-scope").await;
+    delete_provider(&pool, provider_id).await;
+}
+
+/// #4699: a token response without `id_token` is an IdP-side problem. It must
+/// surface as a 502 that names the provider and says the IdP returned no
+/// id_token, not as an opaque 500 `INTERNAL_ERROR`.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON error body in a test assertion is not an artifact path (#1608)
+async fn test_oidc_token_response_without_id_token_is_502_naming_provider() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let provider_name: String = sqlx::query_scalar("SELECT name FROM oidc_configs WHERE id = $1")
+        .bind(provider_id)
+        .fetch_one(&pool)
+        .await
+        .expect("provider name");
+
+    let (sso_state, _nonce) = login_state_nonce(&pool, provider_id).await;
+    Mock::given(method("POST"))
+        .and(wm_path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "mock-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })))
+        .mount(&idp.server)
+        .await;
+
+    let resp = do_callback_state(&pool, provider_id, &sso_state).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body: Value = serde_json::from_slice(&body).expect("json error body");
+    assert_eq!(body["code"], "OIDC_NO_ID_TOKEN", "body: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&provider_name) && message.contains("id_token"),
+        "message must name the provider and the missing id_token: {message}"
+    );
+
+    delete_provider(&pool, provider_id).await;
+}
