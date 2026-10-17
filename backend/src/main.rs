@@ -3681,6 +3681,26 @@ mod tests {
         assert!(services.is_none());
         assert!(!plugins_dir.exists());
     }
+
+    /// The default (`PLUGINS_ENABLED` unset) still builds the runtime: the
+    /// registry and service come back and the plugins directory is created,
+    /// exactly as before the gate existed (#4650).
+    #[tokio::test]
+    async fn enabled_plugins_initialize_runtime_and_create_directory() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        let config = Config::default();
+        assert!(config.plugins_enabled, "the runtime is on by default");
+        let services =
+            initialize_wasm_plugins_if_enabled(&config, iso.pool.clone(), plugins_dir.clone())
+                .await
+                .expect("enabled plugins initialize the runtime");
+        assert!(services.is_some());
+        assert!(plugins_dir.is_dir());
+    }
 }
 // warm cache benchmark
 // sqlx-cli benchmark
