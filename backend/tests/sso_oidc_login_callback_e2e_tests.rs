@@ -77,8 +77,8 @@ use artifact_keeper_backend::services::auth_config_service::{
 };
 
 use common::sso_support::{
-    allow_private_sso_ip, audit_row_eventually, build_state, ensure_sso_encryption_key,
-    non_loopback_bind_ip, sso_app, try_pool,
+    allow_private_sso_ip, audit_row_eventually, build_state, build_state_with_config,
+    ensure_sso_encryption_key, non_loopback_bind_ip, sso_app, test_config, try_pool,
 };
 
 // ===========================================================================
@@ -244,6 +244,9 @@ struct ProviderOpts {
     attr_extra: Value,
     map_groups_to_groups: bool,
     auto_create_users: bool,
+    /// Pin `attribute_mapping.redirect_uri`. Off only for the cases that
+    /// assert the request-derived redirect_uri (#4143).
+    pin_redirect_uri: bool,
 }
 
 impl Default for ProviderOpts {
@@ -252,6 +255,7 @@ impl Default for ProviderOpts {
             attr_extra: json!({}),
             map_groups_to_groups: false,
             auto_create_users: true,
+            pin_redirect_uri: true,
         }
     }
 }
@@ -266,9 +270,13 @@ async fn create_provider_with(pool: &PgPool, idp: &MockIdp, opts: ProviderOpts) 
     // Pin a fixed redirect_uri so we can assert it on the login redirect
     // without relying on request Host headers, then merge any case-specific
     // claim overrides on top.
-    let mut attr = json!({
-        "redirect_uri": "https://ak.example.test/api/v1/auth/sso/oidc/callback"
-    });
+    let mut attr = if opts.pin_redirect_uri {
+        json!({
+            "redirect_uri": "https://ak.example.test/api/v1/auth/sso/oidc/callback"
+        })
+    } else {
+        json!({})
+    };
     if let (Value::Object(base), Value::Object(more)) = (&mut attr, opts.attr_extra) {
         base.extend(more);
     }
@@ -1369,6 +1377,95 @@ async fn test_oidc_token_response_without_id_token_is_502_naming_provider() {
     assert!(
         message.contains(&provider_name) && message.contains("id_token"),
         "message must name the provider and the missing id_token: {message}"
+    );
+
+    delete_provider(&pool, provider_id).await;
+}
+
+// ===========================================================================
+// Request-derived redirect_uri behind a reverse proxy (#4143)
+// ===========================================================================
+
+/// Drive `GET /oidc/{id}/login` as if the TCP peer were `peer`, with the
+/// headers a TLS-terminating proxy sets, and return the `redirect_uri` sent
+/// to the IdP.
+async fn login_redirect_uri_from_peer(
+    state: SharedState,
+    provider_id: Uuid,
+    peer: std::net::SocketAddr,
+) -> String {
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(format!("/oidc/{provider_id}/login"))
+        .header("host", "backend.internal:8080")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "ak.example.test")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    let resp = sso_app(state).oneshot(req).await.expect("login oneshot");
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let query = location.split_once('?').map(|(_, q)| q).unwrap_or("");
+    url_decode_query(query)
+        .remove("redirect_uri")
+        .expect("redirect_uri on the authorize URL")
+}
+
+/// #4143: with `RATE_LIMIT_TRUSTED_PROXY_CIDRS` set, `X-Forwarded-Proto` /
+/// `X-Forwarded-Host` decide the OIDC `redirect_uri` only when the TCP peer is
+/// one of those proxies. Behind a trusted proxy that sets
+/// `X-Forwarded-Proto: https` the redirect_uri is `https://`; the same headers
+/// from an untrusted peer are ignored (before the fix they were believed from
+/// any peer, so a client could steer the redirect_uri sent to the IdP).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_redirect_uri_forwarded_headers_only_from_trusted_proxy() {
+    if std::env::var("AK_EXTERNAL_URL").is_ok() {
+        // AK_EXTERNAL_URL overrides every request-derived base URL.
+        return;
+    }
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider_with(
+        &pool,
+        &idp,
+        ProviderOpts {
+            pin_redirect_uri: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.rate_limit_trusted_proxy_cidrs = vec![
+        artifact_keeper_backend::api::middleware::rate_limit::CidrRange::parse("10.0.0.0/8")
+            .unwrap(),
+    ];
+    let state = build_state_with_config(pool.clone(), cfg);
+
+    let trusted = login_redirect_uri_from_peer(
+        state.clone(),
+        provider_id,
+        "10.20.30.40:51000".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        trusted, "https://ak.example.test/api/v1/auth/sso/oidc/callback",
+        "a trusted proxy's X-Forwarded-Proto/Host must decide the redirect_uri"
+    );
+
+    let untrusted =
+        login_redirect_uri_from_peer(state, provider_id, "203.0.113.7:51000".parse().unwrap())
+            .await;
+    assert_eq!(
+        untrusted, "http://backend.internal:8080/api/v1/auth/sso/oidc/callback",
+        "forwarding headers from an untrusted peer must be ignored"
     );
 
     delete_provider(&pool, provider_id).await;

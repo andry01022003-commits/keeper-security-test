@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    async_trait,
+    extract::{ConnectInfo, FromRequestParts, Path, Query, State},
+    http::{request::Parts, HeaderMap},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
@@ -18,7 +19,10 @@ use uuid::Uuid;
 // #3713: the crate's `Json` rather than `axum::Json`, so a body this module
 // refuses (a NUL in `code` included) is the 400 VALIDATION_ERROR envelope
 // every other handler emits, not axum's 422 plain text (#1368).
-use crate::api::extractors::{request_scheme_is_https, trusted_external_url, Json, RequestBaseUrl};
+use crate::api::extractors::{
+    forwarded_headers_trusted, request_base_url_from_request, request_base_url_ignoring_forwarded,
+    request_scheme_is_https, trusted_external_url, Json,
+};
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::validation::validate_outbound_sso_url;
 
@@ -226,7 +230,7 @@ pub async fn oidc_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(query): Query<OidcLoginQuery>,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
 ) -> Result<Redirect> {
     // 0. Validate the optional prompt before any session/state is created so
     //    a rejected request leaves nothing behind.
@@ -265,6 +269,13 @@ pub async fn oidc_login(
     // 4. Build redirect_uri from attribute_mapping, falling back to an
     //    externally visible absolute URL derived from the request.
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id, base_url.as_str());
+    if let Some(hint) = insecure_redirect_uri_hint(
+        &redirect_uri,
+        &row.attribute_mapping,
+        trusted_external_url().is_some(),
+    ) {
+        tracing::warn!(provider = %row.name, "{hint}");
+    }
 
     // 5. Build authorization URL
     let scope = oidc_request_scope(&row.scopes);
@@ -508,7 +519,7 @@ pub async fn oidc_callback(
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
@@ -557,7 +568,7 @@ pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
@@ -591,7 +602,7 @@ async fn oidc_callback_inner(
     authorization_code: String,
     session_nonce: Option<String>,
     pkce_code_verifier: Option<String>,
-    base_url: RequestBaseUrl,
+    base_url: OidcBaseUrl,
     client_is_https: bool,
 ) -> Result<Response> {
     // 1. Get decrypted OIDC config
@@ -1392,6 +1403,81 @@ pub(crate) fn build_sso_callback_redirect(
         client_is_https,
     );
     Ok(response)
+}
+
+/// The externally visible base URL the OIDC `redirect_uri` is built from
+/// (#4143).
+///
+/// `AK_EXTERNAL_URL` wins when set. Otherwise `X-Forwarded-Proto` /
+/// `X-Forwarded-Host` are honoured only when [`forwarded_headers_trusted`]
+/// accepts the TCP peer against `RATE_LIMIT_TRUSTED_PROXY_CIDRS`; from any
+/// other peer they are ignored, so a client cannot steer the `redirect_uri`
+/// the backend sends to the IdP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcBaseUrl(pub String);
+
+impl OidcBaseUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Pure core of [`OidcBaseUrl`]: see its docs.
+pub(crate) fn oidc_base_url(
+    headers: &HeaderMap,
+    uri: Option<&axum::http::Uri>,
+    peer: Option<std::net::IpAddr>,
+    trusted_proxies: &[crate::api::middleware::rate_limit::CidrRange],
+) -> String {
+    if forwarded_headers_trusted(peer, trusted_proxies) {
+        request_base_url_from_request(headers, uri)
+    } else {
+        request_base_url_ignoring_forwarded(headers, uri)
+    }
+}
+
+#[async_trait]
+impl FromRequestParts<SharedState> for OidcBaseUrl {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &SharedState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        Ok(Self(oidc_base_url(
+            &parts.headers,
+            Some(&parts.uri),
+            peer,
+            &state.config.rate_limit_trusted_proxy_cidrs,
+        )))
+    }
+}
+
+/// The operator hint for a plain-`http://` OIDC `redirect_uri` (#4143), or
+/// `None` when the URI is `https://` or was pinned explicitly. An IdP that
+/// registered the `https://` callback (Microsoft Entra rejects the mismatch
+/// with AADSTS50011) fails the login, and the usual cause is a TLS-terminating
+/// proxy that does not send `X-Forwarded-Proto: https` with no
+/// `AK_EXTERNAL_URL` set.
+pub(crate) fn insecure_redirect_uri_hint(
+    redirect_uri: &str,
+    attribute_mapping: &serde_json::Value,
+    external_url_configured: bool,
+) -> Option<String> {
+    let pinned = attribute_mapping.get("redirect_uri").is_some();
+    if pinned || external_url_configured || !redirect_uri.starts_with("http://") {
+        return None;
+    }
+    Some(format!(
+        "OIDC redirect_uri {redirect_uri} was derived from the request and is plain http. \
+         If users reach Artifact Keeper over HTTPS, set AK_EXTERNAL_URL to the public \
+         https:// base URL, or have the reverse proxy send X-Forwarded-Proto: https \
+         (and list it in RATE_LIMIT_TRUSTED_PROXY_CIDRS when that is set)."
+    ))
 }
 
 /// Resolve the redirect URI from OIDC attribute_mapping, falling back to an
@@ -3192,6 +3278,68 @@ mod tests {
             resolve_oidc_redirect_uri(&attr, &id, "https://external.example.com"),
             "https://external.example.com/api/v1/auth/sso/oidc/callback"
         );
+    }
+
+    fn forwarded_https_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "backend:8080".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "ak.example.com".parse().unwrap());
+        headers
+    }
+
+    fn proxy_cidrs() -> Vec<crate::api::middleware::rate_limit::CidrRange> {
+        vec![crate::api::middleware::rate_limit::CidrRange::parse("10.0.0.0/8").unwrap()]
+    }
+
+    #[test]
+    fn test_oidc_base_url_honours_forwarded_headers_from_trusted_proxy() {
+        let peer = Some("10.1.2.3".parse().unwrap());
+        assert_eq!(
+            oidc_base_url(&forwarded_https_headers(), None, peer, &proxy_cidrs()),
+            "https://ak.example.com"
+        );
+    }
+
+    #[test]
+    fn test_oidc_base_url_ignores_forwarded_headers_from_untrusted_peer() {
+        let headers = forwarded_https_headers();
+        let outside = Some("203.0.113.9".parse().unwrap());
+        assert_eq!(
+            oidc_base_url(&headers, None, outside, &proxy_cidrs()),
+            "http://backend:8080"
+        );
+        // No ConnectInfo: no peer to vouch for, so untrusted too.
+        assert_eq!(
+            oidc_base_url(&headers, None, None, &proxy_cidrs()),
+            "http://backend:8080"
+        );
+    }
+
+    #[test]
+    fn test_oidc_base_url_empty_proxy_list_keeps_accept_all() {
+        let outside = Some("203.0.113.9".parse().unwrap());
+        assert_eq!(
+            oidc_base_url(&forwarded_https_headers(), None, outside, &[]),
+            "https://ak.example.com"
+        );
+    }
+
+    #[test]
+    fn test_insecure_redirect_uri_hint() {
+        let empty = serde_json::json!({});
+        let hint = insecure_redirect_uri_hint(
+            "http://ak.example.com/api/v1/auth/sso/oidc/callback",
+            &empty,
+            false,
+        )
+        .expect("plain http derived from the request gets a hint");
+        assert!(hint.contains("AK_EXTERNAL_URL"), "{hint}");
+        assert!(hint.contains("X-Forwarded-Proto"), "{hint}");
+        assert!(insecure_redirect_uri_hint("https://ak.example.com/cb", &empty, false).is_none());
+        assert!(insecure_redirect_uri_hint("http://ak.example.com/cb", &empty, true).is_none());
+        let pinned = serde_json::json!({ "redirect_uri": "http://ak.example.com/cb" });
+        assert!(insecure_redirect_uri_hint("http://ak.example.com/cb", &pinned, false).is_none());
     }
 
     #[test]
