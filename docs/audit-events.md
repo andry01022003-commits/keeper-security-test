@@ -75,13 +75,6 @@ For the password/session lifecycle events (`PASSWORD_CHANGED`,
 column keeps its established subject-keyed semantics — the stream does not
 change what the admin API returns.
 
-`source_ip` is deliberately nullable. Most authentication, permission, and
-token emitters do not currently capture the request address, so those events
-generally emit `null`; existing emitters such as artifact operations populate
-it when that context is already available. Client attribution across the wider
-request surface needs a considered trust model and is separate from this export
-contract.
-
 ## Examples
 
 Human login (request-scoped, `LOG_FORMAT=json` diagnostics elided):
