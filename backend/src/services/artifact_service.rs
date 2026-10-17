@@ -1038,7 +1038,7 @@ impl ArtifactService {
             // NuGet stores the lowercased id, so deriving the name here
             // registered a second, lowercased package beside the handler's.
             let registration = match catalog_name {
-                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone())),
+                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone(), None)),
                 None => match self.repo_service.get_by_id(artifact.repository_id).await {
                     Ok(repo)
                         if matches!(
@@ -1061,17 +1061,22 @@ impl ArtifactService {
                                 Ok(coords) => Some((
                                     format!("{}:{}", coords.group_id, coords.artifact_id),
                                     coords.version,
+                                    // #4633: a Maven version is the sum of
+                                    // the files in its directory.
+                                    crate::api::handlers::maven::maven_version_directory(
+                                        &artifact.path,
+                                    ),
                                 )),
-                                Err(_) => Some((artifact.name.clone(), ver.clone())),
+                                Err(_) => Some((artifact.name.clone(), ver.clone(), None)),
                             }
                         }
                     }
-                    _ => Some((artifact.name.clone(), ver.clone())),
+                    _ => Some((artifact.name.clone(), ver.clone(), None)),
                 },
             };
             // A metadata/sidecar upload (None) still gets its artifact row and
             // the sync fan-out below — only catalog registration is skipped.
-            if let Some((package_name, package_version)) = registration {
+            if let Some((package_name, package_version, version_directory)) = registration {
                 let pkg_svc =
                     crate::services::package_service::PackageService::new(self.db.clone());
                 pkg_svc
@@ -1085,6 +1090,16 @@ impl ArtifactService {
                         None,
                     )
                     .await;
+                if let Some(directory) = version_directory {
+                    pkg_svc
+                        .try_set_version_size_to_directory_total(
+                            artifact.repository_id,
+                            &package_name,
+                            &package_version,
+                            directory,
+                        )
+                        .await;
+                }
             }
         }
 

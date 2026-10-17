@@ -3452,6 +3452,13 @@ fn compute_checksum(data: &[u8], checksum_type: ChecksumType) -> String {
     }
 }
 
+/// The version directory of a Maven file path, with its trailing `/`
+/// (`com/acme/demo/1.0/demo-1.0.jar` -> `com/acme/demo/1.0/`): the directory
+/// whose files together make up the version (#4633).
+pub(crate) fn maven_version_directory(path: &str) -> Option<&str> {
+    path.rfind('/').map(|i| &path[..=i])
+}
+
 fn maven_package_name(coords: &MavenCoordinates) -> String {
     format!("{}:{}", coords.group_id, coords.artifact_id)
 }
@@ -3946,6 +3953,18 @@ async fn upload(
         package_metadata,
     )
     .await;
+    // #4633: the version's size is the total of its files, not the one file
+    // the registration above kept as the representative row.
+    if let Some(directory) = maven_version_directory(&path) {
+        crate::services::package_service::PackageService::new(state.db.clone())
+            .try_set_version_size_to_directory_total(
+                repo.id,
+                &package_name,
+                &coords.version,
+                directory,
+            )
+            .await;
+    }
 
     if should_enqueue_maven_sync_tasks(&headers) {
         queue_maven_sync_tasks(
@@ -5644,6 +5663,102 @@ mod tests {
         assert_eq!(
             rows, 1,
             "the upsert must leave exactly one row for the contended path"
+        );
+    }
+
+    /// #4633: a Maven version's catalog size is the total of its files. The
+    /// smallest-`(checksum, size)` guard kept one file's size as the version's,
+    /// so the Packages page showed the pom's few bytes (or whichever file's
+    /// hash sorted first) for a version whose jar was far larger. A file of a
+    /// neighbouring version must not count toward it.
+    #[tokio::test]
+    async fn test_maven_version_size_is_total_of_its_files_4633() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+
+        let dir = "com/example/size4633/demo-lib";
+        let pom = bytes::Bytes::from_static(
+            br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example.size4633</groupId>
+  <artifactId>demo-lib</artifactId>
+  <version>1.0.0</version>
+</project>"#,
+        );
+        let jar = bytes::Bytes::from(vec![b'j'; 40_000]);
+        let sources = bytes::Bytes::from(vec![b's'; 7_000]);
+        let other_version = bytes::Bytes::from(vec![b'o'; 1_000]);
+        let uploads = [
+            (format!("{dir}/1.0.0/demo-lib-1.0.0.jar"), jar.clone()),
+            (format!("{dir}/1.0.0/demo-lib-1.0.0.pom"), pom.clone()),
+            (
+                format!("{dir}/1.0.0/demo-lib-1.0.0-sources.jar"),
+                sources.clone(),
+            ),
+            (
+                format!("{dir}/1.0.01/demo-lib-1.0.01.jar"),
+                other_version.clone(),
+            ),
+        ];
+        let mut statuses = Vec::new();
+        for (path, body) in &uploads {
+            let router = tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+            let (status, _) = tdh::send(
+                router,
+                tdh::put(format!("/{repo_key}/{path}"), body.clone()),
+            )
+            .await;
+            statuses.push((path.clone(), status));
+        }
+
+        let sizes: Vec<(String, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT pv.version, pv.size_bytes, p.size_bytes
+            FROM packages p
+            JOIN package_versions pv ON pv.package_id = p.id
+            WHERE p.repository_id = $1
+              AND p.name = 'com.example.size4633:demo-lib'
+            ORDER BY pv.version
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query package catalog");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        for (path, status) in statuses {
+            assert!(status.is_success(), "PUT {path} answered {status}");
+        }
+        let expected = (jar.len() + pom.len() + sources.len()) as i64;
+        let version_size = sizes
+            .iter()
+            .find(|(v, _, _)| v == "1.0.0")
+            .map(|(_, pv, _)| *pv);
+        assert_eq!(
+            version_size,
+            Some(expected),
+            "version 1.0.0 must be jar + pom + sources: {sizes:?}"
+        );
+        let other = sizes
+            .iter()
+            .find(|(v, _, _)| v == "1.0.01")
+            .map(|(_, pv, p)| (*pv, *p));
+        assert_eq!(
+            other,
+            Some((other_version.len() as i64, other_version.len() as i64)),
+            "the neighbouring version counts only its own file, and is the \
+             package's latest version: {sizes:?}"
         );
     }
 
