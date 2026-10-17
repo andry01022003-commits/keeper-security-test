@@ -241,7 +241,7 @@ serde_json_canonicalizer = "0.3"
 # version `sigstore` 0.14.0 already resolves. Used only to serialize a bundle's
 # DSSE envelope with the crate's own serializer, so the Rekor `envelopeHash`
 # comparison (#4082) hashes the very bytes `verify_digest` hashes.
-sigstore_protobuf_specs = "=0.5.1"
+sigstore_protobuf_specs = "=0.5.2"
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
