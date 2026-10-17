@@ -68,6 +68,9 @@ pub struct PermissionResponse {
     pub principal_name: Option<String>,
     pub target_type: String,
     pub target_id: Uuid,
+    /// Display name of the target (#4639): the repository, group or project
+    /// name, or `name@version` (the path when unversioned) for an artifact.
+    /// `null` for target types without a name and for deleted targets.
     pub target_name: Option<String>,
     pub actions: Vec<String>,
     /// Optional rule conditions (#1849); `{}` when the rule is unconditional.
@@ -118,6 +121,13 @@ impl From<PermissionRow> for PermissionResponse {
 /// exactly the rows a still-effective grant empowers. Because the join keys
 /// on the `users` primary key, dropping the guard can never attach the
 /// WRONG name to a row -- only a previously-missing one.
+///
+/// #4639: `target_name` is resolved for every target type that has a human
+/// name, not just repositories: a group's name, a project's name, and an
+/// artifact's `name@version` (its path when it has no version). Each is one
+/// primary-key LEFT JOIN guarded by `target_type`, so a listing stays a
+/// single query however many rows it returns. A target that no longer exists
+/// (or a soft-deleted artifact) keeps `null`, and the web UI shows the id.
 fn hydrate_select(from_clause: &str) -> String {
     format!(
         r#"
@@ -129,12 +139,23 @@ fn hydrate_select(from_clause: &str) -> String {
                END as principal_name,
                CASE
                    WHEN p.target_type = 'repository' THEN r.name
+                   WHEN p.target_type = 'group' THEN tg.name
+                   WHEN p.target_type = 'project' THEN pr.name
+                   WHEN p.target_type = 'artifact' THEN
+                       CASE
+                           WHEN NULLIF(a.version, '') IS NOT NULL THEN a.name || '@' || a.version
+                           ELSE a.path
+                       END
                END as target_name
         FROM {from_clause}
         LEFT JOIN users u ON p.principal_type IN ('user', 'service_account')
                          AND p.principal_id = u.id
         LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
         LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
+        LEFT JOIN groups tg ON p.target_type = 'group' AND p.target_id = tg.id
+        LEFT JOIN projects pr ON p.target_type = 'project' AND p.target_id = pr.id
+        LEFT JOIN artifacts a ON p.target_type = 'artifact' AND p.target_id = a.id
+                             AND NOT a.is_deleted
         "#
     )
 }
@@ -863,6 +884,111 @@ mod tests {
 
         cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[group_id])
             .await;
+    }
+
+    /// #4639: grants on a group, a project or an artifact list (and fetch)
+    /// with the target's human name, not `target_name: null`; an artifact
+    /// reads `name@version`, or its path when it has no version. A grant
+    /// whose target no longer exists (or a soft-deleted artifact) keeps
+    /// `null`, which the web UI renders as the raw id.
+    #[tokio::test]
+    async fn list_and_get_hydrate_non_repository_target_names_4639() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (group_id, group_name) = tdh::create_group(&pool).await;
+        let (repo_id, _repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let tag = Uuid::new_v4().simple().to_string();
+
+        let project_name = format!("Project {}", &tag[..8]);
+        let project_id: Uuid =
+            sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $2) RETURNING id")
+                .bind(format!("t4639{}", &tag[..10]))
+                .bind(&project_name)
+                .fetch_one(&pool)
+                .await
+                .expect("seed project");
+        let seed_artifact = |path: String, version: Option<&'static str>, deleted: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, is_deleted) \
+                     VALUES ($1, $2, 'left-pad', $3, 1, $4, 'application/octet-stream', $2, $5) \
+                     RETURNING id",
+                )
+                .bind(repo_id)
+                .bind(path)
+                .bind(version)
+                .bind("0".repeat(64))
+                .bind(deleted)
+                .fetch_one(&pool)
+                .await
+                .expect("seed artifact")
+            }
+        };
+        let versioned = seed_artifact(
+            format!("left-pad/-/left-pad-1.3.0-{tag}.tgz"),
+            Some("1.3.0"),
+            false,
+        )
+        .await;
+        let unversioned_path = format!("misc/{tag}/notes.txt");
+        let unversioned = seed_artifact(unversioned_path.clone(), None, false).await;
+        let soft_deleted = seed_artifact(format!("gone/{tag}.tgz"), Some("0.0.1"), true).await;
+
+        let group_grant = seed_permission(&pool, "group", group_id, "group", group_id).await;
+        let project_grant = seed_permission(&pool, "group", group_id, "project", project_id).await;
+        let artifact_grant = seed_permission(&pool, "group", group_id, "artifact", versioned).await;
+        let path_grant = seed_permission(&pool, "group", group_id, "artifact", unversioned).await;
+        let deleted_grant =
+            seed_permission(&pool, "group", group_id, "artifact", soft_deleted).await;
+        let dangling_grant =
+            seed_permission(&pool, "group", group_id, "project", Uuid::new_v4()).await;
+
+        let listed = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/?principal_id={group_id}&per_page=100")),
+        )
+        .await;
+        let items = listed["items"].as_array().expect("permission items");
+        let name_of = |id: Uuid| {
+            items
+                .iter()
+                .find(|item| item["id"] == id.to_string())
+                .expect("listed permission")["target_name"]
+                .clone()
+        };
+        assert_eq!(name_of(group_grant), group_name);
+        assert_eq!(name_of(project_grant), project_name);
+        assert_eq!(name_of(artifact_grant), "left-pad@1.3.0");
+        assert_eq!(name_of(path_grant), unversioned_path);
+        assert!(name_of(deleted_grant).is_null(), "soft-deleted target");
+        assert!(name_of(dangling_grant).is_null(), "deleted target");
+
+        for (id, expected) in [
+            (group_grant, serde_json::json!(group_name)),
+            (project_grant, serde_json::json!(project_name)),
+            (artifact_grant, serde_json::json!("left-pad@1.3.0")),
+        ] {
+            let fetched =
+                response_json(state.clone(), auth.clone(), tdh::get(format!("/{id}"))).await;
+            assert_eq!(fetched["target_name"], expected);
+        }
+
+        let _ = sqlx::query("DELETE FROM artifacts WHERE id = ANY($1)")
+            .bind(vec![versioned, unversioned, soft_deleted])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[], &[group_id]).await;
     }
 
     /// #2826 hardening: between migration 057 (Feb 2026, `is_service_account`
