@@ -4,7 +4,7 @@
 #
 # * Every entry below is a Go-dependency CVE compiled INTO one of the vendored
 #   scanner CLIs that AK images ship and invoke:
-#     - /usr/local/bin/grype  (upstream tag v0.118.0, BUILT FROM SOURCE in
+#     - /usr/local/bin/grype  (upstream tag v0.120.1, BUILT FROM SOURCE in
 #       docker/Dockerfile.backend{,.alpine} since #3352 — backend images)
 #     - /usr/local/bin/trivy  (ghcr.io/artifact-keeper/trivy, pinned by digest
 #       in docker/Dockerfile.scanner-adapter — scanner-adapter image only; the
@@ -34,9 +34,9 @@
 #   trivy has been our own build of the pinned upstream tag since #3123
 #   (ghcr.io/artifact-keeper/trivy, dependency overrides declared in that
 #   repo's overrides.yaml). grype joined it at #3352: the backend Dockerfiles
-#   now COMPILE upstream v0.118.0 from source with a Go toolchain floored at
-#   go1.27.1, instead of copying the prebuilt binary out of
-#   ghcr.io/anchore/grype.
+#   now COMPILE upstream v0.120.1 (since #3698) from source with a Go
+#   toolchain floored at go1.27.2, instead of copying the prebuilt binary out
+#   of ghcr.io/anchore/grype.
 #
 #   The consequence for this file is the point of both changes. A Go STDLIB
 #   CVE is now FIXABLE by us — it is a property of the compiler, and the fix
@@ -135,7 +135,7 @@
 # in overrides.yaml). None of those tokens belongs in this file.
 #
 # ---------------------------------------------------------------------------
-# grype v0.118.0 binary — github.com/docker/docker @ v28.5.2+incompatible
+# grype v0.120.1 binary — github.com/docker/docker @ v28.5.2+incompatible
 # CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
 # (FixedVersion=none). CVE-2026-33997 / -34040 are fixed in docker 29.3.1 but
 # grype v0.118.0 requires v28.5.2. When these were added (2026-08-16, trivy
@@ -169,6 +169,15 @@
 # google.golang.org/grpc override for CVE-2026-84304 (HIGH, fixed in v1.83.1),
 # and neither of those ever appeared in this file — which is the rule working:
 # a dependency CVE with a version to build against gets BUILT, not listed.
+#
+# Retried again on the v0.118.0 -> v0.120.1 bump (2026-10-17, #3698). v0.120.1's
+# go.mod still pins github.com/docker/docker v28.5.2+incompatible, and
+# `go mod edit -require=github.com/docker/docker@v29.3.1+incompatible` followed
+# by `go mod download` still fails with "unknown revision v29.3.1". All five
+# tokens stay LIVE. The same bump retired the grpc override (v0.120.1 pins
+# v1.83.2 itself) and brings golang.org/x/crypto v0.57.0, clearing
+# CVE-2026-56855 / CVE-2026-78662 from upstream's own pin; neither was ever
+# listed here.
 CVE-2026-33997
 CVE-2026-34040
 CVE-2026-41567
