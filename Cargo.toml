@@ -119,7 +119,7 @@ aes-gcm = "0.10"
 zeroize = { version = "1.8", features = ["alloc", "derive"] }
 
 # S3 storage using Apache object_store crate (supports custom CA certs for TLS)
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 
 # HTTP types (used for presigned URL methods)
 http = "1"

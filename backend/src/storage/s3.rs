@@ -2784,7 +2784,11 @@ impl S3Backend {
                 .map_err(|e| {
                     AppError::Storage(format!("Failed to build an S3 list request: {}", e))
                 })?;
-            AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+            AwsAuthorizer::new(&credential, "s3", &self.region)
+                .try_authorize(&mut request, None)
+                .map_err(|e| {
+                    AppError::Storage(format!("Failed to sign an S3 list request: {}", e))
+                })?;
 
             let mut send = self
                 .raw_http
@@ -2971,7 +2975,9 @@ impl S3Backend {
         let mut request = builder
             .body(object_store::client::HttpRequestBody::empty())
             .map_err(|e| AppError::Storage(format!("Failed to build {} request: {}", what, e)))?;
-        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+        AwsAuthorizer::new(&credential, "s3", &self.region)
+            .try_authorize(&mut request, None)
+            .map_err(|e| AppError::Storage(format!("Failed to sign {} request: {}", what, e)))?;
 
         let mut send = self
             .raw_http
