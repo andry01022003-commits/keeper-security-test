@@ -29649,6 +29649,61 @@ mod oci_write_authz_and_size_tests {
             "a declared Content-Length within the limit must not be rejected"
         );
     }
+
+    /// #4125: a hosted `docker push` must start a scan when the repository has
+    /// `scan_enabled` + `scan_on_upload`, and must start none when
+    /// `scan_on_upload` is off. Returns the probe scan rows the push produced.
+    async fn manifest_push_probe_scans(on_upload: bool, budget: Duration) -> Option<i64> {
+        let fx = tdh::Fixture::setup("local", "docker").await?;
+        let auth = tdh::bearer_for(&fx.state, fx.user_id).await;
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 37,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{}", "1".repeat(64)),
+                "size": 17,
+            }],
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/scanme/manifests/1.0", fx.repo_key))
+            .header(AUTHORIZATION, auth)
+            .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+            .unwrap();
+        let scans = tdh::native_upload_probe_scans(&fx, router(None), req, on_upload, budget).await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        Some(scans)
+    }
+
+    #[tokio::test]
+    async fn manifest_push_starts_scan_when_scan_on_upload_is_on_4125() {
+        let Some(scans) = manifest_push_probe_scans(true, Duration::from_secs(30)).await else {
+            return;
+        };
+        assert!(
+            scans > 0,
+            "a docker push into a scan_on_upload repository must start a scan (#4125)"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_push_starts_no_scan_when_scan_on_upload_is_off_4125() {
+        let Some(scans) = manifest_push_probe_scans(false, Duration::from_secs(3)).await else {
+            return;
+        };
+        assert_eq!(scans, 0, "scan_on_upload is off, so the push must not scan");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -9775,6 +9775,47 @@ mod tests {
              (owned-GAV protection must be retained, #2328)"
         );
     }
+
+    /// #4124: an `mvn deploy` (the native `PUT` of a jar) into a repository
+    /// with `scan_enabled` + `scan_on_upload` must start a scan, and must
+    /// start none when `scan_on_upload` is off. Returns the probe scan rows.
+    async fn deploy_probe_scans(on_upload: bool, budget: std::time::Duration) -> Option<i64> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let fx = tdh::Fixture::setup("local", "maven").await?;
+        let req = tdh::put(
+            format!(
+                "/{}/org/example/ak/scanme/1.0.0/scanme-1.0.0.jar",
+                fx.repo_key
+            ),
+            bytes::Bytes::from_static(b"maven jar bytes for the scan-on-upload test"),
+        );
+        let scans =
+            tdh::native_upload_probe_scans(&fx, super::router(), req, on_upload, budget).await;
+        fx.teardown().await;
+        Some(scans)
+    }
+
+    #[tokio::test]
+    async fn deploy_starts_scan_when_scan_on_upload_is_on_4124() {
+        let Some(scans) = deploy_probe_scans(true, std::time::Duration::from_secs(30)).await else {
+            return;
+        };
+        assert!(
+            scans > 0,
+            "an mvn deploy into a scan_on_upload repository must start a scan (#4124)"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_starts_no_scan_when_scan_on_upload_is_off_4124() {
+        let Some(scans) = deploy_probe_scans(false, std::time::Duration::from_secs(3)).await else {
+            return;
+        };
+        assert_eq!(
+            scans, 0,
+            "scan_on_upload is off, so the deploy must not scan"
+        );
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
