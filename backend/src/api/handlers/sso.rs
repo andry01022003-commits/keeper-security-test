@@ -972,19 +972,22 @@ pub async fn ldap_login(
     )
     .await;
 
+    // `expires_in` is the access token's real lifetime
+    // (JWT_ACCESS_TOKEN_EXPIRY_MINUTES), as `POST /auth/login` reports it
+    // (#4648); it was missing here and the cookie assumed one hour.
     let body = serde_json::json!({
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
         "token_type": "Bearer",
+        "expires_in": tokens.expires_in,
     });
 
-    // Default expires_in for LDAP tokens (1 hour = 3600 seconds)
     let mut response = Json(body).into_response();
     set_auth_cookies(
         response.headers_mut(),
         &tokens.access_token,
         &tokens.refresh_token,
-        3600,
+        tokens.expires_in,
         client_is_https,
     );
     Ok(response)
@@ -1293,6 +1296,25 @@ struct ExchangeCodeResponse {
     access_token: String,
     refresh_token: String,
     token_type: String,
+    /// Seconds until `access_token` expires (#4648). Login sessions are
+    /// short-lived (`JWT_ACCESS_TOKEN_EXPIRY_MINUTES`, 30 by default);
+    /// automation should mint an API token instead.
+    expires_in: u64,
+}
+
+/// Seconds left before `access_token` expires, read from its `exp` claim
+/// (#4648). The exchange code stores only the token strings, and the token
+/// was minted at callback time, so the remaining lifetime is what a client
+/// should schedule against. A token without a readable `exp` (never minted
+/// by this backend) reports `fallback_secs`.
+pub(crate) fn access_token_expires_in(access_token: &str, now: i64, fallback_secs: u64) -> u64 {
+    // Unverified read of a token this backend minted moments ago, used only
+    // to report its remaining lifetime; it authorises nothing.
+    jsonwebtoken::dangerous::insecure_decode::<serde_json::Value>(access_token)
+        .ok()
+        .and_then(|data| data.claims["exp"].as_i64())
+        .map(|exp| exp.saturating_sub(now).max(0) as u64)
+        .unwrap_or(fallback_secs)
 }
 
 /// Exchange a short-lived code for access and refresh tokens
@@ -1316,19 +1338,24 @@ pub async fn exchange_code(
     let (access_token, refresh_token) =
         AuthConfigService::exchange_code(&state.db, &req.code).await?;
 
+    let expires_in = access_token_expires_in(
+        &access_token,
+        chrono::Utc::now().timestamp(),
+        (state.config.jwt_access_token_expiry_minutes.max(0) as u64) * 60,
+    );
     let body = ExchangeCodeResponse {
         access_token: access_token.clone(),
         refresh_token: refresh_token.clone(),
         token_type: "Bearer".to_string(),
+        expires_in,
     };
 
-    // Default expires_in for SSO tokens (1 hour = 3600 seconds)
     let mut response = Json(body).into_response();
     set_auth_cookies(
         response.headers_mut(),
         &access_token,
         &refresh_token,
-        3600,
+        expires_in,
         client_is_https,
     );
     Ok(response)
@@ -2536,6 +2563,18 @@ mod tests {
     }
 
     #[test]
+    fn test_access_token_expires_in_reads_exp() {
+        let token = make_jwt(&serde_json::json!({ "sub": "u", "exp": 10_001_800 }));
+        assert_eq!(access_token_expires_in(&token, 10_000_000, 60), 1800);
+        // Already expired: zero, never a wrapped huge value.
+        assert_eq!(access_token_expires_in(&token, 10_009_999, 60), 0);
+        // No readable exp: the configured lifetime.
+        assert_eq!(access_token_expires_in("not-a-jwt", 0, 1800), 1800);
+        let no_exp = make_jwt(&serde_json::json!({ "sub": "u" }));
+        assert_eq!(access_token_expires_in(&no_exp, 0, 1800), 1800);
+    }
+
+    #[test]
     fn test_decode_jwt_payload_valid() {
         let claims = serde_json::json!({
             "sub": "user-123",
@@ -3056,8 +3095,10 @@ mod tests {
             access_token: "at_123".to_string(),
             refresh_token: "rt_456".to_string(),
             token_type: "Bearer".to_string(),
+            expires_in: 1800,
         };
         let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["expires_in"], 1800);
         assert_eq!(json["access_token"], "at_123");
         assert_eq!(json["refresh_token"], "rt_456");
         assert_eq!(json["token_type"], "Bearer");

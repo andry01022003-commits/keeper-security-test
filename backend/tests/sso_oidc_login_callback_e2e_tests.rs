@@ -1470,3 +1470,76 @@ async fn test_oidc_redirect_uri_forwarded_headers_only_from_trusted_proxy() {
 
     delete_provider(&pool, provider_id).await;
 }
+
+// ===========================================================================
+// SSO session lifetime is reported to the client (#4648)
+// ===========================================================================
+
+/// #4648: login sessions are short-lived, so every login response must say
+/// how long the access token lives. `POST /auth/login` already returns
+/// `expires_in`; the SSO exchange (`POST /sso/exchange`, which hands the
+/// browser its OIDC/SAML session) did not. It must report the configured
+/// `JWT_ACCESS_TOKEN_EXPIRY_MINUTES`, here set to a non-default 45.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON body in a test assertion is not an artifact path (#1608)
+async fn test_sso_exchange_reports_configured_expires_in() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+    let external_id = format!("oidc-sub-4648-{}", Uuid::new_v4().as_simple());
+    idp.mount_token_endpoint(&nonce, json!({ "sub": external_id }))
+        .await;
+
+    let mut cfg = test_config();
+    cfg.jwt_access_token_expiry_minutes = 45;
+    let state = build_state_with_config(pool.clone(), cfg);
+
+    let resp = do_callback(
+        state.clone(),
+        provider_id,
+        &format!(
+            "code=mock-auth-code&state={}",
+            urlencoding::encode(&sso_state)
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let code = url_decode_query(location.split_once('?').map(|(_, q)| q).unwrap_or(""))
+        .remove("code")
+        .expect("exchange code on the frontend redirect");
+
+    let resp = sso_app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "code": code }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("exchange oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(body["token_type"], "Bearer");
+    let expires_in = body["expires_in"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("exchange response must carry expires_in: {body}"));
+    assert!(
+        (45 * 60 - 10..=45 * 60).contains(&expires_in),
+        "expires_in must be the configured 45-minute lifetime, got {expires_in}"
+    );
+
+    delete_user_by_sub(&pool, &external_id).await;
+    delete_provider(&pool, provider_id).await;
+}

@@ -185,7 +185,12 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
+    /// Seconds until `access_token` expires (`JWT_ACCESS_TOKEN_EXPIRY_MINUTES`,
+    /// 30 minutes by default). Login sessions are short-lived: renew with the
+    /// refresh token, or have automation mint an API token
+    /// (`POST /api/v1/auth/tokens`) instead of logging in (#4648).
     pub expires_in: u64,
+    /// Always `Bearer`.
     pub token_type: String,
     pub must_change_password: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
