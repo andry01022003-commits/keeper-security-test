@@ -908,26 +908,26 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download backend amd64 digest
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: backend-digests-amd64
           path: /tmp/backend-digests
 
       - name: Download openscap amd64 digest
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: openscap-digests-amd64
           path: /tmp/openscap-digests
 
       - name: Download scanner-adapter amd64 digest
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: scanner-adapter-digests-amd64
           path: /tmp/scanner-adapter-digests
 
       # Alpine digest download skipped while alpine builds are suspended.
       # - name: Download backend alpine amd64 digest
-      #   uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      #   uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       #   with:
       #     name: backend-alpine-digests-amd64
       #     path: /tmp/backend-alpine-digests
@@ -1216,21 +1216,21 @@ jobs:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
       - name: Upload Scanner Adapter Trivy SARIF
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
         if: always()
         with:
           sarif_file: 'scanner-adapter-trivy.sarif'
@@ -1238,7 +1238,7 @@ jobs:
 
       # Alpine SARIF upload skipped while alpine builds are suspended.
       - name: Upload Backend Alpine Trivy SARIF
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
         if: false
         with:
           sarif_file: 'backend-alpine-trivy.sarif'
@@ -1386,7 +1386,7 @@ jobs:
 
       - name: Download digests
         if: ${{ env.PROMOTE_VERSION == '' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/digests
           pattern: backend-digests-*
@@ -1793,7 +1793,7 @@ jobs:
 
       - name: Download digests
         if: ${{ env.PROMOTE_VERSION == '' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/digests
           pattern: openscap-digests-*
@@ -2089,7 +2089,7 @@ jobs:
 
       - name: Download digests
         if: ${{ env.PROMOTE_VERSION == '' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/digests
           pattern: scanner-adapter-digests-*
@@ -2462,7 +2462,7 @@ jobs:
 
     steps:
       - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/digests
           pattern: backend-alpine-digests-*
