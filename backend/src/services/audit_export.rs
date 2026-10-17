@@ -412,6 +412,11 @@ pub mod details {
         /// An `upstream_url` change on update (#4467), userinfo redacted.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub upstream_change: Option<UpstreamChangeAudit>,
+        /// A project assignment change on update (#4026): the project the
+        /// repository left (`null` when it had none) and the one it is now
+        /// in (`null` when the assignment was cleared).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub project_change: Option<ProjectChangeAudit>,
         /// `true` when this write made (or kept) a repository public while it
         /// carries upstream credentials, accepted only because the caller sent
         /// `allow_public_with_upstream_credentials` (#4662): anonymous reads
@@ -428,6 +433,13 @@ pub mod details {
         pub previous_upstream_url: Option<String>,
         pub upstream_url: Option<String>,
         pub credentials_changed: bool,
+    }
+
+    /// Before/after of a repository's project assignment (#4026).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ProjectChangeAudit {
+        pub previous_project_id: Option<Uuid>,
+        pub project_id: Option<Uuid>,
     }
 
     /// One repository scan configuration, as carried by a
@@ -1190,6 +1202,7 @@ mod tests {
             previous_scan_config: None,
             scan_config_changed: None,
             upstream_change: None,
+            project_change: None,
             allow_public_with_upstream_credentials: None,
         };
         let v = serde_json::to_value(&d).unwrap();

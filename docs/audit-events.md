@@ -115,7 +115,7 @@ the remaining actions is an incremental follow-up.
 
 | Actions | `details` shape |
 | --- | --- |
-| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields) |
+| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026) |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
 | `LOGIN_FAILED`, `PERMISSION_DENIED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |

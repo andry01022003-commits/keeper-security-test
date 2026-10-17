@@ -1274,10 +1274,18 @@ pub struct UpdateRepositoryRequest {
     /// CRAN, Hex and Bazel virtuals (#4192). Stored in `repository_config`
     /// under `virtual_metadata_partial`.
     pub virtual_metadata_partial: Option<bool>,
-    /// Assign this repository to a project (#2472). P1 is set-only: omitting
-    /// the field leaves the assignment unchanged (unassignment ships with the
-    /// project-admin surface in P2).
-    pub project_id: Option<Uuid>,
+    /// Assign this repository to a project (#2472), or take it out of one
+    /// (#4026). Three-way semantics via `Option<Option<Uuid>>`: omit the field
+    /// to leave the assignment unchanged; send `null` to clear it; send a
+    /// project id to (re)assign it. Moving into a project needs project admin
+    /// on that project, clearing needs project admin on the current one (a
+    /// global admin or system repository admin may do either).
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
+    #[schema(value_type = Option<Uuid>)]
+    pub project_id: Option<Option<Uuid>>,
     /// Update the trusted upstream OpenPGP public key for RPM curation (#2568).
     /// Three-way semantics via `Option<Option<String>>`: omit the field to
     /// leave the stored key unchanged; send `null` to clear it (revert to
@@ -1586,6 +1594,28 @@ async fn with_repodata_depth(
     response.repodata_depth = depth;
     response.repodata_depth_editable = editable;
     Ok(response)
+}
+
+/// The project assignment a PATCH actually changes (#4026): `Some(target)`
+/// when the request carries `project_id` and it differs from the current
+/// assignment (`target` is `None` for a clear), `None` when the field is
+/// omitted or re-sends the current value (a full-form edit is no move).
+fn project_assignment_change(
+    current: Option<Uuid>,
+    requested: Option<Option<Uuid>>,
+) -> Option<Option<Uuid>> {
+    requested.filter(|target| *target != current)
+}
+
+/// The audit record of a PATCH's project assignment change (#4026).
+fn project_change_audit(
+    previous: Option<Uuid>,
+    change: Option<Option<Uuid>>,
+) -> Option<audit_details::ProjectChangeAudit> {
+    change.map(|project_id| audit_details::ProjectChangeAudit {
+        previous_project_id: previous,
+        project_id,
+    })
 }
 
 /// The audit record of a PATCH's `upstream_url` change (#4467): both URLs with
@@ -4137,6 +4167,7 @@ pub async fn create_repository(
                 previous_scan_config: None,
                 scan_config_changed: None,
                 upstream_change: None,
+                project_change: None,
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
             }),
     )
@@ -4732,7 +4763,7 @@ pub async fn get_repository_storage_tree(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
         (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a renamed/reassigned key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id"),
+        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
@@ -4815,19 +4846,28 @@ pub async fn update_repository(
     // by inheritance) must not push a repository into a project the caller
     // does not administer. When the key or the assignment changes, the
     // opt-in key-prefix convention is re-validated for the result.
-    let reassigned_to = payload
-        .project_id
-        .filter(|p| existing.project_id != Some(*p));
-    if let Some(project_id) = reassigned_to {
+    // Clearing the assignment (#4026) is held to the same rule from the other
+    // side: project admin on the project the repository is leaving.
+    let project_change = project_assignment_change(existing.project_id, payload.project_id);
+    let required_project_admin = match (project_change, existing.project_id) {
+        (Some(Some(destination)), _) => Some((
+            destination,
+            "Project admin access to the destination project required",
+        )),
+        (Some(None), Some(source)) => Some((
+            source,
+            "Project admin access to the repository's current project required",
+        )),
+        _ => None,
+    };
+    if let Some((project_id, denial)) = required_project_admin {
         if !projects::can_assign_to_project(&state, &auth, project_id).await? {
-            return Err(AppError::Authorization(
-                "Project admin access to the destination project required".to_string(),
-            ));
+            return Err(AppError::Authorization(denial.to_string()));
         }
     }
     let key_changed = payload.key.as_deref().is_some_and(|k| k != existing.key);
-    if key_changed || reassigned_to.is_some() {
-        if let Some(project_id) = payload.project_id.or(existing.project_id) {
+    if key_changed || project_change.is_some() {
+        if let Some(project_id) = project_change.unwrap_or(existing.project_id) {
             let effective_key = payload.key.as_deref().unwrap_or(&existing.key);
             projects::validate_repo_key_project_prefix(
                 &state,
@@ -4921,9 +4961,9 @@ pub async fn update_repository(
                 upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
-                // P1 set-only (#2472): a present field maps to Some(Some(id));
-                // an omitted field leaves the assignment unchanged.
-                project_id: payload.project_id.map(Some),
+                // Three-way (#2472, #4026): omit = unchanged, Some(None) =
+                // clear, Some(Some(id)) = assign (authorized above).
+                project_id: payload.project_id,
                 // Trusted upstream GPG key (#2568). Three-way: omit = unchanged,
                 // Some(None) = clear, Some(Some(key)) = set (already validated).
                 trusted_gpg_key: payload.trusted_gpg_key,
@@ -4943,7 +4983,7 @@ pub async fn update_repository(
     // members their old actions for up to the cache TTL. (Other replicas
     // are not notified: the `repositories` change trigger does not watch
     // `project_id` yet, a tracked follow-up.)
-    if reassigned_to.is_some() {
+    if project_change.is_some() {
         state.permission_service.invalidate_cache();
     }
 
@@ -5269,6 +5309,7 @@ pub async fn update_repository(
                     existing.upstream_url.as_deref(),
                     payload.upstream_url.as_deref(),
                 ),
+                project_change: project_change_audit(existing.project_id, project_change),
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
             }),
     )
@@ -5989,6 +6030,7 @@ pub async fn delete_repository(
                 previous_scan_config: None,
                 scan_config_changed: None,
                 upstream_change: None,
+                project_change: None,
                 allow_public_with_upstream_credentials: None,
             }),
     )
@@ -11905,6 +11947,7 @@ pub async fn set_upstream_auth(
                     previous_scan_config: None,
                     scan_config_changed: None,
                     upstream_change: None,
+                    project_change: None,
                     allow_public_with_upstream_credentials: Some(true),
                 }),
         )
@@ -28319,6 +28362,47 @@ mod tests {
             Some("https://o.example.com/x")
         );
         assert!(upstream_change_audit(None, Some("https://h.example.com")).is_some());
+    }
+
+    #[test]
+    fn update_request_project_id_is_three_way_4026() {
+        let parse = |v: serde_json::Value| -> UpdateRepositoryRequest {
+            serde_json::from_value(v).expect("deserialize")
+        };
+        let p = Uuid::new_v4();
+        assert_eq!(parse(serde_json::json!({})).project_id, None);
+        assert_eq!(
+            parse(serde_json::json!({ "project_id": null })).project_id,
+            Some(None)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "project_id": p })).project_id,
+            Some(Some(p))
+        );
+    }
+
+    #[test]
+    fn project_assignment_change_ignores_omitted_and_unchanged_4026() {
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(project_assignment_change(Some(p), None), None);
+        assert_eq!(project_assignment_change(Some(p), Some(Some(p))), None);
+        assert_eq!(project_assignment_change(None, Some(None)), None);
+        assert_eq!(project_assignment_change(Some(p), Some(None)), Some(None));
+        assert_eq!(
+            project_assignment_change(Some(p), Some(Some(q))),
+            Some(Some(q))
+        );
+        assert_eq!(
+            project_assignment_change(None, Some(Some(q))),
+            Some(Some(q))
+        );
+
+        assert_eq!(project_change_audit(Some(p), None), None);
+        let cleared = project_change_audit(Some(p), Some(None)).expect("changed");
+        assert_eq!(cleared.previous_project_id, Some(p));
+        assert_eq!(cleared.project_id, None);
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert!(json["project_id"].is_null(), "a clear serializes as null");
     }
 
     #[test]

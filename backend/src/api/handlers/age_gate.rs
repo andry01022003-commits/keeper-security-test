@@ -462,6 +462,7 @@ pub async fn update_repo_age_gate(
                     previous_scan_config: None,
                     scan_config_changed: None,
                     upstream_change: None,
+                    project_change: None,
                     allow_public_with_upstream_credentials: None,
                 }),
         )

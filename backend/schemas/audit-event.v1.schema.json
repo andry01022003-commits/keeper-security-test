@@ -183,7 +183,18 @@
         "age_gate_min_age_days": { "type": "integer", "minimum": 0 },
         "scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
         "previous_scan_config": { "$ref": "#/$defs/ScanConfigAuditState" },
-        "scan_config_changed": { "type": "array", "items": { "type": "string" } }
+        "scan_config_changed": { "type": "array", "items": { "type": "string" } },
+        "project_change": { "$ref": "#/$defs/ProjectChangeAudit" }
+      }
+    },
+    "ProjectChangeAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["previous_project_id", "project_id"],
+      "description": "A repository's project assignment before and after a REPOSITORY_UPDATED that changed it; project_id is null when the assignment was cleared (#4026).",
+      "properties": {
+        "previous_project_id": { "type": ["string", "null"], "format": "uuid" },
+        "project_id": { "type": ["string", "null"], "format": "uuid" }
       }
     },
     "ScanConfigAuditState": {

@@ -284,6 +284,7 @@ mod tests {
                     previous_scan_config: None,
                     scan_config_changed: None,
                     upstream_change: None,
+                    project_change: None,
                     allow_public_with_upstream_credentials: None,
                 }),
         ];
@@ -364,6 +365,10 @@ mod tests {
                 previous_scan_config: Some(state("fail_open")),
                 scan_config_changed: Some(vec!["proxy_scan_action".into()]),
                 upstream_change: None,
+                project_change: Some(details::ProjectChangeAudit {
+                    previous_project_id: Some(Uuid::new_v4()),
+                    project_id: None,
+                }),
                 allow_public_with_upstream_credentials: None,
             })
             .unwrap(),
