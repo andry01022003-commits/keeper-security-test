@@ -380,6 +380,14 @@ struct GetResourcesResponse {
 // ---------------------------------------------------------------------------
 
 fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
+    // The database sites pass `db_status(&e)` with `internal`; a 503 there
+    // (saturated pool, unreachable database) is Connect's retryable
+    // `unavailable`, the code Connect itself maps HTTP 503 to (#4765).
+    let code = if status == StatusCode::SERVICE_UNAVAILABLE && code == "internal" {
+        "unavailable"
+    } else {
+        code
+    };
     let body = serde_json::json!({ "code": code, "message": message });
     super::with_retry_after_on_503(
         Response::builder()
@@ -2093,6 +2101,37 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
         assert_eq!(json["code"], "internal");
         assert_eq!(json["message"], "Database operation failed");
+    }
+
+    /// #4765: a database outage in a Connect handler is Connect's retryable
+    /// `unavailable` at 503 with `Retry-After: 1`, not `internal` at 500.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_connect_db_error_db_unavailable_is_503_unavailable_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+        let e = sqlx::query("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect_err("a closed pool cannot run a query");
+
+        let response = connect_db_error(e);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "unavailable");
     }
 
     #[test]

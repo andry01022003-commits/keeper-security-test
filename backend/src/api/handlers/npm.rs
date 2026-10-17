@@ -7576,6 +7576,46 @@ mod tests {
             .await;
     }
 
+    /// #4765: with the database gone, the npm envelope (`{"error": …}`) an
+    /// `npm install` reads must be a retryable 503 with `Retry-After: 1`, not
+    /// the 500 it answered before (`db_status` shed only pool timeouts). The
+    /// error is the one a closed pool really returns, run through the same
+    /// `map_status(db_status, db_err_message)` the npm DB site uses.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_map_status_db_unavailable_is_503_with_retry_after_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+        let e = sqlx::query("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect_err("a closed pool cannot run a query");
+
+        let response = map_status(
+            crate::api::handlers::db_status(&e),
+            crate::api::handlers::db_err_message(&e),
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("npm JSON envelope");
+        assert_eq!(
+            body["error"],
+            "Database is temporarily unavailable, retry shortly"
+        );
+    }
+
     /// #3667: the npm error envelope (`{"error": …}`) is built here rather
     /// than by `db_err`, so the message it carries must be the stable text.
     #[tokio::test]

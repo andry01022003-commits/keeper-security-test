@@ -97,6 +97,15 @@ fn oci_error_detail(
     message: &str,
     detail: Option<serde_json::Value>,
 ) -> Response {
+    // The database sites pass `db_status(&e)` with `INTERNAL_ERROR`; when
+    // that status is a 503 (saturated pool, unreachable database) the error is
+    // transient, so it carries the same `UNAVAILABLE` code the other
+    // retryable 503s here use rather than claiming a server fault (#4765).
+    let code = if status == StatusCode::SERVICE_UNAVAILABLE && code == "INTERNAL_ERROR" {
+        "UNAVAILABLE"
+    } else {
+        code
+    };
     let body = OciErrorResponse {
         errors: vec![OciErrorEntry {
             code: code.to_string(),
@@ -13498,6 +13507,53 @@ mod tests {
     use chrono::Utc;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use std::sync::Arc;
+
+    /// #4765: an OCI upload-session lookup that hits a database outage must
+    /// answer a retryable 503 with `Retry-After: 1` and the registry's
+    /// `UNAVAILABLE` code (as the `/v2/` credential check already does), not
+    /// `500 INTERNAL_ERROR`. Drives the real lookup against a closed pool.
+    #[tokio::test]
+    async fn test_fetch_oci_upload_session_db_unavailable_is_503_unavailable_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+
+        let response = match fetch_oci_upload_session(&pool, Uuid::new_v4(), Uuid::new_v4()).await {
+            Ok(_) => panic!("a closed pool cannot read an upload session"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("OCI error envelope");
+        assert_eq!(body["errors"][0]["code"], "UNAVAILABLE");
+    }
+
+    /// A query error is still a server fault: the OCI envelope keeps
+    /// `500 INTERNAL_ERROR` and no `Retry-After` (#4765 only widens the
+    /// unavailable class).
+    #[test]
+    fn test_oci_db_error_query_fault_stays_500_internal_error_4765() {
+        let raw = "error returned from database: relation \"t\" does not exist";
+        let response = oci_error(
+            crate::api::handlers::db_status(raw),
+            "INTERNAL_ERROR",
+            crate::api::handlers::db_err_message(raw),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+    }
 
     // -----------------------------------------------------------------------
     // /v2/token: accept repeated `?scope=` query parameters (multi-scope)
@@ -42990,8 +43046,10 @@ mod oci_v2_resolution_db_error_leak_3761 {
                 serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
             assert_eq!(
                 parsed["errors"][0]["code"].as_str(),
-                Some("INTERNAL_ERROR"),
-                "{label}: the spec envelope and its code are unchanged: {body}"
+                // A retryable 503 carries the registry's `UNAVAILABLE` code
+                // since #4765 (it said `INTERNAL_ERROR` before).
+                Some("UNAVAILABLE"),
+                "{label}: the spec envelope carries the retryable code: {body}"
             );
             assert_eq!(
                 parsed["errors"][0]["message"].as_str(),

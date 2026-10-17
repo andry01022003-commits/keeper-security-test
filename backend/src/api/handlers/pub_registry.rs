@@ -83,13 +83,16 @@ async fn resolve_pub_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 
 /// The plain-text error a failed member query in the virtual-repo fan-out
 /// becomes: the status sheds a saturated pool to 503 (#2083) and the body is
-/// the stable text, never the driver's (#3667).
+/// the stable text, never the driver's (#3667). An unreachable database is a
+/// 503 too, and every 503 carries `Retry-After` (#4765).
 fn virtual_member_db_error<E: std::fmt::Display + ?Sized>(e: &E) -> Response {
-    (
-        crate::api::handlers::db_status(e),
-        crate::api::handlers::db_err_message(e),
+    crate::api::handlers::with_retry_after_on_503(
+        (
+            crate::api::handlers::db_status(e),
+            crate::api::handlers::db_err_message(e),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 // ---------------------------------------------------------------------------

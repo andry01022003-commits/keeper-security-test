@@ -1242,6 +1242,45 @@ mod tests {
     // build; the message they pass must never be the driver text.
     // -----------------------------------------------------------------------
 
+    /// #4765: a Git LFS batch against a database that went away must get a
+    /// retryable 503 in the LFS envelope (`{"message": …}`) with
+    /// `Retry-After: 1`, not a 500. Drives the real repository lookup every
+    /// LFS route starts with, against a closed pool.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_resolve_lfs_repo_db_unavailable_is_503_with_retry_after_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+
+        let response = match resolve_lfs_repo(&pool, "lfs-repo").await {
+            Ok(_) => panic!("a closed pool cannot resolve a repository"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            LFS_CONTENT_TYPE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("LFS JSON envelope");
+        assert_eq!(
+            body["message"],
+            "Database is temporarily unavailable, retry shortly"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::disallowed_methods)]
     // streaming-invariant: test exempt — a small JSON error body is not an

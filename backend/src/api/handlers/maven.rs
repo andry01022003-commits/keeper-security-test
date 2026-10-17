@@ -2745,13 +2745,16 @@ async fn collect_local_group_prefixes(
 /// The plain-text error the metadata cache's load failure becomes. The
 /// cache surfaces the sqlx error as `Arc<String>`; the status still sheds a
 /// saturated pool to 503 (#2083) and the body is the stable text, never the
-/// driver's (#3667).
+/// driver's (#3667). An unreachable database is a 503 too, and every 503
+/// carries `Retry-After` (#4765).
 fn metadata_cache_error_response(err: &str) -> Response {
-    (
-        crate::api::handlers::db_status(err),
-        crate::api::handlers::db_err_message(err),
+    crate::api::handlers::with_retry_after_on_503(
+        (
+            crate::api::handlers::db_status(err),
+            crate::api::handlers::db_err_message(err),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 async fn generate_metadata_for_artifact(

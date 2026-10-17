@@ -193,18 +193,24 @@ fn swift_json_response(status: StatusCode, body: serde_json::Value) -> Response 
 }
 
 /// Build an error response with the Content-Version: 1 header.
+///
+/// A 503 (the database sites pass `db_status`, which picks it for a saturated
+/// pool or an unreachable database) carries `Retry-After` like every other
+/// format's envelope (#4765).
 fn swift_error_response(status: StatusCode, detail: &str) -> Response {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/problem+json")
-        .header("Content-Version", "1")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "detail": detail,
-            }))
+    super::with_retry_after_on_503(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/problem+json")
+            .header("Content-Version", "1")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "detail": detail,
+                }))
+                .unwrap(),
+            ))
             .unwrap(),
-        ))
-        .unwrap()
+    )
 }
 
 // ---------------------------------------------------------------------------
