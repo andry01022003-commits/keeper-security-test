@@ -79,6 +79,10 @@ impl AuditAction {
                 Outcome::Failure
             }
             AuditAction::PermissionDenied | AuditAction::AgeGateRejected => Outcome::Denied,
+            // #4710: a promotion the gate / policy / rules refused, and a
+            // promotion request a reviewer turned down, are refusals of the
+            // requesting principal, like `AGE_GATE_REJECTED`.
+            AuditAction::PromotionRefused | AuditAction::PromotionApprovalDenied => Outcome::Denied,
             // #2805: the password was correct, but the 2FA enforcement policy
             // withheld the session pending enrollment. Not a success (no session
             // was issued) and not a credential failure — it is a policy denial,
@@ -137,7 +141,29 @@ impl AuditAction {
             | AuditAction::CiOidcGroupBindingReconciled
             | AuditAction::StorageScrubRun
             | AuditAction::StorageReindexRun
-            | AuditAction::RepositoryAllowlistChanged => Outcome::Success,
+            | AuditAction::RepositoryAllowlistChanged
+            | AuditAction::QuarantineReleased
+            | AuditAction::QuarantineRejected
+            | AuditAction::PromotionApprovalGranted
+            | AuditAction::ArtifactPromoted
+            | AuditAction::PromotionRejected
+            | AuditAction::PermissionRuleCreated
+            | AuditAction::PermissionRuleUpdated
+            | AuditAction::PermissionRuleDeleted
+            | AuditAction::SsoProviderCreated
+            | AuditAction::SsoProviderUpdated
+            | AuditAction::SsoProviderDeleted
+            | AuditAction::SsoProviderEnabled
+            | AuditAction::SsoProviderDisabled
+            | AuditAction::SigningKeyRotated
+            | AuditAction::SigningKeyRevoked
+            | AuditAction::WebhookCreated
+            | AuditAction::WebhookUpdated
+            | AuditAction::WebhookDeleted
+            | AuditAction::WebhookSecretRotated
+            | AuditAction::SyncPolicyCreated
+            | AuditAction::SyncPolicyUpdated
+            | AuditAction::SyncPolicyDeleted => Outcome::Success,
         }
     }
 }

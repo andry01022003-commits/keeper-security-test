@@ -13,6 +13,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
+use crate::services::audit_service::{
+    audit_fire_and_forget, changed_fields, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::auth_config_service::{
     AuthConfigService, CreateLdapConfigRequest, CreateOidcConfigRequest, CreateSamlConfigRequest,
     LdapConfigResponse, LdapTestResult, OidcConfigResponse, SamlConfigResponse, SsoProviderInfo,
@@ -46,6 +49,109 @@ pub fn router() -> Router<SharedState> {
         .route("/saml/:id/toggle", patch(toggle_saml))
         // All enabled providers
         .route("/providers", get(list_providers))
+}
+
+// ---------------------------------------------------------------------------
+// Audit (#4710)
+// ---------------------------------------------------------------------------
+
+/// Records SSO provider changes for one provider type (`oidc`, `ldap`,
+/// `saml`). Details carry the provider type and name and the non-secret
+/// fields that changed; client secrets, bind passwords and certificates are
+/// never recorded (the response shapes this diffs carry only `has_*` flags),
+/// only THAT a credential was replaced.
+struct SsoAudit<'a> {
+    state: &'a SharedState,
+    auth: &'a AuthExtension,
+    provider_type: &'static str,
+}
+
+impl SsoAudit<'_> {
+    async fn record(&self, action: AuditAction, id: Uuid, name: &str, extra: serde_json::Value) {
+        let mut details = serde_json::json!({
+            "provider_type": self.provider_type,
+            "name": name,
+        });
+        if let (Some(map), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+            map.extend(extra);
+        }
+        audit_fire_and_forget(
+            self.state.db.clone(),
+            AuditEntry::for_principal(action, ResourceType::SsoProvider, self.auth)
+                .resource(id)
+                .resource_name(name)
+                .details(details),
+        )
+        .await;
+    }
+
+    async fn created(&self, id: Uuid, name: &str, is_enabled: bool) {
+        self.record(
+            AuditAction::SsoProviderCreated,
+            id,
+            name,
+            serde_json::json!({ "is_enabled": is_enabled }),
+        )
+        .await;
+    }
+
+    async fn updated<T: serde::Serialize>(
+        &self,
+        id: Uuid,
+        name: &str,
+        (before, after): (&T, &T),
+        credential_replaced: bool,
+    ) {
+        let before = serde_json::to_value(before).unwrap_or_default();
+        let after = serde_json::to_value(after).unwrap_or_default();
+        self.record(
+            AuditAction::SsoProviderUpdated,
+            id,
+            name,
+            serde_json::json!({
+                "changed_fields": changed_fields(&before, &after),
+                "credential_replaced": credential_replaced,
+            }),
+        )
+        .await;
+    }
+
+    async fn deleted(&self, id: Uuid, name: &str) {
+        self.record(
+            AuditAction::SsoProviderDeleted,
+            id,
+            name,
+            serde_json::json!({}),
+        )
+        .await;
+    }
+
+    async fn toggled(&self, id: Uuid, name: &str, enabled: bool) {
+        let action = if enabled {
+            AuditAction::SsoProviderEnabled
+        } else {
+            AuditAction::SsoProviderDisabled
+        };
+        self.record(
+            action,
+            id,
+            name,
+            serde_json::json!({ "is_enabled": enabled }),
+        )
+        .await;
+    }
+}
+
+fn sso_audit<'a>(
+    state: &'a SharedState,
+    auth: &'a AuthExtension,
+    provider_type: &'static str,
+) -> SsoAudit<'a> {
+    SsoAudit {
+        state,
+        auth,
+        provider_type,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +225,9 @@ pub async fn create_oidc(
 ) -> Result<Json<OidcConfigResponse>> {
     auth.require_admin()?;
     let result = AuthConfigService::create_oidc(&state.db, req).await?;
+    sso_audit(&state, &auth, "oidc")
+        .created(result.id, &result.name, result.is_enabled)
+        .await;
     Ok(Json(result))
 }
 
@@ -146,7 +255,12 @@ pub async fn update_oidc(
     Json(req): Json<UpdateOidcConfigRequest>,
 ) -> Result<Json<OidcConfigResponse>> {
     auth.require_admin()?;
+    let before = AuthConfigService::get_oidc(&state.db, id).await?;
+    let credential_replaced = req.client_secret.is_some();
     let result = AuthConfigService::update_oidc(&state.db, id, req).await?;
+    sso_audit(&state, &auth, "oidc")
+        .updated(id, &result.name, (&before, &result), credential_replaced)
+        .await;
     Ok(Json(result))
 }
 
@@ -172,7 +286,11 @@ pub async fn delete_oidc(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     auth.require_admin()?;
+    let before = AuthConfigService::get_oidc(&state.db, id).await?;
     AuthConfigService::delete_oidc(&state.db, id).await?;
+    sso_audit(&state, &auth, "oidc")
+        .deleted(id, &before.name)
+        .await;
     Ok(())
 }
 
@@ -200,7 +318,11 @@ pub async fn toggle_oidc(
     Json(req): Json<ToggleRequest>,
 ) -> Result<()> {
     auth.require_admin()?;
-    AuthConfigService::toggle_oidc(&state.db, id, req).await?;
+    let enabled = req.enabled;
+    let result = AuthConfigService::toggle_oidc(&state.db, id, req).await?;
+    sso_audit(&state, &auth, "oidc")
+        .toggled(id, &result.name, enabled)
+        .await;
     Ok(())
 }
 
@@ -276,6 +398,9 @@ pub async fn create_ldap(
     auth.require_admin()?;
     crate::api::validation::validate_outbound_ldap_url(&req.server_url, "LDAP server URL")?;
     let result = AuthConfigService::create_ldap(&state.db, req).await?;
+    sso_audit(&state, &auth, "ldap")
+        .created(result.id, &result.name, result.is_enabled)
+        .await;
     Ok(Json(result))
 }
 
@@ -306,7 +431,12 @@ pub async fn update_ldap(
     if let Some(server_url) = &req.server_url {
         crate::api::validation::validate_outbound_ldap_url(server_url, "LDAP server URL")?;
     }
+    let before = AuthConfigService::get_ldap(&state.db, id).await?;
+    let credential_replaced = req.bind_password.is_some();
     let result = AuthConfigService::update_ldap(&state.db, id, req).await?;
+    sso_audit(&state, &auth, "ldap")
+        .updated(id, &result.name, (&before, &result), credential_replaced)
+        .await;
     Ok(Json(result))
 }
 
@@ -332,7 +462,11 @@ pub async fn delete_ldap(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     auth.require_admin()?;
+    let before = AuthConfigService::get_ldap(&state.db, id).await?;
     AuthConfigService::delete_ldap(&state.db, id).await?;
+    sso_audit(&state, &auth, "ldap")
+        .deleted(id, &before.name)
+        .await;
     Ok(())
 }
 
@@ -360,7 +494,11 @@ pub async fn toggle_ldap(
     Json(req): Json<ToggleRequest>,
 ) -> Result<()> {
     auth.require_admin()?;
-    AuthConfigService::toggle_ldap(&state.db, id, req).await?;
+    let enabled = req.enabled;
+    let result = AuthConfigService::toggle_ldap(&state.db, id, req).await?;
+    sso_audit(&state, &auth, "ldap")
+        .toggled(id, &result.name, enabled)
+        .await;
     Ok(())
 }
 
@@ -461,6 +599,9 @@ pub async fn create_saml(
 ) -> Result<Json<SamlConfigResponse>> {
     auth.require_admin()?;
     let result = AuthConfigService::create_saml(&state.db, req).await?;
+    sso_audit(&state, &auth, "saml")
+        .created(result.id, &result.name, result.is_enabled)
+        .await;
     Ok(Json(result))
 }
 
@@ -488,7 +629,12 @@ pub async fn update_saml(
     Json(req): Json<UpdateSamlConfigRequest>,
 ) -> Result<Json<SamlConfigResponse>> {
     auth.require_admin()?;
+    let before = AuthConfigService::get_saml(&state.db, id).await?;
+    let credential_replaced = false;
     let result = AuthConfigService::update_saml(&state.db, id, req).await?;
+    sso_audit(&state, &auth, "saml")
+        .updated(id, &result.name, (&before, &result), credential_replaced)
+        .await;
     Ok(Json(result))
 }
 
@@ -514,7 +660,11 @@ pub async fn delete_saml(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     auth.require_admin()?;
+    let before = AuthConfigService::get_saml(&state.db, id).await?;
     AuthConfigService::delete_saml(&state.db, id).await?;
+    sso_audit(&state, &auth, "saml")
+        .deleted(id, &before.name)
+        .await;
     Ok(())
 }
 
@@ -542,7 +692,11 @@ pub async fn toggle_saml(
     Json(req): Json<ToggleRequest>,
 ) -> Result<()> {
     auth.require_admin()?;
-    AuthConfigService::toggle_saml(&state.db, id, req).await?;
+    let enabled = req.enabled;
+    let result = AuthConfigService::toggle_saml(&state.db, id, req).await?;
+    sso_audit(&state, &auth, "saml")
+        .toggled(id, &result.name, enabled)
+        .await;
     Ok(())
 }
 
@@ -1182,5 +1336,99 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert!(!json["success"].as_bool().unwrap());
         assert!(json["message"].as_str().unwrap().contains("timed out"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4710: SSO provider changes are audited
+    // -----------------------------------------------------------------------
+
+    /// Create, update, enable, disable and delete of an OIDC provider each
+    /// write one audit row naming the admin and the provider, and the update
+    /// row lists what changed without ever carrying the client secret.
+    #[tokio::test]
+    async fn test_oidc_provider_lifecycle_is_audited() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The SSO config encryption key comes from SSO_ENCRYPTION_KEY or
+        // JWT_SECRET; without either the create cannot run.
+        if std::env::var("SSO_ENCRYPTION_KEY").is_err() && std::env::var("JWT_SECRET").is_err() {
+            return;
+        }
+        let _guard = tdh::sso_provider_serial_lock().await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = || Extension(tdh::admin_auth(admin_id, &admin_name));
+        let name = format!("audit4710-{}", Uuid::new_v4());
+        let create: CreateOidcConfigRequest = serde_json::from_value(json!({
+            "name": name,
+            "issuer_url": "https://issuer.test.invalid",
+            "client_id": "client-4710",
+            "client_secret": "first-secret-4710",
+            "is_enabled": false
+        }))
+        .expect("create request");
+
+        let created = create_oidc(State(state.clone()), auth(), Json(create))
+            .await
+            .expect("create_oidc")
+            .0;
+        let id = created.id;
+        let update: UpdateOidcConfigRequest = serde_json::from_value(json!({
+            "issuer_url": "https://issuer2.test.invalid",
+            "client_secret": "second-secret-4710"
+        }))
+        .expect("update request");
+        let updated = update_oidc(State(state.clone()), auth(), Path(id), Json(update)).await;
+        let enabled = toggle_oidc(
+            State(state.clone()),
+            auth(),
+            Path(id),
+            Json(ToggleRequest { enabled: true }),
+        )
+        .await;
+        let disabled = toggle_oidc(
+            State(state.clone()),
+            auth(),
+            Path(id),
+            Json(ToggleRequest { enabled: false }),
+        )
+        .await;
+        let deleted = delete_oidc(State(state.clone()), auth(), Path(id)).await;
+
+        let mut rows = Vec::new();
+        for action in [
+            "SSO_PROVIDER_CREATED",
+            "SSO_PROVIDER_UPDATED",
+            "SSO_PROVIDER_ENABLED",
+            "SSO_PROVIDER_DISABLED",
+            "SSO_PROVIDER_DELETED",
+        ] {
+            rows.push(tdh::audit_row_eventually(&pool, id, action).await);
+        }
+        let _ = sqlx::query("DELETE FROM oidc_configs WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert!(updated.is_ok() && enabled.is_ok() && disabled.is_ok() && deleted.is_ok());
+        for row in &rows {
+            assert_eq!(row.user_id, Some(admin_id));
+            assert_eq!(row.resource_type, "sso_provider");
+            assert_eq!(row.details["provider_type"], "oidc");
+            assert_eq!(row.details["name"], name.as_str());
+            let text = row.details.to_string();
+            assert!(
+                !text.contains("first-secret-4710") && !text.contains("second-secret-4710"),
+                "an SSO audit row must never carry the client secret: {text}"
+            );
+        }
+        assert_eq!(rows[0].details["is_enabled"], false);
+        assert_eq!(rows[1].details["changed_fields"], json!(["issuer_url"]));
+        assert_eq!(rows[1].details["credential_replaced"], true);
+        assert_eq!(rows[2].details["is_enabled"], true);
+        assert_eq!(rows[3].details["is_enabled"], false);
     }
 }

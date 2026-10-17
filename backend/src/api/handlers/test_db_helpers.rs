@@ -1636,6 +1636,42 @@ pub async fn audit_count_eventually(
     last
 }
 
+/// The newest `audit_log` row recorded for `(resource_id, action)` (#4710).
+#[derive(Debug)]
+pub struct AuditRow {
+    pub user_id: Option<Uuid>,
+    pub resource_type: String,
+    pub details: serde_json::Value,
+}
+
+/// Poll (~2s, like [`audit_count_eventually`]) for the newest `audit_log` row
+/// with this `resource_id` and `action`, panicking when none appears. The
+/// handler-level audit tests use it to assert the actor, target and `details`
+/// a fire-and-forget emitter recorded. Read it BEFORE deleting the acting
+/// user: `audit_log.user_id` is `ON DELETE SET NULL`.
+pub async fn audit_row_eventually(pool: &PgPool, resource_id: Uuid, action: &str) -> AuditRow {
+    for _ in 0..100 {
+        let row: Option<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT user_id, resource_type, details FROM audit_log \
+             WHERE resource_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(resource_id)
+        .bind(action)
+        .fetch_optional(pool)
+        .await
+        .expect("audit_log row query");
+        if let Some((user_id, resource_type, details)) = row {
+            return AuditRow {
+                user_id,
+                resource_type,
+                details: details.unwrap_or(serde_json::Value::Null),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no {action} audit row for resource {resource_id}");
+}
+
 /// Count `download_statistics` rows for `artifact_id`.
 pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")

@@ -15,6 +15,9 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -158,6 +161,38 @@ fn map_permission_write_error(e: sqlx::Error) -> AppError {
     } else {
         AppError::Database(msg)
     }
+}
+
+/// The audited shape of a permission rule (#4710): who it grants, on what,
+/// which actions and under which conditions.
+fn permission_rule_audit_snapshot(row: &PermissionRow) -> serde_json::Value {
+    serde_json::json!({
+        "principal_type": row.principal_type,
+        "principal_id": row.principal_id,
+        "principal_name": row.principal_name,
+        "target_type": row.target_type,
+        "target_id": row.target_id,
+        "target_name": row.target_name,
+        "actions": row.actions,
+        "conditions": row.conditions,
+    })
+}
+
+/// Record a permission-rule change (#4710), best-effort.
+async fn audit_permission_rule(
+    state: &SharedState,
+    auth: &AuthExtension,
+    action: AuditAction,
+    rule_id: Uuid,
+    details: serde_json::Value,
+) {
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(action, ResourceType::PermissionRule, auth)
+            .resource(rule_id)
+            .details(details),
+    )
+    .await;
 }
 
 async fn fetch_permission_row<'e, E>(executor: E, id: Uuid) -> Result<Option<PermissionRow>>
@@ -369,7 +404,6 @@ pub async fn create_permission(
     // surfaced as 500 DATABASE_ERROR. The contract is admin-only, so reject
     // here with 403 before any DB write.
     auth.require_admin()?;
-    let _ = auth;
 
     // Only now, after the caller is authorized, parse the payload. Malformed
     // or missing fields surface as 400 VALIDATION_ERROR (the canonical
@@ -453,6 +487,14 @@ pub async fn create_permission(
     state
         .event_bus
         .emit("permission.created", permission.id, None);
+    audit_permission_rule(
+        &state,
+        &auth,
+        AuditAction::PermissionRuleCreated,
+        permission.id,
+        permission_rule_audit_snapshot(&permission),
+    )
+    .await;
 
     Ok(Json(PermissionResponse::from(permission)))
 }
@@ -535,7 +577,6 @@ pub async fn update_permission(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     auth.require_admin()?;
-    let _ = auth;
 
     let payload: CreatePermissionRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
@@ -577,6 +618,11 @@ pub async fn update_permission(
         "#,
         hydrate_select("p")
     );
+    // The rule as it stood, for the audit row's before/after (#4710).
+    let before = fetch_permission_row(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
+
     // As on create, an absent `conditions` field persists `{}` (unconditional).
     let conditions_json = payload
         .conditions
@@ -600,6 +646,20 @@ pub async fn update_permission(
     state
         .event_bus
         .emit("permission.updated", permission.id, None);
+    let before = permission_rule_audit_snapshot(&before);
+    let after = permission_rule_audit_snapshot(&permission);
+    audit_permission_rule(
+        &state,
+        &auth,
+        AuditAction::PermissionRuleUpdated,
+        permission.id,
+        serde_json::json!({
+            "changed_fields": crate::services::audit_service::changed_fields(&before, &after),
+            "before": before,
+            "after": after,
+        }),
+    )
+    .await;
 
     Ok(Json(PermissionResponse::from(permission)))
 }
@@ -639,7 +699,9 @@ pub async fn delete_permission(
     // treatment, so any logged-in non-admin could remove arbitrary permission
     // rows. Match create/update: admin only.
     auth.require_admin()?;
-    let _ = auth;
+
+    // The rule being removed, for the audit row (#4710).
+    let removed = fetch_permission_row(&state.db, id).await?;
 
     let result = sqlx::query("DELETE FROM permissions WHERE id = $1")
         .bind(id)
@@ -653,6 +715,16 @@ pub async fn delete_permission(
 
     state.permission_service.invalidate_cache();
     state.event_bus.emit("permission.deleted", id, None);
+    audit_permission_rule(
+        &state,
+        &auth,
+        AuditAction::PermissionRuleDeleted,
+        id,
+        removed
+            .as_ref()
+            .map_or(serde_json::Value::Null, permission_rule_audit_snapshot),
+    )
+    .await;
 
     Ok(())
 }
@@ -922,6 +994,80 @@ mod tests {
         assert_eq!(fetched_legacy["target_name"], repo_name);
 
         cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[]).await;
+    }
+
+    /// #4710: create, update and delete of a permission rule each write one
+    /// audit row naming the admin, the rule's principal and target, and (for
+    /// an update) what changed.
+    #[tokio::test]
+    async fn permission_rule_crud_is_audited() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (grantee_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let rule = |actions: serde_json::Value| {
+            Bytes::from(
+                json!({
+                    "principal_type": "user",
+                    "principal_id": grantee_id,
+                    "target_type": "repository",
+                    "target_id": repo_id,
+                    "actions": actions
+                })
+                .to_string(),
+            )
+        };
+
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post("/".to_string(), "application/json", rule(json!(["read"]))),
+        )
+        .await;
+        let rule_id: Uuid = serde_json::from_value(created["id"].clone()).expect("rule id");
+        response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::put_json(format!("/{rule_id}"), rule(json!(["read", "write"]))),
+        )
+        .await;
+        let (delete_status, _) = tdh::send(
+            permission_app(state.clone(), auth.clone()),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/{rule_id}"))
+                .body(Body::empty())
+                .expect("DELETE request"),
+        )
+        .await;
+
+        let created_row =
+            tdh::audit_row_eventually(&pool, rule_id, "PERMISSION_RULE_CREATED").await;
+        let updated_row =
+            tdh::audit_row_eventually(&pool, rule_id, "PERMISSION_RULE_UPDATED").await;
+        let deleted_row =
+            tdh::audit_row_eventually(&pool, rule_id, "PERMISSION_RULE_DELETED").await;
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[grantee_id], &[]).await;
+
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(created_row.user_id, Some(admin_id));
+        assert_eq!(created_row.resource_type, "permission_rule");
+        assert_eq!(created_row.details["principal_id"], grantee_id.to_string());
+        assert_eq!(created_row.details["target_id"], repo_id.to_string());
+        assert_eq!(created_row.details["actions"], json!(["read"]));
+        assert_eq!(updated_row.user_id, Some(admin_id));
+        assert_eq!(updated_row.details["changed_fields"], json!(["actions"]));
+        assert_eq!(updated_row.details["before"]["actions"], json!(["read"]));
+        assert_eq!(
+            updated_row.details["after"]["actions"],
+            json!(["read", "write"])
+        );
+        assert_eq!(deleted_row.user_id, Some(admin_id));
+        assert_eq!(deleted_row.details["actions"], json!(["read", "write"]));
     }
 
     #[tokio::test]

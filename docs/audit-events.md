@@ -122,6 +122,44 @@ the remaining actions is an incremental follow-up.
 | `ARTIFACT_UPLOADED` / `_DOWNLOADED` / `_DELETED` | `ArtifactDetails` (`repository_id`, `path`, `name`, `version?`, `size_bytes?`, `digest?`, `uploaded_by?`) |
 | `SETTING_CHANGED` | `SettingDetails` (`key`, `old_value?`, `new_value?`) |
 
+## Privileged administrative actions
+
+These actions record who changed a security-relevant configuration or
+released, approved or promoted content (#4710). Each row's `user_id` (and the
+envelope's `actor`) is the authenticated principal; `resource` is the target
+named below. `details` never carries a secret: no client secret, bind
+password, key material, token, or webhook secret or secret digest, only flags
+such as `credential_replaced` or `secret_rotated`.
+
+| Action | Resource | `details` |
+| --- | --- | --- |
+| `QUARANTINE_RELEASED` | `artifact` (or `repository` for a held proxy-cache entry) | `artifact_id`, `previous_status`; for a proxy-cache entry `repository`, `path`, `proxy_cache: true` |
+| `QUARANTINE_REJECTED` | `artifact` | `artifact_id`, `previous_status`, `reason` |
+| `PROMOTION_APPROVAL_GRANTED` | `promotion_approval` | `approval_id`, `artifact_id`, `artifact_path`, `source_repository`, `target_repository`, `requested_by`, `promoted_artifact_id`, `promotion_id`, `skip_policy_check`, `notes` |
+| `PROMOTION_APPROVAL_DENIED` | `promotion_approval` | `approval_id`, `artifact_id`, `source_repository`, `target_repository`, `requested_by`, `notes` |
+| `ARTIFACT_PROMOTED` | `artifact` (the source artifact) | `artifact_id`, `artifact_path`, `source_repository`, `target_repository`, `promotion_id`, `skip_policy_check`, `bulk`, `gate_results` (`evaluated`, `failed`, `failed_rules`), `policy_violations` (count) |
+| `PROMOTION_REFUSED` | `artifact` | as `ARTIFACT_PROMOTED`, with `promotion_id: null` and the refusal `message`. Written when the quality gate, the promotion policy or a promotion rule refuses the promotion (single or bulk item) |
+| `PROMOTION_REJECTED` | `artifact` | `artifact_id`, `source_repository`, `rejection_id`, `reason`, `notes` |
+| `PERMISSION_RULE_CREATED` / `_DELETED` | `permission_rule` | `principal_type`, `principal_id`, `principal_name`, `target_type`, `target_id`, `target_name`, `actions`, `conditions` |
+| `PERMISSION_RULE_UPDATED` | `permission_rule` | `changed_fields`, `before`, `after` (each the shape above) |
+| `SSO_PROVIDER_CREATED` | `sso_provider` | `provider_type` (`oidc`, `ldap`, `saml`), `name`, `is_enabled` |
+| `SSO_PROVIDER_UPDATED` | `sso_provider` | `provider_type`, `name`, `changed_fields`, `credential_replaced` |
+| `SSO_PROVIDER_DELETED` | `sso_provider` | `provider_type`, `name` |
+| `SSO_PROVIDER_ENABLED` / `_DISABLED` | `sso_provider` | `provider_type`, `name`, `is_enabled` |
+| `SIGNING_KEY_ROTATED` | `signing_key` (the old key) | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id`, `new_key_id`, `new_fingerprint` |
+| `SIGNING_KEY_REVOKED` | `signing_key` | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id` |
+| `WEBHOOK_CREATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `signing_mode`, `signed` |
+| `WEBHOOK_UPDATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `is_enabled` (written by enable and disable) |
+| `WEBHOOK_DELETED` | `webhook` | `name`, `url`, `events`, `repository_id` |
+| `WEBHOOK_SECRET_ROTATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `secret_rotated: true`, `previous_secret_expires_at` |
+| `SYNC_POLICY_CREATED` / `_DELETED` | `sync_policy` | `name`, `policy` (the policy without timestamps) |
+| `SYNC_POLICY_UPDATED` | `sync_policy` | `name`, `changed_fields`, `before`, `after` (written by update and by enable / disable) |
+
+A webhook `url` is recorded as scheme, host, port and path: userinfo, query
+string and fragment are dropped because receivers often carry a token there.
+`PROMOTION_REFUSED` and `PROMOTION_APPROVAL_DENIED` export with outcome
+`denied`; the others export as `success`.
+
 ## Compatibility policy
 
 Within `schema_version: 1`:

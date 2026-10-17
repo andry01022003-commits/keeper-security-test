@@ -19,6 +19,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::quarantine_service;
 
 /// Create quarantine routes.
@@ -291,7 +294,7 @@ pub async fn release_artifact(
     auth.require_admin()?;
 
     // Verify artifact exists
-    quarantine_service::get_status(&state.db, artifact_id).await?;
+    let (previous_status, _) = quarantine_service::get_status(&state.db, artifact_id).await?;
 
     quarantine_service::transition(
         &state.db,
@@ -300,6 +303,21 @@ pub async fn release_artifact(
         None,
     )
     .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::QuarantineReleased,
+            ResourceType::Artifact,
+            &auth,
+        )
+        .resource(artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": artifact_id,
+            "previous_status": previous_status,
+        })),
+    )
+    .await;
 
     tracing::info!(
         artifact_id = %artifact_id,
@@ -371,6 +389,23 @@ pub async fn release_proxy_cache_entry(
         .release_quarantined_cache_entry(repo.id, req.path.trim())
         .await?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::QuarantineReleased,
+            ResourceType::Repository,
+            &auth,
+        )
+        .resource(repo.id)
+        .resource_name(repo_key.clone())
+        .details(serde_json::json!({
+            "repository": repo_key,
+            "path": req.path.trim(),
+            "proxy_cache": true,
+        })),
+    )
+    .await;
+
     tracing::info!(
         repository = %repo_key,
         path = %req.path,
@@ -417,7 +452,7 @@ pub async fn reject_artifact(
     auth.require_admin()?;
 
     // Verify artifact exists
-    quarantine_service::get_status(&state.db, artifact_id).await?;
+    let (previous_status, _) = quarantine_service::get_status(&state.db, artifact_id).await?;
 
     // Persist the admin's rejection reason rather than only logging it, so the
     // stored reason describes the rejection instead of whatever the preceding
@@ -429,6 +464,22 @@ pub async fn reject_artifact(
         req.reason.as_deref(),
     )
     .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::QuarantineRejected,
+            ResourceType::Artifact,
+            &auth,
+        )
+        .resource(artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": artifact_id,
+            "previous_status": previous_status,
+            "reason": req.reason,
+        })),
+    )
+    .await;
 
     let reason = req.reason.as_deref().unwrap_or("No reason provided");
     tracing::info!(
@@ -811,6 +862,49 @@ mod tests {
         );
     }
 
+    /// #4710: releasing and rejecting a held artifact each write one audit
+    /// row naming the admin, the artifact and the state it left.
+    #[tokio::test]
+    async fn test_release_and_reject_are_audited() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let released = seed_artifact(&fx, Some("quarantined"), None, Some("held")).await;
+        let rejected = seed_artifact(&fx, Some("quarantined"), None, Some("held")).await;
+
+        let (release_status, _) = tdh::send(
+            admin_router(&fx),
+            tdh::post(
+                format!("/{released}/release"),
+                "application/json",
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let (reject_status, _) = tdh::send(
+            admin_router(&fx),
+            tdh::post(
+                format!("/{rejected}/reject"),
+                "application/json",
+                Bytes::from_static(br#"{"reason":"typosquat"}"#),
+            ),
+        )
+        .await;
+        let release_row =
+            tdh::audit_row_eventually(&fx.pool, released, "QUARANTINE_RELEASED").await;
+        let reject_row = tdh::audit_row_eventually(&fx.pool, rejected, "QUARANTINE_REJECTED").await;
+        fx.teardown().await;
+
+        assert_eq!(release_status, StatusCode::OK);
+        assert_eq!(reject_status, StatusCode::OK);
+        assert_eq!(release_row.user_id, Some(fx.user_id));
+        assert_eq!(release_row.resource_type, "artifact");
+        assert_eq!(release_row.details["previous_status"], "quarantined");
+        assert_eq!(reject_row.user_id, Some(fx.user_id));
+        assert_eq!(reject_row.details["reason"], "typosquat");
+        assert_eq!(reject_row.details["previous_status"], "quarantined");
+    }
+
     // -----------------------------------------------------------------------
     // #3174: `can_access_repo` is TOKEN SCOPE, not repository visibility.
     // -----------------------------------------------------------------------
@@ -1076,8 +1170,16 @@ mod tests {
         .expect_err("a double release must be refused");
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
 
+        // #4710: the release is audited against the repository, with the path.
+        let row = tdh::audit_row_eventually(&fx.pool, fx.repo_id, "QUARANTINE_RELEASED").await;
+
         fx.teardown().await;
         let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(row.user_id, Some(fx.user_id));
+        assert_eq!(row.resource_type, "repository");
+        assert_eq!(row.details["path"], path.as_str());
+        assert_eq!(row.details["proxy_cache"], true);
     }
 
     /// Authz and lookup failures: admin-only (403), unauthenticated (401),
