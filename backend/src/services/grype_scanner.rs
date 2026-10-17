@@ -4066,7 +4066,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
             zip.start_file("acme_widget-1.2.3.dist-info/METADATA", opts)
                 .unwrap();
             zip.write_all(

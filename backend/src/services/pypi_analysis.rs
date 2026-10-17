@@ -433,7 +433,13 @@ pub fn analyze_wheel_limited<R: Read + Seek>(
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
         if name.ends_with(".dist-info/RECORD") {
             record_index = Some(i);
         }
@@ -710,7 +716,7 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut buf);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, data) in entries {
                 zw.start_file(*name, opts).unwrap();

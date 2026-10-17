@@ -963,7 +963,10 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
         // Match on the central-directory name BEFORE opening the entry, so an
         // unmatched entry costs one string comparison rather than a local-
         // header read; large archives (a 12k-entry wheel, #3886) walk cheaply.
-        if !archive.name_for_index(i).is_some_and(&matches) {
+        if !archive
+            .name_for_index(i)
+            .is_some_and(|name| name.as_deref().is_ok_and(&matches))
+        {
             continue;
         }
         let mut file = archive
@@ -1014,7 +1017,14 @@ pub fn reject_unsafe_zip_entry_names<R: Read + Seek>(archive: &zip::ZipArchive<R
     }
     for i in 0..archive.len() {
         if let Some(name) = archive.name_for_index(i) {
-            if is_unsafe_archive_entry_name(name) {
+            // zip 9 decodes the name as UTF-8 or CP437 and refuses anything
+            // else; a name this check cannot read is a name it cannot vet.
+            let name = name.map_err(|e| {
+                AppError::Validation(format!(
+                    "ZIP archive entry {i} has an undecodable name: {e}"
+                ))
+            })?;
+            if is_unsafe_archive_entry_name(&name) {
                 let shown: String = name.chars().take(200).collect();
                 return Err(AppError::Validation(format!(
                     "ZIP archive entry {shown:?} is an absolute path or escapes the archive root"
@@ -1087,7 +1097,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, data) in entries {
                 w.start_file(*name, opts).unwrap();
@@ -1312,7 +1322,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let stored: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             let target_opts = if deflate {
                 stored.compression_method(zip::CompressionMethod::Deflated)

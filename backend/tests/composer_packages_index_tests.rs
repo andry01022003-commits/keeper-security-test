@@ -265,7 +265,7 @@ fn build_composer_zip(name: &str, version: &str, description: &str) -> Vec<u8> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("composer.json", options)
             .expect("start composer.json");

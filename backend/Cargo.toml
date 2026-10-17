@@ -140,7 +140,7 @@ flate2 = "1.0"
 tar = "0.4"
 xz2 = "0.1"
 mime_guess = "2.0"
-zip = "8.5"
+zip = "9.0"
 toml = "1.1"
 serde_yaml = "0.9"
 regex = "1.11"
@@ -155,8 +155,8 @@ rmp-serde = "1.3"
 # networking module is not needed (we stream from in-memory upload bytes), and
 # its `.tar.bz2` reader is single-stream, so the multi-stream v1 path stays on
 # our own reader (#4067).
-rattler_conda_types = { version = "0.53", default-features = false }
-rattler_package_streaming = { version = "0.27", default-features = false }
+rattler_conda_types = { version = "0.57", default-features = false }
+rattler_package_streaming = { version = "0.27.15", default-features = false }
 
 # WASM runtime
 wasmtime.workspace = true
