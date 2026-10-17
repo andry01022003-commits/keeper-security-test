@@ -21,7 +21,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Extension;
 use axum::Router;
 use base64::Engine;
@@ -94,15 +94,44 @@ pub fn router() -> Router<SharedState> {
         // wildcard because axum prefers literal segments over `*` wildcards.
         // See the filed issue for the full reproducer and impact analysis.
         .route("/:repo_key/-/*rest", get(npm_meta_get))
+        // `npm unpublish` (#4025). The `-rev` segment is a literal, distinct
+        // from the `-` the tarball and meta routes use, so these sit beside
+        // them without shadowing either.
+        //   PUT    /npm/{repo}/{pkg}/-rev/{rev}             packument rewrite (version unpublish)
+        //   DELETE /npm/{repo}/{pkg}/-rev/{rev}             whole-package unpublish
+        //   DELETE /npm/{repo}/{pkg}/-/{file}/-rev/{rev}    tarball delete
+        .route(
+            "/:repo_key/@:scope/:package/-/:filename/-rev/:rev",
+            delete(unpublish_scoped_tarball),
+        )
+        .route(
+            "/:repo_key/@:scope/:package/-rev/:rev",
+            put(unpublish_scoped_versions).delete(unpublish_scoped_package),
+        )
+        .route(
+            "/:repo_key/:package/-/:filename/-rev/:rev",
+            delete(unpublish_tarball),
+        )
+        .route(
+            "/:repo_key/:package/-rev/:rev",
+            put(unpublish_versions).delete(unpublish_package),
+        )
         // Scoped package tarball: GET /npm/{repo_key}/@{scope}/{package}/-/{filename}
         .route(
             "/:repo_key/@:scope/:package/-/:filename",
             get(download_scoped_tarball),
         )
         // Scoped version metadata: GET /npm/{repo_key}/@{scope}/{package}/{version}
+        //
+        // npm addresses a scoped packument as ONE encoded segment
+        // (`@scope%2fname`), so its unpublish requests
+        // (`@scope%2fname/-rev/{rev}`) land on this route with
+        // `package == "-rev"`; PUT/DELETE here exist only for that shape (#4025).
         .route(
             "/:repo_key/@:scope/:package/:version",
-            get(get_scoped_version_metadata),
+            get(get_scoped_version_metadata)
+                .put(unpublish_encoded_scoped_versions)
+                .delete(unpublish_encoded_scoped_package),
         )
         // Scoped package metadata / publish: GET/PUT /npm/{repo_key}/@{scope}/{package}
         .route(
@@ -5978,6 +6007,367 @@ async fn dist_tags_delete(
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Unpublish (`npm unpublish`) -- #4025
+// ---------------------------------------------------------------------------
+//
+// libnpmpublish's unpublish sends, for `npm unpublish <pkg>@<version>`:
+// `GET /{pkg}?write=true`, then `PUT /{pkg}/-rev/{_rev}` with that packument
+// minus the version, then `DELETE /{pkg}/-/{file}/-rev/{_rev}`; and for the
+// whole package (`npm unpublish <pkg> --force`, or the last version)
+// `DELETE /{pkg}/-rev/{_rev}`. It reads a 404 on any of them as "already
+// gone", so these must exist or an unpublish silently does nothing.
+//
+// This registry keeps no packument revisions and serves no `_rev`, so the
+// client sends `-rev/undefined`; any `{rev}` is accepted.
+
+/// One live artifact row of an npm package, as unpublish sees it.
+struct NpmPackageRow {
+    id: uuid::Uuid,
+    version: Option<String>,
+    path: String,
+}
+
+/// Authorize an unpublish and resolve the hosted repository it acts on.
+///
+/// The same gates as the REST artifact delete: an authenticated principal,
+/// the `delete:artifacts` token scope, the repository `delete` action
+/// (deny-by-default, #2603), and no direct delete on a `promotion_only`
+/// repository for non-approvers. Remote and virtual repositories are refused
+/// with the publish route's answers (405 / 400); a virtual repository is not
+/// routed to its deployment target, because that member need not be the one
+/// holding the package.
+async fn resolve_npm_unpublish_target(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+) -> Result<RepoInfo, Response> {
+    let auth = auth.ok_or_else(|| {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Basic realm=\"npm\"")
+            .body(Body::from("Authentication required"))
+            .unwrap()
+    })?;
+    crate::api::middleware::auth::require_scope_response(Some(auth), "delete:artifacts")?;
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    crate::api::handlers::repositories::require_repo_action(
+        auth,
+        repo.id,
+        "delete",
+        &state.permission_service,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    proxy_helpers::reject_direct_delete_if_promotion_only(
+        repo.promotion_only,
+        auth.is_admin || auth.is_service_account,
+    )?;
+    Ok(repo)
+}
+
+async fn fetch_npm_package_rows(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    package: &str,
+) -> Result<Vec<NpmPackageRow>, Response> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, version, path FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(package)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+    Ok(rows
+        .iter()
+        .map(|r| NpmPackageRow {
+            id: r.get("id"),
+            version: r.get("version"),
+            path: r.get("path"),
+        })
+        .collect())
+}
+
+/// The versions a `PUT /{pkg}/-rev/{rev}` packument keeps.
+#[allow(clippy::result_large_err)]
+fn parse_unpublish_packument(
+    body: &[u8],
+    package: &str,
+) -> Result<std::collections::HashSet<String>, Response> {
+    let invalid = |msg: &str| AppError::Validation(msg.to_string()).into_response();
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| invalid("packument body must be JSON"))?;
+    if let Some(name) = value.get("name") {
+        if name.as_str() != Some(package) {
+            return Err(invalid("packument name does not match the package"));
+        }
+    }
+    let versions = value
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| invalid("packument must carry a versions object"))?;
+    Ok(versions.keys().cloned().collect())
+}
+
+/// Rows whose version is absent from the kept set. Rows without a version are
+/// never selected.
+fn rows_not_kept<'a>(
+    rows: &'a [NpmPackageRow],
+    kept: &std::collections::HashSet<String>,
+) -> Vec<&'a NpmPackageRow> {
+    rows.iter()
+        .filter(|r| r.version.as_ref().is_some_and(|v| !kept.contains(v)))
+        .collect()
+}
+
+/// Remove `rows` through `ArtifactService` (soft delete, audit,
+/// `artifact.deleted` webhook, replication delete tasks, search removal),
+/// drop dist-tags that pointed at a removed version (`latest` is then derived
+/// again from what is left), and invalidate the packument caches.
+async fn unpublish_npm_rows(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package: &str,
+    rows: &[&NpmPackageRow],
+) -> Result<(), Response> {
+    let storage = state.storage_for_repo_or_500(&repo.storage_location())?;
+    let artifact_service = state.create_artifact_service(storage);
+    let mut removed_versions: Vec<String> = Vec::new();
+    for row in rows {
+        match artifact_service.delete(row.id).await {
+            // A concurrent unpublish got there first: the row is gone either way.
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e.into_response()),
+        }
+        removed_versions.extend(row.version.clone());
+    }
+    sqlx::query(
+        "UPDATE npm_dist_tags SET tags = COALESCE( \
+             (SELECT jsonb_object_agg(key, value) FROM jsonb_each(tags) \
+              WHERE NOT (value #>> '{}' = ANY($3))), '{}'::jsonb), updated_at = NOW() \
+         WHERE repository_id = $1 AND name = $2",
+    )
+    .bind(repo.id)
+    .bind(package)
+    .bind(&removed_versions)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo.id)
+        .execute(&state.db)
+        .await;
+    invalidate_packument_caches(state, repo.id, &repo.key, package).await;
+    info!(
+        "npm unpublish: {} versions {:?} from repo {}",
+        package, removed_versions, repo.key
+    );
+    Ok(())
+}
+
+fn npm_ok_response() -> Response {
+    build_json_metadata_response(serde_json::json!({"ok": true}).to_string())
+}
+
+fn npm_package_not_found(package: &str) -> Response {
+    AppError::NotFound(format!("Package {} not found", package)).into_response()
+}
+
+/// `PUT /{pkg}/-rev/{rev}`: every stored version missing from the body's
+/// `versions` is unpublished. A rewrite that removes nothing is refused rather
+/// than answered `ok`: this registry does not apply other packument edits
+/// (owners, metadata) through this route, and must not report them done.
+async fn unpublish_versions_for(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    package: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
+    let kept = parse_unpublish_packument(body, package)?;
+    let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
+    if rows.is_empty() {
+        return Err(npm_package_not_found(package));
+    }
+    let removed = rows_not_kept(&rows, &kept);
+    if removed.is_empty() {
+        return Err(AppError::Validation(
+            "the packument removes no version; this registry only applies version \
+             removal (npm unpublish) through /-rev/"
+                .to_string(),
+        )
+        .into_response());
+    }
+    unpublish_npm_rows(state, &repo, package, &removed).await?;
+    Ok(npm_ok_response())
+}
+
+/// `DELETE /{pkg}/-rev/{rev}`: unpublish every version of the package.
+async fn unpublish_package_for(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    package: &str,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
+    let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
+    if rows.is_empty() {
+        return Err(npm_package_not_found(package));
+    }
+    let all: Vec<&NpmPackageRow> = rows.iter().collect();
+    unpublish_npm_rows(state, &repo, package, &all).await?;
+    let _ = sqlx::query("DELETE FROM npm_dist_tags WHERE repository_id = $1 AND name = $2")
+        .bind(repo.id)
+        .bind(package)
+        .execute(&state.db)
+        .await;
+    Ok(npm_ok_response())
+}
+
+/// `DELETE /{pkg}/-/{file}/-rev/{rev}`: unpublish the version whose tarball
+/// is `file`. After a version unpublish this is already gone and answers 404,
+/// which the client treats as done.
+async fn unpublish_tarball_for(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    package: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
+    let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
+    let matching: Vec<&NpmPackageRow> = rows
+        .iter()
+        .filter(|r| r.path.rsplit('/').next() == Some(filename))
+        .collect();
+    if matching.is_empty() {
+        return Err(
+            AppError::NotFound(format!("Tarball {} of {} not found", filename, package))
+                .into_response(),
+        );
+    }
+    unpublish_npm_rows(state, &repo, package, &matching).await?;
+    Ok(npm_ok_response())
+}
+
+#[allow(clippy::result_large_err)]
+fn unscoped_unpublish_name(package: &str) -> Result<String, Response> {
+    let package = normalize_package_name(package);
+    validate_package_name(&package)?;
+    Ok(package)
+}
+
+#[allow(clippy::result_large_err)]
+fn scoped_unpublish_name(scope: &str, package: &str) -> Result<String, Response> {
+    let full_name = build_scoped_package_name(
+        &normalize_package_name(scope),
+        &normalize_package_name(package),
+    );
+    validate_package_name(&full_name)?;
+    Ok(full_name)
+}
+
+/// `@:scope/:package/:version` carries an unpublish only when npm sent the
+/// encoded `@scope%2fname/-rev/{rev}` shape; `scope` is then `scope/name`.
+#[allow(clippy::result_large_err)]
+fn encoded_scoped_unpublish_name(scope: &str, rev_segment: &str) -> Result<String, Response> {
+    if rev_segment != "-rev" {
+        return Err((StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response());
+    }
+    let full_name = format!("@{}", normalize_package_name(scope));
+    if !full_name[1..].contains('/') {
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
+    validate_package_name(&full_name)?;
+    Ok(full_name)
+}
+
+async fn unpublish_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = unscoped_unpublish_name(&package)?;
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+}
+
+async fn unpublish_scoped_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = scoped_unpublish_name(&scope, &package)?;
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+}
+
+async fn unpublish_encoded_scoped_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+}
+
+async fn unpublish_package(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let package = unscoped_unpublish_name(&package)?;
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+}
+
+async fn unpublish_scoped_package(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let package = scoped_unpublish_name(&scope, &package)?;
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+}
+
+async fn unpublish_encoded_scoped_package(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+}
+
+async fn unpublish_tarball(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, filename, _rev)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let package = unscoped_unpublish_name(&package)?;
+    unpublish_tarball_for(&state, auth.as_ref(), &repo_key, &package, &filename).await
+}
+
+async fn unpublish_scoped_tarball(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, package, filename, _rev)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let package = scoped_unpublish_name(&scope, &package)?;
+    unpublish_tarball_for(&state, auth.as_ref(), &repo_key, &package, &filename).await
 }
 
 // ---------------------------------------------------------------------------
@@ -18251,6 +18641,476 @@ mod serve_key_4365_tests {
             );
             assert_eq!(got.cache_key, key);
             assert!(got.scannable);
+        }
+    }
+}
+
+/// #4025: `npm unpublish` drives `PUT /{pkg}/-rev/{rev}` (packument rewrite
+/// without the version), `DELETE /{pkg}/-/{file}/-rev/{rev}` (the tarball) and
+/// `DELETE /{pkg}/-rev/{rev}` (the whole package). None of them was routed, so
+/// the client read the 404 as "already gone" and exited 0 having removed
+/// nothing.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod unpublish_4025_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// `npm publish` body for one version, optionally with extra dist-tags.
+    fn publish_body(package: &str, version: &str, tags: serde_json::Value) -> bytes::Bytes {
+        use base64::Engine;
+        let short = package.rsplit('/').next().unwrap();
+        let tarball_b64 =
+            base64::engine::general_purpose::STANDARD.encode(format!("tgz-{package}-{version}"));
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": package,
+                "dist-tags": tags,
+                "versions": { version: { "name": package, "version": version } },
+                "_attachments": {
+                    format!("{short}-{version}.tgz"): { "data": tarball_b64 }
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// A repository owner (read/write/delete) on the fixture repository.
+    fn owner_router(fx: &tdh::Fixture) -> axum::Router {
+        fx.router_with_auth(super::router())
+    }
+
+    async fn make_owner(fx: &tdh::Fixture) {
+        tdh::grant_repo_role(&fx.pool, fx.repo_id, fx.user_id, "repository-owner").await;
+    }
+
+    async fn publish(fx: &tdh::Fixture, uri_name: &str, name: &str, version: &str) {
+        let tags = serde_json::json!({ "latest": version });
+        let (status, body) = tdh::send(
+            owner_router(fx),
+            tdh::put_json(
+                format!("/{}/{}", fx.repo_key, uri_name),
+                publish_body(name, version, tags),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish {name}@{version}: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    async fn packument(fx: &tdh::Fixture, uri_name: &str) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(
+            owner_router(fx),
+            tdh::get(format!("/{}/{}?write=true", fx.repo_key, uri_name)),
+        )
+        .await;
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn tarball_status(fx: &tdh::Fixture, tarball_path: &str) -> StatusCode {
+        tdh::send(
+            owner_router(fx),
+            tdh::get(format!("/{}/{}", fx.repo_key, tarball_path)),
+        )
+        .await
+        .0
+    }
+
+    fn request(
+        method: &str,
+        uri: String,
+        body: bytes::Bytes,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_parse_unpublish_packument_4025() {
+        let kept = super::parse_unpublish_packument(
+            br#"{"name":"a","versions":{"1.0.0":{},"2.0.0":{}}}"#,
+            "a",
+        )
+        .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains("1.0.0") && kept.contains("2.0.0"));
+        // A body without a name is accepted; one naming another package is not.
+        assert!(super::parse_unpublish_packument(br#"{"versions":{}}"#, "a").is_ok());
+        for bad in [
+            &br#"{"name":"b","versions":{}}"#[..],
+            br#"{"name":"a"}"#,
+            b"not json",
+        ] {
+            let err = super::parse_unpublish_packument(bad, "a").unwrap_err();
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn test_rows_not_kept_skips_versionless_rows_4025() {
+        let row = |v: Option<&str>| super::NpmPackageRow {
+            id: uuid::Uuid::new_v4(),
+            version: v.map(str::to_string),
+            path: String::new(),
+        };
+        let rows = vec![row(Some("1.0.0")), row(Some("2.0.0")), row(None)];
+        let kept: std::collections::HashSet<String> = ["1.0.0".to_string()].into();
+        let removed = super::rows_not_kept(&rows, &kept);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn test_encoded_scoped_unpublish_name_4025() {
+        assert_eq!(
+            super::encoded_scoped_unpublish_name("scope/name", "-rev").unwrap(),
+            "@scope/name"
+        );
+        assert_eq!(
+            super::encoded_scoped_unpublish_name("scope/name", "1.0.0")
+                .unwrap_err()
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            super::encoded_scoped_unpublish_name("scope", "-rev")
+                .unwrap_err()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// What libnpmpublish sends for `npm unpublish <pkg>@<version>`: the
+    /// `?write=true` packument with the version (and every dist-tag pointing
+    /// at it) removed, PUT to `/{pkg}/-rev/{_rev}`. This registry sends no
+    /// `_rev`, so the client's URL carries `undefined`.
+    async fn npm_unpublish_version(
+        fx: &tdh::Fixture,
+        app: axum::Router,
+        uri_name: &str,
+        version: &str,
+    ) -> (StatusCode, bytes::Bytes) {
+        let (_, mut pkg) = packument(fx, uri_name).await;
+        pkg["versions"].as_object_mut().unwrap().remove(version);
+        let tags = pkg["dist-tags"].as_object_mut().unwrap();
+        tags.retain(|_, v| v.as_str() != Some(version));
+        tdh::send(
+            app,
+            request(
+                "PUT",
+                format!("/{}/{}/-rev/undefined", fx.repo_key, uri_name),
+                bytes::Bytes::from(serde_json::to_vec(&pkg).unwrap()),
+            ),
+        )
+        .await
+    }
+
+    fn version_keys(pkg: &serde_json::Value) -> Vec<String> {
+        let mut v: Vec<String> = pkg["versions"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn test_npm_unpublish_version_removes_it_and_recomputes_latest_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-widget";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        publish(&fx, pkg, pkg, "1.1.0").await;
+        // 2.0.0 also carries a custom `beta` tag.
+        let (status, _) = tdh::send(
+            owner_router(&fx),
+            tdh::put_json(
+                format!("/{}/{}", fx.repo_key, pkg),
+                publish_body(
+                    pkg,
+                    "2.0.0",
+                    serde_json::json!({"latest": "2.0.0", "beta": "2.0.0"}),
+                ),
+            ),
+        )
+        .await;
+        assert!(status.is_success());
+        let (_, before) = packument(&fx, pkg).await;
+        assert_eq!(before["dist-tags"]["latest"], "2.0.0");
+        let removed_id = tdh::artifact_id_at(
+            &fx.pool,
+            fx.repo_id,
+            &format!("{pkg}/2.0.0/{pkg}-2.0.0.tgz"),
+        )
+        .await;
+
+        let (status, body) = npm_unpublish_version(&fx, owner_router(&fx), pkg, "2.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        // The client's follow-up tarball DELETE: the version is already gone.
+        let (status, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-/{pkg}-2.0.0.tgz/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, after) = packument(&fx, pkg).await;
+        let gone = tarball_status(&fx, &format!("{pkg}/-/{pkg}-2.0.0.tgz")).await;
+        let kept = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.1.0.tgz")).await;
+        let audits = tdh::audit_count_eventually(&fx.pool, removed_id, "ARTIFACT_DELETED", 1).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(version_keys(&after), vec!["1.0.0", "1.1.0"]);
+        assert_eq!(after["dist-tags"]["latest"], "1.1.0", "latest recomputed");
+        assert!(
+            after["dist-tags"].get("beta").is_none(),
+            "beta pointed at 2.0.0"
+        );
+        assert_eq!(gone, StatusCode::NOT_FOUND, "unpublished tarball 404s");
+        assert_eq!(kept, StatusCode::OK, "other versions remain");
+        assert_eq!(audits, 1, "the delete goes through ArtifactService (audit)");
+    }
+
+    #[tokio::test]
+    async fn test_npm_unpublish_tarball_delete_removes_version_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-tar";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        publish(&fx, pkg, pkg, "2.0.0").await;
+        let (status, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-/{pkg}-1.0.0.tgz/-rev/3-deadbeef", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (_, after) = packument(&fx, pkg).await;
+        let gone = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.0.0.tgz")).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(version_keys(&after), vec!["2.0.0"]);
+        assert_eq!(gone, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_npm_unpublish_whole_package_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-all";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        publish(&fx, pkg, pkg, "2.0.0").await;
+        let (status, body) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (meta, _) = packument(&fx, pkg).await;
+        let tar = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.0.0.tgz")).await;
+        // A second whole-package unpublish has nothing left to remove.
+        let (again, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(meta, StatusCode::NOT_FOUND, "packument 404s");
+        assert_eq!(tar, StatusCode::NOT_FOUND);
+        assert_eq!(again, StatusCode::NOT_FOUND);
+    }
+
+    /// Scoped packages: npm addresses the packument as `@scope%2fname` (one
+    /// segment) and the tarball as `@scope/name/-/name-<v>.tgz`.
+    #[tokio::test]
+    async fn test_npm_unpublish_scoped_package_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let name = "@unpub/scoped";
+        for v in ["1.0.0", "2.0.0", "3.0.0"] {
+            publish(&fx, "@unpub/scoped", name, v).await;
+        }
+
+        // Version unpublish through the encoded single segment.
+        let (status, body) =
+            npm_unpublish_version(&fx, owner_router(&fx), "@unpub%2fscoped", "3.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        // Version unpublish through the two-segment form.
+        let (status, body) =
+            npm_unpublish_version(&fx, owner_router(&fx), "@unpub/scoped", "2.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (_, mid) = packument(&fx, "@unpub/scoped").await;
+        let gone = tarball_status(&fx, "@unpub/scoped/-/scoped-3.0.0.tgz").await;
+
+        // Scoped tarball DELETE of what is left, then the whole package.
+        let (tar_del, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!(
+                    "/{}/@unpub/scoped/-/scoped-1.0.0.tgz/-rev/undefined",
+                    fx.repo_key
+                ),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        publish(&fx, "@unpub/scoped", name, "4.0.0").await;
+        let (pkg_del, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/@unpub%2fscoped/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (meta, _) = packument(&fx, "@unpub%2fscoped").await;
+        fx.teardown().await;
+        assert_eq!(version_keys(&mid), vec!["1.0.0"]);
+        assert_eq!(mid["dist-tags"]["latest"], "1.0.0");
+        assert_eq!(gone, StatusCode::NOT_FOUND);
+        assert_eq!(tar_del, StatusCode::OK);
+        assert_eq!(pkg_del, StatusCode::OK);
+        assert_eq!(meta, StatusCode::NOT_FOUND);
+    }
+
+    /// A read-only token and a write-only member are both refused, and the
+    /// version stays published.
+    #[tokio::test]
+    async fn test_npm_unpublish_requires_delete_scope_and_action_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "unpub-guarded";
+        // The fixture user is a `developer` (read/write, no delete).
+        let (status, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put_json(
+                format!("/{}/{}", fx.repo_key, pkg),
+                publish_body(pkg, "1.0.0", serde_json::json!({"latest": "1.0.0"})),
+            ),
+        )
+        .await;
+        assert!(status.is_success());
+        publish(&fx, pkg, pkg, "1.1.0").await;
+
+        let (developer, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+
+        make_owner(&fx).await;
+        let read_only = crate::api::middleware::auth::AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+            ..tdh::make_auth(fx.user_id, &fx.username)
+        };
+        let ro_app = || tdh::router_with_auth(super::router(), fx.state.clone(), read_only.clone());
+        let (ro_put, _) = npm_unpublish_version(&fx, ro_app(), pkg, "1.1.0").await;
+        let (ro_tar, _) = tdh::send(
+            ro_app(),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-/{pkg}-1.0.0.tgz/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (ro_pkg, _) = tdh::send(
+            ro_app(),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (anon, _) = tdh::send(
+            fx.router_anon(super::router()),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (_, after) = packument(&fx, pkg).await;
+        fx.teardown().await;
+        assert_eq!(developer, StatusCode::FORBIDDEN, "write without delete");
+        assert_eq!(ro_put, StatusCode::FORBIDDEN);
+        assert_eq!(ro_tar, StatusCode::FORBIDDEN);
+        assert_eq!(ro_pkg, StatusCode::FORBIDDEN);
+        assert_eq!(anon, StatusCode::UNAUTHORIZED);
+        assert_eq!(version_keys(&after), vec!["1.0.0", "1.1.0"]);
+    }
+
+    /// Remote repositories refuse with 405 and virtual ones with 400, the
+    /// answers the publish route gives for a non-hosted repository.
+    #[tokio::test]
+    async fn test_npm_unpublish_refused_on_remote_and_virtual_4025() {
+        for (repo_type, want) in [
+            ("remote", StatusCode::METHOD_NOT_ALLOWED),
+            ("virtual", StatusCode::BAD_REQUEST),
+        ] {
+            let Some(fx) = tdh::Fixture::setup(repo_type, "npm").await else {
+                return;
+            };
+            make_owner(&fx).await;
+            let mut got = Vec::new();
+            for (method, path) in [
+                ("PUT", "pkg/-rev/undefined"),
+                ("DELETE", "pkg/-rev/undefined"),
+                ("DELETE", "pkg/-/pkg-1.0.0.tgz/-rev/undefined"),
+            ] {
+                let body = bytes::Bytes::from_static(br#"{"name":"pkg","versions":{}}"#);
+                let (status, _) = tdh::send(
+                    owner_router(&fx),
+                    request(method, format!("/{}/{path}", fx.repo_key), body),
+                )
+                .await;
+                got.push(status);
+            }
+            fx.teardown().await;
+            assert_eq!(got, vec![want; 3], "{repo_type}");
         }
     }
 }
