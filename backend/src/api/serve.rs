@@ -36,7 +36,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::watch;
 use tower::{Service, ServiceExt};
 
@@ -68,6 +68,45 @@ impl Connected<IncomingConnection> for SocketAddr {
     fn connect_info(target: IncomingConnection) -> Self {
         target.remote_addr
     }
+}
+
+/// Bind the API listener (#4647). `backlog` is the accept-queue length
+/// (`HTTP_LISTEN_BACKLOG`); `None` binds exactly as `TcpListener::bind` does,
+/// which on Linux asks for the OS maximum (`net.core.somaxconn`).
+pub async fn bind_listener(addr: SocketAddr, backlog: Option<u32>) -> io::Result<TcpListener> {
+    let Some(backlog) = backlog else {
+        return TcpListener::bind(addr).await;
+    };
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    // `TcpListener::bind` sets SO_REUSEADDR on Unix; keep that so a restart
+    // can rebind while old connections sit in TIME_WAIT.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog)
+}
+
+/// The accept-queue length the kernel grants: Linux caps any request,
+/// including the "OS maximum" default, at `net.core.somaxconn`.
+pub fn effective_listen_backlog(requested: Option<u32>, somaxconn: Option<u32>) -> Option<u32> {
+    match (requested, somaxconn) {
+        (Some(requested), Some(cap)) => Some(requested.min(cap)),
+        (Some(requested), None) => Some(requested),
+        (None, cap) => cap,
+    }
+}
+
+/// `net.core.somaxconn` for this network namespace, where it can be read.
+pub fn read_somaxconn() -> Option<u32> {
+    std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Serve `make_service` on `listener` until `shutdown` resolves, then stop
@@ -490,5 +529,52 @@ mod tests {
     fn only_hyper_header_timeouts_are_classified_as_such() {
         let io_err = io::Error::new(io::ErrorKind::TimedOut, "x");
         assert!(!is_header_read_timeout(&io_err));
+    }
+
+    /// #4647: `HTTP_LISTEN_BACKLOG` reaches the kernel. A listener nobody
+    /// accepts from completes `backlog + 1` handshakes (Linux holds one more
+    /// than the configured length); the next SYN is dropped, so its connect
+    /// hangs rather than being refused. Without the setting the listener keeps
+    /// the OS maximum (`net.core.somaxconn`), so the same burst all connects.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn listen_backlog_is_applied_4647() {
+        use std::time::Duration;
+        async fn connected(addr: SocketAddr, n: usize) -> usize {
+            let mut held = Vec::new();
+            for _ in 0..n {
+                match tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(addr))
+                    .await
+                {
+                    Ok(Ok(stream)) => held.push(stream),
+                    _ => break,
+                }
+            }
+            held.len()
+        }
+        let any = SocketAddr::from(([127, 0, 0, 1], 0));
+
+        let small = bind_listener(any, Some(1)).await.expect("bind backlog 1");
+        assert_eq!(
+            connected(small.local_addr().unwrap(), 6).await,
+            2,
+            "backlog 1 queues exactly two un-accepted connections"
+        );
+
+        let default = bind_listener(any, None).await.expect("bind default");
+        assert_eq!(
+            connected(default.local_addr().unwrap(), 32).await,
+            32,
+            "the default keeps the OS maximum"
+        );
+    }
+
+    #[test]
+    fn effective_listen_backlog_is_capped_by_somaxconn_4647() {
+        assert_eq!(effective_listen_backlog(None, Some(4096)), Some(4096));
+        assert_eq!(effective_listen_backlog(Some(1024), Some(4096)), Some(1024));
+        assert_eq!(effective_listen_backlog(Some(8192), Some(4096)), Some(4096));
+        assert_eq!(effective_listen_backlog(Some(512), None), Some(512));
+        assert_eq!(effective_listen_backlog(None, None), None);
     }
 }

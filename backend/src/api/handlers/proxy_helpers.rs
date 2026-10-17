@@ -15236,6 +15236,7 @@ mod tests {
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
                 http_header_read_timeout_secs: 10,
+                http_listen_backlog: 0,
                 upload_progress_window_secs: 60,
                 upload_min_progress_bytes: 16 * 1024,
                 upload_max_in_flight_per_principal: 64,

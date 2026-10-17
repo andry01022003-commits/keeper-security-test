@@ -1427,7 +1427,28 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     }
 
     let http_shutdown_token = shutdown_token.clone();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // #4647: the accept queue a CPU-starved process drains slowly. Logged so
+    // an operator can see what the kernel actually granted.
+    let listen_backlog = config.http_listen_backlog();
+    let somaxconn = artifact_keeper_backend::api::serve::read_somaxconn();
+    let listener = artifact_keeper_backend::api::serve::bind_listener(addr, listen_backlog).await?;
+    tracing::info!(
+        requested = ?listen_backlog,
+        somaxconn = ?somaxconn,
+        effective = ?artifact_keeper_backend::api::serve::effective_listen_backlog(
+            listen_backlog,
+            somaxconn
+        ),
+        "HTTP listener accept backlog (HTTP_LISTEN_BACKLOG; unset = OS maximum)"
+    );
+    if let (Some(requested), Some(cap)) = (listen_backlog, somaxconn) {
+        if requested > cap {
+            tracing::warn!(
+                "HTTP_LISTEN_BACKLOG={requested} exceeds net.core.somaxconn={cap}; the kernel \
+                 caps the accept queue at {cap}. Raise the sysctl to use the larger value."
+            );
+        }
+    }
     // Install `ConnectInfo<SocketAddr>` so the TCP peer address is available
     // in request extensions. Without it, `extract_client_ip_addr` never sees
     // a peer and the per-IP rate-limit key degenerates to the constant

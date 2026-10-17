@@ -927,6 +927,16 @@ pub struct Config {
     /// to 0 to disable the timeout.
     pub http_header_read_timeout_secs: u64,
 
+    /// Accept-queue length requested for the API listener (#4647): how many
+    /// completed TCP handshakes the kernel holds while the process has not
+    /// yet accepted them. When it is full, Linux drops further SYNs, so a
+    /// client's connect stalls and retries instead of reaching the HTTP
+    /// load-shed that would answer 503 + `Retry-After`. Linux caps the value
+    /// at `net.core.somaxconn`. Env var: `HTTP_LISTEN_BACKLOG`. Default 0,
+    /// which keeps the OS maximum (`somaxconn` on Linux), the value the
+    /// listener has always used.
+    pub http_listen_backlog: u32,
+
     /// Progress window, in seconds, for artifact upload bodies on the
     /// byte-transfer routes that `global_request_timeout_secs` exempts
     /// (GHSA-9f9r-c4w8-rjv9). An upload body that delivers fewer than
@@ -1430,6 +1440,7 @@ redacted_debug!(Config {
     show global_max_concurrency,
     show global_request_timeout_secs,
     show http_header_read_timeout_secs,
+    show http_listen_backlog,
     show upload_progress_window_secs,
     show upload_min_progress_bytes,
     show upload_max_in_flight_per_principal,
@@ -1583,6 +1594,7 @@ impl Default for Config {
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
             http_header_read_timeout_secs: DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
+            http_listen_backlog: 0,
             upload_progress_window_secs: 60,
             upload_min_progress_bytes: 16 * 1024,
             upload_max_in_flight_per_principal: 64,
@@ -1663,6 +1675,12 @@ impl Config {
     pub fn http_header_read_timeout(&self) -> Option<std::time::Duration> {
         (self.http_header_read_timeout_secs > 0)
             .then(|| std::time::Duration::from_secs(self.http_header_read_timeout_secs))
+    }
+
+    /// The explicit API-listener backlog, or `None` for the OS maximum
+    /// (`HTTP_LISTEN_BACKLOG` unset or 0, #4647).
+    pub fn http_listen_backlog(&self) -> Option<u32> {
+        (self.http_listen_backlog > 0).then_some(self.http_listen_backlog)
     }
 
     /// Return a `Config` with sensible defaults for unit tests. Equivalent to
@@ -1940,6 +1958,7 @@ impl Config {
                 "HTTP_HEADER_READ_TIMEOUT_SECS",
                 DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
             ),
+            http_listen_backlog: env_parse("HTTP_LISTEN_BACKLOG", 0_u32),
             upload_progress_window_secs: env_parse("UPLOAD_PROGRESS_WINDOW_SECS", 60_u64),
             upload_min_progress_bytes: env_parse("UPLOAD_MIN_PROGRESS_BYTES", 16_384_u64),
             upload_max_in_flight_per_principal: env_parse(
@@ -2892,6 +2911,46 @@ mod tests {
     }
 
     /// #4665: the header-read timeout defaults to 10 s, honours a custom
+    /// #4647: `HTTP_LISTEN_BACKLOG` parses to an explicit accept-queue length;
+    /// unset, 0 and garbage keep the OS maximum the listener always used.
+    #[test]
+    fn test_http_listen_backlog_parsing_4647() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved = env::var("HTTP_LISTEN_BACKLOG").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        let cases: [(Option<&str>, Option<u32>); 4] = [
+            (None, None),
+            (Some("2048"), Some(2048)),
+            (Some("0"), None),
+            (Some("lots"), None),
+        ];
+        for (raw, backlog) in cases {
+            match raw {
+                Some(v) => env::set_var("HTTP_LISTEN_BACKLOG", v),
+                None => env::remove_var("HTTP_LISTEN_BACKLOG"),
+            }
+            let config = Config::from_env().expect("config should load");
+            assert_eq!(config.http_listen_backlog(), backlog, "{raw:?}");
+        }
+        assert_eq!(Config::default().http_listen_backlog(), None);
+
+        match saved {
+            Some(v) => env::set_var("HTTP_LISTEN_BACKLOG", v),
+            None => env::remove_var("HTTP_LISTEN_BACKLOG"),
+        }
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        }
+    }
+
     /// value, treats 0 as "off", and falls back to the default on garbage.
     #[test]
     fn test_http_header_read_timeout_parsing() {

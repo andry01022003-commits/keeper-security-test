@@ -1866,6 +1866,12 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "other routes are still shed while the pool is full"
         );
+        // #4647: the shed is a status a retrying client can act on, not a
+        // dropped connection.
+        assert!(
+            shed.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "a shed request carries Retry-After"
+        );
 
         release.notify_one();
         let held = holder.await.unwrap().unwrap();
