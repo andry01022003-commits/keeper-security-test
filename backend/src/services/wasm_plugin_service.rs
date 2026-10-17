@@ -886,7 +886,7 @@ impl WasmPluginService {
     ) -> Result<PluginInstallResult> {
         // Validate the URL to prevent SSRF via file://, ssh://, or git://
         // protocols targeting internal resources.
-        crate::api::validation::validate_outbound_url(url, "Plugin git URL")?;
+        Self::validate_git_source_url(url)?;
 
         info!("Installing plugin from Git: {} (ref: {:?})", url, git_ref);
 
@@ -999,6 +999,13 @@ impl WasmPluginService {
             version: manifest.plugin.version,
             format_key,
         })
+    }
+
+    /// Refuse a plugin git source that the outbound SSRF guard rejects
+    /// (non-http(s) scheme, blocked host, private/internal address). Shared
+    /// by install and every re-fetch so both refuse with the same `400`.
+    fn validate_git_source_url(url: &str) -> Result<()> {
+        crate::api::validation::validate_outbound_url(url, "Plugin git URL")
     }
 
     /// Clone a Git repository to the target directory.
@@ -1706,6 +1713,12 @@ impl WasmPluginService {
         url: &str,
         git_ref: Option<&str>,
     ) -> Result<(PluginManifest, Vec<u8>)> {
+        // The stored source was validated at install time, but its host may
+        // since resolve to an internal address (DNS rebinding, a repo moved
+        // behind a private host), so every re-fetch re-runs the same guard
+        // before any clone is attempted (#4757).
+        Self::validate_git_source_url(url)?;
+
         let temp_dir = tempfile::tempdir()
             .map_err(|e| AppError::Internal(format!("Failed to create temp directory: {}", e)))?;
 
@@ -3181,5 +3194,84 @@ timeout_secs = 30
         svc.sync_core_format_handlers()
             .await
             .expect("restore core rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // Reload re-fetches the stored git source through the SSRF guard (#4757)
+    //
+    // `install_from_git` validated the URL, but `reload_plugin` re-cloned the
+    // stored `source_url` through `fetch_from_git` with no validation, so a
+    // source at (or later resolving to) a private address was cloned from.
+    // -----------------------------------------------------------------------
+
+    /// Insert a WASM git plugin row whose stored source is `source_url`.
+    async fn insert_git_plugin(pool: &PgPool, name: &str, source_url: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO plugins (id, name, version, display_name, status, plugin_type, \
+             source_type, source_url) \
+             VALUES ($1, $2, '1.0.0', $2, 'active', 'format_handler', 'wasm_git', $3)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(source_url)
+        .execute(pool)
+        .await
+        .expect("insert git plugin row");
+        id
+    }
+
+    #[tokio::test]
+    async fn test_reload_refuses_private_git_source_without_cloning() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let name = format!("ssrf-4757-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let id = insert_git_plugin(&pool, &name, "http://10.10.10.10/x.git").await;
+        let svc = format_sync_service(pool.clone());
+
+        // The refusal must come from validation before any clone: a clone of
+        // 10.10.10.10 would either hang on connect or fail as a git error, so
+        // a bounded wait plus the Validation variant proves none was tried.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), svc.reload_plugin(id)).await;
+
+        sqlx::query("DELETE FROM plugins WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("delete git plugin row");
+
+        let err = outcome
+            .expect("reload attempted a network clone instead of refusing up front")
+            .expect_err("reload of a private git source must be refused");
+        match &err {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("Plugin git URL"), "unexpected message: {msg}");
+                assert!(
+                    msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+                    "refusal must name the setting that admits the host: {msg}"
+                );
+            }
+            other => panic!("expected a validation refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_git_source_validation_admits_public_https() {
+        // The clone itself is skipped; only the guard every re-fetch passes
+        // through is exercised. An IP literal keeps DNS out of the test.
+        assert!(WasmPluginService::validate_git_source_url(
+            "https://140.82.112.3/example/plugin.git"
+        )
+        .is_ok());
+        assert!(matches!(
+            WasmPluginService::validate_git_source_url("http://10.10.10.10/x.git"),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            WasmPluginService::validate_git_source_url("file:///etc/passwd"),
+            Err(AppError::Validation(_))
+        ));
     }
 }
