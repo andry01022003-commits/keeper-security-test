@@ -16,7 +16,7 @@ use crate::services::analytics_service::AnalyticsService;
 use crate::services::backup_service::{BackupService, BackupType, CreateBackupRequest};
 use crate::services::event_bus::EventBus;
 use crate::services::health_monitor_service::{HealthMonitorService, MonitorConfig};
-use crate::services::lifecycle_service::LifecycleService;
+use crate::services::lifecycle_service::{LifecycleService, PolicyExecutionResult};
 use crate::services::metrics_service;
 use crate::services::scan_result_service::ScanResultService;
 use crate::services::smtp_service::SmtpService;
@@ -50,6 +50,72 @@ struct GaugeStats {
 fn jittered_startup_delay(base_secs: u64) -> Duration {
     let jitter = rand::random::<u64>() % 30;
     Duration::from_secs(base_secs.saturating_add(jitter))
+}
+
+/// Totals for one scheduled lifecycle cycle (#4451).
+///
+/// The summary line and the `lifecycle` cleanup metric used to count only
+/// `artifacts_removed`, so a policy scoped to a Remote repository — whose
+/// eviction is reported on `PolicyExecutionResult::proxy_cache` rather than the
+/// artifact counters — logged nothing and recorded zero. A cache-only sweep is
+/// exactly what the metric exists to make visible, so fold both counters in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LifecycleCycleTotals {
+    /// Artifacts soft-deleted by the artifact policies this cycle.
+    artifacts_removed: i64,
+    /// Remote proxy-cache entries evicted by the cache arm (#3734).
+    cache_entries_removed: i64,
+    /// Storage reclaimed by both of the above, in bytes.
+    bytes_freed: i64,
+}
+
+impl LifecycleCycleTotals {
+    /// Sum every policy's artifact and proxy-cache counters.
+    fn from_results(results: &[PolicyExecutionResult]) -> Self {
+        results.iter().fold(Self::default(), |mut totals, result| {
+            totals.artifacts_removed += result.artifacts_removed;
+            totals.cache_entries_removed += result.proxy_cache.entries_removed;
+            totals.bytes_freed += result.bytes_freed + result.proxy_cache.bytes_freed;
+            totals
+        })
+    }
+
+    /// Everything reclaimed this cycle, artifacts and cache entries alike.
+    /// This is the increment recorded on the `lifecycle` cleanup metric.
+    fn items_removed(&self) -> i64 {
+        self.artifacts_removed + self.cache_entries_removed
+    }
+
+    /// Whether the cycle reclaimed nothing and so is not worth logging or
+    /// recording. Bytes alone never decide this: a run can free zero bytes
+    /// (empty entries, or rows that vanished mid-sweep) and still have evicted
+    /// items.
+    fn is_empty(&self) -> bool {
+        self.items_removed() == 0
+    }
+}
+
+/// Log the summary line and record the `lifecycle` cleanup metric for one
+/// scheduled cycle (#4451).
+///
+/// Extracted from the scheduler loop so the wording and the counters are
+/// unit-testable without a running scheduler. Both used to count only
+/// `artifacts_removed`, so a Remote-cache-only sweep — whose eviction is
+/// reported on `proxy_cache`, not the artifact counters — logged nothing and
+/// recorded zero.
+fn report_lifecycle_cycle(results: &[PolicyExecutionResult]) {
+    let totals = LifecycleCycleTotals::from_results(results);
+    if totals.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "Lifecycle cleanup: removed {} artifacts and {} proxy-cache entries, freed {} bytes across {} policies",
+        totals.artifacts_removed,
+        totals.cache_entries_removed,
+        totals.bytes_freed,
+        results.len()
+    );
+    metrics_service::record_cleanup("lifecycle", totals.items_removed() as u64);
 }
 
 /// The remainder of the scheduled storage-GC tick (#3503): the blob-GC
@@ -473,17 +539,7 @@ pub fn spawn_all(
 
                 match service.execute_due_policies(&lease_lost).await {
                     Ok(results) => {
-                        let total_removed: i64 = results.iter().map(|r| r.artifacts_removed).sum();
-                        let total_freed: i64 = results.iter().map(|r| r.bytes_freed).sum();
-                        if total_removed > 0 {
-                            tracing::info!(
-                                "Lifecycle cleanup: removed {} artifacts, freed {} bytes across {} policies",
-                                total_removed,
-                                total_freed,
-                                results.len()
-                            );
-                            metrics_service::record_cleanup("lifecycle", total_removed as u64);
-                        }
+                        report_lifecycle_cycle(&results);
                     }
                     Err(e) => {
                         tracing::warn!("Lifecycle policy execution failed: {}", e);
@@ -4131,5 +4187,77 @@ mod tests {
             .bind(vec![bad_id, good_id, bad_remote, good_remote])
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4451 — the scheduled summary and cleanup metric count proxy-cache
+    // evictions, not just artifacts
+    // -----------------------------------------------------------------------
+
+    /// One policy's result, with only the fields the scheduler totals read set.
+    fn lifecycle_result(
+        artifacts_removed: i64,
+        bytes_freed: i64,
+        cache_entries_removed: i64,
+        cache_bytes_freed: i64,
+    ) -> PolicyExecutionResult {
+        PolicyExecutionResult {
+            policy_id: uuid::Uuid::new_v4(),
+            policy_name: "p".to_string(),
+            dry_run: false,
+            artifacts_matched: 0,
+            artifacts_removed,
+            bytes_matched: 0,
+            bytes_freed,
+            errors: vec![],
+            proxy_cache: crate::services::lifecycle_service::ProxyCacheExecutionResult {
+                entries_removed: cache_entries_removed,
+                bytes_freed: cache_bytes_freed,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn lifecycle_totals_fold_cache_evictions_into_items_and_bytes_4451() {
+        let results = vec![
+            lifecycle_result(3, 1000, 0, 0),
+            // A Remote-only policy: `artifacts_removed` is zero and its
+            // evictions live on `proxy_cache`. This is what the metric missed.
+            lifecycle_result(0, 0, 2, 6586),
+            lifecycle_result(1, 500, 4, 200),
+        ];
+
+        let totals = LifecycleCycleTotals::from_results(&results);
+
+        assert_eq!(totals.artifacts_removed, 4);
+        assert_eq!(totals.cache_entries_removed, 6);
+        assert_eq!(totals.bytes_freed, 8286);
+        assert_eq!(totals.items_removed(), 10);
+        assert!(!totals.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_totals_treat_a_cache_only_sweep_as_non_empty_4451() {
+        // Reproduces the reported gap: only proxy-cache entries removed, so the
+        // old `artifacts_removed > 0` gate logged nothing and recorded zero.
+        let totals = LifecycleCycleTotals::from_results(&[lifecycle_result(0, 0, 3, 10123)]);
+        assert_eq!(totals.artifacts_removed, 0);
+        assert_eq!(totals.items_removed(), 3);
+        assert!(!totals.is_empty());
+        // The summary path runs, and does not panic on a metrics recorder-less
+        // test process; a cache-only cycle must not be silently dropped.
+        report_lifecycle_cycle(&[lifecycle_result(0, 0, 3, 10123)]);
+    }
+
+    #[test]
+    fn lifecycle_totals_of_an_empty_cycle_are_empty_4451() {
+        assert!(LifecycleCycleTotals::default().is_empty());
+        assert!(LifecycleCycleTotals::from_results(&[]).is_empty());
+        // A no-op policy result (nothing matched, nothing removed) must not
+        // emit a summary line or bump the metric.
+        assert!(LifecycleCycleTotals::from_results(&[lifecycle_result(0, 0, 0, 0)]).is_empty());
+        report_lifecycle_cycle(&[]);
+        report_lifecycle_cycle(&[lifecycle_result(0, 0, 0, 0)]);
     }
 }
