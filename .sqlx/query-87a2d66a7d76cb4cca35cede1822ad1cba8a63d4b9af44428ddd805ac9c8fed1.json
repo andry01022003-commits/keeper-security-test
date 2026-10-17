@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "peer_instance_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "peer_instance_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "artifact_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "artifact_id"
+          }
+        }
       },
       {
         "ordinal": 3,
@@ -34,47 +52,101 @@
               ]
             }
           }
+        },
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "status"
+          }
         }
       },
       {
         "ordinal": 4,
         "name": "priority",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "priority"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "bytes_transferred",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "bytes_transferred"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "error_message",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "error_message"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "started_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "started_at"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "completed_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "completed_at"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sync_tasks",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "storage_key",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "storage_key"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "artifact_size",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "artifacts",
+            "name": "size_bytes"
+          }
+        }
       }
     ],
     "parameters": {

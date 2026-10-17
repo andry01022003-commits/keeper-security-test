@@ -28,6 +28,24 @@ extra tooling to install:
 The hooks are fast local feedback, not a substitute for CI. Bypass once with
 `git commit --no-verify` / `git push --no-verify` only when you genuinely need to.
 
+## The offline query cache (`.sqlx/`)
+
+CI and the git hooks compile with `SQLX_OFFLINE=true` against the committed `.sqlx/` cache.
+After adding or changing a `sqlx::query!` macro, regenerate it against a migrated throwaway
+database and commit the result:
+
+```bash
+export DATABASE_URL=postgresql://registry:registry@localhost:5432/artifact_registry
+sqlx migrate run --source backend/migrations
+cargo sqlx prepare --workspace -- --all-targets
+cargo sqlx prepare --workspace --check -- --all-targets   # the cache is reproducible
+```
+
+Keep the `-- --all-targets`. Without it the inline test modules are not compiled, so prepare
+deletes the entry for every query that only a test uses, and the next offline test build fails
+(#4092). Do not hand-edit `.sqlx/*.json`; a hand-written entry goes stale the next time the
+schema changes and makes `--check` fail for everyone.
+
 ## What CI checks
 
 Every PR must be fully green before merge. The pipeline (`.github/workflows/ci.yml` and
