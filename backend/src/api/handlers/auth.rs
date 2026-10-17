@@ -1172,6 +1172,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Database outage during login (#4756)
+    // -----------------------------------------------------------------------
+
+    /// #4756: with the database gone, `POST /api/v1/auth/login` cannot check
+    /// the credentials at all, so it must answer a retryable 503 with
+    /// Retry-After, for a correct and a wrong password alike, never a 401
+    /// and never a 500. Before the fix the user lookup's error mapped to
+    /// `500 DATABASE_ERROR`. The pool is closed, the shape of a database
+    /// that went away (the same fixture #4750 uses for the middleware).
+    #[tokio::test]
+    async fn test_login_db_unavailable_returns_503_not_500_4756() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::to_bytes;
+
+        let pool = tdh::lazy_pool();
+        pool.close().await;
+        let state = tdh::build_state(pool, std::env::temp_dir().to_string_lossy().as_ref());
+
+        for password in ["Correct!Horse9Battery", "wrong-password"] {
+            let req = LoginRequest {
+                username: "admin".to_string(),
+                password: password.to_string(),
+            };
+            let err = login(State(state.clone()), HeaderMap::new(), None, Json(req))
+                .await
+                .expect_err("login cannot succeed with the database closed");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "login during a DB outage must be a retryable 503"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .expect("503 must carry Retry-After"),
+                "1"
+            );
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "DATABASE_UNAVAILABLE");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // CreateApiTokenRequest / CreateTicketRequest — NUL in a bound field (#3713)
     // -----------------------------------------------------------------------
 

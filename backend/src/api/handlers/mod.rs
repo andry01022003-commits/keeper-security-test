@@ -591,7 +591,9 @@ mod tests {
 
     #[test]
     fn test_db_err_returns_500() {
-        let resp = db_err("connection refused");
+        // A query error, not an outage: an unreachable database is a 503
+        // since #4756.
+        let resp = db_err("error returned from database: relation \"t\" does not exist");
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 

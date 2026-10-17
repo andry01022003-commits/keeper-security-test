@@ -335,6 +335,14 @@ impl AppError {
             // Retry-After lets clients back off and retry on the same
             // path. See #1437 / #1442.
             e if e.is_pool_timeout() => (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED"),
+            // The database could not be reached or could not answer: a lost,
+            // refused or closed connection, a statement timeout, a server
+            // shutting down (#4750's classification). Nothing was decided, so
+            // the request is retryable; a 500 makes clients that read
+            // "5xx but not 503" as a server bug give up, including on
+            // `POST /api/v1/auth/login` (#4756). Query and data errors stay
+            // 500 below.
+            e if e.is_db_unavailable() => (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_UNAVAILABLE"),
             Self::Database(_) | Self::Sqlx(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR")
             }
@@ -432,6 +440,9 @@ impl AppError {
             // Server-side errors: return generic messages (details are logged)
             e if e.is_pool_timeout() => {
                 "Database connection pool is saturated, retry shortly".to_string()
+            }
+            e if e.is_db_unavailable() => {
+                "Database is temporarily unavailable, retry shortly".to_string()
             }
             Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
             Self::Migration(_) => "Database migration failed".to_string(),
@@ -633,6 +644,72 @@ mod tests {
         let (status, code) = err.status_and_code();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "DATABASE_ERROR");
+    }
+
+    /// #4756: a database outage raised inside a handler's own query (not a
+    /// credential check) is a retryable 503 with Retry-After, in both the
+    /// typed and the stringified forms. Before the fix only a pool-acquire
+    /// timeout was; a lost, refused or closed connection answered
+    /// 500 DATABASE_ERROR. Other database errors stay 500.
+    #[test]
+    fn test_db_unavailable_maps_to_503_with_retry_after_4756() {
+        let refused = || {
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Connection refused (os error 111)",
+            ))
+        };
+        let outages = [
+            AppError::Sqlx(refused()),
+            AppError::Database(refused().to_string()),
+            AppError::Sqlx(sqlx::Error::PoolClosed),
+            AppError::Database(sqlx::Error::PoolClosed.to_string()),
+            AppError::Database(
+                "error returned from database: terminating connection due to administrator command"
+                    .into(),
+            ),
+        ];
+        for err in outages {
+            let rendered = err.to_string();
+            let (status, code) = err.status_and_code();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{rendered}");
+            assert_eq!(code, "DATABASE_UNAVAILABLE", "{rendered}");
+            let msg = err.user_message();
+            assert!(msg.contains("retry"), "{rendered}: {msg}");
+            assert!(!msg.contains("refused"), "details must not leak: {msg}");
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers().get(header::RETRY_AFTER).unwrap(),
+                RETRY_AFTER_SECS_ON_503
+            );
+        }
+
+        // A pool-acquire timeout keeps its own, more specific code.
+        assert_eq!(
+            AppError::Sqlx(sqlx::Error::PoolTimedOut)
+                .status_and_code()
+                .1,
+            "POOL_EXHAUSTED"
+        );
+        // Query and data errors are still server faults.
+        for err in [
+            AppError::Sqlx(sqlx::Error::RowNotFound),
+            AppError::Database(
+                "error returned from database: duplicate key value violates unique constraint"
+                    .into(),
+            ),
+            AppError::Database(
+                "error returned from database: invalid byte sequence for encoding \"UTF8\": 0x00"
+                    .into(),
+            ),
+        ] {
+            assert_eq!(
+                err.status_and_code(),
+                (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
