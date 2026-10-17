@@ -74,3 +74,27 @@ health check briefly removed the endpoint.
   backend's `GLOBAL_REQUEST_TIMEOUT_SECS` (120 s), and make sure it passes the
   backend's `503` and `Retry-After` through rather than turning upstream
   overload into a connection error.
+
+## Database connection budget
+
+Every replica opens its own pool, so size the fleet against the server
+(#4549): `DATABASE_MAX_CONNECTIONS` x replicas, plus the single-flight
+lock/wait connections held outside the pool (capped per replica by
+`PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`), plus one rolling-update surge
+replica, must stay below Postgres `max_connections`. The defaults
+(3 x 50 = 150) do not fit a stock server's 100. Every pool connection arms
+server-side TCP keepalives (15 s idle, 5 s interval, 3 probes), so sessions
+left behind by a force-killed pod are reaped in about 30 s.
+
+`ak_db_pool_connection_failures_total{stage}` counts pool connection
+failures:
+
+| `stage` | Counted when |
+|---|---|
+| `startup` | An initial connect attempt failed at boot. Startup retries five times with a jittered 1 to 8 s backoff, so a refusal storm shows several increments before the process exits or recovers. |
+| `request` | A pool acquire timed out while serving a request and the client was answered `503 POOL_EXHAUSTED`. |
+
+A sustained non-zero `rate(ak_db_pool_connection_failures_total{stage="request"}[5m])`
+means the pool is too small for the load, or the server is refusing new
+sessions; the server's `FATAL: sorry, too many clients already` lines appear
+only in the Postgres log.
