@@ -797,7 +797,9 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
         allow_anonymous_download: false,
         max_upload_size_bytes: 100 * 1024 * 1024, // 100MB default
         retention_days: 365,
-        audit_retention_days: 90,
+        // #4718: report the EFFECTIVE audit retention. Retention is off (0)
+        // until a period is saved; a displayed default of 90 was never applied.
+        audit_retention_days: 0,
         backup_retention_count: 10,
         edge_stale_threshold_minutes: 5,
     };
@@ -2039,6 +2041,14 @@ pub struct CleanupResponse {
     pub stale_uploads_deleted: i64,
 }
 
+/// Whether a manual cleanup deletes audit rows: requested, and a positive
+/// retention period. `audit_retention_days <= 0` means retention is off
+/// (#4718), as for the scheduled job; `cleanup(0)` would otherwise delete
+/// every audit row.
+fn audit_cleanup_applies(requested: Option<bool>, audit_retention_days: i32) -> bool {
+    requested.unwrap_or(false) && audit_retention_days > 0
+}
+
 /// Run cleanup tasks
 #[utoipa::path(
     post,
@@ -2067,7 +2077,7 @@ pub async fn run_cleanup(
     // Get settings for cleanup
     let settings = get_settings(State(state.clone())).await?.0;
 
-    if request.cleanup_audit_logs.unwrap_or(false) {
+    if audit_cleanup_applies(request.cleanup_audit_logs, settings.audit_retention_days) {
         use crate::services::audit_service::AuditService;
         let audit_service = AuditService::new(state.db.clone());
         result.audit_logs_deleted =
@@ -2905,6 +2915,15 @@ mod tests {
     // -----------------------------------------------------------------------
     // SystemSettings defaults
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manual_audit_cleanup_needs_request_and_positive_period() {
+        assert!(audit_cleanup_applies(Some(true), 90));
+        assert!(!audit_cleanup_applies(Some(true), 0));
+        assert!(!audit_cleanup_applies(Some(true), -1));
+        assert!(!audit_cleanup_applies(Some(false), 90));
+        assert!(!audit_cleanup_applies(None, 90));
+    }
 
     #[test]
     fn test_system_settings_defaults() {

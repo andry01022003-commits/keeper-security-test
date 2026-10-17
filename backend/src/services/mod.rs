@@ -7,6 +7,7 @@ pub mod artifact_service;
 pub mod artifactory_client;
 pub mod artifactory_import;
 pub mod audit_export;
+pub mod audit_retention;
 pub mod audit_schema;
 pub mod audit_service;
 pub mod auth_config_service;

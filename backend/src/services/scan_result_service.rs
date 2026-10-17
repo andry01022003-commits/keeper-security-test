@@ -434,8 +434,8 @@ impl ScanResultService {
     /// Durability caveats: neither half of the pair is a long-term
     /// compliance store:
     ///   * `audit_log.action='SCAN_REAPED'` entries are deleted by the
-    ///     `audit_retention_days` retention sweep (default 90 days, see
-    ///     `AuditService::cleanup`).
+    ///     `audit_retention_days` retention sweep once a period is saved
+    ///     (off by default, see `services::audit_retention`).
     ///   * The `scan_results` row itself is `ON DELETE CASCADE` from
     ///     `artifacts` and `repositories`, so deleting a repo destroys
     ///     its reaped-row evidence independently of audit retention.

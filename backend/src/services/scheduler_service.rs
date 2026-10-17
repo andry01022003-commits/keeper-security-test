@@ -971,6 +971,74 @@ pub fn spawn_all(
         });
     }
 
+    // audit_log retention (#4718): hourly, applies the `audit_retention_days`
+    // system setting (read on every pass; absent, zero or negative turns it
+    // off). One replica at a time; the lease is renewed for the whole pass and
+    // a lost lease stops it between batches (#3502). The period in force is
+    // logged once at startup and each pass logs one summary line.
+    {
+        use crate::services::audit_retention as retention;
+        let db = db.clone();
+        tokio::spawn(async move {
+            match retention::configured_retention_days(&db).await {
+                Ok(days) => tracing::info!("{}", retention::startup_message(days)),
+                Err(e) => tracing::warn!("Audit retention: could not read the setting: {}", e),
+            }
+            tokio::time::sleep(jittered_startup_delay(240)).await;
+            let mut ticker = interval(Duration::from_secs(
+                retention::AUDIT_RETENTION_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let days = match retention::configured_retention_days(&db).await {
+                    Ok(Some(days)) => days,
+                    Ok(None) => {
+                        tracing::debug!("Audit retention is off; skipping");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Audit retention: could not read the setting: {}", e);
+                        continue;
+                    }
+                };
+                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    retention::AUDIT_RETENTION_LEASE_NAME,
+                    retention::AUDIT_RETENTION_LEASE_TTL_SECS,
+                )
+                .await
+                else {
+                    tracing::debug!("Another replica owns the audit retention lease");
+                    continue;
+                };
+                let (renewal, lost) = lease.spawn_renewal_with_cancellation(
+                    db.clone(),
+                    retention::AUDIT_RETENTION_LEASE_TTL_SECS,
+                );
+                match retention::apply_retention(
+                    &db,
+                    Some(days),
+                    retention::AUDIT_RETENTION_BATCH_SIZE,
+                    Some(&lost),
+                )
+                .await
+                {
+                    Ok(r) => tracing::info!(
+                        retention_days = days,
+                        rows_deleted = r.rows_deleted,
+                        batches = r.batches,
+                        interrupted = r.interrupted,
+                        "Audit retention pass"
+                    ),
+                    Err(e) => tracing::warn!("Audit retention pass failed: {}", e),
+                }
+                drop(renewal);
+                lease.release(&db).await;
+            }
+        });
+    }
+
     // Chunked upload session cleanup + orphaned incus staging sweep (every hour)
     {
         let db = db.clone();
@@ -1210,7 +1278,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention"
     );
 }
 

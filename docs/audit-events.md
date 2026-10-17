@@ -153,10 +153,30 @@ reserved for system emitters and is set only via a static label.
 
 ## Retention
 
-The audit stream and the database audit trail are independent. `audit_log`
-retention is governed by the existing cleanup job; the SIEM owns long-term
-retention of the streamed copy. The stream is not a replacement for the DB audit
-trail — it is a delivery mechanism alongside it.
+The audit stream and the database audit trail are independent: the SIEM owns
+long-term retention of the streamed copy, and the stream is not a replacement
+for the DB audit trail but a delivery mechanism alongside it.
+
+`audit_log` retention is applied by a scheduled job (#4718):
+
+- **What runs.** Once an hour, one replica (a scheduler lease keeps replicas
+  from running it at the same time) deletes the `audit_log` rows whose
+  `created_at` is older than the `audit_retention_days` system setting, oldest
+  first, in batches of 5,000 rows. Each run logs one `Audit retention pass`
+  line with the period, rows deleted and batch count; the period in force is
+  logged once at startup.
+- **How to set it.** `POST /api/v1/admin/settings` with
+  `audit_retention_days` set to a positive number of days. The job reads the
+  setting on every run, so a change applies within the hour without a restart.
+- **Off until saved.** A period must be saved explicitly before the job
+  deletes anything. Until then `GET /api/v1/admin/settings` reports
+  `audit_retention_days: 0` (it used to show `90`, a default that was never
+  applied), and nothing is deleted.
+- **How to turn it off.** Set `audit_retention_days` to `0`.
+
+`POST /api/v1/admin/cleanup` with `"cleanup_audit_logs": true` still deletes
+the same rows on demand, and deletes none while the period is `0` or was
+never saved.
 
 ## Delivery semantics
 
