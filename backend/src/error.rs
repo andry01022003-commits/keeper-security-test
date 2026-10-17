@@ -46,6 +46,38 @@ pub(crate) fn is_pool_timeout(msg: &str) -> bool {
     lower.contains("pool timed out") || lower.contains("pooltimedout")
 }
 
+/// Stringified database failures that mean "the database could not answer
+/// right now", as opposed to "the query was wrong" or "the data was bad"
+/// (#4750). Matched on the rendered text because most call sites wrap sqlx
+/// errors as `AppError::Database(e.to_string())`, which drops the variant
+/// and the SQLSTATE. Deliberately excludes data exceptions such as
+/// `invalid byte sequence for encoding "UTF8": 0x00`: those are caused by
+/// client-supplied bytes, and retrying them can never succeed.
+fn is_db_unavailable_message(msg: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        // sqlx::Error::PoolClosed / Io / Tls / WorkerCrashed renderings.
+        "closed pool",
+        "error communicating with database",
+        "tls connection",
+        "crashed background worker",
+        // Server-side cancellation and connection loss.
+        "canceling statement due to statement timeout",
+        "canceling statement due to lock timeout",
+        "terminating connection",
+        "connection refused",
+        "connection reset",
+        "too many clients already",
+        "the database system is starting up",
+        "the database system is shutting down",
+        "the database system is in recovery mode",
+    ];
+    if is_pool_timeout(msg) {
+        return true;
+    }
+    let lower = msg.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// PostgreSQL SQLSTATE for `foreign_key_violation`.
 const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
 
@@ -253,6 +285,27 @@ impl AppError {
         match self {
             Self::Sqlx(sqlx::Error::PoolTimedOut) => true,
             Self::Database(msg) => is_pool_timeout(msg),
+            _ => false,
+        }
+    }
+
+    /// True when the database could not be reached or could not answer in
+    /// time: a pool-acquire timeout ([`Self::is_pool_timeout`]), a closed
+    /// pool, a lost or refused connection, or a statement / lock timeout
+    /// (#4750). This is an infrastructure failure, so a credential check that
+    /// hits it must answer a retryable 503, never a 401. A data error caused
+    /// by the request's own bytes is not included.
+    pub(crate) fn is_db_unavailable(&self) -> bool {
+        match self {
+            Self::Sqlx(
+                sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::Io(_)
+                | sqlx::Error::Tls(_)
+                | sqlx::Error::WorkerCrashed,
+            ) => true,
+            Self::Sqlx(e) => is_db_unavailable_message(&e.to_string()),
+            Self::Database(msg) => is_db_unavailable_message(msg),
             _ => false,
         }
     }
@@ -491,6 +544,42 @@ mod tests {
             !AppError::Authentication("Invalid username or password".to_string()).is_pool_timeout()
         );
         assert!(!AppError::Unauthorized("Token has been revoked".to_string()).is_pool_timeout());
+    }
+
+    /// #4750: "the database could not answer" vs "the request was bad".
+    #[test]
+    fn test_is_db_unavailable_separates_outages_from_bad_input_4750() {
+        for typed in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ] {
+            let rendered = typed.to_string();
+            assert!(AppError::Sqlx(typed).is_db_unavailable(), "{rendered}");
+            assert!(
+                AppError::Database(rendered.clone()).is_db_unavailable(),
+                "stringified: {rendered}"
+            );
+        }
+        for msg in [
+            "error returned from database: canceling statement due to lock timeout",
+            "error returned from database: canceling statement due to statement timeout",
+            "error returned from database: terminating connection due to administrator command",
+            "error returned from database: sorry, too many clients already",
+            "error returned from database: the database system is shutting down",
+        ] {
+            assert!(AppError::Database(msg.into()).is_db_unavailable(), "{msg}");
+        }
+        // A data error caused by client bytes is not an outage: retrying it
+        // can never succeed, so a credential check that hits it stays 401.
+        assert!(!AppError::Database(
+            "error returned from database: invalid byte sequence for encoding \"UTF8\": 0x00"
+                .into()
+        )
+        .is_db_unavailable());
+        assert!(!AppError::Sqlx(sqlx::Error::RowNotFound).is_db_unavailable());
+        assert!(!AppError::Authentication("Invalid API token".into()).is_db_unavailable());
     }
 
     #[test]

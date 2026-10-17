@@ -507,7 +507,7 @@ pub async fn require_auth_with_bearer_fallback(
             // transient capacity problem (POOL_EXHAUSTED), not a bad password:
             // surface a retryable 503 rather than flattening it to a spurious
             // 401 (#2125). Any genuine failure keeps the existing 401.
-            if e.is_pool_timeout() {
+            if e.is_db_unavailable() {
                 return service_unavailable_response();
             }
             Response::builder()
@@ -895,6 +895,11 @@ pub async fn auth_middleware(
         ExtractedToken::Bearer(token) => {
             match auth_service.validate_access_token_async(token).await {
                 Ok(claims) => Ok(AuthExtension::from(claims)),
+                // The JWT's signature already verified (the DB is only reached
+                // after `decode_token`), so a DB failure in the live-user /
+                // credential-watermark lookup is infrastructure, not a bad
+                // token: retryable 503, never a fall-through to 401 (#4750).
+                Err(ref e) if e.is_db_unavailable() => return service_unavailable_response(),
                 Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
                     Ok(ext) => Ok(ext),
                     // Same transient bcrypt-capacity shed as the Basic branch
@@ -943,7 +948,7 @@ pub async fn auth_middleware(
                     // password": surface the same retryable 503 the #2101/#2102
                     // handlers return rather than flattening it to a spurious
                     // 401 (#2125). Clients retry on 503 but abort on 401.
-                    Err(ref e) if e.is_pool_timeout() => {
+                    Err(ref e) if e.is_db_unavailable() => {
                         return service_unavailable_response();
                     }
                     Err(_) => {
@@ -967,6 +972,9 @@ pub async fn auth_middleware(
                         // restores the /api/v1 Basic-auth boundary.
                         match auth_service.validate_access_token_async(&password).await {
                             Ok(claims) => Ok(AuthExtension::from(claims)),
+                            Err(ref e) if e.is_db_unavailable() => {
+                                return service_unavailable_response();
+                            }
                             Err(_) => Err("Invalid credentials"),
                         }
                     }
@@ -1096,8 +1104,10 @@ fn classify_token_validation_err(err: AppError) -> TokenAuthError {
         // (POOL_EXHAUSTED) exactly like the #2101/#2102 handler path instead of
         // flattening it to a spurious 401 (#2125). Reuses the shared
         // `AppError::is_pool_timeout` predicate so the classification stays
-        // consistent all the way up the stack.
-        ref e if e.is_pool_timeout() => TokenAuthError::Overloaded,
+        // consistent all the way up the stack. Widened to every
+        // database-unavailable failure (closed pool, lost connection,
+        // statement / lock timeout) by #4750.
+        ref e if e.is_db_unavailable() => TokenAuthError::Overloaded,
         _ => TokenAuthError::Invalid,
     }
 }
@@ -1210,8 +1220,11 @@ pub(crate) async fn try_resolve_auth_outcome(
             // See `auth_middleware` for why this is the async variant. Same
             // rationale: optional-auth routes still need to reject pre-change
             // tokens across replicas (#1173).
-            if let Ok(claims) = auth_service.validate_access_token_async(token).await {
-                return AuthOutcome::Resolved(AuthExtension::from(claims));
+            match auth_service.validate_access_token_async(token).await {
+                Ok(claims) => return AuthOutcome::Resolved(AuthExtension::from(claims)),
+                // Signature verified, DB lookup failed: retryable 503 (#4750).
+                Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
+                Err(_) => {}
             }
             match validate_api_token_with_scopes(auth_service, token).await {
                 Ok(ext) => return AuthOutcome::Resolved(ext),
@@ -1229,6 +1242,7 @@ pub(crate) async fn try_resolve_auth_outcome(
                     // A transient bcrypt-capacity shed must surface as 503, not
                     // 401. See `AuthOutcome::Overloaded`.
                     Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
+                    Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
                     Err(_) => {}
                 }
             }
@@ -1261,15 +1275,17 @@ pub(crate) async fn try_resolve_auth_outcome(
                 // acquire-timeout on the API-token fallback below before the
                 // classifier reaches the same conclusion (#2125). See
                 // `AuthOutcome::Overloaded`.
-                Err(ref e) if e.is_pool_timeout() => return AuthOutcome::Overloaded,
+                Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
                 Err(_) => {}
             }
             // Try treating the password as a short-lived JWT access token.
             // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
             // package managers like Maven, pip/twine, and Helm send the AK access
             // token as the Basic auth password.
-            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
-                return AuthOutcome::Resolved(AuthExtension::from(claims));
+            match auth_service.validate_access_token_async(&password).await {
+                Ok(claims) => return AuthOutcome::Resolved(AuthExtension::from(claims)),
+                Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
+                Err(_) => {}
             }
             // Fall back to treating the password as an API token — compatible with
             // pip netrc / Artifactory-style `token:<api_token>` credential format.
@@ -7618,17 +7634,35 @@ mod tests {
 
     #[test]
     fn test_classify_token_validation_err_genuine_failures_stay_invalid() {
-        // Genuinely bad tokens (unknown, expired, revoked, deactivated owner)
-        // and infrastructure errors must keep producing 401 from the token
-        // call sites — only the transient capacity shed maps to Overloaded.
+        // Genuinely bad tokens (unknown, expired, revoked, deactivated owner),
+        // internal faults, and database errors caused by the request's own
+        // bytes keep producing 401 from the token call sites. A database that
+        // could not answer is NOT in this list any more: since #4750 it is
+        // Overloaded (503), see the test below.
         for err in [
             AppError::Authentication("Invalid API token".to_string()),
             AppError::Authentication("API token expired".to_string()),
             AppError::Unauthorized("Token has been revoked".to_string()),
-            AppError::Database("connection refused".to_string()),
+            AppError::Database(
+                "error returned from database: invalid byte sequence for encoding \"UTF8\": 0x00"
+                    .to_string(),
+            ),
             AppError::Internal("bcrypt failure".to_string()),
         ] {
             assert_eq!(classify_token_validation_err(err), TokenAuthError::Invalid);
+        }
+        // #4750: an unreachable or failing database is infrastructure.
+        for err in [
+            AppError::Database("connection refused".to_string()),
+            AppError::Sqlx(sqlx::Error::PoolClosed),
+            AppError::Database(
+                "error returned from database: canceling statement due to lock timeout".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                classify_token_validation_err(err),
+                TokenAuthError::Overloaded
+            );
         }
     }
 
@@ -11280,6 +11314,96 @@ mod tests {
             ),
             "#3717 must not touch writes: a PUT to a private repository outside the token's \
              scope stays refused BY THE SCOPE GATE with 403"
+        );
+    }
+
+    /// #4750: an auth service whose pool is CLOSED, the shape of a database
+    /// that went away mid-request (failover, restart). Every query fails with
+    /// `PoolClosed`, which is not a pool-acquire timeout, so before #4750 none
+    /// of the 503 classifications (#2125) caught it.
+    async fn closed_pool_auth_service(secret: &str) -> AuthService {
+        let pool = lazy_pool();
+        pool.close().await;
+        let cfg = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+        AuthService::new(pool, Arc::new(cfg))
+    }
+
+    /// #4750: a correctly signed JWT whose live-user / credential-watermark
+    /// lookup fails because the database is unavailable must answer a
+    /// retryable 503. Before the fix the error was ignored, the token fell
+    /// through to the API-token lookup, and the request got a 401 "Invalid or
+    /// expired token" that makes docker and CI clients give up.
+    #[tokio::test]
+    async fn test_auth_middleware_jwt_db_unavailable_returns_503_not_401_4750() {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+
+        let secret = "test-secret-at-least-32-bytes-long-for-4750";
+        let auth_service = Arc::new(closed_pool_auth_service(secret).await);
+        let jwt = mint_access_jwt(secret, Uuid::new_v4(), "ci-user");
+        let app: Router = Router::new()
+            .route(
+                "/probe",
+                any(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                auth_middleware,
+            ));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", format!("Bearer {jwt}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// #4750: the same outage on the optional-auth / format-endpoint resolver
+    /// (Bearer JWT and JWT-as-Basic-password) is `Overloaded` (503), not
+    /// `InvalidCredential` (401).
+    #[tokio::test]
+    async fn test_try_resolve_auth_outcome_jwt_db_unavailable_is_overloaded_4750() {
+        let secret = "test-secret-at-least-32-bytes-long-for-4750";
+        let auth_service = closed_pool_auth_service(secret).await;
+        let jwt = mint_access_jwt(secret, Uuid::new_v4(), "ci-user");
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer(&jwt), true).await;
+        assert!(
+            matches!(outcome, AuthOutcome::Overloaded),
+            "Bearer JWT during a DB outage: {outcome:?}"
+        );
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{jwt}"));
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true).await;
+        assert!(
+            matches!(outcome, AuthOutcome::Overloaded),
+            "JWT as Basic password during a DB outage: {outcome:?}"
+        );
+    }
+
+    /// #4750 control: a credential that is rejected before the database is
+    /// consulted (a JWT signed with the wrong key, then too short to be an API
+    /// token) is still a 401 while the database is down.
+    #[tokio::test]
+    async fn test_auth_middleware_invalid_credential_still_401_during_db_outage_4750() {
+        let auth_service =
+            closed_pool_auth_service("test-secret-at-least-32-bytes-long-for-4750").await;
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("short"), true).await;
+        assert!(
+            matches!(outcome, AuthOutcome::InvalidCredential),
+            "{outcome:?}"
         );
     }
 }
