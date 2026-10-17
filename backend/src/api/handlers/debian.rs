@@ -787,6 +787,21 @@ fn package_matches_requested_arch(package_arch: &str, requested_arch: &str) -> b
     }
 }
 
+/// The `Packages` index text for `component`/`arch`, exactly as
+/// `dists/<dist>/<component>/binary-<arch>/Packages` serves it.
+#[cfg(test)]
+pub(crate) async fn render_packages_index(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    component: &str,
+    arch: &str,
+) -> Result<String, StatusCode> {
+    let entries = fetch_package_entries(db, repo_id, component, arch)
+        .await
+        .map_err(|r| r.status())?;
+    Ok(build_packages_text(&entries))
+}
+
 /// Fetch all package entries for a given repo, component, and architecture.
 async fn fetch_package_entries(
     db: &PgPool,
@@ -3954,7 +3969,9 @@ async fn persist_debian_upload(
 /// generic chunked completion (#1846, via [`StagedDebianPackage::parts`]), so
 /// a `.deb` gets the same records whichever way it arrived. `deb_head` must reach the end of the
 /// `control.tar` member. Only the metadata write is fatal; the rest is
-/// best-effort, as on the native path.
+/// best-effort, as on the native path (see [`record_debian_package_extras`],
+/// which the migration importer calls after writing the control document in
+/// its own transaction, #4657).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_debian_package(
     state: &SharedState,
@@ -3975,6 +3992,33 @@ pub(crate) async fn record_debian_package(
         )
         .await?;
 
+    record_debian_package_extras(
+        &state.db,
+        repo_id,
+        artifact_id,
+        size_bytes,
+        checksum_sha256,
+        upload,
+        deb_head,
+    )
+    .await;
+    Ok(())
+}
+
+/// The best-effort part of [`record_debian_package`]: maintainer-script
+/// analysis, the package catalog row and the repository `updated_at` bump.
+/// The migration importer (#4657) writes the control document inside its own
+/// transaction and calls this once it commits, so a migrated `.deb` ends up
+/// with exactly the records a native upload has.
+pub(crate) async fn record_debian_package_extras(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    upload: &DebianPackageUpload,
+    deb_head: &[u8],
+) {
     // `preinst`/`postinst`/`prerm`/`postrm` run as root on `apt install`
     // (#4033). Best-effort: the artifact row is already committed.
     let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(deb_head);
@@ -3985,15 +4029,8 @@ pub(crate) async fn record_debian_package(
             .all(|s| s.kind.runs_as_root()),
         "debian maintainer scripts are root-privileged hooks"
     );
-    if let Err(e) = record_install_scripts(
-        &state.db,
-        artifact_id,
-        "debian",
-        scripts,
-        unanalyzed,
-        completeness,
-    )
-    .await
+    if let Err(e) =
+        record_install_scripts(db, artifact_id, "debian", scripts, unanalyzed, completeness).await
     {
         tracing::warn!(
             artifact_id = %artifact_id,
@@ -4002,7 +4039,7 @@ pub(crate) async fn record_debian_package(
         );
     }
 
-    PackageService::new(state.db.clone())
+    PackageService::new(db.clone())
         .try_create_or_update_from_artifact(
             repo_id,
             &upload.control.package,
@@ -4018,10 +4055,8 @@ pub(crate) async fn record_debian_package(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
         repo_id,
     )
-    .execute(&state.db)
+    .execute(db)
     .await;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4055,6 +4090,12 @@ impl StagedDebianPackage {
     /// takes them once the artifact row exists.
     pub(crate) fn parts(&self) -> (&DebianPackageUpload, &[u8]) {
         (&self.upload, &self.deb_head)
+    }
+
+    /// The `artifact_metadata` control document (`format = 'debian'`) the
+    /// native upload stores, which `Packages` and `Release` render from.
+    pub(crate) fn control_document(&self) -> &serde_json::Value {
+        &self.upload.metadata
     }
 }
 

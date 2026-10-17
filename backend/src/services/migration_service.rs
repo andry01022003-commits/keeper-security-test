@@ -357,7 +357,12 @@ impl MigrationService {
             // package's header metadata (requires/provides/summary) exactly as
             // a native or generic upload does (#3925).
             "rpm" => FormatCompatibility::Full,
-            "conan" | "conda" | "debian" => FormatCompatibility::Partial,
+            // Debian is Full: `Packages`/`Release` are rendered at request time
+            // from the repository's `pool/` rows, and the importer files each
+            // `.deb` under `pool/<component>/` and records its control file and
+            // catalog row exactly as a native upload does (#4657).
+            "debian" => FormatCompatibility::Full,
+            "conan" | "conda" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
         }
     }
@@ -396,11 +401,6 @@ impl MigrationService {
                 "the Conda channel index (repodata.json) stays empty, so \
                  `conda install` resolves nothing",
                 "re-upload the packages to /conda/<repo>",
-            ),
-            "debian" => (
-                "the APT index (Packages/Release) stays empty, so \
-                 `apt-get update` sees no packages",
-                "re-upload the .deb files to /debian/<repo>",
             ),
             _ => (
                 "the package index stays empty",
@@ -2536,7 +2536,7 @@ mod tests {
 
     #[test]
     fn test_format_compatibility_all_partial() {
-        let partial_formats = ["conan", "conda", "debian"];
+        let partial_formats = ["conan", "conda"];
         for fmt in &partial_formats {
             assert_eq!(
                 MigrationService::get_format_compatibility(fmt),
@@ -2635,14 +2635,14 @@ mod tests {
             FormatCompatibility::Full
         );
 
-        // #2784: Nexus `apt` repositories map to AK's `debian` (partial
-        // support: files copied, index not built). Before the mapping, `apt`
-        // normalized to the unknown name `apt` and was classified
-        // Unsupported, so the whole repository failed to migrate.
+        // #2784: Nexus `apt` repositories map to AK's `debian` (full support
+        // since #4657). Before the mapping, `apt` normalized to the unknown
+        // name `apt` and was classified Unsupported, so the whole repository
+        // failed to migrate.
         assert_eq!(MigrationService::normalize_package_type("apt"), "debian");
         assert_eq!(
             MigrationService::get_format_compatibility("apt"),
-            FormatCompatibility::Partial
+            FormatCompatibility::Full
         );
 
         // #2784: `golang` is an alias for AK's `go` (full support).
@@ -2660,10 +2660,10 @@ mod tests {
 
     #[test]
     fn test_prepare_repository_migration_normalizes_nexus_apt() {
-        // #2784: a Nexus `apt` repository must prepare as `debian` with
-        // Partial compatibility so it migrates (as a file copy into a native
-        // `debian` repository, see #3925) instead of being rejected as an
-        // unsupported format.
+        // #2784: a Nexus `apt` repository must prepare as `debian` so it
+        // migrates into a native `debian` repository (Full since #4657, which
+        // registers each `.deb`) instead of being rejected as an unsupported
+        // format.
         let repo = RepositoryListItem {
             key: "apt-hosted".to_string(),
             repo_type: "hosted".to_string(),
@@ -2675,7 +2675,7 @@ mod tests {
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "debian");
-        assert_eq!(config.format_compatibility, FormatCompatibility::Partial);
+        assert_eq!(config.format_compatibility, FormatCompatibility::Full);
     }
 
     #[test]
@@ -4114,16 +4114,13 @@ mod tests {
     /// The formats the migration copies byte-for-byte without building
     /// their package index, paired with the AK `repository_format` each one
     /// must be provisioned as. RPM left this list when the importer started
-    /// recording header metadata for the dynamically rendered repodata.
-    const INDEX_GAP_FORMATS: [(&str, &str); 3] = [
-        ("conan", "conan"),
-        ("conda", "conda_native"),
-        ("debian", "debian"),
-    ];
+    /// recording header metadata for the dynamically rendered repodata, and
+    /// Debian when it started registering each `.deb` (#4657).
+    const INDEX_GAP_FORMATS: [(&str, &str); 2] = [("conan", "conan"), ("conda", "conda_native")];
 
     /// The limitation text has to name the format, the index that stays
     /// empty, and the command that fills it — and must exist for exactly the
-    /// four formats that migrate as a file copy, for no others.
+    /// formats that still migrate as a file copy, for no others.
     #[test]
     fn test_index_limitation_covers_exactly_the_file_copy_formats_3925() {
         for (source_format, _) in INDEX_GAP_FORMATS {
@@ -4144,7 +4141,7 @@ mod tests {
         }
 
         // Source-specific aliases resolve to the same statement.
-        for alias in ["apt", "CONAN"] {
+        for alias in ["CONAN", "conda_native"] {
             assert!(
                 MigrationService::index_limitation(alias).is_some(),
                 "{alias} normalizes onto a file-copy-only format"
@@ -4153,7 +4150,8 @@ mod tests {
 
         // Natively-indexed and unsupported formats say nothing.
         for quiet in [
-            "maven", "npm", "docker", "pypi", "generic", "cargo", "rpm", "yum", "wat",
+            "maven", "npm", "docker", "pypi", "generic", "cargo", "rpm", "yum", "debian", "apt",
+            "wat",
         ] {
             assert!(
                 MigrationService::index_limitation(quiet).is_none(),
@@ -4383,7 +4381,7 @@ mod tests {
     }
 
     /// The pre-migration assessment must name the limitation per repository,
-    /// in terms an operator can act on, for each of the four formats.
+    /// in terms an operator can act on, for each format that still has one.
     ///
     /// Fails-before: the only thing the assessment said was "Package type
     /// 'conan' will be migrated as generic format" — which described the
@@ -4674,8 +4672,13 @@ mod tests {
 
         // The operator pre-created the destination natively and routed the
         // migration at it; the bytes land, the index does not.
-        seed_migrated_repo(&pool, &target_key, "debian").await;
-        seed_completed_item(&pool, job_id, &format!("{source_key}/pkg_1.0-1_amd64.deb")).await;
+        seed_migrated_repo(&pool, &target_key, "conan").await;
+        seed_completed_item(
+            &pool,
+            job_id,
+            &format!("{source_key}/acme/zlib/1.3/conanfile.py"),
+        )
+        .await;
 
         let warnings_text = generated_report_warnings(&pool, job_id).await.to_string();
         assert!(

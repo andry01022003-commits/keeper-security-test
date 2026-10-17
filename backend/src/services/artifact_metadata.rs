@@ -46,6 +46,7 @@ pub fn parse_name_and_version(
         "nuget" => parse_nuget(filename, artifact_path),
         "go" | "golang" => parse_go(artifact_path, filename),
         "cran" => parse_cran(filename, artifact_path),
+        "debian" => parse_debian(filename),
         _ => fallback(filename),
     }
 }
@@ -382,6 +383,29 @@ fn parse_cran(filename: &str, artifact_path: &str) -> ParsedArtifact {
     fallback(filename)
 }
 
+/// Debian binary package: `{package}_{version}_{arch}.deb` (also `.udeb` /
+/// `.ddeb`), the name `dpkg-name` gives and the Debian handler requires
+/// (#4657). The package name and architecture never contain `_`; the version
+/// cannot either (Debian policy), so the split is unambiguous. Anything else
+/// in a Debian repository (source tarballs, `.dsc`) keeps the fallback.
+fn parse_debian(filename: &str) -> ParsedArtifact {
+    let stem = [".deb", ".udeb", ".ddeb"]
+        .iter()
+        .find_map(|ext| filename.strip_suffix(ext));
+    let parts: Option<Vec<&str>> = stem.map(|s| s.split('_').collect());
+    match parts.as_deref() {
+        Some([name, version, arch])
+            if !name.is_empty() && !version.is_empty() && !arch.is_empty() =>
+        {
+            ParsedArtifact {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+            }
+        }
+        _ => fallback(filename),
+    }
+}
+
 /// `bin/<platform>/contrib/...`: where CRAN mirrors keep binary packages.
 fn is_cran_binary_path(artifact_path: &str) -> bool {
     let mut segs = artifact_path.trim_start_matches('/').split('/');
@@ -518,6 +542,39 @@ fn parse_from_path_segments(artifact_path: &str) -> Option<ParsedArtifact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_debian_4657() {
+        assert_eq!(
+            parse_name_and_version(
+                "debian",
+                "hello_1.0-1_amd64.deb",
+                "pool/main/h/hello/hello_1.0-1_amd64.deb"
+            ),
+            ParsedArtifact {
+                name: "hello".into(),
+                version: Some("1.0-1".into())
+            }
+        );
+        assert_eq!(
+            parse_name_and_version("debian", "d-i_2:1.2_all.udeb", "pool/d-i_2:1.2_all.udeb")
+                .version
+                .as_deref(),
+            Some("2:1.2")
+        );
+        for not_binary in [
+            "hello_1.0.orig.tar.gz",
+            "hello_1.0-1.dsc",
+            "README",
+            "a_b.deb",
+        ] {
+            assert_eq!(
+                parse_name_and_version("debian", not_binary, not_binary),
+                fallback(not_binary),
+                "{not_binary}"
+            );
+        }
+    }
 
     #[test]
     fn pypi_wheel() {

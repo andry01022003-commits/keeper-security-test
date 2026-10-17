@@ -1337,6 +1337,12 @@ impl MigrationWorker {
                 package_type,
             )
             .await?;
+        // #4657: a `.deb` imported before the importer registered Debian
+        // packages is re-imported (in place) rather than skipped.
+        let should_skip = should_skip
+            && !self
+                .debian_registration_missing(keys.target.as_str(), package_type, artifact_path)
+                .await;
 
         if should_skip {
             // #3927: a repository migrated before the importer wrote Maven
@@ -1449,6 +1455,85 @@ impl MigrationWorker {
                     "RPM header parse task failed; migrated without header metadata"
                 );
                 None
+            }
+        }
+    }
+
+    /// The parsed control file of a migrated `.deb`, validated exactly as the
+    /// native `PUT /debian/<repo>/pool/...` and the chunked completion (#1846)
+    /// validate it, against the pool path the row is stored under (#4657).
+    /// `None` for other formats and files, and for a package whose control
+    /// file is unreadable or disagrees with its file name: a native upload
+    /// refuses those with 400; here the bytes still move and the package is
+    /// listed from its file name, as before.
+    async fn migration_debian_package(
+        &self,
+        package_type: &str,
+        artifact_path: &str,
+        temp_path: &std::path::Path,
+    ) -> Option<crate::api::handlers::debian::StagedDebianPackage> {
+        if !package_type.eq_ignore_ascii_case("debian") {
+            return None;
+        }
+        let stored_path = debian_destination_path(artifact_path);
+        match crate::api::handlers::debian::finalize_from_staged(&stored_path, temp_path).await {
+            Ok(package) => package,
+            Err(reason) => {
+                tracing::warn!(
+                    path = %artifact_path,
+                    reason = %reason,
+                    "Debian control file unreadable or inconsistent; migrated without package registration"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether a Debian package already imported under its pool path still
+    /// lacks the control document the native upload records (#4657). A
+    /// repository migrated before the fix has the rows but none of that, so
+    /// a re-run must re-import such an item instead of skipping it as a
+    /// duplicate; the re-import refreshes the row in place. `false` for every
+    /// other format and file, and on a lookup error (the skip stands).
+    async fn debian_registration_missing(
+        &self,
+        target_key: &str,
+        package_type: &str,
+        artifact_path: &str,
+    ) -> bool {
+        if !package_type.eq_ignore_ascii_case("debian")
+            || crate::services::artifact_metadata::parse_name_and_version(
+                "debian",
+                extract_name_from_path(artifact_path),
+                artifact_path,
+            )
+            .version
+            .is_none()
+        {
+            return false;
+        }
+        let registered = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM artifacts a \
+                 JOIN repositories r ON r.id = a.repository_id \
+                 JOIN artifact_metadata am ON am.artifact_id = a.id \
+                 WHERE r.key = $1 AND a.path = $2 AND a.is_deleted = false \
+                   AND am.format = 'debian')",
+        )
+        .bind(target_key)
+        .bind(debian_destination_path(artifact_path))
+        .fetch_one(&self.db)
+        .await;
+        match registered {
+            Ok(registered) => !registered,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %target_key,
+                    path = %artifact_path,
+                    error = %e,
+                    "could not check the Debian registration of an already-migrated package"
+                );
+                false
             }
         }
     }
@@ -2217,6 +2302,14 @@ impl MigrationWorker {
         // and is bounded for npm/helm because those tarballs are small.
         // Returns None for unknown formats; the artifact INSERT proceeds
         // either way and only the metadata row is skipped.
+        // #4657: a `.deb` is registered the way the native upload registers
+        // it: its control document (what `Packages`/`Release` render) is
+        // written with the row below, and the catalog row and maintainer-
+        // script analysis follow the commit.
+        let debian_package = self
+            .migration_debian_package(package_type, artifact_path, &temp_path)
+            .await;
+
         // #2561: permit-scoped decode; on saturation skip the best-effort
         // extraction (only the metadata row is skipped).
         let extracted_metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
@@ -2232,7 +2325,12 @@ impl MigrationWorker {
         // (`format = 'maven'`, `groupId`/`artifactId`). Without one a migrated
         // coordinate resolved by exact version yet had no metadata document,
         // so LATEST/RELEASE resolution fell through to another repository.
-        .or_else(|| migration_maven_metadata(package_type, artifact_path));
+        .or_else(|| migration_maven_metadata(package_type, artifact_path))
+        .or_else(|| {
+            debian_package
+                .as_ref()
+                .map(|package| package.control_document().clone())
+        });
 
         // #3925: an RPM's header metadata (summary, requires/provides, the
         // #3801 repodata block) is what repodata renders beyond the filename.
@@ -2518,6 +2616,21 @@ impl MigrationWorker {
                             Some(&sha256_hex),
                         )
                         .await?;
+                        // #4657: a `.deb` an earlier import kept at its source
+                        // path outside `pool/<component>/` now lives under
+                        // `pool/main/`; retire the old row (same bytes only).
+                        if package_type.eq_ignore_ascii_case("debian")
+                            && identity.path != artifact_path
+                        {
+                            retire_rows_at_paths(
+                                &mut tx,
+                                repository_id,
+                                &[artifact_path.to_string()],
+                                Some(&identity.path),
+                                Some(&sha256_hex),
+                            )
+                            .await?;
+                        }
                         Some(id)
                     }
                 };
@@ -2698,9 +2811,28 @@ impl MigrationWorker {
                 // best-effort by contract (a catalog failure must not fail
                 // an item whose content already committed — the wrapper
                 // logs and swallows, mirroring the live paths).
-                if let Some(entry) =
+                // #4657: a parsed `.deb` gets the native upload's catalog row
+                // (with its description), maintainer-script analysis and
+                // repository bump instead of the filename-derived entry below.
+                if let (Some(id), Some(package)) = (artifact_id, &debian_package) {
+                    let (upload, deb_head) = package.parts();
+                    crate::api::handlers::debian::record_debian_package_extras(
+                        &self.db,
+                        repository_id,
+                        id,
+                        content_size as i64,
+                        &sha256_hex,
+                        upload,
+                        deb_head,
+                    )
+                    .await;
+                }
+                let catalog_entry = if debian_package.is_some() {
+                    None
+                } else {
                     migration_catalog_entry(package_type, artifact_path, &oci_role, &parsed)
-                {
+                };
+                if let Some(entry) = catalog_entry {
                     let size_bytes = match (&oci_role, &oci_manifest_body) {
                         // Docker: size the catalog row like the live push —
                         // config+layers for an image manifest, plus the sum
@@ -3625,11 +3757,37 @@ fn migration_artifact_path(
         // (e.g. com/example/artifact/version/file.jar) that clients use
         // verbatim when resolving.
         "maven" | "gradle" | "sbt" | "ivy" => artifact_path.to_string(),
+        // #4657: Debian packages live under `pool/<component>/`, the layout
+        // `Packages` indexes and `apt` downloads from.
+        "debian" => debian_destination_path(artifact_path),
         _ => match version {
             Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
             _ => artifact_path.to_string(),
         },
     }
+}
+
+/// Component a migrated `.deb` outside `pool/<component>/` is filed under.
+const DEFAULT_DEBIAN_COMPONENT: &str = "main";
+
+/// Where a Debian repository's file is stored (#4657). A binary package
+/// already in the `pool/<component>/...` layout the Debian handler indexes
+/// keeps its path. One anywhere else, such as Artifactory's "Set Me Up"
+/// `pool/<file>.deb`, moves under `pool/main/` (its source path, minus a
+/// leading `pool/`), so it appears in the `main` component's `Packages`
+/// instead of being stored where no index looks. Every other file keeps its
+/// path.
+fn debian_destination_path(artifact_path: &str) -> String {
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    let is_package = [".deb", ".udeb", ".ddeb"]
+        .iter()
+        .any(|ext| filename.ends_with(ext));
+    if !is_package || crate::api::handlers::debian::staged_package_target(artifact_path).is_some() {
+        return artifact_path.to_string();
+    }
+    let rest = artifact_path.trim_start_matches('/');
+    let rest = rest.strip_prefix("pool/").unwrap_or(rest);
+    format!("pool/{DEFAULT_DEBIAN_COMPONENT}/{rest}")
 }
 
 /// The path [`migration_artifact_path`] will store `artifact_path` under,
@@ -3840,12 +3998,19 @@ pub(crate) fn migration_catalog_entry(
 /// Whether `artifact_path` is an index the source registry generates for a
 /// format whose index Artifact Keeper builds itself from the imported rows.
 ///
-/// CRAN only today (#2525): `PACKAGES`, `PACKAGES.gz`, `PACKAGES.rds` and
-/// `PACKAGES.json` under `src/contrib/` or `bin/.../contrib/<r-version>/`. AK's
+/// Debian (#4657): everything under `dists/`. CRAN (#2525): `PACKAGES`,
+/// `PACKAGES.gz`, `PACKAGES.rds` and `PACKAGES.json` under `src/contrib/` or `bin/.../contrib/<r-version>/`. AK's
 /// CRAN handler lists every `artifacts` row of the repository, so a copied
 /// `PACKAGES` file would appear in the served index as a package called
 /// `PACKAGES` with no version.
 pub(crate) fn is_source_generated_index(package_type: &str, artifact_path: &str) -> bool {
+    // Debian (#4657): everything under `dists/` (`Release`, `InRelease`,
+    // `Packages*`, `by-hash/...`) is the source's APT index, signed with the
+    // source's key. AK renders and signs its own from the `pool/` rows, so the
+    // copies were only clutter in the artifact list.
+    if package_type.eq_ignore_ascii_case("debian") {
+        return artifact_path.trim_start_matches('/').starts_with("dists/");
+    }
     if !package_type.eq_ignore_ascii_case("cran") {
         return false;
     }
@@ -3979,6 +4144,20 @@ async fn retire_legacy_migration_rows(
     require_checksum: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     let legacy = legacy_migration_paths(keys, artifact_path);
+    retire_rows_at_paths(tx, repository_id, &legacy, keep_path, require_checksum).await
+}
+
+/// Soft-delete the live rows at `paths` (except `keep_path`, and only those
+/// holding `require_checksum` when given). The statement behind
+/// [`retire_legacy_migration_rows`], also used for a `.deb` a pre-#4657
+/// import stored outside `pool/<component>/` (see [`debian_destination_path`]).
+async fn retire_rows_at_paths(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repository_id: Uuid,
+    paths: &[String],
+    keep_path: Option<&str>,
+    require_checksum: Option<&str>,
+) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
          WHERE repository_id = $1 AND is_deleted = false \
@@ -3986,7 +4165,7 @@ async fn retire_legacy_migration_rows(
            AND ($4::text IS NULL OR checksum_sha256 = $4)",
     )
     .bind(repository_id)
-    .bind(&legacy)
+    .bind(paths)
     .bind(keep_path)
     .bind(require_checksum)
     .execute(&mut **tx)
@@ -3995,9 +4174,9 @@ async fn retire_legacy_migration_rows(
     if retired > 0 {
         tracing::info!(
             repository_id = %repository_id,
-            source_path = %artifact_path,
+            paths = ?paths,
             retired,
-            "retired legacy-shaped artifacts rows from a pre-#3533/#3654 import"
+            "retired legacy-shaped artifacts rows from an earlier import"
         );
     }
     Ok(retired)
@@ -4617,10 +4796,11 @@ mod tests {
             // `fallback()` formats: no per-format parser at all.
             ("generic", "corp/1.0/app-1.0.tgz", "app-1.0.tgz"),
             ("raw", "corp/1.0/app-1.0.tgz", "app-1.0.tgz"),
+            // A `.deb` has a version since #4657; a source tarball does not.
             (
                 "debian",
-                "pool/main/n/nginx/nginx_1.0_amd64.deb",
-                "nginx_1.0_amd64.deb",
+                "pool/main/n/nginx/nginx_1.0.orig.tar.gz",
+                "nginx_1.0.orig.tar.gz",
             ),
             ("rpm", "packages/x86_64/pkg.rpm", "pkg.rpm"),
             ("cargo", "api/v1/crates/serde/1.0.0/download", "download"),
@@ -11427,6 +11607,261 @@ mod tests {
         );
 
         cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// A minimal, valid `.deb` (ar: `debian-binary`, `control.tar.gz`,
+    /// `data.tar.gz`) whose control file names `package`/`version`/`arch`.
+    fn test_deb(package: &str, version: &str, arch: &str) -> bytes::Bytes {
+        fn ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                name,
+                0,
+                0,
+                0,
+                "100644",
+                content.len()
+            );
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(content);
+            if content.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut builder = tar::Builder::new(Vec::new());
+            for (name, body) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, *body)
+                    .expect("append");
+            }
+            let tar_bytes = builder.into_inner().expect("tar bytes");
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, &tar_bytes).expect("gzip");
+            enc.finish().expect("gzip finish")
+        }
+        let control = format!(
+            "Package: {package}\nVersion: {version}\nArchitecture: {arch}\n\
+             Maintainer: Test <test@example.local>\nSection: utils\n\
+             Description: {package} from the migration test\n"
+        );
+        let mut deb = b"!<arch>\n".to_vec();
+        ar_member(&mut deb, "debian-binary", b"2.0\n");
+        ar_member(
+            &mut deb,
+            "control.tar.gz",
+            &tar_gz(&[("./control", control.as_bytes())]),
+        );
+        ar_member(&mut deb, "data.tar.gz", &tar_gz(&[]));
+        bytes::Bytes::from(deb)
+    }
+
+    /// #4657: a Debian repository migrated from Artifactory imported its files
+    /// but no packages. Two `.deb`s, one in the conventional
+    /// `pool/<component>/` layout and one at Artifactory's "Set Me Up" path
+    /// directly under `pool/`, must both produce catalog rows, a `debian`
+    /// control document, and an entry in the rendered `Packages` index.
+    #[tokio::test]
+    async fn test_debian_import_registers_packages_4657() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4657-deb", "debian").await;
+
+        let conventional = "pool/main/h/hello/hello_1.0-1_amd64.deb";
+        let set_me_up = "pool/world_2.0_all.deb";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            conventional.to_string(),
+            test_deb("hello", "1.0-1", "amd64"),
+        );
+        files.insert(set_me_up.to_string(), test_deb("world", "2.0", "all"));
+        for p in [conventional, set_me_up] {
+            transfer_one(&worker, &storage, &files, &repo_key, "debian", p)
+                .await
+                .unwrap_or_else(|e| panic!("debian transfer of {p} must succeed: {e}"));
+        }
+
+        let mut catalog: Vec<(String, String)> = sqlx::query_as(
+            "SELECT p.name, pv.version FROM packages p \
+             JOIN package_versions pv ON pv.package_id = p.id \
+             WHERE p.repository_id = $1 ORDER BY p.name",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query catalog");
+        catalog.sort();
+        assert_eq!(
+            catalog,
+            vec![
+                ("hello".to_string(), "1.0-1".to_string()),
+                ("world".to_string(), "2.0".to_string()),
+            ],
+            "both migrated .debs must be in the packages catalog"
+        );
+
+        let documents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_metadata am \
+             JOIN artifacts a ON a.id = am.artifact_id \
+             WHERE a.repository_id = $1 AND am.format = 'debian' \
+               AND am.metadata->>'component' = 'main'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count control documents");
+        assert_eq!(documents, 2, "each .deb carries its control document");
+
+        let packages =
+            crate::api::handlers::debian::render_packages_index(&pool, repo_id, "main", "amd64")
+                .await
+                .expect("render Packages");
+        assert!(packages.contains("Package: hello\n"), "{packages}");
+        assert!(packages.contains("Package: world\n"), "{packages}");
+        assert!(
+            packages.contains("Description: hello from the migration test"),
+            "the control file, not just the file name, feeds the index: {packages}"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #4657: a repository imported before the fix has the `.deb` rows but no
+    /// control documents or catalog rows. Re-running the job must register
+    /// them instead of skipping the items as duplicates.
+    #[tokio::test]
+    async fn test_debian_remigration_registers_previously_imported_debs_4657() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4657-rerun", "debian").await;
+        let path = "pool/main/h/hello/hello_1.0-1_amd64.deb";
+        let body = test_deb("hello", "1.0-1", "amd64");
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+        transfer_one(&worker, &storage, &files, &repo_key, "debian", path)
+            .await
+            .expect("first import");
+        // Pre-fix state: the row exists, nothing else does.
+        sqlx::query(
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("strip metadata");
+        sqlx::query("DELETE FROM packages WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("strip catalog");
+
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let run = || async {
+            let mut c = (0i32, 0i32, 0i32, 0i64);
+            worker
+                .process_single_artifact(
+                    Uuid::new_v4(),
+                    Arc::new(MapSource {
+                        files: files.clone(),
+                    }),
+                    storage.clone(),
+                    &keys,
+                    "debian",
+                    path,
+                    path,
+                    body.len() as i64,
+                    ExpectedChecksums {
+                        sha256: None,
+                        sha1: None,
+                    },
+                    ConflictResolution::Skip,
+                    false,
+                    &mut c.0,
+                    &mut c.1,
+                    &mut c.2,
+                    &mut c.3,
+                )
+                .await
+                .expect("process_single_artifact");
+            c
+        };
+        let counters = run().await;
+        assert_eq!(
+            (counters.0, counters.1, counters.2),
+            (1, 0, 0),
+            "an unregistered .deb is re-imported, not skipped"
+        );
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("hello".to_string(), "1.0-1".to_string()))
+        );
+
+        // Once registered, a further re-run skips it as before.
+        let again = run().await;
+        assert_eq!((again.0, again.1, again.2), (0, 0, 1));
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    #[test]
+    fn test_debian_destination_path_4657() {
+        // Already in the indexed `pool/<component>/` layout: unchanged.
+        for kept in [
+            "pool/main/h/hello/hello_1.0-1_amd64.deb",
+            "pool/contrib/x_2_all.udeb",
+            "pool/main/n/nginx/nginx_1.0.orig.tar.gz",
+            "README.txt",
+        ] {
+            assert_eq!(debian_destination_path(kept), kept);
+            assert_eq!(migration_destination_path("debian", kept), kept);
+        }
+        // Artifactory "Set Me Up" layout and arbitrary paths move under main.
+        for (src, dst) in [
+            ("pool/world_2.0_all.deb", "pool/main/world_2.0_all.deb"),
+            (
+                "focal/world_2.0_all.deb",
+                "pool/main/focal/world_2.0_all.deb",
+            ),
+            ("/world_2.0_all.deb", "pool/main/world_2.0_all.deb"),
+        ] {
+            assert_eq!(debian_destination_path(src), dst, "{src}");
+            assert_eq!(migration_destination_path("debian", src), dst, "{src}");
+        }
+    }
+
+    #[test]
+    fn test_is_source_generated_index_debian_4657() {
+        for path in [
+            "dists/focal/InRelease",
+            "dists/focal/Release",
+            "dists/focal/Release.gpg",
+            "dists/focal/main/binary-amd64/Packages.gz",
+            "dists/focal/main/binary-amd64/by-hash/SHA256/08f0458b1ab9085e7b167251ff1fde1e",
+        ] {
+            assert!(is_source_generated_index("debian", path), "{path}");
+        }
+        assert!(!is_source_generated_index(
+            "debian",
+            "pool/main/h/hello/hello_1.0-1_amd64.deb"
+        ));
+        assert!(!is_source_generated_index(
+            "generic",
+            "dists/focal/InRelease"
+        ));
     }
 
     /// #3925: a migrated `.rpm` must carry the header metadata the native and
