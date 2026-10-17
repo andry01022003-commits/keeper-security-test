@@ -239,6 +239,15 @@ pub enum AppError {
     #[error("OIDC token response missing id_token: {0}")]
     OidcNoIdToken(String),
 
+    /// A 502 that carries its own machine-readable `code` instead of the
+    /// generic `BAD_GATEWAY`, for an upstream fault a client or operator is
+    /// expected to tell apart from other gateway errors (e.g.
+    /// `UPSTREAM_SHORT_BODY`, #4759: the upstream promised a `Content-Length`
+    /// and its body ended first). The message names the repository and the
+    /// byte counts, never credentials or upstream URLs.
+    #[error("Bad gateway ({code}): {message}")]
+    CodedBadGateway { code: &'static str, message: String },
+
     /// A required dependency or feature is not configured / not enabled on
     /// this deployment. Distinct from `Internal` (which is "the server
     /// failed unexpectedly") because operators alert on 500s but not on
@@ -375,6 +384,7 @@ impl AppError {
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
             Self::UpstreamAuth(_) => (StatusCode::BAD_GATEWAY, "UPSTREAM_AUTH_FAILED"),
             Self::OidcNoIdToken(_) => (StatusCode::BAD_GATEWAY, "OIDC_NO_ID_TOKEN"),
+            Self::CodedBadGateway { code, .. } => (StatusCode::BAD_GATEWAY, code),
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
             Self::ScannerEngineUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -463,7 +473,9 @@ impl AppError {
             | Self::ServiceUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg)
             | Self::NotImplemented(msg) => msg.clone(),
-            Self::CodedValidation { message, .. } => message.clone(),
+            Self::CodedValidation { message, .. } | Self::CodedBadGateway { message, .. } => {
+                message.clone()
+            }
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -831,6 +843,22 @@ mod tests {
         );
         assert_eq!(err.user_message(), "refused");
         assert_eq!(err.log_level(), tracing::Level::INFO);
+    }
+
+    #[test]
+    fn test_coded_bad_gateway_is_a_502_with_its_own_code_4759() {
+        let err = AppError::CodedBadGateway {
+            code: "UPSTREAM_SHORT_BODY",
+            message: "upstream of 'r' ended after 0 of 4096 bytes".into(),
+        };
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::BAD_GATEWAY, "UPSTREAM_SHORT_BODY")
+        );
+        assert_eq!(
+            err.user_message(),
+            "upstream of 'r' ended after 0 of 4096 bytes"
+        );
     }
 
     #[test]

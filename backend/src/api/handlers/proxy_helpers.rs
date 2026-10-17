@@ -743,6 +743,26 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             response.extensions_mut().insert(UpstreamAuthFailure);
             response
         }
+        // #4759: a 502 that names its own cause (e.g. `UPSTREAM_SHORT_BODY`,
+        // an upstream body that ended before its `Content-Length`). The
+        // message was written for the client -- it names the repository and
+        // the byte counts, never the upstream URL -- so it is returned as the
+        // standard `{code, message}` error body instead of the opaque text
+        // below.
+        crate::error::AppError::CodedBadGateway { code, message } => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %diagnostic_path,
+                code = %code,
+                "Proxy fetch failed: {}",
+                message
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({ "code": code, "message": message })),
+            )
+                .into_response()
+        }
         _ => {
             tracing::warn!(
                 repo_key = %repo_key,
@@ -12938,6 +12958,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(is_upstream_auth_failure(&resp));
         assert!(!is_member_policy_block_response(&resp));
+    }
+
+    #[tokio::test]
+    async fn test_map_proxy_error_returns_coded_bad_gateway_body_4759() {
+        let resp = map_proxy_error(
+            "generic-remote",
+            "f/empty.bin",
+            crate::error::AppError::CodedBadGateway {
+                code: "UPSTREAM_SHORT_BODY",
+                message: "upstream of repository 'generic-remote' promised 4096 bytes".into(),
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_upstream_auth_failure(&resp));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "UPSTREAM_SHORT_BODY");
+        assert_eq!(
+            json["message"],
+            "upstream of repository 'generic-remote' promised 4096 bytes"
+        );
     }
 
     // ── promotion_only direct-upload gate ───────────────────────────

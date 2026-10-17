@@ -1753,6 +1753,89 @@ async fn discard_bad_publish(storage: &StorageService, cache_key: &str) {
     }
 }
 
+/// Error code of the 502 answered when an upstream body ends before the
+/// `Content-Length` it advertised, while the client response has not yet
+/// started (#4759).
+const UPSTREAM_SHORT_BODY: &str = "UPSTREAM_SHORT_BODY";
+
+/// The client-facing error for an upstream body that ended short (#4759):
+/// names the repository and both byte counts, never the upstream URL.
+fn upstream_short_body_error(repo_key: &str, expected: u64, received: u64) -> AppError {
+    AppError::CodedBadGateway {
+        code: UPSTREAM_SHORT_BODY,
+        message: format!(
+            "upstream of repository '{repo_key}' promised {expected} bytes (Content-Length) \
+             but its body ended after {received} bytes"
+        ),
+    }
+}
+
+/// Wait for the first byte of a streaming upstream body that advertised a
+/// non-zero `Content-Length`, before the response is handed to the client
+/// (#4759).
+///
+/// The streaming leader used to return the upstream headers immediately, so
+/// the client's `200` and `Content-Length: N` were committed before a single
+/// body byte had been read. An upstream that promised `N` bytes and then
+/// closed left nothing to do but drop the connection: the client saw no HTTP
+/// status at all (curl exit 52). Holding the headers until the first body
+/// chunk arrives costs nothing on a healthy upstream (the response could not
+/// have streamed before that byte anyway) and turns the body-never-came case
+/// into an ordinary upstream error the caller can answer with a status --
+/// `502 UPSTREAM_SHORT_BODY`, or stale-if-error when a cached copy exists.
+///
+/// Once a byte has arrived the response is committed. A body that ends short
+/// after that point is reported by [`CachePersister::tee_stream`]: the client
+/// stream ends in an error (the connection is closed, the only honest signal
+/// left), a warn names the key and both counts, and nothing is cached.
+///
+/// A body with no advertised length (chunked) or an advertised length of
+/// zero passes through untouched: an empty body is legitimate for both.
+async fn await_first_upstream_bytes(
+    body: BoxStream<'static, Result<Bytes>>,
+    content_length: Option<u64>,
+    repo_key: &str,
+    cache_key: &str,
+) -> Result<BoxStream<'static, Result<Bytes>>> {
+    let Some(expected) = content_length.filter(|&n| n > 0) else {
+        return Ok(body);
+    };
+    let mut body = body;
+    loop {
+        match body.next().await {
+            Some(Ok(chunk)) if chunk.is_empty() => continue,
+            Some(Ok(chunk)) => {
+                return Ok(Box::pin(
+                    futures::stream::once(async move { Ok(chunk) }).chain(body),
+                ));
+            }
+            Some(Err(e)) => {
+                tracing::warn!(
+                    repository = %repo_key,
+                    cache_key = %cache_key,
+                    expected_bytes = expected,
+                    received_bytes = 0u64,
+                    error = %e,
+                    "upstream body failed before its first byte; answering 502 \
+                     UPSTREAM_SHORT_BODY, nothing cached (#4759)"
+                );
+                return Err(upstream_short_body_error(repo_key, expected, 0));
+            }
+            None => {
+                tracing::warn!(
+                    repository = %repo_key,
+                    cache_key = %cache_key,
+                    expected_bytes = expected,
+                    received_bytes = 0u64,
+                    "upstream advertised a Content-Length and sent no body; answering 502 \
+                     UPSTREAM_SHORT_BODY, nothing cached (#4759)"
+                );
+                return Err(upstream_short_body_error(repo_key, expected, 0));
+            }
+        }
+    }
+}
+
 /// Storage keys for a single proxy-cache entry: the artifact body and its
 /// `__cache_meta__.json` sidecar.
 ///
@@ -3051,6 +3134,7 @@ impl CachePersister {
         //   * yield the chunk to the client.
         // On upstream error: forward the error to storage (so put_stream
         // sees the error and aborts cleanly) and surface to the client.
+        let tee_cache_key = cache_key;
         let tee_stream = async_stream::try_stream! {
             let mut upstream = upstream;
             // GHSA-qxv7-p3mq-88fv: hash the bytes actually handed to the
@@ -3072,6 +3156,11 @@ impl CachePersister {
             // is not guaranteed to run; without this the writer found an
             // empty slot and refused every gated object.
             let mut forwarded_bytes: u64 = 0;
+            // #4759: bytes yielded to the CLIENT (unlike `forwarded_bytes`,
+            // which stops counting once the cache half is abandoned), for the
+            // warn that reports a body that ended short after the response
+            // had already started.
+            let mut client_bytes: u64 = 0;
             while let Some(chunk_result) = upstream.next().await {
                 match chunk_result {
                     Ok(mut bytes) => {
@@ -3139,6 +3228,7 @@ impl CachePersister {
                                 }
                                 let _ = tx.send(Ok(slice.clone())).await;
                             }
+                            client_bytes += slice.len() as u64;
                             yield slice;
                         }
                     }
@@ -3158,6 +3248,18 @@ impl CachePersister {
                             e
                         )));
                         let _ = tx.send(storage_msg).await;
+                        // #4759: the response headers are already out, so the
+                        // only signal left for the client is the closed
+                        // connection this error causes. Say so, with the
+                        // counts, where an operator will look.
+                        tracing::warn!(
+                            cache_key = %tee_cache_key,
+                            expected_bytes = expected_len,
+                            received_bytes = client_bytes,
+                            error = %e,
+                            "upstream body failed after the response had started; closing the \
+                             client connection, nothing cached (#4759)"
+                        );
                         Err(e)?;
                     }
                 }
@@ -3186,6 +3288,24 @@ impl CachePersister {
             }
             // upstream EOF: drop tx so the writer sees end-of-stream
             drop(tx);
+            // #4759: an upstream body that ended short of its
+            // `Content-Length` without a transport error (hyper reports one
+            // for a real HTTP/1.1 upstream; see the `Err` arm above). The
+            // writer rejects the object as truncated, and the client's
+            // response, which declared the same length, is cut short when its
+            // body ends, so its connection is closed by the server. Record it
+            // with the same counts as the error arm.
+            if let Some(expected) = expected_len {
+                if client_bytes < expected {
+                    tracing::warn!(
+                        cache_key = %tee_cache_key,
+                        expected_bytes = expected,
+                        received_bytes = client_bytes,
+                        "upstream body ended before its Content-Length after the response had \
+                         started; the client connection is closed short, nothing cached (#4759)"
+                    );
+                }
+            }
         };
         Box::pin(tee_stream)
     }
@@ -5893,7 +6013,10 @@ impl ProxyService {
                 // AFTER freshness evaluation; the error propagates and is
                 // never degraded to a Miss (which would refetch upstream).
                 check_quarantine_until(metadata.quarantine_until)?;
-                match self.open_cached_stream(cache_key, &metadata).await? {
+                match self
+                    .open_cached_stream(cache_key, metadata_key, &metadata)
+                    .await?
+                {
                     Some(result) => Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata))),
                     None => Ok(StreamingCacheReadOutcome::Miss),
                 }
@@ -5913,7 +6036,10 @@ impl ProxyService {
                         // Package Age Policy (#1770): gate the revalidated /
                         // stale-if-error body the same way as a fresh hit.
                         check_quarantine_until(metadata.quarantine_until)?;
-                        match self.open_cached_stream(cache_key, &metadata).await? {
+                        match self
+                            .open_cached_stream(cache_key, metadata_key, &metadata)
+                            .await?
+                        {
                             Some(result) => {
                                 Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata)))
                             }
@@ -5927,12 +6053,72 @@ impl ProxyService {
         }
     }
 
+    /// Read-side size check for a cache entry whose sidecar pins no storage
+    /// ETag (#4758): the filesystem backend never pins one, nor does an entry
+    /// cached before #1051.
+    ///
+    /// The #4630 guard ([`sidecar_pins_empty_object`]) recognizes a poisoned
+    /// entry by the ETag its sidecar pinned, so without a pin it sees nothing.
+    /// The sidecar still records the exact byte count of the object it vouches
+    /// for, and every backend can measure an object, so compare the two. On a
+    /// mismatch the entry is evicted (body, then sidecar, then the in-process
+    /// sidecar LRU) and a warn names the key; the caller treats it as a miss
+    /// and refetches upstream, which republishes both objects. Evicting rather
+    /// than merely skipping is what keeps the warn to once per poisoned entry
+    /// and keeps stale-if-error from ever handing the entry out.
+    ///
+    /// Returns `true` when the entry was evicted. A size probe that fails is
+    /// not a verdict: `NotFound` is left to the caller's own missing-body arm,
+    /// and any other error lets the read proceed exactly as before.
+    ///
+    /// Entries WITH a pin are left to the ETag checks, so an S3-compatible
+    /// backend pays no extra round trip on a hit.
+    async fn evict_if_unpinned_body_disagrees(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        metadata: &CacheMetadata,
+    ) -> bool {
+        if metadata.storage_etag.is_some() {
+            return false;
+        }
+        let expected = metadata.size_bytes.max(0) as u64;
+        let stored = match self.storage.size(cache_key).await {
+            Ok(stored) if stored != expected => stored,
+            Ok(_) => return false,
+            Err(e) => {
+                tracing::debug!(
+                    cache_key = %cache_key,
+                    error = %e,
+                    "proxy cache size probe failed; leaving the verdict to the body read (#4758)"
+                );
+                return false;
+            }
+        };
+        tracing::warn!(
+            cache_key = %cache_key,
+            sidecar_bytes = expected,
+            stored_bytes = stored,
+            "proxy cache object does not have the size its sidecar vouches for (no storage \
+             ETag pinned); evicting the entry and refetching upstream (#4758)"
+        );
+        // Body before sidecar, as every eviction orders them. Delete errors
+        // are ignored like `CacheStore::invalidate` ignores them: a surviving
+        // sidecar over a deleted body reads as a miss, and a surviving body
+        // with no sidecar is never served (#3147).
+        let _ = self.storage.delete(cache_key).await;
+        let _ = self.storage.delete(metadata_key).await;
+        invalidate_proxy_metadata_lru(metadata_key).await;
+        true
+    }
+
     /// Open a streaming read of a cached body and pair it with the sidecar's
     /// content-type / size. Returns `Ok(None)` when the sidecar says cached but
     /// the body is gone (out-of-band eviction) so the caller refetches (B6).
     async fn open_cached_stream(
         &self,
         cache_key: &str,
+        metadata_key: &str,
         metadata: &CacheMetadata,
     ) -> Result<Option<StreamingFetchResult>> {
         // #4630: a sidecar that vouches for N > 0 bytes while pinning the ETag
@@ -5951,6 +6137,16 @@ impl ProxyService {
                 "proxy cache sidecar pins the ETag of an empty object while claiming a \
                  non-zero size; treating as a miss and refetching upstream (#4630)"
             );
+            return Ok(None);
+        }
+        // #4758: the same lie with no ETag to give it away. The filesystem
+        // backend (the default) pins no `storage_etag`, so the check above
+        // never fires there, and an emptied or truncated body under an intact
+        // sidecar went out as `Content-Length: N` over fewer bytes, forever.
+        if self
+            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, metadata)
+            .await
+        {
             return Ok(None);
         }
         match self.storage.get_stream(cache_key).await {
@@ -6001,8 +6197,31 @@ impl ProxyService {
         // window was never honoured on the streaming path.)
 
         let full_url = self.gated_upstream_url(repo, fetch_path).await?;
-        let upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
+        let mut upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
             Ok(upstream) => upstream,
+            Err(err) => {
+                return self
+                    .handle_streaming_leader_upstream_error(
+                        cache_path,
+                        &cache_key,
+                        &metadata_key,
+                        err,
+                    )
+                    .await;
+            }
+        };
+        // #4759: hold the response until the first body byte, so a body that
+        // never comes is an upstream error answered with a status (or served
+        // stale) instead of a dropped connection after a committed `200`.
+        upstream.body = match await_first_upstream_bytes(
+            upstream.body,
+            upstream.content_length,
+            &repo.key,
+            &cache_key,
+        )
+        .await
+        {
+            Ok(body) => body,
             Err(err) => {
                 return self
                     .handle_streaming_leader_upstream_error(
@@ -6285,6 +6504,17 @@ impl ProxyService {
                  empty object while claiming a non-zero size; refusing to serve it \
                  (stale-if-error, #4630)"
             );
+            return Err(upstream_err);
+        }
+
+        // #4758: the unpinned sibling of the check above. This reader takes
+        // `Content-Length` straight off the sidecar too, so an emptied or
+        // truncated body under an unpinned sidecar would otherwise be handed
+        // out exactly when upstream is down.
+        if self
+            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, &metadata)
+            .await
+        {
             return Err(upstream_err);
         }
 
@@ -13109,6 +13339,158 @@ mod tests {
         }
     }
 
+    /// The sidecar key that sits beside a proxy-cache content key.
+    fn sidecar_key_of(content_key: &str) -> String {
+        format!(
+            "{}__cache_meta__.json",
+            content_key
+                .strip_suffix("__content__")
+                .expect("a proxy-cache content key")
+        )
+    }
+
+    /// #4758, read side: a sidecar with no pinned storage ETag (the filesystem
+    /// default) over a body that does not have the size it vouches for --
+    /// emptied, or truncated -- is a miss, and the entry is evicted so it is
+    /// never handed out again (not by the hit path, not by stale-if-error).
+    #[tokio::test]
+    async fn test_open_cached_stream_evicts_an_unpinned_entry_whose_body_disagrees_4758() {
+        for (slug, stored) in [
+            ("4758-emptied", &b""[..]),
+            ("4758-truncated", &b"real-tarb"[..]),
+        ] {
+            let backend = CacheObjectBackend::new();
+            let content_key = format!("proxy-cache/npm-remote/{slug}/__content__");
+            let metadata_key = sidecar_key_of(&content_key);
+            backend
+                .objects
+                .lock()
+                .await
+                .insert(content_key.clone(), Bytes::copy_from_slice(stored));
+            let mut metadata = stale_positive_sidecar(18);
+            metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+            assert!(metadata.storage_etag.is_none());
+            backend.put_sidecar(&metadata_key, &metadata).await;
+            let proxy = build_proxy_service_with_storage(backend.clone());
+
+            let opened = proxy
+                .open_cached_stream(&content_key, &metadata_key, &metadata)
+                .await
+                .expect("a poisoned entry is a miss, never an error");
+
+            assert!(
+                opened.is_none(),
+                "{slug}: a sidecar vouching for 18 bytes over {} stored bytes must be a miss \
+                 (#4758), not Content-Length: 18 over a short body",
+                stored.len()
+            );
+            assert!(
+                !backend.exists(&content_key).await.unwrap()
+                    && !backend.exists(&metadata_key).await.unwrap(),
+                "{slug}: the poisoned entry is evicted, body and sidecar"
+            );
+        }
+    }
+
+    /// Positive control for #4758: an unpinned entry whose body has the size
+    /// its sidecar records is served, exactly as before.
+    #[tokio::test]
+    async fn test_open_cached_stream_serves_a_consistent_unpinned_entry_4758() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4758-healthy/__content__";
+        backend.put_object(content_key, b"real-tarball-bytes").await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+        let mut metadata = stale_positive_sidecar(18);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+
+        let opened = proxy
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
+            .await
+            .expect("consistent entry opens")
+            .expect("a consistent unpinned entry is a hit");
+
+        assert_eq!(opened.content_length, Some(18));
+        assert_eq!(
+            drain_body(opened.body).await,
+            b"real-tarball-bytes".to_vec()
+        );
+        assert!(backend.exists(content_key).await.unwrap());
+    }
+
+    /// #4758 on the stale-if-error reader, which takes `Content-Length` off the
+    /// sidecar itself: an unpinned entry whose body is empty is refused (the
+    /// upstream error propagates) and evicted.
+    #[tokio::test]
+    async fn test_stale_if_error_refuses_an_unpinned_entry_whose_body_disagrees_4758() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-proxy/4758-stale-emptied/__content__";
+        backend.put_object(content_key, b"").await;
+        backend
+            .put_sidecar(&sidecar_key_of(content_key), &stale_positive_sidecar(5594))
+            .await;
+
+        let served = serve_stale_if_error(backend.clone(), "4758-stale-emptied").await;
+
+        match served {
+            Err(AppError::BadGateway(_)) => {}
+            Err(other) => panic!("expected the upstream error to propagate, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error served a sidecar claiming 5594 bytes over {} stored bytes \
+                 (#4758)",
+                bytes.len()
+            ),
+        }
+        assert!(!backend.exists(content_key).await.unwrap());
+    }
+
+    /// #4759: a streaming upstream body that ends before its first byte
+    /// although it advertised a length is an upstream error naming the
+    /// repository and both counts; a body that delivers its first byte is
+    /// handed on whole; no length (or a zero length) passes through.
+    #[tokio::test]
+    async fn test_await_first_upstream_bytes_4759() {
+        let empty: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::empty());
+        match await_first_upstream_bytes(empty, Some(4096), "generic-remote", "k").await {
+            Err(AppError::CodedBadGateway { code, message }) => {
+                assert_eq!(code, "UPSTREAM_SHORT_BODY");
+                assert!(
+                    message.contains("'generic-remote'")
+                        && message.contains("4096")
+                        && message.contains("after 0 bytes"),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected UPSTREAM_SHORT_BODY, got {other:?}"),
+            Ok(_) => panic!("an empty body under Content-Length: 4096 must not be handed on"),
+        }
+
+        let failing: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::new()),
+            Err(AppError::Storage("connection closed".into())),
+        ]));
+        assert!(matches!(
+            await_first_upstream_bytes(failing, Some(10), "r", "k").await,
+            Err(AppError::CodedBadGateway { .. })
+        ));
+
+        let healthy: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"def")),
+        ]));
+        let body = await_first_upstream_bytes(healthy, Some(6), "r", "k")
+            .await
+            .expect("a body that started is handed on");
+        assert_eq!(drain_body(body).await, b"abcdef".to_vec());
+
+        for length in [None, Some(0)] {
+            let empty: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::empty());
+            let body = await_first_upstream_bytes(empty, length, "r", "k")
+                .await
+                .expect("no advertised bytes, nothing to wait for");
+            assert!(drain_body(body).await.is_empty());
+        }
+    }
+
     /// #3147 reader 1, the reproduction: an object on the live content key
     /// with NO sidecar is served verbatim when upstream fails.
     ///
@@ -13976,7 +14358,7 @@ mod tests {
         metadata.storage_etag = Some("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string());
 
         let opened = proxy
-            .open_cached_stream(content_key, &metadata)
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
             .await
             .expect("the guard reports a miss, never an error");
         assert!(
@@ -14000,7 +14382,7 @@ mod tests {
         metadata.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
 
         let opened = proxy
-            .open_cached_stream(content_key, &metadata)
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
             .await
             .expect("consistent entry opens");
         let opened = opened.expect("a consistent entry is a hit");
@@ -14151,7 +14533,7 @@ mod tests {
             .expect("the clobbering delete succeeds");
 
         let opened = proxy
-            .open_cached_stream(content_key, &metadata)
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
             .await
             .expect("a missing object is a miss, never an error");
 
@@ -18343,6 +18725,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// An upstream that answers `200` with `Content-Length: declared`, writes
+    /// `sent` bytes of body and closes the connection (#4759). wiremock cannot
+    /// model this: its server derives `Content-Length` from the body it sends.
+    /// Returns the base URL and a counter of the requests it answered.
+    async fn spawn_short_body_upstream(
+        declared: usize,
+        sent: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind short-body upstream");
+        let addr = listener.local_addr().expect("local addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/java-archive\r\n\
+                         Content-Length: {declared}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&vec![b'p'; sent]).await;
+                    let _ = socket.flush().await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// #4758 end to end, on the filesystem backend (which pins no
+    /// `storage_etag`): a cached `__content__` that no longer has the size its
+    /// sidecar vouches for must not be served. Before the fix the hit path
+    /// answered `Content-Length: 4096` over an empty body without contacting
+    /// upstream, on every request, forever (the #4630 symptom the ETag guard
+    /// cannot see when nothing is pinned).
+    #[tokio::test]
+    async fn test_streaming_hit_refetches_an_unpinned_entry_shorter_than_its_sidecar_4758() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar_path = "org/example/lib/1.0.0/lib-1.0.0.jar";
+        let jar: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{jar_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-4758-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_key = format!("maven-4758-{}", Uuid::new_v4());
+        let repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
+
+        let first = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("cold fetch");
+        assert_eq!(drain_stream(first.body).await, jar);
+        tdh::wait_for_cache_commit(&tmp, jar.len() as u64).await;
+        let sidecar = tdh::proxy_sidecar_path(&tmp, &repo_key, jar_path);
+        let content = sidecar.with_file_name("__content__");
+        let pinned: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("sidecar")).unwrap();
+        assert!(
+            pinned["storage_etag"].is_null(),
+            "the filesystem backend pins no ETag; this is the case #4758 is about"
+        );
+
+        // The #4630 shape: the body is gone, the sidecar still vouches for it.
+        std::fs::write(&content, b"").expect("empty the cached body");
+
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::WARN);
+        let second = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("a poisoned entry is a miss, never an error");
+        let second_len = second.content_length;
+        let second_body = drain_stream(second.body).await;
+        drop(guard);
+
+        let upstream_gets = server.received_requests().await.unwrap_or_default().len();
+        assert_eq!(
+            second_body.len(),
+            jar.len(),
+            "the hit path served {} bytes under Content-Length {:?} instead of refetching (#4758)",
+            second_body.len(),
+            second_len
+        );
+        assert_eq!(second_body, jar);
+        assert_eq!(
+            upstream_gets, 2,
+            "the poisoned entry must fall through to upstream"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.contains("WARN") && logs.contains(&repo_key) && logs.contains("4758"),
+            "the eviction must be logged at warn with the key: {logs}"
+        );
+
+        // The refetch republished the entry and it is a hit again.
+        tdh::wait_for_cache_commit(&tmp, jar.len() as u64).await;
+        let third = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("healed hit");
+        assert_eq!(drain_stream(third.body).await, jar);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            2,
+            "the healed entry is served from cache"
+        );
+    }
+
+    /// #4759 at the handler boundary: an upstream that promises
+    /// `Content-Length: 4096` and closes without a body must answer the client
+    /// `502 UPSTREAM_SHORT_BODY` naming the repository and both byte counts.
+    /// Before the fix the 200 headers were already handed back, so the client
+    /// saw the connection drop with no status at all (curl exit 52).
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // reads a small test error body (#1608)
+    async fn test_streaming_proxy_answers_502_for_an_upstream_body_that_never_came_4759() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (upstream, hits) = spawn_short_body_upstream(4096, 0).await;
+        let tmp = std::env::temp_dir().join(format!("ak-4759-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_key = format!("generic-4759-{}", Uuid::new_v4());
+        let path = "f/empty.bin";
+
+        let response = match crate::api::handlers::proxy_helpers::proxy_fetch_streaming(
+            &proxy,
+            Uuid::new_v4(),
+            &repo_key,
+            &upstream,
+            path,
+            "application/octet-stream",
+        )
+        .await
+        {
+            Ok(response) | Err(response) => response,
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&body).into_owned();
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "an upstream body that ended before its first byte must be a 502, not a \
+             200 whose connection is then dropped (#4759); body: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+        assert_eq!(json["code"], "UPSTREAM_SHORT_BODY");
+        let message = json["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&repo_key) && message.contains("4096") && message.contains(" 0 "),
+            "the message names the repository and the expected/received counts: {message}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sidecar = tdh::proxy_sidecar_path(&tmp, &repo_key, path);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            !sidecar.exists(),
+            "nothing is cached for a body that never came"
+        );
+    }
+
+    /// #4759, the other half: once bytes have been forwarded the headers are
+    /// gone and closing the connection is the only honest signal left. The
+    /// client stream must end in an error (never a clean short body), a warn
+    /// must name the key with the expected and received counts, and nothing is
+    /// cached.
+    #[tokio::test]
+    async fn test_streaming_proxy_closes_and_warns_when_upstream_body_ends_mid_stream_4759() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (upstream, _hits) = spawn_short_body_upstream(4096, 1000).await;
+        let tmp = std::env::temp_dir().join(format!("ak-4759-short-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_key = format!("maven-4759-{}", Uuid::new_v4());
+        let jar_path = "org/example/short/1.0.0/short-1.0.0.jar";
+        let repo = remote_repo_for(&repo_key, &upstream, tmp.to_str().unwrap());
+
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::WARN);
+        let handle = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("bytes arrived, so the response has started");
+        assert_eq!(handle.content_length, Some(4096));
+        let mut body = handle.body;
+        let mut received = 0usize;
+        let mut ended_in_error = false;
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(bytes) => received += bytes.len(),
+                Err(_) => {
+                    ended_in_error = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(guard);
+        let logs = capture.text();
+        let sidecar = tdh::proxy_sidecar_path(&tmp, &repo_key, jar_path);
+        let cached = sidecar.exists();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(received, 1000);
+        assert!(
+            ended_in_error,
+            "a short body must end the client stream in an error"
+        );
+        assert!(!cached, "a short body is never committed to the cache");
+        let line = logs
+            .lines()
+            .find(|l| l.contains("WARN") && l.contains("4759"))
+            .unwrap_or_else(|| panic!("no #4759 warn was logged: {logs}"));
+        assert!(
+            line.contains(&repo_key)
+                && line.contains("expected_bytes=4096")
+                && line.contains("received_bytes=1000"),
+            "the warn names the key and both counts: {line}"
+        );
+    }
+
     async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
         let mut body = body;
         let mut out = Vec::new();
@@ -18583,8 +19223,15 @@ mod tests {
 
         let keys =
             CacheKeys::derive(&ProxyCacheScope::unscoped(), "pypi-remote", cache_path).unwrap();
+        // The sidecar vouches for the body actually stored: the hit path
+        // checks an unpinned entry's size against it (#4758).
+        let mut sidecar: CacheMetadata = serde_json::from_slice(&fresh_metadata_bytes()).unwrap();
+        sidecar.size_bytes = wheel_body.len() as i64;
         let mut entries = std::collections::HashMap::new();
-        entries.insert(keys.metadata.clone(), fresh_metadata_bytes());
+        entries.insert(
+            keys.metadata.clone(),
+            Bytes::from(serde_json::to_vec(&sidecar).unwrap()),
+        );
         entries.insert(keys.content.clone(), wheel_body.clone());
 
         let storage = Arc::new(RecordingMapStorage {
