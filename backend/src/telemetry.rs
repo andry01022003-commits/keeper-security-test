@@ -151,7 +151,7 @@ where
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
             .with_ansi(false)
-            .event_format(json_log::FlatJson)
+            .event_format(json_log::FlatJson::default())
             .with_writer(writer)
             .boxed(),
     }
@@ -770,8 +770,7 @@ mod tests {
             }
             tracing::info!(
                 correlation_id = "corr-4674",
-                status = 201u16,
-                method = "PUT",
+                status = %201u16,
                 user = "alice",
                 ip = "203.0.113.7",
                 latency_ms = 42u64,
@@ -800,7 +799,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         let done = &lines[1];
 
-        assert_eq!(done["message"], "Request completed");
+        assert_eq!(done["fields"]["message"], "Request completed");
         assert_eq!(done["level"], "INFO");
         assert!(done["timestamp"].is_string());
         assert_eq!(done["method"], "PUT");
@@ -816,7 +815,13 @@ mod tests {
         assert_eq!(done["user"], "alice");
         assert_eq!(done["ip"], "203.0.113.7");
         assert_eq!(done["latency_ms"], 42);
-        assert!(!done.contains_key("fields"), "event fields are flattened");
+        // The hoisted keys are copies: the nested originals keep their shape,
+        // including `fields.status` as the string it has always been.
+        assert_eq!(done["fields"]["status"], "201");
+        assert_eq!(done["fields"]["user"], "alice");
+        assert_eq!(done["span"]["name"], "http_request");
+        assert_eq!(done["span"]["correlation_id"], "corr-4674");
+        assert!(!done.contains_key("message"), "message stays nested");
 
         // The span stack survives under `spans`.
         let spans = done["spans"].as_array().expect("spans list");
@@ -826,7 +831,8 @@ mod tests {
         // A line inside an inner span: request fields still top-level and the
         // outer span wins the `uri` clash; the inner one stays under `spans`.
         let inner = &lines[0];
-        assert_eq!(inner["message"], "fetching upstream");
+        assert_eq!(inner["fields"]["message"], "fetching upstream");
+        assert_eq!(inner["span"]["name"], "proxy_fetch");
         assert_eq!(inner["uri"], uri);
         assert_eq!(inner["correlation_id"], "corr-4674");
         let inner_spans = inner["spans"].as_array().unwrap();
@@ -837,6 +843,48 @@ mod tests {
             !capture.text().contains('\u{1b}'),
             "JSON never carries ANSI"
         );
+    }
+
+    /// Backward compatibility (#4674): `LOG_FORMAT=json` shipped in 1.10.0 with
+    /// the stock `fmt::layer().json()` layout. Every key that layout emits must
+    /// still be emitted with the same value, nesting and type; the only
+    /// difference allowed is the extra top-level request keys.
+    #[test]
+    fn test_json_keeps_every_key_of_the_1_10_layout() {
+        let ours = Capture::default();
+        emit_request_lines(build_fmt_layer_with_writer(
+            LogFormat::Json,
+            false,
+            ours.clone(),
+        ));
+        let stock = Capture::default();
+        emit_request_lines(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(stock.clone())
+                .boxed(),
+        );
+        let ours = json_lines(&ours);
+        let stock = json_lines(&stock);
+        assert_eq!(ours.len(), stock.len());
+        for (new, old) in ours.iter().zip(&stock) {
+            for (key, old_value) in old {
+                if key == "timestamp" {
+                    assert!(new[key].is_string(), "{new:?}");
+                    continue;
+                }
+                assert_eq!(new.get(key), Some(old_value), "key {key} changed: {new:?}");
+            }
+            for key in new.keys().filter(|k| !old.contains_key(*k)) {
+                assert!(
+                    json_log::HOISTED.contains(&key.as_str()),
+                    "unexpected new key {key}: {new:?}"
+                );
+            }
+        }
+        // The stock layout really is the nested one this test protects.
+        assert!(stock[1].contains_key("fields") && stock[1].contains_key("span"));
+        assert!(stock[1].contains_key("spans") && stock[1].contains_key("target"));
     }
 
     /// Strip the leading timestamp (the only part that differs run to run).
@@ -938,7 +986,7 @@ mod tests {
         let lines = json_lines(&capture);
         let done = lines
             .iter()
-            .find(|l| l["message"] == "Request completed")
+            .find(|l| l["fields"]["message"] == "Request completed")
             .unwrap_or_else(|| panic!("no Request completed line in {lines:?}"));
         assert_eq!(done["method"], "PUT");
         let uri = done["uri"].as_str().unwrap();
@@ -984,7 +1032,7 @@ mod tests {
         let lines = json_lines(&capture);
         let done = lines
             .iter()
-            .find(|l| l["message"] == "Request completed")
+            .find(|l| l["fields"]["message"] == "Request completed")
             .unwrap_or_else(|| panic!("no Request completed line in {lines:?}"));
         assert!(!done.contains_key("user"), "{done:?}");
         assert!(!done.contains_key("ip"), "no client-IP scope: {done:?}");

@@ -485,7 +485,7 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(
                 correlation_id = %correlation_id,
-                status = response.status().as_u16(),
+                status = %response.status().as_u16(),
                 user = user.as_deref(),
                 ip = ip.map(tracing::field::display),
                 latency_ms,
