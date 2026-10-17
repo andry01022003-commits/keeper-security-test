@@ -160,6 +160,25 @@ string and fragment are dropped because receivers often carry a token there.
 `PROMOTION_REFUSED` and `PROMOTION_APPROVAL_DENIED` export with outcome
 `denied`; the others export as `success`.
 
+## Conda channel and environment actions
+
+Conda publishes, withdrawals and CEP-27 attestation outcomes, and stored
+environment registrations and deletions, each write one row (#4709). Every
+row's `user_id` / `actor.id` is the authenticated caller, and `details` carries
+the repository (`repository` key, `repository_id`) plus the fields below. The
+conda rows also carry `repository_type` and the package coordinates under
+`package`: `{ name, version, build, subdir, filename }` (name, version and build
+come from the CEP-26 filename and are `null` when it does not parse).
+
+| Action | Resource | Fires when | `details` beyond the common fields |
+| --- | --- | --- | --- |
+| `ARTIFACT_UPLOADED` | `artifact` | A package is published natively (`PUT /conda/{key}/{subdir}/{file}` or `POST /conda/{key}/upload`, including the `/t/{token}/` forms) to a hosted or staging channel and its artifact row is committed. | The `ArtifactDetails` fields (`path`, `name`, `version`, `size_bytes`, `digest`, `uploaded_by`). The `artifact.uploaded` webhook fires as before. |
+| `CONDA_PACKAGE_WITHDRAWN` | `artifact` | An administrator withdraws a hosted package (`DELETE /conda/{key}/{subdir}/{file}`). | `artifact_id`; `reason` (the supplied reason, or the default text) and `reason_supplied`; `hold` (`quarantine_status`, `permanent: true`); `notice` (the CEP-6 notice `id` and `message`). |
+| `ATTESTATION_VERIFIED` | `artifact` | A CEP-27 attestation (`PUT .../{file}/attestation`) verifies and is stored. | `artifact_id`, `stored: true`, `method` (`sigstore-keyless` or `sigstore-key`), `identity`, `issuer`, `key_fingerprint` (key-based only), `statement_type`, `checks_passed`. |
+| `ATTESTATION_REJECTED` | `artifact` | An attestation for an existing package does not verify, or its body is not JSON. Outcome `denied` when refused (the default, `CONDA_ATTESTATION_REQUIRE_VERIFIED=true`); outcome `failure` with `stored: true` when the operator opt-out stored it anyway. | The same fields as `ATTESTATION_VERIFIED`, with `reason`: the failure reason the API returned (the text after `CEP-27 attestation verification failed: `, or `Invalid JSON body`). |
+| `ENVIRONMENT_REGISTERED` | `environment` | A lockfile is ingested as a stored environment (`POST /api/v1/repositories/{key}/environments`), new or replacing one of the same name. | `environment_id`, `name`, `lockfile_format`, `lockfile_filename`, `content_sha256`, `replaced`, `package_count` (distinct packages), `memberships`, `scope` (`count`, `environments`, `platforms`). |
+| `ENVIRONMENT_DELETED` | `environment` | A stored environment is deleted (`DELETE /api/v1/repositories/{key}/environments/{id}`). | `environment_id`, `name`, `lockfile_format`, `content_sha256`, and the stored `summary`. |
+
 ## Compatibility policy
 
 Within `schema_version: 1`:

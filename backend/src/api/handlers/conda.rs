@@ -51,6 +51,10 @@ use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope,
 use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::audit_export::Outcome;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::auth_service::AuthService;
 use crate::services::conda_identity::{
     self, CondaArchiveType, CondaIdentity, CondaIdentityInput, NoarchKind,
@@ -5889,6 +5893,155 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Audit trail (#4709)
+// ---------------------------------------------------------------------------
+
+/// The package coordinates a conda audit row carries in `details.package`.
+fn conda_audit_package(
+    name: Option<&str>,
+    version: Option<&str>,
+    build: Option<&str>,
+    subdir: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build": build,
+        "subdir": subdir,
+        "filename": filename,
+    })
+}
+
+/// [`conda_audit_package`] with name, version and build parsed out of the
+/// CEP-26 filename; a filename that does not parse keeps them `null`.
+fn conda_audit_package_from_path(subdir: &str, filename: &str) -> serde_json::Value {
+    let parsed = CondaNativeHandler::parse_path(&build_conda_artifact_path(subdir, filename)).ok();
+    let parsed = parsed.as_ref();
+    conda_audit_package(
+        parsed.and_then(|p| p.name.as_deref()),
+        parsed.and_then(|p| p.version.as_deref()),
+        parsed.and_then(|p| p.build.as_deref()),
+        subdir,
+        filename,
+    )
+}
+
+/// `details` for a conda audit row: the repository, the package
+/// coordinates, then the action-specific `extra` fields.
+fn conda_audit_details(
+    repo: &RepoInfo,
+    package: serde_json::Value,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "repository": repo.key,
+        "repository_id": repo.id,
+        "repository_type": repo.repo_type,
+        "package": package,
+    });
+    if let (Some(map), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    details
+}
+
+/// Write one conda audit row for an action on `artifact_id`, best-effort
+/// (an audit-table outage never fails the request).
+async fn audit_conda_artifact(
+    state: &SharedState,
+    action: AuditAction,
+    user_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    resource_name: String,
+    details: serde_json::Value,
+    outcome: Option<Outcome>,
+) {
+    let mut entry = AuditEntry::new(action, ResourceType::Artifact)
+        .user(user_id)
+        .resource(artifact_id)
+        .resource_name(resource_name)
+        .with_request_client_ip()
+        .details(details);
+    if let Some(outcome) = outcome {
+        entry = entry.outcome(outcome);
+    }
+    audit_fire_and_forget(state.db.clone(), entry).await;
+}
+
+/// `ARTIFACT_UPLOADED` for a native conda publish: the native path inserts
+/// its own artifact row instead of going through the audited
+/// `ArtifactService` upload, so it writes the row itself. `details` is the
+/// shared `ArtifactDetails` shape plus the repository key and the conda
+/// coordinates under `package`.
+async fn audit_conda_upload(
+    state: &SharedState,
+    repo: &RepoInfo,
+    user_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    artifact: crate::services::audit_export::details::ArtifactDetails,
+    package: serde_json::Value,
+) {
+    let resource_name = artifact.path.clone();
+    let artifact = serde_json::to_value(artifact).unwrap_or_default();
+    audit_conda_artifact(
+        state,
+        AuditAction::ArtifactUploaded,
+        user_id,
+        artifact_id,
+        resource_name,
+        conda_audit_details(repo, package, artifact),
+        None,
+    )
+    .await;
+}
+
+/// `ATTESTATION_VERIFIED` / `ATTESTATION_REJECTED` for one attestation PUT.
+/// `stored` is whether the bundle was kept (always for a verified one; for a
+/// failed one only under the `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`
+/// opt-out). `reason` is the refusal reason the API returned.
+#[allow(clippy::too_many_arguments)]
+async fn audit_attestation_outcome(
+    state: &SharedState,
+    user_id: uuid::Uuid,
+    repo: &RepoInfo,
+    subdir: &str,
+    filename: &str,
+    artifact_id: uuid::Uuid,
+    verdict: Option<&attestation_verify::AttestationVerdict>,
+    reason: Option<&str>,
+    stored: bool,
+) {
+    let verified = verdict.is_some_and(|v| v.is_verified());
+    let (action, outcome) = match (verified, stored) {
+        (true, _) => (AuditAction::AttestationVerified, None),
+        (false, false) => (AuditAction::AttestationRejected, None),
+        (false, true) => (AuditAction::AttestationRejected, Some(Outcome::Failure)),
+    };
+    let extra = serde_json::json!({
+        "artifact_id": artifact_id,
+        "stored": stored,
+        "reason": reason,
+        "method": verdict.and_then(|v| v.method),
+        "identity": verdict.and_then(|v| v.identity.as_deref()),
+        "issuer": verdict.and_then(|v| v.issuer.as_deref()),
+        "key_fingerprint": verdict.and_then(|v| v.key_fingerprint.as_deref()),
+        "statement_type": verdict.and_then(|v| v.statement_type.as_deref()),
+        "checks_passed": verdict.map(|v| v.checks_passed),
+    });
+    audit_conda_artifact(
+        state,
+        action,
+        user_id,
+        artifact_id,
+        build_conda_artifact_path(subdir, filename),
+        conda_audit_details(repo, conda_audit_package_from_path(subdir, filename), extra),
+        outcome,
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // DELETE /conda/{repo_key}/{subdir}/{filename} - Withdraw package (#4059)
 // ---------------------------------------------------------------------------
 
@@ -5985,13 +6138,15 @@ async fn withdraw_package(
             .await
             .map_err(|e| e.into_response())?;
 
+    let reason_supplied = reason.is_some();
     let reason_text = reason.unwrap_or_else(|| "Withdrawn by administrator".to_string());
+    let notice_message = format!(
+        "Package {} was withdrawn from this channel: {}",
+        filename, reason_text
+    );
     let notice = serde_json::json!({
         "id": uuid::Uuid::new_v4().to_string(),
-        "message": format!(
-            "Package {} was withdrawn from this channel: {}",
-            filename, reason_text
-        ),
+        "message": notice_message,
         "level": "warning",
         "created_at": chrono::Utc::now().to_rfc3339(),
         "package": filename,
@@ -6012,6 +6167,26 @@ async fn withdraw_package(
         "Conda withdraw: {} from repo {} by {} (artifact {}): {}",
         filename, repo_key, ext.username, artifact_id, reason_text
     );
+    audit_conda_artifact(
+        &state,
+        AuditAction::CondaPackageWithdrawn,
+        ext.user_id,
+        artifact_id,
+        artifact_path,
+        conda_audit_details(
+            &repo,
+            conda_audit_package_from_path(&subdir, &filename),
+            serde_json::json!({
+                "artifact_id": artifact_id,
+                "reason": reason_text,
+                "reason_supplied": reason_supplied,
+                "hold": { "quarantine_status": new_status, "permanent": true },
+                "notice": { "id": notice_id, "message": notice_message },
+            }),
+        ),
+        None,
+    )
+    .await;
     state.event_bus.emit(
         "artifact.quarantine.quarantined",
         artifact_id,
@@ -7123,6 +7298,7 @@ async fn store_attestation(
     subdir: &str,
     filename: &str,
     body: &Bytes,
+    user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
     // Enforce attestation-specific body size limit (H3)
     if body.len() > ATTESTATION_MAX_BODY_SIZE {
@@ -7153,8 +7329,25 @@ async fn store_attestation(
     // Parse the attestation (a Sigstore bundle per CEP-27; a bare Statement
     // parses too and is rejected by the verifier with the reason that says
     // why — see `cep27::BARE_STATEMENT_REASON`).
-    let attestation: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid JSON body").into_response())?;
+    let attestation: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(attestation) => attestation,
+        Err(_) => {
+            const INVALID_JSON: &str = "Invalid JSON body";
+            audit_attestation_outcome(
+                state,
+                user_id,
+                repo,
+                subdir,
+                filename,
+                artifact_id,
+                None,
+                Some(INVALID_JSON),
+                false,
+            )
+            .await;
+            return Err((StatusCode::BAD_REQUEST, INVALID_JSON).into_response());
+        }
+    };
 
     // Hash the exact package bytes the attestation claims to bind, streamed
     // out of storage rather than buffered: a `.conda` package can run to
@@ -7224,15 +7417,25 @@ async fn store_attestation(
             error = ?verdict.error,
             "CEP-27 attestation refused: verification required and the bundle did not verify"
         );
+        let reason = verdict
+            .error
+            .as_deref()
+            .unwrap_or("attestation did not verify");
+        audit_attestation_outcome(
+            state,
+            user_id,
+            repo,
+            subdir,
+            filename,
+            artifact_id,
+            Some(&verdict),
+            Some(reason),
+            false,
+        )
+        .await;
         return Err((
             StatusCode::BAD_REQUEST,
-            format!(
-                "CEP-27 attestation verification failed: {}",
-                verdict
-                    .error
-                    .as_deref()
-                    .unwrap_or("attestation did not verify")
-            ),
+            format!("CEP-27 attestation verification failed: {reason}"),
         )
             .into_response());
     }
@@ -7271,6 +7474,18 @@ async fn store_attestation(
         appended = appended.appended,
         "CEP-27 attestation stored"
     );
+    audit_attestation_outcome(
+        state,
+        user_id,
+        repo,
+        subdir,
+        filename,
+        artifact_id,
+        Some(&verdict),
+        verdict.error.as_deref(),
+        true,
+    )
+    .await;
 
     let status = if appended.appended {
         StatusCode::CREATED
@@ -7832,9 +8047,9 @@ async fn put_attestation(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
+    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
 }
 
 /// GET /conda/{repo_key}/{subdir}/{filename}/attestation
@@ -7862,13 +8077,13 @@ async fn put_attestation_with_token(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = if auth.is_some() {
+    let user_id = if auth.is_some() {
         require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
+    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
 }
 
 /// GET /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
@@ -8379,6 +8594,29 @@ async fn store_conda_package(
         "Conda upload: {}-{}-{} ({}) to repo {}/{}",
         pkg_name, pkg_version, build_string, filename, repo.id, subdir
     );
+    audit_conda_upload(
+        state,
+        repo,
+        user_id,
+        artifact_id,
+        crate::services::audit_export::details::ArtifactDetails {
+            repository_id: repo.id,
+            path: artifact_path.clone(),
+            name: pkg_name.clone(),
+            version: Some(pkg_version.clone()),
+            size_bytes: u64::try_from(size_bytes).ok(),
+            digest: Some(format!("sha256:{computed_sha256}")),
+            uploaded_by: Some(user_id),
+        },
+        conda_audit_package(
+            Some(&pkg_name),
+            Some(&pkg_version),
+            Some(&build_string),
+            subdir,
+            filename,
+        ),
+    )
+    .await;
 
     Ok(Response::builder()
         .status(StatusCode::CREATED)
@@ -16516,6 +16754,62 @@ mod withdrawal_tests {
         assert!(!is_withdrawn(Some("quarantined"), Some(past), now));
     }
 
+    /// #4709: a withdrawal writes `CONDA_PACKAGE_WITHDRAWN` for the withdrawn
+    /// package only, with the reason, the hold and the CEP-6 notice.
+    #[tokio::test]
+    async fn withdraw_writes_a_conda_package_withdrawn_audit_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let (good_id, bad_id) = seed_pair(&fx).await;
+        let (status, body) = tdh::send(
+            admin_router(&fx),
+            delete_req(
+                format!("/{}/noarch/{BAD}", fx.repo_key),
+                Some("compromised maintainer key"),
+            ),
+        )
+        .await;
+        let row = tdh::audit_row_eventually(&fx.pool, bad_id, "CONDA_PACKAGE_WITHDRAWN").await;
+        let good_rows = tdh::audit_count(&fx.pool, good_id, "CONDA_PACKAGE_WITHDRAWN").await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tdh::AuditRow {
+            user_id, details, ..
+        } = row;
+        assert_eq!(good_rows, 0, "only the withdrawn package is audited");
+        assert_eq!(user_id, Some(fx.user_id));
+        assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+        assert_eq!(details["reason"], "compromised maintainer key");
+        assert_eq!(details["reason_supplied"], true);
+        assert_eq!(
+            details["hold"],
+            serde_json::json!({
+                "quarantine_status": response["quarantine_status"],
+                "permanent": true,
+            })
+        );
+        assert_eq!(details["notice"]["id"], response["notice_id"]);
+        assert!(
+            details["notice"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("compromised maintainer key") && m.contains(BAD)),
+            "{details}"
+        );
+        assert_eq!(
+            details["package"],
+            serde_json::json!({
+                "name": "bad",
+                "version": "2.0",
+                "build": "0",
+                "subdir": "noarch",
+                "filename": BAD,
+            })
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The acceptance test: publish 2, withdraw 1, every variant serves the
     // other only, download is gated, the CEP-6 notice carries the reason.
@@ -17271,6 +17565,29 @@ mod attestation_verification_tests {
             .unwrap()
     }
 
+    /// #4709: the module's single seeded package.
+    async fn seeded_artifact_id(fx: &tdh::Fixture) -> uuid::Uuid {
+        sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 LIMIT 1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("seeded artifact")
+    }
+
+    /// #4709: the newest `action` audit row for the seeded package, after
+    /// checking the actor and repository every attestation row carries.
+    async fn attestation_audit(fx: &tdh::Fixture, action: &str) -> serde_json::Value {
+        let artifact_id = seeded_artifact_id(fx).await;
+        let tdh::AuditRow {
+            user_id, details, ..
+        } = tdh::audit_row_eventually(&fx.pool, artifact_id, action).await;
+        assert_eq!(user_id, Some(fx.user_id), "the actor is the uploader");
+        assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+        assert_eq!(details["artifact_id"], artifact_id.to_string(), "{details}");
+        assert_eq!(details["package"]["subdir"], "noarch", "{details}");
+        details
+    }
+
     async fn stored_metadata(fx: &tdh::Fixture) -> Option<serde_json::Value> {
         sqlx::query_scalar(
             "SELECT am.metadata FROM artifact_metadata am \
@@ -17328,6 +17645,18 @@ mod attestation_verification_tests {
              only inside a Sigstore bundle: {text}"
         );
 
+        // #4709: each of the three refusals left an ATTESTATION_REJECTED row
+        // and none a verified one.
+        let artifact_id = seeded_artifact_id(&fx).await;
+        assert_eq!(
+            tdh::audit_count_eventually(&fx.pool, artifact_id, "ATTESTATION_REJECTED", 3).await,
+            3
+        );
+        assert_eq!(
+            tdh::audit_count(&fx.pool, artifact_id, "ATTESTATION_VERIFIED").await,
+            0
+        );
+
         fx.teardown().await;
     }
 
@@ -17369,6 +17698,18 @@ mod attestation_verification_tests {
             stored_metadata(&fx).await.is_none(),
             "a refused attestation must leave nothing behind"
         );
+
+        // #4709: the refusal is audited with the reason the API returned.
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        let reason = audit["reason"].as_str().expect("reason recorded");
+        assert!(reason.contains("predicateType"), "{audit}");
+        assert_eq!(
+            text,
+            format!("CEP-27 attestation verification failed: {reason}"),
+            "the audit reason is the API's vocabulary"
+        );
+        assert_eq!(audit["stored"], false, "{audit}");
+        assert_eq!(audit["package"]["filename"], WHL_NAME, "{audit}");
 
         fx.teardown().await;
     }
@@ -17433,6 +17774,21 @@ mod attestation_verification_tests {
             verdict.state,
             attestation_verify::AttestationState::Failed,
             "the stored record must read back as Failed: {verdict:?}"
+        );
+
+        // #4709: stored under the opt-out, but audited as rejected and
+        // flagged as stored, never as verified.
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        assert_eq!(audit["stored"], true, "{audit}");
+        assert_eq!(audit["reason"], record["error"], "{audit}");
+        assert_eq!(
+            tdh::audit_count(
+                &fx.pool,
+                seeded_artifact_id(&fx).await,
+                "ATTESTATION_VERIFIED"
+            )
+            .await,
+            0
         );
 
         fx.teardown().await;
@@ -17650,6 +18006,28 @@ mod attestation_verification_tests {
             metadata[SIDECAR_SHA256_METADATA_KEY],
             "{repodata}"
         );
+
+        // #4709: ATTESTATION_VERIFIED names the method, signer and package.
+        let audit = attestation_audit(&fx, "ATTESTATION_VERIFIED").await;
+        assert_eq!(audit["method"], "sigstore-key", "{audit}");
+        assert_eq!(audit["identity"], "acme-ci", "{audit}");
+        assert_eq!(audit["issuer"], "key:8ef972c8a32ae989", "{audit}");
+        assert_eq!(
+            audit["key_fingerprint"], record["key_fingerprint"],
+            "{audit}"
+        );
+        assert_eq!(audit["stored"], true, "{audit}");
+        assert!(audit["reason"].is_null(), "{audit}");
+        assert_eq!(
+            audit["package"],
+            serde_json::json!({
+                "name": "acme-core",
+                "version": "1.0",
+                "build": "py_0",
+                "subdir": "noarch",
+                "filename": COSIGN_PKG_NAME,
+            })
+        );
         fx.teardown().await;
     }
 
@@ -17674,6 +18052,39 @@ mod attestation_verification_tests {
             .await
             .map(|m| m.get("attestation").is_none())
             .unwrap_or(true));
+
+        // #4709: the refusal is audited, with the API's reason.
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        assert!(
+            audit["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("not a configured trusted key")),
+            "{audit}"
+        );
+        assert_eq!(audit["stored"], false, "{audit}");
+        assert_eq!(audit["package"]["name"], "acme-core", "{audit}");
+        fx.teardown().await;
+    }
+
+    /// #4709: a body that is not JSON is refused and audited as rejected.
+    #[tokio::test]
+    async fn malformed_attestation_body_is_audited_as_rejected() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        seed_wheel(&fx).await;
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/noarch/{WHL_NAME}/attestation", fx.repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let (status, body) = tdh::send(write_router(&fx), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        assert_eq!(audit["reason"], String::from_utf8_lossy(&body).as_ref());
+        assert_eq!(audit["stored"], false, "{audit}");
+        assert!(audit["method"].is_null(), "{audit}");
         fx.teardown().await;
     }
 
@@ -20176,6 +20587,76 @@ mod upload_subdir_tests {
             String::from_utf8_lossy(&post_body)
         );
         assert_eq!(paths, vec![format!("linux-64/{filename}")]);
+    }
+
+    /// #4709: a native publish to a hosted or staging channel writes one
+    /// `ARTIFACT_UPLOADED` row carrying the actor, the repository and the
+    /// conda coordinates.
+    #[tokio::test]
+    async fn native_publish_is_audited_with_conda_coordinates() {
+        for repo_type in ["local", "staging"] {
+            let Some(fx) = tdh::Fixture::setup(repo_type, "conda").await else {
+                return;
+            };
+            let filename = "acme-audited-2.1-h7_3.tar.bz2";
+            let package = v1_package_for("acme-audited", "2.1", "h7_3", "linux-64");
+            let (status, body) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(
+                    format!("/{}/linux-64/{filename}", fx.repo_key),
+                    Bytes::from(package),
+                ),
+            )
+            .await;
+            let artifact_id: Option<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("linux-64/{filename}"))
+            .fetch_optional(&fx.pool)
+            .await
+            .unwrap();
+            let (row, count) = match artifact_id {
+                Some(id) => (
+                    Some(tdh::audit_row_eventually(&fx.pool, id, "ARTIFACT_UPLOADED").await),
+                    tdh::audit_count(&fx.pool, id, "ARTIFACT_UPLOADED").await,
+                ),
+                None => (None, 0),
+            };
+            fx.teardown().await;
+
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{repo_type}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let tdh::AuditRow {
+                user_id, details, ..
+            } = row.expect("ARTIFACT_UPLOADED row");
+            assert_eq!(count, 1, "{repo_type}: exactly one upload row");
+            assert_eq!(user_id, Some(fx.user_id), "{repo_type}");
+            assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+            assert_eq!(details["repository_type"], repo_type, "{details}");
+            assert_eq!(details["path"], format!("linux-64/{filename}"));
+            assert!(
+                details["digest"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("sha256:")),
+                "{details}"
+            );
+            assert_eq!(
+                details["package"],
+                serde_json::json!({
+                    "name": "acme-audited",
+                    "version": "2.1",
+                    "build": "h7_3",
+                    "subdir": "linux-64",
+                    "filename": filename,
+                }),
+                "{repo_type}"
+            );
+        }
     }
 }
 

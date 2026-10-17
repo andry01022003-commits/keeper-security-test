@@ -193,6 +193,22 @@ pub enum AuditAction {
     SyncPolicyCreated,
     SyncPolicyUpdated,
     SyncPolicyDeleted,
+
+    // Conda channel lifecycle (#4709). Appended at the END of the enum.
+    /// An administrator withdrew a hosted conda package
+    /// (`DELETE /conda/{key}/{subdir}/{file}`): permanent hold plus a CEP-6
+    /// channel notice.
+    CondaPackageWithdrawn,
+    /// A CEP-27 attestation uploaded for a package verified and was stored.
+    AttestationVerified,
+    /// A CEP-27 attestation uploaded for a package did not verify: refused,
+    /// or (under the explicit `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`
+    /// opt-out) stored with its failed verification record.
+    AttestationRejected,
+    /// A lockfile was ingested as a stored environment (new or replaced).
+    EnvironmentRegistered,
+    /// A stored environment was deleted.
+    EnvironmentDeleted,
 }
 
 impl AuditAction {
@@ -282,6 +298,11 @@ impl AuditAction {
             AuditAction::SyncPolicyCreated => "SYNC_POLICY_CREATED",
             AuditAction::SyncPolicyUpdated => "SYNC_POLICY_UPDATED",
             AuditAction::SyncPolicyDeleted => "SYNC_POLICY_DELETED",
+            AuditAction::CondaPackageWithdrawn => "CONDA_PACKAGE_WITHDRAWN",
+            AuditAction::AttestationVerified => "ATTESTATION_VERIFIED",
+            AuditAction::AttestationRejected => "ATTESTATION_REJECTED",
+            AuditAction::EnvironmentRegistered => "ENVIRONMENT_REGISTERED",
+            AuditAction::EnvironmentDeleted => "ENVIRONMENT_DELETED",
         }
     }
 }
@@ -306,6 +327,8 @@ pub enum ResourceType {
     SigningKey,
     Webhook,
     SyncPolicy,
+    /// A stored environment (ingested lockfile graph, #4054 / #4709).
+    Environment,
 }
 
 impl ResourceType {
@@ -327,6 +350,7 @@ impl ResourceType {
             ResourceType::SigningKey => "signing_key",
             ResourceType::Webhook => "webhook",
             ResourceType::SyncPolicy => "sync_policy",
+            ResourceType::Environment => "environment",
         }
     }
 }
@@ -1428,6 +1452,31 @@ mod tests {
         assert_eq!(AuditAction::PermissionDenied.as_str(), "PERMISSION_DENIED");
     }
 
+    #[test]
+    fn test_audit_action_as_str_conda_lifecycle() {
+        // #4709: conda withdraw, attestation outcomes, environment lifecycle.
+        assert_eq!(
+            AuditAction::CondaPackageWithdrawn.as_str(),
+            "CONDA_PACKAGE_WITHDRAWN"
+        );
+        assert_eq!(
+            AuditAction::AttestationVerified.as_str(),
+            "ATTESTATION_VERIFIED"
+        );
+        assert_eq!(
+            AuditAction::AttestationRejected.as_str(),
+            "ATTESTATION_REJECTED"
+        );
+        assert_eq!(
+            AuditAction::EnvironmentRegistered.as_str(),
+            "ENVIRONMENT_REGISTERED"
+        );
+        assert_eq!(
+            AuditAction::EnvironmentDeleted.as_str(),
+            "ENVIRONMENT_DELETED"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ResourceType::as_str
     // -----------------------------------------------------------------------
@@ -1453,6 +1502,7 @@ mod tests {
         assert_eq!(ResourceType::SigningKey.as_str(), "signing_key");
         assert_eq!(ResourceType::Webhook.as_str(), "webhook");
         assert_eq!(ResourceType::SyncPolicy.as_str(), "sync_policy");
+        assert_eq!(ResourceType::Environment.as_str(), "environment");
     }
 
     /// #4710: the core privileged-action vocabulary. The names are a published

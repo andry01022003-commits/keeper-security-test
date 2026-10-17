@@ -83,6 +83,10 @@ impl AuditAction {
             // promotion request a reviewer turned down, are refusals of the
             // requesting principal, like `AGE_GATE_REJECTED`.
             AuditAction::PromotionRefused | AuditAction::PromotionApprovalDenied => Outcome::Denied,
+            // #4709: an attestation that did not verify. Refused by default;
+            // the emitter overrides to `Failure` when the operator opt-out
+            // stored it anyway.
+            AuditAction::AttestationRejected => Outcome::Denied,
             // #2805: the password was correct, but the 2FA enforcement policy
             // withheld the session pending enrollment. Not a success (no session
             // was issued) and not a credential failure — it is a policy denial,
@@ -163,7 +167,11 @@ impl AuditAction {
             | AuditAction::WebhookSecretRotated
             | AuditAction::SyncPolicyCreated
             | AuditAction::SyncPolicyUpdated
-            | AuditAction::SyncPolicyDeleted => Outcome::Success,
+            | AuditAction::SyncPolicyDeleted
+            | AuditAction::CondaPackageWithdrawn
+            | AuditAction::AttestationVerified
+            | AuditAction::EnvironmentRegistered
+            | AuditAction::EnvironmentDeleted => Outcome::Success,
         }
     }
 }
@@ -964,6 +972,7 @@ mod tests {
     fn test_outcome_denied_variants() {
         assert_eq!(AuditAction::PermissionDenied.outcome(), Outcome::Denied);
         assert_eq!(AuditAction::AgeGateRejected.outcome(), Outcome::Denied);
+        assert_eq!(AuditAction::AttestationRejected.outcome(), Outcome::Denied);
     }
 
     #[test]
@@ -978,6 +987,10 @@ mod tests {
             AuditAction::BackupCompleted,
             AuditAction::AgeGateApproved,
             AuditAction::AgeGateReopened,
+            AuditAction::CondaPackageWithdrawn,
+            AuditAction::AttestationVerified,
+            AuditAction::EnvironmentRegistered,
+            AuditAction::EnvironmentDeleted,
         ] {
             assert_eq!(a.outcome(), Outcome::Success, "{}", a.as_str());
         }
