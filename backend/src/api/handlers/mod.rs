@@ -307,6 +307,12 @@ pub(crate) mod test_db_helpers;
 #[cfg(test)]
 mod virtual_token_scope_tests;
 
+/// #4690: router-level tests that a virtual's REST listings explain an empty
+/// result to a caller granted the virtual but none of its members.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod virtual_members_notice_tests;
+
 /// #4498: router-level tests that an unreadable repository answers exactly
 /// like a missing one on the REST read endpoints.
 #[cfg(ak_test_shard = "router")]

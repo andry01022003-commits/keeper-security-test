@@ -896,7 +896,7 @@ pub fn router() -> Router<SharedState> {
         // Artifact routes nested under repository
         .route(
             "/:key/artifacts",
-            get(list_artifacts).post(upload_artifact_multipart),
+            get(list_artifacts_with_notice).post(upload_artifact_multipart),
         )
         .route(
             "/:key/artifacts/*path",
@@ -6319,6 +6319,95 @@ pub struct MavenComponentResponse {
     pub last_promotion: Option<LastPromotion>,
 }
 
+/// Response header naming why a virtual repository's listing came back empty
+/// for this caller (#4690).
+pub(crate) const VIRTUAL_MEMBERS_NOTICE_HEADER: &str = "x-ak-virtual-members-notice";
+
+/// The text of [`VIRTUAL_MEMBERS_NOTICE_HEADER`]. The access model is that a
+/// grant on a virtual repository does not grant its members (#1804, #3163):
+/// reading through a virtual needs read on each member the caller should see.
+/// A user granted only the virtual gets an empty listing, and before #4690
+/// the only trace of why was a server log line.
+pub(crate) const NO_READABLE_MEMBERS_NOTICE: &str =
+    "No member of this virtual repository is readable by you. Reading through a \
+     virtual repository requires read access on each member repository; a grant \
+     on the virtual repository alone does not include its members.";
+
+/// Does `auth` hold `read` on the virtual itself, as a GRANT (not through the
+/// repository's visibility)? Gates the #4690 notice to the caller it is meant
+/// for: someone who was given the virtual and expects its members. Admins read
+/// every member, so they never need it.
+async fn holds_virtual_read_grant(
+    state: &SharedState,
+    auth: &AuthExtension,
+    virtual_repo_id: Uuid,
+) -> Result<bool> {
+    if auth.is_admin {
+        return Ok(false);
+    }
+    state
+        .permission_service
+        .check_repository_action(auth.user_id, virtual_repo_id, "read", false)
+        .await
+}
+
+/// `response` with [`VIRTUAL_MEMBERS_NOTICE_HEADER`] set when `notice`.
+///
+/// The notice carries no member count and no member identity, and is decided
+/// only by "the caller can read no member": a virtual whose members were all
+/// filtered out and a virtual with no members answer identically, so the
+/// header is not an existence oracle over private members (#3452).
+fn with_virtual_members_notice(response: impl IntoResponse, notice: bool) -> Response {
+    let mut response = response.into_response();
+    if notice {
+        response.headers_mut().insert(
+            VIRTUAL_MEMBERS_NOTICE_HEADER,
+            axum::http::HeaderValue::from_static(NO_READABLE_MEMBERS_NOTICE),
+        );
+    }
+    response
+}
+
+/// Whether an artifact listing returned nothing at all, in any grouping.
+fn artifact_listing_is_empty(listing: &ArtifactListResponse) -> bool {
+    listing.items.is_empty()
+        && listing.components.as_ref().is_none_or(Vec::is_empty)
+        && listing.docker_tags.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// Route handler for `GET /{key}/artifacts`: [`list_artifacts`] plus the
+/// #4690 notice when a virtual's listing is empty because the caller can read
+/// none of its members. The member walk only runs for an empty listing.
+async fn list_artifacts_with_notice(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    query: Query<ListArtifactsQuery>,
+) -> Result<Response> {
+    let listing = list_artifacts(
+        State(state.clone()),
+        Extension(auth.clone()),
+        Path(key.clone()),
+        query,
+    )
+    .await?;
+    let notice = match auth.as_ref() {
+        Some(a) if artifact_listing_is_empty(&listing.0) => {
+            let repo = RepositoryService::new(state.db.clone())
+                .get_by_key(&key)
+                .await?;
+            repo.repo_type == RepositoryType::Virtual
+                && holds_virtual_read_grant(&state, a, repo.id).await?
+                && proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await
+                    .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?
+                    .is_empty()
+        }
+        _ => false,
+    };
+    Ok(with_virtual_members_notice(listing, notice))
+}
+
 /// List artifacts in repository
 #[utoipa::path(
     get,
@@ -6330,7 +6419,7 @@ pub struct MavenComponentResponse {
         ListArtifactsQuery,
     ),
     responses(
-        (status = 200, description = "List of artifacts", body = ArtifactListResponse),
+        (status = 200, description = "List of artifacts. For a virtual repository whose members the caller cannot read although it holds read on the virtual, the `X-AK-Virtual-Members-Notice` header says why (#4690)", body = ArtifactListResponse),
         (status = 404, description = "Repository not found"),
     )
 )]
@@ -11356,7 +11445,7 @@ struct VirtualMemberRow {
     ),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "List of virtual repository members (filtered to caller-visible members)", body = VirtualMembersListResponse),
+        (status = 200, description = "List of virtual repository members (filtered to caller-visible members). When the caller holds read on the virtual but can read none of its members, the `X-AK-Virtual-Members-Notice` header says why (#4690)", body = VirtualMembersListResponse),
         (status = 400, description = "Repository is not virtual"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found"),
@@ -11366,7 +11455,7 @@ pub async fn list_virtual_members(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-) -> Result<Json<VirtualMembersListResponse>> {
+) -> Result<Response> {
     // Issue #913 (read side): require auth and filter the response to members
     // the caller can actually see. Without this, a token restricted to a single
     // repo (or any authenticated user, prior to this fix) could enumerate the
@@ -11462,7 +11551,15 @@ pub async fn list_virtual_members(
         .map(map_member_row)
         .collect();
 
-    Ok(Json(VirtualMembersListResponse { members }))
+    // #4690: an empty member list for a caller who holds read on the virtual
+    // itself says why. Keyed on the readable set being empty, never on how
+    // many members were dropped, so it is the same for a virtual with no
+    // members at all (#3452).
+    let notice = visible.is_empty() && holds_virtual_read_grant(&state, &auth, repo.id).await?;
+    Ok(with_virtual_members_notice(
+        Json(VirtualMembersListResponse { members }),
+        notice,
+    ))
 }
 
 /// Add a member to a virtual repository
@@ -11660,7 +11757,7 @@ pub async fn update_virtual_members(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
     Json(payload): Json<UpdateVirtualMembersRequest>,
-) -> Result<Json<VirtualMembersListResponse>> {
+) -> Result<Response> {
     let auth = require_auth(auth)?;
     auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());

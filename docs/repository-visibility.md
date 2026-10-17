@@ -82,6 +82,47 @@ evicts the cached repository record. Without that, a repository narrowed from
 60-second cache TTL expired — a stale-*authorization* window, not merely a
 stale-metadata one.
 
+## Reading through a virtual repository
+
+A virtual repository has no access of its own to hand out. Its members are
+separate repositories with their own grants, and every member is checked
+against the caller exactly as a direct read of that member would be. **To read
+through a virtual, the principal needs read on each member it should see; a
+grant on the virtual alone yields an empty channel.** The grant on the virtual
+is still required: it is what lets the caller reach the virtual's URL at all.
+
+For example, to let the members of group `developers` resolve through a Maven
+virtual `maven-all` whose members are `maven-internal` (local) and
+`maven-central` (remote), grant the group `read` on all three:
+
+```bash
+for repo in maven-all maven-internal maven-central; do
+  REPO_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    "$AK/api/v1/repositories/$repo" | jq -r .id)
+  curl -s -X POST "$AK/api/v1/permissions" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"principal_type\":\"group\",\"principal_id\":\"$GROUP_ID\",
+         \"target_type\":\"repository\",\"target_id\":\"$REPO_ID\",
+         \"actions\":[\"read\"]}"
+done
+```
+
+With `read` on `maven-all` only, `/maven/maven-all/...` answers 404 for every
+artifact, and the server logs `virtual member walk narrowed by caller
+authorization` with `members_accessible=0`. Granting a subset of the members
+is how a virtual is narrowed per audience: each caller sees the members it can
+read, in the virtual's priority order. Putting the virtual and its members in
+one project and granting the group on the project covers all of them with one
+rule.
+
+Since 1.11.2, when a caller holding read on a virtual can read none of its
+members, `GET /api/v1/repositories/{key}/members` and
+`GET /api/v1/repositories/{key}/artifacts` add an `X-AK-Virtual-Members-Notice`
+header saying so (#4690). The header is decided only by "no member is readable
+by this caller", so a virtual with no members at all answers the same and the
+header does not reveal whether private members exist. The format endpoints
+(`/maven/<virtual>/...` and the like) still answer a plain 404.
+
 ## Tokens scoped to a virtual repository
 
 A token whose repository scope names a virtual repository (a repository token
