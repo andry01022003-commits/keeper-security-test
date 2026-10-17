@@ -1159,6 +1159,63 @@ pub fn router_with_auth_ext(
         .layer(Extension::<Option<AuthExtension>>(Some(auth)))
 }
 
+/// Put the production `client_ip_context_middleware` in front of `app` with
+/// no trusted proxies and `XFF_TRUSTED_FOR_AUTHZ` off (#4681 defaults), so
+/// the request's resolved client IP is the TCP peer set by
+/// [`request_from_peer`]. Used by the audit client-IP tests (#4762).
+pub fn with_client_ip_middleware(app: Router) -> Router {
+    app.layer(axum::middleware::from_fn_with_state(
+        Arc::new(crate::api::middleware::client_ip::ClientIpConfig {
+            trusted_proxies: Vec::new(),
+            xff_trusted_for_authz: false,
+        }),
+        crate::api::middleware::client_ip::client_ip_context_middleware,
+    ))
+}
+
+/// A JSON `POST` to `uri` arriving from TCP peer `peer`, carrying a spoofed
+/// `X-Forwarded-For` the untrusted-peer resolution must ignore.
+pub fn request_from_peer(uri: &str, body: serde_json::Value, peer: &str) -> Request<Body> {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("X-Forwarded-For", "192.0.2.1")
+        .body(Body::from(body.to_string()))
+        .expect("build request");
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>()
+            .expect("peer socket address"),
+    ));
+    req
+}
+
+/// Poll for the (fire-and-forget) audit row of `action` on `resource_id` and
+/// return its `ip_address`. `None` when no row appeared; `Some(None)` when the
+/// row was written without a client IP.
+pub async fn audit_row_ip(
+    pool: &PgPool,
+    action: &str,
+    resource_id: Uuid,
+) -> Option<Option<String>> {
+    for _ in 0..40 {
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT ip_address FROM audit_log WHERE action = $1 AND resource_id = $2 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(action)
+        .bind(resource_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read audit row");
+        if row.is_some() {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
 /// Register a peer instance via the real `PeerInstanceService` and return its
 /// id. `name_prefix` namespaces the generated peer name so concurrent suites do
 /// not collide (e.g. "probe", "labels-authz", "map-err"). Centralizes the

@@ -30792,6 +30792,51 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// #4762: the `REPOSITORY_CREATED` audit row records the request's client
+    /// IP (the TCP peer under the #4681 resolution; a spoofed XFF from an
+    /// untrusted peer is ignored), like login and the #4710 rows.
+    #[tokio::test]
+    async fn test_4762_repository_created_audit_row_records_client_ip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let dir = std::env::temp_dir().join(format!("repo-ip-4762-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let app = tdh::with_client_ip_middleware(tdh::router_with_auth(
+            router(),
+            state,
+            admin_auth(user_id, &username),
+        ));
+        let key = format!("ip-4762-{}", Uuid::new_v4().simple());
+        let req = tdh::request_from_peer(
+            "/",
+            serde_json::json!({
+                "key": key, "name": key, "format": "generic", "repo_type": "local"
+            }),
+            "203.0.113.61:4762",
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let repo_id: Uuid = created["id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("created repository id");
+
+        let ip = tdh::audit_row_ip(&pool, "REPOSITORY_CREATED", repo_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            ip,
+            Some(Some("203.0.113.61".to_string())),
+            "the REPOSITORY_CREATED row must carry the request peer IP (#4762)"
+        );
+    }
 }
 
 // --------------------------------------------------------------------------

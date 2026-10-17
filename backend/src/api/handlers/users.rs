@@ -4011,6 +4011,42 @@ mod router_split_tests {
         delete_user_row(&pool, caller_id).await;
         delete_user_row(&pool, target_id).await;
     }
+
+    /// #4762: the `USER_CREATED` audit row records the request's client IP
+    /// (the TCP peer under the #4681 resolution; a spoofed XFF from an
+    /// untrusted peer is ignored), like login and the #4710 rows.
+    #[tokio::test]
+    async fn test_4762_user_created_audit_row_records_client_ip() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let app = tdh::with_client_ip_middleware(build_admin_app(
+            state,
+            tdh::admin_auth(user_id, &username),
+        ));
+        let new_name = format!("ip4762-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let req = tdh::request_from_peer(
+            "/",
+            json!({ "username": new_name, "email": format!("{new_name}@test.local") }),
+            "203.0.113.62:4762",
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let created_id: Uuid = created["user"]["id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("created user id");
+
+        let ip = tdh::audit_row_ip(&pool, "USER_CREATED", created_id).await;
+        delete_user_row(&pool, created_id).await;
+        delete_user_row(&pool, user_id).await;
+        assert_eq!(
+            ip,
+            Some(Some("203.0.113.62".to_string())),
+            "the USER_CREATED row must carry the request peer IP (#4762)"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

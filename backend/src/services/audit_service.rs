@@ -528,6 +528,15 @@ impl AuditEntry {
     /// previous behavior; jobs that emit several related events should group
     /// them under one explicit [`AuditEntry::correlation`] value per logical
     /// operation.
+    ///
+    /// The client IP likewise defaults to the in-flight request's VERIFIED
+    /// client IP (#4762), the address [`AuditEntry::with_request_client_ip`]
+    /// resolves (#3888/#4681): the TCP peer, or a forwarded address only
+    /// under `XFF_TRUSTED_FOR_AUTHZ` behind a trusted proxy. Every writer
+    /// that builds its entry while handling a request records the same
+    /// address, whether or not it opts in. Outside a request scope, or when
+    /// the address is not verified, it stays `None` (`NULL` in the row);
+    /// [`AuditEntry::ip`] still overrides it.
     pub fn new(action: AuditAction, resource_type: ResourceType) -> Self {
         Self {
             event_id: Uuid::new_v4(),
@@ -537,7 +546,7 @@ impl AuditEntry {
             resource_id: None,
             resource_name: None,
             details: None,
-            ip_address: None,
+            ip_address: crate::api::middleware::client_ip::current_verified_client_ip(),
             correlation_id: crate::api::middleware::tracing::current_correlation_id()
                 .map(crate::api::middleware::tracing::CorrelationId::into_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -1983,6 +1992,37 @@ mod tests {
         )
         .await;
         assert_eq!(entry.ip_address, Some(verified));
+    }
+
+    #[tokio::test]
+    async fn new_entry_defaults_to_the_verified_request_client_ip_4762() {
+        // #4762: a writer that never opts in still records the verified
+        // client IP of the request it runs in; only the verified grade is
+        // used, and an explicit `.ip(..)` still wins.
+        use crate::api::middleware::client_ip::with_client_ip_context;
+        let best = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33));
+        let verified = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 62));
+        let entry = with_client_ip_context(Some(best), Some(verified), async {
+            AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(verified));
+
+        let entry = with_client_ip_context(Some(best), None, async {
+            AuditEntry::new(AuditAction::UserCreated, ResourceType::User)
+        })
+        .await;
+        assert_eq!(
+            entry.ip_address, None,
+            "an unverified address is never recorded"
+        );
+
+        let explicit = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let entry = with_client_ip_context(Some(best), Some(verified), async {
+            AuditEntry::new(AuditAction::UserCreated, ResourceType::User).ip(explicit)
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(explicit));
     }
 
     #[test]
