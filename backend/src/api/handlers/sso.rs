@@ -37,6 +37,7 @@ use crate::services::auth_config_service::SamlConfigRow;
 use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
+use crate::services::metrics_service::AuthFailureReason;
 use crate::services::oidc_service::resolve_federated_email;
 use crate::services::saml_service::SamlService;
 
@@ -83,6 +84,17 @@ async fn audit_federated_login(
         entry = entry.actor_name(name);
     }
     audit_fire_and_forget(state.db.clone(), entry).await;
+}
+
+/// Count a rejected OIDC, SAML or LDAP sign-in in `ak_auth_failures_total`
+/// (#4676): only credential and policy refusals, `expired` when the
+/// validator said so, never an IdP outage.
+fn record_sso_auth_failure(err: &AppError, fallback: AuthFailureReason) {
+    crate::services::metrics_service::record_auth_failure_for_error(
+        crate::services::metrics_service::AuthFailureSurface::Sso,
+        err,
+        fallback,
+    );
 }
 
 /// Re-validate an OIDC endpoint URL against the outbound-URL SSRF guard
@@ -540,11 +552,13 @@ pub async fn oidc_callback(
     // /oidc/{B}/callback so the PKCE code_verifier and code travel to
     // provider B's token endpoint. We derive provider_id from the session
     // (the authoritative side) and reject if the URL path disagrees.
-    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
+    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state)
+        .await
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
     if session.provider_id != id {
-        return Err(AppError::Authentication(
-            "SSO state does not match provider".to_string(),
-        ));
+        let err = AppError::Authentication("SSO state does not match provider".to_string());
+        record_sso_auth_failure(&err, AuthFailureReason::InvalidToken);
+        return Err(err);
     }
     oidc_callback_inner(
         state,
@@ -581,7 +595,9 @@ pub async fn oidc_callback_generic(
     };
 
     // Validate SSO session and resolve the provider from the stored state
-    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
+    let session = AuthConfigService::validate_sso_session(&state.db, &sso_state)
+        .await
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
     oidc_callback_inner(
         state,
         session.provider_id,
@@ -670,7 +686,8 @@ async fn oidc_callback_inner(
         session_nonce.as_deref(),
         row.allow_legacy_rsa_keys,
     )
-    .await?;
+    .await
+    .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
     // 6. Extract user claims (using attribute_mapping overrides when configured)
     let attr = &row.attribute_mapping;
@@ -769,6 +786,7 @@ async fn oidc_callback_inner(
     {
         Ok(result) => result,
         Err(e) => {
+            record_sso_auth_failure(&e, AuthFailureReason::Scope);
             audit_federated_login(
                 &state,
                 AuditAction::LoginFailed,
@@ -887,6 +905,7 @@ pub async fn ldap_login(
     let ldap_user = match ldap_svc.authenticate(&req.username, &req.password).await {
         Ok(u) => u,
         Err(e) => {
+            record_sso_auth_failure(&e, AuthFailureReason::BadPassword);
             audit_federated_login(
                 &state,
                 AuditAction::LoginFailed,
@@ -1191,6 +1210,7 @@ pub async fn saml_acs(
     let saml_user = match saml_svc.authenticate(&form.saml_response).await {
         Ok(u) => u,
         Err(e) => {
+            record_sso_auth_failure(&e, AuthFailureReason::InvalidToken);
             audit_federated_login(
                 &state,
                 AuditAction::LoginFailed,
@@ -1335,8 +1355,9 @@ pub async fn exchange_code(
     Json(req): Json<ExchangeCodeRequest>,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
-    let (access_token, refresh_token) =
-        AuthConfigService::exchange_code(&state.db, &req.code).await?;
+    let (access_token, refresh_token) = AuthConfigService::exchange_code(&state.db, &req.code)
+        .await
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
     let expires_in = access_token_expires_in(
         &access_token,
@@ -4060,6 +4081,62 @@ mod tests {
     /// the handler and before the pool checkout. Router-level and DB-backed
     /// (no-op without `DATABASE_URL`) because the counterfactual *is* the
     /// query: with the hook removed this answers 500.
+    /// #4676: a rejected SSO step is counted in
+    /// `ak_auth_failures_total{surface="sso"}`: an unknown exchange code and
+    /// an unknown callback `state` are `invalid_token`. A request refused as
+    /// malformed (a NUL in the code) is not an auth failure.
+    #[test]
+    fn rejected_sso_steps_are_counted_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let dir = std::env::temp_dir().join(format!("ph-4676-{}", uuid::Uuid::new_v4()));
+            let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+            let app = tdh::router_anon(super::router(), state);
+            let exchange = |body: String| {
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/exchange")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            };
+            let (status, _) = tdh::send(
+                app.clone(),
+                exchange(format!("{{\"code\":\"ph-4676-{}\"}}", uuid::Uuid::new_v4())),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+            let (status, _) =
+                tdh::send(app.clone(), exchange("{\"code\":\"a\\u0000b\"}".into())).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+            let callback = axum::http::Request::builder()
+                .uri(format!(
+                    "/oidc/callback?code=c&state=ph-4676-{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, _) = tdh::send(app, callback).await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+            true
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "sso"), ("reason", "invalid_token")]
+            ),
+            2
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 2);
+    }
+
     #[tokio::test]
     async fn exchange_code_rejects_a_nul_in_code_before_the_query() {
         use crate::api::handlers::test_db_helpers as tdh;

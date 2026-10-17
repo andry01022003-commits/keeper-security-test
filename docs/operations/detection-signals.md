@@ -2,6 +2,9 @@
 
 Signals added for the detection gaps the 1.11.0 red team found (#4677). The
 audit actions are described in [audit-events.md](../audit-events.md).
+The connection, rate-limit, SSRF, rejected-credential and proxy-scan series
+(#4676), and the note on querying counters across restarts, are in
+[detection-metrics.md](detection-metrics.md).
 
 ## Refused logins
 

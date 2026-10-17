@@ -139,6 +139,17 @@ pub enum OutboundUrlContext {
 }
 
 impl OutboundUrlContext {
+    /// The `surface` label of `ak_ssrf_blocks_total` for this trust class
+    /// (#4676).
+    pub(crate) fn ssrf_surface(self) -> &'static str {
+        match self {
+            OutboundUrlContext::Upstream => "upstream",
+            OutboundUrlContext::Webhook => "webhook",
+            OutboundUrlContext::SsoDiscovery => "sso",
+            OutboundUrlContext::TrustedInternal => "internal",
+        }
+    }
+
     /// Name of the env var that, when set to a truthy value, exempts
     /// RFC1918 / IPv6 unique-local addresses for this context.
     fn env_var(self) -> &'static str {
@@ -259,7 +270,7 @@ pub fn validate_outbound_ldap_url(url_str: &str, label: &str) -> Result<()> {
     }
 
     if let Some(reason) = is_blocked_host_str(host, OutboundUrlContext::Upstream) {
-        record_block(label, &reason);
+        record_block(label, &reason, "ldap");
         return Err(block_reason_to_error(
             label,
             reason,
@@ -347,7 +358,7 @@ fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContex
     }
 
     if let Some(reason) = is_blocked_url_in(&parsed, ctx) {
-        record_block(label, &reason);
+        record_block(label, &reason, ssrf_surface(ctx, label));
         return Err(block_reason_to_error(label, reason, ctx));
     }
 
@@ -864,7 +875,21 @@ fn ipv6_in_prefix(net: std::net::Ipv6Addr, ip: std::net::Ipv6Addr, prefix: u8) -
     (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
-fn record_block(label: &str, reason: &BlockReason) {
+/// The `surface` label of `ak_ssrf_blocks_total` for one validation (#4676):
+/// the plugin and peer endpoints validate in the upstream trust class but are
+/// separate attack surfaces, so they are told apart by their field label;
+/// everything else is the trust class itself.
+fn ssrf_surface(ctx: OutboundUrlContext, label: &str) -> &'static str {
+    if label.starts_with("Plugin ") {
+        "plugin"
+    } else if label.starts_with("Peer ") {
+        "peer"
+    } else {
+        ctx.ssrf_surface()
+    }
+}
+
+fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
     let detail = match reason {
         BlockReason::Hostname(host) => host.clone(),
         BlockReason::Ip(ip) => ip.to_string(),
@@ -877,6 +902,7 @@ fn record_block(label: &str, reason: &BlockReason) {
         "outbound URL blocked"
     );
     crate::services::metrics_service::record_outbound_url_blocked(reason.metric_label(), label);
+    crate::services::metrics_service::record_ssrf_block(surface);
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -2441,5 +2467,36 @@ mod tests {
         assert!(sso.contains("SSO_ALLOW_PRIVATE_IPS"), "{sso}");
         // The hint is given once, not stacked by the SSO wrapper.
         assert_eq!(sso.matches("SSO_ALLOW_PRIVATE_IPS").count(), 1, "{sso}");
+    }
+
+    /// #4676: every SSRF refusal is counted in `ak_ssrf_blocks_total` under
+    /// the bounded surface that asked. Cloud metadata is hard-blocked in every
+    /// trust class, so no env toggle can change the outcome here.
+    #[test]
+    fn test_ssrf_blocks_are_counted_by_surface_4676() {
+        use crate::services::metrics_service::capture_counters;
+        let metadata = "http://169.254.169.254/latest/meta-data/";
+        let ((), counted) = capture_counters(|| {
+            assert!(validate_outbound_url(metadata, "Upstream URL").is_err());
+            assert!(validate_outbound_url(metadata, "Cargo upstream download URL").is_err());
+            assert!(validate_outbound_webhook_url(metadata, "Webhook URL").is_err());
+            assert!(validate_outbound_sso_url(metadata, "OIDC token endpoint").is_err());
+            assert!(validate_outbound_internal_url(metadata, "Scanner adapter URL").is_err());
+            assert!(validate_outbound_url(metadata, "Plugin callback URL").is_err());
+            assert!(validate_outbound_url(metadata, "Peer endpoint URL").is_err());
+            assert!(validate_outbound_ldap_url("ldap://169.254.169.254:389", "LDAP URL").is_err());
+            // Allowed and malformed URLs are not SSRF blocks.
+            assert!(validate_outbound_url("https://example.com/", "Upstream URL").is_ok());
+            assert!(validate_outbound_url("ftp://example.com/", "Upstream URL").is_err());
+        });
+        let get = |surface: &str| counted.get("ak_ssrf_blocks_total", &[("surface", surface)]);
+        assert_eq!(get("upstream"), 2);
+        assert_eq!(get("webhook"), 1);
+        assert_eq!(get("sso"), 1);
+        assert_eq!(get("internal"), 1);
+        assert_eq!(get("plugin"), 1);
+        assert_eq!(get("peer"), 1);
+        assert_eq!(get("ldap"), 1);
+        assert_eq!(counted.get("ak_ssrf_blocks_total", &[]), 8);
     }
 }

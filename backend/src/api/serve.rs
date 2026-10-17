@@ -17,7 +17,8 @@
 //! Every connection closed by either deadline while a request head was
 //! outstanding increments `ak_http_header_read_timeouts_total`. hyper also
 //! uses the header-read timer to close idle keep-alive connections; those are
-//! normal and are not counted.
+//! normal and are not counted. `ak_http_connections_open` is the number of
+//! accepted connections whose task has not finished (#4676).
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -160,7 +161,10 @@ where
 
         let signal_tx = Arc::clone(&signal_tx);
         let close_rx = close_rx.clone();
+        // `ak_http_connections_open` (#4676), released when the task ends.
+        let open = crate::services::metrics_service::OpenConnectionGuard::open();
         tokio::spawn(async move {
+            let _open = open;
             serve_connection(stream, tower_service, header_read_timeout, signal_tx).await;
             tracing::trace!("connection {remote_addr} closed");
             drop(close_rx);
@@ -483,6 +487,68 @@ mod tests {
         let mut buf = [0u8; 1];
         let held = tokio::time::timeout(TIMEOUT * 3, stream.read(&mut buf)).await;
         assert!(held.is_err(), "with the timeout off the server waits");
+        token.cancel();
+    }
+
+    /// `ak_http_connections_open` as of now. A debugging snapshot drains
+    /// what it reports, so the reads are summed into `seen`.
+    fn open_connections(snapshotter: &Snapshotter, seen: &mut f64) -> f64 {
+        *seen += snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "ak_http_connections_open")
+            .map(|(.., value)| match value {
+                DebugValue::Gauge(n) => n.into_inner(),
+                other => panic!("expected a gauge, got {other:?}"),
+            })
+            .unwrap_or(0.0);
+        *seen
+    }
+
+    /// Poll until `ak_http_connections_open` reads `want`, or give up.
+    async fn await_open_connections(snapshotter: &Snapshotter, seen: &mut f64, want: f64) -> f64 {
+        let deadline = Instant::now() + CLOSE_BOUND;
+        loop {
+            let now = open_connections(snapshotter, seen);
+            if now == want || Instant::now() > deadline {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #4676: `ak_http_connections_open` counts accepted connections until
+    /// their task ends, however the client leaves.
+    #[tokio::test]
+    async fn open_connections_gauge_tracks_accepted_connections_4676() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut seen = 0.0;
+
+        let (addr, token) = start(None).await;
+        // A held connection that has sent half a request head, and an idle one.
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let idle = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(
+            await_open_connections(&snapshotter, &mut seen, 2.0).await,
+            2.0
+        );
+
+        drop(idle);
+        assert_eq!(
+            await_open_connections(&snapshotter, &mut seen, 1.0).await,
+            1.0
+        );
+        drop(slow);
+        assert_eq!(
+            await_open_connections(&snapshotter, &mut seen, 0.0).await,
+            0.0
+        );
         token.cancel();
     }
 

@@ -363,6 +363,12 @@ pub async fn login(
     {
         Ok(result) => result,
         Err(failure) => {
+            if let Some(reason) = failure.metric_reason() {
+                crate::services::metrics_service::record_auth_failure(
+                    crate::services::metrics_service::AuthFailureSurface::Api,
+                    reason,
+                );
+            }
             // The response no longer says which arm rejected the login, so the
             // audit event carries it instead: a SIEM can still separate a
             // username sweep (`unknown_or_inactive_user`) from a locked-out
@@ -2743,6 +2749,38 @@ mod tests {
             "past the pad budget the handler must pass TimingPad::Off, so an \
              unknown username costs no bcrypt (#3504)"
         );
+    }
+
+    /// #4676: a rejected login is counted in `ak_auth_failures_total` on the
+    /// `api` surface, bucketed by the reason its audit row records.
+    #[test]
+    fn test_login_rejection_is_counted_by_reason_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let dir = std::env::temp_dir().join(format!("ph-4676-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+            let app = login_app_with_pad_budget(state, 10_000);
+            let (status, _) =
+                login_unknown_user_counting_bcrypt(&app, &format!("ph-ghost-{}", Uuid::new_v4()))
+                    .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            true
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "api"), ("reason", "unknown_user")]
+            ),
+            1
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 1);
     }
 
     // -----------------------------------------------------------------------

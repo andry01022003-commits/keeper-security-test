@@ -6,6 +6,13 @@
 //! instead of the concrete URL. This avoids high-cardinality label explosion.
 //! When no matched path is available (scanner traffic, 404s, fallback routes),
 //! the label is collapsed to the fixed string `"unmatched"`.
+//!
+//! The OCI Distribution API is the exception (#4676): `/v2/*` is served by one
+//! fallback handler that parses the path itself, so axum has no pattern for
+//! it. Those requests are labelled with the distribution-spec template
+//! (`/v2/{name}/manifests/{reference}`, `/v2/{name}/blobs/{digest}`, ...)
+//! parsed by the same function the handler uses, so repository names, tags
+//! and digests never become label values.
 
 use std::time::Instant;
 
@@ -61,11 +68,13 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     // Prefer the matched route pattern for low-cardinality labels. When no
     // route matched, collapse to "unmatched" to avoid per-URL label explosion
     // from scanner traffic (which accounts for >99% of unmatched requests).
-    let path = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|mp| mp.as_str().to_owned())
-        .unwrap_or_else(|| "unmatched".to_string());
+    let path = path_label(
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str),
+        request.uri().path(),
+    );
 
     let start = Instant::now();
 
@@ -103,6 +112,40 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     // _guard drops here, firing exactly one decrement in all cases:
     // normal completion and future cancellation.
     response
+}
+
+/// The `path` label for a request: its OCI route template when it is an OCI
+/// Distribution request with no route pattern of its own, else axum's matched
+/// pattern, else `"unmatched"`.
+fn path_label(matched: Option<&str>, uri_path: &str) -> String {
+    let routed_by_pattern = matched.is_some_and(|m| !m.contains('*'));
+    if !routed_by_pattern {
+        if let Some(template) = oci_route_template(uri_path) {
+            return template.to_string();
+        }
+    }
+    matched.unwrap_or("unmatched").to_string()
+}
+
+/// The distribution-spec route template for an OCI `/v2/...` request path,
+/// or `None` when the path is not under `/v2/` or is not an OCI operation
+/// the handler recognises (those stay `"unmatched"`).
+fn oci_route_template(uri_path: &str) -> Option<&'static str> {
+    let rest = uri_path.strip_prefix("/v2/")?;
+    let (name, operation, reference) = crate::api::handlers::oci_v2::parse_oci_path(rest)?;
+    if name.is_empty() {
+        return None;
+    }
+    let has_reference = reference.is_some_and(|r| !r.is_empty());
+    Some(match (operation.as_str(), has_reference) {
+        ("manifests", _) => "/v2/{name}/manifests/{reference}",
+        ("blobs", _) => "/v2/{name}/blobs/{digest}",
+        ("uploads", true) => "/v2/{name}/blobs/uploads/{uuid}",
+        ("uploads", false) => "/v2/{name}/blobs/uploads/",
+        ("tags", _) => "/v2/{name}/tags/list",
+        ("referrers", _) => "/v2/{name}/referrers/{digest}",
+        _ => return None,
+    })
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -234,6 +277,78 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .expect("path label should exist");
         assert_eq!(path, "unmatched");
+    }
+
+    fn path_label_of(metrics: &[CapturedMetric]) -> String {
+        find_labels(metrics, "ak_http_requests_total")
+            .iter()
+            .find(|(k, _)| k == "path")
+            .map(|(_, v)| v.clone())
+            .expect("path label should exist")
+    }
+
+    /// The production shape of the OCI surface (#4676): `/v2` is a nested
+    /// router whose concrete routes are `/token` and `/_catalog`, with every
+    /// content operation served by its fallback, and the metrics layer on the
+    /// outer router as in `main.rs`.
+    fn oci_shaped_app() -> Router {
+        let v2 = Router::new()
+            .route("/token", get(test_handler))
+            .route("/_catalog", get(test_handler))
+            .fallback(test_handler);
+        Router::new()
+            .route("/v2/", get(test_handler))
+            .nest("/v2", v2)
+            .route("/api/v1/repositories/:key", get(test_handler))
+            .layer(middleware::from_fn(metrics_middleware))
+    }
+
+    #[test]
+    fn test_oci_requests_are_labelled_with_route_templates_4676() {
+        let cases = [
+            (
+                "/v2/library/alpine/manifests/3.20",
+                "/v2/{name}/manifests/{reference}",
+            ),
+            (
+                "/v2/team/app/manifests/sha256:0123abcd",
+                "/v2/{name}/manifests/{reference}",
+            ),
+            ("/v2/app/blobs/sha256:0123abcd", "/v2/{name}/blobs/{digest}"),
+            ("/v2/a/b/c/blobs/uploads/", "/v2/{name}/blobs/uploads/"),
+            (
+                "/v2/app/blobs/uploads/5f0c6c1e-1b1a-4a8e-9f0e-2d1d2c3b4a59",
+                "/v2/{name}/blobs/uploads/{uuid}",
+            ),
+            ("/v2/library/alpine/tags/list", "/v2/{name}/tags/list"),
+            (
+                "/v2/app/referrers/sha256:0123abcd",
+                "/v2/{name}/referrers/{digest}",
+            ),
+        ];
+        for (uri, template) in cases {
+            let metrics = run_with_recorder(oci_shaped_app(), uri);
+            assert_eq!(path_label_of(&metrics), template, "{uri}");
+        }
+    }
+
+    #[test]
+    fn test_oci_concrete_routes_and_other_paths_keep_their_labels_4676() {
+        for (uri, label) in [
+            ("/v2/token", "/v2/token"),
+            ("/v2/_catalog", "/v2/_catalog"),
+            ("/v2/", "/v2/"),
+            (
+                "/api/v1/repositories/maven-local",
+                "/api/v1/repositories/:key",
+            ),
+            // Under /v2 but not an OCI operation: bounded, not the raw path.
+            ("/v2/not/an/oci/operation", "unmatched"),
+            ("/scanner-probe/.env", "unmatched"),
+        ] {
+            let metrics = run_with_recorder(oci_shaped_app(), uri);
+            assert_eq!(path_label_of(&metrics), label, "{uri}");
+        }
     }
 
     #[test]

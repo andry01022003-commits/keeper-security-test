@@ -9435,6 +9435,57 @@ pub(crate) async fn gate_proxy_scan_serve(
     identity: ProxyScanIdentity,
     mode: ProxyScanMode,
 ) -> ProxyScanServeOutcome {
+    let outcome = decide_proxy_scan_serve(
+        state,
+        repo_id,
+        filename,
+        digest,
+        synthetic,
+        bytes,
+        action,
+        severity_gate,
+        identity,
+        mode,
+    )
+    .await;
+    record_proxy_scan_outcome(&outcome);
+    outcome
+}
+
+/// The `(verdict, action)` labels of `ak_proxy_scan_verdicts_total` for one
+/// gate outcome (#4676). A denial is told apart by its status: 403 is a
+/// vulnerable verdict blocked, anything else (423) an inconclusive scan
+/// locked under fail-closed.
+fn proxy_scan_outcome_labels(outcome: &ProxyScanServeOutcome) -> (&'static str, &'static str) {
+    match outcome {
+        ProxyScanServeOutcome::Serve(ProxyScanServed::Clean) => ("clean", "served"),
+        ProxyScanServeOutcome::Serve(ProxyScanServed::Pending) => ("pending", "served"),
+        ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded) => ("vulnerable", "recorded"),
+        ProxyScanServeOutcome::Deny(resp) if resp.status() == StatusCode::FORBIDDEN => {
+            ("vulnerable", "blocked")
+        }
+        ProxyScanServeOutcome::Deny(_) => ("inconclusive", "locked"),
+    }
+}
+
+fn record_proxy_scan_outcome(outcome: &ProxyScanServeOutcome) {
+    let (verdict, action) = proxy_scan_outcome_labels(outcome);
+    crate::services::metrics_service::record_proxy_scan_verdict(verdict, action);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_proxy_scan_serve(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+    synthetic: crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    identity: ProxyScanIdentity,
+    mode: ProxyScanMode,
+) -> ProxyScanServeOutcome {
     use crate::services::proxy_scan_service::{decide_serve, ProxyScanService, ServeDecision};
 
     let pss = ProxyScanService::new(state.db.clone());
@@ -9847,6 +9898,7 @@ async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
                 repo_id = %req.repo_id, file = %req.filename, format = F::LABEL,
                 "proxy object exceeds scan byte cap; fail-closed -> 423"
             );
+            crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "locked");
             Err(scan_pending_locked_response(req.filename))
         }
         InconclusiveOutcome::ServePending => {
@@ -9855,6 +9907,7 @@ async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
                 "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
             );
             let mut resp = file.serve_unscanned_stream(state, req).await?;
+            crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "served");
             record_scanned_proxy_download(state, req).await;
             resp.headers_mut()
                 .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
@@ -11313,6 +11366,68 @@ mod tests {
             ),
             "inconclusive under fail-open must still serve loudly pending"
         );
+    }
+
+    /// #4676: every gate decision is counted in
+    /// `ak_proxy_scan_verdicts_total{verdict,action}`: here an inconclusive
+    /// scan locked under fail-closed and a first pull served pending under
+    /// fail-open.
+    #[test]
+    fn inline_gate_outcomes_are_counted_by_verdict_and_action_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+                return false;
+            };
+            run_gate(&fx.state, ProxyScanAction::FailClosed).await;
+            run_gate(&fx.state, ProxyScanAction::FailOpen).await;
+            fx.teardown().await;
+            true
+        });
+        if !ran {
+            return;
+        }
+        let get = |verdict: &str, action: &str| {
+            counted.get(
+                "ak_proxy_scan_verdicts_total",
+                &[("verdict", verdict), ("action", action)],
+            )
+        };
+        assert_eq!(get("inconclusive", "locked"), 1);
+        assert_eq!(get("pending", "served"), 1);
+        assert_eq!(counted.get("ak_proxy_scan_verdicts_total", &[]), 2);
+    }
+
+    /// #4676: the label mapping for every outcome the gate can return.
+    #[test]
+    fn proxy_scan_outcome_labels_cover_every_outcome_4676() {
+        let cases = [
+            (
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
+                ("clean", "served"),
+            ),
+            (
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Pending),
+                ("pending", "served"),
+            ),
+            (
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded),
+                ("vulnerable", "recorded"),
+            ),
+            (
+                ProxyScanServeOutcome::Deny(scan_blocked_response("f")),
+                ("vulnerable", "blocked"),
+            ),
+            (
+                ProxyScanServeOutcome::Deny(scan_pending_locked_response("f")),
+                ("inconclusive", "locked"),
+            ),
+        ];
+        for (outcome, labels) in cases {
+            assert_eq!(proxy_scan_outcome_labels(&outcome), labels);
+        }
     }
 
     /// ScanFailed arm: a CVE-authoritative scanner that hard-errors is

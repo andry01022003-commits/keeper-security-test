@@ -53,6 +53,7 @@ use crate::error::{AppError, Result};
 use crate::models::user::User;
 use crate::services::auth_service::{AccessToken, AuthService, FederatedCredentials};
 use crate::services::ci_oidc_service::{claim_value, CiOidcProvider, CiOidcService};
+use crate::services::metrics_service::AuthFailureReason;
 
 /// Create public CI auth routes (no auth middleware needed — the CI JWT is the
 /// credential).
@@ -149,13 +150,20 @@ pub async fn exchange_ci_token(
     //    explicit `provider_id` override when one was sent (#3548).
     let provider = svc
         .resolve_provider_for_assertion(jwt, req.provider_id)
-        .await?;
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
     // 2. Validate the CI JWT (signature, audience, issuer — no claim check yet)
-    let claims = svc.validate_ci_jwt(&provider, jwt).await?;
+    let claims = svc
+        .validate_ci_jwt(&provider, jwt)
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
-    // 3-5. Resolve the mapping, its service account, and mint.
-    let (user, tokens) = exchange_validated_claims(&state, &svc, &provider, &claims).await?;
+    // 3-5. Resolve the mapping, its service account, and mint. A verified
+    // assertion refused here is refused by policy (no mapping matches).
+    let (user, tokens) = exchange_validated_claims(&state, &svc, &provider, &claims)
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::Scope))?;
 
     Ok(Json(CiTokenResponse {
         access_token: tokens.access_token,
@@ -163,6 +171,16 @@ pub async fn exchange_ci_token(
         expires_in: tokens.expires_in,
         username: user.username,
     }))
+}
+
+/// Count a rejected CI assertion in `ak_auth_failures_total` (#4676): only
+/// credential rejections, `expired` when the validator said so.
+fn record_ci_auth_failure(err: &AppError, fallback: AuthFailureReason) {
+    crate::services::metrics_service::record_auth_failure_for_error(
+        crate::services::metrics_service::AuthFailureSurface::CiOidc,
+        err,
+        fallback,
+    );
 }
 
 /// Everything the exchange does once the assertion is verified: pick the
@@ -636,6 +654,35 @@ mod tests {
         .expect_err("missing Authorization header must fail");
 
         assert!(err.to_string().contains("Missing Authorization header"));
+    }
+
+    /// #4676: a rejected CI assertion is counted in
+    /// `ak_auth_failures_total{surface="ci_oidc"}`; a request that presents no
+    /// assertion at all is not. Both are rejected before any DB lookup.
+    #[test]
+    fn exchange_ci_token_counts_rejected_assertions_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer not-a-jwt"),
+            );
+            exchange_ci_token(State(lazy_test_state()), headers, Bytes::new())
+                .await
+                .expect_err("an unreadable assertion must be rejected");
+            exchange_ci_token(State(lazy_test_state()), HeaderMap::new(), Bytes::new())
+                .await
+                .expect_err("a missing assertion must be rejected");
+        });
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "ci_oidc"), ("reason", "invalid_token")]
+            ),
+            1
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 1);
     }
 
     #[tokio::test]

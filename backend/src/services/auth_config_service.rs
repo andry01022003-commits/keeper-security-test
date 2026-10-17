@@ -1471,6 +1471,7 @@ impl AuthConfigService {
             .into_iter()
             .find(|sa| !crate::api::validation::is_blocked_resolved_ip(sa.ip()));
         let Some(vetted) = vetted else {
+            crate::services::metrics_service::record_ssrf_block("ldap");
             // Name the setting that admits a private LDAP server (#4638).
             return Err(match first {
                 Some(ip) => {

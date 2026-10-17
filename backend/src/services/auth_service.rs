@@ -1265,6 +1265,15 @@ pub struct LoginFailure {
     pub reason: Option<&'static str>,
 }
 
+impl LoginFailure {
+    /// The `ak_auth_failures_total` reason for this failure (#4676), or
+    /// `None` when it was not a credential rejection (an outage, shed load).
+    pub fn metric_reason(&self) -> Option<crate::services::metrics_service::AuthFailureReason> {
+        self.reason
+            .map(crate::services::metrics_service::AuthFailureReason::for_login_audit_reason)
+    }
+}
+
 impl From<AppError> for LoginFailure {
     fn from(error: AppError) -> Self {
         Self {
@@ -1433,9 +1442,20 @@ impl AuthService {
     /// [`Self::authenticate_for_login`] for the unauthenticated login
     /// endpoint.
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
-        self.authenticate_inner(username, password, AuthEntry::Shared)
+        self.authenticate_with_reason(username, password)
             .await
             .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::authenticate`], keeping the server-side rejection reason so a
+    /// caller can count the failure (#4676). Same entry point: no pad, no log.
+    pub async fn authenticate_with_reason(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> std::result::Result<(User, TokenPair), LoginFailure> {
+        self.authenticate_inner(username, password, AuthEntry::Shared)
+            .await
     }
 
     /// Authenticate for `POST /api/v1/auth/login` (#3504).

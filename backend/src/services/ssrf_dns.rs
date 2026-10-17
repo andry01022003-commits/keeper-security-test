@@ -227,6 +227,18 @@ pub fn ssrf_guard_resolver_sso() -> Arc<dyn Resolve> {
     Arc::new(SsrfGuardResolver::with_mode(ResolverMode::SsoDiscovery))
 }
 
+impl ResolverMode {
+    /// The `surface` label of `ak_ssrf_blocks_total` for this mode (#4676).
+    fn ssrf_surface(self) -> &'static str {
+        match self {
+            ResolverMode::Upstream => "upstream",
+            ResolverMode::TrustedInternal => "internal",
+            ResolverMode::Webhook => "webhook",
+            ResolverMode::SsoDiscovery => "sso",
+        }
+    }
+}
+
 /// True when a resolved IP must be dropped for the given [`ResolverMode`].
 fn is_blocked_for(mode: ResolverMode, ip: std::net::IpAddr) -> bool {
     match mode {
@@ -285,6 +297,7 @@ impl Resolve for SsrfGuardResolver {
                     mode = ?mode,
                     "SSRF DNS guard blocked all resolved addresses for host"
                 );
+                crate::services::metrics_service::record_ssrf_block(mode.ssrf_surface());
                 let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "all resolved addresses blocked by SSRF policy",
@@ -383,6 +396,30 @@ mod tests {
             result.is_err(),
             "localhost must be refused by the SSRF resolver"
         );
+    }
+
+    /// #4676: a connect-time refusal (every resolved address blocked) is an
+    /// SSRF block too, counted under the resolver's surface.
+    #[test]
+    fn resolver_refusal_is_counted_as_an_ssrf_block_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            let refuse = |resolver: Arc<dyn Resolve>| async move {
+                let name: Name = "169.254.169.254".parse().expect("valid dns name");
+                assert!(resolver.resolve(name).await.is_err());
+            };
+            refuse(Arc::new(SsrfGuardResolver::default())).await;
+            refuse(ssrf_guard_resolver_webhook()).await;
+            refuse(ssrf_guard_resolver_sso()).await;
+            refuse(ssrf_guard_resolver_internal()).await;
+        });
+        for surface in ["upstream", "webhook", "sso", "internal"] {
+            assert_eq!(
+                counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
+                1,
+                "{surface}"
+            );
+        }
     }
 
     #[tokio::test]

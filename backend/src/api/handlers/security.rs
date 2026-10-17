@@ -3009,6 +3009,7 @@ async fn rescan_proxy_cached_path(
     // a storage failure still retains its canonical 404 without consuming
     // this repository's rescan slot -- no scanner has run yet.
     if let Err(remaining) = claim_rescan_slot(repo.id) {
+        crate::services::metrics_service::record_rate_limit_rejection("proxy_rescan");
         return Ok(rescan_throttled_response(remaining));
     }
 

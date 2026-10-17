@@ -33,6 +33,9 @@ use crate::models::access_scope::AccessScope;
 use crate::models::repository::RepositoryVisibility;
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
+use crate::services::metrics_service::{
+    record_auth_failure, AuthFailureReason, AuthFailureSurface,
+};
 use crate::services::permission_service::PermissionService;
 
 /// Custom header name for API key
@@ -892,7 +895,9 @@ pub async fn auth_middleware(
     // invalidation (TOTP, password) to exempt the calling session's own token
     // now travels as `AuthExtension::iat_ms`, stamped at the single
     // `From<Claims>` source; it is `None` for non-JWT principals (#1394).
-    let header_result: Result<AuthExtension, &'static str> = match extracted {
+    // A failure carries the 401 message and, when a credential was presented,
+    // what `ak_auth_failures_total` counts it as (#4676).
+    let header_result: HeaderAuthResult = match extracted {
         // Replica-safe access-token validation. The async variant consults the
         // DB credential-change watermark (#1173) so a password reset, TOTP
         // change, or deactivation on a peer replica is honoured here on the
@@ -908,27 +913,46 @@ pub async fn auth_middleware(
                 // credential-watermark lookup is infrastructure, not a bad
                 // token: retryable 503, never a fall-through to 401 (#4750).
                 Err(ref e) if e.is_db_unavailable() => return service_unavailable_response(),
-                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => Ok(ext),
-                    // Same transient bcrypt-capacity shed as the Basic branch
-                    // below: a saturated cap is "retry shortly", not "wrong
-                    // token". See `TokenAuthError::Overloaded`.
-                    Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
-                    Err(TokenAuthError::Invalid) => Err("Invalid or expired token"),
-                },
+                Err(jwt_err) => {
+                    match validate_api_token_with_scopes(&auth_service, token).await {
+                        Ok(ext) => Ok(ext),
+                        // Same transient bcrypt-capacity shed as the Basic branch
+                        // below: a saturated cap is "retry shortly", not "wrong
+                        // token". See `TokenAuthError::Overloaded`.
+                        Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
+                        Err(TokenAuthError::Invalid(reason)) => Err((
+                            "Invalid or expired token",
+                            Some(bearer_failure(&jwt_err, reason)),
+                        )),
+                    }
+                }
             }
         }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => Ok(ext),
                 Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
-                Err(TokenAuthError::Invalid) => Err("Invalid or expired API token"),
+                Err(TokenAuthError::Invalid(reason)) => Err((
+                    "Invalid or expired API token",
+                    Some((AuthFailureSurface::Api, reason)),
+                )),
             }
         }
         ExtractedToken::Basic(encoded) => match decode_basic_credentials(encoded) {
-            None => Err("Invalid Basic auth credentials"),
+            None => Err((
+                "Invalid Basic auth credentials",
+                Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken)),
+            )),
             Some((username, password)) => {
-                match auth_service.authenticate(&username, &password).await {
+                match auth_service
+                    .authenticate_with_reason(&username, &password)
+                    .await
+                    .map_err(|failure| {
+                        let reason = failure
+                            .metric_reason()
+                            .unwrap_or(AuthFailureReason::BadPassword);
+                        (failure.error, reason)
+                    }) {
                     Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
                     // A transient bcrypt-capacity shed must NOT be collapsed
                     // into a 401. `authenticate()` runs bcrypt(cost=12) under a
@@ -943,7 +967,7 @@ pub async fn auth_middleware(
                     // saturated cap): twine does not retry on 401 but does on
                     // 503. Surface the shed as 503 + Retry-After so well-behaved
                     // clients back off and retry instead of aborting.
-                    Err(AppError::ServiceUnavailable(msg)) => {
+                    Err((AppError::ServiceUnavailable(msg), _)) => {
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
                             [(axum::http::header::RETRY_AFTER, "1")],
@@ -956,10 +980,10 @@ pub async fn auth_middleware(
                     // password": surface the same retryable 503 the #2101/#2102
                     // handlers return rather than flattening it to a spurious
                     // 401 (#2125). Clients retry on 503 but abort on 401.
-                    Err(ref e) if e.is_db_unavailable() => {
+                    Err((ref e, _)) if e.is_db_unavailable() => {
                         return service_unavailable_response();
                     }
-                    Err(_) => {
+                    Err((_, password_reason)) => {
                         // Try treating the password as a short-lived JWT access
                         // token. This enables CI/CD keyless flows (e.g. OIDC
                         // token exchange) where package managers like Maven,
@@ -983,17 +1007,23 @@ pub async fn auth_middleware(
                             Err(ref e) if e.is_db_unavailable() => {
                                 return service_unavailable_response();
                             }
-                            Err(_) => Err("Invalid credentials"),
+                            Err(_) => Err((
+                                "Invalid credentials",
+                                Some((AuthFailureSurface::Basic, password_reason)),
+                            )),
                         }
                     }
                 }
             }
         },
-        ExtractedToken::None => Err("Missing authorization header"),
-        ExtractedToken::Invalid => Err("Invalid authorization header format"),
+        ExtractedToken::None => Err(("Missing authorization header", None)),
+        ExtractedToken::Invalid => Err((
+            "Invalid authorization header format",
+            Some((AuthFailureSurface::Api, AuthFailureReason::InvalidToken)),
+        )),
     };
 
-    let header_error = match header_result {
+    let (header_error, header_failure) = match header_result {
         Ok(ext) => {
             // Enforce a forced password rotation (`must_change_password`).
             //
@@ -1077,7 +1107,34 @@ pub async fn auth_middleware(
     } else {
         header_error
     };
+    // Count the rejected credential (#4676). A rejected download ticket is a
+    // presented credential too; a request that presented nothing is not.
+    let failure = header_failure.or_else(|| {
+        ticket_parts
+            .is_some()
+            .then_some((AuthFailureSurface::Api, AuthFailureReason::InvalidToken))
+    });
+    if let Some((surface, reason)) = failure {
+        record_auth_failure(surface, reason);
+    }
     (StatusCode::UNAUTHORIZED, message).into_response()
+}
+
+/// `(surface, reason)` of one rejected credential for `ak_auth_failures_total`.
+type AuthFailureLabels = (AuthFailureSurface, AuthFailureReason);
+
+/// `auth_middleware`'s header-credential result: the principal, or the 401
+/// message plus the labels of the rejected credential (none when nothing was
+/// presented).
+type HeaderAuthResult = Result<AuthExtension, (&'static str, Option<AuthFailureLabels>)>;
+
+/// The labels for a Bearer credential that failed as a JWT and then as an API
+/// token: `expired` if either validator said so, else `invalid_token`.
+fn bearer_failure(jwt_err: &AppError, api_token_reason: AuthFailureReason) -> AuthFailureLabels {
+    (
+        AuthFailureSurface::Api,
+        AuthFailureReason::for_token_error(jwt_err, api_token_reason),
+    )
 }
 
 /// Why an API-token validation attempt did not produce an [`AuthExtension`].
@@ -1093,7 +1150,9 @@ pub async fn auth_middleware(
 #[derive(Debug, PartialEq, Eq)]
 enum TokenAuthError {
     /// The credential failed validation; the caller owes the client a 401.
-    Invalid,
+    /// Carries the `ak_auth_failures_total` reason (`expired` or
+    /// `invalid_token`, #4676).
+    Invalid(AuthFailureReason),
     /// The bcrypt-bound auth-concurrency cap is saturated; the caller must
     /// surface a retryable 503 (see [`service_unavailable_response`]), never
     /// a 401.
@@ -1118,7 +1177,10 @@ fn classify_token_validation_err(err: AppError) -> TokenAuthError {
         // database-unavailable failure (closed pool, lost connection,
         // statement / lock timeout) by #4750.
         ref e if e.is_db_unavailable() => TokenAuthError::Overloaded,
-        _ => TokenAuthError::Invalid,
+        ref e => TokenAuthError::Invalid(AuthFailureReason::for_token_error(
+            e,
+            AuthFailureReason::InvalidToken,
+        )),
     }
 }
 
@@ -1219,29 +1281,55 @@ pub(crate) enum AuthOutcome {
 /// Runs in an `INTERNAL` `authenticate` span (#4455), so a trace shows how
 /// much of a request went to credential validation (JWT, API-token lookup,
 /// bcrypt). The span records no credential material.
+///
+/// Every [`AuthOutcome::InvalidCredential`] is counted in
+/// `ak_auth_failures_total` (#4676): each request resolves its credential
+/// through here once on the path that answers it (the guest-access guard
+/// answers an invalid credential itself, before any inner middleware runs).
 #[tracing::instrument(name = "authenticate", level = "info", skip_all)]
 pub(crate) async fn try_resolve_auth_outcome(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
     allow_basic_api_token: bool,
 ) -> AuthOutcome {
+    let mut failure = None;
+    let outcome =
+        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+    if matches!(outcome, AuthOutcome::InvalidCredential) {
+        let (surface, reason) =
+            failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
+        record_auth_failure(surface, reason);
+    }
+    outcome
+}
+
+/// [`try_resolve_auth_outcome`]'s decision tree. Sets `failure` to the
+/// `ak_auth_failures_total` labels before answering `InvalidCredential`.
+async fn resolve_auth_outcome(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
+    failure: &mut Option<AuthFailureLabels>,
+) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
             // See `auth_middleware` for why this is the async variant. Same
             // rationale: optional-auth routes still need to reject pre-change
             // tokens across replicas (#1173).
-            match auth_service.validate_access_token_async(token).await {
+            let jwt_err = match auth_service.validate_access_token_async(token).await {
                 Ok(claims) => return AuthOutcome::Resolved(AuthExtension::from(claims)),
                 // Signature verified, DB lookup failed: retryable 503 (#4750).
                 Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
-                Err(_) => {}
-            }
+                Err(e) => e,
+            };
             match validate_api_token_with_scopes(auth_service, token).await {
                 Ok(ext) => return AuthOutcome::Resolved(ext),
                 // A transient bcrypt-capacity shed must surface as 503, not
                 // 401. See `AuthOutcome::Overloaded`.
                 Err(TokenAuthError::Overloaded) => return AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid) => {}
+                Err(TokenAuthError::Invalid(reason)) => {
+                    *failure = Some(bearer_failure(&jwt_err, reason));
+                }
             }
             // Some package managers (npm, cargo, goproxy) send Bearer tokens
             // that are base64-encoded `username:password` rather than JWTs or
@@ -1264,29 +1352,45 @@ pub(crate) async fn try_resolve_auth_outcome(
                 // See `AuthOutcome::Overloaded`: saturated bcrypt cap is a
                 // retryable 503, never a 401.
                 Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid) => AuthOutcome::InvalidCredential,
+                Err(TokenAuthError::Invalid(reason)) => {
+                    *failure = Some((AuthFailureSurface::Api, reason));
+                    AuthOutcome::InvalidCredential
+                }
             }
         }
         ExtractedToken::Basic(encoded) => {
             let Some((username, password)) = decode_basic_credentials(encoded) else {
+                *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken));
                 return AuthOutcome::InvalidCredential;
             };
             // Try bcrypt username/password auth first
-            match auth_service.authenticate(&username, &password).await {
+            match auth_service
+                .authenticate_with_reason(&username, &password)
+                .await
+            {
                 Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
                 // A transient bcrypt-capacity shed must surface as 503, not a
                 // 401. Without this, twine (which sends standard Basic auth)
                 // gets a spurious 401 under parallel-suite load and aborts,
                 // while a single curl -u upload with the same credentials
                 // succeeds. See `AuthOutcome::Overloaded`.
-                Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
+                Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => {
+                    return AuthOutcome::Overloaded
+                }
                 // A pool-acquire timeout is a retryable 503, never a 401.
                 // Short-circuit here so a saturated pool does not pay a second
                 // acquire-timeout on the API-token fallback below before the
                 // classifier reaches the same conclusion (#2125). See
                 // `AuthOutcome::Overloaded`.
-                Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
-                Err(_) => {}
+                Err(ref f) if f.error.is_db_unavailable() => return AuthOutcome::Overloaded,
+                // If every fallback below fails too, this is what the
+                // rejected credential counts as.
+                Err(f) => {
+                    *failure = Some((
+                        AuthFailureSurface::Basic,
+                        f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
+                    ));
+                }
             }
             // Try treating the password as a short-lived JWT access token.
             // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
@@ -1317,11 +1421,14 @@ pub(crate) async fn try_resolve_auth_outcome(
                 // pip-netrc-style `token:<api_token>` clients get the
                 // retryable 503, not a spurious 401.
                 Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid) => AuthOutcome::InvalidCredential,
+                Err(TokenAuthError::Invalid(_)) => AuthOutcome::InvalidCredential,
             }
         }
         ExtractedToken::None => AuthOutcome::NoCredential,
-        ExtractedToken::Invalid => AuthOutcome::InvalidCredential,
+        ExtractedToken::Invalid => {
+            *failure = Some((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
+            AuthOutcome::InvalidCredential
+        }
     }
 }
 
@@ -7663,7 +7770,10 @@ mod tests {
             ),
             AppError::Internal("bcrypt failure".to_string()),
         ] {
-            assert_eq!(classify_token_validation_err(err), TokenAuthError::Invalid);
+            assert!(matches!(
+                classify_token_validation_err(err),
+                TokenAuthError::Invalid(_)
+            ));
         }
         // #4750: an unreachable or failing database is infrastructure.
         for err in [
@@ -7697,6 +7807,160 @@ mod tests {
                 sqlx::Error::PoolTimedOut.to_string()
             )),
             TokenAuthError::Overloaded
+        );
+    }
+
+    /// #4676: every credential `try_resolve_auth_outcome` rejects is counted
+    /// in `ak_auth_failures_total` by surface and reason; a request with no
+    /// credential is not. These shapes are all rejected before any DB lookup.
+    #[test]
+    fn test_try_resolve_auth_outcome_counts_rejected_credentials_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            let auth_service = make_test_auth_service();
+            for extracted in [
+                ExtractedToken::Invalid,
+                ExtractedToken::ApiKey("badtok"),
+                ExtractedToken::Bearer("badtok"),
+                ExtractedToken::Basic("not-base64-at-all"),
+            ] {
+                let outcome = try_resolve_auth_outcome(&auth_service, extracted, true).await;
+                assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+            }
+            let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None, true).await;
+            assert!(matches!(outcome, AuthOutcome::NoCredential));
+        });
+        let get = |surface: &str, reason: &str| {
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", surface), ("reason", reason)],
+            )
+        };
+        assert_eq!(get("api", "invalid_token"), 3);
+        assert_eq!(get("basic", "invalid_token"), 1);
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 4);
+    }
+
+    /// #4676: a Bearer credential is `expired` when either validator said so.
+    #[test]
+    fn test_bearer_failure_reason_prefers_expired_4676() {
+        let expired_jwt = AppError::Authentication("Invalid token: ExpiredSignature".into());
+        let bad_jwt = AppError::Authentication("Invalid token: InvalidToken".into());
+        assert_eq!(
+            bearer_failure(&expired_jwt, AuthFailureReason::InvalidToken),
+            (AuthFailureSurface::Api, AuthFailureReason::Expired)
+        );
+        assert_eq!(
+            bearer_failure(&bad_jwt, AuthFailureReason::Expired),
+            (AuthFailureSurface::Api, AuthFailureReason::Expired)
+        );
+        assert_eq!(
+            bearer_failure(&bad_jwt, AuthFailureReason::InvalidToken),
+            (AuthFailureSurface::Api, AuthFailureReason::InvalidToken)
+        );
+    }
+
+    /// #4676: the management API's `auth_middleware` counts the credentials it
+    /// answers 401 for, with the password reason for Basic auth, and never a
+    /// request that presented nothing.
+    #[test]
+    fn test_auth_middleware_counts_rejected_credentials_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let secret = "test-secret-at-least-32-bytes-long-for-testing";
+            let cfg = crate::config::Config {
+                jwt_secret: secret.to_string(),
+                ..crate::config::Config::default()
+            };
+            let auth_service = Arc::new(AuthService::new(pool.clone(), Arc::new(cfg)));
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let hash = AuthService::hash_password("right-password").await.unwrap();
+            sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+                .bind(user_id)
+                .bind(&hash)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let unknown = run_auth_middleware_with_service(
+                auth_service.clone(),
+                basic_get(&format!("no-such-user-{}", Uuid::new_v4()), "x"),
+            )
+            .await;
+            let wrong = run_auth_middleware_with_service(
+                auth_service.clone(),
+                basic_get(&username, "wrong-password"),
+            )
+            .await;
+            let mut expired_claims = Claims {
+                sub: user_id,
+                username: username.clone(),
+                email: format!("{username}@test.local"),
+                is_admin: false,
+                allowed_repo_ids: None,
+                iat: Utc::now().timestamp() - 7200,
+                iat_ms: None,
+                exp: Utc::now().timestamp() - 3600,
+                token_type: "access".to_string(),
+                jti: None,
+                family_id: None,
+                scan_pull_repo: None,
+                scopes: None,
+            };
+            expired_claims.iat_ms = Some(expired_claims.iat * 1000);
+            let expired_jwt = encode(
+                &Header::default(),
+                &expired_claims,
+                &EncodingKey::from_secret(secret.as_bytes()),
+            )
+            .unwrap();
+            let expired = run_auth_middleware_with_service(
+                auth_service.clone(),
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", format!("Bearer {expired_jwt}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            let anonymous = run_auth_middleware_with_service(
+                auth_service.clone(),
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            for resp in [&unknown, &wrong, &expired, &anonymous] {
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            }
+            true
+        });
+        if !ran {
+            return;
+        }
+        let get = |surface: &str, reason: &str| {
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", surface), ("reason", reason)],
+            )
+        };
+        assert_eq!(get("basic", "unknown_user"), 1);
+        assert_eq!(get("basic", "bad_password"), 1);
+        assert_eq!(get("api", "expired"), 1);
+        assert_eq!(
+            counted.get("ak_auth_failures_total", &[]),
+            3,
+            "the anonymous request is not an auth failure"
         );
     }
 

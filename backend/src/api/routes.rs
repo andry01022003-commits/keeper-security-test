@@ -542,20 +542,26 @@ fn build_login_rate_limit_state(
     // username-cycling attacker cannot exhaust memory via unbounded distinct
     // keys. Sized far above any legitimate concurrent-login volume so real
     // users never reach it; it sheds rather than starves.
-    let backstop = Arc::new(RateLimiter::new(
-        config.rate_limit_login_global_per_window,
-        config.rate_limit_window_secs,
-    ));
+    let backstop = Arc::new(
+        RateLimiter::new(
+            config.rate_limit_login_global_per_window,
+            config.rate_limit_window_secs,
+        )
+        .named("login_global"),
+    );
     // Dedicated tight per-(username, IP) bucket for the login endpoint. The
     // login handler bcrypt-verifies the submitted password (and does so even
     // for locked accounts), so borrowing the loose general-auth budget lets a
     // single client drive a burst of verifies that saturates CPU. This budget
     // sheds excess login attempts as 429 in the middleware layer, before the
     // verifier runs. Default: 10 attempts / 15 minutes per (username, IP).
-    let limiter = Arc::new(RateLimiter::new(
-        config.rate_limit_login_per_window,
-        config.rate_limit_login_window_secs,
-    ));
+    let limiter = Arc::new(
+        RateLimiter::new(
+            config.rate_limit_login_per_window,
+            config.rate_limit_login_window_secs,
+        )
+        .named("login"),
+    );
     // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
     // above is keyed per-(username, IP), so cycling usernames gets a fresh one
     // every request; this one accrues against the source IP. It gates the pad,
@@ -608,10 +614,13 @@ fn build_token_exchange_rate_limit_state(
     login: &LoginRateLimitState,
     config: &crate::config::Config,
 ) -> LoginRateLimitState {
-    let limiter = Arc::new(RateLimiter::new(
-        token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
-        config.rate_limit_login_window_secs,
-    ));
+    let limiter = Arc::new(
+        RateLimiter::new(
+            token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
+            config.rate_limit_login_window_secs,
+        )
+        .named("token"),
+    );
     {
         let cleanup = Arc::clone(&limiter);
         tokio::spawn(async move {
@@ -663,33 +672,48 @@ fn api_v1_routes(
     // above) so they stay identical to the policy `/v2/token` sees; only the
     // endpoint limiters are built here.
 
-    let auth_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_auth_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    let api_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_api_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    let search_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_search_per_window,
-        state.config.rate_limit_window_secs,
-    ));
+    let auth_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("auth"),
+    );
+    let api_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_api_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("api"),
+    );
+    let search_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_search_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("search"),
+    );
     // Stricter per-IP bucket for endpoints that mint presigned download
     // URLs. See #1053.
-    let presign_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_presign_per_window,
-        state.config.rate_limit_window_secs,
-    ));
+    let presign_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_presign_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("presign"),
+    );
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
     // password guesses through this endpoint and CPU-grind the bcrypt
     // verifier. Default: 5 attempts / 15 minutes per user. See #1026.
-    let password_change_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_password_change_per_window,
-        state.config.rate_limit_password_change_window_secs,
-    ));
+    let password_change_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_password_change_per_window,
+            state.config.rate_limit_password_change_window_secs,
+        )
+        .named("password_change"),
+    );
 
     // Master on/off switch (#1602). When disabled, every rate-limit layer
     // short-circuits before touching its limiter so no request is limited.
@@ -1498,6 +1522,30 @@ mod tests {
         assert!(Arc::ptr_eq(&login.backstop, &token.backstop));
         assert!(Arc::ptr_eq(&login.failed_by_ip, &token.failed_by_ip));
         assert!(!Arc::ptr_eq(&login.inner.limiter, &token.inner.limiter));
+    }
+
+    /// #4676: the production limiters carry the names their refusals are
+    /// counted under in `ak_rate_limit_rejections_total{limiter}`.
+    #[tokio::test]
+    async fn production_login_limiters_are_named_for_the_rejection_counter() {
+        let config = crate::config::Config::test_config();
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&config, &exemptions, &proxies);
+        let token = build_token_exchange_rate_limit_state(&login, &config);
+        assert_eq!(login.inner.limiter.name(), "login");
+        assert_eq!(login.backstop.name(), "login_global");
+        assert_eq!(token.inner.limiter.name(), "token");
+        for name in ["auth", "api", "search", "presign", "password_change"] {
+            assert!(
+                ROUTES_RS_SRC.contains(&format!(".named(\"{name}\")")),
+                "the {name} limiter must be named for ak_rate_limit_rejections_total"
+            );
+        }
     }
 
     const ROUTES_RS_SRC: &str = include_str!("routes.rs");

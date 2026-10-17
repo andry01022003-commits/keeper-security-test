@@ -370,6 +370,7 @@ fn ssrf_redirect_policy() -> Policy {
     ssrf_redirect_policy_with(
         crate::api::validation::is_blocked_url,
         "http-client redirect",
+        "upstream",
     )
 }
 
@@ -382,6 +383,7 @@ fn ssrf_internal_redirect_policy() -> Policy {
     ssrf_redirect_policy_with(
         crate::api::validation::is_blocked_url_internal,
         "internal-service redirect",
+        "internal",
     )
 }
 
@@ -394,6 +396,7 @@ fn ssrf_webhook_redirect_policy() -> Policy {
     ssrf_redirect_policy_with(
         crate::api::validation::is_blocked_url_webhook,
         "webhook redirect",
+        "webhook",
     )
 }
 
@@ -403,7 +406,11 @@ fn ssrf_webhook_redirect_policy() -> Policy {
 /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` while metadata / loopback / link-local
 /// pivots are still refused.
 fn ssrf_sso_redirect_policy() -> Policy {
-    ssrf_redirect_policy_with(crate::api::validation::is_blocked_url_sso, "sso redirect")
+    ssrf_redirect_policy_with(
+        crate::api::validation::is_blocked_url_sso,
+        "sso redirect",
+        "sso",
+    )
 }
 
 /// Shared redirect-policy body: re-run `is_blocked` on every hop and refuse
@@ -412,6 +419,7 @@ fn ssrf_sso_redirect_policy() -> Policy {
 fn ssrf_redirect_policy_with(
     is_blocked: fn(&reqwest::Url) -> Option<crate::api::validation::BlockReason>,
     context_label: &'static str,
+    surface: &'static str,
 ) -> Policy {
     Policy::custom(move |attempt| {
         if let Some(reason) = is_blocked(attempt.url()) {
@@ -425,6 +433,7 @@ fn ssrf_redirect_policy_with(
                 reason.metric_label(),
                 context_label,
             );
+            crate::services::metrics_service::record_ssrf_block(surface);
             return attempt.error("redirect target rejected by SSRF policy");
         }
         if attempt.previous().len() >= MAX_REDIRECTS {
@@ -707,10 +716,9 @@ mod tests {
             }
         });
 
-        let client = loopback_client_from(
-            reqwest::Client::builder()
-                .redirect(super::ssrf_redirect_policy_with(|_| None, "test redirect")),
-        );
+        let client = loopback_client_from(reqwest::Client::builder().redirect(
+            super::ssrf_redirect_policy_with(|_| None, "test redirect", "upstream"),
+        ));
         let response = client
             .get(format!("http://127.0.0.1:{entry_port}/start"))
             .header(reqwest::header::AUTHORIZATION, "Bearer test-pat")

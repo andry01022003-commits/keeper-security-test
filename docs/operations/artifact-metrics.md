@@ -43,6 +43,10 @@ counter agrees with the download counts in the UI and API:
   be written, is not counted here; it is counted in
   `ak_download_events_dropped_total{kind="stats"}` instead.
 
+Both counters reset to zero when a backend process restarts; query them with
+`increase()` or `rate()` (see
+[detection-metrics.md](detection-metrics.md#counters-reset-on-restart)).
+
 ## Example queries
 
 ```promql

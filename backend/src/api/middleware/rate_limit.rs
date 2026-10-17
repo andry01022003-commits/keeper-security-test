@@ -284,6 +284,8 @@ pub struct RateLimiter {
     pub(crate) max_requests: u32,
     /// Duration of the rate limiting window
     window: Duration,
+    /// Fixed name for `ak_rate_limit_rejections_total{limiter}` (#4676).
+    name: &'static str,
 }
 
 impl RateLimiter {
@@ -297,7 +299,20 @@ impl RateLimiter {
             requests: Arc::new(Mutex::new(HashMap::new())),
             max_requests,
             window: Duration::from_secs(window_secs),
+            name: "other",
         }
+    }
+
+    /// Name this limiter for `ak_rate_limit_rejections_total{limiter}`
+    /// (#4676). Unnamed limiters report `other`.
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// The `limiter` label this limiter's refusals are counted under.
+    pub fn name(&self) -> &'static str {
+        self.name
     }
 
     /// Check if a request should be rate limited.
@@ -439,7 +454,7 @@ pub async fn rate_limit_middleware(
         ),
         Err(retry_after) => {
             tracing::debug!(key = %key, retry_after, "rate limit exceeded");
-            too_many_requests(retry_after, state.limiter.max_requests)
+            too_many_requests(retry_after, &state.limiter)
         }
     }
 }
@@ -492,7 +507,7 @@ pub async fn rate_limit_by_ip_middleware(
         ),
         Err(retry_after) => {
             tracing::debug!(key = %key, retry_after, "presign-mint rate limit exceeded");
-            too_many_requests(retry_after, state.limiter.max_requests)
+            too_many_requests(retry_after, &state.limiter)
         }
     }
 }
@@ -868,7 +883,7 @@ async fn run_login_with_key(
             ),
         )
         .await;
-        return too_many_requests(retry_after, state.backstop.max_requests);
+        return too_many_requests(retry_after, &state.backstop);
     }
 
     // Per-IP failed-login budget (#3504). This gates the bcrypt timing pad,
@@ -925,7 +940,7 @@ async fn run_login_with_key(
                 ),
             )
             .await;
-            too_many_requests(retry_after, state.inner.limiter.max_requests)
+            too_many_requests(retry_after, &state.inner.limiter)
         }
     }
 }
@@ -1105,8 +1120,11 @@ fn token_form_body_too_large() -> Response {
         .into_response()
 }
 
-/// Build a 429 response with `Retry-After` and `X-RateLimit-*` headers.
-fn too_many_requests(retry_after: u64, max_requests: u32) -> Response {
+/// Build a 429 response with `Retry-After` and `X-RateLimit-*` headers, and
+/// count the refusal against `limiter`'s name (#4676).
+fn too_many_requests(retry_after: u64, limiter: &RateLimiter) -> Response {
+    crate::services::metrics_service::record_rate_limit_rejection(limiter.name);
+    let max_requests = limiter.max_requests;
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         "Rate limit exceeded. Please try again later.",
@@ -2599,6 +2617,60 @@ mod tests {
             (1..=60).contains(&retry_after),
             "Retry-After must come from the login window"
         );
+    }
+
+    /// #4676: every 429 a limiter answers is counted in
+    /// `ak_rate_limit_rejections_total` under that limiter's name, and only
+    /// the refused requests are counted.
+    #[test]
+    fn test_rejections_are_counted_by_limiter_name_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            // Per-(user, IP) login bucket of 1: the second attempt is refused.
+            let login = LoginRateLimitState {
+                inner: RateLimitState {
+                    limiter: Arc::new(RateLimiter::new(1, 60).named("login")),
+                    exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                    enabled: true,
+                    trusted_proxies: Arc::new(Vec::new()),
+                },
+                backstop: Arc::new(RateLimiter::new(2, 60).named("login_global")),
+                failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
+                audit: None,
+            };
+            let app = axum::Router::new()
+                .route("/login", axum::routing::post(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    login,
+                    login_rate_limit_middleware,
+                ));
+            assert_eq!(login_once(&app, "x", "10.0.0.1").await, StatusCode::OK);
+            assert_eq!(
+                login_once(&app, "x", "10.0.0.1").await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            // The backstop (2) is spent by now: a fresh identity is shed by it.
+            assert_eq!(
+                login_once(&app, "y", "10.0.0.2").await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+
+            let mut api = state_with(true);
+            api.limiter = Arc::new(RateLimiter::new(1, 60).named("api"));
+            let api_app = axum::Router::new()
+                .route("/", axum::routing::get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    api,
+                    rate_limit_middleware,
+                ));
+            assert_eq!(count_429s(api_app, 3).await, 2);
+        });
+        let get =
+            |limiter: &str| counted.get("ak_rate_limit_rejections_total", &[("limiter", limiter)]);
+        assert_eq!(get("login"), 1);
+        assert_eq!(get("login_global"), 1);
+        assert_eq!(get("api"), 2);
+        assert_eq!(counted.get("ak_rate_limit_rejections_total", &[]), 4);
     }
 
     #[tokio::test]

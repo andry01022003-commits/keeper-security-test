@@ -49,6 +49,7 @@ use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
+use crate::services::metrics_service::AuthFailureReason;
 use crate::services::repository_service::{format_handler_key, parse_format_str};
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 
@@ -5144,6 +5145,14 @@ fn offline_access_type_from_query(offline_token: Option<&str>) -> Option<String>
 /// `refresh_token_jti.revoked_at`, so any of (a) deactivated user,
 /// (b) password change since issue, (c) TOTP enable/disable since issue,
 /// (d) logout/admin family revocation, will surface here as a 401.
+/// Count one credential `/v2/token` rejected (#4676).
+fn record_token_auth_failure(reason: AuthFailureReason) {
+    crate::services::metrics_service::record_auth_failure(
+        crate::services::metrics_service::AuthFailureSurface::V2Token,
+        reason,
+    );
+}
+
 async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response {
     let refresh = match form.refresh_token.as_deref() {
         Some(s) if !s.is_empty() => s,
@@ -5161,7 +5170,12 @@ async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response
         .await
     {
         Ok(pair) => pair,
-        Err(_) => {
+        Err(e) => {
+            crate::services::metrics_service::record_auth_failure_for_error(
+                crate::services::metrics_service::AuthFailureSurface::V2Token,
+                &e,
+                AuthFailureReason::InvalidToken,
+            );
             return oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -5407,6 +5421,7 @@ async fn token(
             // to anonymous. Falling through to anonymous would mask the
             // revocation and hand the caller a usable pull token.
             if had_bearer_header {
+                record_token_auth_failure(AuthFailureReason::InvalidToken);
                 return oci_error(
                     StatusCode::UNAUTHORIZED,
                     "UNAUTHORIZED",
@@ -5515,14 +5530,14 @@ async fn token(
             (user, tokens, true)
         }
         Err(_) => match auth_service
-            .authenticate(&credentials.0, &credentials.1)
+            .authenticate_with_reason(&credentials.0, &credentials.1)
             .await
         {
             Ok((user, tokens)) => (user, tokens, false),
-            Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+            Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
                 return oci_auth_unavailable()
             }
-            Err(_) => {
+            Err(password_failure) => {
                 // Final fallback: accept a valid AK access token (JWT) as the
                 // Docker password. This enables the CI/CD keyless push flow:
                 //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
@@ -5581,11 +5596,18 @@ async fn token(
                         return oci_auth_unavailable()
                     }
                     Err(_) => {
+                        // Neither an API token, a password nor an access
+                        // token: count it as the password rejection (#4676).
+                        record_token_auth_failure(
+                            password_failure
+                                .metric_reason()
+                                .unwrap_or(AuthFailureReason::BadPassword),
+                        );
                         return oci_error(
                             StatusCode::UNAUTHORIZED,
                             "UNAUTHORIZED",
                             "invalid username or password",
-                        )
+                        );
                     }
                 }
             }
@@ -5734,7 +5756,7 @@ async fn version_check(
 ///   "test/python/manifests/latest" → ("test/python", "manifests", "latest")
 ///   "test/python/blobs/uploads/"   → ("test/python", "uploads", None)
 ///   "test/python/blobs/uploads/uuid" → ("test/python", "uploads", "uuid")
-fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
+pub(crate) fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
     let path = path.trim_start_matches('/');
     if let Some(name) = path.strip_suffix("/tags/list") {
         return Some((
@@ -19142,6 +19164,84 @@ mod token_lockout_regression_tests {
     /// it here keeps that invariant from regressing if anyone later
     /// "optimizes" the dummy-hash code path without realizing the OCI handler
     /// depends on it.
+    /// #4676: `/v2/token` counts the credentials it rejects in
+    /// `ak_auth_failures_total{surface="v2_token"}`, bucketed by the password
+    /// rejection: a wrong password, an unknown username, and a presented
+    /// Bearer that does not validate. A request with no credential is not.
+    #[test]
+    fn rejected_token_exchanges_are_counted_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+            sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+                .bind(&pwd_hash)
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("update password_hash");
+            let storage_dir = std::env::temp_dir().join(format!("oci-4676-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+            let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let app = router(None).with_state(state);
+            let send = |authorization: Option<String>| {
+                let app = app.clone();
+                async move {
+                    let mut req = Request::builder().method("GET").uri("/token");
+                    if let Some(value) = authorization {
+                        req = req.header("Authorization", value);
+                    }
+                    app.oneshot(req.body(Body::empty()).unwrap())
+                        .await
+                        .expect("oneshot")
+                        .status()
+                }
+            };
+            let basic = |user: &str, password: &str| {
+                Some(format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+                ))
+            };
+            let wrong = send(basic(&username, "wrong-password")).await;
+            let unknown = send(basic(&format!("ghost-{}", Uuid::new_v4()), "x")).await;
+            let bad_bearer = send(Some("Bearer not-a-jwt".to_string())).await;
+            let anonymous = send(None).await;
+
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+            assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+            assert_eq!(unknown, StatusCode::UNAUTHORIZED);
+            assert_eq!(bad_bearer, StatusCode::UNAUTHORIZED);
+            // 200 (anonymous pull token) or 401 (guest access off): either
+            // way no credential was presented, so nothing is counted.
+            assert!(matches!(
+                anonymous,
+                StatusCode::OK | StatusCode::UNAUTHORIZED
+            ));
+            true
+        });
+        if !ran {
+            return;
+        }
+        let get = |reason: &str| {
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "v2_token"), ("reason", reason)],
+            )
+        };
+        assert_eq!(get("bad_password"), 1);
+        assert_eq!(get("unknown_user"), 1);
+        assert_eq!(get("invalid_token"), 1);
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 3);
+    }
+
     #[tokio::test]
     async fn password_basic_auth_falls_through_to_authenticate() {
         let Some(pool) = tdh::try_pool().await else {

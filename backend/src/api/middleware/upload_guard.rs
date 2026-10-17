@@ -315,6 +315,7 @@ pub async fn per_principal_upload_admission(
             limit = admission.max_in_flight,
             "upload refused: principal is at its in-flight upload limit (GHSA-9f9r-c4w8-rjv9)"
         );
+        crate::services::metrics_service::record_rate_limit_rejection("upload");
         let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
             "Too many concurrent uploads for this principal; retry when one finishes",
