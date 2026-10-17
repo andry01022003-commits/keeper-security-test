@@ -2698,7 +2698,9 @@ impl MigrationWorker {
                 // best-effort by contract (a catalog failure must not fail
                 // an item whose content already committed — the wrapper
                 // logs and swallows, mirroring the live paths).
-                if let Some(entry) = migration_catalog_entry(package_type, &oci_role, &parsed) {
+                if let Some(entry) =
+                    migration_catalog_entry(package_type, artifact_path, &oci_role, &parsed)
+                {
                     let size_bytes = match (&oci_role, &oci_manifest_body) {
                         // Docker: size the catalog row like the live push —
                         // config+layers for an image manifest, plus the sum
@@ -3774,15 +3776,22 @@ pub(crate) struct CatalogEntry {
 ///   row is `<image>@<tag>`, exactly like the live manifest-PUT handler.
 ///   Digest-addressed child manifests and layer/config blobs are skipped
 ///   (mirrors the live path's `oci_reference_is_tag` filter).
-/// - Maven family: skipped. Live maven catalog names are
-///   `groupId:artifactId` and `parse_name_and_version` recovers only the
-///   artifactId, so writing rows here would diverge from the shape the
-///   repository components view expects (follow-up, not in #2676's scope).
+/// - Maven/Gradle: the live upload handler catalogues `groupId:artifactId`
+///   at the directory version, and `parse_name_and_version` recovers only the
+///   artifactId, so the coordinate is read back out of `artifact_path` with
+///   the same derivation the catalog backfill uses
+///   ([`backfill_catalog_coordinates`]). Checksum sidecars and
+///   `maven-metadata.xml` get no row. Skipping the whole family left a
+///   migrated Maven repository with an empty Packages tab (#4691).
+/// - SBT/Ivy: skipped (their layout is not a Maven GAV path).
 /// - Everything else (helm, nuget, npm, pypi, generic, ...): a row is
 ///   written whenever the importer recovered a version, under the same
 ///   `(name, version)` the artifact row itself carries.
+///
+/// [`backfill_catalog_coordinates`]: crate::services::package_service::backfill_catalog_coordinates
 pub(crate) fn migration_catalog_entry(
     package_type: &str,
+    artifact_path: &str,
     oci_role: &OciRole,
     parsed: &crate::services::artifact_metadata::ParsedArtifact,
 ) -> Option<CatalogEntry> {
@@ -3801,7 +3810,21 @@ pub(crate) fn migration_catalog_entry(
         }
         OciRole::NotOci => {
             let pt = package_type.to_lowercase();
-            if matches!(pt.as_str(), "maven" | "gradle" | "sbt" | "ivy") {
+            if matches!(pt.as_str(), "maven" | "gradle") {
+                let (name, version) =
+                    crate::services::package_service::backfill_catalog_coordinates(
+                        &pt,
+                        artifact_path,
+                        &parsed.name,
+                        parsed.version.as_deref(),
+                    )?;
+                return Some(CatalogEntry {
+                    name,
+                    version,
+                    format: pt,
+                });
+            }
+            if matches!(pt.as_str(), "sbt" | "ivy") {
                 return None;
             }
             let version = parsed.version.clone()?;
@@ -10631,6 +10654,7 @@ mod tests {
         };
         let entry = migration_catalog_entry(
             "docker",
+            "",
             &OciRole::Manifest {
                 image: "org/app".to_string(),
                 reference: "v1.2".to_string(),
@@ -10654,6 +10678,7 @@ mod tests {
         assert_eq!(
             migration_catalog_entry(
                 "docker",
+                "",
                 &OciRole::Manifest {
                     image: "app".to_string(),
                     reference: format!("sha256:{}", "a".repeat(64)),
@@ -10666,6 +10691,7 @@ mod tests {
         assert_eq!(
             migration_catalog_entry(
                 "docker",
+                "",
                 &OciRole::Blob {
                     digest: format!("sha256:{}", "b".repeat(64)),
                 },
@@ -10683,7 +10709,7 @@ mod tests {
         };
         // Version recovered => catalog row under the parsed identity, with
         // the format key lowercased.
-        let entry = migration_catalog_entry("NuGet", &OciRole::NotOci, &parsed)
+        let entry = migration_catalog_entry("NuGet", "", &OciRole::NotOci, &parsed)
             .expect("versioned non-OCI artifact must produce a catalog entry");
         assert_eq!(entry.name, "MyPackage");
         assert_eq!(entry.version, "1.0.0");
@@ -10696,18 +10722,39 @@ mod tests {
             version: None,
         };
         assert_eq!(
-            migration_catalog_entry("generic", &OciRole::NotOci, &unversioned),
+            migration_catalog_entry("generic", "blob.bin", &OciRole::NotOci, &unversioned),
             None
         );
 
-        // Maven-family catalog names are `groupId:artifactId`; the parser
-        // only recovers the artifactId, so no row is written (follow-up).
+        // #4691: Maven/Gradle catalog names are `groupId:artifactId` at the
+        // directory version, read from the path (the parser only recovers the
+        // artifactId), exactly as a live `mvn deploy` registers them.
+        let jar = crate::services::artifact_metadata::ParsedArtifact {
+            name: "guava".to_string(),
+            version: Some("31.1-jre".to_string()),
+        };
+        let jar_path = "com/google/guava/guava/31.1-jre/guava-31.1-jre.jar";
+        for format in ["maven", "Maven", "gradle"] {
+            let entry = migration_catalog_entry(format, jar_path, &OciRole::NotOci, &jar)
+                .unwrap_or_else(|| panic!("{format} jar must produce a catalog entry"));
+            assert_eq!(entry.name, "com.google.guava:guava", "{format}");
+            assert_eq!(entry.version, "31.1-jre", "{format}");
+            assert_eq!(entry.format, format.to_lowercase());
+        }
+        // Sidecars and the repository metadata document are not packages.
+        for path in [
+            "com/google/guava/guava/31.1-jre/guava-31.1-jre.jar.sha1",
+            "com/google/guava/guava/maven-metadata.xml",
+        ] {
+            assert_eq!(
+                migration_catalog_entry("maven", path, &OciRole::NotOci, &jar),
+                None,
+                "{path}"
+            );
+        }
+        // SBT/Ivy layouts are not Maven GAV paths: still skipped.
         assert_eq!(
-            migration_catalog_entry("maven", &OciRole::NotOci, &parsed),
-            None
-        );
-        assert_eq!(
-            migration_catalog_entry("gradle", &OciRole::NotOci, &parsed),
+            migration_catalog_entry("sbt", jar_path, &OciRole::NotOci, &jar),
             None
         );
 
@@ -10717,7 +10764,7 @@ mod tests {
             name: "github.com/gorilla/mux".to_string(),
             version: Some("v1.8.0".to_string()),
         };
-        let go_entry = migration_catalog_entry("go", &OciRole::NotOci, &go_parsed)
+        let go_entry = migration_catalog_entry("go", "", &OciRole::NotOci, &go_parsed)
             .expect("versioned go module must produce a catalog entry");
         assert_eq!(go_entry.name, "github.com/gorilla/mux");
         assert_eq!(go_entry.version, "v1.8.0");
@@ -10974,6 +11021,122 @@ mod tests {
         assert_eq!(
             sidecar_rows, 0,
             "sidecars must not be recorded as coordinates"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// The Maven import paths every #4691 test transfers: two versions of one
+    /// module, plus a checksum sidecar and the source's own metadata document,
+    /// which are not packages.
+    const MAVEN_4691_PATHS: [&str; 5] = [
+        "com/example/lib/1.0.0/lib-1.0.0.pom",
+        "com/example/lib/1.0.0/lib-1.0.0.jar",
+        "com/example/lib/1.1.0/lib-1.1.0.jar",
+        "com/example/lib/1.1.0/lib-1.1.0.jar.sha1",
+        "com/example/lib/maven-metadata.xml",
+    ];
+
+    async fn import_maven_4691(
+        worker: &MigrationWorker,
+        storage: &Arc<dyn StorageBackend>,
+        repo_key: &str,
+    ) {
+        let mut files = std::collections::HashMap::new();
+        for p in MAVEN_4691_PATHS {
+            files.insert(p.to_string(), bytes::Bytes::from(format!("bytes of {p}")));
+        }
+        for p in MAVEN_4691_PATHS {
+            transfer_one(worker, storage, &files, repo_key, "maven", p)
+                .await
+                .unwrap_or_else(|e| panic!("maven transfer of {p} must succeed: {e}"));
+        }
+    }
+
+    /// Every `(package name, version)` catalog row of a repository, sorted.
+    async fn catalog_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT p.name, pv.version FROM packages p \
+             JOIN package_versions pv ON pv.package_id = p.id \
+             WHERE p.repository_id = $1 ORDER BY p.name, pv.version",
+        )
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("list catalog rows")
+    }
+
+    fn maven_4691_expected_rows() -> Vec<(String, String)> {
+        vec![
+            ("com.example:lib".to_string(), "1.0.0".to_string()),
+            ("com.example:lib".to_string(), "1.1.0".to_string()),
+        ]
+    }
+
+    /// #4691: a Maven repository migrated from Nexus must show its packages on
+    /// the Packages tab, which reads `packages`/`package_versions`. Pre-fix the
+    /// importer skipped the catalog for the whole Maven family, so a migrated
+    /// repository with every file stored listed no packages at all. The rows
+    /// must use the `groupId:artifactId` name a live `mvn deploy` registers,
+    /// skip sidecars and `maven-metadata.xml`, and stay single on a re-run.
+    #[tokio::test]
+    async fn test_maven_import_populates_package_catalog_4691() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4691-maven", "maven").await;
+
+        import_maven_4691(&worker, &storage, &repo_key).await;
+        assert_eq!(
+            catalog_rows(&pool, repo_id).await,
+            maven_4691_expected_rows(),
+            "every migrated Maven version must appear in the packages catalog \
+             under groupId:artifactId"
+        );
+
+        import_maven_4691(&worker, &storage, &repo_key).await;
+        assert_eq!(
+            catalog_counts(&pool, repo_id).await,
+            (1, 2),
+            "re-running the migration must not duplicate catalog rows"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #4691 recovery: a repository imported before the fix has `artifacts`
+    /// rows and an empty catalog. `POST /api/v1/admin/packages/backfill`
+    /// (`PackageService::backfill_catalog`, #3659) must rebuild exactly the
+    /// rows a fixed import writes, so operators can repair it in place without
+    /// re-running the migration.
+    #[tokio::test]
+    async fn test_maven_catalog_backfill_repairs_pre_fix_import_4691() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4691-backfill", "maven").await;
+
+        import_maven_4691(&worker, &storage, &repo_key).await;
+        // Reproduce a pre-fix import: the files are in, the catalog is empty.
+        sqlx::query("DELETE FROM packages WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("clear catalog");
+        assert_eq!(catalog_counts(&pool, repo_id).await, (0, 0));
+
+        crate::services::package_service::PackageService::new(pool.clone())
+            .backfill_catalog(Some(repo_id))
+            .await
+            .expect("catalog backfill");
+        assert_eq!(
+            catalog_rows(&pool, repo_id).await,
+            maven_4691_expected_rows(),
+            "the backfill must restore the migrated Maven versions"
         );
 
         cleanup_repo(&pool, repo_id).await;
