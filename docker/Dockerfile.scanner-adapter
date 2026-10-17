@@ -86,7 +86,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/scanner-adapter .
 
 # ---------- Stage 2: pull the matching trivy binary ----------
-# Our own build of upstream trivy v0.74.0 (artifact-keeper/trivy): the same
+# Our own build of upstream trivy v0.76.0 (artifact-keeper/trivy): the same
 # upstream source tag, built with our pinned Go toolchain plus the documented
 # dependency overrides in that repo's overrides.yaml.
 #
@@ -167,20 +167,44 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # is #4712. VERSION moves 1.4.1 -> 1.4.2 because this file is part of the
 # adapter's versioned source set (RELEASING.md step 5).
 #
+# 0.74.0-r5 -> 0.76.0-r1 (#4712) is that coordinated move: the bundled client
+# and the trivy server sidecar go to 0.76.0 in the same change, because
+# checkTrivyServer and clientModeProvenance (remote.go) refuse a server that
+# reports a different release than this binary. The sidecar pin moves in
+# docker-compose{,.local-dev,.test}.yml and in the docker-publish,
+# scheduled-container-scan and scheduled-base-image-watch workflows; the Helm
+# chart's trivy.image.tag moves in artifact-keeper-iac. Upstream v0.76.0
+# (531360e5) pins every module the r-builds were overriding at or above the
+# override version (grpc v1.84.0, golang.org/x/net v0.60.0, containerd/v2
+# v2.4.1 and the k8s.io 0.37 line with it), so that repo's overrides.yaml is
+# empty again and 0.76.0-r1 is pristine upstream built on go1.27.2 (v0.75.0
+# raised go.mod to `go 1.27.0`). Upstream 0.75/0.76 also changed client/server
+# mode itself: cryptographic assets now travel with the blob and the result
+# (aquasecurity/trivy#11141), and packages keep their modularity label, build
+# info and installed files across the RPC (aquasecurity/trivy#11188), which
+# fixes silent false negatives on RHEL-family modular packages and Red Hat
+# SBOM properties that only client/server mode lost. Both add RPC fields, so
+# mixing releases is unsupported; the report's `Trivy.Server` block the
+# adapter verifies is unchanged in shape. VERSION moves 1.4.2 -> 1.5.0, a
+# minor, because the trivy server release the adapter requires changes.
+#
 # Pinned by DIGEST, not tag: that repo rebuilds weekly to pick up RPM errata,
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.74.0-r5 (note: no leading
+# This digest is the manifest-list digest of tag 0.76.0-r1 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
 # Nothing couples the backend to a specific trivy version: the 0.71.2 strings
 # in backend/scanner-adapter tests are mock/stub fixtures, and the adapter
 # probes the real version at startup (ProbeVersion). The upstream source tag
-# DID move this time — the bundled binary now reports `Version: 0.74.0` — and
+# DID move this time — the bundled binary now reports `Version: 0.76.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:91c8e3f6b452e8407479f030a99a1bd2bb30c6b529af720678811acbf0a67647 AS trivy
+#
+# This digest is the manifest-list digest of tag 0.76.0-r1 (artifact-keeper/
+# trivy#18, tagged 2026-10-17; verified with `skopeo inspect --raw`).
+FROM ghcr.io/artifact-keeper/trivy@sha256:36e93de3edfa615553692781624be999fb22d113d1ecbe6712a3c90c71d5cc74 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

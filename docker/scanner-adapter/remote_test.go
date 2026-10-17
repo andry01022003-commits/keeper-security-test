@@ -26,7 +26,7 @@ func fakeTrivyServer(t *testing.T, status int, body string) *httptest.Server {
 	}))
 }
 
-const versionWithDB = `{"Version":"0.74.0","VulnerabilityDB":{"Version":2,"UpdatedAt":"2026-09-30T00:00:00Z"}}`
+const versionWithDB = `{"Version":"0.76.0","VulnerabilityDB":{"Version":2,"UpdatedAt":"2026-09-30T00:00:00Z"}}`
 
 func TestLoadConfigClientModeDefaultsOff(t *testing.T) {
 	t.Setenv("SCANNER_TRIVY_SERVER", "")
@@ -98,10 +98,10 @@ func TestCheckTrivyServer(t *testing.T) {
 
 	ok := fakeTrivyServer(t, http.StatusOK, versionWithDB)
 	defer ok.Close()
-	if err := checkTrivyServer(ctx, client, ok.URL, "0.74.0"); err != nil {
+	if err := checkTrivyServer(ctx, client, ok.URL, "0.76.0"); err != nil {
 		t.Errorf("matching server with DB: %v", err)
 	}
-	if err := checkTrivyServer(ctx, client, ok.URL+"/", "v0.74.0"); err != nil {
+	if err := checkTrivyServer(ctx, client, ok.URL+"/", "v0.76.0"); err != nil {
 		t.Errorf("v-prefix and trailing slash must be tolerated: %v", err)
 	}
 	if err := checkTrivyServer(ctx, client, ok.URL, ""); err == nil {
@@ -110,13 +110,19 @@ func TestCheckTrivyServer(t *testing.T) {
 	if err := checkTrivyServer(ctx, client, ok.URL, "0.62.1"); err == nil || !strings.Contains(err.Error(), "matching releases") {
 		t.Errorf("version mismatch must fail, got %v", err)
 	}
+	// The #4712 upgrade: a 0.76.0 client against a sidecar still on 0.74.0.
+	old := fakeTrivyServer(t, http.StatusOK, `{"Version":"0.74.0","VulnerabilityDB":{"Version":2,"UpdatedAt":"2026-09-30T00:00:00Z"}}`)
+	defer old.Close()
+	if err := checkTrivyServer(ctx, client, old.URL, "0.76.0"); err == nil || !strings.Contains(err.Error(), "matching releases") {
+		t.Errorf("a server left at 0.74.0 must fail against a 0.76.0 client, got %v", err)
+	}
 
 	for name, body := range map[string]string{
-		"null DB":    `{"Version":"0.74.0","VulnerabilityDB":null}`,
-		"missing DB": `{"Version":"0.74.0"}`,
+		"null DB":    `{"Version":"0.76.0","VulnerabilityDB":null}`,
+		"missing DB": `{"Version":"0.76.0"}`,
 	} {
 		srv := fakeTrivyServer(t, http.StatusOK, body)
-		if err := checkTrivyServer(ctx, client, srv.URL, "0.74.0"); err == nil {
+		if err := checkTrivyServer(ctx, client, srv.URL, "0.76.0"); err == nil {
 			t.Errorf("%s must fail closed", name)
 		}
 		srv.Close()
@@ -124,15 +130,15 @@ func TestCheckTrivyServer(t *testing.T) {
 
 	bad := fakeTrivyServer(t, http.StatusInternalServerError, "boom")
 	defer bad.Close()
-	if err := checkTrivyServer(ctx, client, bad.URL, "0.74.0"); err == nil {
+	if err := checkTrivyServer(ctx, client, bad.URL, "0.76.0"); err == nil {
 		t.Error("non-200 must fail")
 	}
-	if err := checkTrivyServer(ctx, client, "trivy.scan:4954", "0.74.0"); err == nil {
+	if err := checkTrivyServer(ctx, client, "trivy.scan:4954", "0.76.0"); err == nil {
 		t.Error("URL without scheme must fail")
 	}
 	down := fakeTrivyServer(t, http.StatusOK, versionWithDB)
 	down.Close()
-	if err := checkTrivyServer(ctx, client, down.URL, "0.74.0"); err == nil {
+	if err := checkTrivyServer(ctx, client, down.URL, "0.76.0"); err == nil {
 		t.Error("unreachable server must fail")
 	}
 }
@@ -177,7 +183,7 @@ func TestProbeReadyClientModeFollowsServer(t *testing.T) {
 	cfg.TrivyServer = trivy.URL
 	// The gate compares against the probed binary, not the reported pin.
 	cfg.ScannerVersion = "9.9.9"
-	cfg.ClientVersion = "0.74.0"
+	cfg.ClientVersion = "0.76.0"
 	srv := NewServer(cfg)
 	srv.remote.ttl = 0 // re-check on every probe for the test
 	ts := httptest.NewServer(srv.Handler())
@@ -190,7 +196,7 @@ func TestProbeReadyClientModeFollowsServer(t *testing.T) {
 	if code := getStatus(t, ts.URL+"/probe/ready"); code != http.StatusOK {
 		t.Fatalf("server with DB status = %d, want 200", code)
 	}
-	body.Store(`{"Version":"0.74.0","VulnerabilityDB":null}`)
+	body.Store(`{"Version":"0.76.0","VulnerabilityDB":null}`)
 	if code := getStatus(t, ts.URL+"/probe/ready"); code != http.StatusServiceUnavailable {
 		t.Fatalf("server without DB status = %d, want 503", code)
 	}
@@ -330,20 +336,22 @@ func TestStartClientModeProbesBinaryDespitePin(t *testing.T) {
 	}
 }
 
-// realClientReportTrivy is the `Trivy` block of a real trivy 0.74.0
-// `fs --server` report, captured against a 0.74.0 `trivy server`.
-const realClientReportTrivy = `{"Version":"0.74.0","Server":{"Version":"0.74.0","VulnerabilityDB":{"Version":2,"NextUpdate":"2026-10-06T07:14:49.216148168Z","UpdatedAt":"2026-10-05T07:14:49.216148418Z","DownloadedAt":"2026-10-05T12:27:34.522438333Z"}}}`
+// realClientReportTrivy is the `Trivy` block of a real trivy 0.76.0
+// `fs --server` report, captured on 2026-10-17 against a 0.76.0 `trivy server`
+// (ghcr.io/aquasecurity/trivy:0.76.0 on both sides). The block's shape is
+// unchanged from 0.74.0; 0.75/0.76 changed the RPC payload, not this.
+const realClientReportTrivy = `{"Version":"0.76.0","Server":{"Version":"0.76.0","VulnerabilityDB":{"Version":2,"NextUpdate":"2026-10-17T01:13:54.947090202Z","UpdatedAt":"2026-10-16T01:13:54.947090392Z","DownloadedAt":"2026-10-17T09:10:05.946898112Z"}}}`
 
 func TestClientModeProvenanceFromRealReport(t *testing.T) {
 	var info trivyReportInfo
 	if err := json.Unmarshal([]byte(realClientReportTrivy), &info); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	db, err := clientModeProvenance(info, "0.74.0")
+	db, err := clientModeProvenance(info, "0.76.0")
 	if err != nil {
 		t.Fatalf("clientModeProvenance: %v", err)
 	}
-	want := time.Date(2026, 10, 5, 7, 14, 49, 216148418, time.UTC)
+	want := time.Date(2026, 10, 16, 1, 13, 54, 947090392, time.UTC)
 	if db == nil || db.Version != 2 || db.UpdatedAt == nil || !db.UpdatedAt.Equal(want) {
 		t.Fatalf("provenance = %+v, want version 2 updated %v", db, want)
 	}
@@ -351,24 +359,25 @@ func TestClientModeProvenanceFromRealReport(t *testing.T) {
 
 func TestClientModeProvenanceFailsClosed(t *testing.T) {
 	for name, raw := range map[string]string{
-		"standalone-shaped report (no Server)": `{"Version":"0.74.0"}`,
-		"server version fetch failed":          `{"Version":"0.74.0","Server":{}}`,
-		"server without DB":                    `{"Version":"0.74.0","Server":{"Version":"0.74.0"}}`,
-		"server DB null":                       `{"Version":"0.74.0","Server":{"Version":"0.74.0","VulnerabilityDB":null}}`,
-		"release mismatch":                     `{"Version":"0.74.0","Server":{"Version":"0.73.1","VulnerabilityDB":{"Version":2}}}`,
+		"standalone-shaped report (no Server)": `{"Version":"0.76.0"}`,
+		"server version fetch failed":          `{"Version":"0.76.0","Server":{}}`,
+		"server without DB":                    `{"Version":"0.76.0","Server":{"Version":"0.76.0"}}`,
+		"server DB null":                       `{"Version":"0.76.0","Server":{"Version":"0.76.0","VulnerabilityDB":null}}`,
+		"release mismatch":                     `{"Version":"0.76.0","Server":{"Version":"0.73.1","VulnerabilityDB":{"Version":2}}}`,
+		"server left at 0.74.0":                `{"Version":"0.76.0","Server":{"Version":"0.74.0","VulnerabilityDB":{"Version":2}}}`,
 	} {
 		var info trivyReportInfo
 		if err := json.Unmarshal([]byte(raw), &info); err != nil {
 			t.Fatalf("%s: unmarshal: %v", name, err)
 		}
-		if db, err := clientModeProvenance(info, "0.74.0"); err == nil {
+		if db, err := clientModeProvenance(info, "0.76.0"); err == nil {
 			t.Errorf("%s: expected the scan to fail closed, got %+v", name, db)
 		}
 	}
 	// A DB block that is present but unidentifiable only omits provenance.
 	var info trivyReportInfo
-	_ = json.Unmarshal([]byte(`{"Server":{"Version":"0.74.0","VulnerabilityDB":{"UpdatedAt":"2026-10-05T00:00:00Z"}}}`), &info)
-	if db, err := clientModeProvenance(info, "0.74.0"); err != nil || db != nil {
+	_ = json.Unmarshal([]byte(`{"Server":{"Version":"0.76.0","VulnerabilityDB":{"UpdatedAt":"2026-10-05T00:00:00Z"}}}`), &info)
+	if db, err := clientModeProvenance(info, "0.76.0"); err != nil || db != nil {
 		t.Errorf("malformed DB block: got db=%+v err=%v, want omitted without failing", db, err)
 	}
 }
@@ -459,7 +468,7 @@ func TestClientModeTakesDBFromReport(t *testing.T) {
 // paths instead of returning possibly incomplete findings.
 func TestClientModeScanFailsClosedOnServerMismatch(t *testing.T) {
 	for name, block := range map[string]string{
-		"mismatch":       `{"Version":"0.71.2","Server":{"Version":"0.74.0","VulnerabilityDB":{"Version":2}}}`,
+		"mismatch":       `{"Version":"0.71.2","Server":{"Version":"0.76.0","VulnerabilityDB":{"Version":2}}}`,
 		"no server info": `{"Version":"0.71.2"}`,
 	} {
 		if status, body := runClientImageScan(t, clientStub(t, block, false)); status != http.StatusInternalServerError {

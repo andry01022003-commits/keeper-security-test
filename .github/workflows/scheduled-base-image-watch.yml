@@ -54,7 +54,7 @@ jobs:
       # technique and same version as scheduled-container-scan.yml.
       - name: Install Trivy
         run: |
-          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.74.0)
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.76.0)
           docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
           docker rm "$CONTAINER_ID"
           trivy --version

@@ -1008,16 +1008,16 @@ jobs:
         run: |
           set -euo pipefail
           n=0; max=5
-          until docker pull -q ghcr.io/aquasecurity/trivy:0.74.0; do
+          until docker pull -q ghcr.io/aquasecurity/trivy:0.76.0; do
             n=$((n + 1))
             if [[ "$n" -ge "$max" ]]; then
-              echo "::error title=Trivy install failed (infra)::Pulling ghcr.io/aquasecurity/trivy:0.74.0 failed after ${max} attempts. Infrastructure failure, not a vulnerability finding."
+              echo "::error title=Trivy install failed (infra)::Pulling ghcr.io/aquasecurity/trivy:0.76.0 failed after ${max} attempts. Infrastructure failure, not a vulnerability finding."
               exit 1
             fi
             echo "Trivy image pull attempt ${n}/${max} failed; retrying in $((n * 10))s..."
             sleep $((n * 10))
           done
-          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.74.0)
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.76.0)
           docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
           docker rm "$CONTAINER_ID"
           trivy --version
