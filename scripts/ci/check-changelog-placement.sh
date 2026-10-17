@@ -74,6 +74,13 @@
 # must hold; a bullet folded into a tagged section is still misplaced, because
 # that section is history (the assembler refuses --append there too).
 #
+# RECOGNITION. `### Sponsors` and `### Thank You` credit people; they do not
+# claim that work is in the release (release-preflight.sh skips them for the
+# same reason). A sponsor list that drifted, or a reporter missed at cut time,
+# is corrected in the section it belongs to, so a bullet added under one of
+# those two subheadings passes assertion 1 even inside a tagged section
+# (#4754). Every other subheading of a shipped section stays history.
+#
 # Usage:  check-changelog-placement.sh [<base-ref>]        (default origin/main)
 #
 # Env:
@@ -240,6 +247,7 @@ if [[ -n "$ADDED" ]]; then
   legacy=0
   assembled=0
   folded=0
+  recognition=0
   while IFS=$'\037' read -r vh sh bullet; do
     [[ -z "$bullet" ]] && continue
     if [[ "$vh" == "## [Unreleased]" ]]; then
@@ -248,6 +256,12 @@ if [[ -n "$ADDED" ]]; then
     fi
     if [[ -n "$vh" ]] && printf '%s\n' "$ADDED_HEADINGS" | grep -qxF -- "$vh"; then
       assembled=$((assembled + 1))
+      continue
+    fi
+    # Recognition bullets credit people rather than document work, so they
+    # may be corrected in a shipped section (see RECOGNITION in the header).
+    if [[ -n "$vh" ]] && [[ "$sh" =~ ^###[[:space:]]+(Sponsors|Thank[[:space:]]You)([[:space:]]|$) ]]; then
+      recognition=$((recognition + 1))
       continue
     fi
     # A fold-in: the bullet's issue is a fragment this branch deletes, and the
@@ -291,6 +305,9 @@ if [[ -n "$ADDED" ]]; then
     fi
     if [[ "$folded" -gt 0 ]]; then
       echo "  ${folded} added bullet(s) folded into an untagged version section from fragment(s) this branch deletes (assemble-changelog.sh --append)"
+    fi
+    if [[ "$recognition" -gt 0 ]]; then
+      echo "  ${recognition} added bullet(s) under a '### Sponsors' / '### Thank You' recognition heading of a shipped section (credits, not entries)"
     fi
     if [[ "$legacy" -gt 0 ]]; then
       echo "  ${legacy} added bullet(s), all under '## [Unreleased]'"

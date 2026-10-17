@@ -355,6 +355,36 @@ else
   fail "the assembler refused the --append fixture"
 fi
 
+# 20. RECOGNITION (#4754): the Sponsors list of a shipped section is a credit,
+#     not a claim about what the release contains, so correcting it after the
+#     tag is allowed. The branch adds a `### Sponsors` block with a bullet to
+#     the released 1.9.0 section and nothing else.
+make_repo
+python3 - "$r/CHANGELOG.md" << 'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("## [1.9.0] - 2026-09-01\n\n### Fixed\n",
+              "## [1.9.0] - 2026-09-01\n\n### Sponsors\n\n- **A Backer** ([@abacker](https://github.com/abacker))\n- and one sponsor who chose to stay private\n\n### Fixed\n")
+open(p, 'w').write(s)
+PY
+commit_pr
+run_case "sponsor bullets added under a released ### Sponsors -> pass" 0 "recognition heading of a shipped section"
+
+# 21. ...and the same for `### Thank You`, which credits a reporter missed at
+#     cut time. Any other subheading of a shipped section is still history.
+make_repo
+python3 - "$r/CHANGELOG.md" << 'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("- **something that actually shipped in 1.9.0** (#900)\n",
+              "- **something that actually shipped in 1.9.0** (#900)\n\n### Thank You\n\n- **[@reporter](https://github.com/reporter)**: reporting the thing (#900)\n")
+open(p, 'w').write(s)
+PY
+commit_pr
+run_case "thank-you bullet added under a released ### Thank You -> pass" 0 "recognition heading of a shipped section"
+
 # 19. ...but not once the version is tagged: that section is history, and the
 #     entry belongs to the next version.
 git -C "$r" tag v1.9.1 main
