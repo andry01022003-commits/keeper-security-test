@@ -9816,6 +9816,64 @@ mod tests {
             "scan_on_upload is off, so the deploy must not scan"
         );
     }
+
+    /// #4642: `ak_artifact_uploads_total` and `ak_artifact_upload_size_bytes`
+    /// were defined but never recorded, so a `/metrics` scrape had no upload
+    /// series at all. An `mvn deploy` of one jar must count one upload for the
+    /// repository and format, sized by the jar.
+    #[test]
+    fn deploy_counts_upload_metrics_4642() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use metrics_util::debugging::DebugValue;
+        const JAR: &[u8] = b"jar bytes for the upload metrics test";
+        let (repo_key, captured) = tdh::capture_metrics(|| async {
+            let fx = tdh::Fixture::setup("local", "maven").await?;
+            let (status, body) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(
+                    format!(
+                        "/{}/org/example/ak/metered/1.0.0/metered-1.0.0.jar",
+                        fx.repo_key
+                    ),
+                    bytes::Bytes::from_static(JAR),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "Maven PUT failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let key = fx.repo_key.clone();
+            fx.teardown().await;
+            Some(key)
+        });
+        let Some(repo_key) = repo_key else {
+            return;
+        };
+        assert_eq!(
+            tdh::captured_metric(
+                &captured,
+                "ak_artifact_uploads_total",
+                &[("repository", &repo_key), ("format", "maven")],
+            ),
+            Some(&DebugValue::Counter(1)),
+            "one deploy must count one upload (#4642); captured: {captured:?}"
+        );
+        match tdh::captured_metric(
+            &captured,
+            "ak_artifact_upload_size_bytes",
+            &[("format", "maven")],
+        ) {
+            Some(DebugValue::Histogram(samples)) => assert_eq!(
+                samples.iter().map(|s| s.into_inner()).collect::<Vec<_>>(),
+                vec![JAR.len() as f64],
+                "the upload histogram must record the jar size"
+            ),
+            other => panic!("no upload size sample recorded: {other:?}"),
+        }
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-1")]

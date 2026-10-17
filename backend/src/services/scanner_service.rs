@@ -10475,13 +10475,17 @@ pub async fn scan_on_upload_enabled(db: &PgPool, repository_id: Uuid) -> bool {
 ///
 /// The `every_format_upload_triggers_scan_on_upload` ratchet test in
 /// `api::handlers::proxy_helpers` requires every handler that inserts an
-/// artifact to reach this function.
+/// artifact to reach this function. Because of that it is also where a
+/// committed upload is counted in `ak_artifact_uploads_total` and
+/// `ak_artifact_upload_size_bytes` (#4642), whether or not a scanner is
+/// configured.
 pub async fn trigger_scan_on_upload(
     db: &PgPool,
     scanner: Option<Arc<ScannerService>>,
     repository_id: Uuid,
     artifact_id: Uuid,
 ) -> bool {
+    record_upload_metrics(db, repository_id, artifact_id).await;
     let Some(scanner) = scanner else {
         return false;
     };
@@ -10491,6 +10495,34 @@ pub async fn trigger_scan_on_upload(
             tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
         }
     })
+}
+
+/// Count one committed upload (#4642), labelled by the artifact's repository
+/// key and format and sized by its recorded `size_bytes`. A read error is
+/// logged and the upload goes uncounted: metrics never fail an upload.
+async fn record_upload_metrics(db: &PgPool, repository_id: Uuid, artifact_id: Uuid) {
+    let row: sqlx::Result<Option<(String, String, i64)>> = sqlx::query_as(
+        "SELECT r.key, r.format::text, a.size_bytes \
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = $1 AND a.repository_id = $2",
+    )
+    .bind(artifact_id)
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await;
+    match row {
+        Ok(Some((repo_key, format, size_bytes))) => {
+            crate::services::metrics_service::record_artifact_upload(
+                &repo_key,
+                &format,
+                u64::try_from(size_bytes).unwrap_or(0),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::debug!(artifact_id = %artifact_id, error = %e, "upload metrics lookup failed");
+        }
+    }
 }
 
 #[cfg(ak_test_shard = "services-2")]

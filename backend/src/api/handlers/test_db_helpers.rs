@@ -3344,6 +3344,69 @@ impl AuthzQueryOutage {
 
 pub use admin_gate::assert_admin_routes_refuse_repo_scoped_tokens;
 
+// ---------------------------------------------------------------------------
+// #4642: metric capture for async, DB-backed tests.
+// ---------------------------------------------------------------------------
+
+/// One captured metric: name, labels, value.
+pub type CapturedMetric = (
+    String,
+    Vec<(String, String)>,
+    metrics_util::debugging::DebugValue,
+);
+
+/// Run `body` to completion on a current-thread runtime under a local
+/// `DebuggingRecorder` and return its output with every metric it recorded.
+/// Current-thread so tasks the body spawns (and awaits) record on the same
+/// thread, which is the only thread a local recorder sees.
+pub fn capture_metrics<F, Fut, T>(body: F) -> (T, Vec<CapturedMetric>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(body())
+    });
+    let captured = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .map(|(ck, _, _, value)| {
+            let (_kind, key) = ck.into_parts();
+            let name = key.name().to_string();
+            let labels = key
+                .into_parts()
+                .1
+                .into_iter()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            (name, labels, value)
+        })
+        .collect();
+    (out, captured)
+}
+
+/// The captured metric named `name` whose labels are exactly `labels`.
+pub fn captured_metric<'a>(
+    captured: &'a [CapturedMetric],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<&'a metrics_util::debugging::DebugValue> {
+    captured.iter().find_map(|(n, l, v)| {
+        let same = l.len() == labels.len()
+            && labels
+                .iter()
+                .all(|(k, val)| l.iter().any(|(lk, lv)| lk == k && lv == val));
+        (n == name && same).then_some(v)
+    })
+}
+
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
 // #1315 token-mint surface gate, which skips test modules, does not count the
 // API-token mint below as a production endpoint.

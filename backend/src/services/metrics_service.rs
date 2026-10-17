@@ -54,16 +54,23 @@ pub fn record_http_header_read_timeout() {
     counter!("ak_http_header_read_timeouts_total").increment(1);
 }
 
-/// Record an artifact upload event.
+/// Record one committed artifact upload: `ak_artifact_uploads_total` and the
+/// `ak_artifact_upload_size_bytes` histogram. Called from
+/// `scanner_service::trigger_scan_on_upload`, the post-commit step every
+/// upload path reaches (#4642). Labels are the repository key and format only,
+/// never an artifact name, so the series count stays bounded.
 pub fn record_artifact_upload(repo_key: &str, format: &str, size_bytes: u64) {
     counter!("ak_artifact_uploads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
     histogram!("ak_artifact_upload_size_bytes", "format" => format.to_string())
         .record(size_bytes as f64);
 }
 
-/// Record an artifact download event.
-pub fn record_artifact_download(repo_key: &str, format: &str) {
-    counter!("ak_artifact_downloads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
+/// Count `count` served artifact downloads in `ak_artifact_downloads_total`.
+/// Called by the download-event dispatcher once it has persisted the
+/// `download_statistics` rows (#4642), so the counter moves by the rows a
+/// flush wrote. Same bounded labels as [`record_artifact_upload`].
+pub fn record_artifact_downloads(repo_key: &str, format: &str, count: u64) {
+    counter!("ak_artifact_downloads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(count);
 }
 
 /// Record a proxy-cache lookup. `result` is a stable low-cardinality
@@ -523,8 +530,8 @@ mod tests {
     }
 
     #[test]
-    fn test_record_artifact_download_does_not_panic() {
-        record_artifact_download("my-repo", "npm");
+    fn test_record_artifact_downloads_does_not_panic() {
+        record_artifact_downloads("my-repo", "npm", 3);
     }
 
     #[test]
