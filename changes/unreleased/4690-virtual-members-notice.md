@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4690]
----
-- **A virtual repository's REST listings now explain an empty result when the caller holds read on the virtual but on none of its members** (#4690). A grant on a virtual repository does not grant its members: reading through a virtual needs read on each member the caller should see, and a grant on the virtual alone yields an empty channel. That is unchanged. Before, a user granted only the virtual (for example through a group rule) got an empty member list, an empty artifact listing and 404s from the format routes, and the only explanation was the server log line `virtual member walk narrowed by caller authorization`. `GET /api/v1/repositories/{key}/members` and `GET /api/v1/repositories/{key}/artifacts` now add an `X-AK-Virtual-Members-Notice` header in that case saying a grant on the virtual does not include its members. The header depends only on the caller being able to read no member, so a virtual with no members answers the same and private members are not revealed. Format routes such as `/maven/<virtual>/...` still answer 404. `docs/repository-visibility.md` documents the rule with a group-grant example.

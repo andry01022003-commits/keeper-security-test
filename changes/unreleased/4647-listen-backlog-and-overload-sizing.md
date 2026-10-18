@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#4647]
----
-- **`HTTP_LISTEN_BACKLOG` sets the API listener's accept-queue length, and the backlog the kernel actually granted is logged at startup** (#4647). Unset (the default) keeps the OS maximum the listener has always used (`net.core.somaxconn` on Linux), so nothing changes unless you set it. The new `docs/operations/load-shedding.md` explains where an overloaded backend makes a request wait. A full accept queue drops SYNs, which clients see as connect timeouts. A request over `GLOBAL_MAX_CONCURRENCY` is answered at once with `503` and `Retry-After`. Below that limit, requests slow down together. The page includes local measurements under a CPU quota, in which the backend's listener refused no connections. It also gives sizing guidance for CPU-limited replicas: at least 8 cores, or a CPU request without a limit, for mixed CI-fleet load, and lowering `GLOBAL_MAX_CONCURRENCY` when fast `503`s are preferable to latency. `GLOBAL_MAX_CONCURRENCY` and `HTTP_LISTEN_BACKLOG` are now documented in `.env.example`.

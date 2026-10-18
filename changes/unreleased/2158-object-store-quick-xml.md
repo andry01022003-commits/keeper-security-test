@@ -1,5 +1,0 @@
----
-section: Security
-issues: [#2158]
----
-- **quick-xml 0.39 is gone from the dependency graph, and the two cargo-audit ignores that covered it are removed** (#2158). The direct quick-xml dependency has been 0.41 since the RUSTSEC-2026-0194/0195 XML-parser DoS fixes. But `object_store` 0.13.2, which backs S3 storage, still pulled in a vulnerable quick-xml 0.39.2 to parse S3 responses. That instance only ever parsed responses from the operator's own storage endpoint, so the DoS was not reachable there, and it was ignored in `.cargo/audit.toml`. `object_store` is now 0.14.2, which depends on quick-xml ^0.41. `cargo tree -i quick-xml` shows a single 0.41.0 instance, and `cargo audit` passes without the ignores. The upgrade also drops the second reqwest (0.12) from the build. S3 TLS keeps the same trust rules: the system trust store, plus any `S3_CA_CERT_PATH` certificates. The three SigV4 signing calls move to `try_authorize`, so a signing failure on the AWS upstream-auth and S3 REST fallback paths now returns an error instead of panicking.

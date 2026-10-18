@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4750]
----
-- **A database outage while checking a credential now returns a retryable 503, not a 401** (#4750). Previously the auth middleware returned 503 only when the connection pool timed out or the password-hashing concurrency limit was reached. Other database failures returned 401 "Invalid or expired token": a closed pool, a lost or refused connection, a statement or lock timeout, a server shutting down. For a signed JWT, the failed live-user lookup fell through to the API-token lookup and also ended in 401. The `/v2` OCI registry and its `/v2/token` exchange returned 401 for every such failure, including an exhausted pool. Docker, twine, cargo and CI runners abort or ask for a login again on 401, but retry on 503. These failures now return 503 with `Retry-After: 1` on the auth middleware, the format-endpoint resolver, every `/v2` verb, `/v2/` and `/v2/token`. An unknown, wrong, expired or revoked credential still returns 401. So does a database error caused by the request's own bytes, such as a NUL in a Basic-auth username.

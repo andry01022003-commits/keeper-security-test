@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4765]
----
-- **npm, OCI, Git LFS and the other format endpoints now answer a database outage with a retryable 503, not a 500** (#4765). Format handlers that build their own protocol error body classified only a saturated connection pool as transient, so with the database unreachable an `npm install`, a `docker pull` past the credential check or a Git LFS batch got a non-retryable `500`. A closed pool, a lost or refused connection, a statement or lock timeout, and a server that is shutting down or recovering (the classification from #4750) now return `503` with `Retry-After: 1` in each format's own error shape: npm `{"error": ...}`, Git LFS `{"message": ...}`, OCI code `UNAVAILABLE` and protobuf Connect code `unavailable` (both also used now for a saturated pool, which said `INTERNAL_ERROR` / `internal` before). The Swift, Maven metadata and Pub virtual-member error responses also gained the `Retry-After` header on a 503. Query and data errors still return `500`.

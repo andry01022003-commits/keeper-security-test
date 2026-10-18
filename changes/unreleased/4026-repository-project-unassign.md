@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4026]
----
-- **`PATCH /api/v1/repositories/{key}` with `{"project_id": null}` now takes the repository out of its project instead of answering 200 and changing nothing** (#4026). The request field could not tell an explicit `null` from an omitted field, and the service's `COALESCE` update would have discarded a clear anyway, so a repository filed into the wrong project could not be unassigned through the API and the caller got no sign that nothing happened. `project_id` now has the same three-way semantics as `trusted_gpg_key` and `debian`: omit it to leave the assignment alone, send `null` to clear it, send an id to (re)assign. Clearing needs the same authority as assigning, seen from the other side: a global admin, a system repository admin, or a project admin of the project the repository is leaving; a repository-level admin alone gets 403. The `REPOSITORY_UPDATED` audit row now carries `project_change` (`previous_project_id`, `project_id`) whenever the assignment changes. `quota_bytes` and `description` still cannot be cleared to `null` this way; that is tracked in #4729.

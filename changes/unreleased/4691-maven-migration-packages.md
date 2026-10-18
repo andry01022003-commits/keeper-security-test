@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4691]
----
-- **A Maven or Gradle repository migrated from Nexus or Artifactory now lists its packages on the Packages tab** (#4691). Since #2676 the importer registers migrated artifacts in the package catalog (`packages` / `package_versions`, which the Packages tab reads), but it skipped the whole Maven family. A migrated Maven repository therefore stored every file, yet showed "No packages in this repository yet". The importer now catalogues each Maven file as `groupId:artifactId` at its directory version, the same entry a live `mvn deploy` and the catalog backfill write. Checksum sidecars and `maven-metadata.xml` are skipped. A repository imported before this fix keeps its empty catalog until an admin runs the existing backfill once per repository: `curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "https://<host>/api/v1/admin/packages/backfill?repository_key=<repo-key>"`. Re-running the migration job does not rebuild the catalog, because already-imported files are skipped.

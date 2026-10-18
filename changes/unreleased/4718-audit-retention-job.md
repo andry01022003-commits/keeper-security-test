@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4718]
----
-- **Audit retention runs on a schedule, as the documentation said it did** (#4718). `docs/audit-events.md` described `audit_log` retention as applied by a cleanup job, but the only code that deleted old rows was `POST /api/v1/admin/cleanup`, so an operator who set `audit_retention_days` still got unbounded growth until someone ran the cleanup by hand. An hourly scheduler job now deletes rows older than the configured period, oldest first in batches of 5,000, on one replica at a time, and logs one summary line per run; the period in force is logged at startup. The setting is read on every run, so a change applies within the hour. A period must be saved explicitly before anything is deleted: `0`, or a setting that was never saved, leaves retention off, and `GET /api/v1/admin/settings` now reports `audit_retention_days: 0` in that case instead of a `90` that was never applied, so upgrading deletes no audit rows. The manual cleanup endpoint stays; with the period at `0` or unsaved it now deletes no audit rows (at `0` it used to delete all of them, and unsaved it used 90 days).

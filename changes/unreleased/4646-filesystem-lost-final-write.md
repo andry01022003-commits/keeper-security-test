@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4646]
----
-- **Filesystem storage no longer reports a write as complete when its last buffered write failed, which could make a correct chunked `docker push` fail with `DIGEST_INVALID`** (#4646). `put` and `put_stream` called `sync_all` without `flush` first. tokio's `sync_all` waits for the last in-flight write but does not return its error, so if that write failed (for example disk full on the storage volume) the short temp file was still renamed into place, and the call returned the length and SHA-256 of the full input. For an OCI chunked upload, the PATCH was accepted with the right `Range`, and the commit later read the short part and refused the push with a digest that matched nothing the client sent. Both writes now flush before syncing, so the failed write returns an error and nothing is published. The OCI commit also now checks each stored part against the length recorded at PATCH time. A mismatch is reported as a 500 naming the part instead of `DIGEST_INVALID`. Digest mismatches log the session's part keys and sizes, the assembled length, and both digests.

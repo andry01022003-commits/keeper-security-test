@@ -1,7 +1,0 @@
----
-section: Fixed
-issues: [#4657]
----
-- **Migrating a Debian repository from Artifactory or Nexus now imports its packages, not just its files** (#4657). The importer copied each `.deb` but registered none of them: no control document, no `packages`/`package_versions` row, so the Packages tab stayed empty and the rendered `Packages` index had file-name-only entries (or none, for a `.deb` outside `pool/<component>/`). It also copied the source's own `dists/` tree (`Release`, `InRelease`, `by-hash/...`), signed with the source's key, as ordinary artifacts. Each migrated `.deb` is now parsed and recorded the way a native `PUT /debian/<repo>/pool/...` records it: control document, catalog row with description, maintainer-script analysis and repository bump. A `.deb` outside `pool/<component>/`, such as Artifactory's "Set Me Up" path `pool/<file>.deb`, is filed under `pool/main/`, and `dists/` is skipped because Artifact Keeper renders and signs its own index. Debian therefore moves from "file copy only" to fully supported in the migration assessment.
-
-  To repair a repository migrated before this fix, re-run the migration job: a `.deb` that is already present but unregistered is re-imported in place instead of being skipped as a duplicate, and a copy an earlier run left outside `pool/<component>/` is retired once it is re-filed under `pool/main/`. The copied `dists/` files from the earlier run stay in the artifact list and can be deleted.
