@@ -605,13 +605,38 @@ RUN set -eu; \
 # go1.27.2 is what golang:1.27-alpine serves and x/net v0.60.0 is on the module
 # proxy. buildctl has never been listed there and still is not.
 #
-# The source tag is UNCHANGED (v0.33.0 @ dddd5621), so this is a repackaging,
-# not an upgrade: the client speaks the same protocol to the same daemons it
-# did, and `buildctl --version` still prints
-# `buildctl github.com/moby/buildkit v0.33.0 dddd5621...`, because the ldflags
-# below are upstream's own (the `buildkit-version` stage of moby/buildkit's
-# Dockerfile at the tag). Upstream builds buildctl with CGO_ENABLED=0 and no
-# build tags, as here; -trimpath and the static check are ours.
+# The move to source build left the tag UNCHANGED (v0.33.0 @ dddd5621), so it
+# was a repackaging, not an upgrade. `buildctl --version` prints the tag the
+# ARGs name (`buildctl github.com/moby/buildkit v0.33.1 8c91502c...` since the
+# bump below), because the ldflags below are upstream's own (the
+# `buildkit-version` stage of moby/buildkit's Dockerfile at the tag). Upstream
+# builds buildctl with CGO_ENABLED=0 and no build tags, as here; -trimpath and
+# the static check are ours.
+#
+# TAG BUMP v0.33.0 -> v0.33.1 (2026-10-18, #4780). The push-time Trivy scan
+# of the 1.11.2 image (code-scanning category trivy-backend, 2026-10-17)
+# reported three MEDIUM findings against usr/local/bin/buildctl, all in the
+# containerd module v0.33.0 vendors:
+#   github.com/containerd/containerd/v2 v2.3.4  CVE-2026-53493  fixed in 2.3.6
+#                                               CVE-2026-53495  fixed in 2.3.5
+#                                               CVE-2026-95838  fixed in 2.3.5
+# Unlike x/net, upstream HAS made this bump, on the release branch we already
+# track: v0.33.1 (2026-09-30, commit 8c91502c) vendors containerd v2.3.6
+# (upstream commits 9d198b8f and a9d42a81), so a tag move is the fix and no
+# containerd override is needed. v0.33.1 is a patch release of the same
+# v0.33 line: 35 commits, the containerd and x/crypto v0.56.0 vendor bumps
+# plus input-validation hardening in daemon-side code (solver, gateway,
+# executor, cache, source). Its go.mod otherwise only raises the `go`
+# directive to 1.26.8, still below the GO_MIN_PATCH toolchain we compile
+# with, and promotes cyphar/filepath-securejoin from indirect. v0.34.0 also reaches the fix (containerd v2.4.1) but
+# is a minor release, so it is not taken here. Measured on the built stage:
+# `go version -m /buildctl` records containerd/v2 v2.3.6, and Trivy 0.76.0
+# reports none of the three advisories (main's stage: all three). The
+# build-info check at the end of this stage now also asserts containerd/v2 >=
+# CONTAINERD_MIN, so a tag change that vendors an older containerd fails the
+# build here rather than at Docker Publish's gate. That floor is not an
+# override and has no removal condition; raise it with the next containerd
+# advisory.
 #
 # The x/net override follows the grype x/net block's reasoning and makes the
 # same policy exception, stated the same way: upstream has NOT made this bump
@@ -627,7 +652,10 @@ RUN set -eu; \
 # golang.org/x modules move, from the same versions to the same versions, as
 # in grype-bin (x/crypto v0.57.0, x/mod v0.41.0, x/net v0.60.0, x/sync
 # v0.23.0, x/sys v0.48.0, x/term v0.46.0, x/text v0.42.0), because buildkit
-# v0.33.0 pins the same x/ versions grype v0.118.0 does. BuildKit VENDORS its
+# v0.33.0 pins the same x/ versions grype v0.118.0 does. Re-measured
+# 2026-10-18 on the v0.33.1 tree: the same seven modules move to the same
+# versions; the one difference is that x/crypto starts from v0.56.0, not
+# v0.55.0, so the declared set in the guard is unchanged. BuildKit VENDORS its
 # dependencies, so `go mod vendor` re-materializes vendor/ from the
 # checksum-verified graph after `go get`, and the build keeps upstream's
 # default -mod=vendor.
@@ -643,12 +671,14 @@ RUN set -eu; \
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS buildkit-bin
 ARG TARGETOS
 ARG TARGETARCH
-ARG BUILDKIT_VERSION=0.33.0
-ARG BUILDKIT_COMMIT=dddd5621af04ea57823085c93a063383f71d3173
+ARG BUILDKIT_VERSION=0.33.1
+ARG BUILDKIT_COMMIT=8c91502cf280bd70a0c50912ce251c46a8881d9f
 ARG GO_MIN_PATCH=1.27.2
 # The one declared divergence from upstream buildkit at this tag.
 ARG XNET_FROM=v0.58.0
 ARG XNET_TO=v0.60.0
+# Floor for the vendored containerd (#4780), asserted on the build info below.
+ARG CONTAINERD_MIN=v2.3.6
 
 RUN apk add --no-cache git ca-certificates
 
@@ -733,7 +763,16 @@ RUN set -eu; \
       echo "       The Trivy gate reads this build info; the override did not ship." >&2; \
       exit 1; \
     fi; \
-    echo "buildctl build: build info verified — $(printf '%s\n' "${info}" | head -n1 | sed 's|^/buildctl: ||'), golang.org/x/net ${xnet} across ${deps} deps"
+    ctrd="$(printf '%s\n' "${info}" \
+            | sed -n 's|^[[:space:]]*dep[[:space:]]*github\.com/containerd/containerd/v2[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+            | head -n1)"; \
+    lowest="$(printf '%s\n%s\n' "${ctrd#v}" "${CONTAINERD_MIN#v}" | sort -V | head -n1)"; \
+    if [ -z "${ctrd}" ] || [ "${lowest}" != "${CONTAINERD_MIN#v}" ]; then \
+      echo "ERROR: compiled buildctl records github.com/containerd/containerd/v2 '${ctrd}'," >&2; \
+      echo "       below the ${CONTAINERD_MIN} floor (CVE-2026-53493, -53495, -95838; #4780)." >&2; \
+      exit 1; \
+    fi; \
+    echo "buildctl build: build info verified — $(printf '%s\n' "${info}" | head -n1 | sed 's|^/buildctl: ||'), golang.org/x/net ${xnet}, containerd/v2 ${ctrd} across ${deps} deps"
 
 # ---------- Stage 5a: unsquashfs for the Incus scanner (#4469) ----------
 # incus_scanner.rs extracts SquashFS rootfs images with `unsquashfs`, on both

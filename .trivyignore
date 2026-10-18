@@ -9,7 +9,7 @@
 #     - /usr/local/bin/trivy  (ghcr.io/artifact-keeper/trivy, pinned by digest
 #       in docker/Dockerfile.scanner-adapter — scanner-adapter image only; the
 #       backend images do NOT bundle trivy)
-#     - /usr/local/bin/buildctl  (moby/buildkit v0.33.0, BUILT FROM SOURCE in
+#     - /usr/local/bin/buildctl  (moby/buildkit v0.33.1, BUILT FROM SOURCE in
 #       docker/Dockerfile.backend since 2026-10-10 — UBI backend image only)
 #   All are short-lived CLI subprocesses the services shell out to. They are
 #   NOT part of the network-reachable service surface (axum HTTP :8080 / gRPC
