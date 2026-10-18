@@ -2058,6 +2058,68 @@ pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<Cat
     })
 }
 
+/// #4725: subscribe a fresh push peer to `repo_id` and return its id.
+///
+/// The peer's row cascades to `peer_repo_subscriptions` and `sync_tasks` on
+/// delete, so tests must delete it — [`delete_push_peer`] — before
+/// `fx.teardown()` or the repository delete trips the subscription FK.
+pub async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> Uuid {
+    let peer_service =
+        crate::services::peer_instance_service::PeerInstanceService::new(pool.clone());
+    let peer = peer_service
+        .register(
+            crate::services::peer_instance_service::RegisterPeerInstanceRequest {
+                name: format!("{label}-push-peer-{}", uuid::Uuid::new_v4()),
+                endpoint_url: "https://push-peer.example.test".to_string(),
+                region: None,
+                cache_size_bytes: 1024 * 1024,
+                sync_filter: None,
+                api_key: "push-peer-key".to_string(),
+            },
+        )
+        .await
+        .expect("register push peer");
+    peer_service
+        .assign_repository(
+            peer.id,
+            repo_id,
+            true,
+            Some(crate::services::peer_instance_service::ReplicationMode::Push),
+            None,
+            None,
+        )
+        .await
+        .expect("assign repo to push peer");
+    peer.id
+}
+
+/// #4725: the artifact paths in `repo_id` that have a queued `push` sync task
+/// for `peer_id`, ordered by path. A native-format hosted upload that forgot
+/// to queue replication yields an empty vector.
+pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT a.path FROM sync_tasks st \
+         JOIN artifacts a ON a.id = st.artifact_id \
+         WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
+           AND a.repository_id = $2 AND a.is_deleted = false \
+         ORDER BY a.path",
+    )
+    .bind(peer_id)
+    .bind(repo_id)
+    .fetch_all(pool)
+    .await
+    .expect("list queued push sync tasks")
+}
+
+/// #4725: delete the peer registered by [`subscribe_push_peer`] (and with it
+/// its subscriptions and queued tasks). No-op when the peer is already gone.
+pub async fn delete_push_peer(pool: &PgPool, peer_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+        .bind(peer_id)
+        .execute(pool)
+        .await;
+}
+
 /// Assert that the native publish just driven fired exactly ONE
 /// `artifact.uploaded` (#3411, #3939), scoped to `repo_id` and identifying the
 /// `artifacts` row it wrote for `(name, version)`.

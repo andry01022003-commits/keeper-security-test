@@ -14,7 +14,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -644,6 +644,7 @@ async fn upload_package(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     base_url: RequestBaseUrl,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "pub", "write:artifacts")?.user_id;
@@ -819,6 +820,17 @@ async fn upload_package(
         size_bytes,
         &computed_sha256,
         pubspec.description.as_deref().filter(|d| !d.is_empty()),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -2332,6 +2344,60 @@ mod publish_protocol_tests {
             "finalize must return {{\"success\": {{\"message\": ...}}}}"
         );
         fx.teardown().await;
+    }
+
+    /// #4725: a hosted pub upload must queue a push sync task for a subscribed
+    /// push peer, and an upload arriving as peer replication must not be
+    /// fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn pub_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "pub").await;
+
+        let upload_uri = format!("/{}/api/packages/versions/newUpload", fx.repo_key);
+        let archive = pub_archive("push_sync_pkg", "1.0.0");
+        let (ct, body) = multipart_file(&archive);
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(upload_uri.clone(), &ct, body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "upload failed: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let archive = pub_archive("push_sync_pkg", "2.0.0");
+        let (ct, body) = multipart_file(&archive);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(upload_uri)
+            .header("x-artifact-keeper-replication", "true")
+            .header("content-type", ct)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "replicated upload failed: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["push_sync_pkg/1.0.0/push_sync_pkg-1.0.0.tar.gz".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 }
 

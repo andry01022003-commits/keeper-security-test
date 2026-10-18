@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -569,6 +569,7 @@ async fn put_file(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "bazel", "write:artifacts")?.user_id;
@@ -675,6 +676,18 @@ async fn put_file(
         )
         .await;
     }
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and (for MODULE.bazel) its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        body.len() as i64,
+    )
+    .await;
 
     info!(
         "Bazel publish: {} {} {} to repo {}",
@@ -1034,6 +1047,56 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
         }
         f.teardown().await;
+    }
+
+    /// #4725: a hosted Bazel publish must queue a push sync task for every
+    /// subscribed push peer, and a replicated write must not fan out again.
+    #[tokio::test]
+    async fn bazel_publish_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "bazel").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "bazel").await;
+
+        assert_eq!(
+            put_as_member(
+                &f,
+                "modules/queuelib/1.0.0/MODULE.bazel",
+                b"module(name='queuelib')"
+            )
+            .await,
+            StatusCode::CREATED,
+            "client publish must succeed"
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the file
+        // but must not queue another task.
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/modules/queuelib/2.0.0/MODULE.bazel",
+                f.repo_key
+            ))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(&b"module(name='queuelib')"[..]))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["modules/queuelib/1.0.0/MODULE.bazel".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
     }
 
     #[tokio::test]

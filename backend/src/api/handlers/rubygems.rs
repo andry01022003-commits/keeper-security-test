@@ -21,7 +21,7 @@ use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -297,6 +297,7 @@ async fn push_gem(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -411,6 +412,18 @@ async fn push_gem(
         size_bytes,
         &computed_sha256,
         gemspec.summary.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -2195,6 +2208,57 @@ mod tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         f.teardown().await;
+    }
+
+    /// #4725: a `gem push` to a hosted repository must queue a push sync task
+    /// for a subscribed push peer, and a push that arrives as peer replication
+    /// must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn gem_push_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "rubygems").await;
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from(build_test_gem("repl-gem", "1.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "gem push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated push (as the sync worker sends it) stores the gem but
+        // must not queue another task.
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(build_test_gem("repl-gem", "2.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated gem push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["repl-gem/1.0.0/repl-gem-1.0.0.gem".to_string()],
+            "only the client push queues a push task; the replicated one must not"
+        );
     }
 
     /// A minimal `.gem`: a plain tar carrying a gzip'd gemspec-YAML `metadata.gz`.

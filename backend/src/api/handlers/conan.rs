@@ -2180,6 +2180,7 @@ async fn recipe_file_upload(
         String,
         String,
     )>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Reject path segments that exceed the filesystem NAME_MAX before any
@@ -2358,6 +2359,25 @@ async fn recipe_file_upload(
                 "channel": normalize_channel(&channel),
                 "reference": build_conan_reference(&name, &version, &user, &channel),
             })),
+        )
+        .await;
+    }
+
+    // #4725: fan out to subscribed push peers. A peer-replicated write is
+    // skipped by the header check inside the helper. A pending companion is
+    // not published yet, so it is not queued — its revision's manifest upload
+    // covers the whole revision, companions included. A manifest publishes the
+    // revision, so it queues every live artifact of it.
+    if is_manifest {
+        queue_revision_push_sync_tasks(&state.db, &headers, repo.id, &rev).await;
+    } else if !pending {
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            &headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
         )
         .await;
     }
@@ -2634,6 +2654,67 @@ async fn publish_conan_revision(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// #4725: queue a push sync task for every live artifact of a published Conan
+/// revision. A revision is published by its manifest, which also makes the
+/// companions stored `pending` live, so the single-artifact queue would miss
+/// them. Mirrors `publish_conan_revision`'s predicate; the request headers keep
+/// a peer-replicated manifest from fanning back out.
+async fn queue_revision_push_sync_tasks(
+    db: &PgPool,
+    headers: &HeaderMap,
+    repository_id: uuid::Uuid,
+    rev: &ConanRevisionRef<'_>,
+) {
+    let rows = sqlx::query_as::<_, (uuid::Uuid, String, i64)>(
+        r#"
+        SELECT a.id, a.path, a.size_bytes
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+          AND am.metadata->>'type' = $7
+          AND ($8::text IS NULL OR am.metadata->>'packageId' = $8)
+          AND ($9::text IS NULL OR am.metadata->>'packageRevision' = $9)
+        ORDER BY a.path
+        "#,
+    )
+    .bind(repository_id)
+    .bind(rev.name)
+    .bind(rev.version)
+    .bind(normalize_user(rev.user))
+    .bind(normalize_channel(rev.channel))
+    .bind(rev.revision)
+    .bind(rev.kind())
+    .bind(rev.package.map(|(pid, _)| pid))
+    .bind(rev.package.map(|(_, prev)| prev))
+    .fetch_all(db)
+    .await;
+    let Ok(rows) = rows else {
+        tracing::warn!(
+            "Conan push sync: could not list revision {} for fan-out",
+            rev.display()
+        );
+        return;
+    };
+    for (artifact_id, path, size_bytes) in rows {
+        super::queue_push_sync_tasks_for_upload(
+            db,
+            headers,
+            repository_id,
+            artifact_id,
+            &path,
+            size_bytes,
+        )
+        .await;
+    }
 }
 
 /// Store an uploaded Conan file's artifact row and metadata in one
@@ -3405,6 +3486,7 @@ async fn package_file_upload(
         String,
         String,
     )>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Reject excessively long path segments up front (before any DB, auth,
@@ -3579,6 +3661,23 @@ async fn package_file_upload(
     )
     .execute(&state.db)
     .await;
+
+    // #4725: fan out to subscribed push peers. See `recipe_file_upload` for
+    // the pending/manifest semantics; the manifest publishes the package
+    // revision, so it queues every live artifact of it.
+    if is_manifest {
+        queue_revision_push_sync_tasks(&state.db, &headers, repo.id, &rev).await;
+    } else if !pending {
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            &headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await;
+    }
 
     info!(
         "Conan package upload: {}/{} rev={} pkg={} pkg_rev={} file={} to repo {}",
@@ -12028,6 +12127,108 @@ mod repo_scoped_keys_4694 {
             Some(format!(
                 "conan/{repo_id}/samerev/1.0/_/_/recipe/{RREV}/conanfile.py"
             ))
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4725: native Conan uploads must fan out push sync tasks to subscribed
+// push peers, once the revision is published.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod push_sync_4725 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+
+    /// PUT a recipe file through the router; `replication` adds the header the
+    /// sync worker sends on peer replication writes.
+    async fn put_recipe_file(
+        f: &tdh::Fixture,
+        revision: &str,
+        file: &str,
+        body: &[u8],
+        replication: bool,
+    ) -> StatusCode {
+        let mut builder = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/v2/conans/lib/1.0/_/_/revisions/{}/files/{}",
+                f.repo_key, revision, file
+            ))
+            .header("Authorization", basic_auth(&f.username, "irrelevant"));
+        if replication {
+            builder = builder.header("x-artifact-keeper-replication", "true");
+        }
+        let req = builder.body(Body::from(body.to_vec())).expect("build PUT");
+        let (status, _) = send(f.router_with_auth(super::router()), req).await;
+        status
+    }
+
+    /// A companion file of an unpublished revision is stored `pending` and
+    /// must not be queued; the manifest that publishes the revision queues the
+    /// whole revision — companion and manifest alike. A revision that arrives
+    /// as peer replication must queue nothing.
+    #[tokio::test]
+    async fn recipe_manifest_publish_queues_revision_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "conan").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "conan").await;
+
+        assert_eq!(
+            put_recipe_file(&f, "rrev1", "conanfile.py", sample_conanfile_py(), false).await,
+            StatusCode::CREATED
+        );
+        assert!(
+            tdh::queued_push_paths(&f.pool, peer_id, f.repo_id)
+                .await
+                .is_empty(),
+            "a pending companion must not queue a push task"
+        );
+        assert_eq!(
+            put_recipe_file(
+                &f,
+                "rrev1",
+                "conanmanifest.txt",
+                sample_conanmanifest_txt(),
+                false
+            )
+            .await,
+            StatusCode::CREATED
+        );
+
+        // The same revision arriving as peer replication stores its files but
+        // must not fan back out.
+        assert_eq!(
+            put_recipe_file(&f, "rrev2", "conanfile.py", sample_conanfile_py(), true).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            put_recipe_file(
+                &f,
+                "rrev2",
+                "conanmanifest.txt",
+                sample_conanmanifest_txt(),
+                true
+            )
+            .await,
+            StatusCode::CREATED
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![
+                "lib/1.0/_/_/revisions/rrev1/files/conanfile.py".to_string(),
+                "lib/1.0/_/_/revisions/rrev1/files/conanmanifest.txt".to_string(),
+            ],
+            "the manifest publish must queue the whole revision; a replicated publish must queue nothing"
         );
     }
 }

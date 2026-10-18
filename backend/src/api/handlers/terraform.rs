@@ -29,7 +29,7 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
@@ -1544,6 +1544,7 @@ async fn upload_module(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1678,6 +1679,17 @@ async fn upload_module(
         size_bytes,
         &checksum,
         None,
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -2065,6 +2077,7 @@ async fn upload_provider(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -2202,6 +2215,17 @@ async fn upload_provider(
         size_bytes,
         &checksum,
         None,
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -5335,6 +5359,125 @@ mod tests {
         )
         .await;
         status
+    }
+
+    /// #4725: a hosted module upload must queue a push sync task for a
+    /// subscribed push peer, and an upload arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn terraform_module_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "terraform").await;
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!(
+                    "{}/{}/v1/modules/acme/pushsync/aws/1.0.0",
+                    MOUNT_PREFIX, fx.repo_key
+                ),
+                // #4590: a module upload must be a real archive type.
+                Bytes::from_static(b"PK\x03\x04module-archive-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "module upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the module
+        // but must not queue another task.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "{}/{}/v1/modules/acme/pushsync/aws/2.0.0",
+                MOUNT_PREFIX, fx.repo_key
+            ))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(bytes::Bytes::from_static(
+                b"PK\x03\x04module-archive-bytes",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(mounted_router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated module upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["acme/pushsync/aws/1.0.0".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
+    }
+
+    /// #4725: a hosted provider upload must queue a push sync task for a
+    /// subscribed push peer, and an upload arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn terraform_provider_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "terraform").await;
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!(
+                    "{}/{}/v1/providers/acme/pushsync/1.0.0/linux/arm64",
+                    MOUNT_PREFIX, fx.repo_key
+                ),
+                bytes::Bytes::from_static(b"PK\x03\x04provider-zip-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "provider upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "{}/{}/v1/providers/acme/pushsync/2.0.0/linux/arm64",
+                MOUNT_PREFIX, fx.repo_key
+            ))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(bytes::Bytes::from_static(
+                b"PK\x03\x04provider-zip-bytes",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(mounted_router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated provider upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["acme/pushsync/1.0.0/linux_arm64".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 
     /// Resolve a (possibly relative) advertised URL the way a client does —

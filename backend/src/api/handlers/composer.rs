@@ -16,7 +16,7 @@ use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
@@ -1634,6 +1634,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -1837,6 +1838,17 @@ async fn upload(
         &sha256,
         composer_json.description.as_deref(),
         Some(serde_json::json!({ "format": "composer" })),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -3805,6 +3817,58 @@ mod upload_db_tests {
         );
 
         f.teardown().await;
+    }
+
+    /// #4725: a Composer publish to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and a publish that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn composer_upload_queues_push_sync_task_4725() {
+        use sha2::{Digest, Sha256};
+
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "composer").await;
+        let name = "acme/repl4725";
+
+        let zip = build_composer_zip(name, "1.2.3", "4725 push-peer fan-out");
+        let sha = format!("{:x}", Sha256::digest(&zip));
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "expected 2xx for Composer upload, got {}: {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let zip = build_composer_zip(name, "2.0.0", "4725 push-peer fan-out");
+        let mut req = put_composer(format!("/{}/api/packages", f.repo_key), zip);
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let app = f.router_with_auth(super::router());
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "expected 2xx for replicated Composer upload, got {}: {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![format!("{name}/1.2.3/{sha}.zip")],
+            "only the client publish queues a push task; the replicated one must not"
+        );
     }
 }
 

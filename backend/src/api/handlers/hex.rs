@@ -13,7 +13,7 @@ use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -827,6 +827,7 @@ async fn publish_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -978,6 +979,17 @@ async fn publish_package(
         size_bytes,
         &computed_sha256,
         None,
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -3369,6 +3381,64 @@ mod tests {
         let row = tdh::catalog_row(&f.pool, f.repo_id, "pushpkg").await;
         f.teardown().await;
         assert!(row.is_some(), "a hex publish must write a packages row");
+    }
+
+    /// #4725: a hosted hex publish must queue a push sync task for a
+    /// subscribed push peer, and a publish arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn hex_publish_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "hex").await;
+
+        let metadata = r#"{<<"name">>, <<"pushsync">>}.
+{<<"version">>, <<"1.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let (status, body) = publish_hex(&f, tar_data).await;
+        assert!(
+            status.is_success(),
+            "hex publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // package but must not queue another task.
+        let metadata = r#"{<<"name">>, <<"pushsync">>}.
+{<<"version">>, <<"2.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(tar_data))
+            .unwrap();
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated hex publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["pushsync/1.0.0/pushsync-1.0.0.tar".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
     }
 
     /// #2904: a tarball whose CHECKSUM member is missing or malformed can never

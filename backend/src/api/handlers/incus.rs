@@ -692,6 +692,10 @@ struct UpsertArtifactParams<'a> {
     storage_key: &'a str,
     user_id: Uuid,
     metadata: &'a serde_json::Value,
+    /// #4725: whether the finalize request should fan out push sync tasks —
+    /// false when the write arrived as peer replication (or from a caller with
+    /// no request context).
+    enqueue_sync_tasks: bool,
 }
 
 /// Insert or update the artifact record and store metadata. Shared by
@@ -709,6 +713,7 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
         storage_key,
         user_id,
         metadata,
+        enqueue_sync_tasks,
     } = p;
     let content_type = content_type_for_artifact(artifact_path);
 
@@ -765,6 +770,12 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
         db, event_bus, repo_id, "incus", product, version, size_bytes, checksum, None,
     )
     .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    if enqueue_sync_tasks {
+        super::queue_push_sync_tasks_now(db, repo_id, artifact_id, artifact_path, size_bytes).await;
+    }
 
     Ok(artifact_id)
 }
@@ -1075,6 +1086,7 @@ async fn upload_image(
     Extension(auth): Extension<Option<AuthExtension>>,
     OriginalUri(original_uri): OriginalUri,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1190,6 +1202,8 @@ async fn upload_image(
             final_path: None,
             finalize_token,
             staged_part_keys: Vec::new(),
+            // #4725: a peer-replicated publish must not fan back out.
+            enqueue_sync_tasks: !super::is_replication_request(&headers),
         },
     ));
 
@@ -2282,6 +2296,8 @@ async fn complete_chunked_upload(
             final_path: Some(final_path.clone()),
             finalize_token,
             staged_part_keys: staged_keys,
+            // #4725: a peer-replicated publish must not fan back out.
+            enqueue_sync_tasks: !super::is_replication_request(&headers),
         },
     ));
 
@@ -2649,6 +2665,9 @@ struct FinalizeParams {
     /// once the session is terminal. Empty for the monolithic path and for a
     /// session started by an earlier server version.
     staged_part_keys: Vec<String>,
+    /// #4725: whether this finalize should fan out push sync tasks to
+    /// subscribed peers. False for a write that arrived as peer replication.
+    enqueue_sync_tasks: bool,
 }
 
 /// Push the staged temp file to the repo's StorageBackend, create the
@@ -2699,6 +2718,7 @@ async fn run_finalize(
         storage_key: &p.storage_key,
         user_id: p.user_id,
         metadata: &p.metadata,
+        enqueue_sync_tasks: p.enqueue_sync_tasks,
     })
     .await?;
 
@@ -4359,6 +4379,7 @@ mod tests {
             storage_key: &storage_key,
             user_id: f.user_id,
             metadata: &metadata,
+            enqueue_sync_tasks: false,
         })
         .await
         else {
@@ -4833,6 +4854,67 @@ mod streaming_pipeline_regression_tests {
         f.teardown().await;
     }
 
+    /// #4725: a monolithic image upload to a hosted repository must queue a
+    /// push sync task for a subscribed push peer, and an upload that arrives
+    /// as peer replication must not be fanned back out.
+    #[tokio::test]
+    async fn monolithic_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "incus").await;
+
+        // PUT a monolithic image, wait for the async finalize, and return the
+        // artifact path it wrote.
+        async fn put(f: &tdh::Fixture, version: &str, replication: bool) -> String {
+            let mut builder = axum::http::Request::builder().method("PUT").uri(format!(
+                "/{}/images/ubuntu-noble/{}/incus.tar.xz",
+                f.repo_key, version
+            ));
+            if replication {
+                builder = builder.header("x-artifact-keeper-replication", "true");
+            }
+            let req = builder
+                .body(Body::from(vec![7u8; 4096]))
+                .expect("build PUT");
+            let (status, body) = tdh::send(f.router_with_auth(router()), req).await;
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "monolithic PUT must return 202: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse upload response");
+            let session_id: Uuid = json["session_id"]
+                .as_str()
+                .expect("response has session_id")
+                .parse()
+                .expect("session_id is a UUID");
+            let progress = await_finalize(f, session_id).await;
+            assert_eq!(
+                progress["status"].as_str(),
+                Some("completed"),
+                "finalize must complete: {progress}"
+            );
+            build_artifact_path("ubuntu-noble", version, "incus.tar.xz")
+        }
+
+        let first = put(&f, "20240215", false).await;
+        // A replicated publish (as the sync worker sends it) stores the image
+        // but must not queue another task.
+        let second = put(&f, "20240216", true).await;
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![first.clone()],
+            "only the client upload queues a push task; the replicated one ({second}) must not"
+        );
+    }
+
     /// GET for an artifact whose `storage_key` row exists but whose object
     /// is missing from the StorageBackend must surface as a non-200 error.
     /// Exercises `download_image`'s `get_stream` error-mapping closure.
@@ -5242,6 +5324,7 @@ mod streaming_pipeline_regression_tests {
                 final_path: None,
                 finalize_token,
                 staged_part_keys: Vec::new(),
+                enqueue_sync_tasks: false,
             },
         )
         .await;
@@ -5273,6 +5356,7 @@ mod streaming_pipeline_regression_tests {
             storage_key: &build_storage_key(&f.repo_id, &artifact_path),
             user_id: f.user_id,
             metadata: &metadata,
+            enqueue_sync_tasks: false,
         })
         .await
         .expect_err("the locked admission refuses the row");
@@ -5347,6 +5431,7 @@ mod streaming_pipeline_regression_tests {
                 final_path: None,
                 finalize_token,
                 staged_part_keys: Vec::new(),
+                enqueue_sync_tasks: false,
             },
         )
         .await;
@@ -5473,6 +5558,7 @@ mod streaming_pipeline_regression_tests {
                 final_path: None,
                 finalize_token: stale_token,
                 staged_part_keys: Vec::new(),
+                enqueue_sync_tasks: false,
             },
         )
         .await;

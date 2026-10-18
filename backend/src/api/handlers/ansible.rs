@@ -81,8 +81,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, OriginalUri, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
-use axum::http::Uri;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -1634,6 +1633,7 @@ async fn upload_collection(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "ansible", "write:artifacts")?.user_id;
@@ -1884,6 +1884,17 @@ async fn upload_collection(
         ansible_metadata
             .pointer("/collection_json/description")
             .and_then(|d| d.as_str()),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -2659,6 +2670,71 @@ mod tests {
         assert!(
             row.is_some(),
             "an ansible publish must write a packages row"
+        );
+    }
+
+    /// #4725: a collection publish to a hosted repository must queue a push
+    /// sync task for a subscribed push peer, and a publish that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn ansible_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "ansible").await;
+
+        let body = b"fake-tar-content-4725";
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        let sha = format!("{:x}", hasher.finalize());
+        let multipart =
+            galaxy_cli_multipart("BOUNDARY", "community-repl4725-1.0.0.tar.gz", body, &sha);
+        let app = f.router_with_auth(super::router());
+        let (status, resp) = tdh::send(
+            app,
+            tdh::post(
+                format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+                "multipart/form-data; boundary=BOUNDARY",
+                multipart,
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "collection publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // collection but must not queue another task.
+        let multipart =
+            galaxy_cli_multipart("BOUNDARY", "community-repl4725-2.0.0.tar.gz", body, &sha);
+        let mut req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart,
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let app = f.router_with_auth(super::router());
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated collection publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["community-repl4725/1.0.0/community-repl4725-1.0.0.tar.gz".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
         );
     }
 

@@ -11442,6 +11442,13 @@ where
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
     let artifact_name = format!("{}:{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    // #4725: deliberately NOT queued for peer push sync here, unlike the other
+    // native-format upload handlers. Layer blobs live in `oci_blobs`, not
+    // `artifacts`, so the artifact-driven sync worker can only ever transfer
+    // the manifest bytes. A peer that received the manifest alone would serve
+    // an image whose blobs 404 — worse than having nothing. Replicating an
+    // image needs a blob-aware transfer (manifest + its blob closure), which
+    // is a separate design from this artifact-row fan-out.
     // NO-QUOTA-ADMISSION: a manifest row records the image size, whose bytes
     // are admitted blob by blob; the usage ledger excludes `oci-manifests/%`
     // rows (#4545, migration 288), so the row adds 0 (a push, a migration

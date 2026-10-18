@@ -2366,6 +2366,7 @@ async fn upload_package_put(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, pkg_path)): Path<(String, String)>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -2387,13 +2388,14 @@ async fn upload_package_put(
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
     }
 
-    store_rpm(&state, &repo, &filename, body, user_id).await
+    store_rpm(&state, &repo, &filename, &headers, body, user_id).await
 }
 
 async fn upload_relative(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
@@ -2410,7 +2412,7 @@ async fn upload_relative(
         )
             .into_response());
     }
-    store_rpm(&state, &repo, &path, body, user_id).await
+    store_rpm(&state, &repo, &path, &headers, body, user_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2436,7 +2438,7 @@ async fn upload_package_post(
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
     }
 
-    store_rpm(&state, &repo, &filename, body, user_id).await
+    store_rpm(&state, &repo, &filename, &headers, body, user_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2447,6 +2449,7 @@ async fn store_rpm(
     state: &SharedState,
     repo: &RepoInfo,
     path: &str,
+    headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
@@ -2637,6 +2640,17 @@ async fn store_rpm(
             size_bytes,
             &computed_sha256,
             description,
+        )
+        .await;
+
+        // #4725: fan out to subscribed push peers.
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
         )
         .await;
     }
@@ -4299,6 +4313,55 @@ mod tests {
             status
         );
         f.teardown().await;
+    }
+
+    /// #4725: an RPM upload to a hosted repository must queue a push sync task
+    /// for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn rpm_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "rpm").await;
+
+        let body: Vec<u8> = vec![0u8; 32];
+        let req = tdh::put(
+            format!("/{}/packages/repl-rpm-1.0-1.noarch.rpm", f.repo_key),
+            bytes::Bytes::from(body.clone()),
+        );
+        let (status, resp) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "rpm upload must succeed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let mut req = tdh::put(
+            format!("/{}/packages/repl-rpm-2.0-1.noarch.rpm", f.repo_key),
+            bytes::Bytes::from(body),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, resp) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated rpm upload must succeed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["packages/repl-rpm-1.0-1.noarch.rpm".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 
     #[tokio::test]

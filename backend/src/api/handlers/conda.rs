@@ -6237,6 +6237,7 @@ async fn upload_package_put(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -6253,7 +6254,16 @@ async fn upload_package_put(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, Some(&subdir), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        Some(&subdir),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -6291,7 +6301,16 @@ async fn upload_post(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, subdir.as_deref(), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        subdir.as_deref(),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -6303,6 +6322,7 @@ async fn upload_package_put_with_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
@@ -6325,7 +6345,16 @@ async fn upload_package_put_with_token(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, Some(&subdir), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        Some(&subdir),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 /// POST upload using URL path token: /conda/t/<TOKEN>/<repo_key>/upload
@@ -6365,7 +6394,16 @@ async fn upload_post_with_token(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, subdir.as_deref(), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        subdir.as_deref(),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -8396,6 +8434,7 @@ async fn store_conda_package(
     repo: &RepoInfo,
     requested_subdir: Option<&str>,
     filename: &str,
+    headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
@@ -8664,6 +8703,17 @@ async fn store_conda_package(
         repo.id,
     )
     .execute(&state.db)
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
     .await;
 
     // #4711: a package arrives with no attestation of its own; CEP-27
@@ -16474,6 +16524,78 @@ mod tests {
         assert_eq!(sha, hex::encode(Sha256::digest(text.as_bytes())));
         assert_eq!(attestations_sha256_of(Some(&legacy)), Some(sha));
         assert_eq!(attestations_sha256_of(Some(&stored)), Some("abc".into()));
+    }
+
+    /// #4725: a conda upload to a hosted repository must queue a push sync task
+    /// for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn conda_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "conda").await;
+
+        // The embedded index.json must agree with the filename's coordinates
+        // (`check_filename_matches_metadata`), so each upload builds its own.
+        let package = |version: &str| {
+            let info = vec![(
+                "info/index.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "numpy",
+                    "version": version,
+                    "build": "py312h02b7e37_0",
+                    "build_number": 0,
+                }))
+                .unwrap(),
+            )];
+            build_test_conda_v2_package_with_payload(&info, &[])
+        };
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "linux-64")
+            .header("X-Package-Filename", "numpy-1.26.4-py312h02b7e37_0.conda")
+            .body(axum::body::Body::from(package("1.26.4")))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "conda upload must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "linux-64")
+            .header("X-Package-Filename", "numpy-1.27.0-py312h02b7e37_0.conda")
+            .body(axum::body::Body::from(package("1.27.0")))
+            .unwrap();
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated conda upload must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["linux-64/numpy-1.26.4-py312h02b7e37_0.conda".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 }
 

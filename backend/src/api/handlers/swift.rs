@@ -1241,6 +1241,18 @@ async fn publish_release(
     )
     .await;
 
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
     info!(
         "Swift publish: {}.{} {} to repo {}",
         scope, name, version, repo_key
@@ -2443,6 +2455,74 @@ mod catalog_registration_tests {
         assert_eq!(
             row.description.as_deref(),
             Some("a catalogued swift package")
+        );
+    }
+
+    /// #4725: a SE-0292 publish to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and a publish that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing
+    /// queued).
+    #[tokio::test]
+    async fn swift_publish_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "swift").await;
+
+        let archive = source_zip();
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{CATALOG_BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"source-archive\"\r\n");
+        body.extend_from_slice(b"Content-Type: application/zip\r\n");
+        body.extend_from_slice(b"Content-Transfer-Encoding: binary\r\n\r\n");
+        body.extend_from_slice(&archive);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{CATALOG_BOUNDARY}--\r\n").as_bytes());
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/example/ExamplePackage/1.0.0", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={CATALOG_BOUNDARY}"),
+            )
+            .body(axum::body::Body::from(body.clone()))
+            .expect("build publish request");
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "swift publish must succeed: {status} {}",
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // release but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/example/ExamplePackage/2.0.0", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={CATALOG_BOUNDARY}"),
+            )
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(body))
+            .expect("build replicated publish request");
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated swift publish must succeed: {status} {}",
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["example/ExamplePackage/1.0.0/ExamplePackage.zip".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
         );
     }
 }

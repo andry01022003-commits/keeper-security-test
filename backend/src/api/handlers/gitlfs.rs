@@ -659,6 +659,17 @@ async fn upload_object(
     .execute(&state.db)
     .await;
 
+    // #4725: fan out to subscribed push peers now that the row is committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
     info!(
         "Git LFS upload: {} ({} bytes) to repo {}",
         oid, size_bytes, repo_key
@@ -1700,6 +1711,63 @@ mod tests {
         assert!(
             result.is_err(),
             "require_auth_basic(None, ...) must return Err to deny unauthenticated callers"
+        );
+    }
+
+    /// #4725: an LFS object upload to a hosted repository must queue a push
+    /// sync task for a subscribed push peer, and an upload that arrives as
+    /// peer replication must not be fanned back out. Fails on `main`
+    /// (nothing queued).
+    #[tokio::test]
+    async fn gitlfs_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "gitlfs").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "gitlfs").await;
+
+        let content = b"lfs-push-sync-bytes".to_vec();
+        let oid = format!("{:x}", Sha256::digest(&content));
+        let path = format!("lfs/objects/{}/{}", &oid[..2], oid);
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/objects/{}", f.repo_key, oid))
+            .body(axum::body::Body::from(content))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "LFS upload must succeed: {status} {:?}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the object
+        // but must not queue another task.
+        let repl_content = b"lfs-replicated-bytes".to_vec();
+        let repl_oid = format!("{:x}", Sha256::digest(&repl_content));
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/objects/{}", f.repo_key, repl_oid))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(repl_content))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated LFS upload must succeed: {status} {:?}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![path],
+            "only the client upload queues a push task; the replicated one must not"
         );
     }
 

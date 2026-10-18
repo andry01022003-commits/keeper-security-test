@@ -12,6 +12,50 @@ pub(crate) fn is_replication_request(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Queue push sync tasks for a freshly committed hosted upload so every
+/// subscribed push/mirror peer receives it (#4725).
+///
+/// The native-format handlers write their artifact rows directly, so they do
+/// not pass through `ArtifactService::finalize_upload`, which queues these
+/// tasks for the generic upload path. This helper is the shared replacement:
+/// call it once the artifact row (and its metadata) is committed, with the
+/// request's headers so a peer replication write is never fanned back out to
+/// other peers.
+pub(crate) async fn queue_push_sync_tasks_for_upload(
+    db: &sqlx::PgPool,
+    headers: &HeaderMap,
+    repository_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    path: &str,
+    size_bytes: i64,
+) {
+    if is_replication_request(headers) {
+        return;
+    }
+    queue_push_sync_tasks_now(db, repository_id, artifact_id, path, size_bytes).await;
+}
+
+/// [`queue_push_sync_tasks_for_upload`] for a call site that already knows the
+/// write is not a replication (it threaded an `enqueue_sync_tasks: bool` down
+/// from its handler instead of the `HeaderMap`).
+pub(crate) async fn queue_push_sync_tasks_now(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    path: &str,
+    size_bytes: i64,
+) {
+    crate::services::peer_instance_service::PeerInstanceService::new(db.clone())
+        .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+            id: artifact_id,
+            repository_id,
+            path,
+            size_bytes,
+            created_at: chrono::Utc::now(),
+        })
+        .await;
+}
+
 /// Remove any soft-deleted artifact at the given `(repository_id, path)` so
 /// that a subsequent INSERT won't violate the UNIQUE constraint.  This is a
 /// fire-and-forget cleanup: if the DELETE fails or finds nothing we just
