@@ -1136,13 +1136,25 @@ impl MigrationWorker {
                     continue;
                 }
 
+                // #4740: a `.deb`'s component comes from the source's
+                // `deb.component` property when it has one; resolved once here
+                // and threaded through, since the duplicate check below already
+                // needs the destination path it decides.
+                let debian_component = self
+                    .debian_component(client.as_ref(), repo_key, package_type, &artifact_path)
+                    .await;
+
                 // Check for duplicates in the artifacts table (cross-job support)
                 // This is checked BEFORE creating migration_item so we avoid tracking
                 // duplicates that already exist, which makes delta migrations work
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
                         keys.target.as_str(),
-                        &artifact_path,
+                        &duplicate_lookup_path(
+                            package_type,
+                            &artifact_path,
+                            debian_component.as_deref(),
+                        ),
                         &source_path,
                         &ExpectedChecksums {
                             sha256: expected_sha256.clone(),
@@ -1210,6 +1222,7 @@ impl MigrationWorker {
                     failed,
                     skipped,
                     transferred,
+                    debian_component.as_deref(),
                 )
                 .await?;
 
@@ -1324,13 +1337,14 @@ impl MigrationWorker {
         failed: &mut i32,
         skipped: &mut i32,
         transferred: &mut i64,
+        debian_component: Option<&str>,
     ) -> Result<(), MigrationError> {
         // Read the source by source key; write the destination by target key.
         let repo_key = keys.source.as_str();
         let should_skip = self
             .check_artifact_duplicate(
                 keys.target.as_str(),
-                artifact_path,
+                &duplicate_lookup_path(package_type, artifact_path, debian_component),
                 source_path,
                 &expected,
                 conflict_resolution,
@@ -1341,7 +1355,12 @@ impl MigrationWorker {
         // packages is re-imported (in place) rather than skipped.
         let should_skip = should_skip
             && !self
-                .debian_registration_missing(keys.target.as_str(), package_type, artifact_path)
+                .debian_registration_missing(
+                    keys.target.as_str(),
+                    package_type,
+                    artifact_path,
+                    debian_component,
+                )
                 .await;
 
         if should_skip {
@@ -1367,6 +1386,7 @@ impl MigrationWorker {
                 artifact_path,
                 include_metadata,
                 &expected,
+                debian_component,
             )
             .await
         {
@@ -1459,6 +1479,39 @@ impl MigrationWorker {
         }
     }
 
+    /// The component the source records for a Debian package (#4740), read
+    /// from its `deb.component` property. `None` for other formats and files,
+    /// a source without properties (Nexus), and a failed lookup: the path
+    /// then decides (see [`debian_destination_path`]).
+    async fn debian_component(
+        &self,
+        client: &dyn SourceRegistry,
+        repo_key: &str,
+        package_type: &str,
+        artifact_path: &str,
+    ) -> Option<String> {
+        if !package_type.eq_ignore_ascii_case("debian")
+            || !is_debian_package_file(extract_name_from_path(artifact_path))
+        {
+            return None;
+        }
+        match client.get_properties(repo_key, artifact_path).await {
+            Ok(props) => props
+                .properties
+                .as_ref()
+                .and_then(debian_component_from_properties),
+            Err(e) => {
+                tracing::debug!(
+                    repo = %repo_key,
+                    path = %artifact_path,
+                    error = %e,
+                    "could not read deb.component; the path decides the component"
+                );
+                None
+            }
+        }
+    }
+
     /// The parsed control file of a migrated `.deb`, validated exactly as the
     /// native `PUT /debian/<repo>/pool/...` and the chunked completion (#1846)
     /// validate it, against the pool path the row is stored under (#4657).
@@ -1471,11 +1524,12 @@ impl MigrationWorker {
         package_type: &str,
         artifact_path: &str,
         temp_path: &std::path::Path,
+        debian_component: Option<&str>,
     ) -> Option<crate::api::handlers::debian::StagedDebianPackage> {
         if !package_type.eq_ignore_ascii_case("debian") {
             return None;
         }
-        let stored_path = debian_destination_path(artifact_path);
+        let stored_path = debian_destination_path(artifact_path, debian_component);
         match crate::api::handlers::debian::finalize_from_staged(&stored_path, temp_path).await {
             Ok(package) => package,
             Err(reason) => {
@@ -1500,6 +1554,7 @@ impl MigrationWorker {
         target_key: &str,
         package_type: &str,
         artifact_path: &str,
+        debian_component: Option<&str>,
     ) -> bool {
         if !package_type.eq_ignore_ascii_case("debian")
             || crate::services::artifact_metadata::parse_name_and_version(
@@ -1521,7 +1576,7 @@ impl MigrationWorker {
                    AND am.format = 'debian')",
         )
         .bind(target_key)
-        .bind(debian_destination_path(artifact_path))
+        .bind(debian_destination_path(artifact_path, debian_component))
         .fetch_one(&self.db)
         .await;
         match registered {
@@ -2104,6 +2159,7 @@ impl MigrationWorker {
         artifact_path: &str,
         include_metadata: bool,
         expected: &ExpectedChecksums,
+        debian_component: Option<&str>,
     ) -> Result<TransferResult, MigrationError> {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
@@ -2307,7 +2363,7 @@ impl MigrationWorker {
         // written with the row below, and the catalog row and maintainer-
         // script analysis follow the commit.
         let debian_package = self
-            .migration_debian_package(package_type, artifact_path, &temp_path)
+            .migration_debian_package(package_type, artifact_path, &temp_path, debian_component)
             .await;
 
         // #2561: permit-scoped decode; on saturation skip the best-effort
@@ -2457,6 +2513,7 @@ impl MigrationWorker {
                     &parsed,
                     filename,
                     artifact_path,
+                    debian_component,
                 );
 
                 // Path-traversal guard: the stored path is used verbatim as
@@ -3759,7 +3816,7 @@ fn migration_artifact_path(
         "maven" | "gradle" | "sbt" | "ivy" => artifact_path.to_string(),
         // #4657: Debian packages live under `pool/<component>/`, the layout
         // `Packages` indexes and `apt` downloads from.
-        "debian" => debian_destination_path(artifact_path),
+        "debian" => debian_destination_path(artifact_path, None),
         _ => match version {
             Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
             _ => artifact_path.to_string(),
@@ -3770,24 +3827,102 @@ fn migration_artifact_path(
 /// Component a migrated `.deb` outside `pool/<component>/` is filed under.
 const DEFAULT_DEBIAN_COMPONENT: &str = "main";
 
-/// Where a Debian repository's file is stored (#4657). A binary package
-/// already in the `pool/<component>/...` layout the Debian handler indexes
-/// keeps its path. One anywhere else, such as Artifactory's "Set Me Up"
-/// `pool/<file>.deb`, moves under `pool/main/` (its source path, minus a
-/// leading `pool/`), so it appears in the `main` component's `Packages`
-/// instead of being stored where no index looks. Every other file keeps its
-/// path.
-fn debian_destination_path(artifact_path: &str) -> String {
-    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
-    let is_package = [".deb", ".udeb", ".ddeb"]
+/// Whether `file_name` is a Debian binary package.
+fn is_debian_package_file(file_name: &str) -> bool {
+    [".deb", ".udeb", ".ddeb"]
         .iter()
-        .any(|ext| filename.ends_with(ext));
-    if !is_package || crate::api::handlers::debian::staged_package_target(artifact_path).is_some() {
+        .any(|ext| file_name.ends_with(ext))
+}
+
+/// Whether a path below `pool/` starts with a Debian pool *prefix* rather
+/// than a component: `z/zlib/...` or `libz/libzstd/...`, the
+/// `pool/<letter>/<name>/` layout a Nexus apt repository stores its packages
+/// in and a mirror of Ubuntu's pool keeps without its component segment
+/// (#4740). Read as `pool/<component>/`, the letter became the component and
+/// the package was missing from `dists/<dist>/main/`.
+fn is_pool_prefix_layout(below_pool: &str) -> bool {
+    let mut segments = below_pool.split('/');
+    let (Some(prefix), Some(name), Some(_)) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    let is_prefix = prefix.len() == 1 || (prefix.len() == 4 && prefix.starts_with("lib"));
+    is_prefix && name.starts_with(prefix)
+}
+
+/// A `deb.component` property value usable as one `pool/<component>/` path
+/// segment, or `None` (the path then decides, as without the property).
+fn valid_debian_component(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let ok = !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
+    ok.then_some(value)
+}
+
+/// The component an Artifactory item's properties record for it (#4740):
+/// the first usable `deb.component` value.
+fn debian_component_from_properties(
+    properties: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<String> {
+    properties
+        .get("deb.component")?
+        .iter()
+        .find_map(|v| valid_debian_component(v))
+        .map(str::to_string)
+}
+
+/// Where a Debian repository's file is stored (#4657, #4740).
+///
+/// A binary package is filed under `pool/<component>/`, the layout the Debian
+/// handler indexes. The component is, in order: `component` (the source's
+/// `deb.component` property, see [`debian_component_from_properties`]); the
+/// path's own `pool/<component>/` segment; and [`DEFAULT_DEBIAN_COMPONENT`]
+/// for a path with no component segment, such as Artifactory's "Set Me Up"
+/// `pool/<file>.deb` or the `pool/<letter>/<name>/` layout of a Nexus apt
+/// repository (see [`is_pool_prefix_layout`]). The source path, minus a
+/// leading `pool/`, follows the component unless it already starts with it.
+/// Every other file keeps its path.
+fn debian_destination_path(artifact_path: &str, component: Option<&str>) -> String {
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    if !is_debian_package_file(filename) {
         return artifact_path.to_string();
     }
     let rest = artifact_path.trim_start_matches('/');
     let rest = rest.strip_prefix("pool/").unwrap_or(rest);
-    format!("pool/{DEFAULT_DEBIAN_COMPONENT}/{rest}")
+    let component = match component {
+        Some(component) => component,
+        None if crate::api::handlers::debian::staged_package_target(artifact_path).is_some()
+            && !is_pool_prefix_layout(rest) =>
+        {
+            return artifact_path.to_string();
+        }
+        None => DEFAULT_DEBIAN_COMPONENT,
+    };
+    match rest.strip_prefix(component) {
+        Some(below) if below.starts_with('/') => format!("pool/{rest}"),
+        _ => format!("pool/{component}/{rest}"),
+    }
+}
+
+/// The path the duplicate check looks an item up under: a `.deb`'s
+/// destination (#4740), since a re-run must find a package under the
+/// component it is now filed in, and must re-import (and retire) one an
+/// earlier run stored under the wrong component. Every other item keeps its
+/// source-relative path.
+fn duplicate_lookup_path(
+    package_type: &str,
+    artifact_path: &str,
+    debian_component: Option<&str>,
+) -> String {
+    if package_type.eq_ignore_ascii_case("debian") {
+        debian_destination_path(artifact_path, debian_component)
+    } else {
+        artifact_path.to_string()
+    }
 }
 
 /// The path [`migration_artifact_path`] will store `artifact_path` under,
@@ -3851,6 +3986,7 @@ pub(crate) fn migration_artifact_identity(
     parsed: &crate::services::artifact_metadata::ParsedArtifact,
     filename: &str,
     artifact_path: &str,
+    debian_component: Option<&str>,
 ) -> Option<MigratedArtifactIdentity> {
     match oci_role {
         OciRole::Blob { .. } => None,
@@ -3863,13 +3999,17 @@ pub(crate) fn migration_artifact_identity(
                 .to_string(),
         }),
         OciRole::NotOci => {
-            let path = migration_artifact_path(
-                package_type,
-                &parsed.name,
-                parsed.version.as_deref(),
-                filename,
-                artifact_path,
-            );
+            let path = if package_type == "debian" {
+                debian_destination_path(artifact_path, debian_component)
+            } else {
+                migration_artifact_path(
+                    package_type,
+                    &parsed.name,
+                    parsed.version.as_deref(),
+                    filename,
+                    artifact_path,
+                )
+            };
             Some(MigratedArtifactIdentity {
                 path,
                 name: parsed.name.clone(),
@@ -4879,6 +5019,7 @@ mod tests {
             ),
             "1.31.1",
             "v2/busybox/manifests/1.31.1",
+            None,
         )
         .expect("manifest must produce an artifacts row");
         assert_eq!(identity.path, "v2/busybox/manifests/1.31.1");
@@ -4908,6 +5049,7 @@ mod tests {
             ),
             "manifest.json",
             &format!("v2/app/manifests/{reference}"),
+            None,
         )
         .expect("digest-referenced child manifest must produce an artifacts row");
         assert_eq!(identity.path, format!("v2/app/manifests/{reference}"));
@@ -4931,6 +5073,7 @@ mod tests {
             ),
             &format!("sha256:{hex}"),
             &format!("v2/app/blobs/sha256:{hex}"),
+            None,
         );
         assert!(
             identity.is_none(),
@@ -4951,6 +5094,7 @@ mod tests {
             ),
             "lodash-4.17.21.tgz",
             "lodash/-/lodash-4.17.21.tgz",
+            None,
         )
         .expect("non-OCI artifact must produce an artifacts row");
         assert_eq!(identity.path, "lodash/4.17.21/lodash-4.17.21.tgz");
@@ -8686,6 +8830,7 @@ mod tests {
                 "irrelevant/path",
                 false,
                 &expected,
+                None,
             )
             .await;
 
@@ -8887,6 +9032,7 @@ mod tests {
                 "irrelevant/path",
                 false,
                 &expected,
+                None,
             )
             .await;
 
@@ -9228,6 +9374,7 @@ mod tests {
                     sha256: None,
                     sha1: None,
                 },
+                None,
             )
             .await
     }
@@ -9282,6 +9429,7 @@ mod tests {
                 &mut failed,
                 &mut skipped,
                 &mut transferred,
+                None,
             )
             .await
             .expect("process_single_artifact");
@@ -10286,6 +10434,7 @@ mod tests {
                     sha256: None,
                     sha1: None,
                 },
+                None,
             )
             .await
             .expect_err("a second, different manifest for hello:latest must fail the item");
@@ -11794,6 +11943,7 @@ mod tests {
                     &mut c.1,
                     &mut c.2,
                     &mut c.3,
+                    None,
                 )
                 .await
                 .expect("process_single_artifact");
@@ -11818,6 +11968,251 @@ mod tests {
     }
 
     #[test]
+    fn test_debian_destination_path_component_4740() {
+        let ubuntu_layout = "pool/h/hello/hello_1.0-1_amd64.deb";
+        // The source's `deb.component` decides when present.
+        assert_eq!(
+            debian_destination_path(ubuntu_layout, Some("contrib")),
+            "pool/contrib/h/hello/hello_1.0-1_amd64.deb"
+        );
+        assert_eq!(
+            debian_destination_path(
+                "pool/contrib/h/hello/hello_1.0-1_amd64.deb",
+                Some("contrib")
+            ),
+            "pool/contrib/h/hello/hello_1.0-1_amd64.deb",
+            "a path already under the component keeps it"
+        );
+        assert_eq!(
+            debian_destination_path("pool/hello_1.0-1_amd64.deb", Some("contrib")),
+            "pool/contrib/hello_1.0-1_amd64.deb"
+        );
+        // Without it, the `pool/<letter>/<name>/` layout (Nexus apt, an
+        // Ubuntu pool mirror) has no component segment and files under main,
+        // where the letter used to become the component.
+        for (src, dst) in [
+            (ubuntu_layout, "pool/main/h/hello/hello_1.0-1_amd64.deb"),
+            (
+                "pool/libz/libzstd1/libzstd1_1.5_amd64.deb",
+                "pool/main/libz/libzstd1/libzstd1_1.5_amd64.deb",
+            ),
+        ] {
+            assert_eq!(debian_destination_path(src, None), dst, "{src}");
+            assert_eq!(migration_destination_path("debian", src), dst, "{src}");
+            assert_eq!(duplicate_lookup_path("debian", src, None), dst, "{src}");
+        }
+        // A real component segment still decides without the property.
+        for kept in [
+            "pool/main/h/hello/hello_1.0-1_amd64.deb",
+            "pool/universe/libz/libzstd1/libzstd1_1.5_amd64.deb",
+            "pool/contrib/x_2_all.udeb",
+        ] {
+            assert_eq!(debian_destination_path(kept, None), kept);
+        }
+        // Non-package files and other formats are untouched.
+        assert_eq!(
+            debian_destination_path("pool/h/hello/hello_1.0.orig.tar.gz", Some("contrib")),
+            "pool/h/hello/hello_1.0.orig.tar.gz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("generic", ubuntu_layout, Some("contrib")),
+            ubuntu_layout
+        );
+    }
+
+    #[test]
+    fn test_debian_component_from_properties_4740() {
+        let props = |vals: &[&str]| {
+            std::collections::HashMap::from([(
+                "deb.component".to_string(),
+                vals.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+            )])
+        };
+        assert_eq!(
+            debian_component_from_properties(&props(&["contrib"])),
+            Some("contrib".to_string())
+        );
+        assert_eq!(
+            debian_component_from_properties(&props(&["../x", " non-free "])),
+            Some("non-free".to_string()),
+            "an unusable value is skipped, not turned into a path"
+        );
+        assert_eq!(
+            debian_component_from_properties(&props(&["a/b", ".."])),
+            None
+        );
+        assert_eq!(
+            debian_component_from_properties(&std::collections::HashMap::new()),
+            None
+        );
+    }
+
+    /// A [`MapSource`] whose items carry Artifactory properties.
+    struct PropertiesSource {
+        files: std::collections::HashMap<String, bytes::Bytes>,
+        properties: std::collections::HashMap<String, Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for PropertiesSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!()
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![])
+        }
+        async fn list_artifacts(
+            &self,
+            _repo_key: &str,
+            _offset: i64,
+            _limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!()
+        }
+        async fn download_artifact(
+            &self,
+            repo_key: &str,
+            path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            MapSource {
+                files: self.files.clone(),
+            }
+            .download_artifact(repo_key, path)
+            .await
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: Some(self.properties.clone()),
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "artifactory"
+        }
+    }
+
+    /// #4740: a `.deb` in the `pool/<letter>/<name>/` layout was filed under
+    /// the letter as its component. With `deb.component` on the source item
+    /// it lands in that component; without it, in `main`.
+    #[tokio::test]
+    async fn test_debian_migration_takes_component_from_deb_component_4740() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig4740", "debian").await;
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let hello = "pool/h/hello/hello_1.0-1_amd64.deb";
+        let world = "pool/w/world/world_2.0_all.deb";
+
+        for (path, body, properties) in [
+            (
+                hello,
+                test_deb("hello", "1.0-1", "amd64"),
+                std::collections::HashMap::from([(
+                    "deb.component".to_string(),
+                    vec!["contrib".to_string()],
+                )]),
+            ),
+            (
+                world,
+                test_deb("world", "2.0", "all"),
+                std::collections::HashMap::new(),
+            ),
+        ] {
+            let source = PropertiesSource {
+                files: std::collections::HashMap::from([(path.to_string(), body)]),
+                properties,
+            };
+            let component = worker
+                .debian_component(&source, &repo_key, "debian", path)
+                .await;
+            worker
+                .transfer_artifact(
+                    None,
+                    Arc::new(source),
+                    storage.clone(),
+                    &keys,
+                    "debian",
+                    path,
+                    false,
+                    &ExpectedChecksums {
+                        sha256: None,
+                        sha1: None,
+                    },
+                    component.as_deref(),
+                )
+                .await
+                .expect("transfer .deb");
+        }
+
+        let mut rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT a.path, am.metadata->>'component' FROM artifacts a \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read rows");
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "pool/contrib/h/hello/hello_1.0-1_amd64.deb".to_string(),
+                    Some("contrib".to_string())
+                ),
+                (
+                    "pool/main/w/world/world_2.0_all.deb".to_string(),
+                    Some("main".to_string())
+                ),
+            ]
+        );
+        let contrib =
+            crate::api::handlers::debian::render_packages_index(&pool, repo_id, "contrib", "amd64")
+                .await
+                .expect("render contrib Packages");
+        assert!(contrib.contains("Package: hello\n"), "{contrib}");
+        let main =
+            crate::api::handlers::debian::render_packages_index(&pool, repo_id, "main", "amd64")
+                .await
+                .expect("render main Packages");
+        assert!(main.contains("Package: world\n"), "{main}");
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    #[test]
     fn test_debian_destination_path_4657() {
         // Already in the indexed `pool/<component>/` layout: unchanged.
         for kept in [
@@ -11826,7 +12221,7 @@ mod tests {
             "pool/main/n/nginx/nginx_1.0.orig.tar.gz",
             "README.txt",
         ] {
-            assert_eq!(debian_destination_path(kept), kept);
+            assert_eq!(debian_destination_path(kept, None), kept);
             assert_eq!(migration_destination_path("debian", kept), kept);
         }
         // Artifactory "Set Me Up" layout and arbitrary paths move under main.
@@ -11838,7 +12233,7 @@ mod tests {
             ),
             ("/world_2.0_all.deb", "pool/main/world_2.0_all.deb"),
         ] {
-            assert_eq!(debian_destination_path(src), dst, "{src}");
+            assert_eq!(debian_destination_path(src, None), dst, "{src}");
             assert_eq!(migration_destination_path("debian", src), dst, "{src}");
         }
     }
