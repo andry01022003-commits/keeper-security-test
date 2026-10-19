@@ -16,6 +16,10 @@ use crate::services::artifactory_client::{
 };
 use crate::services::source_registry::SourceRegistry;
 
+/// Most failed items a migration report lists by path; the summary's
+/// `failed_items_omitted` counts the rest (#4778).
+pub(crate) const REPORT_FAILED_ITEMS_CAP: i64 = 100;
+
 /// Errors that can occur during migration
 #[derive(Error, Debug)]
 pub enum MigrationError {
@@ -1348,12 +1352,22 @@ impl MigrationService {
             SELECT item_type, source_path, error_message
             FROM migration_items
             WHERE job_id = $1 AND status = 'failed'
-            LIMIT 100
+            ORDER BY source_path, id
+            LIMIT $2
             "#,
         )
         .bind(job_id)
+        .bind(REPORT_FAILED_ITEMS_CAP)
         .fetch_all(&self.db)
         .await?;
+
+        // The list above is capped, and a report that silently stops at the
+        // cap reads as if those were all the failures (#4778). Say how many
+        // were left out; `GET /api/v1/migrations/{id}/items?status=failed`
+        // pages through every one of them.
+        let failed_total: i64 = type_counts.iter().map(|(_, _, _, fail, _)| fail).sum();
+        summary["failed_items_omitted"] =
+            serde_json::json!((failed_total - errors.len() as i64).max(0));
 
         let errors_json: Vec<serde_json::Value> = errors
             .iter()

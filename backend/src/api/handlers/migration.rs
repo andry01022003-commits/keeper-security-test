@@ -1579,7 +1579,43 @@ async fn list_migration_items(
     let per_page = query.per_page.unwrap_or(50);
     let offset = (page - 1) * per_page;
 
-    // Build query based on filters
+    let (items, total) = fetch_migration_items(
+        &state.db,
+        id,
+        query.status.as_deref(),
+        query.item_type.as_deref(),
+        per_page,
+        offset,
+    )
+    .await?;
+
+    Ok(Json(ListResponse {
+        items: items.into_iter().map(Into::into).collect(),
+        pagination: Some(MigrationPaginationInfo {
+            page,
+            per_page,
+            total,
+            total_pages: (total + per_page - 1) / per_page,
+        }),
+    }))
+}
+
+/// One page of a job's migration items plus the total matching row count.
+///
+/// `status` and `item_type` narrow both the page and the count (#4778); they
+/// were accepted by the endpoint but never applied, so `status=failed` paged
+/// through every item of the job. `($n::text IS NULL OR col = $n)` keeps one
+/// statement for every filter combination. The `id` tie-breaker keeps paging
+/// stable: items that never started share `started_at IS NULL`, and without
+/// it rows could repeat or go missing across pages.
+async fn fetch_migration_items(
+    db: &sqlx::PgPool,
+    job_id: Uuid,
+    status: Option<&str>,
+    item_type: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<MigrationItemRow>, i64)> {
     let items: Vec<MigrationItemRow> = sqlx::query_as(
         r#"
         SELECT id, job_id, item_type, source_path, target_path, status, size_bytes,
@@ -1587,30 +1623,36 @@ async fn list_migration_items(
                started_at, completed_at
         FROM migration_items
         WHERE job_id = $1
-        ORDER BY started_at DESC NULLS LAST
-        LIMIT $2 OFFSET $3
+          AND ($2::text IS NULL OR status = $2)
+          AND ($3::text IS NULL OR item_type = $3)
+        ORDER BY started_at DESC NULLS LAST, id
+        LIMIT $4 OFFSET $5
         "#,
     )
-    .bind(id)
-    .bind(per_page)
+    .bind(job_id)
+    .bind(status)
+    .bind(item_type)
+    .bind(limit)
     .bind(offset)
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await?;
 
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
-        .bind(id)
-        .fetch_one(&state.db)
-        .await?;
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM migration_items
+        WHERE job_id = $1
+          AND ($2::text IS NULL OR status = $2)
+          AND ($3::text IS NULL OR item_type = $3)
+        "#,
+    )
+    .bind(job_id)
+    .bind(status)
+    .bind(item_type)
+    .fetch_one(db)
+    .await?;
 
-    Ok(Json(ListResponse {
-        items: items.into_iter().map(Into::into).collect(),
-        pagination: Some(MigrationPaginationInfo {
-            page,
-            per_page,
-            total: total.0,
-            total_pages: (total.0 + per_page - 1) / per_page,
-        }),
-    }))
+    Ok((items, total))
 }
 
 /// Fetch the persisted report row for a job, if one exists.
@@ -3096,6 +3138,169 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("count reports")
+    }
+
+    /// Seed one migration item for `job`.
+    async fn seed_item(pool: &sqlx::PgPool, job: Uuid, item_type: &str, path: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO migration_items (job_id, item_type, source_path, status) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(job)
+        .bind(item_type)
+        .bind(path)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed migration item");
+    }
+
+    /// GET `uri` on the migration router as `user` and decode the JSON body.
+    async fn get_json(
+        state: SharedState,
+        user: Uuid,
+        name: &str,
+        uri: String,
+    ) -> serde_json::Value {
+        let app = app_as(state, tdh::make_auth(user, name));
+        let (status, body) = tdh::send(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    // Issue #4778: `status` and `item_type` were parsed and never applied, so
+    // `?status=failed` returned every item of the job and the pagination total
+    // counted all of them.
+    #[tokio::test]
+    async fn test_list_items_applies_status_and_item_type_filters_4778() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_connection(&pool, marco).await;
+        let job = seed_job(&pool, conn, marco).await;
+        seed_item(&pool, job, "artifact", "a/ok-1", "completed").await;
+        seed_item(&pool, job, "artifact", "a/ok-2", "completed").await;
+        seed_item(&pool, job, "artifact", "a/bad-1", "failed").await;
+        seed_item(&pool, job, "artifact", "a/bad-2", "failed").await;
+        seed_item(&pool, job, "repository", "repo-bad", "failed").await;
+        seed_item(&pool, job, "repository", "repo-ok", "completed").await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let paths = |v: &serde_json::Value| -> Vec<String> {
+            let mut p: Vec<String> = v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["source_path"].as_str().unwrap().to_string())
+                .collect();
+            p.sort();
+            p
+        };
+
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            format!("/{job}/items?status=failed"),
+        )
+        .await;
+        assert_eq!(paths(&v), vec!["a/bad-1", "a/bad-2", "repo-bad"]);
+        assert_eq!(v["pagination"]["total"], 3, "total counts only matches");
+
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            format!("/{job}/items?item_type=repository"),
+        )
+        .await;
+        assert_eq!(paths(&v), vec!["repo-bad", "repo-ok"]);
+        assert_eq!(v["pagination"]["total"], 2);
+
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            format!("/{job}/items?status=failed&item_type=artifact"),
+        )
+        .await;
+        assert_eq!(paths(&v), vec!["a/bad-1", "a/bad-2"]);
+        assert_eq!(v["pagination"]["total"], 2);
+
+        // No filter still lists the whole job.
+        let v = get_json(state.clone(), marco, &marco_name, format!("/{job}/items")).await;
+        assert_eq!(v["pagination"]["total"], 6);
+
+        // Pages of unstarted items (all `started_at IS NULL`) neither repeat
+        // nor drop rows: the `id` tie-breaker makes the order total.
+        let mut seen = Vec::new();
+        for page in 1..=3 {
+            let v = get_json(
+                state.clone(),
+                marco,
+                &marco_name,
+                format!("/{job}/items?per_page=2&page={page}"),
+            )
+            .await;
+            seen.extend(paths(&v));
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "every item appears on exactly one page");
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    // Issue #4778: the report lists at most `REPORT_FAILED_ITEMS_CAP` failed
+    // items and used to give no sign that more existed.
+    #[tokio::test]
+    async fn test_report_counts_failed_items_omitted_by_cap_4778() {
+        use crate::services::migration_service::REPORT_FAILED_ITEMS_CAP;
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_connection(&pool, marco).await;
+        let job = seed_job(&pool, conn, marco).await;
+        let extra = 3;
+        sqlx::query(
+            "INSERT INTO migration_items (job_id, item_type, source_path, status, error_message) \
+             SELECT $1, 'artifact', 'f/' || g, 'failed', 'boom' \
+             FROM generate_series(1, $2::int) g",
+        )
+        .bind(job)
+        .bind((REPORT_FAILED_ITEMS_CAP + extra) as i32)
+        .execute(&pool)
+        .await
+        .expect("seed failed items");
+        seed_item(&pool, job, "artifact", "ok", "completed").await;
+        mark_job_completed(&pool, job).await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let v = get_json(state, marco, &marco_name, format!("/{job}/report")).await;
+        assert_eq!(
+            v["errors"].as_array().map(Vec::len),
+            Some(REPORT_FAILED_ITEMS_CAP as usize),
+            "the listed failures stay capped"
+        );
+        assert_eq!(
+            v["summary"]["failed_items_omitted"], extra,
+            "the report says how many failures it left out: {}",
+            v["summary"]
+        );
+
+        cleanup_user(&pool, marco).await;
     }
 
     // Issue #2097 Gap 1: a report must be readable after a *successful*
