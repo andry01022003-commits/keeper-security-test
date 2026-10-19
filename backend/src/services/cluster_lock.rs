@@ -184,6 +184,36 @@ impl PgAdvisoryLock {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Open the dedicated session a blocking wait runs on (#4552): the pool's
+    /// connect options with sqlx's slow-statement logging turned off, bounded
+    /// by the pool's acquire timeout. It never belongs to the pool, so it
+    /// closes on drop exactly like the detached connection it replaces.
+    async fn connect_wait_session(&self) -> Result<sqlx::PgConnection> {
+        use sqlx::Connection;
+        let options = wait_session_options(&self.pool.connect_options());
+        match tokio::time::timeout(
+            self.pool.options().get_acquire_timeout(),
+            sqlx::PgConnection::connect_with(&options),
+        )
+        .await
+        {
+            Ok(conn) => Ok(conn?),
+            Err(_) => Err(sqlx::Error::PoolTimedOut.into()),
+        }
+    }
+}
+
+/// Connect options for a blocking advisory-lock wait session (#4552): the
+/// pool's options with slow-statement logging off, since the lock statement is
+/// expected to block for as long as the leader's fill takes.
+fn wait_session_options(
+    pool_options: &sqlx::postgres::PgConnectOptions,
+) -> sqlx::postgres::PgConnectOptions {
+    use sqlx::ConnectOptions;
+    pool_options
+        .clone()
+        .log_slow_statements(tracing::log::LevelFilter::Off, Duration::MAX)
 }
 
 #[async_trait]
@@ -230,7 +260,15 @@ impl ClusterLock for PgAdvisoryLock {
         // simply closes on drop, and the server drops the wait (or the lock)
         // with it. It also means the session-level `lock_timeout` below never
         // leaks into a pooled connection.
-        let mut conn = self.pool.acquire().await?.detach();
+        //
+        // #4552: the session is opened from the pool's own connect options
+        // (same server, credentials, TLS and startup options) rather than
+        // acquired and detached, because sqlx fixes a connection's
+        // slow-statement logging at connect time. The wait below is SUPPOSED
+        // to take as long as the leader's fill; at sqlx's default 1 s
+        // threshold every follower logged a "slow statement" WARN per cold
+        // object. The outcome is logged once at DEBUG instead.
+        let mut conn = self.connect_wait_session().await?;
         sqlx::query("SELECT set_config('lock_timeout', $1, false)")
             .bind(lock_timeout_setting(timeout))
             .execute(&mut conn)
@@ -248,20 +286,38 @@ impl ClusterLock for PgAdvisoryLock {
         // A waiter that is granted the lock holds it until it releases; if its
         // node died meanwhile, only keepalives free it.
         arm_dead_peer_keepalives(&mut conn).await;
-        match sqlx::query("SELECT pg_advisory_lock($1, $2)")
+        let started = std::time::Instant::now();
+        let outcome = sqlx::query("SELECT pg_advisory_lock($1, $2)")
             .bind(class)
             .bind(obj)
             .execute(&mut conn)
-            .await
-        {
-            Ok(_) => Ok(Some(ClusterLease::Postgres(PgAdvisoryLease {
-                conn: Some(conn),
-                class,
-                obj,
-            }))),
+            .await;
+        let waited_secs = started.elapsed().as_secs_f64();
+        match outcome {
+            Ok(_) => {
+                tracing::debug!(
+                    class,
+                    obj,
+                    waited_secs,
+                    "cluster lock: advisory-lock wait ended, lock acquired"
+                );
+                Ok(Some(ClusterLease::Postgres(PgAdvisoryLease {
+                    conn: Some(conn),
+                    class,
+                    obj,
+                })))
+            }
             // The holder is still working after `timeout`: not an error, the
             // caller falls back to fetching on its own. `conn` closes here.
-            Err(e) if is_wait_expired(&e) => Ok(None),
+            Err(e) if is_wait_expired(&e) => {
+                tracing::debug!(
+                    class,
+                    obj,
+                    waited_secs,
+                    "cluster lock: advisory-lock wait expired while still held"
+                );
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -670,6 +726,73 @@ mod tests {
             .expect("free after the waiter released");
         free.release().await;
     }
+    /// #4552: a follower's expected advisory-lock wait must not be reported
+    /// as a sqlx "slow statement" WARN, however long the leader's fill takes;
+    /// the outcome is logged once at DEBUG with the wait time instead.
+    #[tokio::test]
+    async fn pg_blocking_wait_is_not_logged_as_a_slow_statement() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let lock = PgAdvisoryLock::new(pool);
+        let key = format!("proxy-cache:pgslowlog-{}", uuid::Uuid::new_v4());
+        let obj = lease_object_id(&key);
+        let held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj)
+            .await
+            .expect("query ok")
+            .expect("acquired");
+
+        let capture = tdh::LogCapture::default();
+        // With a single registered dispatcher, tracing-core computes a new
+        // callsite's interest from the REGISTERING thread's default, so a
+        // sibling test reaching `acquire_blocking` first (no subscriber on its
+        // thread) would cache "never" for the very lines asserted below. A
+        // second live dispatcher makes registration consult every one.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+        let _guard = capture.install(tracing::Level::TRACE);
+        // Past sqlx's default 1 s slow-statement threshold, once while the
+        // wait expires and once while it is granted on release.
+        let expired = lock
+            .acquire_blocking(
+                PROXY_HYDRATION_LOCK_CLASS,
+                obj,
+                Duration::from_millis(1_200),
+            )
+            .await
+            .expect("lock_timeout maps to Ok(None)");
+        assert!(expired.is_none());
+        let releaser = async {
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            held.release().await;
+        };
+        let (granted, ()) = tokio::join!(
+            lock.acquire_blocking(PROXY_HYDRATION_LOCK_CLASS, obj, Duration::from_secs(30)),
+            releaser
+        );
+        granted
+            .expect("query ok")
+            .expect("acquired after release")
+            .release()
+            .await;
+
+        let logs = capture.text();
+        assert!(
+            !logs.contains("slow statement"),
+            "an expected advisory-lock wait must not log a slow statement:\n{logs}"
+        );
+        assert!(
+            logs.contains("advisory-lock wait expired while still held"),
+            "the expired wait is logged once at DEBUG:\n{logs}"
+        );
+        assert!(
+            logs.contains("advisory-lock wait ended, lock acquired")
+                && logs.contains("waited_secs"),
+            "the granted wait is logged once at DEBUG with its duration:\n{logs}"
+        );
+    }
+
     /// #4013 review: a cancelled blocking wait must not leave a server backend
     /// queued on the lock until `lock_timeout`. With
     /// `client_connection_check_interval` the server notices the closed
