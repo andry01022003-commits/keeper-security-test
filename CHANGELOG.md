@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
+## [1.11.3] - 2026-10-19
+
+### Sponsors
+
+Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
+
+**Backers**
+
+- **Advailo, SIA** ([@advailo](https://github.com/advailo))
+- **stringke** ([@StringKe](https://github.com/StringKe))
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Mike** ([@huylv95](https://github.com/huylv95))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+- **Narek Engibaryan** ([@narek01](https://github.com/narek01))
+- and one sponsor who chose to stay private
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Thank You
+
+- **[@TheClonker](https://github.com/TheClonker)** for requesting that the upload archive entry-count cap be configurable, so a Composer package that ships its `vendor/` tree can be admitted (#4093).
+- **[@axi92](https://github.com/axi92)** for reporting that `npm audit` failed with "Unable to authenticate" against a public npm repository (#4317).
+- **[@cbachhuber](https://github.com/cbachhuber)** for reporting that the OpenAPI spec marked `curation_default_action` as required on `UpdateRepositoryRequest` (#4330).
+- **[@macmoonshine](https://github.com/macmoonshine)** for the fix that queues push sync tasks for hosted uploads in the native package formats (#4725, in #4779).
+- **[@Doubleth1nk](https://github.com/Doubleth1nk)** for reporting that a read-only API token could change a repository's scan configuration (GHSA-gvhj-8vg9-358g).
+- **[@mymarche](https://github.com/mymarche)** for reporting missing action-level authorization on several REST mutation handlers (GHSA-mvmh-g8wm-r3cp).
+- **[@kta1kri](https://github.com/kta1kri)** for reporting Dockerfile instruction injection through the pip package regex that bypassed `AK_IMAGE_BUILD_ALLOW_RUN=false` (GHSA-59mx-6fq9-pp9p).
+- **[@Zyy0530](https://github.com/Zyy0530)** for reporting that read-only repository members could delete and rewrite SBOM attestations (GHSA-ww52-pmcg-f53c), and that slow Git LFS uploads could exhaust the global request pool (GHSA-9f9r-c4w8-rjv9).
+- **[@cazlo](https://github.com/cazlo)** for reporting the client-controlled `X-Forwarded-For` prefix that bypassed IP rate limits behind an appending trusted proxy (GHSA-8jm4-4x6c-6787), and the refresh-token replay race in multi-replica deployments (GHSA-qxxr-g6f9-2c7v).
+- **[@dragonpaw](https://github.com/dragonpaw)** for reporting that the chunked upload API did not enforce API-token write scope (GHSA-5f2q-qrr7-3gcx).
+- **[@valfon1393](https://github.com/valfon1393)** for reporting missing authorization checks that let non-admin users access and change repositories and administrative integrations (GHSA-f7qf-8555-3rv5).
+- **[@endscene665](https://github.com/endscene665)** for reporting that authenticated users could install and activate arbitrary WASM format plugins (GHSA-wf46-j6px-hcpc) and two further missing-authorization issues (GHSA-g2hq-mx6j-cx8r, GHSA-qcmj-58p5-2ww5).
+- **[@ssorathia](https://github.com/ssorathia)** for reporting that read-scoped service-account tokens were accepted on admin write endpoints and package push paths (GHSA-vvc3-h39c-mrq5).
+- **[@vadim-belous](https://github.com/vadim-belous)** for reporting the plugin-reload SSRF fixed in 1.11.2, whose advisory is now published (GHSA-r8fc-5fvw-rvh4).
+
+### Added
+
+- **The upload archive entry-count cap is configurable with `MAX_INGEST_ARCHIVE_ENTRIES`** (#4093). The 10,000-entry ceiling that guards metadata extraction against entry-count bombs was a compile-time constant, so a legitimate package with more files, such as a Composer package of a paid WordPress plugin that ships its `vendor/` tree, was refused with no way to admit it. It is now read like its sibling `MAX_INGEST_DECOMPRESSED_BYTES`: a positive integer raises or lowers the cap for every format that uses it (Composer, Swift, Helm, Debian, conda, protobuf, ansible, Python wheels and sdists), and a blank, zero or non-numeric value keeps the default of 10,000. Both variables are now documented in `.env.example`.
+
+### Changed
+
+- **Cutting a release line also creates the matching test-suite branch, and the release candidate runs its preflight after Docker Publish instead of racing it** (#4784, #4372). `scripts/release/create-release-line.sh` now also creates `release/X.Y.x` in artifact-keeper-test (`--tests-from-run <id>` takes the commit from the Release Candidate run that certified `vX.Y.0`, `--tests-sha` names it directly), so a maintenance candidate's gate runs the suite from that line instead of from `main`; an existing test branch is left where it is, and an existing backend line with a `--tests-*` option gets only the test branch. In `release-candidate.yml` the Docker Publish wait moves into its own `publish` job that both `preflight` and `images` need, so preflight check 3 no longer fails with "Docker Publish for HEAD is still 'pending'" on a fresh commit. What the candidate certifies is unchanged. Release tooling only; nothing in the shipped images changes.
+
+### Fixed
+
+- **`npm audit` and the audit step of `npm install` work anonymously against a public npm repository** (#4317). The repository visibility middleware treated every anonymous `POST` as a write and answered 401, so the advisory lookups at `/-/npm/v1/security/advisories/bulk` and `/-/npm/v1/security/audits/quick` failed with "Unable to authenticate" even though the metadata and tarball `GET`s worked without credentials. Those two paths are now classified as reads: an anonymous caller can reach them on any repository it may already read anonymously, a private repository still answers 401, and every other npm write (publish, dist-tag, unpublish) still requires authentication. Authenticated read-only members also no longer get 403 on them.
+
+- **The OpenAPI spec no longer marks `curation_default_action` as required on `UpdateRepositoryRequest`** (#4330). The field is optional on `PATCH /api/v1/repositories/{key}` and omitting it leaves the stored value unchanged, but a `value_type = String` schema override published it as the only required property, so clients generated from the spec had to `GET` the repository and echo the value back on every update. The schema now declares it as an optional string.
+
+- **Pulling an image that does not exist through an anonymous OCI Remote no longer logs a "Proxy fetch failed" WARN on every pull** (#4526). Docker Hub answers a missing repository with `401`, so an anonymous Remote's manifest request is refused; the client correctly gets `404 MANIFEST_UNKNOWN` and the refusal is logged once at INFO, but the generic catch-all of the proxy error mapping also logged an unsampled WARN for the same pull, so a client retrying a missing image filled the log with WARNs. An upstream `401`/`403` to a request that carried no credentials (no upstream credentials configured, or a refused anonymous bearer token) now logs that line at DEBUG. Refusals of a credentialed request, upstream `5xx` and transport failures still log at WARN.
+
+- **A replica waiting on another replica's proxy single-flight lock no longer logs a sqlx "slow statement" WARN** (#4552). With `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`, every follower's `SELECT pg_advisory_lock($1, $2)` blocks until the leader finishes its fill, which is the designed behaviour, but it ran on a connection with sqlx's default 1 s slow-statement threshold, so each waiting replica logged one WARN per cold object (13 s for a 256 MiB fill, 65 s at the wait timeout) and buried real slow queries. The wait now runs on a dedicated session opened from the pool's connect options with slow-statement logging off (its statements still log at DEBUG like any other), and the outcome, granted or expired, is logged once at DEBUG with the lock key and `waited_secs`.
+
+- **Hosted uploads in the native package formats now reach subscribed push/mirror peers** (#4725). Alpine, Ansible, Bazel, Cargo, Chef, CocoaPods, Composer, Conan, Conda, CRAN, Git LFS, Helm, Hex, Hugging Face, Incus, JetBrains, Pacman, Protobuf, Pub, Puppet, RPM, RubyGems, sbt, Swift, Terraform and VS Code uploads wrote their artifact rows directly and never queued a peer push sync task, so a publish to a hosted repository of those formats only reached a peer after a manual run-now sync (`POST /api/v1/peers/{peer}/repositories/{repo}/sync`) — the same gap #4643/#4644 fixed for Maven, npm and Go. Each handler now queues the task once the artifact row, its metadata and its catalog entry are committed, and skips the fan-out for peer replication writes so a replicated artifact is never pushed back out to other peers. Conan queues the whole revision when its manifest publishes it, so companion files stored pending replicate with it. OCI/Docker images are deliberately excluded: layer blobs live in `oci_blobs` rather than `artifacts`, so the artifact-driven sync worker can only transfer the manifest, which would leave peers serving an image whose blobs 404 — image replication needs a blob-aware transfer and is tracked separately.
+
+- **A migrated Debian package is filed under the component the source records, not one guessed from its path** (#4797, #4740). A `.deb` in the `pool/<letter>/<name>/` layout (a Nexus apt repository, or an Artifactory mirror of Ubuntu's pool) kept its path, so the letter became its component and the package was missing from `dists/<dist>/main/`. The migration now reads the item's Artifactory `deb.component` property; without one, a path with no component segment files the package under `main`, and a path that already has one (`pool/universe/...`) keeps it. The duplicate check looks the package up at that destination, so re-running a job moves a package an earlier run filed under the wrong component and retires the old row.
+
+- **The remote-instance relay now forwards query strings and content types, relays useful response headers, and refuses to chain to another relay** (#4776). `/api/v1/instances/{id}/proxy/{*path}` sent only the path to the remote, so pagination, search and filter parameters were silently dropped; it relabelled every request body as `application/json`, so multipart or octet-stream bodies were misparsed; and it returned only `content-type`/`content-length`, losing `content-disposition`, `etag`, `last-modified`, `link` and `x-total-count`. The relay now appends the caller's query string, passes the caller's `content-type` through (still defaulting to JSON when none is sent), and forwards an allow-list of response headers. Paths under `api/v1/instances` are now rejected with 400 instead of being forwarded to the remote's own relay or instance registry. A PATCH relay route (needed for chunked uploads through the relay) follows in 1.12.0.
+
+- **`GET /api/v1/migrations/{id}/items` applies its `status` and `item_type` filters, and the migration report says how many failed items it left out** (#4778). Both query parameters were accepted and ignored, so `?status=failed` paged through every item of the job and the pagination total counted all of them; they now narrow the page and the total. Items that share a `started_at` (every item not yet started) are ordered by id as well, so pages no longer repeat or skip rows. The report still lists at most 100 failed items, and its `summary.failed_items_omitted` now counts the rest; `?status=failed` on the items endpoint lists them all.
+
+- **A hung `/readyz` dependency now costs the 2 s deadline once per cache window, not on every probe** (#4781). `/readyz` bounded each dependency twice with independent 2 s timers: an outer one started before the cache lock was taken and an inner one started after. Any lock wait let the outer timer fire first and drop the probe before it stored its timed-out result, so the next `/readyz` probed the hung OpenSearch, scanner, LDAP or storage backend again for the full deadline. Both timers now share one deadline, with the outer (lock-wait) one 100 ms later, so the timeout is always cached.
+
+### Security
+
+- **The backend image's bundled `buildctl` is rebuilt from BuildKit v0.33.1, which vendors containerd v2.3.6 and clears three MEDIUM containerd advisories** (#4780). The push-time Trivy scan of the 1.11.2 UBI image reported CVE-2026-53493 (fixed in containerd 2.3.6), CVE-2026-53495 and CVE-2026-95838 (both fixed in 2.3.5) against `/usr/local/bin/buildctl`, whose BuildKit v0.33.0 source vendors `github.com/containerd/containerd/v2` v2.3.4. BuildKit's own v0.33.1 patch release on the same line already vendors v2.3.6, so the `buildkit-bin` stage moves its pinned tag and commit (`8c91502c`) instead of carrying a containerd override; the go1.27.2 toolchain floor and the `golang.org/x/net` v0.60.0 override stay as they were. `buildctl --version` now reports v0.33.1. Nothing is added to `.trivyignore`. The Alpine image does not ship `buildctl` and is unchanged.
+
 ## [1.11.2] - 2026-10-18
 
 ### Sponsors
