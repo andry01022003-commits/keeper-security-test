@@ -653,8 +653,46 @@ fn redact_proxy_path_for_diagnostics(path: &str) -> String {
 ///   but the client gets a retry-friendly status).
 /// * **Everything else** (timeouts, TLS errors, auth challenge parse
 ///   failures, body read errors) stays at `warn` because those genuinely
-///   warrant operator attention.
+///   warrant operator attention, except an upstream refusal of an anonymous
+///   request, which is a miss already logged at `info` (see
+///   [`proxy_fetch_failure_level`], #4526).
 fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
+    map_proxy_error_classified(repo_key, path, e, false)
+}
+
+/// The level of the generic "Proxy fetch failed" line for a proxy error that
+/// reached the 502 catch-all of [`map_proxy_error`] (#4526).
+///
+/// An upstream `401`/`403` to a request that carried NO credentials (an
+/// anonymous OCI Remote asking for an image that does not exist, which is how
+/// Docker Hub answers) is an expected miss: the client gets
+/// `MANIFEST_UNKNOWN`, and the refusal was already logged once at INFO where
+/// it was classified. It drops to DEBUG so a client pulling a missing image
+/// in a loop does not log one WARN per pull. `anonymous_refusal` is that
+/// classification for an upstream refusal of the plain request
+/// ([`crate::services::proxy_service::oci_registry_auth_error`] without
+/// credentials); a refusal of an anonymous bearer token carries it in the
+/// error itself. Upstream 5xx that are not folded into 503, transport
+/// failures and refusals of a credentialed request stay at WARN.
+fn proxy_fetch_failure_level(
+    e: &crate::error::AppError,
+    anonymous_refusal: bool,
+) -> tracing::Level {
+    if anonymous_refusal || crate::services::proxy_service::is_anonymous_token_refusal(e) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    }
+}
+
+/// [`map_proxy_error`] for a caller that already knows whether `e` is an
+/// upstream refusal of an anonymous request ([`proxy_fetch_failure_level`]).
+fn map_proxy_error_classified(
+    repo_key: &str,
+    path: &str,
+    e: crate::error::AppError,
+    anonymous_refusal: bool,
+) -> Response {
     let diagnostic_path = redact_proxy_path_for_diagnostics(path);
     match &e {
         crate::error::AppError::NotFound(_) => {
@@ -764,12 +802,21 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
                 .into_response()
         }
         _ => {
-            tracing::warn!(
-                repo_key = %repo_key,
-                path = %diagnostic_path,
-                "Proxy fetch failed: {}",
-                e
-            );
+            if proxy_fetch_failure_level(&e, anonymous_refusal) == tracing::Level::DEBUG {
+                tracing::debug!(
+                    repo_key = %repo_key,
+                    path = %diagnostic_path,
+                    "Proxy fetch failed (upstream refused an anonymous request): {}",
+                    e
+                );
+            } else {
+                tracing::warn!(
+                    repo_key = %repo_key,
+                    path = %diagnostic_path,
+                    "Proxy fetch failed: {}",
+                    e
+                );
+            }
             (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
         }
     }
@@ -962,6 +1009,7 @@ pub async fn proxy_fetch_capped_with_accept(
     // sends credentials is an upstream authentication failure like a
     // refusing token service (#4453), not an indeterminate miss. Without
     // credentials it stays a miss (see `oci_registry_auth_error`).
+    let mut anonymous_refusal = false;
     let error = if repo.format == RepositoryFormat::Docker
         && crate::services::proxy_service::upstream_request_auth_refusal(&error).is_some()
     {
@@ -973,6 +1021,7 @@ pub async fn proxy_fetch_capped_with_accept(
         // A refusal of an anonymous bearer token never gets here (#4527), so
         // for what does, configured credentials were sent to the upstream.
         let credentials_sent = proxy_service.has_upstream_credentials(repo_id).await;
+        anonymous_refusal = !credentials_sent;
         crate::services::proxy_service::oci_registry_auth_error(
             error,
             repo_id,
@@ -982,7 +1031,12 @@ pub async fn proxy_fetch_capped_with_accept(
     } else {
         error
     };
-    Err(map_proxy_error(repo_key, path, error))
+    Err(map_proxy_error_classified(
+        repo_key,
+        path,
+        error,
+        anonymous_refusal,
+    ))
 }
 
 /// As [`proxy_fetch_capped`], but also reports the upstream `Content-Encoding`
@@ -13061,6 +13115,98 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(!is_member_policy_block_response(&resp));
         assert!(!is_upstream_auth_failure(&resp));
+    }
+
+    /// #4526: an upstream refusal of an ANONYMOUS request (a missing image on
+    /// an anonymous OCI Remote) is an expected miss and logs the generic
+    /// failure line at DEBUG; an upstream 502, a transport failure and a
+    /// refusal of a credentialed request stay at WARN.
+    #[test]
+    fn test_proxy_fetch_failure_level_quiets_anonymous_refusals_4526() {
+        use crate::error::AppError;
+        use tracing::Level;
+        let url = "https://registry-1.docker.io/v2/library/missing/manifests/latest";
+        // The shape `validate_upstream_status` gives an upstream 401.
+        let refused_401 = || {
+            AppError::BadGateway(format!(
+                "Upstream returned error status {}: {url}",
+                reqwest::StatusCode::UNAUTHORIZED
+            ))
+        };
+        let anonymous_token = AppError::BadGateway(format!(
+            "Upstream returned error status 401 Unauthorized for an anonymous bearer token: {url}"
+        ));
+        let upstream_502 = AppError::BadGateway(format!(
+            "Upstream returned error status {}: {url}",
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+
+        assert!(
+            crate::services::proxy_service::upstream_request_auth_refusal(&refused_401()).is_some()
+        );
+        assert_eq!(
+            proxy_fetch_failure_level(&refused_401(), true),
+            Level::DEBUG
+        );
+        assert_eq!(
+            proxy_fetch_failure_level(&anonymous_token, false),
+            Level::DEBUG
+        );
+        assert_eq!(
+            proxy_fetch_failure_level(&refused_401(), false),
+            Level::WARN
+        );
+        assert_eq!(proxy_fetch_failure_level(&upstream_502, false), Level::WARN);
+        assert_eq!(
+            proxy_fetch_failure_level(&AppError::Storage("connection reset".into()), false),
+            Level::WARN
+        );
+    }
+
+    /// #4526 regression: `map_proxy_error` must not log a WARN for an
+    /// upstream refusal of an anonymous bearer token, while the response is
+    /// still the 502 the OCI handlers turn into `MANIFEST_UNKNOWN`.
+    #[test]
+    fn test_map_proxy_error_does_not_warn_for_anonymous_refusal_4526() {
+        use crate::api::handlers::test_db_helpers::LogCapture;
+        let url = "https://registry-1.docker.io/v2/library/missing/manifests/latest";
+        // With a single registered dispatcher, tracing-core computes a new
+        // callsite's interest from the REGISTERING thread's default, so a
+        // sibling test reaching these lines first (no subscriber on its
+        // thread) would cache "never" for them. A second live dispatcher makes
+        // registration consult every one.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+        let capture = LogCapture::default();
+        let guard = capture.install(tracing::Level::DEBUG);
+        let anonymous = map_proxy_error(
+            "w6-dh-anon",
+            "v2/library/missing/manifests/latest",
+            crate::error::AppError::BadGateway(format!(
+                "Upstream returned error status 401 Unauthorized for an anonymous bearer token: {url}"
+            )),
+        );
+        let quiet = capture.text();
+        let transient = map_proxy_error(
+            "w6-dh-anon",
+            "v2/library/missing/manifests/latest",
+            crate::error::AppError::BadGateway(
+                "Upstream returned error status 502 Bad Gateway".into(),
+            ),
+        );
+        drop(guard);
+        let all = capture.text();
+        assert_eq!(anonymous.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(transient.status(), StatusCode::BAD_GATEWAY);
+        assert!(!quiet.contains("WARN"), "{quiet}");
+        assert!(
+            quiet.contains("DEBUG") && quiet.contains("Proxy fetch failed"),
+            "{quiet}"
+        );
+        let later = &all[quiet.len()..];
+        assert!(
+            later.contains("WARN") && later.contains("Proxy fetch failed"),
+            "{later}"
+        );
     }
 
     #[test]

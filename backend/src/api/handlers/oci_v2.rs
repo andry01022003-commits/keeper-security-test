@@ -38927,6 +38927,9 @@ mod remote_pull_through_cache_tests {
         let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
+        // A second live dispatcher, so the captures below see callsites a
+        // sibling test registered first on a thread without a subscriber.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
         let mut seen = Vec::new();
         for (key, credentialed) in [(&repo_key, true), (&anon_key, false)] {
             for name in ["private", "basic401", "basic403"] {
@@ -39004,6 +39007,14 @@ mod remote_pull_through_cache_tests {
                 assert!(
                     logs.contains("refused an anonymous manifest request")
                         || logs.contains("anonymous bearer token"),
+                    "{name}: {logs}"
+                );
+                // #4526: the refusal is logged once at INFO; the generic
+                // proxy failure line must not repeat it as a WARN per pull.
+                assert!(
+                    !logs
+                        .lines()
+                        .any(|l| l.contains("WARN") && l.contains("Proxy fetch failed")),
                     "{name}: {logs}"
                 );
             }

@@ -974,8 +974,20 @@ fn anonymous_token_refused_error(status: StatusCode, url: &str) -> AppError {
          credentials were sent); treating the object as not available"
     );
     AppError::BadGateway(format!(
-        "Upstream returned error status {status} for an anonymous bearer token: {url}"
+        "Upstream returned error status {status}{ANONYMOUS_TOKEN_REFUSAL_MARKER}: {url}"
     ))
+}
+
+/// The part of [`anonymous_token_refused_error`]'s message that tells it apart
+/// from every other `BadGateway`.
+const ANONYMOUS_TOKEN_REFUSAL_MARKER: &str = " for an anonymous bearer token";
+
+/// Whether `err` is an [`anonymous_token_refused_error`] (#4526): an upstream
+/// refusal of a request that carried no credentials, already logged at INFO
+/// where it was classified, so the proxy's generic failure WARN must not
+/// repeat it for every pull.
+pub(crate) fn is_anonymous_token_refusal(err: &AppError) -> bool {
+    matches!(err, AppError::BadGateway(msg) if msg.contains(ANONYMOUS_TOKEN_REFUSAL_MARKER))
 }
 
 /// The status of an upstream `401`/`403` answer to the request ITSELF, when
@@ -19814,6 +19826,10 @@ mod tests {
         let anon =
             anonymous_token_refused_error(StatusCode::UNAUTHORIZED, "https://u:p@r.test/v2/x");
         assert!(upstream_request_auth_refusal(&anon).is_none(), "{anon:?}");
+        assert!(is_anonymous_token_refusal(&anon), "{anon:?}");
+        assert!(!is_anonymous_token_refusal(
+            &validate_upstream_status(StatusCode::UNAUTHORIZED, "https://r.test/v2/x").unwrap_err()
+        ));
         assert!(!format!("{anon:?}").contains("u:p"), "{anon:?}");
     }
 
