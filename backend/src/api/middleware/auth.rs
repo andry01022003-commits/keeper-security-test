@@ -2292,6 +2292,12 @@ fn is_write_method(method: &Method) -> bool {
 ///   issues it with no credential, so a public index must serve it like a
 ///   `GET`. It is distinct from the twine upload at `POST /pypi/<repo_key>/`,
 ///   which stays a write.
+/// * **npm audit** — `POST /npm/<repo_key>/-/npm/v1/security/advisories/bulk`
+///   and `POST /npm/<repo_key>/-/npm/v1/security/audits/quick` send a
+///   dependency list and get advisories back (#4317). They only query
+///   advisory data (proxied upstream for a Remote) and never change AK state;
+///   `npm install` and `npm audit` issue them with whatever credential the
+///   client has for reads, which on a public registry is none.
 ///
 /// These paths are classified as reads for the *permission* check only. The
 /// `#508` write-auth requirement (writes require authentication; anonymous
@@ -2331,6 +2337,8 @@ fn is_non_mutating_format_post(path: &str) -> bool {
         }
         // /pypi/<repo_key>/pypi (XML-RPC, #3783)
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
+        // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
+        Some("npm") => is_npm_audit_tail(segments),
         _ => false,
     }
 }
@@ -2349,6 +2357,14 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 ///   metadata (#3783). JupyterLab's `PyPIExtensionManager` calls it through
 ///   `xmlrpc.client.ServerProxy` with no credential, exactly as pip reads
 ///   `/simple/` anonymously from a public index.
+///
+/// * **npm audit** — `POST /npm/<repo_key>/-/npm/v1/security/advisories/bulk`
+///   and `POST /npm/<repo_key>/-/npm/v1/security/audits/quick` (#4317). `npm
+///   install` and `npm audit` post the dependency tree here with the same
+///   (absent) credential they use for the anonymous metadata and tarball
+///   `GET`s, so a public npm registry answered every audit with 401. The
+///   handlers only look up advisories and never change AK state. Publish,
+///   dist-tag and unpublish stay writes (they are `PUT`/`DELETE`).
 ///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
@@ -2369,6 +2385,23 @@ fn is_pypi_xmlrpc_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool 
         && segments.next().is_none()
 }
 
+/// `<repo_key>/-/npm/v1/security/advisories/bulk` or
+/// `<repo_key>/-/npm/v1/security/audits/quick` — the remaining segments of an
+/// npm audit path after the leading `npm` (#4317). Exact match only: nothing
+/// deeper and no trailing slash, matching the two routes in `handlers::npm`.
+fn is_npm_audit_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && segments.next() == Some("-")
+        && segments.next() == Some("npm")
+        && segments.next() == Some("v1")
+        && segments.next() == Some("security")
+        && matches!(
+            (segments.next(), segments.next()),
+            (Some("advisories"), Some("bulk")) | (Some("audits"), Some("quick"))
+        )
+        && segments.next().is_none()
+}
+
 fn is_anonymous_readable_format_post(path: &str) -> bool {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut segments = trimmed.split('/');
@@ -2382,6 +2415,8 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
         }
         // /pypi/<repo_key>/pypi (XML-RPC, #3783)
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
+        // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
+        Some("npm") => is_npm_audit_tail(segments),
         _ => false,
     }
 }
@@ -8783,6 +8818,99 @@ mod tests {
             "//vscode/openvsx/gallery/extensionquery",
         ] {
             assert!(!is_anonymous_readable_format_post(path), "{path}");
+        }
+    }
+
+    const NPM_AUDIT_TAILS: [&str; 2] = [
+        "-/npm/v1/security/advisories/bulk",
+        "-/npm/v1/security/audits/quick",
+    ];
+
+    fn npm_cached_repo(is_public: bool) -> CachedRepo {
+        CachedRepo {
+            format: "npm".to_string(),
+            ..make_cached_repo(is_public)
+        }
+    }
+
+    #[test]
+    fn test_4317_npm_audit_post_is_anonymous_readable_and_non_mutating() {
+        for tail in NPM_AUDIT_TAILS {
+            let path = format!("/npm/pubnpm/{tail}");
+            assert!(is_anonymous_readable_format_post(&path), "{path}");
+            assert!(is_non_mutating_format_post(&path), "{path}");
+        }
+        // Near misses and the other npm write shapes stay writes.
+        for path in [
+            "/npm/pubnpm/-/npm/v1/security/advisories/bulk/",
+            "/npm/pubnpm/-/npm/v1/security/advisories/bulk/extra",
+            "/npm/pubnpm/-/npm/v1/security/advisories",
+            "/npm/pubnpm/-/npm/v1/security/audits",
+            "/npm/pubnpm/-/npm/v1/security/audits/bulk",
+            "/npm//-/npm/v1/security/advisories/bulk",
+            "/npm/pubnpm/left-pad",
+            "/npm/pubnpm/@scope/pkg",
+            "/npm/pubnpm/-/package/left-pad/dist-tags/latest",
+            "/pypi/pubnpm/-/npm/v1/security/advisories/bulk",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_4317_npm_audit_post_no_auth_passes_on_public_repo() {
+        let state = make_vis_state(Some(("pubnpm".to_string(), npm_cached_repo(true)))).await;
+        for tail in NPM_AUDIT_TAILS {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/npm/pubnpm/{tail}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{tail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_4317_npm_audit_post_no_auth_returns_401_on_private_repo() {
+        let state = make_vis_state(Some(("privnpm".to_string(), npm_cached_repo(false)))).await;
+        for tail in NPM_AUDIT_TAILS {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/npm/privnpm/{tail}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{tail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_4317_npm_publish_no_auth_still_returns_401_on_public_repo() {
+        // The audit exemption must not widen into a general `/npm/...` write
+        // exemption: publish (PUT) and any other npm POST stay #508-gated.
+        let state = make_vis_state(Some(("pubnpm".to_string(), npm_cached_repo(true)))).await;
+        for (method, uri) in [
+            (Method::PUT, "/npm/pubnpm/left-pad"),
+            (Method::PUT, "/npm/pubnpm/@scope%2fpkg"),
+            (Method::POST, "/npm/pubnpm/left-pad"),
+            (
+                Method::POST,
+                "/npm/pubnpm/-/npm/v1/security/advisories/bulk/extra",
+            ),
+            (Method::PUT, "/npm/pubnpm/-/npm/v1/security/advisories/bulk"),
+            (Method::DELETE, "/npm/pubnpm/-/npm/v1/security/audits/quick"),
+        ] {
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
         }
     }
 
