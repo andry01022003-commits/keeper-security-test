@@ -90,10 +90,11 @@ fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> 
 
     // Defence-in-depth entry-count cap (#2556): the per-entry byte cap already
     // bounds memory, but reject entry-count bombs before walking the archive.
-    if archive.len() as u64 > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+    let max_entries = crate::util::bounded_archive::max_ingest_archive_entries();
+    if archive.len() as u64 > max_entries {
         tracing::debug!(
             entries = archive.len(),
-            cap = crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+            cap = max_entries,
             "swift manifest extraction: too many zip entries"
         );
         return None;

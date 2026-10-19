@@ -6703,6 +6703,7 @@ fn walk_bounded_tar<R: std::io::Read>(
         }
     };
 
+    let max_entries = crate::util::bounded_archive::max_ingest_archive_entries();
     let mut entries_seen: u64 = 0;
     for entry in entries {
         // A truncated or over-budget archive keeps whatever it already yielded
@@ -6717,7 +6718,7 @@ fn walk_bounded_tar<R: std::io::Read>(
         };
 
         entries_seen += 1;
-        if entries_seen > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+        if entries_seen > max_entries {
             tracing::debug!("{} exceeds the entry-count cap; stopping the walk", what);
             outcome.truncated = true;
             break;
@@ -16183,7 +16184,7 @@ mod tests {
     #[test]
     fn test_conda_payload_entry_cap_truncates_and_is_partial() {
         let filler: Vec<(String, Vec<u8>)> = (0
-            ..crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES + 1)
+            ..crate::util::bounded_archive::max_ingest_archive_entries() + 1)
             .map(|i| (format!("lib/f{i}.py"), Vec::new()))
             .collect();
         let mut payload: Vec<(&str, Vec<u8>)> = filler

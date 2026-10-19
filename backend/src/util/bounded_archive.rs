@@ -19,8 +19,9 @@
 //!    it defeats both the *pre-target-inflation* bomb (huge entries walked
 //!    before the metadata file) and the *entry-count* bomb (the walk hits the
 //!    byte budget and stops),
-//! 2. a **10 000 entry-count cap** ([`MAX_INGEST_ARCHIVE_ENTRIES`]) —
-//!    defence-in-depth against inode/entry-count bombs with a clearer error,
+//! 2. an **entry-count cap** (default 10 000, env
+//!    [`MAX_INGEST_ARCHIVE_ENTRIES_ENV`]) — defence-in-depth against
+//!    inode/entry-count bombs with a clearer error,
 //! 3. an **8 MiB per-metadata-entry cap** ([`MAX_INGEST_METADATA_ENTRY_BYTES`])
 //!    — a metadata file larger than this is itself a bomb.
 //!
@@ -61,9 +62,17 @@ pub const DEFAULT_MAX_INGEST_DECOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 /// ingestion and scan caps with the same idiom.
 pub const MAX_INGEST_DECOMPRESSED_BYTES_ENV: &str = "MAX_INGEST_DECOMPRESSED_BYTES";
 
-/// Maximum tar/zip entries walked while searching for the metadata file.
-/// 10 000 matches conda's `MAX_TAR_ENTRIES`; bounds inode/entry-count bombs.
-pub const MAX_INGEST_ARCHIVE_ENTRIES: u64 = 10_000;
+/// Default maximum tar/zip entries walked while searching for the metadata
+/// file. 10 000 matches conda's `MAX_TAR_ENTRIES`; bounds inode/entry-count
+/// bombs.
+pub const DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES: u64 = 10_000;
+
+/// Env var overriding [`DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES`] (#4093), for
+/// packages that legitimately ship more files (a Composer package that
+/// vendors its dependencies). Value is a plain decimal entry count;
+/// blank/zero/non-numeric falls back to the default, like
+/// [`MAX_INGEST_DECOMPRESSED_BYTES_ENV`].
+pub const MAX_INGEST_ARCHIVE_ENTRIES_ENV: &str = "MAX_INGEST_ARCHIVE_ENTRIES";
 
 /// Maximum bytes read for the single matched metadata entry (`Chart.yaml` /
 /// `.nuspec` / `pubspec.yaml` / `METADATA` / …). 8 MiB is ≥ helm's prior 4 MiB
@@ -88,6 +97,15 @@ pub fn max_ingest_decompressed_bytes() -> u64 {
     positive_env_or(
         MAX_INGEST_DECOMPRESSED_BYTES_ENV,
         DEFAULT_MAX_INGEST_DECOMPRESSED_BYTES,
+    )
+}
+
+/// Effective archive entry-count ceiling, honouring
+/// [`MAX_INGEST_ARCHIVE_ENTRIES_ENV`] over the default.
+pub fn max_ingest_archive_entries() -> u64 {
+    positive_env_or(
+        MAX_INGEST_ARCHIVE_ENTRIES_ENV,
+        DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES,
     )
 }
 
@@ -632,7 +650,7 @@ fn map_archive_err(context: &str, err: &io::Error) -> AppError {
 /// Wrap a *decoded* stream in the shared total-byte budget so a decompression
 /// bomb aborts mid-inflate. Use when a caller must drive its own tar/zip walk
 /// (e.g. to keep a format-specific per-entry cap or message) but still wants the
-/// module's total-byte defence; pair it with [`MAX_INGEST_ARCHIVE_ENTRIES`] for
+/// module's total-byte defence; pair it with [`max_ingest_archive_entries`] for
 /// the entry-count cap. A budget breach surfaces as an [`io::Error`] during the
 /// walk, which the caller maps to its own validation error.
 pub fn budgeted<R: Read>(reader: R) -> impl Read {
@@ -726,7 +744,7 @@ pub fn read_metadata_from_tar_gz<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -759,7 +777,7 @@ pub fn read_metadata_from_tar_bz2<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -797,7 +815,7 @@ pub fn read_metadata_from_tar_xz<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -830,7 +848,7 @@ pub fn read_metadata_from_tar_zst<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -862,7 +880,7 @@ pub fn read_metadata_from_decoded_tar<R: Read>(
         decoded,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -905,7 +923,7 @@ pub fn read_metadata_from_tar<R: Read>(
         reader,
         matches,
         max_ingest_decompressed_bytes(),
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -937,7 +955,7 @@ pub fn read_metadata_from_zip<R: Read + Seek>(
     read_metadata_from_zip_limited(
         reader,
         matches,
-        MAX_INGEST_ARCHIVE_ENTRIES,
+        max_ingest_archive_entries(),
         MAX_INGEST_METADATA_ENTRY_BYTES,
     )
 }
@@ -1009,10 +1027,11 @@ pub fn is_unsafe_archive_entry_name(name: &str) -> bool {
 /// so a client that later unzips the stored bytes naively is not handed a
 /// path-traversal entry (#4673).
 pub fn reject_unsafe_zip_entry_names<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Result<()> {
-    if archive.len() as u64 > MAX_INGEST_ARCHIVE_ENTRIES {
+    let max_entries = max_ingest_archive_entries();
+    if archive.len() as u64 > max_entries {
         return Err(AppError::Validation(format!(
             "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
-            MAX_INGEST_ARCHIVE_ENTRIES
+            max_entries
         )));
     }
     for i in 0..archive.len() {
@@ -1115,6 +1134,46 @@ mod tests {
     #[test]
     fn positive_env_or_falls_back_on_blank_zero_nonnumeric() {
         assert_eq!(positive_env_or("AK_TEST_UNSET_VAR_XYZ", 42), 42);
+    }
+
+    /// #4093: the archive entry-count cap is read from
+    /// `MAX_INGEST_ARCHIVE_ENTRIES` the way the decompressed-byte budget is
+    /// read from `MAX_INGEST_DECOMPRESSED_BYTES`: default when unset, a
+    /// positive integer wins, blank / zero / non-numeric fall back to the
+    /// default. The override stays BELOW the default so a concurrently running
+    /// test that relies on the cap refusing an over-cap archive still sees a
+    /// refusal while the variable is set.
+    #[test]
+    fn max_ingest_archive_entries_env_override_4093() {
+        let key = MAX_INGEST_ARCHIVE_ENTRIES_ENV;
+        assert_eq!(key, "MAX_INGEST_ARCHIVE_ENTRIES");
+        let saved = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(max_ingest_archive_entries(), 10_000);
+        assert_eq!(
+            max_ingest_archive_entries(),
+            DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES
+        );
+
+        std::env::set_var(key, "2500");
+        assert_eq!(max_ingest_archive_entries(), 2_500);
+        std::env::set_var(key, " 9000 ");
+        assert_eq!(max_ingest_archive_entries(), 9_000);
+
+        for bad in ["0", "", "   ", "abc", "-1", "1.5"] {
+            std::env::set_var(key, bad);
+            assert_eq!(
+                max_ingest_archive_entries(),
+                DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES,
+                "value {bad:?} should fall back to the default"
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
@@ -1347,13 +1406,13 @@ mod tests {
         let ok = zip_with_filler(10, "composer.json", json, false);
         assert!(crate::formats::composer::ComposerHandler::parse_composer_json(&ok).is_ok());
         let over = zip_with_filler(
-            MAX_INGEST_ARCHIVE_ENTRIES as usize,
+            max_ingest_archive_entries() as usize,
             "composer.json",
             json,
             false,
         );
         let err = crate::formats::composer::ComposerHandler::parse_composer_json(&over)
-            .expect_err("composer must still refuse > MAX_INGEST_ARCHIVE_ENTRIES");
+            .expect_err("composer must still refuse > max_ingest_archive_entries()");
         assert!(err.to_string().contains("too many entries"), "{err}");
         assert!(read_metadata_from_zip(std::io::Cursor::new(&over), |n| n
             .ends_with("composer.json"))

@@ -1952,7 +1952,7 @@ async fn extract_collection_info_from_staged(path: &std::path::Path) -> Option<s
                         .unwrap_or(false)
                 },
                 crate::util::bounded_archive::max_ingest_decompressed_bytes(),
-                crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+                crate::util::bounded_archive::max_ingest_archive_entries(),
                 MAX_COLLECTION_MANIFEST_BYTES,
             )
         })

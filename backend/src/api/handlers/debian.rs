@@ -4395,7 +4395,7 @@ type ExtractedScripts = (Vec<InstallScript>, Vec<UnanalyzedScript>, Completeness
 
 fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
     use crate::util::bounded_archive::{
-        budgeted, read_capped, MAX_INGEST_ARCHIVE_ENTRIES, MAX_INGEST_METADATA_ENTRY_BYTES,
+        budgeted, max_ingest_archive_entries, read_capped, MAX_INGEST_METADATA_ENTRY_BYTES,
     };
 
     let mut archive = tar::Archive::new(budgeted(decoded));
@@ -4416,6 +4416,7 @@ fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
     let mut unanalyzed = Vec::new();
     let mut problems: Vec<String> = Vec::new();
     let mut scripts_seen: i32 = 0;
+    let max_entries = max_ingest_archive_entries();
     let mut entries_seen: u64 = 0;
     for entry in entries {
         let mut entry = match entry {
@@ -4435,7 +4436,7 @@ fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
             }
         };
         entries_seen += 1;
-        if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+        if entries_seen > max_entries {
             problems.push("control.tar exceeds the entry-count cap".to_string());
             break;
         }

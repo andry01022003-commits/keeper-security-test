@@ -600,7 +600,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
 #[allow(clippy::result_large_err)]
 fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response> {
     use crate::util::bounded_archive::{
-        budgeted, read_capped, MAX_INGEST_ARCHIVE_ENTRIES, MAX_INGEST_METADATA_ENTRY_BYTES,
+        budgeted, max_ingest_archive_entries, read_capped, MAX_INGEST_METADATA_ENTRY_BYTES,
     };
 
     // This extractor reads EVERY entry into memory and base64-encodes it (~1.33x
@@ -612,6 +612,7 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
     let mut archive = tar::Archive::new(budgeted(gz_decoder));
 
     let mut files = Vec::new();
+    let max_entries = max_ingest_archive_entries();
     let mut entries_seen: u64 = 0;
 
     for entry_result in archive.entries().map_err(|e| {
@@ -630,13 +631,13 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
         })?;
 
         entries_seen += 1;
-        if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+        if entries_seen > max_entries {
             return Err(connect_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_argument",
                 &format!(
                     "Bundle contains too many entries (> {}); refusing suspected decompression bomb",
-                    MAX_INGEST_ARCHIVE_ENTRIES
+                    max_entries
                 ),
             ));
         }
