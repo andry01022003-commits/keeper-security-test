@@ -47,6 +47,7 @@ pub mod grype_scanner;
 pub mod guest_access_policy;
 pub mod helm_lint_checker;
 pub mod http_client;
+pub mod iam_legacy_projection;
 pub mod image_build_service;
 pub mod image_scanner;
 pub mod incus_scanner;
