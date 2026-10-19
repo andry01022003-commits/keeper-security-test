@@ -273,8 +273,13 @@ names the same commit.
    backport, before you get as far as preflight.
 
 6. **Dispatch the Release Candidate on the prep commit.** Once the prep PR
-   (steps 2–3, plus the curated notes file) is the tip of `main` and its
-   Docker Publish run is green:
+   (steps 2–3, plus the curated notes file) is the tip of `main`. You need
+   not wait for its Docker Publish run: the candidate's `publish` job waits
+   for that run to succeed (up to 130 minutes) and only then dispatches the
+   preflight, whose check 3 audits the same run. Until #4372 the preflight
+   started beside that wait, so a candidate dispatched right after the prep
+   PR merged failed on "Docker Publish for HEAD is still 'pending'" (run
+   36862392025, v1.10.2).
 
    ```bash
    gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
@@ -519,16 +524,50 @@ one step in this document that a `git push` cannot do. The supported procedure
 is:
 
 ```bash
-# check every precondition and print the plan; changes nothing
-scripts/release/create-release-line.sh --dry-run 1.10
+# the Release Candidate run that certified v1.10.0 (its run id, from the
+# Actions UI or the certification record's candidate_run_id)
+RUN=<id>
 
-# then do it (needs gh authenticated as a repository admin)
-scripts/release/create-release-line.sh 1.10
+# check every precondition and print the plan; changes nothing
+scripts/release/create-release-line.sh --dry-run --tests-from-run "$RUN" 1.10
+
+# then do it (needs gh authenticated as a repository admin, with push access
+# to artifact-keeper-test)
+scripts/release/create-release-line.sh --tests-from-run "$RUN" 1.10
 ```
 
 Paste the audit summary it prints into the release PR, or into the issue that
 asked for the line. An **existing** line needs none of this — only creating
 one, and deleting one, do.
+
+**A line is created in both repositories (#4372).** The Release Gate is
+`artifact-keeper-test`'s `release-gate.yml@main`, and every job in it runs
+that repository's `scripts/switch-tests-ref.sh` (artifact-keeper-test#420):
+when `artifact-keeper-test` has a `release/X.Y.x` for the candidate's
+version, the suite runs from that branch, otherwise from `main`. Without it,
+a maintenance candidate is gated by `main`'s suite, which keeps gaining
+companion tests for features the line never receives; that failed ten suites
+on the v1.10.2 candidate (#4350). So the script also creates
+`release/X.Y.x` in `artifact-keeper-test`, at the suite commit that
+certified the line's first release:
+
+- `--tests-from-run <id>`: the successful Release Candidate run that
+  certified `vX.Y.0`. The commit is the `release-gate.yml` sha GitHub recorded
+  for that run (`referenced_workflows` in the run's API record). The gate's
+  jobs check the suite out at `main` when each starts, so a suite merge
+  landing mid-run can make them differ; if that happened, pass the commit the
+  gate jobs' checkout step logged with `--tests-sha`.
+- `--tests-sha <40-hex>`: that commit, given directly. It must be on
+  `artifact-keeper-test`'s `main`.
+
+`artifact-keeper-test` has no ruleset on `release/*`, so its branch is a plain
+ref creation after the backend window has closed, and nothing has to be
+dispatched there: the gate reads the branch each time a candidate runs. It is
+idempotent. A test branch that already exists is left where it is, because its
+tip legitimately moves (see "Patch releases" below). Running the script for a
+line whose backend branch already exists, with a `--tests-*` option, creates
+only the test branch and never touches the ruleset; that is how a failed
+test-branch creation is retried and how an older line gets one.
 
 ### Why the push is refused, and why that is not a bug
 
@@ -591,12 +630,18 @@ same toggle every time, rather than a hand-typed improvisation during a cut.
    repos/…/rules/branches/release%2F<X.Y>.x` must report all four rules
    (`pull_request`, `required_status_checks`, `non_fast_forward`, `deletion`),
    and `git ls-remote` must show the branch at the sha it was asked for.
-6. Prints the audit summary — actor, UTC window, sha, branch, and how many
-   seconds the ruleset spent in `evaluate`.
+6. Creates `release/<X.Y>.x` in `artifact-keeper-test` (above), resolved and
+   checked with the other preconditions before anything is relaxed: push
+   access, a successful Release Candidate run or an explicit sha, and that
+   commit on the suite's `main`. Then it reads the branch back.
+7. Prints the audit summary — actor, UTC window, sha, branch, how many
+   seconds the ruleset spent in `evaluate`, and the test branch.
 
 `scripts/ci/test-create-release-line.sh` (in the `shell-tests` job) pins the
-refusals, the "`--dry-run` issues no PUT/POST" property and the restore-on-
-failure trap, because none of them is exercised by a normal CI run.
+refusals, the "`--dry-run` issues no PUT/POST" property, the restore-on-
+failure trap and the test-branch cases (created at the run's gate commit,
+left alone when it exists, created alone for an existing line), because none
+of them is exercised by a normal CI run.
 
 ### `release/1.9.1-prep` is not a release line
 
@@ -650,8 +695,14 @@ same way: **both workflows are dispatched on `main`**, and you name the commit.
 #    dispatchable release.yml / promotable docker-publish.yml; the candidate
 #    refuses the commit by name if any is missing.
 
+#    It also needs the matching release/1.9.x in artifact-keeper-test, which
+#    the script creates; the gate runs the line's suite from it (#4372).
+
 # 1. land the fixes on main first, then cherry-pick onto release/1.9.x
-#    (Release Branch Gate enforces this)
+#    (Release Branch Gate enforces this). In the same cycle, cherry-pick the
+#    fixes' companion tests onto artifact-keeper-test's release/1.9.x, or the
+#    line's gate does not exercise the line's own fixes
+#    (artifact-keeper-test#424).
 
 # 2. the release prep commit on release/1.9.x sets Cargo.toml to 1.9.1 and
 #    runs scripts/release/assemble-changelog.sh, exactly as on main (the

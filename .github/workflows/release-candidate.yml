@@ -288,6 +288,82 @@ jobs:
             echo "workflow_blob=${WORKFLOW_BLOB}"
           } >> "$GITHUB_OUTPUT"
 
+  # ── Docker Publish must be green before anything reads its result ──────────
+  # Its own job, ahead of BOTH consumers (#4372). `preflight` used to start
+  # beside the wait, which lived inside `images`, and preflight check 3
+  # ("Docker Publish for the exact commit cleanly published its manifest")
+  # reads the same run: dispatched while the images were still building, the
+  # preflight fails on "Docker Publish for HEAD is still 'pending'" (Release
+  # Preflight run 38989584850, 2026-10-17), and the candidate with it (run
+  # 36862392025 for v1.10.2), which then has to be dispatched again for no
+  # reason. Now both `preflight` and `images` need
+  # this job, so the preflight is only dispatched once Docker Publish has
+  # succeeded for the commit. Nothing about WHAT is certified changes: the
+  # same run is selected the same way, the same preflight must go green, and
+  # the run id still reaches the certification record through `images`.
+  publish:
+    name: Wait for a successful Docker Publish run
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Docker Publish for a fresh main commit can take 60-90 minutes on a cold
+    # cache (see resolve-candidate-digest in release.yml); this follows it.
+    timeout-minutes: 130
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run_id: ${{ steps.publish.outputs.run_id }}
+    steps:
+      # CODE FROM MAIN (adversarial review, finding 1): the resolver is main's
+      # copy, and it reads nothing but the API.
+      - name: Checkout main's tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          sparse-checkout: scripts/ci
+
+      # The same selection release.yml makes for a tag, keyed on the branch
+      # the commit is on: a SUCCESSFUL Docker Publish run for this exact
+      # commit on that branch. docker-publish.yml runs on `release/**` pushes
+      # too, so a maintenance commit has its own `sha-<sha>` images. Nothing
+      # is rebuilt; a commit that has no run cannot be certified, and says so.
+      # Since #3629 that is a narrower set than "a docs-only tip": CHANGELOG.md,
+      # the changes/** fragments and .github/release-notes/** build, because a
+      # cut ends on one of them.
+      - name: Wait for a successful Docker Publish run for this commit
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          BRANCH: ${{ needs.resolve.outputs.certified_branch }}
+        run: |
+          set -euo pipefail
+          APPEAR_DEADLINE=$(($(date +%s) + 15*60))
+          while true; do
+            rc=0; out=""
+            out="$(RESOLVE_REPO="${GITHUB_REPOSITORY}" RESOLVE_SHA="${SHA}" RESOLVE_REF="${BRANCH}" \
+              bash scripts/ci/resolve-candidate-publish-run.sh)" || rc=$?
+            case "$rc" in
+              0)
+                echo "  ${out}"
+                echo "run_id=${out#*run_id=}" >> "$GITHUB_OUTPUT"
+                break ;;
+              10)
+                echo "  Docker Publish for ${SHA} is still running; waiting 60s..."; sleep 60 ;;
+              20)
+                echo "::error title=Docker Publish failed for this commit::Every Docker Publish run for ${BRANCH}@${SHA} completed without success, so there are no scanned images to certify. Fix the cause on main; the next commit that publishes cleanly is the candidate."
+                exit 1 ;;
+              21|30)
+                if [[ "$(date +%s)" -ge "$APPEAR_DEADLINE" ]]; then
+                  echo "::error title=No Docker Publish run for this commit::No docker-publish.yml run exists for ${BRANCH}@${SHA} after 15m. A commit touching only markdown other than CHANGELOG.md, changes/** and .github/release-notes/**, or only .beads/** or LICENSE, is skipped by docker-publish.yml's path filter and gets no build (#3629): certify the newest commit that has one, or land a change outside that set."
+                  exit 1
+                fi
+                echo "  no verdict yet (state ${rc}); waiting 30s..."; sleep 30 ;;
+              *)
+                echo "::error title=resolver error::resolve-candidate-publish-run.sh exited ${rc}."; exit 1 ;;
+            esac
+          done
+
   # ── the preflight, reused, and its evidence ─────────────────────────────────
   # release-preflight.yml is DISPATCHED on this commit and followed to a
   # verdict rather than re-implemented here, for the same reason release.yml
@@ -296,7 +372,9 @@ jobs:
   # `release-preflight-<sha>` evidence the tag-push run will demand later.
   preflight:
     name: Require a green Release Preflight for this commit
-    needs: resolve
+    # After `publish` (#4372): preflight check 3 audits the Docker Publish run
+    # for this commit, so it must not be dispatched while that run is pending.
+    needs: [resolve, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -510,11 +588,11 @@ jobs:
   # ── the images Docker Publish already built for this commit ─────────────────
   images:
     name: Resolve the commit's published images
-    needs: resolve
+    needs: [resolve, publish]
     runs-on: ubuntu-latest
-    # Docker Publish for a fresh main commit can take 60-90 minutes on a cold
-    # cache (see resolve-candidate-digest in release.yml); this follows it.
-    timeout-minutes: 130
+    # The wait for Docker Publish is the `publish` job's; once it is green
+    # these steps are registry reads (~20s on the 1.11.2 candidate).
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: read
@@ -531,7 +609,7 @@ jobs:
       adapter_decision: ${{ steps.adapter.outputs.adapter_decision }}
       adapter_owner_rev: ${{ steps.adapter.outputs.adapter_owner_rev }}
       adapter_version: ${{ steps.digests.outputs.adapter_version }}
-      publish_run_id: ${{ steps.publish.outputs.run_id }}
+      publish_run_id: ${{ needs.publish.outputs.run_id }}
     steps:
       # CODE FROM MAIN, DATA FROM THE COMMIT (adversarial review, finding 1).
       # This job holds a token, so nothing it EXECUTES may come from the
@@ -556,48 +634,6 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
-
-      # The same selection release.yml makes for a tag, keyed on the branch
-      # the commit is on: a SUCCESSFUL Docker Publish run for this exact
-      # commit on that branch. docker-publish.yml runs on `release/**` pushes
-      # too, so a maintenance commit has its own `sha-<sha>` images. Nothing
-      # is rebuilt; a commit that has no run cannot be certified, and says so.
-      # Since #3629 that is a narrower set than "a docs-only tip": CHANGELOG.md,
-      # the changes/** fragments and .github/release-notes/** build, because a
-      # cut ends on one of them.
-      - name: Wait for a successful Docker Publish run for this commit
-        id: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ needs.resolve.outputs.sha }}
-          BRANCH: ${{ needs.resolve.outputs.certified_branch }}
-        run: |
-          set -euo pipefail
-          APPEAR_DEADLINE=$(($(date +%s) + 15*60))
-          while true; do
-            rc=0; out=""
-            out="$(RESOLVE_REPO="${GITHUB_REPOSITORY}" RESOLVE_SHA="${SHA}" RESOLVE_REF="${BRANCH}" \
-              bash scripts/ci/resolve-candidate-publish-run.sh)" || rc=$?
-            case "$rc" in
-              0)
-                echo "  ${out}"
-                echo "run_id=${out#*run_id=}" >> "$GITHUB_OUTPUT"
-                break ;;
-              10)
-                echo "  Docker Publish for ${SHA} is still running; waiting 60s..."; sleep 60 ;;
-              20)
-                echo "::error title=Docker Publish failed for this commit::Every Docker Publish run for ${BRANCH}@${SHA} completed without success, so there are no scanned images to certify. Fix the cause on main; the next commit that publishes cleanly is the candidate."
-                exit 1 ;;
-              21|30)
-                if [[ "$(date +%s)" -ge "$APPEAR_DEADLINE" ]]; then
-                  echo "::error title=No Docker Publish run for this commit::No docker-publish.yml run exists for ${BRANCH}@${SHA} after 15m. A commit touching only markdown other than CHANGELOG.md, changes/** and .github/release-notes/**, or only .beads/** or LICENSE, is skipped by docker-publish.yml's path filter and gets no build (#3629): certify the newest commit that has one, or land a change outside that set."
-                  exit 1
-                fi
-                echo "  no verdict yet (state ${rc}); waiting 30s..."; sleep 30 ;;
-              *)
-                echo "::error title=resolver error::resolve-candidate-publish-run.sh exited ${rc}."; exit 1 ;;
-            esac
-          done
 
       # The `sha-<sha>` tags are content-addressed anchors written by every
       # main build. Their digests are what the gate tests and what the
