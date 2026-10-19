@@ -201,11 +201,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = CheckStatus>,
 {
-    with_readyz_deadline(
-        name,
-        cached_check(cache, ttl, || with_readyz_deadline(name, probe())),
-    )
-    .await
+    cached_check(cache, ttl, || with_readyz_deadline(name, probe())).await
 }
 
 /// Probe every dependency the detailed health knows about, concurrently, each
