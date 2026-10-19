@@ -1355,7 +1355,7 @@ pub struct UpdateRepositoryRequest {
     ///
     /// The allowed set is spelled out in the schema so a generated SDK presents it
     /// rather than an unconstrained string.
-    #[schema(value_type = String, example = "allow")]
+    #[schema(value_type = Option<String>, example = "allow")]
     pub curation_default_action: Option<String>,
 }
 

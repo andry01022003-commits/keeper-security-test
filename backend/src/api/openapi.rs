@@ -674,6 +674,28 @@ mod tests {
         }
     }
 
+    /// #4330: `UpdateRepositoryRequest.curation_default_action` is an
+    /// `Option<String>` (absent leaves the stored value unchanged), but a
+    /// `value_type = String` override made the spec list it as required, so
+    /// generated clients had to read-modify-write it on every update.
+    #[test]
+    fn test_4330_update_repository_curation_default_action_not_required() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let schema = &spec["components"]["schemas"]["UpdateRepositoryRequest"];
+        assert!(
+            schema["properties"]["curation_default_action"].is_object(),
+            "UpdateRepositoryRequest.curation_default_action missing from the spec"
+        );
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&"curation_default_action"),
+            "UpdateRepositoryRequest.curation_default_action must be optional, required = {required:?}"
+        );
+    }
+
     /// #3924 added a second 409 to chunked-upload completion (immutable path
     /// occupied) alongside the checksum mismatch, and clients that mapped every
     /// 409 there to a checksum error misreported it. The documented 409 must
