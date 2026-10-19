@@ -748,6 +748,41 @@ async fn get_package_metadata_cached(
         .map(|entry| cached_packument_response(&entry, headers, client_cache_control))
 }
 
+/// Evict what a definitive 404/410 for `scope` actually invalidates (#4240),
+/// unless the underlying Remote keeps on a missing upstream (#4640).
+///
+/// `on_upstream_not_found = keep` also covers this cache: the proxy layer
+/// answers the underlying fetch from the copy it still holds, and evicting the
+/// computed packument here would re-open exactly the upstream round-trip the
+/// policy exists to avoid. Only a Remote scope is consulted — a virtual's 404
+/// is a statement about the virtual computed from one authorized member list
+/// (#4240), not about any one member, so no single member's policy may change
+/// what it invalidates.
+async fn maybe_evict_missing_packument(
+    state: &SharedState,
+    cache: &NpmPackumentCache,
+    scope: &PackumentScope,
+) {
+    if scope.virtual_repo.is_none() {
+        if let Some(proxy_service) = state.proxy_service.as_ref() {
+            if proxy_service
+                .on_upstream_not_found_by_key(&scope.repo_key)
+                .await
+                .keeps()
+            {
+                tracing::info!(
+                    repository = %scope.repo_key,
+                    package = %scope.package,
+                    "upstream 404/410 with on_upstream_not_found=keep; keeping the cached \
+                     packument (#4640)"
+                );
+                return;
+            }
+        }
+    }
+    evict_missing_packument(cache, scope).await;
+}
+
 /// Evict what a definitive 404/410 for `scope` actually invalidates (#4240).
 ///
 /// A Remote packument is one document per package, so the whole package goes,
@@ -788,7 +823,9 @@ fn is_definitive_missing_status(status: StatusCode) -> bool {
 /// `Accept-Encoding`. The entry matching `want_gzip` is returned for serving.
 /// Error responses and non-JSON passthroughs are returned unchanged via
 /// `Err` and left uncached; an authoritative 404/410 additionally evicts the
-/// package's cached variants (see [`is_definitive_missing_status`]).
+/// package's cached variants (see [`is_definitive_missing_status`]), unless the
+/// repository is `on_upstream_not_found = keep` (#4640, see
+/// [`maybe_evict_missing_packument`]).
 #[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped; the exempt call is marked inline below (#1608)
 async fn compute_and_store_packument(
     state: &SharedState,
@@ -834,14 +871,14 @@ async fn compute_and_store_packument(
         Ok(response) => response,
         Err(error_response) => {
             if is_definitive_missing_status(error_response.status()) {
-                evict_missing_packument(cache, scope).await;
+                maybe_evict_missing_packument(state, cache, scope).await;
             }
             return Err(error_response);
         }
     };
     if response.status() != StatusCode::OK {
         if is_definitive_missing_status(response.status()) {
-            evict_missing_packument(cache, scope).await;
+            maybe_evict_missing_packument(state, cache, scope).await;
         }
         return Err(response);
     }

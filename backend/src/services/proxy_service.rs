@@ -35,6 +35,7 @@ use crate::services::proxy_hydration::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
+use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
 use crate::services::upstream_tracing::send_upstream;
 
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
@@ -1547,6 +1548,37 @@ enum RevalidationVerdict {
     /// Upstream was unreachable (5xx / timeout / transport) within the
     /// `stale-if-error` grace window: serve the stale body we already hold.
     ServeStaleIfError,
+    /// #4640: the conditional probe got a definitive 404/410 and the repository
+    /// is `on_upstream_not_found = keep`: serve the cached body we already hold
+    /// without deleting it, writing no marker, and without extending its TTL so
+    /// a later revalidation still notices a re-publish.
+    KeepOnUpstreamNotFound,
+}
+
+/// Outcome of a conditional HEAD revalidation probe (#4640).
+///
+/// Both a "different object" and a "no longer present" answer collapse into the
+/// single `true` that [`UpstreamClient::check_etag_changed`] historically
+/// returned. `on_upstream_not_found = delete` treats them the same (refill), but
+/// `keep` must serve the cached copy on the latter and still refill on the
+/// former, so the reason is preserved here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EtagProbe {
+    /// 304, or 200 carrying the same ETag: the cache is current.
+    Unchanged,
+    /// 200 with a different validator (or none comparable): refill.
+    Changed,
+    /// 404/410: upstream no longer has the object.
+    Gone,
+}
+
+impl EtagProbe {
+    /// Collapse to the binary "changed/newer" answer. A `Gone` object is not
+    /// "the same", so it reads as changed — the `delete` policy then refills
+    /// and negative-caches the 404, exactly as before #4640.
+    const fn is_changed(self) -> bool {
+        matches!(self, Self::Changed | Self::Gone)
+    }
 }
 
 /// Default bearer token TTL when the token endpoint omits `expires_in` (5 minutes).
@@ -4408,6 +4440,26 @@ impl UpstreamClient {
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer).
+    ///
+    /// Thin wrapper over [`Self::check_etag_probe`] that collapses the
+    /// [`EtagProbe`] outcome to the historical boolean (`Unchanged` is `false`,
+    /// both [`EtagProbe::Changed`] and [`EtagProbe::Gone`] are `true`).
+    async fn check_etag_changed(
+        &self,
+        url: &str,
+        cached_etag: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self
+            .check_etag_probe(url, cached_etag, repo_id, accept)
+            .await?
+            .is_changed())
+    }
+
+    /// Conditional HEAD revalidation probe that keeps the *reason* a boolean
+    /// `check_etag_changed` collapses (#4640).
+    ///
     /// Relocated verbatim from `ProxyService::check_etag_changed`.
     ///
     /// `accept` is the `Accept` header the cached representation was fetched
@@ -4418,13 +4470,13 @@ impl UpstreamClient {
     /// the live case — `simple/<project>/` serves HTML or PEP 691 JSON off
     /// `Accept` with per-representation ETags, so probing the JSON variant's
     /// ETag without the JSON `Accept` validates it against the HTML variant.
-    async fn check_etag_changed(
+    async fn check_etag_probe(
         &self,
         url: &str,
         cached_etag: &str,
         repo_id: Uuid,
         accept: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<EtagProbe> {
         let upstream_auth = self
             .upstream_auth_for(
                 url,
@@ -4454,7 +4506,7 @@ impl UpstreamClient {
         match response.status() {
             StatusCode::NOT_MODIFIED => {
                 tracing::debug!("Upstream unchanged (304 Not Modified) for {}", shown);
-                Ok(false)
+                Ok(EtagProbe::Unchanged)
             }
             StatusCode::OK => {
                 // Check if ETag in response differs
@@ -4463,11 +4515,11 @@ impl UpstreamClient {
                 match new_etag {
                     Some(etag) if etag == cached_etag => {
                         tracing::debug!("Upstream ETag unchanged for {}", shown);
-                        Ok(false)
+                        Ok(EtagProbe::Unchanged)
                     }
                     _ => {
                         tracing::debug!("Upstream has newer content for {}", shown);
-                        Ok(true)
+                        Ok(EtagProbe::Changed)
                     }
                 }
             }
@@ -4480,7 +4532,7 @@ impl UpstreamClient {
                     "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
                     shown
                 );
-                Ok(true)
+                Ok(EtagProbe::Changed)
             }
             // #3571: a throttling (429) or broken (5xx) upstream has declined
             // to say whether the object changed. That is not "changed":
@@ -4506,10 +4558,9 @@ impl UpstreamClient {
             // degrades to stale. They stay on the catch-all below.
             //
             // 401 stays above (the OCI bearer exchange depends on it meaning
-            // "re-fetch with a token"); 404/410 fall through below (real
-            // statements about the resource) to the "assume changed" arm, so
-            // the refill GET is attempted and its own 404/410 is negative
-            // cached by `validate_upstream_status` (#3749).
+            // "re-fetch with a token"). 404/410 are caught explicitly below: a
+            // definitive statement about the resource that a `keep` repository
+            // serves from cache (#4640) and a `delete` repository refills.
             status if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
                 tracing::warn!(
                     "Upstream returned {} for ETag check on {}; no content information, \
@@ -4521,8 +4572,16 @@ impl UpstreamClient {
                     Err(err) => Err(err),
                     // Not reachable: the guard admits only statuses the
                     // validator rejects.
-                    Ok(()) => Ok(true),
+                    Ok(()) => Ok(EtagProbe::Changed),
                 }
+            }
+            status if status == StatusCode::NOT_FOUND || status == StatusCode::GONE => {
+                tracing::debug!(
+                    "Upstream answered {} for ETag check on {}; the object is gone",
+                    status,
+                    shown
+                );
+                Ok(EtagProbe::Gone)
             }
             status => {
                 tracing::warn!(
@@ -4530,7 +4589,7 @@ impl UpstreamClient {
                     status,
                     shown
                 );
-                Ok(true)
+                Ok(EtagProbe::Changed)
             }
         }
     }
@@ -4611,12 +4670,16 @@ const UNCACHED_SERVE_TTL: Duration = Duration::from_secs(300);
 const TTL_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Short-TTL memo of the repository facts every mutable-path freshness gate
-/// consults (#3832): the `cache_ttl_secs` override by repository id, and the
-/// `(id, format)` of a repository by key for the key-only read paths. Without
-/// it the read-time TTL clamp would add a database round trip to every
-/// mutable cache hit.
+/// consults (#3832, #4640): the `cache_ttl_secs` override by repository id, the
+/// `on_upstream_not_found` policy by repository id, and the `(id, format)` of a
+/// repository by key for the key-only read paths. Without it the read-time TTL
+/// clamp and the 404/410 keep policy would each add a database round trip to a
+/// mutable-path read.
 struct TtlPolicyCache {
     overrides: Cache<Uuid, Option<i64>>,
+    /// #4640: `on_upstream_not_found` per repository, memoized so a stale entry
+    /// revalidated repeatedly does not re-read `repository_config` every time.
+    upstream_not_found: Cache<Uuid, OnUpstreamNotFound>,
     repo_by_key: Cache<String, Option<(Uuid, RepositoryFormat)>>,
 }
 
@@ -4626,6 +4689,10 @@ impl TtlPolicyCache {
     fn new() -> Self {
         Self {
             overrides: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+            upstream_not_found: Cache::builder()
                 .max_capacity(Self::CAPACITY)
                 .time_to_live(TTL_POLICY_CACHE_TTL)
                 .build(),
@@ -5535,7 +5602,28 @@ impl ProxyService {
                         // not-yet-published artifact does not hammer upstream.
                         // We do NOT serve stale for a 404 (the object is gone /
                         // never existed); propagate the 404.
+                        //
+                        // #4640: unless this repository's
+                        // `on_upstream_not_found = keep` and a vetted positive
+                        // body is still cached -- then the cached copy is
+                        // served and nothing is deleted or negative-cached.
                         if matches!(upstream_err, AppError::NotFound(_)) {
+                            if self.on_upstream_not_found(repo.id).await.keeps() {
+                                if let Some((content, content_type, content_encoding)) = self
+                                    .kept_on_upstream_not_found(&cache_key, &metadata_key)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        repository = %repo.key,
+                                        path = %cache_path,
+                                        "upstream answered 404/410 but on_upstream_not_found=keep; \
+                                         serving the cached copy"
+                                    );
+                                    crate::services::metrics_service::
+                                        record_proxy_kept_on_upstream_not_found(&repo.key);
+                                    return Ok((content, content_type, content_encoding));
+                                }
+                            }
                             self.write_negative_cache(&cache_key, &metadata_key, cache_path)
                                 .await;
                             return Err(upstream_err);
@@ -5978,8 +6066,9 @@ impl ProxyService {
     ///   hit and therefore NEVER contact upstream (the load-bearing invariant).
     /// * **Stale** (mutable, past TTL) -> conditional revalidation via the shared
     ///   [`Self::revalidate_verdict`] core; 304 extends the TTL and streams the
-    ///   cached body, any other outcome degrades to `Miss` so the single-flight
-    ///   streaming leader refills.
+    ///   cached body, a definitive 404/410 under `on_upstream_not_found = keep`
+    ///   also streams the cached body (#4640), and any other outcome degrades to
+    ///   `Miss` so the single-flight streaming leader refills.
     ///
     /// B6 is preserved: a transient sidecar read/parse error is treated as a
     /// `Miss` (refetch), never propagated as a 502.
@@ -6030,9 +6119,12 @@ impl ProxyService {
                     .revalidate_verdict(repo, fetch_path, metadata_key, &metadata, None)
                     .await
                 {
-                    // 304 extended the TTL; stream the cached body.
+                    // 304 extended the TTL; stream the cached body. #4640: a
+                    // `keep` repository's definitive 404/410 streams the cached
+                    // body too, without extending its TTL.
                     RevalidationVerdict::ServeRevalidated
-                    | RevalidationVerdict::ServeStaleIfError => {
+                    | RevalidationVerdict::ServeStaleIfError
+                    | RevalidationVerdict::KeepOnUpstreamNotFound => {
                         // Package Age Policy (#1770): gate the revalidated /
                         // stale-if-error body the same way as a fresh hit.
                         check_quarantine_until(metadata.quarantine_until)?;
@@ -6202,6 +6294,7 @@ impl ProxyService {
             Err(err) => {
                 return self
                     .handle_streaming_leader_upstream_error(
+                        repo,
                         cache_path,
                         &cache_key,
                         &metadata_key,
@@ -6225,6 +6318,7 @@ impl ProxyService {
             Err(err) => {
                 return self
                     .handle_streaming_leader_upstream_error(
+                        repo,
                         cache_path,
                         &cache_key,
                         &metadata_key,
@@ -6404,20 +6498,44 @@ impl ProxyService {
     /// leader (#1611 streaming-path parity). Mirrors the buffered produce
     /// closure's `Err(upstream_err)` arm:
     ///
-    /// * **404** -> write the negative-cache marker so a hot loop of misses on a
-    ///   not-yet-published artifact does not hammer upstream, then propagate the
-    ///   404. We never serve stale for a 404 (the object is gone / never existed).
+    /// * **404/410 with `on_upstream_not_found = keep`** (#4640) and a vetted
+    ///   positive body still cached -> stream the cached body, leave it in place
+    ///   and write no marker.
+    /// * **404/410** otherwise -> write the negative-cache marker so a hot loop
+    ///   of misses on a not-yet-published artifact does not hammer upstream, then
+    ///   propagate the 404. We never serve stale for a 404 (the object is gone /
+    ///   never existed).
     /// * **transient (5xx / timeout / transport)** -> RFC 5861 `stale-if-error`:
     ///   stream the stale body we already hold (regardless of TTL — the entry was
     ///   already past TTL or absent), else propagate the original error.
     async fn handle_streaming_leader_upstream_error(
         &self,
+        repo: &Repository,
         path: &str,
         cache_key: &str,
         metadata_key: &str,
         upstream_err: AppError,
     ) -> Result<StreamHandle> {
         if matches!(upstream_err, AppError::NotFound(_)) {
+            // #4640: a `keep` repository serves the cached copy instead of
+            // deleting it and negative-caching the path.
+            if self.on_upstream_not_found(repo.id).await.keeps() {
+                if let Some(handle) = self
+                    .kept_stream_on_upstream_not_found(cache_key, metadata_key)
+                    .await?
+                {
+                    tracing::warn!(
+                        repository = %repo.key,
+                        path = %path,
+                        "upstream answered 404/410 but on_upstream_not_found=keep; \
+                         serving the cached copy"
+                    );
+                    crate::services::metrics_service::record_proxy_kept_on_upstream_not_found(
+                        &repo.key,
+                    );
+                    return Ok(handle);
+                }
+            }
             self.write_negative_cache(cache_key, metadata_key, path)
                 .await;
             return Err(upstream_err);
@@ -6545,6 +6663,51 @@ impl ProxyService {
         }
 
         Err(upstream_err)
+    }
+
+    /// #4640: the streaming counterpart of [`Self::kept_on_upstream_not_found`]
+    /// — open a stream of the cached body a `keep` repository serves when
+    /// upstream answers a definitive 404/410, without buffering it (a `.nupkg`
+    /// can be large).
+    ///
+    /// Returns `Ok(None)` when nothing servable is cached: never cached, a
+    /// negative marker (which vouches for no body), a poisoned/unvouched body
+    /// ([`Self::open_cached_stream`] applies the #3147 / #4630 / #4758 checks),
+    /// or an unreachable body. A Package-Age-Policy hold is a genuine
+    /// `Err(Conflict)` and is not hidden: a held entry is not served just
+    /// because upstream deleted it.
+    async fn kept_stream_on_upstream_not_found(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+    ) -> Result<Option<StreamHandle>> {
+        let Some(metadata) = self.load_cache_metadata(metadata_key).await.ok().flatten() else {
+            return Ok(None);
+        };
+        // A negative marker records an upstream 404 and vouches for no body at
+        // all; a leftover body under one is never served (#3147).
+        if metadata.negative_cached_until.is_some() {
+            return Ok(None);
+        }
+        // The Package Age Policy still applies to a kept copy (#1770, #3912).
+        check_quarantine_until(metadata.quarantine_until)?;
+        match self
+            .open_cached_stream(cache_key, metadata_key, &metadata)
+            .await?
+        {
+            Some(result) => Ok(Some(StreamHandle {
+                body: result.body,
+                headers: StreamHeaders {
+                    content_type: result.content_type,
+                    content_length: result.content_length,
+                    etag: result.etag,
+                    content_encoding: result.content_encoding,
+                    commit_sha: result.commit_sha,
+                },
+                cache_published: None,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Uncoordinated streaming fetch (cache hit fast path + direct upstream tee
@@ -7690,6 +7853,50 @@ impl ProxyService {
         self.ttl_policy_cache.overrides.invalidate(&repo_id).await;
     }
 
+    /// Drop this process's cached `on_upstream_not_found` policy for `repo_id`
+    /// (#4640), so a change made through the API applies to the very next serve
+    /// here (other replicas pick it up within [`TTL_POLICY_CACHE_TTL`]).
+    pub async fn invalidate_upstream_not_found_policy(&self, repo_id: Uuid) {
+        self.ttl_policy_cache
+            .upstream_not_found
+            .invalidate(&repo_id)
+            .await;
+    }
+
+    /// The repository's `on_upstream_not_found` policy (#4640), defaulting to
+    /// [`OnUpstreamNotFound::Delete`] when the row is absent, unparseable or the
+    /// database is unreachable. Read on the 404/410 path only, through the same
+    /// short-TTL memo as the TTL override.
+    pub(crate) async fn on_upstream_not_found(&self, repo_id: Uuid) -> OnUpstreamNotFound {
+        if let Some(hit) = self.ttl_policy_cache.upstream_not_found.get(&repo_id).await {
+            return hit;
+        }
+        let raw = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(OnUpstreamNotFound::CONFIG_KEY)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten();
+        let policy = OnUpstreamNotFound::parse(raw.as_deref());
+        self.ttl_policy_cache
+            .upstream_not_found
+            .insert(repo_id, policy)
+            .await;
+        policy
+    }
+
+    /// [`Self::on_upstream_not_found`] for callers that only hold a repository
+    /// key (the npm packument cache, #4640). An unknown key is the default.
+    pub async fn on_upstream_not_found_by_key(&self, repo_key: &str) -> OnUpstreamNotFound {
+        match self.repo_identity_by_key(repo_key).await {
+            Some((repo_id, _)) => self.on_upstream_not_found(repo_id).await,
+            None => OnUpstreamNotFound::Delete,
+        }
+    }
+
     /// Resolve the repository's configured `quota_bytes` (#2928).
     ///
     /// Every handler-driven proxy fetch synthesizes its [`Repository`] through
@@ -8355,7 +8562,8 @@ impl ProxyService {
                     _ => Ok(CacheReadOutcome::Miss),
                 }
             }
-            RevalidationVerdict::ServeStaleIfError => {
+            RevalidationVerdict::ServeStaleIfError
+            | RevalidationVerdict::KeepOnUpstreamNotFound => {
                 if let Ok(Some((content, content_type, content_encoding))) = self
                     .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
@@ -8386,6 +8594,8 @@ impl ProxyService {
     ///   revalidate cheaply).
     /// * **304 Not Modified** -> extend TTL, [`RevalidationVerdict::ServeRevalidated`].
     /// * **changed (200 / different ETag)** -> [`RevalidationVerdict::Refill`].
+    /// * **404/410 with `on_upstream_not_found = keep`** (#4640) ->
+    ///   [`RevalidationVerdict::KeepOnUpstreamNotFound`]; `delete` refills.
     /// * **upstream error within grace** -> [`RevalidationVerdict::ServeStaleIfError`].
     /// * **upstream error past grace** -> [`RevalidationVerdict::Refill`].
     ///
@@ -8415,18 +8625,35 @@ impl ProxyService {
         };
 
         match self
-            .check_etag_changed(&full_url, &etag, repo.id, accept)
+            .check_etag_probe(&full_url, &etag, repo.id, accept)
             .await
         {
-            Ok(false) => {
+            Ok(EtagProbe::Unchanged) => {
                 // 304 Not Modified: extend the TTL and serve the cached body.
                 let new_ttl = self.cache_ttl_for_path(repo, fetch_path).await;
                 self.extend_cache_expiry(metadata_key, metadata, new_ttl)
                     .await;
                 RevalidationVerdict::ServeRevalidated
             }
-            // Changed upstream: let the single-flight coordinator refill once.
-            Ok(true) => RevalidationVerdict::Refill,
+            // #4640: a definitive 404/410 from upstream. A `keep` repository
+            // serves the copy it still holds and leaves its TTL untouched, so a
+            // later 200 re-publish is still noticed. A `delete` repository
+            // falls through to the refill below, whose 404 is negative-cached.
+            Ok(EtagProbe::Gone) if self.on_upstream_not_found(repo.id).await.keeps() => {
+                tracing::warn!(
+                    metadata_key = %metadata_key,
+                    repository = %repo.key,
+                    "upstream no longer has the object but on_upstream_not_found=keep; \
+                     serving the cached copy"
+                );
+                crate::services::metrics_service::record_proxy_kept_on_upstream_not_found(
+                    &repo.key,
+                );
+                RevalidationVerdict::KeepOnUpstreamNotFound
+            }
+            // Changed upstream (or a `delete` repository's 404/410): let the
+            // single-flight coordinator refill once.
+            Ok(_) => RevalidationVerdict::Refill,
             Err(err) => {
                 // Upstream unreachable mid-revalidation: stale-if-error within
                 // the grace window, else fall through to a refill attempt.
@@ -8481,6 +8708,44 @@ impl ProxyService {
                 tracing::warn!(metadata_key = %metadata_key, error = %e, "failed to serialize extended cache metadata");
             }
         }
+    }
+
+    /// #4640: the buffered body a `keep`-policy repository serves when upstream
+    /// answers a definitive 404/410 for a path that still has a vetted positive
+    /// cache entry.
+    ///
+    /// Returns `None` when nothing servable is cached — never cached, a
+    /// negative marker (which vouches for no body), a missing or poisoned body,
+    /// or a Package-Age-Policy hold that must still gate a kept copy (#1770 /
+    /// #3912). In every `None` case the caller negative-caches exactly as it
+    /// does today, so a genuinely-missing path still answers 404 from the
+    /// marker.
+    async fn kept_on_upstream_not_found(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+    ) -> Option<CachedBody> {
+        let metadata = self
+            .load_cache_metadata(metadata_key)
+            .await
+            .ok()
+            .flatten()?;
+        // A negative marker records an upstream 404 and vouches for no body at
+        // all; a leftover body under one is never served (the same stance as
+        // the streaming stale-if-error reader, #3147).
+        if metadata.negative_cached_until.is_some() {
+            return None;
+        }
+        // The Package Age Policy still applies to a kept copy: a held entry is
+        // not served just because upstream deleted it. A conflict here is left
+        // to fall through to the 404 rather than served.
+        if check_quarantine_until(metadata.quarantine_until).is_err() {
+            return None;
+        }
+        self.get_stale_cached_artifact(cache_key, metadata_key, Some(metadata))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Write a negative-cache sidecar recording an upstream 404 (#1611). The
@@ -8978,6 +9243,20 @@ impl ProxyService {
     ) -> Result<bool> {
         self.upstream_client
             .check_etag_changed(url, cached_etag, repo_id, accept)
+            .await
+    }
+
+    /// [`Self::check_etag_changed`] without collapsing a definitive 404/410
+    /// into "changed" (#4640) — see [`UpstreamClient::check_etag_probe`].
+    async fn check_etag_probe(
+        &self,
+        url: &str,
+        cached_etag: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+    ) -> Result<EtagProbe> {
+        self.upstream_client
+            .check_etag_probe(url, cached_etag, repo_id, accept)
             .await
     }
 }
@@ -13304,8 +13583,10 @@ mod tests {
         let content_key = format!("proxy-cache/npm-proxy/{slug}/__content__");
         let metadata_key = format!("proxy-cache/npm-proxy/{slug}/__cache_meta__.json");
         let proxy = build_proxy_service_with_storage(backend);
+        let repo = remote_repo_for("npm-proxy", "http://unused", slug);
         match proxy
             .handle_streaming_leader_upstream_error(
+                &repo,
                 slug,
                 &content_key,
                 &metadata_key,
@@ -13725,6 +14006,200 @@ mod tests {
                 bytes.len()
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #4640: `on_upstream_not_found = keep` — what a `keep` repository serves
+    // when upstream answers a definitive 404/410 for a path it still holds a
+    // cached copy of. The helpers below are the two readers the negative-cache
+    // arms consult before falling back to the default (delete + marker).
+    // -----------------------------------------------------------------------
+
+    /// A vetted positive entry is served, and — the whole point of #4640 —
+    /// nothing is deleted on the way.
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_serves_a_vetted_entry_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-kept/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"KEPT-BYTES").await;
+        let mut metadata = stale_positive_sidecar(10);
+        metadata.checksum_sha256 = StorageService::calculate_hash(b"KEPT-BYTES");
+        backend.put_sidecar(&metadata_key, &metadata).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let kept = proxy
+            .kept_on_upstream_not_found(content_key, &metadata_key)
+            .await
+            .expect("a vetted positive entry must be servable");
+
+        assert_eq!(&kept.0[..], b"KEPT-BYTES");
+        assert_eq!(kept.1.as_deref(), Some("application/gzip"));
+        assert!(
+            backend.exists(content_key).await.unwrap()
+                && backend.exists(&metadata_key).await.unwrap(),
+            "#4640 keeps the cached copy: neither the body nor the sidecar may be deleted"
+        );
+    }
+
+    /// A negative marker vouches for no body at all; a leftover body underneath
+    /// one is never served (#3147), so the caller negative-caches as before.
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_refuses_a_negative_marker_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-negative/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"LEFTOVER-BYTES").await;
+        let mut marker = stale_positive_sidecar(0);
+        marker.negative_cached_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        marker.checksum_sha256 = String::new();
+        backend.put_sidecar(&metadata_key, &marker).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .is_none(),
+            "a leftover body under a negative marker is not a cached copy"
+        );
+    }
+
+    /// A path with no cached copy (sidecar but no body, or nothing at all) is
+    /// still a 404: `keep` only keeps what is there.
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_is_none_without_a_body_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-uncached/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend
+            .put_sidecar(&metadata_key, &stale_positive_sidecar(10))
+            .await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .is_none(),
+            "a sidecar whose body never landed is not a cached copy"
+        );
+
+        let orphan = "proxy-cache/npm-remote/4640-orphan/__content__";
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(orphan, &sidecar_key_of(orphan))
+                .await
+                .is_none(),
+            "an uncached path is not a cached copy"
+        );
+    }
+
+    /// The Package Age Policy still gates a kept copy: a hold is never served
+    /// just because upstream deleted the object (#1770, #3912).
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_respects_a_package_age_hold_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-held/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"HELD-BYTES").await;
+        let mut held = stale_positive_sidecar(10);
+        held.checksum_sha256 = StorageService::calculate_hash(b"HELD-BYTES");
+        held.quarantine_until = Some(Utc::now() + chrono::Duration::hours(6));
+        backend.put_sidecar(&metadata_key, &held).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .is_none(),
+            "a Package-Age-Policy hold must still gate a kept copy (#1770/#3912)"
+        );
+    }
+
+    /// Streaming twin of the serving case: the same bytes, handed over as a
+    /// stream so a kept `.nupkg` is never buffered into memory.
+    #[tokio::test]
+    async fn test_kept_stream_on_upstream_not_found_serves_a_vetted_entry_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-stream/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"KEPT-BYTES").await;
+        backend
+            .put_sidecar(&metadata_key, &stale_positive_sidecar(10))
+            .await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let handle = proxy
+            .kept_stream_on_upstream_not_found(content_key, &metadata_key)
+            .await
+            .expect("a vetted positive entry must open")
+            .expect("a vetted positive entry must be servable");
+
+        assert_eq!(handle.headers.content_length, Some(10));
+        assert_eq!(drain_body(handle.body).await, b"KEPT-BYTES".to_vec());
+        assert!(backend.exists(content_key).await.unwrap());
+    }
+
+    /// Streaming twin of the negative-marker refusal.
+    #[tokio::test]
+    async fn test_kept_stream_on_upstream_not_found_refuses_a_negative_marker_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-stream-negative/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"LEFTOVER-BYTES").await;
+        let mut marker = stale_positive_sidecar(0);
+        marker.negative_cached_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        marker.checksum_sha256 = String::new();
+        backend.put_sidecar(&metadata_key, &marker).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_stream_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .expect("a negative marker is never an error")
+                .is_none(),
+            "a leftover body under a negative marker is not a cached copy"
+        );
+    }
+
+    /// Streaming twin of the age-hold refusal: the hold surfaces as the
+    /// conflict it is, rather than being swallowed into a 404.
+    #[tokio::test]
+    async fn test_kept_stream_on_upstream_not_found_respects_a_package_age_hold_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-stream-held/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"HELD-BYTES").await;
+        let mut held = stale_positive_sidecar(10);
+        held.quarantine_until = Some(Utc::now() + chrono::Duration::hours(6));
+        backend.put_sidecar(&metadata_key, &held).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let held = proxy
+            .kept_stream_on_upstream_not_found(content_key, &metadata_key)
+            .await;
+        assert!(
+            matches!(
+                held,
+                Err(AppError::Conflict(_)) | Err(AppError::Authorization(_))
+            ),
+            "the Package-Age-Policy hold must surface from the kept-stream reader (#4640)"
+        );
+    }
+
+    /// `EtagProbe` collapses back to the pre-#4640 boolean exactly as
+    /// `check_etag_changed` promises: only `Unchanged` is "not changed".
+    #[test]
+    fn test_etag_probe_is_changed_preserves_the_boolean_answer() {
+        assert!(!EtagProbe::Unchanged.is_changed());
+        assert!(EtagProbe::Changed.is_changed());
+        assert!(
+            EtagProbe::Gone.is_changed(),
+            "a `delete` repository must keep refilling (and negative-caching) on a 404/410"
+        );
     }
 
     // -----------------------------------------------------------------------

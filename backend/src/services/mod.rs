@@ -133,6 +133,7 @@ pub mod upstream_auth;
 pub mod upstream_feed;
 pub mod upstream_filter;
 pub mod upstream_metadata;
+pub mod upstream_not_found_policy;
 pub mod upstream_tracing;
 pub mod version_order;
 pub mod wasm_bindings;

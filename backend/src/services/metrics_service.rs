@@ -701,6 +701,19 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
     .increment(1);
 }
 
+/// Record a proxy serve that kept a cached body because upstream answered a
+/// definitive 404/410 and the repository's `on_upstream_not_found` policy is
+/// `keep` (#4640). The counter is the observable signal that a served body no
+/// longer exists upstream, so an operator can list (and evict) content that is
+/// being kept past its upstream life.
+pub fn record_proxy_kept_on_upstream_not_found(repo_key: &str) {
+    counter!(
+        "ak_proxy_kept_on_upstream_not_found_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
 /// Counters recorded while a test ran, as `(name, labels, value)`; read one
 /// with [`CounterCapture::get`].
 #[cfg(test)]

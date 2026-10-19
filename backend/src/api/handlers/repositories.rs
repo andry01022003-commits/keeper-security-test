@@ -54,6 +54,7 @@ use crate::services::rpm_layout;
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 use crate::services::upstream_filter::{self, UpstreamFilter};
+use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -840,6 +841,11 @@ pub fn router() -> Router<SharedState> {
         .route("/:key/storage/tree", get(get_repository_storage_tree))
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Upstream 404/410 policy for proxy/remote repositories (#4640)
+        .route(
+            "/:key/on-upstream-not-found",
+            put(set_on_upstream_not_found).get(get_on_upstream_not_found),
+        )
         // npm scope policy for Remote members of npm virtual repositories (#2327)
         .route(
             "/:key/npm-scope-policy",
@@ -2594,6 +2600,171 @@ pub async fn get_cache_ttl(
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
+    }))
+}
+
+/// Reject `on_upstream_not_found` writes against repositories whose proxy code
+/// path will never read the value back (#4640). Only Remote (proxy)
+/// repositories consult the `on_upstream_not_found` row written by
+/// `set_on_upstream_not_found`; writing it for Local, Virtual or Staging repos
+/// produces dead state with no consumer.
+///
+/// The structural regression test below greps `set_on_upstream_not_found`'s
+/// body for a call to this guard, so the handler cannot lose it silently.
+fn is_on_upstream_not_found_configurable(repo_type: &RepositoryType) -> Result<()> {
+    if repo_type != &RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "on_upstream_not_found is only configurable on remote (proxy) repositories".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetOnUpstreamNotFoundRequest {
+    /// What this remote (proxy) repository does when upstream answers 404/410
+    /// for a path that has a cached positive body. `delete` (the default, and
+    /// the behaviour before #4640) evicts the cached copy and negative-caches
+    /// the path. `keep` serves the cached copy and leaves it in place with no
+    /// negative marker — for deployments that use the proxy cache as a
+    /// continuity copy of an external registry whose content may disappear
+    /// upstream. A path that was never cached still returns 404 either way.
+    pub on_upstream_not_found: OnUpstreamNotFound,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OnUpstreamNotFoundResponse {
+    pub repository_key: String,
+    pub on_upstream_not_found: OnUpstreamNotFound,
+}
+
+/// Set the upstream-not-found policy for a remote (proxy) repository
+#[utoipa::path(
+    put,
+    path = "/{key}/on-upstream-not-found",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetOnUpstreamNotFoundRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Policy updated", body = OnUpstreamNotFoundResponse),
+        (status = 400, description = "Invalid policy value"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_on_upstream_not_found(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetOnUpstreamNotFoundRequest>,
+) -> Result<Json<OnUpstreamNotFoundResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write:repositories")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_write_access(&auth, &repo, &service).await?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository. Like the cache TTL, this is a pull-through proxy
+    // supply-chain control on the same administrative tier as delete/update,
+    // so the tenant write gate above is not sufficient on its own.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to change the upstream-not-found policy of this \
+                 repository"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Reject writes on non-remote repos before any further validation: the
+    // value would never be read back by the proxy code path (#4640).
+    is_on_upstream_not_found_configurable(&repo.repo_type)?;
+
+    // Upsert into repository_config table. The enum's `Serialize`/`Deserialize`
+    // already restrict the accepted wire values to `keep` / `delete`.
+    sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = $3, updated_at = NOW()
+        "#,
+    )
+    .bind(repo.id)
+    .bind(OnUpstreamNotFound::CONFIG_KEY)
+    .bind(payload.on_upstream_not_found.as_str())
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // The proxy memoizes the policy per process, so make this process see the
+    // new value at once rather than after its policy-cache TTL. Other replicas
+    // follow within that TTL.
+    if let Some(proxy_service) = state.proxy_service.as_ref() {
+        proxy_service
+            .invalidate_upstream_not_found_policy(repo.id)
+            .await;
+    }
+
+    Ok(Json(OnUpstreamNotFoundResponse {
+        repository_key: key,
+        on_upstream_not_found: payload.on_upstream_not_found,
+    }))
+}
+
+/// Get the upstream-not-found policy for a repository
+#[utoipa::path(
+    get,
+    path = "/{key}/on-upstream-not-found",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Current policy", body = OnUpstreamNotFoundResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+// Note: GET stays permissive for any repo_type even though writes are
+// restricted to Remote repositories (see `set_on_upstream_not_found`), so a
+// UI probing a repository's settings gets the default rather than an error.
+pub async fn get_on_upstream_not_found(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<OnUpstreamNotFoundResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    // Read from repository_config table
+    let result: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT value FROM repository_config
+        WHERE repository_id = $1 AND key = $2
+        "#,
+    )
+    .bind(repo.id)
+    .bind(OnUpstreamNotFound::CONFIG_KEY)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let policy = OnUpstreamNotFound::parse(result.as_ref().map(|(v,)| v.as_str()));
+
+    Ok(Json(OnUpstreamNotFoundResponse {
+        repository_key: key,
+        on_upstream_not_found: policy,
     }))
 }
 
@@ -13045,6 +13216,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         put_pypi_track,
         delete_pypi_track,
         get_cache_ttl,
+        set_on_upstream_not_found,
+        get_on_upstream_not_found,
         invalidate_cache,
         list_artifacts,
         get_artifact_metadata,
@@ -13085,6 +13258,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryStorageTreeResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
+        SetOnUpstreamNotFoundRequest,
+        OnUpstreamNotFoundResponse,
+        OnUpstreamNotFound,
         SetNpmScopePolicyRequest,
         NpmScopePolicyResponse,
         InvalidateCacheQuery,
@@ -22355,6 +22531,87 @@ mod tests {
         );
     }
 
+    /// #4640, against a real row and through the HTTP surface: a fresh Remote
+    /// repository reports the default `delete`, `PUT` stores `keep` under the
+    /// documented `repository_config` key, `GET` reads it back, and the proxy's
+    /// own resolver agrees on what the next serve will use.
+    #[tokio::test]
+    async fn on_upstream_not_found_round_trips_through_the_api_4640() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+
+        let read = |fx: &tdh::Fixture| {
+            let app = fx.router_anon(super::router());
+            let uri = format!("/{}/on-upstream-not-found", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(app, tdh::get(uri)).await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+                json["on_upstream_not_found"]
+                    .as_str()
+                    .expect("on_upstream_not_found")
+                    .to_string()
+            }
+        };
+
+        assert_eq!(
+            read(&fx).await,
+            "delete",
+            "a fresh Remote repository defaults to delete (#4640)"
+        );
+
+        // The PUT needs the `write:repositories` scope and `admin` on the repo,
+        // so drive it as the fixture's admin (the handler bypasses the
+        // fine-grained check for admins).
+        let app = tdh::router_with_auth_ext(
+            super::router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let uri = format!("/{}/on-upstream-not-found", fx.repo_key);
+        let (status, body) = tdh::send(
+            app,
+            tdh::put_json(
+                uri.clone(),
+                axum::body::Bytes::from_static(br#"{"on_upstream_not_found":"keep"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "PUT keep must be accepted: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let stored: (String,) = sqlx::query_as(
+            "SELECT value FROM repository_config \
+             WHERE repository_id = $1 AND key = 'on_upstream_not_found'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("the policy is stored under the documented config key");
+        assert_eq!(stored.0, "keep");
+
+        assert_eq!(read(&fx).await, "keep", "GET reads back what PUT stored");
+
+        // A freshly built proxy (no memo) resolves the stored row, which is
+        // exactly what the fetch paths consult (#4640).
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        assert_eq!(
+            proxy.on_upstream_not_found(fx.repo_id).await,
+            OnUpstreamNotFound::Keep,
+            "the proxy must resolve the stored keep policy"
+        );
+
+        fx.teardown().await;
+    }
+
     /// Runtime regression (#1539): on a Remote repo with the proxy service
     /// configured, `POST /:key/cache/invalidate?path=...` returns 200 with
     /// `invalidated: true`. Idempotent: invalidating a path that was never
@@ -23692,6 +23949,107 @@ mod tests {
             type_idx,
             range_idx,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_on_upstream_not_found_configurable (#4640)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn on_upstream_not_found_configurable_for_remote() {
+        assert!(is_on_upstream_not_found_configurable(&RepositoryType::Remote).is_ok());
+    }
+
+    /// Every repository type whose proxy code path never reads the row rejects
+    /// the write, so no dead `on_upstream_not_found` state can be created.
+    #[test]
+    fn on_upstream_not_found_rejected_for_non_remote_types() {
+        for repo_type in [
+            RepositoryType::Local,
+            RepositoryType::Virtual,
+            RepositoryType::Staging,
+        ] {
+            let err = is_on_upstream_not_found_configurable(&repo_type).unwrap_err();
+            match err {
+                AppError::Validation(msg) => assert!(
+                    msg.contains("remote (proxy)"),
+                    "{repo_type:?} must name the accepted type, got: {msg}"
+                ),
+                other => panic!("Expected Validation error for {repo_type:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Structural guard, in the shape `set_cache_ttl`'s uses (#917): the
+    /// `set_on_upstream_not_found` handler MUST reject non-Remote repositories,
+    /// store the row under the documented `repository_config` key, and drop this
+    /// process's memo so the change is visible immediately (#4640). The
+    /// substrings are built at runtime so the test body cannot satisfy the
+    /// search.
+    #[test]
+    fn set_on_upstream_not_found_stores_the_policy_and_guards_the_repo_type() {
+        let source = include_str!("repositories.rs");
+
+        let signature = format!("pub async fn {}(", "set_on_upstream_not_found");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("could not locate `{signature}` in repositories.rs"));
+        let next_signature = format!("pub async fn {}(", "get_on_upstream_not_found");
+        let end = source[start..]
+            .find(&next_signature)
+            .map(|offset| start + offset)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        let guard_call = format!(
+            "{}(&repo.repo_type)",
+            "is_on_upstream_not_found_configurable"
+        );
+        assert!(
+            body.contains(&guard_call),
+            "set_on_upstream_not_found must call `{guard_call}` to reject non-Remote repos (#4640)"
+        );
+
+        // The value written is the enum's canonical spelling, under the same
+        // config key the proxy reads (#4640).
+        assert!(
+            body.contains("OnUpstreamNotFound::CONFIG_KEY") && body.contains(".as_str()"),
+            "set_on_upstream_not_found must store `on_upstream_not_found` under \
+             `OnUpstreamNotFound::CONFIG_KEY` using its canonical spelling (#4640)"
+        );
+
+        let invalidate_call = format!("invalidate_upstream{}", "_not_found_policy");
+        assert!(
+            body.contains(&invalidate_call),
+            "set_on_upstream_not_found must call `{invalidate_call}` so the new value applies \
+             to the very next serve (#4640)"
+        );
+    }
+
+    /// The request DTO accepts exactly `keep` and `delete` (lowercase), so a
+    /// typo is a 400 rather than a silently-defaulted row.
+    #[test]
+    fn on_upstream_not_found_request_deserializes_only_canonical_values() {
+        let keep: SetOnUpstreamNotFoundRequest =
+            serde_json::from_str(r#"{"on_upstream_not_found":"keep"}"#)
+                .expect("`keep` is a valid policy");
+        assert_eq!(
+            keep.on_upstream_not_found,
+            OnUpstreamNotFound::Keep,
+            "keep must round-trip"
+        );
+
+        let delete: SetOnUpstreamNotFoundRequest =
+            serde_json::from_str(r#"{"on_upstream_not_found":"delete"}"#)
+                .expect("`delete` is a valid policy");
+        assert_eq!(delete.on_upstream_not_found, OnUpstreamNotFound::Delete);
+
+        for bogus in [r#"{"on_upstream_not_found":"tombstone"}"#, r#"{}"#] {
+            assert!(
+                serde_json::from_str::<SetOnUpstreamNotFoundRequest>(bogus).is_err(),
+                "{bogus} must not deserialize into a policy"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
