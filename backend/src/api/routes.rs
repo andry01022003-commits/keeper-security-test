@@ -17,18 +17,18 @@ use crate::error::AppError;
 use super::handlers;
 use super::middleware::auth::{
     admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
-    repo_visibility_middleware, RepoVisibilityState,
+    repo_visibility_middleware, repository_download_auth_middleware, RepoVisibilityState,
 };
-use super::middleware::client_ip::client_ip_context_middleware;
+use super::middleware::client_ip::{self, client_ip_context_middleware};
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
     login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware, CidrRange,
-    LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
+    LoginRateLimitAudit, LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
 };
 use super::middleware::setup::setup_guard;
-use super::middleware::tracing::correlation_id_middleware;
+use super::middleware::tracing::correlation_id_with_proxies_middleware;
 use super::middleware::upload_guard::{
     per_principal_upload_admission, upload_progress_deadline, ProgressPolicy, UploadAdmission,
 };
@@ -67,6 +67,11 @@ pub fn create_router(state: SharedState) -> Router {
     // default 10 GB). A value of 0 disables the limit entirely.
     let upload_limit = state.config.max_upload_size_bytes;
 
+    let wasm_proxy_routes = if state.config.plugins_enabled {
+        Router::new().nest("/ext", handlers::wasm_proxy::router())
+    } else {
+        Router::new()
+    };
     // One in-flight upload budget per principal, shared by every upload
     // surface below (GHSA-9f9r-c4w8-rjv9).
     let upload_admission = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
@@ -134,7 +139,7 @@ pub fn create_router(state: SharedState) -> Router {
         // served via this prefix currently references `/incus/...` download
         // URLs; making those URLs prefix-aware is tracked as a follow-up.
         .nest("/lxc", handlers::incus::router())
-        .nest("/ext", handlers::wasm_proxy::router())
+        .merge(wasm_proxy_routes)
         // Per-principal in-flight upload cap (GHSA-9f9r-c4w8-rjv9). Layered
         // inside the visibility middleware so it sees the caller's identity.
         .layer(middleware::from_fn_with_state(
@@ -187,11 +192,18 @@ pub fn create_router(state: SharedState) -> Router {
         state.config.rate_limit_trusted_cidrs.clone(),
     ));
     let rate_limit_trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
-    let login_rate_limit_state = build_login_rate_limit_state(
+    let client_ip_config = Arc::new(client_ip::ClientIpConfig {
+        trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        xff_trusted_for_authz: state.config.xff_trusted_for_authz,
+    });
+    let mut login_rate_limit_state = build_login_rate_limit_state(
         &state.config,
         &rate_limit_exemptions,
         &rate_limit_trusted_proxies,
     );
+    // #4677: a refused login leaves a `LOGIN_RATE_LIMITED` audit row (once
+    // per source IP per window) instead of no trace at all.
+    login_rate_limit_state.audit = Some(Arc::new(LoginRateLimitAudit::new(state.db.clone())));
 
     let mut router = router
         // API v1 routes
@@ -280,17 +292,26 @@ pub fn create_router(state: SharedState) -> Router {
 
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
-    // X-Correlation-ID response header.
-    router = router.layer(middleware::from_fn(correlation_id_middleware));
-
-    // Client-IP context (#3888/#1849). Resolves the request's client address
-    // once — TCP peer authoritative, `X-Forwarded-For` believed only for
-    // trusted-proxy peers (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the same policy
-    // the rate limiter keys on) — and scopes it as a request task-local so
-    // audit emission and IP-conditioned permission gates observe the same
-    // address without signature threading. Runs on every route.
+    // X-Correlation-ID response header. A gateway's `x-request-id` becomes the
+    // correlation ID only from a trusted-proxy peer (#4677).
     router = router.layer(middleware::from_fn_with_state(
-        rate_limit_trusted_proxies,
+        rate_limit_trusted_proxies.clone(),
+        correlation_id_with_proxies_middleware,
+    ));
+
+    // Client-IP context (#3888/#1849). Resolves the request's client
+    // address once, in two trust grades, and scopes them as a request
+    // task-local so consumers observe the same address without signature
+    // threading: the best-effort grade (rate-limit keying, upload guard,
+    // telemetry — TCP peer authoritative, `X-Forwarded-For` believed only
+    // for trusted-proxy peers per `RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the
+    // same policy the rate limiter keys on) and the authorization grade
+    // (IP-conditioned permission gates, auth-audit attribution — XFF-derived
+    // ONLY under the operator's `XFF_TRUSTED_FOR_AUTHZ` assertion, failing
+    // closed to "unknown" behind trusted proxies without it). Runs on every
+    // route.
+    router = router.layer(middleware::from_fn_with_state(
+        client_ip_config,
         client_ip_context_middleware,
     ));
 
@@ -371,7 +392,8 @@ async fn global_concurrency_backstop(
 
 /// Native-protocol path prefixes whose own routers already declare that they
 /// carry artifact-sized bodies (`DefaultBodyLimit::disable()` for incus/lxc,
-/// a 2 GB limit for Git LFS). See [`is_byte_transfer_path`].
+/// streamed object uploads bounded by `MAX_UPLOAD_SIZE` for Git LFS). See
+/// [`is_byte_transfer_path`].
 const BYTE_TRANSFER_PREFIXES: &[&str] = &["/incus/", "/lxc/", "/lfs/"];
 
 /// Whether `path` is an artifact **byte transfer** — a request whose duration is
@@ -526,20 +548,26 @@ fn build_login_rate_limit_state(
     // username-cycling attacker cannot exhaust memory via unbounded distinct
     // keys. Sized far above any legitimate concurrent-login volume so real
     // users never reach it; it sheds rather than starves.
-    let backstop = Arc::new(RateLimiter::new(
-        config.rate_limit_login_global_per_window,
-        config.rate_limit_window_secs,
-    ));
+    let backstop = Arc::new(
+        RateLimiter::new(
+            config.rate_limit_login_global_per_window,
+            config.rate_limit_window_secs,
+        )
+        .named("login_global"),
+    );
     // Dedicated tight per-(username, IP) bucket for the login endpoint. The
     // login handler bcrypt-verifies the submitted password (and does so even
     // for locked accounts), so borrowing the loose general-auth budget lets a
     // single client drive a burst of verifies that saturates CPU. This budget
     // sheds excess login attempts as 429 in the middleware layer, before the
     // verifier runs. Default: 10 attempts / 15 minutes per (username, IP).
-    let limiter = Arc::new(RateLimiter::new(
-        config.rate_limit_login_per_window,
-        config.rate_limit_login_window_secs,
-    ));
+    let limiter = Arc::new(
+        RateLimiter::new(
+            config.rate_limit_login_per_window,
+            config.rate_limit_login_window_secs,
+        )
+        .named("login"),
+    );
     // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
     // above is keyed per-(username, IP), so cycling usernames gets a fresh one
     // every request; this one accrues against the source IP. It gates the pad,
@@ -560,6 +588,8 @@ fn build_login_rate_limit_state(
         },
         backstop,
         failed_by_ip,
+        // Wired by `create_router`, which owns the database pool (#4677).
+        audit: None,
     }
 }
 
@@ -590,10 +620,13 @@ fn build_token_exchange_rate_limit_state(
     login: &LoginRateLimitState,
     config: &crate::config::Config,
 ) -> LoginRateLimitState {
-    let limiter = Arc::new(RateLimiter::new(
-        token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
-        config.rate_limit_login_window_secs,
-    ));
+    let limiter = Arc::new(
+        RateLimiter::new(
+            token_exchange_per_window(std::env::var(TOKEN_EXCHANGE_PER_WINDOW_ENV).ok().as_deref()),
+            config.rate_limit_login_window_secs,
+        )
+        .named("token"),
+    );
     {
         let cleanup = Arc::clone(&limiter);
         tokio::spawn(async move {
@@ -606,6 +639,12 @@ fn build_token_exchange_rate_limit_state(
     }
     let mut state = login.clone();
     state.inner.limiter = limiter;
+    // Its own once-per-window audit memory (#4677), so a `/v2/token` refusal
+    // is not swallowed by a login refusal from the same address.
+    state.audit = login
+        .audit
+        .as_ref()
+        .map(|audit| Arc::new(audit.for_another_surface()));
     state
 }
 
@@ -634,38 +673,87 @@ fn api_v1_routes(
 
     let upload_limit = state.config.max_upload_size_bytes;
 
+    let plugin_routes = if state.config.plugins_enabled {
+        Router::new()
+            .nest(
+                "/plugins",
+                handlers::plugins::router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
+            )
+            .nest(
+                "/plugins",
+                handlers::plugins::admin_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+            )
+            .nest(
+                "/formats",
+                handlers::plugins::format_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                )),
+            )
+            .nest(
+                "/formats",
+                handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
+            )
+    } else {
+        Router::new()
+    };
+
     // Rate limiters, driven by Config fields. The exemption set and trusted
     // reverse-proxy policy arrive from `create_router` (see the doc comment
     // above) so they stay identical to the policy `/v2/token` sees; only the
     // endpoint limiters are built here.
 
-    let auth_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_auth_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    let api_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_api_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    let search_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_search_per_window,
-        state.config.rate_limit_window_secs,
-    ));
+    let auth_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("auth"),
+    );
+    let api_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_api_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("api"),
+    );
+    let search_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_search_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("search"),
+    );
     // Stricter per-IP bucket for endpoints that mint presigned download
     // URLs. See #1053.
-    let presign_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_presign_per_window,
-        state.config.rate_limit_window_secs,
-    ));
+    let presign_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_presign_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("presign"),
+    );
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
     // password guesses through this endpoint and CPU-grind the bcrypt
     // verifier. Default: 5 attempts / 15 minutes per user. See #1026.
-    let password_change_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_password_change_per_window,
-        state.config.rate_limit_password_change_window_secs,
-    ));
+    let password_change_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_password_change_per_window,
+            state.config.rate_limit_password_change_window_secs,
+        )
+        .named("password_change"),
+    );
 
     // Master on/off switch (#1602). When disabled, every rate-limit layer
     // short-circuits before touching its limiter so no request is limited.
@@ -859,12 +947,9 @@ fn api_v1_routes(
                 // Bulk artifact presence check for air-gap imports (#3427):
                 // POST /repositories/{key}/artifacts-missing.
                 .merge(handlers::artifact_presence::repo_router())
-                .merge(handlers::repositories::download_router().layer(
-                    middleware::from_fn_with_state(
-                        presign_rate_limit_state,
-                        rate_limit_by_ip_middleware,
-                    ),
-                ))
+                // `GET /repositories/{key}/download/{path}` is NOT merged
+                // here: it is nested separately below with its own
+                // authentication layer (#4654).
                 // Inside the auth layer below, so it sees the caller
                 // (GHSA-9f9r-c4w8-rjv9).
                 .layer(middleware::from_fn_with_state(
@@ -879,6 +964,34 @@ fn api_v1_routes(
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     optional_auth_middleware,
+                )),
+        )
+        // The generic download route, `GET /repositories/{key}/download/{path}`,
+        // takes the format routes' authentication contract rather than the
+        // management API's (#4654): an API token is accepted as the Basic
+        // password, and an anonymous request on a non-public repository is
+        // challenged with 401 so wget / curl / Maven send the credential on
+        // their retry. It is nested at the same prefix as a SEPARATE router so
+        // it does not sit under the `optional_auth_middleware` layer above,
+        // which would refuse the token-as-Basic-password (#2809) before this
+        // layer ran. The stricter per-IP presign-mint limiter (#1053) stays
+        // with it.
+        .nest(
+            "/repositories",
+            handlers::repositories::download_router()
+                .layer(middleware::from_fn_with_state(
+                    presign_rate_limit_state,
+                    rate_limit_by_ip_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    RepoVisibilityState {
+                        auth_service: auth_service.clone(),
+                        db: state.db.clone(),
+                        repo_cache: state.repo_cache.clone(),
+                        repo_miss_cache: state.repo_miss_cache.clone(),
+                        permission_service: state.permission_service.clone(),
+                    },
+                    repository_download_auth_middleware,
                 )),
         )
         // Artifact routes (standalone by ID) with optional auth.
@@ -1131,38 +1244,7 @@ fn api_v1_routes(
                 admin_middleware,
             )),
         )
-        // Plugin read-only routes with auth middleware
-        .nest(
-            "/plugins",
-            handlers::plugins::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
-        )
-        // Plugin install + lifecycle routes require admin (loads arbitrary WASM)
-        .nest(
-            "/plugins",
-            handlers::plugins::admin_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                admin_middleware,
-            )),
-        )
-        // Format handler read-only routes (list, get) with optional auth
-        .nest(
-            "/formats",
-            handlers::plugins::format_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                optional_auth_middleware,
-            )),
-        )
-        // Format handler mutating routes (enable, disable, test) require admin
-        .nest(
-            "/formats",
-            handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                admin_middleware,
-            )),
-        )
+        .merge(plugin_routes)
         // Public webhook JWKS (#921): receivers verify `v2=` signatures
         // against it without credentials. No auth layer; also exempt from the
         // guest-access guard (`guest_access::is_allowlisted`).
@@ -1408,12 +1490,21 @@ mod tests {
     //! folded into `incus` or given its own handler with prefix-aware URL
     //! construction (tracked as a follow-up to #1272).
     use super::{
-        build_login_rate_limit_state, build_token_exchange_rate_limit_state,
+        api_v1_routes, build_login_rate_limit_state, build_token_exchange_rate_limit_state,
         token_exchange_per_window, DEFAULT_TOKEN_EXCHANGE_PER_WINDOW,
     };
     use super::{is_byte_transfer_path, request_timed_out_response};
     use crate::api::middleware::rate_limit::RateLimitExemptions;
+    use crate::api::middleware::upload_guard::UploadAdmission;
+    use crate::api::{AppState, SharedState};
+    use crate::storage::filesystem::FilesystemStorage;
+    use crate::storage::{StorageBackend, StorageRegistry};
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Router;
+    use sqlx::PgPool;
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[test]
     fn token_exchange_budget_defaults_and_parses() {
@@ -1451,7 +1542,58 @@ mod tests {
         assert!(!Arc::ptr_eq(&login.inner.limiter, &token.inner.limiter));
     }
 
+    /// #4676: the production limiters carry the names their refusals are
+    /// counted under in `ak_rate_limit_rejections_total{limiter}`.
+    #[tokio::test]
+    async fn production_login_limiters_are_named_for_the_rejection_counter() {
+        let config = crate::config::Config::test_config();
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&config, &exemptions, &proxies);
+        let token = build_token_exchange_rate_limit_state(&login, &config);
+        assert_eq!(login.inner.limiter.name(), "login");
+        assert_eq!(login.backstop.name(), "login_global");
+        assert_eq!(token.inner.limiter.name(), "token");
+        for name in ["auth", "api", "search", "presign", "password_change"] {
+            assert!(
+                ROUTES_RS_SRC.contains(&format!(".named(\"{name}\")")),
+                "the {name} limiter must be named for ak_rate_limit_rejections_total"
+            );
+        }
+    }
+
     const ROUTES_RS_SRC: &str = include_str!("routes.rs");
+
+    fn plugin_test_state(plugins_enabled: bool) -> SharedState {
+        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("connect_lazy should not fail");
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(FilesystemStorage::new("/tmp/test-plugin-routes"));
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut config = crate::config::Config::test_config();
+        config.plugins_enabled = plugins_enabled;
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    fn plugin_test_router(plugins_enabled: bool) -> Router {
+        let state = plugin_test_state(plugins_enabled);
+        let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            Vec::new(),
+        ));
+        let trusted_proxies = Arc::new(Vec::new());
+        let login = build_login_rate_limit_state(&state.config, &exemptions, &trusted_proxies);
+        let uploads = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
+        api_v1_routes(state.clone(), exemptions, trusted_proxies, login, uploads).with_state(state)
+    }
 
     #[test]
     fn lxc_route_is_registered_alongside_incus() {
@@ -1512,6 +1654,57 @@ mod tests {
     }
 
     #[test]
+    fn download_router_carries_its_own_auth_layer_not_optional_auth() {
+        // #4654: `GET /repositories/{key}/download/{path}` must be mounted
+        // under `repository_download_auth_middleware` (token-as-Basic-password
+        // accepted, anonymous callers challenged with 401) and must NOT sit
+        // under the `/repositories` nest's `optional_auth_middleware`, which
+        // would refuse the Basic token (#2809) before the download layer ran.
+        // The per-IP presign-mint limiter (#1053) has to move with it. A
+        // runtime test needs full app state; pin the routing decision in
+        // source like `logout_route_runs_through_optional_auth_middleware`.
+        // Only the production half of the file: this test's own text names
+        // the function too.
+        let production_src = ROUTES_RS_SRC
+            .split("#[cfg(test)]")
+            .next()
+            .expect("routes.rs has a test module");
+        assert_eq!(
+            production_src
+                .matches("handlers::repositories::download_router()")
+                .count(),
+            1,
+            "download_router() must be mounted exactly once"
+        );
+        let after = production_src
+            .split("handlers::repositories::download_router()")
+            .nth(1)
+            .expect("download_router() must be mounted");
+        // Code only: the comments around the mount (and on the nest that
+        // follows it) name both middlewares when explaining the split.
+        let mount: String = after
+            .split(".nest(")
+            .next()
+            .expect("download mount must be followed by other route registrations")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            mount.contains("repository_download_auth_middleware"),
+            "the download route must be layered with repository_download_auth_middleware (#4654)"
+        );
+        assert!(
+            !mount.contains("optional_auth_middleware"),
+            "the download route must not be layered with optional_auth_middleware (#4654)"
+        );
+        assert!(
+            mount.contains("rate_limit_by_ip_middleware"),
+            "the download route must keep its per-IP presign-mint limiter (#1053)"
+        );
+    }
+
+    #[test]
     fn sbom_trailing_slash_is_handled() {
         // Regression for #1784: axum 0.7's `.nest("/sbom", ...)` resolves the
         // no-slash form `/sbom` (against the inner `/` route) but 404's the
@@ -1556,6 +1749,64 @@ mod tests {
             next_middleware.contains("admin_middleware"),
             "plugin install + lifecycle routes must be gated by admin_middleware"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_have_no_runtime_state_or_routes() {
+        let state = plugin_test_state(false);
+        assert!(state.plugin_registry.is_none());
+        assert!(state.wasm_plugin_service.is_none());
+
+        let app = plugin_test_router(false);
+        for (method, uri) in [
+            (Method::GET, "/plugins"),
+            (Method::POST, "/plugins/install/zip"),
+            (Method::GET, "/formats"),
+            (Method::POST, "/formats/example/enable"),
+            (Method::GET, "/ext/example/repository/index"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_plugins_retain_management_routes() {
+        let response = plugin_test_router(true)
+            .oneshot(
+                Request::builder()
+                    .uri("/plugins")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn plugin_routes_are_conditionally_mounted() {
+        assert!(
+            ROUTES_RS_SRC
+                .contains("let plugin_routes = if state.config.plugins_enabled"),
+            "plugin management and format-handler routes must be controlled by the process-level gate"
+        );
+        assert!(ROUTES_RS_SRC.contains(".merge(plugin_routes)"));
+        assert!(
+            ROUTES_RS_SRC.contains("let wasm_proxy_routes = if state.config.plugins_enabled"),
+            "the WASM protocol proxy must be controlled by the same process-level gate"
+        );
+        assert!(ROUTES_RS_SRC.contains(".merge(wasm_proxy_routes)"));
     }
 
     #[test]
@@ -1780,6 +2031,12 @@ mod tests {
             shed.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "other routes are still shed while the pool is full"
+        );
+        // #4647: the shed is a status a retrying client can act on, not a
+        // dropped connection.
+        assert!(
+            shed.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "a shed request carries Retry-After"
         );
 
         release.notify_one();

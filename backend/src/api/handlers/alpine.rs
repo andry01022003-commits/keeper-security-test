@@ -1385,6 +1385,7 @@ async fn upload_package_put(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1404,6 +1405,7 @@ async fn upload_package_put(
         &repository,
         &arch,
         &filename,
+        &headers,
         body,
         user_id,
     )
@@ -1477,6 +1479,7 @@ async fn upload_package_post(
         &repository,
         &arch,
         &filename,
+        &headers,
         body,
         user_id,
     )
@@ -1495,6 +1498,7 @@ async fn store_apk(
     repository: &str,
     arch: &str,
     filename: &str,
+    headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
@@ -1660,6 +1664,17 @@ async fn store_apk(
         repo.id,
     )
     .execute(&state.db)
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
     .await;
 
     info!(
@@ -3370,6 +3385,63 @@ mod tests {
         let key_v322 = build_alpine_storage_key(repo_id, &path_v322);
         let key_v323 = build_alpine_storage_key(repo_id, &path_v323);
         assert_ne!(key_v322, key_v323);
+    }
+
+    /// #4725: an `.apk` upload to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn alpine_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "alpine").await;
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::put(
+                format!("/{}/v3.21/main/aarch64/repl-apk-1.0-r0.apk", fx.repo_key),
+                bytes::Bytes::from_static(MARKER_APK),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "apk upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let mut req = tdh::put(
+            format!("/{}/v3.21/main/aarch64/repl-apk-2.0-r0.apk", fx.repo_key),
+            bytes::Bytes::from_static(MARKER_APK),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated apk upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["v3.21/main/aarch64/repl-apk-1.0-r0.apk".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 }
 

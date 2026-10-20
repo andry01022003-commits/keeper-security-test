@@ -603,6 +603,7 @@ fn cfg(storage_path: &str) -> Config {
         setup_password_hint: None,
         grpc_reflection_enabled: false,
         swagger_enabled: false,
+        plugins_enabled: true,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         conda_attestation_require_verified: true,
@@ -641,9 +642,12 @@ fn cfg(storage_path: &str) -> Config {
         database_acquire_timeout_secs: 30,
         database_idle_timeout_secs: 600,
         database_max_lifetime_secs: 1800,
+        database_tcp_keepalives: true,
         auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        http_header_read_timeout_secs: 10,
+        http_listen_backlog: 0,
         upload_progress_window_secs: 60,
         upload_min_progress_bytes: 16 * 1024,
         upload_max_in_flight_per_principal: 64,
@@ -665,6 +669,7 @@ fn cfg(storage_path: &str) -> Config {
         rate_limit_exempt_service_accounts: false,
         rate_limit_trusted_cidrs: Vec::new(),
         rate_limit_trusted_proxy_cidrs: Vec::new(),
+        xff_trusted_for_authz: false,
         account_lockout_threshold: 5,
         account_lockout_duration_minutes: 30,
         quarantine_enabled: false,
@@ -1156,6 +1161,63 @@ pub fn router_with_auth_ext(
         .layer(Extension::<Option<AuthExtension>>(Some(auth)))
 }
 
+/// Put the production `client_ip_context_middleware` in front of `app` with
+/// no trusted proxies and `XFF_TRUSTED_FOR_AUTHZ` off (#4681 defaults), so
+/// the request's resolved client IP is the TCP peer set by
+/// [`request_from_peer`]. Used by the audit client-IP tests (#4762).
+pub fn with_client_ip_middleware(app: Router) -> Router {
+    app.layer(axum::middleware::from_fn_with_state(
+        Arc::new(crate::api::middleware::client_ip::ClientIpConfig {
+            trusted_proxies: Vec::new(),
+            xff_trusted_for_authz: false,
+        }),
+        crate::api::middleware::client_ip::client_ip_context_middleware,
+    ))
+}
+
+/// A JSON `POST` to `uri` arriving from TCP peer `peer`, carrying a spoofed
+/// `X-Forwarded-For` the untrusted-peer resolution must ignore.
+pub fn request_from_peer(uri: &str, body: serde_json::Value, peer: &str) -> Request<Body> {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("X-Forwarded-For", "192.0.2.1")
+        .body(Body::from(body.to_string()))
+        .expect("build request");
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>()
+            .expect("peer socket address"),
+    ));
+    req
+}
+
+/// Poll for the (fire-and-forget) audit row of `action` on `resource_id` and
+/// return its `ip_address`. `None` when no row appeared; `Some(None)` when the
+/// row was written without a client IP.
+pub async fn audit_row_ip(
+    pool: &PgPool,
+    action: &str,
+    resource_id: Uuid,
+) -> Option<Option<String>> {
+    for _ in 0..40 {
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT ip_address FROM audit_log WHERE action = $1 AND resource_id = $2 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(action)
+        .bind(resource_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read audit row");
+        if row.is_some() {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
 /// Register a peer instance via the real `PeerInstanceService` and return its
 /// id. `name_prefix` namespaces the generated peer name so concurrent suites do
 /// not collide (e.g. "probe", "labels-authz", "map-err"). Centralizes the
@@ -1634,6 +1696,42 @@ pub async fn audit_count_eventually(
     last
 }
 
+/// The newest `audit_log` row recorded for `(resource_id, action)` (#4710).
+#[derive(Debug)]
+pub struct AuditRow {
+    pub user_id: Option<Uuid>,
+    pub resource_type: String,
+    pub details: serde_json::Value,
+}
+
+/// Poll (~2s, like [`audit_count_eventually`]) for the newest `audit_log` row
+/// with this `resource_id` and `action`, panicking when none appears. The
+/// handler-level audit tests use it to assert the actor, target and `details`
+/// a fire-and-forget emitter recorded. Read it BEFORE deleting the acting
+/// user: `audit_log.user_id` is `ON DELETE SET NULL`.
+pub async fn audit_row_eventually(pool: &PgPool, resource_id: Uuid, action: &str) -> AuditRow {
+    for _ in 0..100 {
+        let row: Option<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT user_id, resource_type, details FROM audit_log \
+             WHERE resource_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(resource_id)
+        .bind(action)
+        .fetch_optional(pool)
+        .await
+        .expect("audit_log row query");
+        if let Some((user_id, resource_type, details)) = row {
+            return AuditRow {
+                user_id,
+                resource_type,
+                details: details.unwrap_or(serde_json::Value::Null),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no {action} audit row for resource {resource_id}");
+}
+
 /// Count `download_statistics` rows for `artifact_id`.
 pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
@@ -1958,6 +2056,68 @@ pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<Cat
         description,
         versions,
     })
+}
+
+/// #4725: subscribe a fresh push peer to `repo_id` and return its id.
+///
+/// The peer's row cascades to `peer_repo_subscriptions` and `sync_tasks` on
+/// delete, so tests must delete it — [`delete_push_peer`] — before
+/// `fx.teardown()` or the repository delete trips the subscription FK.
+pub async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> Uuid {
+    let peer_service =
+        crate::services::peer_instance_service::PeerInstanceService::new(pool.clone());
+    let peer = peer_service
+        .register(
+            crate::services::peer_instance_service::RegisterPeerInstanceRequest {
+                name: format!("{label}-push-peer-{}", uuid::Uuid::new_v4()),
+                endpoint_url: "https://push-peer.example.test".to_string(),
+                region: None,
+                cache_size_bytes: 1024 * 1024,
+                sync_filter: None,
+                api_key: "push-peer-key".to_string(),
+            },
+        )
+        .await
+        .expect("register push peer");
+    peer_service
+        .assign_repository(
+            peer.id,
+            repo_id,
+            true,
+            Some(crate::services::peer_instance_service::ReplicationMode::Push),
+            None,
+            None,
+        )
+        .await
+        .expect("assign repo to push peer");
+    peer.id
+}
+
+/// #4725: the artifact paths in `repo_id` that have a queued `push` sync task
+/// for `peer_id`, ordered by path. A native-format hosted upload that forgot
+/// to queue replication yields an empty vector.
+pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT a.path FROM sync_tasks st \
+         JOIN artifacts a ON a.id = st.artifact_id \
+         WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
+           AND a.repository_id = $2 AND a.is_deleted = false \
+         ORDER BY a.path",
+    )
+    .bind(peer_id)
+    .bind(repo_id)
+    .fetch_all(pool)
+    .await
+    .expect("list queued push sync tasks")
+}
+
+/// #4725: delete the peer registered by [`subscribe_push_peer`] (and with it
+/// its subscriptions and queued tasks). No-op when the peer is already gone.
+pub async fn delete_push_peer(pool: &PgPool, peer_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+        .bind(peer_id)
+        .execute(pool)
+        .await;
 }
 
 /// Assert that the native publish just driven fired exactly ONE
@@ -3337,5 +3497,188 @@ impl AuthzQueryOutage {
             let _ = tx.rollback().await;
         }
         self.pool.close().await;
+    }
+}
+
+pub use admin_gate::assert_admin_routes_refuse_repo_scoped_tokens;
+
+// ---------------------------------------------------------------------------
+// #4642: metric capture for async, DB-backed tests.
+// ---------------------------------------------------------------------------
+
+/// One captured metric: name, labels, value.
+pub type CapturedMetric = (
+    String,
+    Vec<(String, String)>,
+    metrics_util::debugging::DebugValue,
+);
+
+/// Run `body` to completion on a current-thread runtime under a local
+/// `DebuggingRecorder` and return its output with every metric it recorded.
+/// Current-thread so tasks the body spawns (and awaits) record on the same
+/// thread, which is the only thread a local recorder sees.
+pub fn capture_metrics<F, Fut, T>(body: F) -> (T, Vec<CapturedMetric>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(body())
+    });
+    let captured = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .map(|(ck, _, _, value)| {
+            let (_kind, key) = ck.into_parts();
+            let name = key.name().to_string();
+            let labels = key
+                .into_parts()
+                .1
+                .into_iter()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            (name, labels, value)
+        })
+        .collect();
+    (out, captured)
+}
+
+/// The captured metric named `name` whose labels are exactly `labels`.
+pub fn captured_metric<'a>(
+    captured: &'a [CapturedMetric],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<&'a metrics_util::debugging::DebugValue> {
+    captured.iter().find_map(|(n, l, v)| {
+        let same = l.len() == labels.len()
+            && labels
+                .iter()
+                .all(|(k, val)| l.iter().any(|(lk, lv)| lk == k && lv == val));
+        (n == name && same).then_some(v)
+    })
+}
+
+// In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
+// #1315 token-mint surface gate, which skips test modules, does not count the
+// API-token mint below as a production endpoint.
+#[cfg(test)]
+mod admin_gate {
+    use super::*;
+
+    /// Router-level check for instance-wide admin listings gated by
+    /// [`AuthExtension::require_unscoped_admin`] (#4273, #4550): every route in
+    /// `routes`, sent through the full router, answers 401 anonymous, 403 to a
+    /// non-admin JWT, 200 to an admin JWT and to an unrestricted admin API token,
+    /// and 403 to a repository-scoped admin API token and a repository-scoped
+    /// admin JWT. Creates and removes its own admin user and tokens.
+    pub async fn assert_admin_routes_refuse_repo_scoped_tokens(fx: &Fixture, routes: &[&str]) {
+        async fn statuses(
+            state: &SharedState,
+            routes: &[&str],
+            cred: Option<&str>,
+        ) -> Vec<StatusCode> {
+            let mut out = Vec::new();
+            for uri in routes {
+                let mut req = get(uri.to_string());
+                if let Some(c) = cred {
+                    req.headers_mut().insert(
+                        "authorization",
+                        c.parse::<axum::http::HeaderValue>().expect("auth header"),
+                    );
+                }
+                let (status, _) = send(crate::api::routes::create_router(state.clone()), req).await;
+                out.push(status);
+            }
+            out
+        }
+
+        let (admin_id, _) = create_user(&fx.pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(admin_id)
+            .execute(&fx.pool)
+            .await
+            .expect("promote admin");
+
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            Arc::new(fx.state.config.clone()),
+        );
+        // Admin-owned API tokens carrying the `admin` scope: one unrestricted,
+        // one pinned to the fixture repository through `api_token_repositories`.
+        let (open_token, _) = auth_service
+            .generate_api_token(admin_id, "gate-open", vec!["admin".into()], None)
+            .await
+            .expect("mint unrestricted admin token");
+        let (pinned_token, pinned_id) = auth_service
+            .generate_api_token(admin_id, "gate-pinned", vec!["admin".into()], None)
+            .await
+            .expect("mint repo-scoped admin token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(pinned_id)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("pin token to the fixture repository");
+        // A repository-scoped JWT for the same admin.
+        let admin_user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("load admin");
+        let scoped_jwt = auth_service
+            .generate_tokens_with_repo_scope(&admin_user, Some(vec![fx.repo_id]))
+            .expect("mint repo-scoped JWT")
+            .access_token;
+
+        let user_bearer = bearer_for(&fx.state, fx.user_id).await;
+        let admin_bearer = bearer_for(&fx.state, admin_id).await;
+
+        let anonymous = statuses(&fx.state, routes, None).await;
+        let non_admin = statuses(&fx.state, routes, Some(&user_bearer)).await;
+        let admin = statuses(&fx.state, routes, Some(&admin_bearer)).await;
+        let open = statuses(&fx.state, routes, Some(&format!("Bearer {open_token}"))).await;
+        let pinned = statuses(&fx.state, routes, Some(&format!("Bearer {pinned_token}"))).await;
+        let scoped = statuses(&fx.state, routes, Some(&format!("Bearer {scoped_jwt}"))).await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(admin_id)
+            .execute(&fx.pool)
+            .await;
+        cleanup_user(&fx.pool, admin_id).await;
+
+        let all = |s: StatusCode| vec![s; routes.len()];
+        assert_eq!(
+            anonymous,
+            all(StatusCode::UNAUTHORIZED),
+            "anonymous {routes:?}"
+        );
+        assert_eq!(
+            non_admin,
+            all(StatusCode::FORBIDDEN),
+            "non-admin JWT {routes:?}"
+        );
+        assert_eq!(admin, all(StatusCode::OK), "admin JWT {routes:?}");
+        assert_eq!(
+            open,
+            all(StatusCode::OK),
+            "unrestricted admin API token {routes:?}"
+        );
+        assert_eq!(
+            pinned,
+            all(StatusCode::FORBIDDEN),
+            "repo-pinned admin API token {routes:?}"
+        );
+        assert_eq!(
+            scoped,
+            all(StatusCode::FORBIDDEN),
+            "repo-scoped admin JWT {routes:?}"
+        );
     }
 }

@@ -185,7 +185,12 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
+    /// Seconds until `access_token` expires (`JWT_ACCESS_TOKEN_EXPIRY_MINUTES`,
+    /// 30 minutes by default). Login sessions are short-lived: renew with the
+    /// refresh token, or have automation mint an API token
+    /// (`POST /api/v1/auth/tokens`) instead of logging in (#4648).
     pub expires_in: u64,
+    /// Always `Bearer`.
     pub token_type: String,
     pub must_change_password: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -358,6 +363,12 @@ pub async fn login(
     {
         Ok(result) => result,
         Err(failure) => {
+            if let Some(reason) = failure.metric_reason() {
+                crate::services::metrics_service::record_auth_failure(
+                    crate::services::metrics_service::AuthFailureSurface::Api,
+                    reason,
+                );
+            }
             // The response no longer says which arm rejected the login, so the
             // audit event carries it instead: a SIEM can still separate a
             // username sweep (`unknown_or_inactive_user`) from a locked-out
@@ -1164,6 +1175,52 @@ mod tests {
             serde_json::from_str("{\"username\":\"ab\",\"password\":\"p\\u0000w\"}").unwrap();
         assert_eq!(req.username, "ab");
         assert!(req.password.contains('\0'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Database outage during login (#4756)
+    // -----------------------------------------------------------------------
+
+    /// #4756: with the database gone, `POST /api/v1/auth/login` cannot check
+    /// the credentials at all, so it must answer a retryable 503 with
+    /// Retry-After, for a correct and a wrong password alike, never a 401
+    /// and never a 500. Before the fix the user lookup's error mapped to
+    /// `500 DATABASE_ERROR`. The pool is closed, the shape of a database
+    /// that went away (the same fixture #4750 uses for the middleware).
+    #[tokio::test]
+    async fn test_login_db_unavailable_returns_503_not_500_4756() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::to_bytes;
+
+        let pool = tdh::lazy_pool();
+        pool.close().await;
+        let state = tdh::build_state(pool, std::env::temp_dir().to_string_lossy().as_ref());
+
+        for password in ["Correct!Horse9Battery", "wrong-password"] {
+            let req = LoginRequest {
+                username: "admin".to_string(),
+                password: password.to_string(),
+            };
+            let err = login(State(state.clone()), HeaderMap::new(), None, Json(req))
+                .await
+                .expect_err("login cannot succeed with the database closed");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "login during a DB outage must be a retryable 503"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .expect("503 must carry Retry-After"),
+                "1"
+            );
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "DATABASE_UNAVAILABLE");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2605,6 +2662,7 @@ mod tests {
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
             failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+            audit: None,
         };
         login_router()
             .with_state(state)
@@ -2693,6 +2751,38 @@ mod tests {
         );
     }
 
+    /// #4676: a rejected login is counted in `ak_auth_failures_total` on the
+    /// `api` surface, bucketed by the reason its audit row records.
+    #[test]
+    fn test_login_rejection_is_counted_by_reason_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let dir = std::env::temp_dir().join(format!("ph-4676-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+            let app = login_app_with_pad_budget(state, 10_000);
+            let (status, _) =
+                login_unknown_user_counting_bcrypt(&app, &format!("ph-ghost-{}", Uuid::new_v4()))
+                    .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            true
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "api"), ("reason", "unknown_user")]
+            ),
+            1
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 1);
+    }
+
     // -----------------------------------------------------------------------
     // #3888: the LOGIN audit row must carry the client IP, resolved under the
     // trusted-proxy policy (TCP peer authoritative; XFF believed only from a
@@ -2723,7 +2813,10 @@ mod tests {
         let app = login_router()
             .with_state(state)
             .layer(axum::middleware::from_fn_with_state(
-                Arc::new(Vec::new()),
+                Arc::new(crate::api::middleware::client_ip::ClientIpConfig {
+                    trusted_proxies: Vec::new(),
+                    xff_trusted_for_authz: false,
+                }),
                 crate::api::middleware::client_ip::client_ip_context_middleware,
             ));
 

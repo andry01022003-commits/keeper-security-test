@@ -82,6 +82,47 @@ evicts the cached repository record. Without that, a repository narrowed from
 60-second cache TTL expired — a stale-*authorization* window, not merely a
 stale-metadata one.
 
+## Reading through a virtual repository
+
+A virtual repository has no access of its own to hand out. Its members are
+separate repositories with their own grants, and every member is checked
+against the caller exactly as a direct read of that member would be. **To read
+through a virtual, the principal needs read on each member it should see; a
+grant on the virtual alone yields an empty channel.** The grant on the virtual
+is still required: it is what lets the caller reach the virtual's URL at all.
+
+For example, to let the members of group `developers` resolve through a Maven
+virtual `maven-all` whose members are `maven-internal` (local) and
+`maven-central` (remote), grant the group `read` on all three:
+
+```bash
+for repo in maven-all maven-internal maven-central; do
+  REPO_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    "$AK/api/v1/repositories/$repo" | jq -r .id)
+  curl -s -X POST "$AK/api/v1/permissions" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"principal_type\":\"group\",\"principal_id\":\"$GROUP_ID\",
+         \"target_type\":\"repository\",\"target_id\":\"$REPO_ID\",
+         \"actions\":[\"read\"]}"
+done
+```
+
+With `read` on `maven-all` only, `/maven/maven-all/...` answers 404 for every
+artifact, and the server logs `virtual member walk narrowed by caller
+authorization` with `members_accessible=0`. Granting a subset of the members
+is how a virtual is narrowed per audience: each caller sees the members it can
+read, in the virtual's priority order. Putting the virtual and its members in
+one project and granting the group on the project covers all of them with one
+rule.
+
+Since 1.11.2, when a caller holding read on a virtual can read none of its
+members, `GET /api/v1/repositories/{key}/members` and
+`GET /api/v1/repositories/{key}/artifacts` add an `X-AK-Virtual-Members-Notice`
+header saying so (#4690). The header is decided only by "no member is readable
+by this caller", so a virtual with no members at all answers the same and the
+header does not reveal whether private members exist. The format endpoints
+(`/maven/<virtual>/...` and the like) still answer a plain 404.
+
 ## Tokens scoped to a virtual repository
 
 A token whose repository scope names a virtual repository (a repository token
@@ -132,6 +173,33 @@ disabled guest access to prevent that. An operator who wants `internal` asks for
 it.
 
 Visibility itself is never changed by toggling the policy.
+
+## Public Remotes with upstream credentials
+
+A public Remote serves anonymous callers, and every upstream request it makes
+for them carries the repository's upstream credentials: upstream-auth (basic,
+bearer, AWS) or userinfo embedded in `upstream_url`. An anonymous caller then
+reads whatever those credentials can read upstream (#4662).
+
+Moving a repository into that state is **refused with a 400** whose `code` is
+`PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`, on every path that can do it: creating a
+public repository with credentials, making a credentialed repository public,
+adding userinfo to a public repository's `upstream_url`, and
+`PUT /api/v1/repositories/{key}/upstream-auth` on a public repository.
+
+An administrator who means it sends `allow_public_with_upstream_credentials:
+true` on the same request. The acceptance is stored with the repository (a later
+toggle back to public does not need it again; `false` withdraws it), logged at
+`WARN`, and recorded in the audit log as
+`allow_public_with_upstream_credentials: true` in the `REPOSITORY_CREATED` /
+`REPOSITORY_UPDATED` details.
+
+Repository responses carry `public_with_upstream_credentials` (the state) and
+`allow_public_with_upstream_credentials` (whether it was accepted). A repository
+that was already public with credentials before the guardrail existed is not
+refused on unrelated updates, so a Terraform apply that re-sends
+`is_public: true` keeps working, but it reports
+`public_with_upstream_credentials: true` with the acceptance `false`.
 
 ## API representation
 

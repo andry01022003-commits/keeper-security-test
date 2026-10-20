@@ -16,10 +16,20 @@
 //!     so it is never constructed on the runtime either.
 //!
 //! The diagnostics stdout format is selected via `LOG_FORMAT`:
-//!   - `pretty` (default) -- the human-readable multi-line `fmt` output
-//!   - `json` -- one JSON object per line, for structured stdout collection by a SIEM / log shipper (#2413 item 1)
+//!   - `text` (default; `pretty` is accepted as an alias) -- the human-readable
+//!     single-line `fmt` output
+//!   - `json` -- one flat JSON object per line, for structured stdout
+//!     collection by a SIEM / log shipper (#2413 item 1, #4674); see
+//!     [`json_log`]
+//!
+//! ANSI colour in the `text` format is selected via `LOG_ANSI` (#4674):
+//!   - `auto` (default) -- colour only when stdout is a terminal (and
+//!     `NO_COLOR` is unset), so container logs collected by a line-oriented
+//!     store carry no escape codes between `key=` and its value
+//!   - `true` / `false` -- force it on or off
 
 mod db_spans;
+mod json_log;
 
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
@@ -29,24 +39,25 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Diagnostics stdout log format, selected via `LOG_FORMAT` (#2413 item 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogFormat {
-    /// Human-readable multi-line `fmt` output (default, unchanged behavior).
-    Pretty,
-    /// One JSON object per line for structured stdout collection.
+    /// Human-readable single-line `fmt` output (default, unchanged behavior).
+    /// `LOG_FORMAT=text` or the original spelling `pretty`.
+    Text,
+    /// One flat JSON object per line for structured stdout collection.
     Json,
 }
 
 impl LogFormat {
-    /// Parse a `LOG_FORMAT` value. Defaults to `pretty` for empty or
+    /// Parse a `LOG_FORMAT` value. Defaults to `text` for empty or
     /// unrecognised values so an operator typo never silently drops
     /// diagnostics to an unexpected shape.
     fn from_value(val: &str) -> Self {
         match val.trim().to_lowercase().as_str() {
             "json" => Self::Json,
-            _ => Self::Pretty,
+            _ => Self::Text,
         }
     }
 
-    /// Read from `LOG_FORMAT`. Defaults to `pretty` when unset or unrecognised.
+    /// Read from `LOG_FORMAT`. Defaults to `text` when unset or unrecognised.
     fn from_env() -> Self {
         Self::from_value(&std::env::var("LOG_FORMAT").unwrap_or_default())
     }
@@ -54,24 +65,95 @@ impl LogFormat {
     /// Canonical name, for the startup log line.
     fn name(self) -> &'static str {
         match self {
-            Self::Pretty => "pretty",
+            Self::Text => "text",
             Self::Json => "json",
         }
     }
+}
+
+/// ANSI colour policy for the `text` format, selected via `LOG_ANSI` (#4674).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogAnsi {
+    /// Colour only when stdout is a terminal and `NO_COLOR` is unset (default).
+    Auto,
+    /// Always colour (the pre-#4674 behaviour, minus `NO_COLOR`).
+    Always,
+    /// Never colour.
+    Never,
+}
+
+impl LogAnsi {
+    /// Parse a `LOG_ANSI` value. Empty or unrecognised values mean `auto`:
+    /// a typo must not put escape codes back into collected logs.
+    fn from_value(val: &str) -> Self {
+        match val.trim().to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "always" => Self::Always,
+            "0" | "false" | "no" | "off" | "never" => Self::Never,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Read from `LOG_ANSI`. Defaults to `auto` when unset or unrecognised.
+    fn from_env() -> Self {
+        Self::from_value(&std::env::var("LOG_ANSI").unwrap_or_default())
+    }
+
+    /// Whether to emit ANSI escapes, given whether stdout is a terminal and
+    /// the `NO_COLOR` value (<https://no-color.org>: any non-empty value
+    /// disables colour). An explicit `true`/`false` overrides both.
+    fn resolve(self, stdout_is_tty: bool, no_color: Option<&str>) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => stdout_is_tty && no_color.is_none_or(str::is_empty),
+        }
+    }
+
+    /// Resolve against the real stdout and environment.
+    fn resolve_from_env(self) -> bool {
+        use std::io::IsTerminal;
+        self.resolve(
+            std::io::stdout().is_terminal(),
+            std::env::var("NO_COLOR").ok().as_deref(),
+        )
+    }
+}
+
+/// Build the diagnostics `fmt` layer in the configured format, writing to
+/// stdout.
+fn build_fmt_layer<S>(format: LogFormat, ansi: bool) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    build_fmt_layer_with_writer(format, ansi, std::io::stdout)
 }
 
 /// Build the diagnostics `fmt` layer in the configured format.
 ///
 /// Boxed so both arms have the same type regardless of the concrete
 /// per-format layer. The workspace `tracing-subscriber` dependency already
-/// carries the `json` feature, so the JSON arm adds no new dependency.
-fn build_fmt_layer<S>(format: LogFormat) -> Box<dyn Layer<S> + Send + Sync>
+/// carries the `json` feature, so the JSON arm adds no new dependency. `ansi`
+/// applies to the text format only: a JSON line never carries escapes.
+fn build_fmt_layer_with_writer<S, W>(
+    format: LogFormat,
+    ansi: bool,
+    writer: W,
+) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
 {
     match format {
-        LogFormat::Pretty => tracing_subscriber::fmt::layer().boxed(),
-        LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
+        LogFormat::Text => tracing_subscriber::fmt::layer()
+            .with_ansi(ansi)
+            .with_writer(writer)
+            .boxed(),
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_ansi(false)
+            .event_format(json_log::FlatJson::default())
+            .with_writer(writer)
+            .boxed(),
     }
 }
 
@@ -284,11 +366,19 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
         "artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info".into()
     });
     let log_format = LogFormat::from_env();
+    let log_ansi = LogAnsi::from_env().resolve_from_env();
 
     match otel_endpoint {
         Some(endpoint) => {
             let protocol = OtlpProtocol::from_env();
-            let guard = init_with_otel(endpoint, service_name, env_filter, protocol, log_format);
+            let guard = init_with_otel(
+                endpoint,
+                service_name,
+                env_filter,
+                protocol,
+                log_format,
+                log_ansi,
+            );
             // Log the resolved sampler: a typo in OTEL_TRACES_SAMPLER falls
             // back to the default rather than failing startup, so the only way
             // an operator can tell which sampler is actually in force is to be
@@ -299,6 +389,7 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
                 service_name,
                 protocol = protocol.name(),
                 log_format = log_format.name(),
+                log_ansi,
                 sampler = sampler_choice.name(),
                 sampler_ratio = sampler_choice
                     .uses_ratio()
@@ -311,7 +402,7 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
         None => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(build_fmt_layer(log_format))
+                .with(build_fmt_layer(log_format, log_ansi))
                 .init();
             None
         }
@@ -338,6 +429,7 @@ fn init_with_otel(
     env_filter: EnvFilter,
     protocol: OtlpProtocol,
     log_format: LogFormat,
+    log_ansi: bool,
 ) -> OtelGuard {
     use opentelemetry::trace::TracerProvider;
     use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
@@ -378,7 +470,7 @@ fn init_with_otel(
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(build_fmt_layer(log_format))
+        .with(build_fmt_layer(log_format, log_ansi))
         .with(otel_layer)
         .with(db_span_layer)
         .init();
@@ -508,11 +600,11 @@ mod tests {
         assert_ne!(OtlpProtocol::Grpc, OtlpProtocol::HttpProtobuf);
     }
 
-    // ── LogFormat (#2413 item 1) ────────────────────────────────────────
+    // ── LogFormat (#2413 item 1, #4674) ────────────────────────────────
 
     #[test]
-    fn test_log_format_defaults_to_pretty_for_empty_string() {
-        assert_eq!(LogFormat::from_value(""), LogFormat::Pretty);
+    fn test_log_format_defaults_to_text_for_empty_string() {
+        assert_eq!(LogFormat::from_value(""), LogFormat::Text);
     }
 
     #[test]
@@ -527,22 +619,27 @@ mod tests {
     }
 
     #[test]
-    fn test_log_format_pretty_explicit() {
-        assert_eq!(LogFormat::from_value("pretty"), LogFormat::Pretty);
-        assert_eq!(LogFormat::from_value("PRETTY"), LogFormat::Pretty);
+    fn test_log_format_text_and_pretty_alias_explicit() {
+        for val in ["text", "TEXT", "pretty", "PRETTY"] {
+            assert_eq!(
+                LogFormat::from_value(val),
+                LogFormat::Text,
+                "failed for {val:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_log_format_unrecognised_falls_back_to_pretty() {
-        assert_eq!(LogFormat::from_value("logfmt"), LogFormat::Pretty);
-        assert_eq!(LogFormat::from_value("bogus"), LogFormat::Pretty);
+    fn test_log_format_unrecognised_falls_back_to_text() {
+        assert_eq!(LogFormat::from_value("logfmt"), LogFormat::Text);
+        assert_eq!(LogFormat::from_value("bogus"), LogFormat::Text);
     }
 
     #[test]
-    fn test_log_format_from_env_defaults_to_pretty_when_unset() {
+    fn test_log_format_from_env_defaults_to_text_when_unset() {
         let _lock = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("LOG_FORMAT");
-        assert_eq!(LogFormat::from_env(), LogFormat::Pretty);
+        assert_eq!(LogFormat::from_env(), LogFormat::Text);
     }
 
     #[test]
@@ -556,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_log_format_name() {
-        assert_eq!(LogFormat::Pretty.name(), "pretty");
+        assert_eq!(LogFormat::Text.name(), "text");
         assert_eq!(LogFormat::Json.name(), "json");
     }
 
@@ -564,8 +661,382 @@ mod tests {
     fn test_build_fmt_layer_builds_both_formats() {
         // Both arms must type-check to the same boxed layer and construct
         // without panicking against the registry subscriber type.
-        let _pretty = build_fmt_layer::<tracing_subscriber::Registry>(LogFormat::Pretty);
-        let _json = build_fmt_layer::<tracing_subscriber::Registry>(LogFormat::Json);
+        let _text = build_fmt_layer::<tracing_subscriber::Registry>(LogFormat::Text, true);
+        let _json = build_fmt_layer::<tracing_subscriber::Registry>(LogFormat::Json, false);
+    }
+
+    // ── LogAnsi (#4674) ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_log_ansi_parses_values() {
+        for val in ["", "auto", "AUTO", "bogus"] {
+            assert_eq!(
+                LogAnsi::from_value(val),
+                LogAnsi::Auto,
+                "failed for {val:?}"
+            );
+        }
+        for val in ["true", "1", "yes", "on", "always", " TRUE "] {
+            assert_eq!(
+                LogAnsi::from_value(val),
+                LogAnsi::Always,
+                "failed for {val:?}"
+            );
+        }
+        for val in ["false", "0", "no", "off", "never"] {
+            assert_eq!(
+                LogAnsi::from_value(val),
+                LogAnsi::Never,
+                "failed for {val:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_ansi_auto_is_off_when_stdout_is_not_a_tty() {
+        // The #4674 default: a container's stdout is a pipe, not a TTY.
+        assert!(!LogAnsi::Auto.resolve(false, None));
+        assert!(LogAnsi::Auto.resolve(true, None));
+        assert!(LogAnsi::Auto.resolve(true, Some("")));
+        assert!(!LogAnsi::Auto.resolve(true, Some("1")));
+    }
+
+    #[test]
+    fn test_log_ansi_explicit_overrides_tty_and_no_color() {
+        assert!(LogAnsi::Always.resolve(false, Some("1")));
+        assert!(!LogAnsi::Never.resolve(true, None));
+    }
+
+    #[test]
+    fn test_log_ansi_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("LOG_ANSI");
+        let unset = LogAnsi::from_env();
+        std::env::set_var("LOG_ANSI", "false");
+        let off = LogAnsi::from_env();
+        std::env::remove_var("LOG_ANSI");
+        assert_eq!(unset, LogAnsi::Auto);
+        assert_eq!(off, LogAnsi::Never);
+    }
+
+    // ── fmt layer output (#4674) ────────────────────────────────────────
+
+    /// A `MakeWriter` that appends every line to a shared buffer.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("log output is UTF-8")
+        }
+    }
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Emit, under `layer`, the events of one request the way production does:
+    /// the `http_request` span from the real span builder, the correlation ID
+    /// recorded onto it, an inner span carrying its own `uri`, and the
+    /// per-request `Request completed` line.
+    fn emit_request_lines(layer: Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>) {
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let request = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/repositories/npm-local/artifacts/a.tgz?token=secret")
+                .body(())
+                .unwrap();
+            let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
+            span.record("correlation_id", "corr-4674");
+            let _request = span.enter();
+            {
+                let inner = tracing::info_span!("proxy_fetch", uri = "https://upstream.example/a");
+                let _inner = inner.enter();
+                tracing::info!("fetching upstream");
+            }
+            tracing::info!(
+                correlation_id = "corr-4674",
+                status = %201u16,
+                user = "alice",
+                ip = "203.0.113.7",
+                latency_ms = 42u64,
+                "Request completed"
+            );
+        });
+    }
+
+    fn json_lines(capture: &Capture) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        capture
+            .text()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+            .collect()
+    }
+
+    #[test]
+    fn test_json_request_line_has_siem_fields_top_level() {
+        let capture = Capture::default();
+        emit_request_lines(build_fmt_layer_with_writer(
+            LogFormat::Json,
+            true,
+            capture.clone(),
+        ));
+        let lines = json_lines(&capture);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let done = &lines[1];
+
+        assert_eq!(done["fields"]["message"], "Request completed");
+        assert_eq!(done["level"], "INFO");
+        assert!(done["timestamp"].is_string());
+        assert_eq!(done["method"], "PUT");
+        // The redacted request URI from the span, never the inner span's URL.
+        let uri = done["uri"].as_str().expect("uri is top-level");
+        assert!(
+            uri.starts_with("/api/v1/repositories/npm-local/artifacts/a.tgz"),
+            "{uri}"
+        );
+        assert!(!uri.contains("secret"), "token must stay redacted: {uri}");
+        assert_eq!(done["correlation_id"], "corr-4674");
+        assert_eq!(done["status"], 201);
+        assert_eq!(done["user"], "alice");
+        assert_eq!(done["ip"], "203.0.113.7");
+        assert_eq!(done["latency_ms"], 42);
+        // The hoisted keys are copies: the nested originals keep their shape,
+        // including `fields.status` as the string it has always been.
+        assert_eq!(done["fields"]["status"], "201");
+        assert_eq!(done["fields"]["user"], "alice");
+        assert_eq!(done["span"]["name"], "http_request");
+        assert_eq!(done["span"]["correlation_id"], "corr-4674");
+        assert!(!done.contains_key("message"), "message stays nested");
+
+        // The span stack survives under `spans`.
+        let spans = done["spans"].as_array().expect("spans list");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "http_request");
+
+        // A line inside an inner span: request fields still top-level and the
+        // outer span wins the `uri` clash; the inner one stays under `spans`.
+        let inner = &lines[0];
+        assert_eq!(inner["fields"]["message"], "fetching upstream");
+        assert_eq!(inner["span"]["name"], "proxy_fetch");
+        assert_eq!(inner["uri"], uri);
+        assert_eq!(inner["correlation_id"], "corr-4674");
+        let inner_spans = inner["spans"].as_array().unwrap();
+        assert_eq!(inner_spans[1]["name"], "proxy_fetch");
+        assert_eq!(inner_spans[1]["uri"], "https://upstream.example/a");
+
+        assert!(
+            !capture.text().contains('\u{1b}'),
+            "JSON never carries ANSI"
+        );
+    }
+
+    /// Backward compatibility (#4674): `LOG_FORMAT=json` shipped in 1.10.0 with
+    /// the stock `fmt::layer().json()` layout. Every key that layout emits must
+    /// still be emitted with the same value, nesting and type; the only
+    /// difference allowed is the extra top-level request keys.
+    #[test]
+    fn test_json_keeps_every_key_of_the_1_10_layout() {
+        let ours = Capture::default();
+        emit_request_lines(build_fmt_layer_with_writer(
+            LogFormat::Json,
+            false,
+            ours.clone(),
+        ));
+        let stock = Capture::default();
+        emit_request_lines(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(stock.clone())
+                .boxed(),
+        );
+        let ours = json_lines(&ours);
+        let stock = json_lines(&stock);
+        assert_eq!(ours.len(), stock.len());
+        for (new, old) in ours.iter().zip(&stock) {
+            for (key, old_value) in old {
+                if key == "timestamp" {
+                    assert!(new[key].is_string(), "{new:?}");
+                    continue;
+                }
+                assert_eq!(new.get(key), Some(old_value), "key {key} changed: {new:?}");
+            }
+            for key in new.keys().filter(|k| !old.contains_key(*k)) {
+                assert!(
+                    json_log::HOISTED.contains(&key.as_str()),
+                    "unexpected new key {key}: {new:?}"
+                );
+            }
+        }
+        // The stock layout really is the nested one this test protects.
+        assert!(stock[1].contains_key("fields") && stock[1].contains_key("span"));
+        assert!(stock[1].contains_key("spans") && stock[1].contains_key("target"));
+    }
+
+    /// Strip the leading timestamp (the only part that differs run to run).
+    fn without_timestamps(text: &str) -> String {
+        regex::Regex::new(r"\d{4}-\d\d-\d\dT[0-9:.]+Z")
+            .unwrap()
+            .replace_all(text, "<ts>")
+            .into_owned()
+    }
+
+    #[test]
+    fn test_text_with_ansi_forced_on_is_byte_identical_to_the_stock_layer() {
+        let ours = Capture::default();
+        emit_request_lines(build_fmt_layer_with_writer(
+            LogFormat::Text,
+            true,
+            ours.clone(),
+        ));
+        let stock = Capture::default();
+        emit_request_lines(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(true)
+                .with_writer(stock.clone())
+                .boxed(),
+        );
+        assert!(
+            ours.text().contains('\u{1b}'),
+            "ANSI forced on: {}",
+            ours.text()
+        );
+        assert_eq!(
+            without_timestamps(&ours.text()),
+            without_timestamps(&stock.text())
+        );
+    }
+
+    #[test]
+    fn test_text_with_ansi_off_has_no_escapes_between_key_and_value() {
+        let capture = Capture::default();
+        emit_request_lines(build_fmt_layer_with_writer(
+            LogFormat::Text,
+            false,
+            capture.clone(),
+        ));
+        let text = capture.text();
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(text.contains("correlation_id=\"corr-4674\""), "{text}");
+        assert!(text.contains("status=201"), "{text}");
+    }
+
+    /// The real per-request line end to end: `TraceLayer` with the production
+    /// span builder, the client-IP scope, `correlation_id_middleware`, and a
+    /// handler that authenticates (records the user) the way the auth
+    /// middleware does. Every SIEM field must come out top-level (#4674).
+    #[tokio::test]
+    async fn test_json_request_completed_line_from_the_real_middleware() {
+        use axum::{body::Body, routing::put, Router};
+        use tower::ServiceExt;
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(build_fmt_layer_with_writer(
+                LogFormat::Json,
+                false,
+                capture.clone(),
+            ));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        async fn authed() -> axum::http::StatusCode {
+            crate::api::middleware::request_span::record_user("alice");
+            axum::http::StatusCode::CREATED
+        }
+        let app = Router::new()
+            .route("/api/v1/things/:id", put(authed))
+            .layer(axum::middleware::from_fn(
+                crate::api::middleware::tracing::correlation_id_middleware,
+            ))
+            .layer(
+                tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                    |request: &axum::http::Request<Body>| {
+                        crate::api::middleware::tracing::make_http_request_span(request, &[])
+                    },
+                ),
+            );
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/v1/things/7?password=hunter2")
+            .header("x-correlation-id", "corr-e2e-4674")
+            .body(Body::empty())
+            .unwrap();
+        let ip: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        let response =
+            crate::api::middleware::client_ip::with_client_ip_scope(Some(ip), app.oneshot(request))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+        let lines = json_lines(&capture);
+        let done = lines
+            .iter()
+            .find(|l| l["fields"]["message"] == "Request completed")
+            .unwrap_or_else(|| panic!("no Request completed line in {lines:?}"));
+        assert_eq!(done["method"], "PUT");
+        let uri = done["uri"].as_str().unwrap();
+        assert!(uri.starts_with("/api/v1/things/7"), "{uri}");
+        assert!(!uri.contains("hunter2"), "{uri}");
+        assert_eq!(done["correlation_id"], "corr-e2e-4674");
+        assert_eq!(done["http.route"], "/api/v1/things/:id");
+        assert_eq!(done["status"], 201);
+        assert_eq!(done["user"], "alice");
+        assert_eq!(done["ip"], "198.51.100.9");
+        assert!(done["latency_ms"].is_u64(), "{done:?}");
+    }
+
+    /// An anonymous request carries no `user` key at all, rather than a
+    /// placeholder a SIEM rule could mistake for a principal.
+    #[tokio::test]
+    async fn test_json_request_completed_line_omits_user_when_anonymous() {
+        use axum::{body::Body, routing::get, Router};
+        use tower::ServiceExt;
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(build_fmt_layer_with_writer(
+                LogFormat::Json,
+                false,
+                capture.clone(),
+            ));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app =
+            Router::new()
+                .route("/anon", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(
+                    crate::api::middleware::tracing::correlation_id_middleware,
+                ));
+        let request = axum::http::Request::builder()
+            .uri("/anon")
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap();
+
+        let lines = json_lines(&capture);
+        let done = lines
+            .iter()
+            .find(|l| l["fields"]["message"] == "Request completed")
+            .unwrap_or_else(|| panic!("no Request completed line in {lines:?}"));
+        assert!(!done.contains_key("user"), "{done:?}");
+        assert!(!done.contains_key("ip"), "no client-IP scope: {done:?}");
+        assert_eq!(done["status"], 200);
     }
 
     // ── build_otel_resource ─────────────────────────────────────────────

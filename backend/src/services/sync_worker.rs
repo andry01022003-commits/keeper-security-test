@@ -677,6 +677,20 @@ async fn claim_pending_sync_tasks(
               AND st.status = 'pending'
               AND (st.claim_expires_at IS NULL OR st.claim_expires_at <= NOW())
               AND (st.task_type = 'delete' OR a.is_deleted = false)
+              AND (
+                  st.task_type = 'delete'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_tasks d
+                      WHERE d.peer_instance_id = st.peer_instance_id
+                        AND d.artifact_id = st.artifact_id
+                        AND d.task_type = 'delete'
+                        AND (
+                            d.status IN ('pending', 'in_progress')
+                            OR (d.status = 'failed' AND d.retry_count < GREATEST(d.max_retries, $4))
+                        )
+                  )
+              )
             ORDER BY st.priority DESC, st.created_at ASC
             LIMIT LEAST(
                 $2,
@@ -1569,6 +1583,24 @@ async fn handle_transfer_success(db: &PgPool, task: &Claimed<TaskRow>, bytes_tra
     .bind(task.repository_id)
     .execute(db)
     .await;
+
+    rearm_if_superseded(db, task).await;
+}
+
+async fn rearm_if_superseded(db: &PgPool, task: &Claimed<TaskRow>) {
+    if task.task_type != "push" {
+        return;
+    }
+    let rearmed = crate::services::peer_instance_service::PeerInstanceService::new(db.clone())
+        .rearm_superseded_push(task.id, Some(&task.checksum_sha256))
+        .await;
+    if matches!(rearmed, Ok(true)) {
+        tracing::info!(
+            "Artifact {} changed while sync task {} was in flight; queued it again",
+            task.artifact_id,
+            task.id
+        );
+    }
 }
 
 /// Outcome of evaluating a sync task failure.
@@ -1728,6 +1760,8 @@ async fn handle_transfer_failure(
     .bind(format!("{} seconds", backoff.as_secs()))
     .execute(db)
     .await;
+
+    rearm_if_superseded(db, task).await;
 }
 
 /// Build the full URL for uploading an artifact to a remote peer.
@@ -4318,6 +4352,154 @@ mod tests {
             metadata_of(generic),
             serde_json::json!({"files": ["kept.class"]})
         );
+        teardown_claim_fixture(&f).await;
+    }
+
+    #[tokio::test]
+    async fn push_is_not_claimed_while_delete_for_same_artifact_is_undelivered() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let push_id = f.task_ids[0];
+        let delete_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, priority) \
+             SELECT peer_instance_id, artifact_id, 'delete', 'pending', 0 FROM sync_tasks \
+             WHERE id = $1 RETURNING id",
+        )
+        .bind(push_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("insert delete task");
+
+        let first = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        assert_eq!(
+            first.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![delete_id]
+        );
+
+        handle_transfer_success(&f.pool, &first[0], 0).await;
+
+        let second = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        assert_eq!(
+            second.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![push_id]
+        );
+
+        teardown_claim_fixture(&f).await;
+    }
+
+    #[tokio::test]
+    async fn push_finished_after_concurrent_reupload_is_queued_again() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("enable versioning");
+
+        let claimed = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        let task = &claimed[0];
+        sqlx::query("UPDATE peer_instances SET active_transfers = 1 WHERE id = $1")
+            .bind(f.peer_id)
+            .execute(&f.pool)
+            .await
+            .expect("seed active transfers");
+
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $2 WHERE id = $1")
+            .bind(task.artifact_id)
+            .bind(format!("{:064x}", 2))
+            .execute(&f.pool)
+            .await
+            .expect("re-upload");
+        crate::services::peer_instance_service::PeerInstanceService::new(f.pool.clone())
+            .queue_sync_task(f.peer_id, task.artifact_id, 0)
+            .await
+            .expect("enqueue re-upload");
+
+        let (status, token): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status::TEXT, claim_token FROM sync_tasks WHERE id = $1")
+                .bind(task.id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("fetch claimed task");
+        assert_eq!(status, "in_progress");
+        assert_eq!(token, Some(task.claim_token()));
+
+        handle_transfer_success(&f.pool, task, 3).await;
+
+        let (status, token, retry_count): (String, Option<Uuid>, i32) = sqlx::query_as(
+            "SELECT status::TEXT, claim_token, retry_count FROM sync_tasks WHERE id = $1",
+        )
+        .bind(task.id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("fetch finalized task");
+        assert_eq!(status, "pending");
+        assert!(token.is_none());
+        assert_eq!(retry_count, 0);
+        let active: i32 =
+            sqlx::query_scalar("SELECT active_transfers FROM peer_instances WHERE id = $1")
+                .bind(f.peer_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("fetch peer");
+        assert_eq!(active, 0);
+
+        let again = claim_all(&f, 5, 5, "worker-b", 60.0).await;
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].checksum_sha256.trim(), format!("{:064x}", 2));
+
+        teardown_claim_fixture(&f).await;
+    }
+
+    #[tokio::test]
+    async fn failed_push_of_a_superseded_revision_keeps_a_retry_budget() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("enable versioning");
+        sqlx::query("UPDATE sync_tasks SET retry_count = 2 WHERE id = $1")
+            .bind(f.task_ids[0])
+            .execute(&f.pool)
+            .await
+            .expect("seed retries");
+
+        let claimed = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        let task = &claimed[0];
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $2 WHERE id = $1")
+            .bind(task.artifact_id)
+            .bind(format!("{:064x}", 2))
+            .execute(&f.pool)
+            .await
+            .expect("re-upload");
+
+        handle_transfer_failure(
+            &f.pool,
+            task,
+            "peer unavailable",
+            SyncRetryPolicy {
+                max_retries: 3,
+                backoff_base_secs: 1,
+                backoff_max_secs: 1,
+            },
+        )
+        .await;
+
+        let (status, retry_count, token): (String, i32, Option<Uuid>) = sqlx::query_as(
+            "SELECT status::TEXT, retry_count, claim_token FROM sync_tasks WHERE id = $1",
+        )
+        .bind(task.id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("fetch task");
+        assert_eq!((status.as_str(), retry_count, token), ("pending", 0, None));
+
         teardown_claim_fixture(&f).await;
     }
 

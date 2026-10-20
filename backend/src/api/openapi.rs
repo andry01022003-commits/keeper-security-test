@@ -23,8 +23,12 @@ Format (package-manager) endpoints such as `/v2/*` (OCI), `/incus/*`, `/debian/*
 registries are intentionally more permissive for client compatibility: in addition to Bearer, they accept \
 HTTP **Basic** auth with the API token supplied in the *password* field (any username), matching the \
 `pip` netrc / Artifactory-style `token:<api_token>` convention used by package managers that cannot send a \
-Bearer header. This Basic-with-token fallback applies to format endpoints only, never to `/api/v1/*`.",
-        version = "1.11.0",
+Bearer header. The one `/api/v1` route that shares this contract is the repository download route, \
+`GET /api/v1/repositories/{key}/download/{path}`: it serves the same bytes as the format endpoints, so it \
+accepts the API token as the Basic password and answers an anonymous request on a non-public repository \
+with `401` and a `WWW-Authenticate` challenge, like they do. Every other `/api/v1/*` route refuses the \
+Basic-with-token fallback.",
+        version = "1.11.3",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
     ),
@@ -86,10 +90,11 @@ pub struct ErrorResponse {
 /// login-issued JWTs are both sent as `Authorization: Bearer <token>`.
 ///
 /// `basic_auth` is documented for the format (package-manager) endpoints
-/// only. Those endpoints additionally accept HTTP Basic with the API token in
-/// the password field for clients that cannot send a Bearer header. The
-/// `/api/v1/*` middleware does NOT honour the Basic-with-token fallback — see
-/// the API description for the asymmetry.
+/// and the repository download route. Those endpoints additionally accept
+/// HTTP Basic with the API token in the password field for clients that
+/// cannot send a Bearer header. The rest of the `/api/v1/*` middleware does
+/// NOT honour the Basic-with-token fallback — see the API description for
+/// the asymmetry (#2809, #4654).
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
@@ -667,6 +672,28 @@ mod tests {
                 "{schema}.visibility must not be deprecated"
             );
         }
+    }
+
+    /// #4330: `UpdateRepositoryRequest.curation_default_action` is an
+    /// `Option<String>` (absent leaves the stored value unchanged), but a
+    /// `value_type = String` override made the spec list it as required, so
+    /// generated clients had to read-modify-write it on every update.
+    #[test]
+    fn test_4330_update_repository_curation_default_action_not_required() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let schema = &spec["components"]["schemas"]["UpdateRepositoryRequest"];
+        assert!(
+            schema["properties"]["curation_default_action"].is_object(),
+            "UpdateRepositoryRequest.curation_default_action missing from the spec"
+        );
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&"curation_default_action"),
+            "UpdateRepositoryRequest.curation_default_action must be optional, required = {required:?}"
+        );
     }
 
     /// #3924 added a second 409 to chunked-upload completion (immutable path

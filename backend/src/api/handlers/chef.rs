@@ -12,7 +12,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -389,6 +389,7 @@ async fn upload_cookbook(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "chef", "write:artifacts")?.user_id;
@@ -588,6 +589,17 @@ async fn upload_cookbook(
         size_bytes,
         &computed_sha256,
         cookbook_description.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -1079,6 +1091,66 @@ mod upload_stream_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         fx.teardown().await;
+    }
+
+    /// #4725: a cookbook upload to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn chef_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "chef").await;
+
+        let tarball = b"cookbook-payload-4725";
+        let body = cookbook_multipart("CHEFBND", "repl4725", "1.0.0", tarball);
+        let app = fx.router_with_auth(super::router());
+        let (status, resp) = tdh::send(
+            app,
+            tdh::post(
+                format!("/{}/api/v1/cookbooks", fx.repo_key),
+                "multipart/form-data; boundary=CHEFBND",
+                body,
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "cookbook upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the cookbook
+        // but must not queue another task.
+        let body = cookbook_multipart("CHEFBND", "repl4725", "2.0.0", tarball);
+        let mut req = tdh::post(
+            format!("/{}/api/v1/cookbooks", fx.repo_key),
+            "multipart/form-data; boundary=CHEFBND",
+            body,
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let app = fx.router_with_auth(super::router());
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated cookbook upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["repl4725/1.0.0/repl4725-1.0.0.tar.gz".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 }
 

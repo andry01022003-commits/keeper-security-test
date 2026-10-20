@@ -114,7 +114,13 @@ impl LdapConfig {
             user_filter: std::env::var("LDAP_USER_FILTER")
                 .unwrap_or_else(|_| "(uid={username})".to_string()),
             bind_dn: std::env::var("LDAP_BIND_DN").ok(),
-            bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
+            bind_password: match crate::config::secret_or_env("LDAP_BIND_PASSWORD") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, "LDAP_BIND_PASSWORD_FILE is set but unusable; continuing without a bind password");
+                    None
+                }
+            },
             username_attr: std::env::var("LDAP_USERNAME_ATTR")
                 .unwrap_or_else(|_| "uid".to_string()),
             email_attr: std::env::var("LDAP_EMAIL_ATTR").unwrap_or_else(|_| "mail".to_string()),
@@ -1406,6 +1412,7 @@ pub(crate) mod tests {
             setup_password_hint: None,
             grpc_reflection_enabled: false,
             swagger_enabled: false,
+            plugins_enabled: true,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             conda_attestation_require_verified: true,
@@ -1444,9 +1451,12 @@ pub(crate) mod tests {
             database_acquire_timeout_secs: 30,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            database_tcp_keepalives: true,
             auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            http_header_read_timeout_secs: 10,
+            http_listen_backlog: 0,
             upload_progress_window_secs: 60,
             upload_min_progress_bytes: 16 * 1024,
             upload_max_in_flight_per_principal: 64,
@@ -1468,6 +1478,7 @@ pub(crate) mod tests {
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
             rate_limit_trusted_proxy_cidrs: Vec::new(),
+            xff_trusted_for_authz: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,

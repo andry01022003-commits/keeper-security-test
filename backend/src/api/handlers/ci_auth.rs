@@ -53,6 +53,7 @@ use crate::error::{AppError, Result};
 use crate::models::user::User;
 use crate::services::auth_service::{AccessToken, AuthService, FederatedCredentials};
 use crate::services::ci_oidc_service::{claim_value, CiOidcProvider, CiOidcService};
+use crate::services::metrics_service::AuthFailureReason;
 
 /// Create public CI auth routes (no auth middleware needed — the CI JWT is the
 /// credential).
@@ -149,13 +150,20 @@ pub async fn exchange_ci_token(
     //    explicit `provider_id` override when one was sent (#3548).
     let provider = svc
         .resolve_provider_for_assertion(jwt, req.provider_id)
-        .await?;
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
     // 2. Validate the CI JWT (signature, audience, issuer — no claim check yet)
-    let claims = svc.validate_ci_jwt(&provider, jwt).await?;
+    let claims = svc
+        .validate_ci_jwt(&provider, jwt)
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
-    // 3-5. Resolve the mapping, its service account, and mint.
-    let (user, tokens) = exchange_validated_claims(&state, &svc, &provider, &claims).await?;
+    // 3-5. Resolve the mapping, its service account, and mint. A verified
+    // assertion refused here is refused by policy (no mapping matches).
+    let (user, tokens) = exchange_validated_claims(&state, &svc, &provider, &claims)
+        .await
+        .inspect_err(|e| record_ci_auth_failure(e, AuthFailureReason::Scope))?;
 
     Ok(Json(CiTokenResponse {
         access_token: tokens.access_token,
@@ -163,6 +171,16 @@ pub async fn exchange_ci_token(
         expires_in: tokens.expires_in,
         username: user.username,
     }))
+}
+
+/// Count a rejected CI assertion in `ak_auth_failures_total` (#4676): only
+/// credential rejections, `expired` when the validator said so.
+fn record_ci_auth_failure(err: &AppError, fallback: AuthFailureReason) {
+    crate::services::metrics_service::record_auth_failure_for_error(
+        crate::services::metrics_service::AuthFailureSurface::CiOidc,
+        err,
+        fallback,
+    );
 }
 
 /// Everything the exchange does once the assertion is verified: pick the
@@ -176,6 +194,12 @@ async fn exchange_validated_claims(
     provider: &CiOidcProvider,
     claims: &serde_json::Value,
 ) -> Result<(User, AccessToken)> {
+    // The verifier accepts an assertion up to its leeway past `exp` (clock
+    // skew between the CI issuer and this server). That leeway must not chain
+    // into a session: refuse here, before any account is touched, when the
+    // assertion has no validity left to clamp the minted token to (#4663).
+    let assertion_exp = mintable_assertion_expiry(claims, chrono::Utc::now())?;
+
     // 3. Find the first matching enabled identity mapping (enforces claim filters)
     let mapping = svc.resolve_mapping(provider.id, claims).await?;
 
@@ -203,7 +227,7 @@ async fn exchange_validated_claims(
             CredentialShape::for_provider(provider),
             mapping.allowed_repo_ids.clone(),
             mapping.group_binding_ids.is_some().then_some(mapping.id),
-            assertion_expiry(claims),
+            assertion_exp,
         )
     };
     let (user, tokens) = match mint(credentials.clone()).await {
@@ -386,6 +410,10 @@ async fn mint_ci_session(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // The account sync and binding reconcile above take time; re-check that
+    // the assertion still has validity left right before the mint (#4663).
+    mintable_expiry(assertion_exp, chrono::Utc::now())?;
+
     let tokens = match shape {
         // `scopes: None` — a CI exchange mints an action-unrestricted token,
         // as the federated path always has (#2430); the repository allow-list
@@ -397,6 +425,7 @@ async fn mint_ci_session(
                 allowed_repo_ids,
                 assertion_exp,
             )?;
+            refuse_zero_lifetime(tokens.expires_in)?;
             auth_service
                 .persist_refresh_jti_from_pair(&tokens, user.id)
                 .await?;
@@ -414,14 +443,60 @@ async fn mint_ci_session(
         // Other provider types still mint action-unrestricted tokens. The
         // general fix, action scopes on a mapping or finer-grained grants
         // alongside the mapping's group binding, is tracked in #4132.
-        CredentialShape::ReadOnlyNoRefresh => auth_service.generate_access_token_capped(
-            &user,
-            Some(KUBERNETES_SCOPES.map(str::to_owned).to_vec()),
-            allowed_repo_ids,
-            assertion_exp,
-        )?,
+        CredentialShape::ReadOnlyNoRefresh => {
+            let token = auth_service.generate_access_token_capped(
+                &user,
+                Some(KUBERNETES_SCOPES.map(str::to_owned).to_vec()),
+                allowed_repo_ids,
+                assertion_exp,
+            )?;
+            refuse_zero_lifetime(token.expires_in)?;
+            token
+        }
     };
     Ok((user, tokens))
+}
+
+/// The assertion has no validity left to mint a session from (#4663).
+fn expired_assertion() -> AppError {
+    AppError::Authentication(
+        "CI token has expired; request a fresh one from the CI platform".into(),
+    )
+}
+
+/// The presented assertion's `exp` as the cap for the minted token, refusing
+/// when less than one whole second of it remains at `now` (#4663).
+///
+/// The verifier keeps its clock-skew leeway, so an assertion up to 60 s past
+/// `exp` verifies. Minting from one would cap the session at an `exp` that
+/// has already passed (`expires_in: 0`), so the exchange is refused instead.
+/// One second, not zero, because `expires_in` counts whole seconds.
+fn mintable_assertion_expiry(
+    claims: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    mintable_expiry(assertion_expiry(claims), now)
+}
+
+/// See [`mintable_assertion_expiry`]. `None` (no usable `exp`) passes: the
+/// configured base TTL then stands.
+fn mintable_expiry(
+    exp: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    match exp {
+        Some(exp) if (exp - now).num_seconds() < 1 => Err(expired_assertion()),
+        other => Ok(other),
+    }
+}
+
+/// Never hand out a session with `expires_in: 0` (#4663): the clamp can still
+/// land there when the mint runs in the last second of the assertion.
+fn refuse_zero_lifetime(expires_in: u64) -> Result<()> {
+    if expires_in == 0 {
+        return Err(expired_assertion());
+    }
+    Ok(())
 }
 
 /// Parse the optional JSON request body.
@@ -491,7 +566,10 @@ pub struct CiAuthApiDoc;
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
-    use super::{assertion_expiry, exchange_ci_token, extract_bearer_jwt, parse_optional_body};
+    use super::{
+        assertion_expiry, exchange_ci_token, expired_assertion, extract_bearer_jwt,
+        mintable_assertion_expiry, mintable_expiry, parse_optional_body, refuse_zero_lifetime,
+    };
     use crate::api::handlers::test_db_helpers as tdh;
     use axum::body::Bytes;
     use axum::extract::State;
@@ -576,6 +654,35 @@ mod tests {
         .expect_err("missing Authorization header must fail");
 
         assert!(err.to_string().contains("Missing Authorization header"));
+    }
+
+    /// #4676: a rejected CI assertion is counted in
+    /// `ak_auth_failures_total{surface="ci_oidc"}`; a request that presents no
+    /// assertion at all is not. Both are rejected before any DB lookup.
+    #[test]
+    fn exchange_ci_token_counts_rejected_assertions_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer not-a-jwt"),
+            );
+            exchange_ci_token(State(lazy_test_state()), headers, Bytes::new())
+                .await
+                .expect_err("an unreadable assertion must be rejected");
+            exchange_ci_token(State(lazy_test_state()), HeaderMap::new(), Bytes::new())
+                .await
+                .expect_err("a missing assertion must be rejected");
+        });
+        assert_eq!(
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "ci_oidc"), ("reason", "invalid_token")]
+            ),
+            1
+        );
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 1);
     }
 
     #[tokio::test]
@@ -703,6 +810,40 @@ mod tests {
         assert_eq!(assertion_expiry(&json!({ "exp": "soon" })), None);
     }
 
+    /// #4663: the verifier accepts an assertion up to 60 s past `exp`; the
+    /// exchange must not mint from one with no validity left, so the session
+    /// never inherits a second leeway window and never reports
+    /// `expires_in: 0`.
+    #[test]
+    fn mintable_expiry_refuses_an_assertion_with_no_validity_left() {
+        let now = chrono::Utc::now();
+        let at = |secs: i64| assertion_expiry(&json!({ "exp": now.timestamp() + secs }));
+        for (offset, why) in [
+            (-59, "inside the verifier leeway, past exp"),
+            (-1, "one second past exp"),
+            (0, "exp is this second"),
+        ] {
+            let err = mintable_expiry(at(offset), now).expect_err(why);
+            assert_eq!(
+                axum::response::IntoResponse::into_response(err).status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{why}"
+            );
+        }
+        assert_eq!(mintable_expiry(at(120), now).unwrap(), at(120));
+        // No usable `exp`: the base TTL stands, as before.
+        assert_eq!(mintable_expiry(None, now).unwrap(), None);
+        assert_eq!(
+            mintable_assertion_expiry(&json!({ "exp": now.timestamp() - 30 }), now)
+                .expect_err("expired assertion")
+                .to_string(),
+            expired_assertion().to_string()
+        );
+
+        assert!(refuse_zero_lifetime(0).is_err());
+        assert!(refuse_zero_lifetime(1).is_ok());
+    }
+
     /// `POST /api/v1/auth/ci/token` exchanges a presented credential, so the
     /// token it mints must not outlive that credential (#3820) — the rule the
     /// Conan and OCI `/v2/token` arms adopted in #3625/#3460. Drives the mint
@@ -799,7 +940,33 @@ mod tests {
             "the minted token must expire exactly with the assertion that bought it"
         );
 
-        for user_id in [far_user.id, soon_user.id] {
+        // #4663: an assertion past its `exp` (the verifier accepted it inside
+        // its leeway) mints nothing, rather than a session born expired.
+        let tag = &Uuid::new_v4().to_string()[..8];
+        let past = chrono::Utc::now().timestamp() - 30;
+        let err = super::mint_ci_session(
+            &svc,
+            &auth_service,
+            creds(&format!("past{tag}")),
+            super::CredentialShape::ReadOnlyNoRefresh,
+            None,
+            None,
+            assertion_expiry(&json!({ "exp": past })),
+        )
+        .await
+        .expect_err("an expired assertion must not mint a session");
+        assert!(
+            matches!(err, crate::error::AppError::Authentication(_)),
+            "{err}"
+        );
+        let past_user: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+                .bind(format!("ci_3820_past{tag}"))
+                .fetch_optional(&pool)
+                .await
+                .expect("lookup past user");
+
+        for user_id in [far_user.id, soon_user.id].into_iter().chain(past_user) {
             let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
                 .bind(user_id)
                 .execute(&pool)

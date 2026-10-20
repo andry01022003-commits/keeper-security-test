@@ -69,6 +69,10 @@ pub const CACHE_OUTCOME_FIELD: &str = "artifact_keeper.cache.outcome";
 struct RequestAttributes {
     repository_key: RefCell<Option<String>>,
     cache_outcome: Cell<Option<&'static str>>,
+    /// The authenticated principal's username, for the `user` field of the
+    /// per-request `Request completed` log line (#4674). A log field only:
+    /// never a span attribute or metric label.
+    user: RefCell<Option<String>>,
 }
 
 tokio::task_local! {
@@ -102,6 +106,24 @@ pub fn record_repository_key(key: &str) {
     let _ = REQUEST_ATTRIBUTES.try_with(|attrs| {
         *attrs.repository_key.borrow_mut() = Some(key.to_string());
     });
+}
+
+/// Record the username the request authenticated as, for the `user` field of
+/// the `Request completed` log line (#4674). Called by the auth middleware
+/// family and the OCI credential check once a credential has been verified;
+/// the last call wins. A no-op outside a request scope.
+pub fn record_user(username: &str) {
+    let _ = REQUEST_ATTRIBUTES.try_with(|attrs| {
+        *attrs.user.borrow_mut() = Some(username.to_string());
+    });
+}
+
+/// The username recorded by [`record_user`] for the request in flight, if any.
+pub fn recorded_user() -> Option<String> {
+    REQUEST_ATTRIBUTES
+        .try_with(|attrs| attrs.user.borrow().clone())
+        .ok()
+        .flatten()
 }
 
 /// Record the proxy-cache outcome of this request. `outcome` is one of the

@@ -21,13 +21,15 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Extension;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
@@ -94,15 +96,44 @@ pub fn router() -> Router<SharedState> {
         // wildcard because axum prefers literal segments over `*` wildcards.
         // See the filed issue for the full reproducer and impact analysis.
         .route("/:repo_key/-/*rest", get(npm_meta_get))
+        // `npm unpublish` (#4025). The `-rev` segment is a literal, distinct
+        // from the `-` the tarball and meta routes use, so these sit beside
+        // them without shadowing either.
+        //   PUT    /npm/{repo}/{pkg}/-rev/{rev}             packument rewrite (version unpublish)
+        //   DELETE /npm/{repo}/{pkg}/-rev/{rev}             whole-package unpublish
+        //   DELETE /npm/{repo}/{pkg}/-/{file}/-rev/{rev}    tarball delete
+        .route(
+            "/:repo_key/@:scope/:package/-/:filename/-rev/:rev",
+            delete(unpublish_scoped_tarball),
+        )
+        .route(
+            "/:repo_key/@:scope/:package/-rev/:rev",
+            put(unpublish_scoped_versions).delete(unpublish_scoped_package),
+        )
+        .route(
+            "/:repo_key/:package/-/:filename/-rev/:rev",
+            delete(unpublish_tarball),
+        )
+        .route(
+            "/:repo_key/:package/-rev/:rev",
+            put(unpublish_versions).delete(unpublish_package),
+        )
         // Scoped package tarball: GET /npm/{repo_key}/@{scope}/{package}/-/{filename}
         .route(
             "/:repo_key/@:scope/:package/-/:filename",
             get(download_scoped_tarball),
         )
         // Scoped version metadata: GET /npm/{repo_key}/@{scope}/{package}/{version}
+        //
+        // npm addresses a scoped packument as ONE encoded segment
+        // (`@scope%2fname`), so its unpublish requests
+        // (`@scope%2fname/-rev/{rev}`) land on this route with
+        // `package == "-rev"`; PUT/DELETE here exist only for that shape (#4025).
         .route(
             "/:repo_key/@:scope/:package/:version",
-            get(get_scoped_version_metadata),
+            get(get_scoped_version_metadata)
+                .put(unpublish_encoded_scoped_versions)
+                .delete(unpublish_encoded_scoped_package),
         )
         // Scoped package metadata / publish: GET/PUT /npm/{repo_key}/@{scope}/{package}
         .route(
@@ -717,6 +748,41 @@ async fn get_package_metadata_cached(
         .map(|entry| cached_packument_response(&entry, headers, client_cache_control))
 }
 
+/// Evict what a definitive 404/410 for `scope` actually invalidates (#4240),
+/// unless the underlying Remote keeps on a missing upstream (#4640).
+///
+/// `on_upstream_not_found = keep` also covers this cache: the proxy layer
+/// answers the underlying fetch from the copy it still holds, and evicting the
+/// computed packument here would re-open exactly the upstream round-trip the
+/// policy exists to avoid. Only a Remote scope is consulted — a virtual's 404
+/// is a statement about the virtual computed from one authorized member list
+/// (#4240), not about any one member, so no single member's policy may change
+/// what it invalidates.
+async fn maybe_evict_missing_packument(
+    state: &SharedState,
+    cache: &NpmPackumentCache,
+    scope: &PackumentScope,
+) {
+    if scope.virtual_repo.is_none() {
+        if let Some(proxy_service) = state.proxy_service.as_ref() {
+            if proxy_service
+                .on_upstream_not_found_by_key(&scope.repo_key)
+                .await
+                .keeps()
+            {
+                tracing::info!(
+                    repository = %scope.repo_key,
+                    package = %scope.package,
+                    "upstream 404/410 with on_upstream_not_found=keep; keeping the cached \
+                     packument (#4640)"
+                );
+                return;
+            }
+        }
+    }
+    evict_missing_packument(cache, scope).await;
+}
+
 /// Evict what a definitive 404/410 for `scope` actually invalidates (#4240).
 ///
 /// A Remote packument is one document per package, so the whole package goes,
@@ -757,7 +823,9 @@ fn is_definitive_missing_status(status: StatusCode) -> bool {
 /// `Accept-Encoding`. The entry matching `want_gzip` is returned for serving.
 /// Error responses and non-JSON passthroughs are returned unchanged via
 /// `Err` and left uncached; an authoritative 404/410 additionally evicts the
-/// package's cached variants (see [`is_definitive_missing_status`]).
+/// package's cached variants (see [`is_definitive_missing_status`]), unless the
+/// repository is `on_upstream_not_found = keep` (#4640, see
+/// [`maybe_evict_missing_packument`]).
 #[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped; the exempt call is marked inline below (#1608)
 async fn compute_and_store_packument(
     state: &SharedState,
@@ -803,14 +871,14 @@ async fn compute_and_store_packument(
         Ok(response) => response,
         Err(error_response) => {
             if is_definitive_missing_status(error_response.status()) {
-                evict_missing_packument(cache, scope).await;
+                maybe_evict_missing_packument(state, cache, scope).await;
             }
             return Err(error_response);
         }
     };
     if response.status() != StatusCode::OK {
         if is_definitive_missing_status(response.status()) {
-            evict_missing_packument(cache, scope).await;
+            maybe_evict_missing_packument(state, cache, scope).await;
         }
         return Err(response);
     }
@@ -1139,22 +1207,218 @@ fn npm_advertised_tarball_filename(
     Some(build_npm_tarball_filename(package_name, version))
 }
 
+#[derive(Debug, Default)]
+struct NpmPackumentDists<'a> {
+    name: Option<Cow<'a, str>>,
+    versions: BTreeMap<Cow<'a, str>, NpmVersionDist<'a>>,
+}
+
+#[derive(Debug, Default)]
+struct NpmVersionDist<'a> {
+    name: Option<Cow<'a, str>>,
+    version: Option<Cow<'a, str>>,
+    dist: Option<NpmDist<'a>>,
+}
+
+#[derive(Debug, Default)]
+struct NpmDist<'a> {
+    tarball: Option<Cow<'a, str>>,
+    integrity: Option<Cow<'a, str>>,
+    shasum: Option<Cow<'a, str>>,
+}
+
+fn parse_npm_packument_dists(content: &[u8]) -> Option<NpmPackumentDists<'_>> {
+    serde_json::from_slice::<NpmLenient<NpmPackumentDists<'_>>>(content)
+        .ok()?
+        .0
+}
+
+trait NpmPackumentPart<'de>: Sized {
+    fn from_text(_text: Cow<'de, str>) -> Option<Self> {
+        None
+    }
+
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(None)
+    }
+}
+
+struct NpmLenient<T>(Option<T>);
+
+impl<'de, T: NpmPackumentPart<'de>> serde::Deserialize<'de> for NpmLenient<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(NpmLenientVisitor(std::marker::PhantomData))
+            .map(NpmLenient)
+    }
+}
+
+struct NpmLenientVisitor<T>(std::marker::PhantomData<T>);
+
+impl<'de, T: NpmPackumentPart<'de>> serde::de::Visitor<'de> for NpmLenientVisitor<T> {
+    type Value = Option<T>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(T::from_text(Cow::Borrowed(v)))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(T::from_text(Cow::Owned(v.to_owned())))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(T::from_text(Cow::Owned(v)))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        T::from_object(map)
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for Cow<'de, str> {
+    fn from_text(text: Cow<'de, str>) -> Option<Self> {
+        Some(text)
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for NpmPackumentDists<'de> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut packument = Self::default();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            match key.as_deref() {
+                Some("name") => packument.name = map.next_value::<NpmLenient<_>>()?.0,
+                Some("versions") => {
+                    packument.versions = map.next_value::<NpmLenient<_>>()?.0.unwrap_or_default()
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Some(packument))
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for BTreeMap<Cow<'de, str>, NpmVersionDist<'de>> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut versions = Self::new();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            let entry = map
+                .next_value::<NpmLenient<NpmVersionDist<'de>>>()?
+                .0
+                .unwrap_or_default();
+            if let Some(key) = key {
+                versions.insert(key, entry);
+            }
+        }
+        Ok(Some(versions))
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for NpmVersionDist<'de> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut entry = Self::default();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            match key.as_deref() {
+                Some("name") => entry.name = map.next_value::<NpmLenient<_>>()?.0,
+                Some("version") => entry.version = map.next_value::<NpmLenient<_>>()?.0,
+                Some("dist") => entry.dist = map.next_value::<NpmLenient<_>>()?.0,
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Some(entry))
+    }
+}
+
+impl<'de> NpmPackumentPart<'de> for NpmDist<'de> {
+    fn from_object<A>(mut map: A) -> Result<Option<Self>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut dist = Self::default();
+        while let Some(NpmLenient(key)) = map.next_key::<NpmLenient<Cow<'de, str>>>()? {
+            match key.as_deref() {
+                Some("tarball") => dist.tarball = map.next_value::<NpmLenient<_>>()?.0,
+                Some("integrity") => dist.integrity = map.next_value::<NpmLenient<_>>()?.0,
+                Some("shasum") => dist.shasum = map.next_value::<NpmLenient<_>>()?.0,
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Some(dist))
+    }
+}
+
 /// Package name and version of one packument version entry: the entry's own
 /// `name` / `version`, falling back to the document name and the map key.
 fn npm_version_identity<'a>(
-    packument: &'a serde_json::Value,
+    packument: &'a NpmPackumentDists<'_>,
     version_key: &'a str,
-    version_data: &'a serde_json::Value,
+    version_data: &'a NpmVersionDist<'_>,
 ) -> (&'a str, &'a str) {
     let name = version_data
-        .get("name")
-        .and_then(|n| n.as_str())
-        .or_else(|| packument.get("name").and_then(|n| n.as_str()))
+        .name
+        .as_deref()
+        .or(packument.name.as_deref())
         .unwrap_or("_unknown");
-    let version = version_data
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or(version_key);
+    let version = version_data.version.as_deref().unwrap_or(version_key);
     (name, version)
 }
 
@@ -1165,17 +1429,16 @@ fn npm_version_identity<'a>(
 /// #3785 (never by parsing a version out of the requested filename). URLs in
 /// a non-standard layout on the upstream's origin match on the canonical
 /// filename `npm_advertised_tarball_filename` rewrote them to.
-fn npm_dist_for_filename<'a>(
-    packument: &'a serde_json::Value,
+fn npm_dist_for_filename<'p, 'a>(
+    packument: &'p NpmPackumentDists<'a>,
     filename: &str,
     upstream_url: Option<&str>,
-) -> Option<(&'a serde_json::Value, &'a str)> {
-    let versions = packument.get("versions")?.as_object()?;
-    for (version_key, version_data) in versions {
-        let Some(dist) = version_data.get("dist") else {
+) -> Option<(&'p NpmDist<'a>, &'p str)> {
+    for (version_key, version_data) in &packument.versions {
+        let Some(dist) = &version_data.dist else {
             continue;
         };
-        let tarball = dist.get("tarball").and_then(|t| t.as_str()).unwrap_or("");
+        let tarball = dist.tarball.as_deref().unwrap_or("");
         let tarball_name = if tarball.contains("/-/") {
             tarball
                 .split(['#', '?'])
@@ -1202,7 +1465,7 @@ fn npm_dist_for_filename<'a>(
 /// repository's upstream credentials may accompany it). `None` means "use the
 /// canonical path".
 fn npm_tarball_source_for_filename(
-    packument: &serde_json::Value,
+    packument: &NpmPackumentDists<'_>,
     filename: &str,
     upstream_url: &str,
 ) -> Option<String> {
@@ -1282,7 +1545,7 @@ fn normalize_npm_shasum(raw: &str) -> Option<String> {
 /// (SRI) is preferred over the legacy `dist.shasum` (SHA-1 hex).
 #[cfg(test)]
 fn npm_integrity_for_filename(
-    packument: &serde_json::Value,
+    packument: &NpmPackumentDists<'_>,
     filename: &str,
 ) -> Option<crate::services::proxy_service::CacheCommitDigest> {
     npm_integrity_for_filename_on_upstream(packument, filename, None)
@@ -1292,22 +1555,18 @@ fn npm_integrity_for_filename(
 /// non-standard layout on `upstream_url`'s origin by the canonical filename
 /// they are advertised under (#3785).
 fn npm_integrity_for_filename_on_upstream(
-    packument: &serde_json::Value,
+    packument: &NpmPackumentDists<'_>,
     filename: &str,
     upstream_url: Option<&str>,
 ) -> Option<crate::services::proxy_service::CacheCommitDigest> {
     use crate::services::proxy_service::CacheCommitDigest;
 
     let (dist, _) = npm_dist_for_filename(packument, filename, upstream_url)?;
-    if let Some(digest) = dist
-        .get("integrity")
-        .and_then(|i| i.as_str())
-        .and_then(parse_npm_sri)
-    {
+    if let Some(digest) = dist.integrity.as_deref().and_then(parse_npm_sri) {
         return Some(digest);
     }
-    dist.get("shasum")
-        .and_then(|s| s.as_str())
+    dist.shasum
+        .as_deref()
         .and_then(normalize_npm_shasum)
         .map(CacheCommitDigest::Sha1Hex)
 }
@@ -1372,7 +1631,7 @@ async fn resolve_npm_tarball_upstream(
     else {
         return NpmTarballUpstream::default();
     };
-    let Ok(packument) = serde_json::from_slice::<serde_json::Value>(&content) else {
+    let Some(packument) = parse_npm_packument_dists(&content) else {
         return NpmTarballUpstream::default();
     };
     NpmTarballUpstream {
@@ -4466,19 +4725,16 @@ async fn serve_tarball(
             // an upstream outside the registry-standard `/-/` layout (GitHub
             // Packages, #3785) — the URL the upstream really serves it at.
             // The proxy cache key stays the canonical `fetch_path` either way.
-            let tarball_upstream = resolve_npm_tarball_upstream(
-                proxy,
-                repo.id,
-                repo_key,
-                upstream_url,
-                package_name,
-                &response_filename,
-            )
-            .await;
-            let source_path = tarball_upstream
-                .source
-                .clone()
-                .unwrap_or_else(|| fetch_path.clone());
+            let resolve_tarball_upstream = || {
+                resolve_npm_tarball_upstream(
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    package_name,
+                    &response_filename,
+                )
+            };
 
             // #3003: when scan-on-proxy is enabled, route through the inline
             // scan-and-block path (buffered capped fetch + digest-keyed
@@ -4491,6 +4747,10 @@ async fn serve_tarball(
             if let Some((action, severity_gate)) =
                 proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
             {
+                let source_path = resolve_tarball_upstream()
+                    .await
+                    .source
+                    .unwrap_or_else(|| fetch_path.clone());
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -4524,22 +4784,39 @@ async fn serve_tarball(
             // variant rather than the SHA-256-only proxy_helpers wrapper; a
             // mismatch is served to the client (npm verifies the SRI itself)
             // but never cached.
-            let expected_integrity = tarball_upstream.integrity;
-            let gated_repo = proxy_helpers::build_remote_repo_with_format(
+            let result = match proxy_helpers::proxy_check_cache_streaming(
+                proxy,
                 repo.id,
                 repo_key,
                 upstream_url,
+                &fetch_path,
                 RepositoryFormat::Npm,
-            );
-            let result = proxy
-                .fetch_artifact_streaming_with_cache_path_gated_digest(
-                    &gated_repo,
-                    &source_path,
-                    &fetch_path,
-                    expected_integrity,
-                )
-                .await
-                .map_err(IntoResponse::into_response)?;
+            )
+            .await
+            {
+                Some(hit) => hit,
+                None => {
+                    let tarball_upstream = resolve_tarball_upstream().await;
+                    let source_path = tarball_upstream
+                        .source
+                        .unwrap_or_else(|| fetch_path.clone());
+                    let gated_repo = proxy_helpers::build_remote_repo_with_format(
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        RepositoryFormat::Npm,
+                    );
+                    proxy
+                        .fetch_artifact_streaming_with_cache_path_gated_digest(
+                            &gated_repo,
+                            &source_path,
+                            &fetch_path,
+                            tarball_upstream.integrity,
+                        )
+                        .await
+                        .map_err(IntoResponse::into_response)?
+                }
+            };
 
             // The upstream registry may return application/octet-stream for
             // npm tarballs, which also gets persisted by the proxy cache.
@@ -5136,7 +5413,7 @@ async fn npm_cached_tarball_source(
         .await
         .ok()
         .flatten()?;
-    let packument: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    let packument = parse_npm_packument_dists(&content)?;
     npm_tarball_source_for_filename(&packument, filename, upstream_url)
 }
 
@@ -5399,6 +5676,13 @@ fn parse_npm_publish_payload(
 
     let mut versions = Vec::new();
     for (version, version_data) in versions_obj {
+        if json_contains_nul(version_data) {
+            return Err(AppError::Validation(format!(
+                "Metadata for version {} contains a NUL character",
+                version
+            ))
+            .into_response());
+        }
         let parsed =
             extract_version_tarball(package_name, version, version_data.clone(), attachments_obj)?;
         versions.push(parsed);
@@ -5416,6 +5700,17 @@ fn parse_npm_publish_payload(
         versions,
         dist_tags,
     })
+}
+
+fn json_contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(json_contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| k.contains('\0') || json_contains_nul(v)),
+        _ => false,
+    }
 }
 
 /// Extract and decode the tarball for a single version from the attachments map.
@@ -5476,6 +5771,7 @@ async fn store_npm_version(
     package_name: &str,
     user_id: uuid::Uuid,
     ver: &NpmVersionToPublish,
+    enqueue_sync_tasks: bool,
 ) -> Result<(), Response> {
     let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
 
@@ -5580,6 +5876,24 @@ async fn store_npm_version(
     .fetch_one(&mut *tx)
     .await
     .map_err(map_db_err)?;
+
+    // Store metadata
+    let npm_metadata = serde_json::json!({
+        "name": package_name,
+        "version": ver.version,
+        "version_data": ver.version_data,
+    });
+
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'npm', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+    )
+    .bind(artifact_id)
+    .bind(&npm_metadata)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_err)?;
     tx.commit().await.map_err(map_db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
@@ -5590,23 +5904,6 @@ async fn store_npm_version(
         repo_id,
         artifact_id,
     )
-    .await;
-
-    // Store metadata
-    let npm_metadata = serde_json::json!({
-        "name": package_name,
-        "version": ver.version,
-        "version_data": ver.version_data,
-    });
-
-    let _ = sqlx::query(
-        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
-         VALUES ($1, 'npm', $2) \
-         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
-    )
-    .bind(artifact_id)
-    .bind(&npm_metadata)
-    .execute(&state.db)
     .await;
 
     record_npm_install_script_analysis(state, artifact_id, &ver.version_data).await;
@@ -5630,6 +5927,18 @@ async fn store_npm_version(
     )
     .await;
 
+    if enqueue_sync_tasks {
+        crate::services::peer_instance_service::PeerInstanceService::new(state.db.clone())
+            .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo_id,
+                path: &artifact_path,
+                size_bytes,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+    }
+
     info!(
         "npm publish: {} {} ({}) to repo {}",
         package_name, ver.version, ver.tarball_filename, repo_key
@@ -5652,8 +5961,8 @@ async fn store_npm_version(
 /// script differs — a `package.json` field here, a payload file there — and
 /// the rules operate on shell text, which is common to both.
 ///
-/// Best-effort, like the metadata write above it: the artifact row is already
-/// committed, so a failure must not fail an otherwise-successful publish. But
+/// Best-effort: the artifact row and its metadata are already committed, so a
+/// failure must not fail an otherwise-successful publish. But
 /// a package with no install scripts still records a row, because "we looked
 /// and there were none" and "we never looked" must stay distinguishable
 /// (#4047).
@@ -5737,6 +6046,7 @@ async fn publish_package(
     repo.reject_if_promotion_only(false)?;
 
     let parsed = parse_npm_publish_payload(&body, package_name)?;
+    let enqueue_sync_tasks = !super::is_replication_request(headers);
 
     for ver in &parsed.versions {
         store_npm_version(
@@ -5747,6 +6057,7 @@ async fn publish_package(
             package_name,
             user_id,
             ver,
+            enqueue_sync_tasks,
         )
         .await?;
     }
@@ -5978,6 +6289,367 @@ async fn dist_tags_delete(
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Unpublish (`npm unpublish`) -- #4025
+// ---------------------------------------------------------------------------
+//
+// libnpmpublish's unpublish sends, for `npm unpublish <pkg>@<version>`:
+// `GET /{pkg}?write=true`, then `PUT /{pkg}/-rev/{_rev}` with that packument
+// minus the version, then `DELETE /{pkg}/-/{file}/-rev/{_rev}`; and for the
+// whole package (`npm unpublish <pkg> --force`, or the last version)
+// `DELETE /{pkg}/-rev/{_rev}`. It reads a 404 on any of them as "already
+// gone", so these must exist or an unpublish silently does nothing.
+//
+// This registry keeps no packument revisions and serves no `_rev`, so the
+// client sends `-rev/undefined`; any `{rev}` is accepted.
+
+/// One live artifact row of an npm package, as unpublish sees it.
+struct NpmPackageRow {
+    id: uuid::Uuid,
+    version: Option<String>,
+    path: String,
+}
+
+/// Authorize an unpublish and resolve the hosted repository it acts on.
+///
+/// The same gates as the REST artifact delete: an authenticated principal,
+/// the `delete:artifacts` token scope, the repository `delete` action
+/// (deny-by-default, #2603), and no direct delete on a `promotion_only`
+/// repository for non-approvers. Remote and virtual repositories are refused
+/// with the publish route's answers (405 / 400); a virtual repository is not
+/// routed to its deployment target, because that member need not be the one
+/// holding the package.
+async fn resolve_npm_unpublish_target(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+) -> Result<RepoInfo, Response> {
+    let auth = auth.ok_or_else(|| {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Basic realm=\"npm\"")
+            .body(Body::from("Authentication required"))
+            .unwrap()
+    })?;
+    crate::api::middleware::auth::require_scope_response(Some(auth), "delete:artifacts")?;
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    crate::api::handlers::repositories::require_repo_action(
+        auth,
+        repo.id,
+        "delete",
+        &state.permission_service,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    proxy_helpers::reject_direct_delete_if_promotion_only(
+        repo.promotion_only,
+        auth.is_admin || auth.is_service_account,
+    )?;
+    Ok(repo)
+}
+
+async fn fetch_npm_package_rows(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    package: &str,
+) -> Result<Vec<NpmPackageRow>, Response> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, version, path FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(package)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+    Ok(rows
+        .iter()
+        .map(|r| NpmPackageRow {
+            id: r.get("id"),
+            version: r.get("version"),
+            path: r.get("path"),
+        })
+        .collect())
+}
+
+/// The versions a `PUT /{pkg}/-rev/{rev}` packument keeps.
+#[allow(clippy::result_large_err)]
+fn parse_unpublish_packument(
+    body: &[u8],
+    package: &str,
+) -> Result<std::collections::HashSet<String>, Response> {
+    let invalid = |msg: &str| AppError::Validation(msg.to_string()).into_response();
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| invalid("packument body must be JSON"))?;
+    if let Some(name) = value.get("name") {
+        if name.as_str() != Some(package) {
+            return Err(invalid("packument name does not match the package"));
+        }
+    }
+    let versions = value
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| invalid("packument must carry a versions object"))?;
+    Ok(versions.keys().cloned().collect())
+}
+
+/// Rows whose version is absent from the kept set. Rows without a version are
+/// never selected.
+fn rows_not_kept<'a>(
+    rows: &'a [NpmPackageRow],
+    kept: &std::collections::HashSet<String>,
+) -> Vec<&'a NpmPackageRow> {
+    rows.iter()
+        .filter(|r| r.version.as_ref().is_some_and(|v| !kept.contains(v)))
+        .collect()
+}
+
+/// Remove `rows` through `ArtifactService` (soft delete, audit,
+/// `artifact.deleted` webhook, replication delete tasks, search removal),
+/// drop dist-tags that pointed at a removed version (`latest` is then derived
+/// again from what is left), and invalidate the packument caches.
+async fn unpublish_npm_rows(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package: &str,
+    rows: &[&NpmPackageRow],
+) -> Result<(), Response> {
+    let storage = state.storage_for_repo_or_500(&repo.storage_location())?;
+    let artifact_service = state.create_artifact_service(storage);
+    let mut removed_versions: Vec<String> = Vec::new();
+    for row in rows {
+        match artifact_service.delete(row.id).await {
+            // A concurrent unpublish got there first: the row is gone either way.
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e.into_response()),
+        }
+        removed_versions.extend(row.version.clone());
+    }
+    sqlx::query(
+        "UPDATE npm_dist_tags SET tags = COALESCE( \
+             (SELECT jsonb_object_agg(key, value) FROM jsonb_each(tags) \
+              WHERE NOT (value #>> '{}' = ANY($3))), '{}'::jsonb), updated_at = NOW() \
+         WHERE repository_id = $1 AND name = $2",
+    )
+    .bind(repo.id)
+    .bind(package)
+    .bind(&removed_versions)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo.id)
+        .execute(&state.db)
+        .await;
+    invalidate_packument_caches(state, repo.id, &repo.key, package).await;
+    info!(
+        "npm unpublish: {} versions {:?} from repo {}",
+        package, removed_versions, repo.key
+    );
+    Ok(())
+}
+
+fn npm_ok_response() -> Response {
+    build_json_metadata_response(serde_json::json!({"ok": true}).to_string())
+}
+
+fn npm_package_not_found(package: &str) -> Response {
+    AppError::NotFound(format!("Package {} not found", package)).into_response()
+}
+
+/// `PUT /{pkg}/-rev/{rev}`: every stored version missing from the body's
+/// `versions` is unpublished. A rewrite that removes nothing is refused rather
+/// than answered `ok`: this registry does not apply other packument edits
+/// (owners, metadata) through this route, and must not report them done.
+async fn unpublish_versions_for(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    package: &str,
+    body: &[u8],
+) -> Result<Response, Response> {
+    let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
+    let kept = parse_unpublish_packument(body, package)?;
+    let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
+    if rows.is_empty() {
+        return Err(npm_package_not_found(package));
+    }
+    let removed = rows_not_kept(&rows, &kept);
+    if removed.is_empty() {
+        return Err(AppError::Validation(
+            "the packument removes no version; this registry only applies version \
+             removal (npm unpublish) through /-rev/"
+                .to_string(),
+        )
+        .into_response());
+    }
+    unpublish_npm_rows(state, &repo, package, &removed).await?;
+    Ok(npm_ok_response())
+}
+
+/// `DELETE /{pkg}/-rev/{rev}`: unpublish every version of the package.
+async fn unpublish_package_for(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    package: &str,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
+    let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
+    if rows.is_empty() {
+        return Err(npm_package_not_found(package));
+    }
+    let all: Vec<&NpmPackageRow> = rows.iter().collect();
+    unpublish_npm_rows(state, &repo, package, &all).await?;
+    let _ = sqlx::query("DELETE FROM npm_dist_tags WHERE repository_id = $1 AND name = $2")
+        .bind(repo.id)
+        .bind(package)
+        .execute(&state.db)
+        .await;
+    Ok(npm_ok_response())
+}
+
+/// `DELETE /{pkg}/-/{file}/-rev/{rev}`: unpublish the version whose tarball
+/// is `file`. After a version unpublish this is already gone and answers 404,
+/// which the client treats as done.
+async fn unpublish_tarball_for(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    package: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
+    let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
+    let matching: Vec<&NpmPackageRow> = rows
+        .iter()
+        .filter(|r| r.path.rsplit('/').next() == Some(filename))
+        .collect();
+    if matching.is_empty() {
+        return Err(
+            AppError::NotFound(format!("Tarball {} of {} not found", filename, package))
+                .into_response(),
+        );
+    }
+    unpublish_npm_rows(state, &repo, package, &matching).await?;
+    Ok(npm_ok_response())
+}
+
+#[allow(clippy::result_large_err)]
+fn unscoped_unpublish_name(package: &str) -> Result<String, Response> {
+    let package = normalize_package_name(package);
+    validate_package_name(&package)?;
+    Ok(package)
+}
+
+#[allow(clippy::result_large_err)]
+fn scoped_unpublish_name(scope: &str, package: &str) -> Result<String, Response> {
+    let full_name = build_scoped_package_name(
+        &normalize_package_name(scope),
+        &normalize_package_name(package),
+    );
+    validate_package_name(&full_name)?;
+    Ok(full_name)
+}
+
+/// `@:scope/:package/:version` carries an unpublish only when npm sent the
+/// encoded `@scope%2fname/-rev/{rev}` shape; `scope` is then `scope/name`.
+#[allow(clippy::result_large_err)]
+fn encoded_scoped_unpublish_name(scope: &str, rev_segment: &str) -> Result<String, Response> {
+    if rev_segment != "-rev" {
+        return Err((StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response());
+    }
+    let full_name = format!("@{}", normalize_package_name(scope));
+    if !full_name[1..].contains('/') {
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
+    validate_package_name(&full_name)?;
+    Ok(full_name)
+}
+
+async fn unpublish_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = unscoped_unpublish_name(&package)?;
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+}
+
+async fn unpublish_scoped_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = scoped_unpublish_name(&scope, &package)?;
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+}
+
+async fn unpublish_encoded_scoped_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+}
+
+async fn unpublish_package(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let package = unscoped_unpublish_name(&package)?;
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+}
+
+async fn unpublish_scoped_package(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let package = scoped_unpublish_name(&scope, &package)?;
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+}
+
+async fn unpublish_encoded_scoped_package(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+}
+
+async fn unpublish_tarball(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, filename, _rev)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let package = unscoped_unpublish_name(&package)?;
+    unpublish_tarball_for(&state, auth.as_ref(), &repo_key, &package, &filename).await
+}
+
+async fn unpublish_scoped_tarball(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, package, filename, _rev)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let package = scoped_unpublish_name(&scope, &package)?;
+    unpublish_tarball_for(&state, auth.as_ref(), &repo_key, &package, &filename).await
 }
 
 // ---------------------------------------------------------------------------
@@ -7152,6 +7824,46 @@ mod tests {
             .await;
     }
 
+    /// #4765: with the database gone, the npm envelope (`{"error": …}`) an
+    /// `npm install` reads must be a retryable 503 with `Retry-After: 1`, not
+    /// the 500 it answered before (`db_status` shed only pool timeouts). The
+    /// error is the one a closed pool really returns, run through the same
+    /// `map_status(db_status, db_err_message)` the npm DB site uses.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_map_status_db_unavailable_is_503_with_retry_after_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+        let e = sqlx::query("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect_err("a closed pool cannot run a query");
+
+        let response = map_status(
+            crate::api::handlers::db_status(&e),
+            crate::api::handlers::db_err_message(&e),
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("npm JSON envelope");
+        assert_eq!(
+            body["error"],
+            "Database is temporarily unavailable, retry shortly"
+        );
+    }
+
     /// #3667: the npm error envelope (`{"error": …}`) is built here rather
     /// than by `db_err`, so the message it carries must be the stable text.
     #[tokio::test]
@@ -7287,12 +7999,12 @@ mod tests {
             }
         });
         assert_eq!(
-            npm_integrity_for_filename(&packument, "my-pkg-1.0.0.tgz"),
+            npm_integrity_for_filename(&dists(&packument), "my-pkg-1.0.0.tgz"),
             Some(CacheCommitDigest::Sha1Hex(shasum.clone()))
         );
         // A filename no version serves resolves to no gate.
         assert_eq!(
-            npm_integrity_for_filename(&packument, "my-pkg-9.9.9.tgz"),
+            npm_integrity_for_filename(&dists(&packument), "my-pkg-9.9.9.tgz"),
             None
         );
         // Scoped tarball URL shapes match by basename too.
@@ -7302,7 +8014,7 @@ mod tests {
                 "shasum": &shasum}}}}
         );
         assert_eq!(
-            npm_integrity_for_filename(&scoped, "pkg-1.0.0.tgz"),
+            npm_integrity_for_filename(&dists(&scoped), "pkg-1.0.0.tgz"),
             Some(CacheCommitDigest::Sha1Hex(shasum))
         );
     }
@@ -7321,11 +8033,117 @@ mod tests {
                 "shasum": "0000000000000000000000000000000000000000"}}}}
         );
         assert_eq!(
-            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            npm_integrity_for_filename(&dists(&packument), "p-1.0.0.tgz"),
             Some(CacheCommitDigest::Sha512Hex(hex::encode(
                 sha2::Sha512::digest(b"real")
             )))
         );
+    }
+
+    fn dists(packument: &serde_json::Value) -> NpmPackumentDists<'_> {
+        <NpmLenient<NpmPackumentDists<'_>> as serde::Deserialize>::deserialize(packument)
+            .expect("packument deserializes")
+            .0
+            .expect("packument is an object")
+    }
+
+    #[test]
+    fn test_npm_packument_dists_reads_escaped_strings() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"escaped"));
+        let body = format!(
+            r#"{{"versions":{{"1.0.0":{{"dist":{{"tarball":"https:\/\/reg.example\/p\/-\/p-1.0.0.tgz","shasum":"{shasum}"}}}}}}}}"#
+        );
+        let packument = parse_npm_packument_dists(body.as_bytes()).expect("packument parses");
+        assert!(matches!(
+            packument.versions.keys().next(),
+            Some(Cow::Borrowed("1.0.0"))
+        ));
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+    }
+
+    #[test]
+    fn test_npm_packument_dists_tolerates_lone_surrogate_in_skipped_field() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"surrogate"));
+        let body = format!(
+            r#"{{"readme":"\ud800","versions":{{"1.0.0":{{"description":"\udfff","dist":{{"tarball":"https://reg.example/p/-/p-1.0.0.tgz","shasum":"{shasum}"}}}}}}}}"#
+        );
+        assert!(serde_json::from_slice::<serde_json::Value>(body.as_bytes()).is_err());
+        let packument = parse_npm_packument_dists(body.as_bytes()).expect("packument parses");
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+    }
+
+    #[test]
+    fn test_npm_packument_dists_ignores_mismatched_types() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"fallback"));
+        let body = serde_json::json!({
+            "name": 42,
+            "time": {"1.0.0": "2020-01-01T00:00:00.000Z"},
+            "versions": {
+                "0.0.1": "not-an-object",
+                "0.0.2": ["p-0.0.2.tgz"],
+                "0.0.3": {"dist": "https://reg.example/p/-/p-0.0.3.tgz"},
+                "0.0.4": {"dist": {"tarball": {"url": "https://reg.example/p/-/p-0.0.4.tgz"}}},
+                "1.0.0": {"name": null, "version": 1, "dist": {
+                    "tarball": "https://reg.example/p/-/p-1.0.0.tgz",
+                    "integrity": 7,
+                    "shasum": &shasum,
+                    "signatures": [{"keyid": "k", "sig": "s"}]}},
+            }
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let packument = parse_npm_packument_dists(&bytes).expect("packument parses");
+        assert!(packument.name.is_none());
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+        for file in ["p-0.0.2.tgz", "p-0.0.3.tgz", "p-0.0.4.tgz"] {
+            assert!(npm_dist_for_filename(&packument, file, None).is_none());
+        }
+    }
+
+    #[test]
+    fn test_npm_packument_dists_identity_falls_back_to_document_name_and_key() {
+        let origin = "https://npm.pkg.github.com";
+        let body = format!(
+            r#"{{"versions":{{"1.2.3":{{"version":["x"],"dist":{{"tarball":"{origin}/download/{GHP_SCOPED}/1.2.3/abc"}}}}}},"name":"{GHP_SCOPED}"}}"#
+        );
+        let packument = parse_npm_packument_dists(body.as_bytes()).expect("packument parses");
+        assert_eq!(
+            npm_tarball_source_for_filename(&packument, "example-package-1.2.3.tgz", origin)
+                .as_deref(),
+            Some("https://npm.pkg.github.com/download/@example-org/example-package/1.2.3/abc")
+        );
+    }
+
+    #[test]
+    fn test_npm_packument_dists_last_duplicate_wins_and_non_objects_match_nothing() {
+        let body = br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://reg.example/p/-/p-1.0.0.tgz"},"dist":{"tarball":"https://reg.example/p/-/p-1.0.1.tgz"}}}}"#;
+        let packument = parse_npm_packument_dists(body).expect("packument parses");
+        assert!(npm_dist_for_filename(&packument, "p-1.0.0.tgz", None).is_none());
+        assert_eq!(
+            npm_dist_for_filename(&packument, "p-1.0.1.tgz", None).map(|(_, url)| url),
+            Some("https://reg.example/p/-/p-1.0.1.tgz")
+        );
+        assert!(parse_npm_packument_dists(b"[]").is_none());
+        assert!(parse_npm_packument_dists(b"<html>not json</html>").is_none());
+        assert!(parse_npm_packument_dists(br#"{"versions":{}} trailing"#).is_none());
+        assert!(parse_npm_packument_dists(br#"{"versions":[1]}"#)
+            .expect("packument parses")
+            .versions
+            .is_empty());
     }
 
     /// DB-backed (#2327 secondary): a virtual repo with two Remote members —
@@ -9879,6 +10697,24 @@ mod tests {
                 "pkg",
                 "missing attachments",
             ),
+            (
+                serde_json::json!({
+                    "name": "pkg",
+                    "versions": { "1.0.0": { "keywords": ["ok", "a\u{0}b"] } },
+                    "_attachments": { "pkg-1.0.0.tgz": { "data": "dGVzdA==" } }
+                }),
+                "pkg",
+                "NUL in version metadata",
+            ),
+            (
+                serde_json::json!({
+                    "name": "pkg",
+                    "versions": { "1.0.0": { "a\u{0}b": true } },
+                    "_attachments": { "pkg-1.0.0.tgz": { "data": "dGVzdA==" } }
+                }),
+                "pkg",
+                "NUL in version metadata key",
+            ),
         ];
 
         for (payload, url_name, label) in cases {
@@ -11095,27 +11931,30 @@ mod tests {
         let packument = ghp_packument(origin, &format!("sha512-{sha512_b64}"));
         let file = "example-package-1.2.3.tgz";
         assert_eq!(
-            npm_tarball_source_for_filename(&packument, file, origin).as_deref(),
+            npm_tarball_source_for_filename(&dists(&packument), file, origin).as_deref(),
             Some("https://npm.pkg.github.com/download/@example-org/example-package/1.2.3/0123456789abcdef")
         );
         assert_eq!(
-            npm_integrity_for_filename_on_upstream(&packument, file, Some(origin)),
+            npm_integrity_for_filename_on_upstream(&dists(&packument), file, Some(origin)),
             Some(CacheCommitDigest::Sha512Hex(hex::encode(
                 sha2::Sha512::digest(b"ghp")
             )))
         );
         // A different upstream origin neither relocates nor matches.
         assert_eq!(
-            npm_tarball_source_for_filename(&packument, file, "https://other.example"),
+            npm_tarball_source_for_filename(&dists(&packument), file, "https://other.example"),
             None
         );
-        assert!(npm_dist_for_filename(&packument, file, Some("https://other.example")).is_none());
+        assert!(
+            npm_dist_for_filename(&dists(&packument), file, Some("https://other.example"))
+                .is_none()
+        );
         // A registry-standard layout keeps the canonical fetch path.
         let standard = serde_json::json!({"versions": {"1.0.0": {"name": "p", "version": "1.0.0",
             "dist": {"tarball": format!("{origin}/p/-/p-1.0.0.tgz")}}}});
-        assert!(npm_dist_for_filename(&standard, "p-1.0.0.tgz", Some(origin)).is_some());
+        assert!(npm_dist_for_filename(&dists(&standard), "p-1.0.0.tgz", Some(origin)).is_some());
         assert_eq!(
-            npm_tarball_source_for_filename(&standard, "p-1.0.0.tgz", origin),
+            npm_tarball_source_for_filename(&dists(&standard), "p-1.0.0.tgz", origin),
             None
         );
     }
@@ -11290,6 +12129,52 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(&body[..], bytes);
         }
+    }
+
+    #[tokio::test]
+    async fn test_remote_warm_tarball_hit_does_not_read_packument_4692_db() {
+        let upstream = wiremock::MockServer::start().await;
+        let Some((fx, state)) = remote_on(&upstream).await else {
+            return;
+        };
+        let bytes = mount_ghp_upstream(&upstream, None, 1..=1).await;
+        let proxy = state.proxy_service.clone().expect("proxy service");
+        let tarball_path = format!("{GHP_SCOPED}/-/example-package-1.2.3.tgz");
+
+        let cold = drain_download(ghp_download(&state, &fx.repo_key).await).await;
+        let mut committed = false;
+        for _ in 0..2400 {
+            if let Ok(Some(_)) = proxy
+                .get_cached_artifact_by_path(&fx.repo_key, &tarball_path)
+                .await
+            {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(committed, "tarball never committed to the proxy cache");
+        proxy
+            .invalidate_cache_by_key(&fx.repo_key, GHP_SCOPED)
+            .await
+            .expect("evict cached packument");
+        let warm = drain_download(ghp_download(&state, &fx.repo_key).await).await;
+        let packument_fetches = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/@example-org%2Fexample-package")
+            .count();
+        fx.teardown().await;
+
+        for served in [cold, warm] {
+            let (status, body) =
+                served.unwrap_or_else(|status| panic!("tarball must be served: {status}"));
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], bytes);
+        }
+        assert_eq!(packument_fetches, 1);
     }
 
     /// #3785, Virtual-over-Remote: a virtual repo whose Remote member is
@@ -12868,6 +13753,125 @@ mod tests {
         assert_eq!(dist_tags["next"], "2.0.0-rc.1");
         // ...and `latest` is the highest STABLE version, not the prerelease.
         assert_eq!(dist_tags["latest"], "1.1.0");
+    }
+
+    #[tokio::test]
+    async fn publish_queues_push_sync_tasks_for_each_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{
+            PeerInstanceService, RegisterPeerInstanceRequest, ReplicationMode,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let peer_service = PeerInstanceService::new(fx.pool.clone());
+        let peer = peer_service
+            .register(RegisterPeerInstanceRequest {
+                name: format!("npm-repl-peer-{}", fx.repo_id),
+                endpoint_url: "https://peer.example.test".to_string(),
+                region: None,
+                cache_size_bytes: 1024 * 1024,
+                sync_filter: None,
+                api_key: "peer-key".to_string(),
+            })
+            .await
+            .expect("register test peer");
+        peer_service
+            .assign_repository(
+                peer.id,
+                fx.repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .expect("assign npm repo to peer");
+
+        let publish = |versions: &[&str], headers: HeaderMap| {
+            let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+            let mut version_map = serde_json::Map::new();
+            let mut attachments = serde_json::Map::new();
+            for v in versions {
+                version_map.insert(
+                    v.to_string(),
+                    serde_json::json!({ "name": "repl-widget", "version": v }),
+                );
+                attachments.insert(
+                    format!("repl-widget-{v}.tgz"),
+                    serde_json::json!({ "data": tarball_b64 }),
+                );
+            }
+            let body = serde_json::json!({
+                "name": "repl-widget",
+                "versions": version_map,
+                "_attachments": attachments,
+            });
+            let state = fx.state.clone();
+            let auth = tdh::make_auth(fx.user_id, &fx.username);
+            let repo_key = fx.repo_key.clone();
+            async move {
+                super::publish_package(
+                    &state,
+                    Some(auth),
+                    &repo_key,
+                    "repl-widget",
+                    &headers,
+                    Bytes::from(serde_json::to_vec(&body).expect("serialize publish body")),
+                )
+                .await
+                .map(|r| r.status())
+                .map_err(|r| r.status())
+            }
+        };
+
+        assert!(publish(&["1.0.0", "1.1.0"], HeaderMap::new()).await.is_ok());
+
+        let mut replicated = HeaderMap::new();
+        replicated.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        assert!(publish(&["2.0.0"], replicated).await.is_ok());
+
+        let queued: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT a.version, am.format FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
+               AND a.repository_id = $2 \
+             ORDER BY a.version",
+        )
+        .bind(peer.id)
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("list npm sync tasks");
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND name = 'repl-widget' AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count npm artifacts");
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(stored, 3);
+        assert_eq!(
+            queued,
+            vec![
+                ("1.0.0".to_string(), Some("npm".to_string())),
+                ("1.1.0".to_string(), Some("npm".to_string())),
+            ]
+        );
     }
 
     /// #1543 finding-2: a plain `npm publish` of a PRERELEASE must not pin
@@ -18251,6 +19255,476 @@ mod serve_key_4365_tests {
             );
             assert_eq!(got.cache_key, key);
             assert!(got.scannable);
+        }
+    }
+}
+
+/// #4025: `npm unpublish` drives `PUT /{pkg}/-rev/{rev}` (packument rewrite
+/// without the version), `DELETE /{pkg}/-/{file}/-rev/{rev}` (the tarball) and
+/// `DELETE /{pkg}/-rev/{rev}` (the whole package). None of them was routed, so
+/// the client read the 404 as "already gone" and exited 0 having removed
+/// nothing.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod unpublish_4025_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// `npm publish` body for one version, optionally with extra dist-tags.
+    fn publish_body(package: &str, version: &str, tags: serde_json::Value) -> bytes::Bytes {
+        use base64::Engine;
+        let short = package.rsplit('/').next().unwrap();
+        let tarball_b64 =
+            base64::engine::general_purpose::STANDARD.encode(format!("tgz-{package}-{version}"));
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": package,
+                "dist-tags": tags,
+                "versions": { version: { "name": package, "version": version } },
+                "_attachments": {
+                    format!("{short}-{version}.tgz"): { "data": tarball_b64 }
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// A repository owner (read/write/delete) on the fixture repository.
+    fn owner_router(fx: &tdh::Fixture) -> axum::Router {
+        fx.router_with_auth(super::router())
+    }
+
+    async fn make_owner(fx: &tdh::Fixture) {
+        tdh::grant_repo_role(&fx.pool, fx.repo_id, fx.user_id, "repository-owner").await;
+    }
+
+    async fn publish(fx: &tdh::Fixture, uri_name: &str, name: &str, version: &str) {
+        let tags = serde_json::json!({ "latest": version });
+        let (status, body) = tdh::send(
+            owner_router(fx),
+            tdh::put_json(
+                format!("/{}/{}", fx.repo_key, uri_name),
+                publish_body(name, version, tags),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish {name}@{version}: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    async fn packument(fx: &tdh::Fixture, uri_name: &str) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(
+            owner_router(fx),
+            tdh::get(format!("/{}/{}?write=true", fx.repo_key, uri_name)),
+        )
+        .await;
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn tarball_status(fx: &tdh::Fixture, tarball_path: &str) -> StatusCode {
+        tdh::send(
+            owner_router(fx),
+            tdh::get(format!("/{}/{}", fx.repo_key, tarball_path)),
+        )
+        .await
+        .0
+    }
+
+    fn request(
+        method: &str,
+        uri: String,
+        body: bytes::Bytes,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_parse_unpublish_packument_4025() {
+        let kept = super::parse_unpublish_packument(
+            br#"{"name":"a","versions":{"1.0.0":{},"2.0.0":{}}}"#,
+            "a",
+        )
+        .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains("1.0.0") && kept.contains("2.0.0"));
+        // A body without a name is accepted; one naming another package is not.
+        assert!(super::parse_unpublish_packument(br#"{"versions":{}}"#, "a").is_ok());
+        for bad in [
+            &br#"{"name":"b","versions":{}}"#[..],
+            br#"{"name":"a"}"#,
+            b"not json",
+        ] {
+            let err = super::parse_unpublish_packument(bad, "a").unwrap_err();
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn test_rows_not_kept_skips_versionless_rows_4025() {
+        let row = |v: Option<&str>| super::NpmPackageRow {
+            id: uuid::Uuid::new_v4(),
+            version: v.map(str::to_string),
+            path: String::new(),
+        };
+        let rows = vec![row(Some("1.0.0")), row(Some("2.0.0")), row(None)];
+        let kept: std::collections::HashSet<String> = ["1.0.0".to_string()].into();
+        let removed = super::rows_not_kept(&rows, &kept);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn test_encoded_scoped_unpublish_name_4025() {
+        assert_eq!(
+            super::encoded_scoped_unpublish_name("scope/name", "-rev").unwrap(),
+            "@scope/name"
+        );
+        assert_eq!(
+            super::encoded_scoped_unpublish_name("scope/name", "1.0.0")
+                .unwrap_err()
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            super::encoded_scoped_unpublish_name("scope", "-rev")
+                .unwrap_err()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// What libnpmpublish sends for `npm unpublish <pkg>@<version>`: the
+    /// `?write=true` packument with the version (and every dist-tag pointing
+    /// at it) removed, PUT to `/{pkg}/-rev/{_rev}`. This registry sends no
+    /// `_rev`, so the client's URL carries `undefined`.
+    async fn npm_unpublish_version(
+        fx: &tdh::Fixture,
+        app: axum::Router,
+        uri_name: &str,
+        version: &str,
+    ) -> (StatusCode, bytes::Bytes) {
+        let (_, mut pkg) = packument(fx, uri_name).await;
+        pkg["versions"].as_object_mut().unwrap().remove(version);
+        let tags = pkg["dist-tags"].as_object_mut().unwrap();
+        tags.retain(|_, v| v.as_str() != Some(version));
+        tdh::send(
+            app,
+            request(
+                "PUT",
+                format!("/{}/{}/-rev/undefined", fx.repo_key, uri_name),
+                bytes::Bytes::from(serde_json::to_vec(&pkg).unwrap()),
+            ),
+        )
+        .await
+    }
+
+    fn version_keys(pkg: &serde_json::Value) -> Vec<String> {
+        let mut v: Vec<String> = pkg["versions"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn test_npm_unpublish_version_removes_it_and_recomputes_latest_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-widget";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        publish(&fx, pkg, pkg, "1.1.0").await;
+        // 2.0.0 also carries a custom `beta` tag.
+        let (status, _) = tdh::send(
+            owner_router(&fx),
+            tdh::put_json(
+                format!("/{}/{}", fx.repo_key, pkg),
+                publish_body(
+                    pkg,
+                    "2.0.0",
+                    serde_json::json!({"latest": "2.0.0", "beta": "2.0.0"}),
+                ),
+            ),
+        )
+        .await;
+        assert!(status.is_success());
+        let (_, before) = packument(&fx, pkg).await;
+        assert_eq!(before["dist-tags"]["latest"], "2.0.0");
+        let removed_id = tdh::artifact_id_at(
+            &fx.pool,
+            fx.repo_id,
+            &format!("{pkg}/2.0.0/{pkg}-2.0.0.tgz"),
+        )
+        .await;
+
+        let (status, body) = npm_unpublish_version(&fx, owner_router(&fx), pkg, "2.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        // The client's follow-up tarball DELETE: the version is already gone.
+        let (status, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-/{pkg}-2.0.0.tgz/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, after) = packument(&fx, pkg).await;
+        let gone = tarball_status(&fx, &format!("{pkg}/-/{pkg}-2.0.0.tgz")).await;
+        let kept = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.1.0.tgz")).await;
+        let audits = tdh::audit_count_eventually(&fx.pool, removed_id, "ARTIFACT_DELETED", 1).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(version_keys(&after), vec!["1.0.0", "1.1.0"]);
+        assert_eq!(after["dist-tags"]["latest"], "1.1.0", "latest recomputed");
+        assert!(
+            after["dist-tags"].get("beta").is_none(),
+            "beta pointed at 2.0.0"
+        );
+        assert_eq!(gone, StatusCode::NOT_FOUND, "unpublished tarball 404s");
+        assert_eq!(kept, StatusCode::OK, "other versions remain");
+        assert_eq!(audits, 1, "the delete goes through ArtifactService (audit)");
+    }
+
+    #[tokio::test]
+    async fn test_npm_unpublish_tarball_delete_removes_version_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-tar";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        publish(&fx, pkg, pkg, "2.0.0").await;
+        let (status, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-/{pkg}-1.0.0.tgz/-rev/3-deadbeef", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (_, after) = packument(&fx, pkg).await;
+        let gone = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.0.0.tgz")).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(version_keys(&after), vec!["2.0.0"]);
+        assert_eq!(gone, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_npm_unpublish_whole_package_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-all";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        publish(&fx, pkg, pkg, "2.0.0").await;
+        let (status, body) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (meta, _) = packument(&fx, pkg).await;
+        let tar = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.0.0.tgz")).await;
+        // A second whole-package unpublish has nothing left to remove.
+        let (again, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(meta, StatusCode::NOT_FOUND, "packument 404s");
+        assert_eq!(tar, StatusCode::NOT_FOUND);
+        assert_eq!(again, StatusCode::NOT_FOUND);
+    }
+
+    /// Scoped packages: npm addresses the packument as `@scope%2fname` (one
+    /// segment) and the tarball as `@scope/name/-/name-<v>.tgz`.
+    #[tokio::test]
+    async fn test_npm_unpublish_scoped_package_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let name = "@unpub/scoped";
+        for v in ["1.0.0", "2.0.0", "3.0.0"] {
+            publish(&fx, "@unpub/scoped", name, v).await;
+        }
+
+        // Version unpublish through the encoded single segment.
+        let (status, body) =
+            npm_unpublish_version(&fx, owner_router(&fx), "@unpub%2fscoped", "3.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        // Version unpublish through the two-segment form.
+        let (status, body) =
+            npm_unpublish_version(&fx, owner_router(&fx), "@unpub/scoped", "2.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (_, mid) = packument(&fx, "@unpub/scoped").await;
+        let gone = tarball_status(&fx, "@unpub/scoped/-/scoped-3.0.0.tgz").await;
+
+        // Scoped tarball DELETE of what is left, then the whole package.
+        let (tar_del, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!(
+                    "/{}/@unpub/scoped/-/scoped-1.0.0.tgz/-rev/undefined",
+                    fx.repo_key
+                ),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        publish(&fx, "@unpub/scoped", name, "4.0.0").await;
+        let (pkg_del, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/@unpub%2fscoped/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (meta, _) = packument(&fx, "@unpub%2fscoped").await;
+        fx.teardown().await;
+        assert_eq!(version_keys(&mid), vec!["1.0.0"]);
+        assert_eq!(mid["dist-tags"]["latest"], "1.0.0");
+        assert_eq!(gone, StatusCode::NOT_FOUND);
+        assert_eq!(tar_del, StatusCode::OK);
+        assert_eq!(pkg_del, StatusCode::OK);
+        assert_eq!(meta, StatusCode::NOT_FOUND);
+    }
+
+    /// A read-only token and a write-only member are both refused, and the
+    /// version stays published.
+    #[tokio::test]
+    async fn test_npm_unpublish_requires_delete_scope_and_action_4025() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "unpub-guarded";
+        // The fixture user is a `developer` (read/write, no delete).
+        let (status, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put_json(
+                format!("/{}/{}", fx.repo_key, pkg),
+                publish_body(pkg, "1.0.0", serde_json::json!({"latest": "1.0.0"})),
+            ),
+        )
+        .await;
+        assert!(status.is_success());
+        publish(&fx, pkg, pkg, "1.1.0").await;
+
+        let (developer, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+
+        make_owner(&fx).await;
+        let read_only = crate::api::middleware::auth::AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+            ..tdh::make_auth(fx.user_id, &fx.username)
+        };
+        let ro_app = || tdh::router_with_auth(super::router(), fx.state.clone(), read_only.clone());
+        let (ro_put, _) = npm_unpublish_version(&fx, ro_app(), pkg, "1.1.0").await;
+        let (ro_tar, _) = tdh::send(
+            ro_app(),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-/{pkg}-1.0.0.tgz/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (ro_pkg, _) = tdh::send(
+            ro_app(),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (anon, _) = tdh::send(
+            fx.router_anon(super::router()),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/undefined", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (_, after) = packument(&fx, pkg).await;
+        fx.teardown().await;
+        assert_eq!(developer, StatusCode::FORBIDDEN, "write without delete");
+        assert_eq!(ro_put, StatusCode::FORBIDDEN);
+        assert_eq!(ro_tar, StatusCode::FORBIDDEN);
+        assert_eq!(ro_pkg, StatusCode::FORBIDDEN);
+        assert_eq!(anon, StatusCode::UNAUTHORIZED);
+        assert_eq!(version_keys(&after), vec!["1.0.0", "1.1.0"]);
+    }
+
+    /// Remote repositories refuse with 405 and virtual ones with 400, the
+    /// answers the publish route gives for a non-hosted repository.
+    #[tokio::test]
+    async fn test_npm_unpublish_refused_on_remote_and_virtual_4025() {
+        for (repo_type, want) in [
+            ("remote", StatusCode::METHOD_NOT_ALLOWED),
+            ("virtual", StatusCode::BAD_REQUEST),
+        ] {
+            let Some(fx) = tdh::Fixture::setup(repo_type, "npm").await else {
+                return;
+            };
+            make_owner(&fx).await;
+            let mut got = Vec::new();
+            for (method, path) in [
+                ("PUT", "pkg/-rev/undefined"),
+                ("DELETE", "pkg/-rev/undefined"),
+                ("DELETE", "pkg/-/pkg-1.0.0.tgz/-rev/undefined"),
+            ] {
+                let body = bytes::Bytes::from_static(br#"{"name":"pkg","versions":{}}"#);
+                let (status, _) = tdh::send(
+                    owner_router(&fx),
+                    request(method, format!("/{}/{path}", fx.repo_key), body),
+                )
+                .await;
+                got.push(status);
+            }
+            fx.teardown().await;
+            assert_eq!(got, vec![want; 3], "{repo_type}");
         }
     }
 }

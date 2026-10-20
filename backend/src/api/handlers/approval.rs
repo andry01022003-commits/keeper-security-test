@@ -21,6 +21,9 @@ use crate::api::handlers::repositories::{require_repo_id_visible, require_visibl
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
 
@@ -1042,6 +1045,29 @@ pub async fn approve_promotion(
         "Promotion approved and executed"
     );
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::PromotionApprovalGranted,
+            ResourceType::PromotionApproval,
+            &auth,
+        )
+        .resource(approval_id)
+        .details(serde_json::json!({
+            "approval_id": approval_id,
+            "artifact_id": approval.artifact_id,
+            "artifact_path": artifact.path,
+            "source_repository": source_repo_key.0,
+            "target_repository": target_repo_key.0,
+            "requested_by": approval.requested_by,
+            "promoted_artifact_id": new_artifact_id,
+            "promotion_id": promotion_id,
+            "skip_policy_check": req.skip_policy_check,
+            "notes": req.notes,
+        })),
+    )
+    .await;
+
     // Return the updated approval
     let row: ApprovalRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "{} WHERE pa.id = $1",
@@ -1127,8 +1153,28 @@ pub async fn reject_promotion(
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+    let response = row.into_response();
 
-    Ok(Json(row.into_response()))
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::PromotionApprovalDenied,
+            ResourceType::PromotionApproval,
+            &auth,
+        )
+        .resource(approval_id)
+        .details(serde_json::json!({
+            "approval_id": approval_id,
+            "artifact_id": response.artifact_id,
+            "source_repository": response.source_repository,
+            "target_repository": response.target_repository,
+            "requested_by": response.requested_by,
+            "notes": req.notes,
+        })),
+    )
+    .await;
+
+    Ok(Json(response))
 }
 
 /// List approval history with optional filtering by status or source repository.
@@ -2949,6 +2995,79 @@ mod tests {
             cleanup_user(&pool, requester).await;
             let _ = std::fs::remove_dir_all(&sdir);
             let _ = std::fs::remove_dir_all(&tdir);
+        }
+
+        /// #4710: approving and rejecting a request each write one audit row
+        /// naming the reviewer, the request, its artifact and both repositories.
+        #[tokio::test]
+        async fn test_approve_and_reject_are_audited() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4710-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4710-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "s4710", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "t4710", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let reviewer = make_admin(&pool, "4710").await;
+            let requester = make_requester(&pool, "4710").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let approved_artifact = make_artifact(&pool, src, &storage, "pkg4710a").await;
+            let denied_artifact = make_artifact(&pool, src, &storage, "pkg4710d").await;
+            let to_approve =
+                make_pending_approval(&pool, approved_artifact, src, tgt, requester).await;
+            let to_deny = make_pending_approval(&pool, denied_artifact, src, tgt, requester).await;
+            let review = |notes: &str| {
+                Json(ReviewRequest {
+                    notes: Some(notes.to_string()),
+                    skip_policy_check: false,
+                })
+            };
+
+            let approved = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(reviewer)),
+                Path(to_approve),
+                review("ship it"),
+            )
+            .await;
+            let denied = reject_promotion(
+                State(state.clone()),
+                Extension(admin_ext(reviewer)),
+                Path(to_deny),
+                review("not yet"),
+            )
+            .await;
+            let granted_row =
+                tdh::audit_row_eventually(&pool, to_approve, "PROMOTION_APPROVAL_GRANTED").await;
+            let denied_row =
+                tdh::audit_row_eventually(&pool, to_deny, "PROMOTION_APPROVAL_DENIED").await;
+
+            cleanup(&pool, &[src, tgt], reviewer).await;
+            cleanup_user(&pool, requester).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+
+            assert!(approved.is_ok(), "approve must succeed: {approved:?}");
+            assert!(denied.is_ok(), "reject must succeed: {denied:?}");
+            assert_eq!(granted_row.user_id, Some(reviewer));
+            assert_eq!(granted_row.resource_type, "promotion_approval");
+            assert_eq!(
+                granted_row.details["artifact_id"],
+                approved_artifact.to_string()
+            );
+            assert_eq!(granted_row.details["source_repository"], src_key.as_str());
+            assert_eq!(granted_row.details["target_repository"], tgt_key.as_str());
+            assert_eq!(granted_row.details["requested_by"], requester.to_string());
+            assert!(granted_row.details["promoted_artifact_id"].is_string());
+            assert_eq!(denied_row.user_id, Some(reviewer));
+            assert_eq!(
+                denied_row.details["artifact_id"],
+                denied_artifact.to_string()
+            );
+            assert_eq!(denied_row.details["notes"], "not yet");
         }
 
         /// skip_policy_check admin break-glass still works on the approval path:

@@ -1661,3 +1661,150 @@ fn glob_match_is_anchored() {
     assert!(glob_match("exact", "exact"));
     assert!(!glob_match("exact", "exactly"));
 }
+
+// ============================== #4082: spaced DSSE envelopes in Rekor ==
+
+/// A real PEP 740 attestation published 2026-01-26, before PyPI's tooling
+/// switched to compact JSON: its Rekor `envelopeHash` is over the Python-spaced
+/// envelope (`{"payload": ..., "payloadType": ...}`), which `verify_digest`
+/// alone rejects as a signature error.
+const SPACED_PROVENANCE: &str =
+    include_str!("testdata/pypi-sigstore-4.2.0-whl-provenance-spaced-envelope.json");
+const SPACED_WHL: &[u8] = include_bytes!("testdata/pypi-sigstore-4.2.0-py3-none-any.whl");
+const SPACED_WHL_FILENAME: &str = "sigstore-4.2.0-py3-none-any.whl";
+
+fn spaced_bundle() -> Value {
+    let mut converted = bundle_convert::provenance_to_bundles(&load(SPACED_PROVENANCE));
+    assert_eq!(converted.len(), 1);
+    converted.remove(0).bundle_json
+}
+
+/// The decoded tlog body of `b`, mutated by `f`, written back.
+fn rewrite_tlog_body(b: &mut Value, f: impl FnOnce(&mut Value)) {
+    let entry = &mut b["verificationMaterial"]["tlogEntries"][0];
+    let mut body: Value = serde_json::from_slice(
+        &B64.decode(entry["canonicalizedBody"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    f(&mut body);
+    entry["canonicalizedBody"] = Value::String(B64.encode(serde_json::to_vec(&body).unwrap()));
+}
+
+#[tokio::test]
+async fn spaced_envelope_attestation_verifies_4082() {
+    let al = allowlist();
+    let v = verify_pypi_provenance(
+        &load(SPACED_PROVENANCE),
+        SPACED_WHL,
+        SPACED_WHL_FILENAME,
+        &al,
+        &trust(),
+    )
+    .await;
+    assert!(v.is_verified(), "pre-2026-05 PyPI attestation: {v:?}");
+    assert_eq!(v.checks_passed, all_mask());
+    assert_eq!(v.repository.as_deref(), Some("sigstore/sigstore-python"));
+}
+
+#[test]
+fn envelope_hash_form_recognises_both_serializations_4082() {
+    use rekor_glue::{dsse_envelope_hash_form, EnvelopeHashForm};
+    assert_eq!(
+        dsse_envelope_hash_form(&good_bundle()),
+        EnvelopeHashForm::Compact
+    );
+    // The real spaced attestation: the hash the crate wants instead is the
+    // compact serialization of the same envelope.
+    match dsse_envelope_hash_form(&spaced_bundle()) {
+        EnvelopeHashForm::Spaced { compact_sha256 } => assert_eq!(
+            compact_sha256,
+            "44a5419fcf33183bc5e4a91fbb4f21e3be0e63587263b97f9ac294f7f792b45b"
+        ),
+        other => panic!("expected Spaced, got {other:?}"),
+    }
+    // A message-signature bundle, or one without a readable body, is not ours
+    // to adjust.
+    let mut b = good_bundle();
+    b["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"] = Value::String("!".into());
+    assert_eq!(dsse_envelope_hash_form(&b), EnvelopeHashForm::NotApplicable);
+}
+
+#[tokio::test]
+async fn compact_bundle_rewritten_to_spaced_hash_passes_the_crate_4082() {
+    // Synthesise the spaced case from the compact fixture: record the spaced
+    // hash instead. The crate's envelopeHash check must now pass (crypto bit
+    // set); the rewritten body no longer matches what the log signed, so the
+    // SET -- run on the unmodified bundle -- is what rejects it.
+    let mut b = good_bundle();
+    let compact = match rekor_glue::dsse_envelope_hash_form(&b) {
+        rekor_glue::EnvelopeHashForm::Compact => {
+            let envelope: Value = b["dsseEnvelope"].clone();
+            serde_json::to_vec(&serde_json::json!({
+                "payload": envelope["payload"],
+                "payloadType": envelope["payloadType"],
+                "signatures": [{ "sig": envelope["signatures"][0]["sig"] }],
+            }))
+            .unwrap()
+        }
+        other => panic!("fixture must be compact: {other:?}"),
+    };
+    let spaced_hash = hex::encode(Sha256::digest(rekor_glue::python_spaced_json(&compact)));
+    rewrite_tlog_body(&mut b, |body| {
+        body["spec"]["envelopeHash"]["value"] = Value::String(spaced_hash);
+    });
+    assert!(matches!(
+        rekor_glue::dsse_envelope_hash_form(&b),
+        rekor_glue::EnvelopeHashForm::Spaced { .. }
+    ));
+    let v = verify_default(&b).await;
+    assert!(!v.is_verified());
+    assert!(has(&v, Check::CryptoAndChain), "{v:?}");
+    assert!(!has(&v, Check::RekorSet), "{v:?}");
+}
+
+#[tokio::test]
+async fn envelope_hash_matching_neither_form_is_a_tlog_mismatch_4082() {
+    let mut b = good_bundle();
+    rewrite_tlog_body(&mut b, |body| {
+        body["spec"]["envelopeHash"]["value"] = Value::String("00".repeat(32));
+    });
+    let v = verify_default(&b).await;
+    assert!(!v.is_verified());
+    assert!(!has(&v, Check::CryptoAndChain), "{v:?}");
+    let err = v.error.as_deref().unwrap();
+    assert!(
+        err.starts_with("transparency log entry mismatch: Rekor dsse envelopeHash 0000"),
+        "{err}"
+    );
+    assert!(err.contains("neither the compact"), "{err}");
+    assert!(!err.contains("signature/certificate chain"), "{err}");
+}
+
+#[tokio::test]
+async fn other_tlog_body_disagreement_is_a_tlog_mismatch_4082() {
+    // payloadHash disagrees, envelopeHash is intact: still the log entry, not
+    // the signature, and the message says so.
+    let mut b = good_bundle();
+    rewrite_tlog_body(&mut b, |body| {
+        body["spec"]["payloadHash"]["value"] = Value::String("00".repeat(32));
+    });
+    let v = verify_default(&b).await;
+    assert!(!v.is_verified());
+    let err = v.error.as_deref().unwrap();
+    assert!(
+        err.starts_with("transparency log entry mismatch: the Rekor entry body disagrees"),
+        "{err}"
+    );
+}
+
+#[test]
+fn python_spaced_json_matches_json_dumps_4082() {
+    use rekor_glue::python_spaced_json;
+    // `json.dumps({"a": "x,y:z", "b": [1, 2], "c": {"d": "\"q\\\\"}})`
+    let compact = br#"{"a":"x,y:z","b":[1,2],"c":{"d":"\"q\\"}}"#;
+    assert_eq!(
+        python_spaced_json(compact),
+        br#"{"a": "x,y:z", "b": [1, 2], "c": {"d": "\"q\\"}}"#.to_vec()
+    );
+}

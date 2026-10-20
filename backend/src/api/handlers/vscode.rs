@@ -4309,6 +4309,13 @@ async fn publish_extension(
         return Err((StatusCode::BAD_REQUEST, "Empty VSIX file").into_response());
     }
 
+    // #4673: entry names that would escape a client's extraction directory
+    // are refused before anything else, as a 400 VALIDATION_ERROR, whether or
+    // not the archive carries a usable manifest.
+    bounded_archive::with_ingest_extraction(|| vscode_extensions::reject_unsafe_entry_names(&body))
+        .and_then(|checked| checked)
+        .map_err(|e| e.into_response())?;
+
     // The archive is the source of truth (#3961); the `x-*` headers only assert.
     let manifest = match bounded_archive::with_ingest_extraction(|| {
         vscode_extensions::extract_vsix_metadata(&body)
@@ -4483,6 +4490,18 @@ async fn publish_extension(
         size_bytes,
         &computed_sha256,
         manifest.description.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -10036,6 +10055,62 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "3.1.4");
         assert_eq!(row.versions, vec!["3.1.4".to_string()]);
     }
+
+    /// #4725: an extension publish to a hosted repository must queue a push
+    /// sync task for a subscribed push peer, and a publish that arrives as
+    /// peer replication must not be fanned back out. Fails on `main`
+    /// (nothing queued).
+    #[tokio::test]
+    async fn vscode_publish_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "vscode").await;
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "widget-tools")
+            .header("x-extension-version", "3.1.4")
+            .body(axum::body::Body::from("vsix-bytes"))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "extension publish must succeed: {status} {}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // extension but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "widget-tools")
+            .header("x-extension-version", "3.1.5")
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from("vsix-bytes-2"))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated extension publish must succeed: {status} {}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["acme/widget-tools/acme.widget-tools-3.1.4.vsix".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10049,6 +10124,17 @@ mod vsix_manifest_publish_tests {
 
     /// A `vsce package` archive, minus the compiled extension itself.
     fn vsix(publisher: &str, name: &str, version: &str, target_platform: &str) -> Vec<u8> {
+        vsix_with(publisher, name, version, target_platform, &[])
+    }
+
+    /// [`vsix`] plus `extra` entries.
+    fn vsix_with(
+        publisher: &str,
+        name: &str,
+        version: &str,
+        target_platform: &str,
+        extra: &[&str],
+    ) -> Vec<u8> {
         use std::io::Write;
         let package_json = serde_json::json!({
             "publisher": publisher,
@@ -10071,7 +10157,7 @@ mod vsix_manifest_publish_tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (entry, bytes) in [
                 ("extension/package.json", package_json.as_bytes()),
@@ -10080,9 +10166,84 @@ mod vsix_manifest_publish_tests {
                 writer.start_file(entry, options).unwrap();
                 writer.write_all(bytes).unwrap();
             }
+            for entry in extra {
+                writer.start_file(*entry, options).unwrap();
+                writer.write_all(b"payload").unwrap();
+            }
             writer.finish().unwrap();
         }
         cursor.into_inner()
+    }
+
+    /// #4673: an otherwise valid VSIX carrying a hostile entry name is refused
+    /// with 400 VALIDATION_ERROR and nothing is stored; a `..` inside a name
+    /// (not a whole segment) is not hostile and still publishes.
+    #[tokio::test]
+    async fn publish_rejects_traversal_entry_names() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let mut refused = Vec::new();
+        for hostile in [
+            "../../etc/passwd",
+            "extension/../../escape.js",
+            "/tmp/x",
+            "\\windows\\system32\\x.dll",
+            "extension\\..\\..\\x.js",
+            "C:/x.js",
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/api/extensions", fx.repo_key))
+                .body(axum::body::Body::from(vsix_with(
+                    "acme",
+                    "widget-tools",
+                    "3.1.4",
+                    "universal",
+                    &[hostile],
+                )))
+                .unwrap();
+            let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+            refused.push((hostile, status, String::from_utf8_lossy(&body).into_owned()));
+        }
+        let stored = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .body(axum::body::Body::from(vsix_with(
+                "acme",
+                "widget-tools",
+                "3.1.5",
+                "universal",
+                &["extension/dist/a..b.js"],
+            )))
+            .unwrap();
+        let (ok_status, ok_body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        fx.teardown().await;
+
+        for (hostile, status, body) in refused {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{hostile}: {body}"
+            );
+            assert!(body.contains("VALIDATION_ERROR"), "{hostile}: {body}");
+            assert!(
+                body.contains("escapes the archive root"),
+                "{hostile}: {body}"
+            );
+        }
+        assert_eq!(stored.expect("count artifacts"), 0, "nothing may be stored");
+        assert!(
+            ok_status.is_success(),
+            "a benign name must still publish: {ok_status} {}",
+            String::from_utf8_lossy(&ok_body)
+        );
     }
 
     /// `vsce package` output publishes with no `x-*` header and its fields are
@@ -10220,7 +10381,7 @@ mod vsix_manifest_publish_tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             writer
                 .start_file("extension/package.json", options)

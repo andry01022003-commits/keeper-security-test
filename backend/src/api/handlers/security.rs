@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::extractors::Json as BodyJson;
 use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::handlers::repositories::{
     require_repo_action, require_repo_admin, require_repo_write_access, require_visible,
@@ -1229,29 +1230,57 @@ pub(crate) const INGEST_FINDINGS_SCOPE: &str = "write:findings";
 /// read AK's findings can post findings back in the same vocabulary.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ExternalFindingInput {
+    // #4667: every text field below is bound into the `scan_findings` insert,
+    // and Postgres rejects a `\0` at the wire protocol, so a NUL in any of
+    // them was a 500 `DATABASE_ERROR`. Refused at the field instead, as #3713
+    // did for the other body carriers: 400 `VALIDATION_ERROR` before the
+    // handler runs.
     /// Scanner severity token. Normalized through the shared classifier, so a
     /// vendor's own spelling (`Moderate`, `NEGLIGIBLE`, ...) is accepted.
     ///
     /// An UNRECOGNIZED token classifies as `high`, not `info` — fail-closed,
     /// per #3306. An unknown verdict from an unknown scanner is the one case
     /// where guessing low would silently disarm every gate that reads severity.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub severity: String,
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub title: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub cve_id: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub affected_component: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub affected_version: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub fixed_version: Option<String>,
     /// Vendor identity for this finding. Defaults to the submission's
     /// `scanner` when omitted, and is what `?source=` filters on (#3410).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub source: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub source_url: Option<String>,
 }
 
@@ -1263,9 +1292,13 @@ pub struct IngestExternalFindingsRequest {
     /// Vendor name, recorded as each finding's `source` unless the finding
     /// overrides it. Required: an unattributed verdict cannot be filtered,
     /// audited, or withdrawn.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub scanner: String,
     /// Vendor build/database version, recorded as `scan_results.scanner_version`.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub scanner_version: Option<String>,
     /// The findings. May be empty — a clean verdict is a verdict, and it is
     /// what clears a previously-flagged artifact.
@@ -1346,6 +1379,47 @@ fn build_external_findings(
         .collect()
 }
 
+/// Most `MAL-*` advisory ids one `EXTERNAL_FINDINGS_INGESTED` row lists
+/// (#4677). A submission may carry up to `MAX_EXTERNAL_FINDINGS_PER_SUBMISSION`
+/// findings; the row keeps the count of every class and the first ids, and
+/// says when it cut the list.
+const INGEST_AUDIT_MAX_MALICIOUS_IDS: usize = 50;
+
+/// What an `EXTERNAL_FINDINGS_INGESTED` audit row records about the findings
+/// of one submission (#4677), beyond the severity tally.
+#[derive(Debug, PartialEq)]
+struct IngestAuditSummary {
+    /// Findings per class (`vulnerability`, `malicious`, `policy`).
+    class_counts: std::collections::BTreeMap<&'static str, usize>,
+    /// The advisory ids of the findings classed `malicious`, in submission
+    /// order, at most [`INGEST_AUDIT_MAX_MALICIOUS_IDS`].
+    malicious_ids: Vec<String>,
+    malicious_ids_truncated: bool,
+}
+
+fn ingest_audit_summary(findings: &[crate::models::security::RawFinding]) -> IngestAuditSummary {
+    use crate::models::security::FindingClass;
+    let mut class_counts: std::collections::BTreeMap<&'static str, usize> =
+        FindingClass::ALL.iter().map(|c| (c.as_str(), 0)).collect();
+    let mut malicious_ids = Vec::new();
+    let mut malicious_ids_truncated = false;
+    for f in findings {
+        *class_counts.entry(f.finding_class.as_str()).or_default() += 1;
+        if f.finding_class == FindingClass::Malicious {
+            if malicious_ids.len() < INGEST_AUDIT_MAX_MALICIOUS_IDS {
+                malicious_ids.push(f.cve_id.clone().unwrap_or_default());
+            } else {
+                malicious_ids_truncated = true;
+            }
+        }
+    }
+    IngestAuditSummary {
+        class_counts,
+        malicious_ids,
+        malicious_ids_truncated,
+    }
+}
+
 /// Ingest findings produced by a scanner that does not live in this tree
 /// (#3411).
 ///
@@ -1394,7 +1468,9 @@ fn build_external_findings(
 async fn ingest_external_findings(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Json(body): Json<IngestExternalFindingsRequest>,
+    // #4667: the crate extractor, so a NUL refused by a field hook renders as
+    // the standard 400 `VALIDATION_ERROR` envelope rather than axum's 422.
+    BodyJson(body): BodyJson<IngestExternalFindingsRequest>,
 ) -> Result<Json<IngestExternalFindingsResponse>> {
     // Two gates, both required. `require_admin` matches the sibling
     // finding-mutation routes (acknowledge / revoke, #1032): there is no
@@ -1421,7 +1497,7 @@ async fn ingest_external_findings(
 
     // Existence-hiding gate, then the repository the artifact belongs to. Both
     // reads run before anything is written.
-    check_artifact_visibility(&Some(auth), body.artifact_id, &state.db, "write").await?;
+    check_artifact_visibility(&Some(auth.clone()), body.artifact_id, &state.db, "write").await?;
     let repository_id: Uuid = sqlx::query_scalar(
         "SELECT repository_id FROM artifacts WHERE id = $1 AND is_deleted = false",
     )
@@ -1434,20 +1510,68 @@ async fn ingest_external_findings(
     let findings = build_external_findings(&scanner, body.findings)?;
     let counts = tally_severities(&findings);
 
+    // One transaction (#4667): a findings insert that fails must not leave a
+    // `completed` row behind that every gate would read as a clean verdict.
     let svc = ScanResultService::new(state.db.clone());
     let scan = svc
-        .create_completed_scan_result(
+        .create_completed_scan_with_findings(
             body.artifact_id,
             repository_id,
             EXTERNAL_SCAN_TYPE,
-            findings.len() as i32,
             counts,
             body.scanner_version.as_deref(),
+            &findings,
         )
         .await?;
-    svc.create_findings(scan.id, body.artifact_id, &findings)
-        .await?;
     let score = svc.recalculate_score(repository_id).await?;
+
+    // #4677: a successful ingest changes what every gate reads (and a `MAL-*`
+    // id plants a `malicious`/Critical verdict), so it is recorded like any
+    // other admin mutation instead of being a silent 200.
+    let summary = ingest_audit_summary(&findings);
+    tracing::info!(
+        target: "security",
+        artifact_id = %body.artifact_id,
+        %repository_id,
+        scan_id = %scan.id,
+        scanner = %scanner,
+        user_id = %auth.user_id,
+        username = %auth.username,
+        findings = findings.len(),
+        malicious = summary.malicious_ids.len(),
+        score = score.score,
+        "external findings ingested"
+    );
+    crate::services::audit_service::audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::ExternalFindingsIngested,
+            ResourceType::Artifact,
+            &auth,
+        )
+        .resource(body.artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": body.artifact_id,
+            "repository_id": repository_id,
+            "scan_id": scan.id,
+            "scanner": scanner,
+            "scanner_version": body.scanner_version,
+            "findings_ingested": findings.len(),
+            "severity_counts": {
+                "critical": counts[0],
+                "high": counts[1],
+                "medium": counts[2],
+                "low": counts[3],
+                "info": counts[4],
+            },
+            "class_counts": summary.class_counts,
+            "malicious_ids": summary.malicious_ids,
+            "malicious_ids_truncated": summary.malicious_ids_truncated,
+            "score": score.score,
+            "grade": score.grade,
+        })),
+    )
+    .await;
 
     Ok(Json(IngestExternalFindingsResponse {
         scan_id: scan.id,
@@ -1873,6 +1997,9 @@ fn scan_config_change_audit(
                 previous_scan_config: Some(scan_config_audit_state(&before)),
                 scan_config_changed: Some(changed),
                 upstream_change: None,
+                project_change: None,
+                allow_public_with_upstream_credentials: None,
+                upstream_auth_change: None,
             }),
     )
 }
@@ -2882,6 +3009,7 @@ async fn rescan_proxy_cached_path(
     // a storage failure still retains its canonical 404 without consuming
     // this repository's rescan slot -- no scanner has run yet.
     if let Err(remaining) = claim_rescan_slot(repo.id) {
+        crate::services::metrics_service::record_rate_limit_rejection("proxy_rescan");
         return Ok(rescan_throttled_response(remaining));
     }
 
@@ -7783,6 +7911,108 @@ mod tests {
         assert_eq!(out[1].severity, Severity::Low);
     }
 
+    fn external_input(cve: &str) -> ExternalFindingInput {
+        ExternalFindingInput {
+            severity: "low".to_string(),
+            title: "t".to_string(),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        }
+    }
+
+    /// #4677: the ingest audit row counts every class and lists the `MAL-*`
+    /// ids it planted, bounded.
+    #[test]
+    fn test_ingest_audit_summary_counts_classes_and_lists_malicious_ids() {
+        let out = build_external_findings(
+            "acme",
+            vec![
+                external_input("MAL-2025-7"),
+                external_input("CVE-2024-1"),
+                external_input("MAL-2025-8"),
+            ],
+        )
+        .expect("valid findings");
+        let summary = ingest_audit_summary(&out);
+        assert_eq!(summary.class_counts["malicious"], 2);
+        assert_eq!(summary.class_counts["vulnerability"], 1);
+        assert_eq!(summary.class_counts["policy"], 0);
+        assert_eq!(summary.malicious_ids, vec!["MAL-2025-7", "MAL-2025-8"]);
+        assert!(!summary.malicious_ids_truncated);
+
+        let many = build_external_findings(
+            "acme",
+            (0..INGEST_AUDIT_MAX_MALICIOUS_IDS + 3)
+                .map(|i| external_input(&format!("MAL-2025-{i}")))
+                .collect(),
+        )
+        .expect("valid findings");
+        let summary = ingest_audit_summary(&many);
+        assert_eq!(summary.malicious_ids.len(), INGEST_AUDIT_MAX_MALICIOUS_IDS);
+        assert!(summary.malicious_ids_truncated);
+        assert_eq!(
+            summary.class_counts["malicious"],
+            INGEST_AUDIT_MAX_MALICIOUS_IDS + 3,
+            "the count is exact even when the id list is cut"
+        );
+    }
+
+    /// #4677: a successful ingest, the `MAL-*` classification ledger write,
+    /// records who planted which verdict instead of being a silent 200.
+    #[tokio::test]
+    async fn test_ingest_external_findings_writes_an_audit_row_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let res = ingest_external_findings(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(fx.user_id, &fx.username)),
+            BodyJson(IngestExternalFindingsRequest {
+                artifact_id: art,
+                scanner: "acme-scanner".to_string(),
+                scanner_version: Some("2026.1".to_string()),
+                findings: vec![
+                    external_input("MAL-2024-1234"),
+                    external_input("CVE-2024-1"),
+                ],
+            }),
+        )
+        .await;
+        let row = tdh::audit_row_eventually(&fx.pool, art, "EXTERNAL_FINDINGS_INGESTED").await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        let _ = sqlx::query("DELETE FROM repository_security_scores WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        let res = res.expect("admin ingest must succeed").0;
+        assert_eq!(row.user_id, Some(fx.user_id), "the acting admin");
+        assert_eq!(row.resource_type, "artifact");
+        let d = &row.details;
+        assert_eq!(d["scan_id"], serde_json::json!(res.scan_id));
+        assert_eq!(d["repository_id"], serde_json::json!(fx.repo_id));
+        assert_eq!(d["scanner"], "acme-scanner");
+        assert_eq!(d["scanner_version"], "2026.1");
+        assert_eq!(d["findings_ingested"], 2);
+        assert_eq!(
+            d["severity_counts"]["critical"], 1,
+            "MAL-* is graded Critical"
+        );
+        assert_eq!(d["severity_counts"]["low"], 1);
+        assert_eq!(d["class_counts"]["malicious"], 1);
+        assert_eq!(d["malicious_ids"], serde_json::json!(["MAL-2024-1234"]));
+        assert_eq!(d["score"], res.score);
+    }
+
     #[test]
     fn test_external_severity_normalization_fails_closed() {
         use crate::models::security::Severity;
@@ -7898,7 +8128,7 @@ mod tests {
         let non_admin = ingest_external_findings(
             State(fx.state.clone()),
             Extension(tdh::make_auth(fx.user_id, &fx.username)),
-            Json(body()),
+            BodyJson(body()),
         )
         .await;
 
@@ -7908,7 +8138,7 @@ mod tests {
         scoped.is_api_token = true;
         scoped.scopes = Some(vec!["write:artifacts".to_string()]);
         let wrong_scope =
-            ingest_external_findings(State(fx.state.clone()), Extension(scoped), Json(body()))
+            ingest_external_findings(State(fx.state.clone()), Extension(scoped), BodyJson(body()))
                 .await;
 
         teardown_scans(&fx.pool, fx.repo_id).await;
@@ -7946,7 +8176,7 @@ mod tests {
         let first = ingest_external_findings(
             State(fx.state.clone()),
             Extension(tdh::admin_auth(fx.user_id, &fx.username)),
-            Json(IngestExternalFindingsRequest {
+            BodyJson(IngestExternalFindingsRequest {
                 artifact_id: art,
                 scanner: "acme-scanner".to_string(),
                 scanner_version: Some("2026.1".to_string()),
@@ -7961,7 +8191,7 @@ mod tests {
         let replay = ingest_external_findings(
             State(fx.state.clone()),
             Extension(tdh::admin_auth(fx.user_id, &fx.username)),
-            Json(IngestExternalFindingsRequest {
+            BodyJson(IngestExternalFindingsRequest {
                 artifact_id: art,
                 scanner: "acme-scanner".to_string(),
                 scanner_version: Some("2026.2".to_string()),
@@ -8029,7 +8259,7 @@ mod tests {
         let res = ingest_external_findings(
             State(fx.state.clone()),
             Extension(tdh::admin_auth(fx.user_id, &fx.username)),
-            Json(IngestExternalFindingsRequest {
+            BodyJson(IngestExternalFindingsRequest {
                 artifact_id: Uuid::new_v4(),
                 scanner: "acme-scanner".to_string(),
                 scanner_version: None,
@@ -8040,7 +8270,7 @@ mod tests {
         let blank_scanner = ingest_external_findings(
             State(fx.state.clone()),
             Extension(tdh::admin_auth(fx.user_id, &fx.username)),
-            Json(IngestExternalFindingsRequest {
+            BodyJson(IngestExternalFindingsRequest {
                 artifact_id: Uuid::new_v4(),
                 scanner: "  ".to_string(),
                 scanner_version: None,
@@ -8054,5 +8284,172 @@ mod tests {
             matches!(blank_scanner, Err(AppError::Validation(_))),
             "an unattributed verdict cannot be filtered, audited or withdrawn"
         );
+    }
+
+    /// #4667: a NUL in any text field of an external finding reached the
+    /// `scan_findings` insert and answered 500 `DATABASE_ERROR`, after the
+    /// scan row had already been committed `completed`. Router-level so the
+    /// 400 envelope is the real extractor's, and DB-backed because the
+    /// counterfactual is the orphaned row.
+    #[tokio::test]
+    async fn test_ingest_external_findings_refuses_a_nul_before_any_write_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let app = tdh::router_with_auth_ext(
+            router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let post = |body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/findings/external")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let finding = |field: &str| {
+            let mut f = serde_json::json!({
+                "severity": "high",
+                "title": "t",
+                "cve_id": "CVE-2024-3094",
+            });
+            f[field] = serde_json::json!("a\u{0}b");
+            f
+        };
+
+        let mut statuses = Vec::new();
+        for field in [
+            "severity",
+            "title",
+            "description",
+            "cve_id",
+            "affected_component",
+            "affected_version",
+            "fixed_version",
+            "source",
+            "source_url",
+        ] {
+            let (status, body) = tdh::send(
+                app.clone(),
+                post(serde_json::json!({
+                    "artifact_id": art,
+                    "scanner": "acme",
+                    "findings": [finding(field)],
+                })),
+            )
+            .await;
+            statuses.push((field, status, String::from_utf8_lossy(&body).to_string()));
+        }
+        let (scanner_status, _) = tdh::send(
+            app.clone(),
+            post(serde_json::json!({
+                "artifact_id": art, "scanner": "ac\u{0}me", "findings": [],
+            })),
+        )
+        .await;
+        let (version_status, _) = tdh::send(
+            app.clone(),
+            post(serde_json::json!({
+                "artifact_id": art, "scanner": "acme",
+                "scanner_version": "1\u{0}", "findings": [],
+            })),
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
+                .bind(art)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count scan rows");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        for (field, status, body) in statuses {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "a NUL in `{field}` must be refused at deserialization (#4667), got {body}"
+            );
+            assert!(body.contains("VALIDATION_ERROR"), "{field}: {body}");
+        }
+        assert_eq!(scanner_status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(version_status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(rows, 0, "a refused submission must write no scan row");
+    }
+
+    /// #4667: the scan row and its findings commit together. A findings
+    /// insert that fails (here a NUL that bypassed the wire guard) must roll
+    /// the `completed` row back rather than leave a clean verdict nobody
+    /// issued.
+    #[tokio::test]
+    async fn test_completed_scan_and_findings_are_one_transaction_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::security::{FindingClass, RawFinding, Severity};
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let finding = |title: &str| RawFinding {
+            severity: Severity::High,
+            title: title.to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: Some("acme".to_string()),
+            source_url: None,
+            finding_class: FindingClass::Vulnerability,
+        };
+        let svc = ScanResultService::new(fx.pool.clone());
+        let failed = svc
+            .create_completed_scan_with_findings(
+                art,
+                fx.repo_id,
+                EXTERNAL_SCAN_TYPE,
+                [0, 2, 0, 0, 0],
+                None,
+                &[finding("ok"), finding("bad\0title")],
+            )
+            .await;
+        let after_failure: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
+                .bind(art)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count scan rows");
+        let ok = svc
+            .create_completed_scan_with_findings(
+                art,
+                fx.repo_id,
+                EXTERNAL_SCAN_TYPE,
+                [0, 1, 0, 0, 0],
+                None,
+                &[finding("ok")],
+            )
+            .await;
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE artifact_id = $1")
+                .bind(art)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count findings");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert!(failed.is_err(), "the findings insert must fail on a NUL");
+        assert_eq!(
+            after_failure, 0,
+            "a failed findings insert must not leave a `completed` scan row behind"
+        );
+        let ok = ok.expect("the control submission commits");
+        assert_eq!(ok.findings_count, 1);
+        assert_eq!(stored, 1);
     }
 }

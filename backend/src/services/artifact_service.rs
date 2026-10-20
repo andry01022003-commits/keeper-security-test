@@ -46,19 +46,17 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                   AND pi.status IN ('online', 'syncing')
                   AND prs.replication_mode::text IN ('push', 'mirror')
                   AND prs.sync_enabled = true
-                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
+                    status = 'pending',
+                    retry_count = 0,
+                    error_message = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
+                WHERE sync_tasks.status <> 'in_progress'
                 "#;
-
-/// Select all peer subscriptions (with their optional artifact filter) that are
-/// eligible to receive a push of a newly uploaded artifact in the repository.
-const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
-                    SELECT prs.peer_instance_id, sp.artifact_filter
-                    FROM peer_repo_subscriptions prs
-                    LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
-                    WHERE prs.repository_id = $1
-                      AND prs.sync_enabled = true
-                      AND prs.replication_mode::text IN ('push', 'mirror')
-                    "#;
 
 /// The three content digests persisted on every artifact row.
 ///
@@ -1038,7 +1036,7 @@ impl ArtifactService {
             // NuGet stores the lowercased id, so deriving the name here
             // registered a second, lowercased package beside the handler's.
             let registration = match catalog_name {
-                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone())),
+                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone(), None)),
                 None => match self.repo_service.get_by_id(artifact.repository_id).await {
                     Ok(repo)
                         if matches!(
@@ -1061,17 +1059,22 @@ impl ArtifactService {
                                 Ok(coords) => Some((
                                     format!("{}:{}", coords.group_id, coords.artifact_id),
                                     coords.version,
+                                    // #4633: a Maven version is the sum of
+                                    // the files in its directory.
+                                    crate::api::handlers::maven::maven_version_directory(
+                                        &artifact.path,
+                                    ),
                                 )),
-                                Err(_) => Some((artifact.name.clone(), ver.clone())),
+                                Err(_) => Some((artifact.name.clone(), ver.clone(), None)),
                             }
                         }
                     }
-                    _ => Some((artifact.name.clone(), ver.clone())),
+                    _ => Some((artifact.name.clone(), ver.clone(), None)),
                 },
             };
             // A metadata/sidecar upload (None) still gets its artifact row and
             // the sync fan-out below — only catalog registration is skipped.
-            if let Some((package_name, package_version)) = registration {
+            if let Some((package_name, package_version, version_directory)) = registration {
                 let pkg_svc =
                     crate::services::package_service::PackageService::new(self.db.clone());
                 pkg_svc
@@ -1085,83 +1088,40 @@ impl ArtifactService {
                         None,
                     )
                     .await;
+                if let Some(directory) = version_directory {
+                    pkg_svc
+                        .try_set_version_size_to_directory_total(
+                            artifact.repository_id,
+                            &package_name,
+                            &package_version,
+                            directory,
+                        )
+                        .await;
+                }
             }
         }
 
         // Queue sync tasks for peer replication (non-blocking)
         if enqueue_sync_tasks {
-            let db = self.db.clone();
+            let peer_service =
+                crate::services::peer_instance_service::PeerInstanceService::new(self.db.clone());
             let artifact_id = artifact.id;
             let repository_id = artifact.repository_id;
             let artifact_path = artifact.path.clone();
             let artifact_size = artifact.size_bytes;
             let artifact_created = artifact.created_at;
             tokio::spawn(async move {
-                // Find peers with push/mirror subscriptions, including the policy's artifact_filter
-                #[derive(sqlx::FromRow)]
-                struct SubWithFilter {
-                    peer_instance_id: uuid::Uuid,
-                    artifact_filter: Option<serde_json::Value>,
-                }
-
-                let subscriptions: std::result::Result<Vec<SubWithFilter>, _> =
-                    sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
-                        .bind(repository_id)
-                        .fetch_all(&db)
-                        .await;
-
-                match subscriptions {
-                    Ok(subs) if !subs.is_empty() => {
-                        let peer_service =
-                            crate::services::peer_instance_service::PeerInstanceService::new(db);
-                        let mut queued = 0usize;
-                        for sub in &subs {
-                            let filter: crate::services::sync_policy_service::ArtifactFilter = sub
-                                .artifact_filter
-                                .as_ref()
-                                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                                .unwrap_or_default();
-
-                            if !filter.matches(&artifact_path, artifact_size, artifact_created) {
-                                tracing::debug!(
-                                    "Artifact {} filtered out for peer {} by policy artifact_filter",
-                                    artifact_id,
-                                    sub.peer_instance_id,
-                                );
-                                continue;
-                            }
-
-                            if let Err(e) = peer_service
-                                .queue_sync_task(sub.peer_instance_id, artifact_id, 0)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to queue sync task for peer {} artifact {}: {}",
-                                    sub.peer_instance_id,
-                                    artifact_id,
-                                    e
-                                );
-                            } else {
-                                queued += 1;
-                            }
-                        }
-                        if queued > 0 {
-                            tracing::info!(
-                                "Queued sync tasks for artifact {} to {} peer(s)",
-                                artifact_id,
-                                queued
-                            );
-                        }
-                    }
-                    Ok(_) => {} // No push/mirror subscriptions
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to query peer subscriptions for repo {}: {}",
+                peer_service
+                    .queue_push_sync_tasks(
+                        &crate::services::peer_instance_service::PublishedArtifact {
+                            id: artifact_id,
                             repository_id,
-                            e
-                        );
-                    }
-                }
+                            path: &artifact_path,
+                            size_bytes: artifact_size,
+                            created_at: artifact_created,
+                        },
+                    )
+                    .await;
             });
         }
 
@@ -4421,15 +4381,96 @@ mod tests {
         assert!(sql.contains("sync_enabled"));
         assert!(sql.contains("is_local = false"));
         assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("WHERE sync_tasks.status <> 'in_progress'"));
     }
 
-    #[test]
-    fn test_push_mirror_subscriptions_sql_filters_enabled_push_mirror() {
-        let sql = PUSH_MIRROR_SUBSCRIPTIONS_SQL;
-        assert!(sql.contains("FROM peer_repo_subscriptions prs"));
-        assert!(sql.contains("LEFT JOIN sync_policies sp"));
-        assert!(sql.contains("prs.sync_enabled = true"));
-        assert!(sql.contains("replication_mode::text IN ('push', 'mirror')"));
+    #[tokio::test]
+    async fn delete_enqueue_requeues_finished_delete_task() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{PeerInstanceService, ReplicationMode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "delete-requeue", "t").await;
+        sqlx::query("UPDATE peer_instances SET status = 'online' WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        PeerInstanceService::new(pool.clone())
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted) \
+             VALUES ($1, 'a/b/c.bin', 'c.bin', 1, $2, 'application/octet-stream', $2, true) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 1))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let delete_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, \
+             retry_count, completed_at) \
+             VALUES ($1, $2, 'delete', 'completed', 3, NOW()) RETURNING id",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state: (String, i32) =
+            sqlx::query_as("SELECT status::TEXT, retry_count FROM sync_tasks WHERE id = $1")
+                .bind(delete_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, ("pending".to_string(), 0));
+
+        let token = Uuid::new_v4();
+        sqlx::query("UPDATE sync_tasks SET status = 'in_progress', claim_token = $2 WHERE id = $1")
+            .bind(delete_id)
+            .bind(token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed: (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status::TEXT, claim_token FROM sync_tasks WHERE id = $1")
+                .bind(delete_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(claimed, ("in_progress".to_string(), Some(token)));
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

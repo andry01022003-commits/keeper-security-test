@@ -4287,8 +4287,8 @@ async fn serve_metadata(
 
 /// Entry-count ceiling for locating a wheel's METADATA (#3886).
 ///
-/// The shared `MAX_INGEST_ARCHIVE_ENTRIES` (10,000) is sized for walks that
-/// inflate or inspect every entry. Real wheels exceed it: `torch 2.12.0+cpu`
+/// The shared ingest entry cap (`MAX_INGEST_ARCHIVE_ENTRIES`, 10,000 by
+/// default) is sized for walks that inflate or inspect every entry. Real wheels exceed it: `torch 2.12.0+cpu`
 /// ships 12,704 entries, so every PEP 658 sidecar for it answered "Metadata not
 /// available" (404) while the wheel itself downloaded fine. This lookup
 /// inflates exactly ONE entry, still capped at `MAX_INGEST_METADATA_ENTRY_BYTES`,
@@ -6588,7 +6588,7 @@ mod content_analysis_tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, data) in entries {
                 w.start_file(*name, opts).unwrap();
@@ -8660,7 +8660,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut cursor);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zip.start_file(
                 format!("{meta_name}-{meta_version}.dist-info/METADATA"),
@@ -14972,7 +14972,7 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file(format!("{dist_info}.dist-info/METADATA"), options)
             .expect("start METADATA entry");
@@ -15131,7 +15131,7 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("torch/_vendor/decoy-0.1.dist-info/METADATA", options)
             .expect("decoy entry");

@@ -128,7 +128,9 @@ mod tests {
 
     #[test]
     fn test_map_db_err_returns_500() {
-        let resp = map_db_err("connection refused");
+        // A query error, not an outage: an unreachable database is a 503
+        // since #4756.
+        let resp = map_db_err("error returned from database: relation \"t\" does not exist");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

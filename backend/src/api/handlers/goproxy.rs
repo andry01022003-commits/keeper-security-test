@@ -353,13 +353,32 @@ async fn handle_put(
     crate::services::upload_service::validate_artifact_path(&path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
     let request = parse_path(&path)?;
+    let enqueue_sync_tasks = !super::is_replication_request(&headers);
 
     match request {
         GoProxyRequest::Zip { module, version } => {
-            upload_zip(&state, &repo, &module, &version, user_id, body).await
+            upload_zip(
+                &state,
+                &repo,
+                &module,
+                &version,
+                user_id,
+                body,
+                enqueue_sync_tasks,
+            )
+            .await
         }
         GoProxyRequest::Mod { module, version } => {
-            upload_mod(&state, &repo, &module, &version, user_id, body).await
+            upload_mod(
+                &state,
+                &repo,
+                &module,
+                &version,
+                user_id,
+                body,
+                enqueue_sync_tasks,
+            )
+            .await
         }
         _ => Err((
             StatusCode::METHOD_NOT_ALLOWED,
@@ -1548,6 +1567,7 @@ async fn upload_zip(
     version: &str,
     user_id: uuid::Uuid,
     body: Bytes,
+    enqueue_sync_tasks: bool,
 ) -> Result<Response, Response> {
     let artifact_path = build_go_zip_artifact_path(module, version);
 
@@ -1633,6 +1653,22 @@ async fn upload_zip(
     .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+
+    // Store metadata
+    let metadata = build_go_artifact_metadata(module, version, "zip");
+
+    sqlx::query!(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'go', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+        artifact_id,
+        metadata,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
     tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
@@ -1661,21 +1697,6 @@ async fn upload_zip(
     )
     .await;
 
-    // Store metadata
-    let metadata = build_go_artifact_metadata(module, version, "zip");
-
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'go', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
     // Update repository timestamp
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
@@ -1683,6 +1704,18 @@ async fn upload_zip(
     )
     .execute(&state.db)
     .await;
+
+    if enqueue_sync_tasks {
+        crate::services::peer_instance_service::PeerInstanceService::new(state.db.clone())
+            .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo.id,
+                path: &artifact_path,
+                size_bytes,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+    }
 
     info!("Go module upload: {}@{} (zip)", module, version);
 
@@ -1703,6 +1736,7 @@ async fn upload_mod(
     version: &str,
     user_id: uuid::Uuid,
     body: Bytes,
+    enqueue_sync_tasks: bool,
 ) -> Result<Response, Response> {
     let artifact_path = build_go_mod_artifact_path(module, version);
 
@@ -1788,6 +1822,22 @@ async fn upload_mod(
     .fetch_one(&mut *tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
+
+    // Store metadata
+    let metadata = build_go_artifact_metadata(module, version, "mod");
+
+    sqlx::query!(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'go', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+        artifact_id,
+        metadata,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
     tx.commit().await.map_err(crate::api::handlers::db_err)?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
@@ -1800,21 +1850,6 @@ async fn upload_mod(
     )
     .await;
 
-    // Store metadata
-    let metadata = build_go_artifact_metadata(module, version, "mod");
-
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'go', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
     // Update repository timestamp
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
@@ -1822,6 +1857,18 @@ async fn upload_mod(
     )
     .execute(&state.db)
     .await;
+
+    if enqueue_sync_tasks {
+        crate::services::peer_instance_service::PeerInstanceService::new(state.db.clone())
+            .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo.id,
+                path: &artifact_path,
+                size_bytes,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+    }
 
     info!("Go module upload: {}@{} (go.mod)", module, version);
 
@@ -3844,6 +3891,99 @@ mod catalog_registration_tests {
         let row = row.expect("a goproxy module upload must write a packages row (#3659)");
         assert_eq!(row.version, "v1.2.3");
         assert_eq!(row.versions, vec!["v1.2.3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn module_upload_queues_push_sync_tasks_with_metadata() {
+        use crate::services::peer_instance_service::{
+            PeerInstanceService, RegisterPeerInstanceRequest, ReplicationMode,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        let peer_service = PeerInstanceService::new(fx.pool.clone());
+        let peer = peer_service
+            .register(RegisterPeerInstanceRequest {
+                name: format!("go-repl-peer-{}", fx.repo_id),
+                endpoint_url: "https://peer.example.test".to_string(),
+                region: None,
+                cache_size_bytes: 1024 * 1024,
+                sync_filter: None,
+                api_key: "peer-key".to_string(),
+            })
+            .await
+            .expect("register test peer");
+        peer_service
+            .assign_repository(
+                peer.id,
+                fx.repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .expect("assign go repo to peer");
+
+        let router = fx.router_with_auth(super::router());
+        for (file, replicated) in [
+            ("v1.0.0.mod", false),
+            ("v1.0.0.zip", false),
+            ("v1.1.0.mod", true),
+            ("v1.1.0.zip", true),
+        ] {
+            let mut req = tdh::put(
+                format!("/{}/example.com/repl/@v/{file}", fx.repo_key),
+                bytes::Bytes::from_static(b"module example.com/repl\n"),
+            );
+            if replicated {
+                req.headers_mut().insert(
+                    "x-artifact-keeper-replication",
+                    axum::http::HeaderValue::from_static("true"),
+                );
+            }
+            let (status, body) = tdh::send(router.clone(), req).await;
+            assert!(
+                status.is_success(),
+                "upload of {file} failed: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let queued: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT a.path, am.format FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
+               AND a.repository_id = $2 \
+             ORDER BY a.path",
+        )
+        .bind(peer.id)
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("list go sync tasks");
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            queued,
+            vec![
+                (
+                    "example.com/repl/v1.0.0/go.mod".to_string(),
+                    Some("go".to_string())
+                ),
+                (
+                    "example.com/repl/v1.0.0/v1.0.0.zip".to_string(),
+                    Some("go".to_string())
+                ),
+            ]
+        );
     }
 
     /// #4166: a native `go.mod` upload into a `scan_on_upload` repository

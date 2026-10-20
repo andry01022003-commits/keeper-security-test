@@ -387,6 +387,32 @@ pub async fn remove_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// The decrypted credentials JSON currently stored for `repo_id`, when one is
+/// present.
+///
+/// A best-effort read used to decide whether a `PUT .../upstream-auth` write
+/// actually changed the credential material (the audit's `credentials_changed`
+/// flag, #4529). Unlike [`load_upstream_auth`] it neither parses the value nor
+/// resolves a dynamic AWS provider, and a decryption failure is reported as
+/// `None` rather than an error, so reading audit context can never fail the
+/// write it describes.
+pub async fn stored_credentials_json(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {
+    let encrypted_hex: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 \
+         AND key = 'upstream_auth_credentials'",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .flatten();
+
+    match encrypted_hex {
+        Some(hex) => Ok(decrypt_credentials_hex(&hex, &encryption_key()).ok()),
+        None => Ok(None),
+    }
+}
+
 /// Check whether upstream auth is configured for a repository.
 /// Returns the auth type string (e.g. "basic", "bearer") or None.
 pub async fn get_upstream_auth_type(db: &PgPool, repo_id: Uuid) -> Result<Option<String>> {

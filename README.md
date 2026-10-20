@@ -296,6 +296,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[mise / aqua GitHub-Releases proxy](docs/mise-aqua.md)** — Mirror GitHub release assets using the github, mise or aqua format with finite caching
 - **[Hugging Face proxy](docs/huggingface.md)** — Proxy and cache huggingface.co for `huggingface_hub` / `hf download` via `HF_ENDPOINT`
 - **[Bazel module registries](docs/bazel.md)** — `--registry=` setup, and how a hosted module name hides the upstream versions in a virtual repository
+- **[Proxy cache freshness](docs/proxy-cache-freshness.md)** — How mutable metadata and immutable artifacts expire on different schedules, and why an upstream yank surfaces as a resolution failure while the artifact still serves
 
 ## Project Structure
 
@@ -438,12 +439,20 @@ Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
 
 ### Backers
 
+<!-- Keep this in step with the active sponsorships: `scripts/release/sponsors.sh` prints the
+     current list (public sponsors by name; private sponsors counted, never named). -->
 <table>
   <tr>
+    <td align="center"><a href="https://github.com/advailo"><img src="https://github.com/advailo.png" width="60" /><br /><sub><b>Advailo, SIA</b></sub></a></td>
+    <td align="center"><a href="https://github.com/StringKe"><img src="https://github.com/StringKe.png" width="60" /><br /><sub><b>stringke</b></sub></a></td>
     <td align="center"><a href="https://github.com/dragonpaw"><img src="https://github.com/dragonpaw.png" width="60" /><br /><sub><b>Ash A.</b></sub></a></td>
+    <td align="center"><a href="https://github.com/huylv95"><img src="https://github.com/huylv95.png" width="60" /><br /><sub><b>Mike</b></sub></a></td>
     <td align="center"><a href="https://github.com/injectedfusion"><img src="https://github.com/injectedfusion.png" width="60" /><br /><sub><b>Gabriel Rodriguez</b></sub></a></td>
+    <td align="center"><a href="https://github.com/narek01"><img src="https://github.com/narek01.png" width="60" /><br /><sub><b>Narek Engibaryan</b></sub></a></td>
   </tr>
 </table>
+
+And one sponsor who chose to stay private. Thank you.
 
 [Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
 

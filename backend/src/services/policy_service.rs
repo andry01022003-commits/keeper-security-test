@@ -2876,6 +2876,55 @@ mod tests {
         assert!(violations[0].contains("unknown"));
     }
 
+    /// #4711: the schema documentation operators read (the
+    /// `CondaPolicyPredicates` doc comment, which utoipa publishes as the
+    /// OpenAPI description) once claimed the channel predicates fall back to
+    /// the owning repository's key when no channel was recorded. The
+    /// evaluator never did. Pin both halves together so they cannot drift
+    /// apart again: no recorded channel plus an `allowed_channels` predicate
+    /// is refused, and the published description says exactly that.
+    #[test]
+    fn test_conda_channel_predicate_doc_matches_fail_closed_evaluation_4711() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            allowed_channels: vec!["my-repo".to_string()],
+            ..Default::default()
+        });
+        let facts = CondaFacts {
+            channel: None,
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &facts);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("[conda.channel]") && v.contains("unknown")),
+            "no recorded channel + allowed_channels must be refused, got: {violations:?}"
+        );
+
+        // A denylist alone has nothing to match an unknown origin against.
+        let deny_only = preds_4058(CondaPolicyPredicates {
+            denied_channels: vec!["my-repo".to_string()],
+            ..Default::default()
+        });
+        assert!(evaluate_conda_predicates("p", &deny_only, &facts).is_empty());
+
+        let schema =
+            serde_json::to_value(<CondaPolicyPredicates as utoipa::PartialSchema>::schema())
+                .expect("schema serializes");
+        let description = schema["description"]
+            .as_str()
+            .expect("CondaPolicyPredicates publishes a description");
+        assert!(
+            !description.contains("falling back"),
+            "the published description must not promise a channel fallback: {description}"
+        );
+        assert!(
+            description.contains("no fallback") && description.contains("fails closed"),
+            "the published description must state that an unknown channel fails \
+             closed: {description}"
+        );
+    }
+
     #[test]
     fn test_conda_channel_denylist_blocks_only_matching_channels() {
         let preds = preds_4058(CondaPolicyPredicates {

@@ -2829,5 +2829,93 @@ mod tests {
             tdh::cleanup_user(&f.pool, repo_admin).await;
             tdh::cleanup_user(&f.pool, global_id).await;
         }
+
+        /// #4026: `{"project_id": null}` clears the assignment instead of
+        /// answering 200 and changing nothing, an omitted field still leaves
+        /// it alone, and clearing needs the same authority as assigning: a
+        /// repository-level admin who does not administer the project the
+        /// repository is in gets 403 and the assignment stays.
+        #[tokio::test]
+        async fn http_repository_project_unassign_4026() {
+            let Some(f) = fixture().await else {
+                return;
+            };
+            let (global_id, global_name) = tdh::create_user(&f.pool).await;
+            let global = tdh::admin_auth(global_id, &global_name);
+            let key = format!("{}-unassign", f.p_key);
+            let RJson(repo) = create_repo_with(&f, &global, &key, Some(f.p))
+                .await
+                .expect("admin creates in P");
+            let stored = |pool: PgPool, id: Uuid| async move {
+                sqlx::query_scalar::<_, Option<Uuid>>(
+                    "SELECT project_id FROM repositories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            };
+
+            // Repository admin alone may not take the repository out of P.
+            let (repo_admin, ra_name) = tdh::create_user(&f.pool).await;
+            tdh::grant_repo_actions(&f.pool, repo.id, repo_admin, &["admin", "read", "write"])
+                .await;
+            let ra_auth = tdh::make_auth(repo_admin, &ra_name);
+            f.state.permission_service.invalidate_cache();
+            let err = update_repo_with(
+                &f,
+                &ra_auth,
+                &key,
+                serde_json::json!({ "project_id": null }),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authorization(_)), "{err:?}");
+            assert_eq!(stored(f.pool.clone(), repo.id).await, Some(f.p));
+
+            // Omitting the field leaves the assignment unchanged.
+            let RJson(untouched) =
+                update_repo_with(&f, &f.auth, &key, serde_json::json!({ "description": "d" }))
+                    .await
+                    .expect("description-only PATCH");
+            assert_eq!(untouched.project_id, Some(f.p));
+            assert_eq!(stored(f.pool.clone(), repo.id).await, Some(f.p));
+
+            // The project admin of P clears it: response and row both NULL.
+            let RJson(cleared) =
+                update_repo_with(&f, &f.auth, &key, serde_json::json!({ "project_id": null }))
+                    .await
+                    .expect("project admin clears the assignment");
+            assert_eq!(
+                cleared.project_id, None,
+                "response echoes the cleared value"
+            );
+            assert_eq!(stored(f.pool.clone(), repo.id).await, None);
+
+            // Clearing an already unassigned repository is a no-op, not a 403.
+            update_repo_with(&f, &global, &key, serde_json::json!({ "project_id": null }))
+                .await
+                .expect("clearing twice is idempotent");
+
+            let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+                .bind(repo_admin)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+                .bind(repo.id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo.id)
+                .execute(&f.pool)
+                .await;
+            teardown(&f).await;
+            tdh::cleanup_user(&f.pool, repo_admin).await;
+            tdh::cleanup_user(&f.pool, global_id).await;
+        }
     }
 }

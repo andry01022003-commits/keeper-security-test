@@ -3,7 +3,7 @@ resolver = "2"
 members = ["backend"]
 
 [workspace.package]
-version = "1.11.0"
+version = "1.11.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
@@ -87,7 +87,7 @@ tokio = { version = "1.50", features = ["full"] }
 # Web framework
 axum = { version = "0.7", features = ["multipart", "tokio"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "compression-br"] }
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
@@ -119,7 +119,7 @@ aes-gcm = "0.10"
 zeroize = { version = "1.8", features = ["alloc", "derive"] }
 
 # S3 storage using Apache object_store crate (supports custom CA certs for TLS)
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 
 # HTTP types (used for presigned URL methods)
 http = "1"
@@ -184,8 +184,8 @@ bytes = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
-wasmtime = { version = "36.0.17", features = ["component-model", "async"] }
-wasmtime-wasi = "36.0.17"
+wasmtime = { version = "36.0.18", features = ["component-model", "async"] }
+wasmtime-wasi = "36.0.18"
 
 # Git operations
 git2 = "0.21"

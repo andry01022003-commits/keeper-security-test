@@ -38,6 +38,11 @@ tokio.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
+# The HTTP accept loop in `api::serve` builds hyper connections itself so it
+# can set an HTTP/1 header-read timeout, which `axum::serve` cannot (#4665).
+# Both are already in the tree through axum.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 
 # Database
 sqlx.workspace = true
@@ -135,7 +140,7 @@ flate2 = "1.0"
 tar = "0.4"
 xz2 = "0.1"
 mime_guess = "2.0"
-zip = "8.5"
+zip = "9.0"
 toml = "1.1"
 serde_yaml = "0.9"
 regex = "1.11"
@@ -150,8 +155,8 @@ rmp-serde = "1.3"
 # networking module is not needed (we stream from in-memory upload bytes), and
 # its `.tar.bz2` reader is single-stream, so the multi-stream v1 path stays on
 # our own reader (#4067).
-rattler_conda_types = { version = "0.53", default-features = false }
-rattler_package_streaming = { version = "0.27", default-features = false }
+rattler_conda_types = { version = "0.57", default-features = false }
+rattler_package_streaming = { version = "0.27.15", default-features = false }
 
 # WASM runtime
 wasmtime.workspace = true
@@ -232,6 +237,11 @@ x509-cert = { version = "0.2", features = ["pem"] }
 # internally for exactly this payload in its (private, feature-gated) cosign
 # path — matching its encoding byte-for-byte is the whole point.
 serde_json_canonicalizer = "0.3"
+# The protobuf types behind `sigstore::bundle::Bundle`, pinned to the exact
+# version `sigstore` 0.14.0 already resolves. Used only to serialize a bundle's
+# DSSE envelope with the crate's own serializer, so the Rekor `envelopeHash`
+# comparison (#4082) hashes the very bytes `verify_digest` hashes.
+sigstore_protobuf_specs = "=0.5.2"
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
@@ -247,6 +257,9 @@ prost-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+# setrlimit(RLIMIT_FSIZE) in the filesystem storage tests, to make a write
+# fail on demand (#4646). Already in the tree transitively.
+libc = "0.2"
 axum-test = "19"
 wiremock = "0.6"
 metrics-util = "0.20"
@@ -255,7 +268,7 @@ metrics-util = "0.20"
 rcgen = "0.14"
 # Serve the CI OIDC e2e mock issuer over TLS (`ci_oidc_exchange_e2e_tests`):
 # the exchange refuses a non-https issuer, and axum 0.7's `serve` is plain TCP.
-# Both are already in the tree transitively; `ring`, not the default aws-lc-rs,
-# matches the provider the backend's own rustls is built with.
+# Both are already in the tree transitively (hyper-util is also a normal
+# dependency); `ring`, not the default aws-lc-rs, matches the provider the
+# backend's own rustls is built with.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }

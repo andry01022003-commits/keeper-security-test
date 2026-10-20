@@ -1213,6 +1213,18 @@ async fn upload_file_impl(
     )
     .await;
 
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
     info!(
         "HuggingFace upload: {}/{}/{} to repo {}",
         model_id, revision, filename, repo_key
@@ -1667,6 +1679,58 @@ mod tests {
             status
         );
         f.teardown().await;
+    }
+
+    /// #4725: a HuggingFace file upload to a hosted repository must queue a
+    /// push sync task for a subscribed push peer, and an upload that arrives
+    /// as peer replication must not be fanned back out. Fails on `main`
+    /// (nothing queued).
+    #[tokio::test]
+    async fn huggingface_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "huggingface").await;
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/models/push-model/upload/main", f.repo_key))
+            .header("x-filename", "model.bin")
+            .body(axum::body::Body::from(vec![1u8; 16]))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "upload must succeed: {status} {:?}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the file
+        // but must not queue another task.
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/models/push-model/upload/main", f.repo_key))
+            .header("x-filename", "replicated.bin")
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(vec![2u8; 16]))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated upload must succeed: {status} {:?}",
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["push-model/main/model.bin".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 
     // -----------------------------------------------------------------------

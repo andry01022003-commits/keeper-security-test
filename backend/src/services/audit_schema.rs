@@ -258,6 +258,14 @@ mod tests {
                 .ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
                 .details_typed(details::AuthDetails::failed_login(Some("attacker"), None)),
+            AuditEntry::new(AuditAction::LoginRateLimited, ResourceType::User)
+                .ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)))
+                .details_typed(details::AuthDetails::rate_limited(
+                    Some("attacker"),
+                    "/api/v1/auth/login",
+                    "POST",
+                    "login_per_account",
+                )),
             AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
                 .system_actor("system:stuck_scan_janitor"),
             AuditEntry::new(AuditAction::PermissionDenied, ResourceType::User)
@@ -284,6 +292,9 @@ mod tests {
                     previous_scan_config: None,
                     scan_config_changed: None,
                     upstream_change: None,
+                    project_change: None,
+                    allow_public_with_upstream_credentials: None,
+                    upstream_auth_change: None,
                 }),
         ];
         for entry in &entries {
@@ -363,6 +374,12 @@ mod tests {
                 previous_scan_config: Some(state("fail_open")),
                 scan_config_changed: Some(vec!["proxy_scan_action".into()]),
                 upstream_change: None,
+                project_change: Some(details::ProjectChangeAudit {
+                    previous_project_id: Some(Uuid::new_v4()),
+                    project_id: None,
+                }),
+                allow_public_with_upstream_credentials: None,
+                upstream_auth_change: None,
             })
             .unwrap(),
         );

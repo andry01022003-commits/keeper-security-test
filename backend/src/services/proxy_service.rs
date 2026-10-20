@@ -35,6 +35,7 @@ use crate::services::proxy_hydration::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
+use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
 use crate::services::upstream_tracing::send_upstream;
 
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
@@ -974,8 +975,20 @@ fn anonymous_token_refused_error(status: StatusCode, url: &str) -> AppError {
          credentials were sent); treating the object as not available"
     );
     AppError::BadGateway(format!(
-        "Upstream returned error status {status} for an anonymous bearer token: {url}"
+        "Upstream returned error status {status}{ANONYMOUS_TOKEN_REFUSAL_MARKER}: {url}"
     ))
+}
+
+/// The part of [`anonymous_token_refused_error`]'s message that tells it apart
+/// from every other `BadGateway`.
+const ANONYMOUS_TOKEN_REFUSAL_MARKER: &str = " for an anonymous bearer token";
+
+/// Whether `err` is an [`anonymous_token_refused_error`] (#4526): an upstream
+/// refusal of a request that carried no credentials, already logged at INFO
+/// where it was classified, so the proxy's generic failure WARN must not
+/// repeat it for every pull.
+pub(crate) fn is_anonymous_token_refusal(err: &AppError) -> bool {
+    matches!(err, AppError::BadGateway(msg) if msg.contains(ANONYMOUS_TOKEN_REFUSAL_MARKER))
 }
 
 /// The status of an upstream `401`/`403` answer to the request ITSELF, when
@@ -1547,6 +1560,37 @@ enum RevalidationVerdict {
     /// Upstream was unreachable (5xx / timeout / transport) within the
     /// `stale-if-error` grace window: serve the stale body we already hold.
     ServeStaleIfError,
+    /// #4640: the conditional probe got a definitive 404/410 and the repository
+    /// is `on_upstream_not_found = keep`: serve the cached body we already hold
+    /// without deleting it, writing no marker, and without extending its TTL so
+    /// a later revalidation still notices a re-publish.
+    KeepOnUpstreamNotFound,
+}
+
+/// Outcome of a conditional HEAD revalidation probe (#4640).
+///
+/// Both a "different object" and a "no longer present" answer collapse into the
+/// single `true` that [`UpstreamClient::check_etag_changed`] historically
+/// returned. `on_upstream_not_found = delete` treats them the same (refill), but
+/// `keep` must serve the cached copy on the latter and still refill on the
+/// former, so the reason is preserved here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EtagProbe {
+    /// 304, or 200 carrying the same ETag: the cache is current.
+    Unchanged,
+    /// 200 with a different validator (or none comparable): refill.
+    Changed,
+    /// 404/410: upstream no longer has the object.
+    Gone,
+}
+
+impl EtagProbe {
+    /// Collapse to the binary "changed/newer" answer. A `Gone` object is not
+    /// "the same", so it reads as changed — the `delete` policy then refills
+    /// and negative-caches the 404, exactly as before #4640.
+    const fn is_changed(self) -> bool {
+        matches!(self, Self::Changed | Self::Gone)
+    }
 }
 
 /// Default bearer token TTL when the token endpoint omits `expires_in` (5 minutes).
@@ -1606,6 +1650,58 @@ fn is_multipart_etag(etag: &str) -> bool {
     MULTIPART_ETAG_RE.is_match(etag.trim_matches('"'))
 }
 
+/// MD5 of the empty byte string: the single-part ETag every S3-compatible
+/// backend reports for a zero-byte object (S3, MinIO, SeaweedFS, Ceph RGW, R2).
+///
+/// A multipart ETag always carries a `-<partcount>` suffix (see
+/// [`MULTIPART_ETAG_RE`]), so the opaque per-upload values #2120 warns about
+/// can never compare equal to this constant.
+const EMPTY_OBJECT_ETAG_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
+
+/// True when `etag` is the single-part ETag of a zero-byte object. Surrounding
+/// double quotes are stripped first, exactly as [`is_multipart_etag`] does, so
+/// both the raw and the quoted header form are recognized.
+fn etag_is_empty_object(etag: &str) -> bool {
+    etag.trim_matches('"')
+        .eq_ignore_ascii_case(EMPTY_OBJECT_ETAG_MD5)
+}
+
+/// True when a proxy-cache sidecar describes an object that cannot exist: it
+/// vouches for `size_bytes > 0` while pinning the ETag of a zero-byte object
+/// (#4630).
+///
+/// [`CachePersister::tee_stream`] writes the two fields in the same breath --
+/// `size_bytes` from the staging `put_stream`, `storage_etag` from a HEAD of
+/// the live key after the publish `copy()` -- so they disagree only when the
+/// copy published nothing. #1051 ETag revalidation cannot catch that: the pin
+/// was taken from the already-empty object, so it matches on every later HEAD.
+/// The contradiction is visible only *within* the sidecar, which is why this
+/// reads no object and makes no storage call.
+///
+/// Pure, and `false` whenever there is nothing to judge: a filesystem or
+/// pre-#1051 entry has no pin, a multipart ETag never equals the empty-object
+/// MD5, and a backend whose ETag is not an MD5 never matches it either --
+/// Azure's is opaque, and so is the native GCS backend's, which pins the JSON
+/// metadata `etag`. GCS reached through its S3-compatible XML API -- the
+/// configuration #3737 is about -- does report the hex MD5 of a single-part
+/// object, so that one is covered. Entries this cannot judge keep their
+/// existing behavior and are covered by the write-path guard in
+/// [`CachePersister::tee_stream`] instead.
+///
+/// The two halves of #4630 are therefore not symmetric, and the asymmetry is
+/// in the truncated case specifically. The write guard refuses a *new*
+/// publish that lands short, because it compares sizes. This predicate cannot
+/// heal an entry already poisoned that way: a truncated object's pin is that
+/// truncated object's own correct MD5, not the empty-object one, so there is
+/// no contradiction to see here and #1051 revalidation finds the entry clean
+/// on every HEAD. Only the empty case leaves a mark a later reader can
+/// recognize. A pre-existing truncated entry still needs either an eviction
+/// or the read-path length comparison that the follow-up on surfacing
+/// `get_stream`'s object length would make free.
+fn sidecar_pins_empty_object(size_bytes: i64, storage_etag: Option<&str>) -> bool {
+    size_bytes > 0 && storage_etag.is_some_and(etag_is_empty_object)
+}
+
 async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
     storage.head_etag(cache_key).await.unwrap_or_else(|e| {
         tracing::debug!(
@@ -1628,6 +1724,159 @@ async fn discard_staging(storage: &StorageService, staging_key: &str) {
             error = %e,
             "best-effort delete of proxy-cache staging object failed"
         );
+    }
+}
+
+/// Best-effort removal of an object a publish just landed on the LIVE cache
+/// key and that must not be served (#4630).
+///
+/// The counterpart to [`discard_staging`], for the one reject path that runs
+/// after a `copy()` reported success. Refusing to write the sidecar is enough
+/// on a first fill -- no sidecar, no read -- but not on a refill: the previous
+/// sidecar is still there, now describing the object the bad publish left
+/// behind, and if that object is empty its pinned ETag is a *correct* MD5 of
+/// it, so [`sidecar_pins_empty_object`] has nothing to catch and the entry
+/// serves `Content-Length` over an empty body on every request. Dropping the
+/// object puts the entry back on [`ProxyService::open_cached_stream`]'s
+/// pre-existing `NotFound` self-heal.
+///
+/// A failure leaves the entry exactly as a release without this check would
+/// have left it, which is why it only warns.
+///
+/// # This is the delete-on-mismatch #3153 declined, and why that is now right
+///
+/// #3153 -- the PR that introduced the staging-key publish this arm sits at
+/// the end of -- ruled one out in as many words: "Not adding a reactive
+/// delete-on-mismatch here: that delete could clobber a concurrent writer's
+/// just-published good object, recreating the exact pattern this PR
+/// removes." `S3Backend::multipart_server_side_copy` still carries that
+/// reasoning in its own doc comment. It was correct when it was written.
+/// What changed is not the race; it is what the loser of the race gets.
+///
+/// A wrong delete was dangerous because of what it left *servable*. Before
+/// #3147, [`ProxyService::handle_streaming_leader_upstream_error`] opened the
+/// body first and loaded the sidecar best-effort, so an object on the content
+/// key went out to a client whether or not a sidecar vouched for it -- the
+/// comment at that reader records the history. Removing the right object
+/// could therefore expose the wrong one. Since #3147 every reader gates on
+/// the sidecar, so an object nothing vouches for is inert, and an object that
+/// is simply *absent* is not a hazard at all: it is the input to
+/// [`ProxyService::open_cached_stream`]'s `NotFound` self-heal.
+///
+/// Run the race the carve-out describes, concretely. Replica A's copy lands
+/// empty and replica B's lands the real bytes; A measures the live key, sees
+/// the mismatch, and deletes B's good object. B then commits a sidecar for a
+/// key that holds nothing. The next read loads that sidecar, opens the body,
+/// gets `NotFound`, and takes the self-heal arm -- one extra upstream fetch,
+/// after which the entry is correct. **The worst case of a wrong delete is a
+/// cache miss, not corruption.** Before #3147 the same mistake cost a client
+/// the bad bytes.
+///
+/// That argument has to survive the ordinary case rather than an exotic one.
+/// Cross-replica single-flight (#1609,
+/// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED`) is opt-in and off by default,
+/// so two replicas publishing the same cold key at once is normal traffic,
+/// not a corner. It does survive it, because the exposure is bounded by a
+/// refetch either way.
+///
+/// The delete is also narrower than the one #3153 turned down. It runs only
+/// after *this* writer's own `copy()` reported success on *this* key, so the
+/// object it removes is one this writer just wrote or replaced moments
+/// earlier. The reject arms that precede the publish are unchanged and still
+/// touch nothing but their own staging key, which is the invariant
+/// `test_tee_concurrent_reject_and_commit_never_touch_live_key_directly`
+/// pins.
+async fn discard_bad_publish(storage: &StorageService, cache_key: &str) {
+    if let Err(e) = storage.delete(cache_key).await {
+        tracing::warn!(
+            cache_key = %cache_key,
+            error = %e,
+            "best-effort delete of a refused proxy-cache publish failed; the live key may \
+             still hold an object no sidecar vouches for (#4630)"
+        );
+    }
+}
+
+/// Error code of the 502 answered when an upstream body ends before the
+/// `Content-Length` it advertised, while the client response has not yet
+/// started (#4759).
+const UPSTREAM_SHORT_BODY: &str = "UPSTREAM_SHORT_BODY";
+
+/// The client-facing error for an upstream body that ended short (#4759):
+/// names the repository and both byte counts, never the upstream URL.
+fn upstream_short_body_error(repo_key: &str, expected: u64, received: u64) -> AppError {
+    AppError::CodedBadGateway {
+        code: UPSTREAM_SHORT_BODY,
+        message: format!(
+            "upstream of repository '{repo_key}' promised {expected} bytes (Content-Length) \
+             but its body ended after {received} bytes"
+        ),
+    }
+}
+
+/// Wait for the first byte of a streaming upstream body that advertised a
+/// non-zero `Content-Length`, before the response is handed to the client
+/// (#4759).
+///
+/// The streaming leader used to return the upstream headers immediately, so
+/// the client's `200` and `Content-Length: N` were committed before a single
+/// body byte had been read. An upstream that promised `N` bytes and then
+/// closed left nothing to do but drop the connection: the client saw no HTTP
+/// status at all (curl exit 52). Holding the headers until the first body
+/// chunk arrives costs nothing on a healthy upstream (the response could not
+/// have streamed before that byte anyway) and turns the body-never-came case
+/// into an ordinary upstream error the caller can answer with a status --
+/// `502 UPSTREAM_SHORT_BODY`, or stale-if-error when a cached copy exists.
+///
+/// Once a byte has arrived the response is committed. A body that ends short
+/// after that point is reported by [`CachePersister::tee_stream`]: the client
+/// stream ends in an error (the connection is closed, the only honest signal
+/// left), a warn names the key and both counts, and nothing is cached.
+///
+/// A body with no advertised length (chunked) or an advertised length of
+/// zero passes through untouched: an empty body is legitimate for both.
+async fn await_first_upstream_bytes(
+    body: BoxStream<'static, Result<Bytes>>,
+    content_length: Option<u64>,
+    repo_key: &str,
+    cache_key: &str,
+) -> Result<BoxStream<'static, Result<Bytes>>> {
+    let Some(expected) = content_length.filter(|&n| n > 0) else {
+        return Ok(body);
+    };
+    let mut body = body;
+    loop {
+        match body.next().await {
+            Some(Ok(chunk)) if chunk.is_empty() => continue,
+            Some(Ok(chunk)) => {
+                return Ok(Box::pin(
+                    futures::stream::once(async move { Ok(chunk) }).chain(body),
+                ));
+            }
+            Some(Err(e)) => {
+                tracing::warn!(
+                    repository = %repo_key,
+                    cache_key = %cache_key,
+                    expected_bytes = expected,
+                    received_bytes = 0u64,
+                    error = %e,
+                    "upstream body failed before its first byte; answering 502 \
+                     UPSTREAM_SHORT_BODY, nothing cached (#4759)"
+                );
+                return Err(upstream_short_body_error(repo_key, expected, 0));
+            }
+            None => {
+                tracing::warn!(
+                    repository = %repo_key,
+                    cache_key = %cache_key,
+                    expected_bytes = expected,
+                    received_bytes = 0u64,
+                    "upstream advertised a Content-Length and sent no body; answering 502 \
+                     UPSTREAM_SHORT_BODY, nothing cached (#4759)"
+                );
+                return Err(upstream_short_body_error(repo_key, expected, 0));
+            }
+        }
     }
 }
 
@@ -2116,6 +2365,22 @@ impl CacheStore {
             return false;
         }
 
+        // #4630: refuse to presign a redirect to an object the sidecar itself
+        // contradicts. The #1051 revalidation below cannot catch this one --
+        // the pin was taken from the already-empty object, so the HEAD matches
+        // it and the entry revalidates clean -- and the #3147 length check sits
+        // in the multipart fallback, which a matching single-part ETag never
+        // reaches.
+        if sidecar_pins_empty_object(metadata.size_bytes, metadata.storage_etag.as_deref()) {
+            tracing::warn!(
+                cache_key = %cache_key,
+                size_bytes = metadata.size_bytes,
+                "proxy cache sidecar pins the ETag of an empty object while claiming a \
+                 non-zero size; not fresh (#4630)"
+            );
+            return false;
+        }
+
         // ETag-based integrity revalidation (#1051). Only meaningful when
         // we have a pinned ETag from cache-write time AND the backend
         // surfaces an ETag now. Either side being `None` falls back to
@@ -2236,6 +2501,17 @@ impl CacheStore {
 ///    existence-only semantics.
 /// 3. **Body → sidecar write ordering.** The content object is written
 ///    first, then the cache-metadata sidecar. Never reordered.
+/// 4. **#4630 published-object check.** The streaming path measures the live
+///    key after the publish `copy()` and refuses to write a sidecar when it
+///    does not hold the bytes that were staged, dropping the published object
+///    as well so the entry misses cleanly instead of being described by a
+///    surviving older sidecar. #1365 validates the STAGING write, so without
+///    this a `copy()` that reports success while storing nothing produces a
+///    sidecar with the right size and checksum over a zero-byte body. The
+///    measurement itself is best-effort (a backend that cannot answer the
+///    HEAD commits as before, see [`Self::tee_stream`]); what is unconditional
+///    is that a *measured* disagreement, or an ETag pin that proves the live
+///    object empty, never reaches a sidecar.
 ///
 /// Streaming-tee failure semantics ([`Self::tee_stream`]) are unchanged: a
 /// cache-write failure must not corrupt the client stream, upstream errors
@@ -2616,6 +2892,22 @@ impl CachePersister {
                         // live key via the backend's native copy (atomic —
                         // readers see the old or new version, never a partial
                         // write). A copy failure degrades like a reject.
+                        //
+                        // #4630, for whoever changes this next: this arm
+                        // discards the STAGING object only, which is right
+                        // today because a `copy()` that returns `Err` on
+                        // every backend here either never touched the live
+                        // key or aborted before the destination became
+                        // visible. It stops being right the moment the
+                        // storage layer starts verifying its own copies: if
+                        // `StorageService::copy` ever grows a post-copy
+                        // length or digest check and returns `Err` on
+                        // mismatch, bad publishes stop arriving at the
+                        // measurement arm below and start arriving HERE --
+                        // where nothing drops the live key, so the refill
+                        // poisoning the arm below exists to prevent would
+                        // come straight back. Move the
+                        // `discard_bad_publish` call up with the check.
                         if let Err(e) = storage_clone
                             .copy(&staging_key, &cache_key_for_writer)
                             .await
@@ -2630,6 +2922,90 @@ impl CachePersister {
                             discard_staging(&storage_clone, &staging_key).await;
                             return;
                         }
+                        // #4630: measure what the publish actually landed on
+                        // the live key before writing a sidecar that vouches
+                        // for it. `classify_stream_write` above validated the
+                        // STAGING write; nothing measures the `copy()` between
+                        // them. An S3-compatible endpoint that accepts the
+                        // #3737 `Content-Length: 0` copy PUT without honouring
+                        // `x-amz-copy-source` answers 200 having stored an
+                        // empty object, and the sidecar then carries the right
+                        // size and checksum over a zero-byte body -- which
+                        // streaming reads serve as a permanent 500. This also
+                        // catches a truncated publish, not only an empty one.
+                        match storage_clone.size(&cache_key_for_writer).await {
+                            Ok(published) if published == result.bytes_written => {}
+                            Ok(published) => {
+                                // #4630 diagnostic. `staged_bytes` is what
+                                // `put_stream` REPORTED writing;
+                                // `staging_bytes` is what the source key
+                                // actually holds right now. The two causes
+                                // this guard otherwise cannot tell apart:
+                                // a staging object that reads 0 against a
+                                // non-zero `staged_bytes` points at the
+                                // source (read-after-write lag on the filer,
+                                // a staging write that did not durably
+                                // land), while one that reads back the
+                                // staged size points at the `copy()` itself.
+                                // `S3Backend::copy` already HEADs the source
+                                // but discards the answer, and surfacing it
+                                // means changing `copy`'s signature across
+                                // every backend -- so measure it here
+                                // instead, on a path that has already
+                                // failed. The staging object is still on the
+                                // backend (`discard_staging` runs below), and
+                                // this costs the hot path nothing: a publish
+                                // that matches never reaches this arm.
+                                let staging_bytes = storage_clone.size(&staging_key).await.ok();
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    staged_bytes = result.bytes_written,
+                                    published_bytes = published,
+                                    staging_bytes = ?staging_bytes,
+                                    "published proxy-cache object does not have the size that \
+                                     was staged; not caching (no metadata sidecar) and dropping \
+                                     the live key so the next request refetches upstream"
+                                );
+                                // Unlike every other reject arm here, this one
+                                // runs AFTER a `copy()` that reported success,
+                                // so the live key already holds the bad object
+                                // and whatever it replaced is gone. Leaving it
+                                // there is not inert: on a REFILL the previous
+                                // sidecar survives, now describing an empty
+                                // body, and its pin is that body's correct MD5
+                                // -- so the read guard stays silent and the
+                                // entry serves the very 500 this is defending
+                                // against. Dropping it instead makes
+                                // `open_cached_stream`'s `NotFound` self-heal
+                                // fire and the entry miss cleanly.
+                                discard_bad_publish(&storage_clone, &cache_key_for_writer).await;
+                                discard_staging(&storage_clone, &staging_key).await;
+                                return;
+                            }
+                            Err(e) => {
+                                // Best-effort, the same posture as
+                                // `pin_storage_etag`'s HEAD: a storage endpoint
+                                // that cannot answer a HEAD right after a copy
+                                // (read-after-write lag on an S3-compatible
+                                // backend) has not told us the publish was bad,
+                                // only that it cannot be measured. Failing
+                                // closed here would stop proxy caching
+                                // altogether on such a backend -- every request
+                                // a fresh upstream fetch -- with a `warn` as
+                                // the only signal. Carry on without the extra
+                                // assurance; the ETag pin taken below is
+                                // checked for the same contradiction before
+                                // anything is committed, and a transient HEAD
+                                // failure leaves behaviour exactly as it is on
+                                // the released code path.
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    error = %e,
+                                    "could not measure the published proxy-cache object; \
+                                     committing the sidecar without that assurance (#4630)"
+                                );
+                            }
+                        }
                         discard_staging(&storage_clone, &staging_key).await;
                         let now = Utc::now();
                         // #1618 S9 / #1051: pin the storage backend's ETag at
@@ -2640,6 +3016,28 @@ impl CachePersister {
                         // error.
                         let storage_etag =
                             pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
+                        // #4630: the pin was just read off the live key, so a
+                        // pin that is the empty-object MD5 while a non-zero
+                        // body was staged proves the publish landed nothing --
+                        // on exactly the backends whose `size()` the arm above
+                        // may not have been able to read. Costs no storage
+                        // call: it re-reads the two values already in hand,
+                        // with the same predicate the read paths apply to a
+                        // sidecar that is already on disk.
+                        if sidecar_pins_empty_object(
+                            result.bytes_written as i64,
+                            storage_etag.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                cache_key = %cache_key_for_writer,
+                                staged_bytes = result.bytes_written,
+                                "published proxy-cache object carries the ETag of an empty \
+                                 object; not caching (no metadata sidecar) and dropping the \
+                                 live key so the next request refetches upstream (#4630)"
+                            );
+                            discard_bad_publish(&storage_clone, &cache_key_for_writer).await;
+                            return;
+                        }
                         let metadata = CacheMetadata {
                             cached_at: now,
                             upstream_etag: template.etag,
@@ -2780,6 +3178,7 @@ impl CachePersister {
         //   * yield the chunk to the client.
         // On upstream error: forward the error to storage (so put_stream
         // sees the error and aborts cleanly) and surface to the client.
+        let tee_cache_key = cache_key;
         let tee_stream = async_stream::try_stream! {
             let mut upstream = upstream;
             // GHSA-qxv7-p3mq-88fv: hash the bytes actually handed to the
@@ -2801,6 +3200,11 @@ impl CachePersister {
             // is not guaranteed to run; without this the writer found an
             // empty slot and refused every gated object.
             let mut forwarded_bytes: u64 = 0;
+            // #4759: bytes yielded to the CLIENT (unlike `forwarded_bytes`,
+            // which stops counting once the cache half is abandoned), for the
+            // warn that reports a body that ended short after the response
+            // had already started.
+            let mut client_bytes: u64 = 0;
             while let Some(chunk_result) = upstream.next().await {
                 match chunk_result {
                     Ok(mut bytes) => {
@@ -2868,6 +3272,7 @@ impl CachePersister {
                                 }
                                 let _ = tx.send(Ok(slice.clone())).await;
                             }
+                            client_bytes += slice.len() as u64;
                             yield slice;
                         }
                     }
@@ -2887,6 +3292,18 @@ impl CachePersister {
                             e
                         )));
                         let _ = tx.send(storage_msg).await;
+                        // #4759: the response headers are already out, so the
+                        // only signal left for the client is the closed
+                        // connection this error causes. Say so, with the
+                        // counts, where an operator will look.
+                        tracing::warn!(
+                            cache_key = %tee_cache_key,
+                            expected_bytes = expected_len,
+                            received_bytes = client_bytes,
+                            error = %e,
+                            "upstream body failed after the response had started; closing the \
+                             client connection, nothing cached (#4759)"
+                        );
                         Err(e)?;
                     }
                 }
@@ -2915,6 +3332,24 @@ impl CachePersister {
             }
             // upstream EOF: drop tx so the writer sees end-of-stream
             drop(tx);
+            // #4759: an upstream body that ended short of its
+            // `Content-Length` without a transport error (hyper reports one
+            // for a real HTTP/1.1 upstream; see the `Err` arm above). The
+            // writer rejects the object as truncated, and the client's
+            // response, which declared the same length, is cut short when its
+            // body ends, so its connection is closed by the server. Record it
+            // with the same counts as the error arm.
+            if let Some(expected) = expected_len {
+                if client_bytes < expected {
+                    tracing::warn!(
+                        cache_key = %tee_cache_key,
+                        expected_bytes = expected,
+                        received_bytes = client_bytes,
+                        "upstream body ended before its Content-Length after the response had \
+                         started; the client connection is closed short, nothing cached (#4759)"
+                    );
+                }
+            }
         };
         Box::pin(tee_stream)
     }
@@ -4017,6 +4452,26 @@ impl UpstreamClient {
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer).
+    ///
+    /// Thin wrapper over [`Self::check_etag_probe`] that collapses the
+    /// [`EtagProbe`] outcome to the historical boolean (`Unchanged` is `false`,
+    /// both [`EtagProbe::Changed`] and [`EtagProbe::Gone`] are `true`).
+    async fn check_etag_changed(
+        &self,
+        url: &str,
+        cached_etag: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self
+            .check_etag_probe(url, cached_etag, repo_id, accept)
+            .await?
+            .is_changed())
+    }
+
+    /// Conditional HEAD revalidation probe that keeps the *reason* a boolean
+    /// `check_etag_changed` collapses (#4640).
+    ///
     /// Relocated verbatim from `ProxyService::check_etag_changed`.
     ///
     /// `accept` is the `Accept` header the cached representation was fetched
@@ -4027,13 +4482,13 @@ impl UpstreamClient {
     /// the live case — `simple/<project>/` serves HTML or PEP 691 JSON off
     /// `Accept` with per-representation ETags, so probing the JSON variant's
     /// ETag without the JSON `Accept` validates it against the HTML variant.
-    async fn check_etag_changed(
+    async fn check_etag_probe(
         &self,
         url: &str,
         cached_etag: &str,
         repo_id: Uuid,
         accept: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<EtagProbe> {
         let upstream_auth = self
             .upstream_auth_for(
                 url,
@@ -4063,7 +4518,7 @@ impl UpstreamClient {
         match response.status() {
             StatusCode::NOT_MODIFIED => {
                 tracing::debug!("Upstream unchanged (304 Not Modified) for {}", shown);
-                Ok(false)
+                Ok(EtagProbe::Unchanged)
             }
             StatusCode::OK => {
                 // Check if ETag in response differs
@@ -4072,11 +4527,11 @@ impl UpstreamClient {
                 match new_etag {
                     Some(etag) if etag == cached_etag => {
                         tracing::debug!("Upstream ETag unchanged for {}", shown);
-                        Ok(false)
+                        Ok(EtagProbe::Unchanged)
                     }
                     _ => {
                         tracing::debug!("Upstream has newer content for {}", shown);
-                        Ok(true)
+                        Ok(EtagProbe::Changed)
                     }
                 }
             }
@@ -4089,7 +4544,7 @@ impl UpstreamClient {
                     "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
                     shown
                 );
-                Ok(true)
+                Ok(EtagProbe::Changed)
             }
             // #3571: a throttling (429) or broken (5xx) upstream has declined
             // to say whether the object changed. That is not "changed":
@@ -4115,10 +4570,9 @@ impl UpstreamClient {
             // degrades to stale. They stay on the catch-all below.
             //
             // 401 stays above (the OCI bearer exchange depends on it meaning
-            // "re-fetch with a token"); 404/410 fall through below (real
-            // statements about the resource) to the "assume changed" arm, so
-            // the refill GET is attempted and its own 404/410 is negative
-            // cached by `validate_upstream_status` (#3749).
+            // "re-fetch with a token"). 404/410 are caught explicitly below: a
+            // definitive statement about the resource that a `keep` repository
+            // serves from cache (#4640) and a `delete` repository refills.
             status if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
                 tracing::warn!(
                     "Upstream returned {} for ETag check on {}; no content information, \
@@ -4130,8 +4584,16 @@ impl UpstreamClient {
                     Err(err) => Err(err),
                     // Not reachable: the guard admits only statuses the
                     // validator rejects.
-                    Ok(()) => Ok(true),
+                    Ok(()) => Ok(EtagProbe::Changed),
                 }
+            }
+            status if status == StatusCode::NOT_FOUND || status == StatusCode::GONE => {
+                tracing::debug!(
+                    "Upstream answered {} for ETag check on {}; the object is gone",
+                    status,
+                    shown
+                );
+                Ok(EtagProbe::Gone)
             }
             status => {
                 tracing::warn!(
@@ -4139,7 +4601,7 @@ impl UpstreamClient {
                     status,
                     shown
                 );
-                Ok(true)
+                Ok(EtagProbe::Changed)
             }
         }
     }
@@ -4220,12 +4682,16 @@ const UNCACHED_SERVE_TTL: Duration = Duration::from_secs(300);
 const TTL_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Short-TTL memo of the repository facts every mutable-path freshness gate
-/// consults (#3832): the `cache_ttl_secs` override by repository id, and the
-/// `(id, format)` of a repository by key for the key-only read paths. Without
-/// it the read-time TTL clamp would add a database round trip to every
-/// mutable cache hit.
+/// consults (#3832, #4640): the `cache_ttl_secs` override by repository id, the
+/// `on_upstream_not_found` policy by repository id, and the `(id, format)` of a
+/// repository by key for the key-only read paths. Without it the read-time TTL
+/// clamp and the 404/410 keep policy would each add a database round trip to a
+/// mutable-path read.
 struct TtlPolicyCache {
     overrides: Cache<Uuid, Option<i64>>,
+    /// #4640: `on_upstream_not_found` per repository, memoized so a stale entry
+    /// revalidated repeatedly does not re-read `repository_config` every time.
+    upstream_not_found: Cache<Uuid, OnUpstreamNotFound>,
     repo_by_key: Cache<String, Option<(Uuid, RepositoryFormat)>>,
 }
 
@@ -4235,6 +4701,10 @@ impl TtlPolicyCache {
     fn new() -> Self {
         Self {
             overrides: Cache::builder()
+                .max_capacity(Self::CAPACITY)
+                .time_to_live(TTL_POLICY_CACHE_TTL)
+                .build(),
+            upstream_not_found: Cache::builder()
                 .max_capacity(Self::CAPACITY)
                 .time_to_live(TTL_POLICY_CACHE_TTL)
                 .build(),
@@ -5144,7 +5614,28 @@ impl ProxyService {
                         // not-yet-published artifact does not hammer upstream.
                         // We do NOT serve stale for a 404 (the object is gone /
                         // never existed); propagate the 404.
+                        //
+                        // #4640: unless this repository's
+                        // `on_upstream_not_found = keep` and a vetted positive
+                        // body is still cached -- then the cached copy is
+                        // served and nothing is deleted or negative-cached.
                         if matches!(upstream_err, AppError::NotFound(_)) {
+                            if self.on_upstream_not_found(repo.id).await.keeps() {
+                                if let Some((content, content_type, content_encoding)) = self
+                                    .kept_on_upstream_not_found(&cache_key, &metadata_key)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        repository = %repo.key,
+                                        path = %cache_path,
+                                        "upstream answered 404/410 but on_upstream_not_found=keep; \
+                                         serving the cached copy"
+                                    );
+                                    crate::services::metrics_service::
+                                        record_proxy_kept_on_upstream_not_found(&repo.key);
+                                    return Ok((content, content_type, content_encoding));
+                                }
+                            }
                             self.write_negative_cache(&cache_key, &metadata_key, cache_path)
                                 .await;
                             return Err(upstream_err);
@@ -5587,8 +6078,9 @@ impl ProxyService {
     ///   hit and therefore NEVER contact upstream (the load-bearing invariant).
     /// * **Stale** (mutable, past TTL) -> conditional revalidation via the shared
     ///   [`Self::revalidate_verdict`] core; 304 extends the TTL and streams the
-    ///   cached body, any other outcome degrades to `Miss` so the single-flight
-    ///   streaming leader refills.
+    ///   cached body, a definitive 404/410 under `on_upstream_not_found = keep`
+    ///   also streams the cached body (#4640), and any other outcome degrades to
+    ///   `Miss` so the single-flight streaming leader refills.
     ///
     /// B6 is preserved: a transient sidecar read/parse error is treated as a
     /// `Miss` (refetch), never propagated as a 502.
@@ -5622,7 +6114,10 @@ impl ProxyService {
                 // AFTER freshness evaluation; the error propagates and is
                 // never degraded to a Miss (which would refetch upstream).
                 check_quarantine_until(metadata.quarantine_until)?;
-                match self.open_cached_stream(cache_key, &metadata).await? {
+                match self
+                    .open_cached_stream(cache_key, metadata_key, &metadata)
+                    .await?
+                {
                     Some(result) => Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata))),
                     None => Ok(StreamingCacheReadOutcome::Miss),
                 }
@@ -5636,13 +6131,19 @@ impl ProxyService {
                     .revalidate_verdict(repo, fetch_path, metadata_key, &metadata, None)
                     .await
                 {
-                    // 304 extended the TTL; stream the cached body.
+                    // 304 extended the TTL; stream the cached body. #4640: a
+                    // `keep` repository's definitive 404/410 streams the cached
+                    // body too, without extending its TTL.
                     RevalidationVerdict::ServeRevalidated
-                    | RevalidationVerdict::ServeStaleIfError => {
+                    | RevalidationVerdict::ServeStaleIfError
+                    | RevalidationVerdict::KeepOnUpstreamNotFound => {
                         // Package Age Policy (#1770): gate the revalidated /
                         // stale-if-error body the same way as a fresh hit.
                         check_quarantine_until(metadata.quarantine_until)?;
-                        match self.open_cached_stream(cache_key, &metadata).await? {
+                        match self
+                            .open_cached_stream(cache_key, metadata_key, &metadata)
+                            .await?
+                        {
                             Some(result) => {
                                 Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata)))
                             }
@@ -5656,14 +6157,102 @@ impl ProxyService {
         }
     }
 
+    /// Read-side size check for a cache entry whose sidecar pins no storage
+    /// ETag (#4758): the filesystem backend never pins one, nor does an entry
+    /// cached before #1051.
+    ///
+    /// The #4630 guard ([`sidecar_pins_empty_object`]) recognizes a poisoned
+    /// entry by the ETag its sidecar pinned, so without a pin it sees nothing.
+    /// The sidecar still records the exact byte count of the object it vouches
+    /// for, and every backend can measure an object, so compare the two. On a
+    /// mismatch the entry is evicted (body, then sidecar, then the in-process
+    /// sidecar LRU) and a warn names the key; the caller treats it as a miss
+    /// and refetches upstream, which republishes both objects. Evicting rather
+    /// than merely skipping is what keeps the warn to once per poisoned entry
+    /// and keeps stale-if-error from ever handing the entry out.
+    ///
+    /// Returns `true` when the entry was evicted. A size probe that fails is
+    /// not a verdict: `NotFound` is left to the caller's own missing-body arm,
+    /// and any other error lets the read proceed exactly as before.
+    ///
+    /// Entries WITH a pin are left to the ETag checks, so an S3-compatible
+    /// backend pays no extra round trip on a hit.
+    async fn evict_if_unpinned_body_disagrees(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        metadata: &CacheMetadata,
+    ) -> bool {
+        if metadata.storage_etag.is_some() {
+            return false;
+        }
+        let expected = metadata.size_bytes.max(0) as u64;
+        let stored = match self.storage.size(cache_key).await {
+            Ok(stored) if stored != expected => stored,
+            Ok(_) => return false,
+            Err(e) => {
+                tracing::debug!(
+                    cache_key = %cache_key,
+                    error = %e,
+                    "proxy cache size probe failed; leaving the verdict to the body read (#4758)"
+                );
+                return false;
+            }
+        };
+        tracing::warn!(
+            cache_key = %cache_key,
+            sidecar_bytes = expected,
+            stored_bytes = stored,
+            "proxy cache object does not have the size its sidecar vouches for (no storage \
+             ETag pinned); evicting the entry and refetching upstream (#4758)"
+        );
+        // Body before sidecar, as every eviction orders them. Delete errors
+        // are ignored like `CacheStore::invalidate` ignores them: a surviving
+        // sidecar over a deleted body reads as a miss, and a surviving body
+        // with no sidecar is never served (#3147).
+        let _ = self.storage.delete(cache_key).await;
+        let _ = self.storage.delete(metadata_key).await;
+        invalidate_proxy_metadata_lru(metadata_key).await;
+        true
+    }
+
     /// Open a streaming read of a cached body and pair it with the sidecar's
     /// content-type / size. Returns `Ok(None)` when the sidecar says cached but
     /// the body is gone (out-of-band eviction) so the caller refetches (B6).
     async fn open_cached_stream(
         &self,
         cache_key: &str,
+        metadata_key: &str,
         metadata: &CacheMetadata,
     ) -> Result<Option<StreamingFetchResult>> {
+        // #4630: a sidecar that vouches for N > 0 bytes while pinning the ETag
+        // of a zero-byte object describes an object that cannot exist. Serving
+        // it sends `Content-Length: N` ahead of an empty body and hyper aborts
+        // the connection mid-response, which a reverse proxy renders as a 500
+        // while this process logs `status=200` (the tracing middleware logs
+        // when the handler returns the Response, before the body is polled).
+        // The object is present, so the missing-body arm below can never fire
+        // and the entry 500s on every retry forever. Treat it as that same
+        // miss: the refetch rewrites both objects and the entry self-heals.
+        if sidecar_pins_empty_object(metadata.size_bytes, metadata.storage_etag.as_deref()) {
+            tracing::warn!(
+                cache_key = %cache_key,
+                size_bytes = metadata.size_bytes,
+                "proxy cache sidecar pins the ETag of an empty object while claiming a \
+                 non-zero size; treating as a miss and refetching upstream (#4630)"
+            );
+            return Ok(None);
+        }
+        // #4758: the same lie with no ETag to give it away. The filesystem
+        // backend (the default) pins no `storage_etag`, so the check above
+        // never fires there, and an emptied or truncated body under an intact
+        // sidecar went out as `Content-Length: N` over fewer bytes, forever.
+        if self
+            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, metadata)
+            .await
+        {
+            return Ok(None);
+        }
         match self.storage.get_stream(cache_key).await {
             Ok(body) => Ok(Some(StreamingFetchResult {
                 body,
@@ -5712,11 +6301,36 @@ impl ProxyService {
         // window was never honoured on the streaming path.)
 
         let full_url = self.gated_upstream_url(repo, fetch_path).await?;
-        let upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
+        let mut upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
             Ok(upstream) => upstream,
             Err(err) => {
                 return self
                     .handle_streaming_leader_upstream_error(
+                        repo,
+                        cache_path,
+                        &cache_key,
+                        &metadata_key,
+                        err,
+                    )
+                    .await;
+            }
+        };
+        // #4759: hold the response until the first body byte, so a body that
+        // never comes is an upstream error answered with a status (or served
+        // stale) instead of a dropped connection after a committed `200`.
+        upstream.body = match await_first_upstream_bytes(
+            upstream.body,
+            upstream.content_length,
+            &repo.key,
+            &cache_key,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                return self
+                    .handle_streaming_leader_upstream_error(
+                        repo,
                         cache_path,
                         &cache_key,
                         &metadata_key,
@@ -5896,20 +6510,44 @@ impl ProxyService {
     /// leader (#1611 streaming-path parity). Mirrors the buffered produce
     /// closure's `Err(upstream_err)` arm:
     ///
-    /// * **404** -> write the negative-cache marker so a hot loop of misses on a
-    ///   not-yet-published artifact does not hammer upstream, then propagate the
-    ///   404. We never serve stale for a 404 (the object is gone / never existed).
+    /// * **404/410 with `on_upstream_not_found = keep`** (#4640) and a vetted
+    ///   positive body still cached -> stream the cached body, leave it in place
+    ///   and write no marker.
+    /// * **404/410** otherwise -> write the negative-cache marker so a hot loop
+    ///   of misses on a not-yet-published artifact does not hammer upstream, then
+    ///   propagate the 404. We never serve stale for a 404 (the object is gone /
+    ///   never existed).
     /// * **transient (5xx / timeout / transport)** -> RFC 5861 `stale-if-error`:
     ///   stream the stale body we already hold (regardless of TTL — the entry was
     ///   already past TTL or absent), else propagate the original error.
     async fn handle_streaming_leader_upstream_error(
         &self,
+        repo: &Repository,
         path: &str,
         cache_key: &str,
         metadata_key: &str,
         upstream_err: AppError,
     ) -> Result<StreamHandle> {
         if matches!(upstream_err, AppError::NotFound(_)) {
+            // #4640: a `keep` repository serves the cached copy instead of
+            // deleting it and negative-caching the path.
+            if self.on_upstream_not_found(repo.id).await.keeps() {
+                if let Some(handle) = self
+                    .kept_stream_on_upstream_not_found(cache_key, metadata_key)
+                    .await?
+                {
+                    tracing::warn!(
+                        repository = %repo.key,
+                        path = %path,
+                        "upstream answered 404/410 but on_upstream_not_found=keep; \
+                         serving the cached copy"
+                    );
+                    crate::services::metrics_service::record_proxy_kept_on_upstream_not_found(
+                        &repo.key,
+                    );
+                    return Ok(handle);
+                }
+            }
             self.write_negative_cache(cache_key, metadata_key, path)
                 .await;
             return Err(upstream_err);
@@ -5972,6 +6610,44 @@ impl ProxyService {
             return Err(upstream_err);
         }
 
+        // #4630: the same self-contradicting sidecar `open_cached_stream`
+        // refuses -- a non-zero `size_bytes` pinned against the ETag of a
+        // zero-byte object. This reader does not go through
+        // `open_cached_stream`: it opens the body itself and takes
+        // `Content-Length` straight off the sidecar, so without this it is a
+        // second way to serve a poisoned entry, reached exactly when upstream
+        // is down and the entry cannot be refetched. The failure is the one
+        // #4630 reports -- `Content-Length: N` ahead of an empty body, the
+        // connection aborted mid-response, logged here as `status=200`.
+        //
+        // Refusing costs the request nothing it had: a sidecar this
+        // contradictory describes no servable body, so the upstream error
+        // propagates, exactly as it does for the two sidecar states checked
+        // around this one. It sits beside them because it is the same class
+        // of reason -- a sidecar that vouches for nothing a client can be
+        // given.
+        if sidecar_pins_empty_object(metadata.size_bytes, metadata.storage_etag.as_deref()) {
+            tracing::warn!(
+                cache_key = %cache_key,
+                size_bytes = metadata.size_bytes,
+                "streaming upstream fetch failed and the cache sidecar pins the ETag of an \
+                 empty object while claiming a non-zero size; refusing to serve it \
+                 (stale-if-error, #4630)"
+            );
+            return Err(upstream_err);
+        }
+
+        // #4758: the unpinned sibling of the check above. This reader takes
+        // `Content-Length` straight off the sidecar too, so an emptied or
+        // truncated body under an unpinned sidecar would otherwise be handed
+        // out exactly when upstream is down.
+        if self
+            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, &metadata)
+            .await
+        {
+            return Err(upstream_err);
+        }
+
         // Package Age Policy (#1770 / #2075): the fresh hit path and the
         // `ServeStaleIfError` revalidation arm both apply this before streaming
         // a cached body. Applying it here too stops a held entry being handed
@@ -5999,6 +6675,51 @@ impl ProxyService {
         }
 
         Err(upstream_err)
+    }
+
+    /// #4640: the streaming counterpart of [`Self::kept_on_upstream_not_found`]
+    /// — open a stream of the cached body a `keep` repository serves when
+    /// upstream answers a definitive 404/410, without buffering it (a `.nupkg`
+    /// can be large).
+    ///
+    /// Returns `Ok(None)` when nothing servable is cached: never cached, a
+    /// negative marker (which vouches for no body), a poisoned/unvouched body
+    /// ([`Self::open_cached_stream`] applies the #3147 / #4630 / #4758 checks),
+    /// or an unreachable body. A Package-Age-Policy hold is a genuine
+    /// `Err(Conflict)` and is not hidden: a held entry is not served just
+    /// because upstream deleted it.
+    async fn kept_stream_on_upstream_not_found(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+    ) -> Result<Option<StreamHandle>> {
+        let Some(metadata) = self.load_cache_metadata(metadata_key).await.ok().flatten() else {
+            return Ok(None);
+        };
+        // A negative marker records an upstream 404 and vouches for no body at
+        // all; a leftover body under one is never served (#3147).
+        if metadata.negative_cached_until.is_some() {
+            return Ok(None);
+        }
+        // The Package Age Policy still applies to a kept copy (#1770, #3912).
+        check_quarantine_until(metadata.quarantine_until)?;
+        match self
+            .open_cached_stream(cache_key, metadata_key, &metadata)
+            .await?
+        {
+            Some(result) => Ok(Some(StreamHandle {
+                body: result.body,
+                headers: StreamHeaders {
+                    content_type: result.content_type,
+                    content_length: result.content_length,
+                    etag: result.etag,
+                    content_encoding: result.content_encoding,
+                    commit_sha: result.commit_sha,
+                },
+                cache_published: None,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Uncoordinated streaming fetch (cache hit fast path + direct upstream tee
@@ -7144,6 +7865,50 @@ impl ProxyService {
         self.ttl_policy_cache.overrides.invalidate(&repo_id).await;
     }
 
+    /// Drop this process's cached `on_upstream_not_found` policy for `repo_id`
+    /// (#4640), so a change made through the API applies to the very next serve
+    /// here (other replicas pick it up within [`TTL_POLICY_CACHE_TTL`]).
+    pub async fn invalidate_upstream_not_found_policy(&self, repo_id: Uuid) {
+        self.ttl_policy_cache
+            .upstream_not_found
+            .invalidate(&repo_id)
+            .await;
+    }
+
+    /// The repository's `on_upstream_not_found` policy (#4640), defaulting to
+    /// [`OnUpstreamNotFound::Delete`] when the row is absent, unparseable or the
+    /// database is unreachable. Read on the 404/410 path only, through the same
+    /// short-TTL memo as the TTL override.
+    pub(crate) async fn on_upstream_not_found(&self, repo_id: Uuid) -> OnUpstreamNotFound {
+        if let Some(hit) = self.ttl_policy_cache.upstream_not_found.get(&repo_id).await {
+            return hit;
+        }
+        let raw = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(OnUpstreamNotFound::CONFIG_KEY)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten();
+        let policy = OnUpstreamNotFound::parse(raw.as_deref());
+        self.ttl_policy_cache
+            .upstream_not_found
+            .insert(repo_id, policy)
+            .await;
+        policy
+    }
+
+    /// [`Self::on_upstream_not_found`] for callers that only hold a repository
+    /// key (the npm packument cache, #4640). An unknown key is the default.
+    pub async fn on_upstream_not_found_by_key(&self, repo_key: &str) -> OnUpstreamNotFound {
+        match self.repo_identity_by_key(repo_key).await {
+            Some((repo_id, _)) => self.on_upstream_not_found(repo_id).await,
+            None => OnUpstreamNotFound::Delete,
+        }
+    }
+
     /// Resolve the repository's configured `quota_bytes` (#2928).
     ///
     /// Every handler-driven proxy fetch synthesizes its [`Repository`] through
@@ -7809,7 +8574,8 @@ impl ProxyService {
                     _ => Ok(CacheReadOutcome::Miss),
                 }
             }
-            RevalidationVerdict::ServeStaleIfError => {
+            RevalidationVerdict::ServeStaleIfError
+            | RevalidationVerdict::KeepOnUpstreamNotFound => {
                 if let Ok(Some((content, content_type, content_encoding))) = self
                     .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
@@ -7840,6 +8606,8 @@ impl ProxyService {
     ///   revalidate cheaply).
     /// * **304 Not Modified** -> extend TTL, [`RevalidationVerdict::ServeRevalidated`].
     /// * **changed (200 / different ETag)** -> [`RevalidationVerdict::Refill`].
+    /// * **404/410 with `on_upstream_not_found = keep`** (#4640) ->
+    ///   [`RevalidationVerdict::KeepOnUpstreamNotFound`]; `delete` refills.
     /// * **upstream error within grace** -> [`RevalidationVerdict::ServeStaleIfError`].
     /// * **upstream error past grace** -> [`RevalidationVerdict::Refill`].
     ///
@@ -7869,18 +8637,35 @@ impl ProxyService {
         };
 
         match self
-            .check_etag_changed(&full_url, &etag, repo.id, accept)
+            .check_etag_probe(&full_url, &etag, repo.id, accept)
             .await
         {
-            Ok(false) => {
+            Ok(EtagProbe::Unchanged) => {
                 // 304 Not Modified: extend the TTL and serve the cached body.
                 let new_ttl = self.cache_ttl_for_path(repo, fetch_path).await;
                 self.extend_cache_expiry(metadata_key, metadata, new_ttl)
                     .await;
                 RevalidationVerdict::ServeRevalidated
             }
-            // Changed upstream: let the single-flight coordinator refill once.
-            Ok(true) => RevalidationVerdict::Refill,
+            // #4640: a definitive 404/410 from upstream. A `keep` repository
+            // serves the copy it still holds and leaves its TTL untouched, so a
+            // later 200 re-publish is still noticed. A `delete` repository
+            // falls through to the refill below, whose 404 is negative-cached.
+            Ok(EtagProbe::Gone) if self.on_upstream_not_found(repo.id).await.keeps() => {
+                tracing::warn!(
+                    metadata_key = %metadata_key,
+                    repository = %repo.key,
+                    "upstream no longer has the object but on_upstream_not_found=keep; \
+                     serving the cached copy"
+                );
+                crate::services::metrics_service::record_proxy_kept_on_upstream_not_found(
+                    &repo.key,
+                );
+                RevalidationVerdict::KeepOnUpstreamNotFound
+            }
+            // Changed upstream (or a `delete` repository's 404/410): let the
+            // single-flight coordinator refill once.
+            Ok(_) => RevalidationVerdict::Refill,
             Err(err) => {
                 // Upstream unreachable mid-revalidation: stale-if-error within
                 // the grace window, else fall through to a refill attempt.
@@ -7935,6 +8720,44 @@ impl ProxyService {
                 tracing::warn!(metadata_key = %metadata_key, error = %e, "failed to serialize extended cache metadata");
             }
         }
+    }
+
+    /// #4640: the buffered body a `keep`-policy repository serves when upstream
+    /// answers a definitive 404/410 for a path that still has a vetted positive
+    /// cache entry.
+    ///
+    /// Returns `None` when nothing servable is cached — never cached, a
+    /// negative marker (which vouches for no body), a missing or poisoned body,
+    /// or a Package-Age-Policy hold that must still gate a kept copy (#1770 /
+    /// #3912). In every `None` case the caller negative-caches exactly as it
+    /// does today, so a genuinely-missing path still answers 404 from the
+    /// marker.
+    async fn kept_on_upstream_not_found(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+    ) -> Option<CachedBody> {
+        let metadata = self
+            .load_cache_metadata(metadata_key)
+            .await
+            .ok()
+            .flatten()?;
+        // A negative marker records an upstream 404 and vouches for no body at
+        // all; a leftover body under one is never served (the same stance as
+        // the streaming stale-if-error reader, #3147).
+        if metadata.negative_cached_until.is_some() {
+            return None;
+        }
+        // The Package Age Policy still applies to a kept copy: a held entry is
+        // not served just because upstream deleted it. A conflict here is left
+        // to fall through to the 404 rather than served.
+        if check_quarantine_until(metadata.quarantine_until).is_err() {
+            return None;
+        }
+        self.get_stale_cached_artifact(cache_key, metadata_key, Some(metadata))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Write a negative-cache sidecar recording an upstream 404 (#1611). The
@@ -8432,6 +9255,20 @@ impl ProxyService {
     ) -> Result<bool> {
         self.upstream_client
             .check_etag_changed(url, cached_etag, repo_id, accept)
+            .await
+    }
+
+    /// [`Self::check_etag_changed`] without collapsing a definitive 404/410
+    /// into "changed" (#4640) — see [`UpstreamClient::check_etag_probe`].
+    async fn check_etag_probe(
+        &self,
+        url: &str,
+        cached_etag: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+    ) -> Result<EtagProbe> {
+        self.upstream_client
+            .check_etag_probe(url, cached_etag, repo_id, accept)
             .await
     }
 }
@@ -11403,6 +12240,41 @@ mod tests {
         );
     }
 
+    /// #4630: the one contradiction #1051 revalidation cannot see. The pin was
+    /// taken off an object that was already empty, so the HEAD below matches
+    /// it and the entry revalidates clean — and #3147's length check sits in
+    /// the multipart fallback, which a matching single-part ETag never
+    /// reaches. This probe is the presigned-redirect gate, so `true` here
+    /// hands the client a 302 straight at a zero-byte object while the
+    /// sidecar, and the `Content-Length` derived from it, claim 42 bytes.
+    /// Positive control: `test_is_cache_fresh_true_when_storage_etag_matches_pin`
+    /// above, where the same matching-pin path still returns true.
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_sidecar_pins_an_empty_object_4630() {
+        let empty_object_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                empty_object_etag.to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present(empty_object_etag.to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash-4630").await;
+
+        assert!(
+            !fresh,
+            "a sidecar pinning the empty-object ETag while claiming 42 bytes must never \
+             authorize a presigned redirect (#4630)"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "the contradiction is inside the sidecar; catching it must cost no storage call"
+        );
+    }
+
     #[tokio::test]
     async fn test_is_cache_fresh_legacy_entry_falls_back_to_exists_check() {
         // Cache entry written before #1051: `storage_etag = None`. Must
@@ -12040,49 +12912,99 @@ mod tests {
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
-        copy_fails: bool,
+        /// What `copy()` does to the live key (#4630).
+        publish: PublishBehavior,
+        /// What `head_etag` reports for the live key. `None` (the default)
+        /// keeps the pre-#1051 shape every other tee test expects.
+        etag: Option<String>,
         // #1611-style guard support (used by write_negative_cache tests): a
         // successful put_stream (even a zero-byte one) creates a real
         // object at the key, same as a real S3 PutObject.
         object_written: std::sync::atomic::AtomicBool,
+        // Bytes each successful `put_stream` recorded, by the key it wrote,
+        // and the size `copy()` left on the live key. A real backend's
+        // `size()` reports what the publish landed, which is what #4630's
+        // guard measures; returning a constant here would make that guard
+        // untestable and would fail every commit test. Per key rather than
+        // one counter because two concurrent writers share one backend
+        // (`test_tee_concurrent_reject_and_commit_never_touch_live_key_directly`),
+        // and a shared counter lets one writer's staging size decide the
+        // other's publish.
+        put_stream_totals: tokio::sync::Mutex<HashMap<String, u64>>,
+        published_size: std::sync::atomic::AtomicU64,
+        /// Every key `size()` was asked about, in call order (#4630). The
+        /// refusal arm measures the STAGING key as well as the live one, to
+        /// say in the log whether a bad publish started from a bad source;
+        /// recording the keys is how that diagnostic is pinned, since the
+        /// field itself only exists in a `warn!`.
+        size_keys: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    /// What the publish `copy()` leaves on the live key (#4630). The failure
+    /// this guards against is not "the copy failed" — every reject arm before
+    /// it already covers that — but "the copy reported success and the object
+    /// is not the one that was staged".
+    #[derive(Clone, Copy)]
+    enum PublishBehavior {
+        /// The live key ends up holding exactly the staged bytes.
+        Faithful,
+        /// `copy()` itself returns an error.
+        Fails,
+        /// `copy()` reports success and leaves the live key empty: the shape
+        /// an S3-compatible endpoint produces when it accepts the #3737
+        /// `Content-Length: 0` copy PUT without honouring `x-amz-copy-source`.
+        LandsEmpty,
+        /// `copy()` reports success and leaves the live key short.
+        LandsTruncated(u64),
+        /// `copy()` reports success and lands the staged bytes, but the live
+        /// key cannot be measured afterwards — a HEAD failure, the shape
+        /// read-after-write lag on an S3-compatible endpoint produces.
+        Unmeasurable,
     }
 
     impl TeeRecordingBackend {
-        fn ok() -> Arc<Self> {
-            Arc::new(Self {
+        fn build(put_stream_fails: bool, publish: PublishBehavior) -> Self {
+            Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
                 copies: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_fails: false,
-                copy_fails: false,
+                put_stream_fails,
+                publish,
+                etag: None,
                 object_written: std::sync::atomic::AtomicBool::new(false),
-            })
+                put_stream_totals: tokio::sync::Mutex::new(HashMap::new()),
+                published_size: std::sync::atomic::AtomicU64::new(0),
+                size_keys: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn ok() -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::Faithful))
         }
         fn failing() -> Arc<Self> {
-            Arc::new(Self {
-                put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
-                copies: tokio::sync::Mutex::new(Vec::new()),
-                metadata_writes: tokio::sync::Mutex::new(Vec::new()),
-                deletes: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_fails: true,
-                copy_fails: false,
-                object_written: std::sync::atomic::AtomicBool::new(false),
-            })
+            Arc::new(Self::build(true, PublishBehavior::Faithful))
         }
         /// `put_stream` succeeds but `copy` (the publish step) always fails.
         fn copy_failing() -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::Fails))
+        }
+        /// #4630: `put_stream` and `copy` both report success, but the publish
+        /// leaves the live key empty.
+        fn publish_lands_empty() -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::LandsEmpty))
+        }
+        /// #4630: as [`Self::publish_lands_empty`] but the live key is left
+        /// holding `landed` bytes instead of none.
+        fn publish_lands_truncated(landed: u64) -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::LandsTruncated(landed)))
+        }
+        /// #4630: the publish succeeds but the live key cannot be measured
+        /// afterwards, so `etag` is the only evidence the writer has about it.
+        fn publish_unmeasurable(etag: Option<&str>) -> Arc<Self> {
             Arc::new(Self {
-                put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
-                copies: tokio::sync::Mutex::new(Vec::new()),
-                metadata_writes: tokio::sync::Mutex::new(Vec::new()),
-                deletes: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_fails: false,
-                copy_fails: true,
-                object_written: std::sync::atomic::AtomicBool::new(false),
+                etag: etag.map(str::to_string),
+                ..Self::build(false, PublishBehavior::Unmeasurable)
             })
         }
     }
@@ -12118,13 +13040,55 @@ mod tests {
                 .lock()
                 .await
                 .push((src.to_string(), dst.to_string()));
-            if self.copy_fails {
-                return Err(AppError::Storage("simulated copy failure".to_string()));
-            }
+            // A real publish leaves the live key holding the staged bytes; the
+            // #4630 doubles leave it empty or short while still reporting
+            // success.
+            let staged = self
+                .put_stream_totals
+                .lock()
+                .await
+                .get(src)
+                .copied()
+                .unwrap_or(0);
+            let landed = match self.publish {
+                PublishBehavior::Fails => {
+                    return Err(AppError::Storage("simulated copy failure".to_string()));
+                }
+                PublishBehavior::Faithful | PublishBehavior::Unmeasurable => staged,
+                PublishBehavior::LandsEmpty => 0,
+                PublishBehavior::LandsTruncated(landed) => landed,
+            };
+            self.published_size
+                .store(landed, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
-        async fn size(&self, _key: &str) -> Result<u64> {
-            Ok(0)
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(self.etag.clone())
+        }
+        /// Key-aware on purpose (#4630). The staging object still holds the
+        /// staged bytes when the publish is measured, so a guard that measured
+        /// the STAGING key instead of the live one would see the two agree and
+        /// wave a bad publish straight through. A stub that ignored its `key`
+        /// argument would let that mistake pass this suite.
+        async fn size(&self, key: &str) -> Result<u64> {
+            self.size_keys.lock().await.push(key.to_string());
+            if key.starts_with(TEE_STAGING_KEY_PREFIX) {
+                return Ok(self
+                    .put_stream_totals
+                    .lock()
+                    .await
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0));
+            }
+            if matches!(self.publish, PublishBehavior::Unmeasurable) {
+                return Err(AppError::Storage(
+                    "simulated HEAD failure on the live key".to_string(),
+                ));
+            }
+            Ok(self
+                .published_size
+                .load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn put_stream(
             &self,
@@ -12148,6 +13112,10 @@ mod tests {
             }
             self.object_written
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.put_stream_totals
+                .lock()
+                .await
+                .insert(key.to_string(), total);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
@@ -12627,8 +13595,10 @@ mod tests {
         let content_key = format!("proxy-cache/npm-proxy/{slug}/__content__");
         let metadata_key = format!("proxy-cache/npm-proxy/{slug}/__cache_meta__.json");
         let proxy = build_proxy_service_with_storage(backend);
+        let repo = remote_repo_for("npm-proxy", "http://unused", slug);
         match proxy
             .handle_streaming_leader_upstream_error(
+                &repo,
                 slug,
                 &content_key,
                 &metadata_key,
@@ -12659,6 +13629,158 @@ mod tests {
             content_type: Some("application/gzip".to_string()),
             size_bytes,
             checksum_sha256: "b".repeat(64),
+        }
+    }
+
+    /// The sidecar key that sits beside a proxy-cache content key.
+    fn sidecar_key_of(content_key: &str) -> String {
+        format!(
+            "{}__cache_meta__.json",
+            content_key
+                .strip_suffix("__content__")
+                .expect("a proxy-cache content key")
+        )
+    }
+
+    /// #4758, read side: a sidecar with no pinned storage ETag (the filesystem
+    /// default) over a body that does not have the size it vouches for --
+    /// emptied, or truncated -- is a miss, and the entry is evicted so it is
+    /// never handed out again (not by the hit path, not by stale-if-error).
+    #[tokio::test]
+    async fn test_open_cached_stream_evicts_an_unpinned_entry_whose_body_disagrees_4758() {
+        for (slug, stored) in [
+            ("4758-emptied", &b""[..]),
+            ("4758-truncated", &b"real-tarb"[..]),
+        ] {
+            let backend = CacheObjectBackend::new();
+            let content_key = format!("proxy-cache/npm-remote/{slug}/__content__");
+            let metadata_key = sidecar_key_of(&content_key);
+            backend
+                .objects
+                .lock()
+                .await
+                .insert(content_key.clone(), Bytes::copy_from_slice(stored));
+            let mut metadata = stale_positive_sidecar(18);
+            metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+            assert!(metadata.storage_etag.is_none());
+            backend.put_sidecar(&metadata_key, &metadata).await;
+            let proxy = build_proxy_service_with_storage(backend.clone());
+
+            let opened = proxy
+                .open_cached_stream(&content_key, &metadata_key, &metadata)
+                .await
+                .expect("a poisoned entry is a miss, never an error");
+
+            assert!(
+                opened.is_none(),
+                "{slug}: a sidecar vouching for 18 bytes over {} stored bytes must be a miss \
+                 (#4758), not Content-Length: 18 over a short body",
+                stored.len()
+            );
+            assert!(
+                !backend.exists(&content_key).await.unwrap()
+                    && !backend.exists(&metadata_key).await.unwrap(),
+                "{slug}: the poisoned entry is evicted, body and sidecar"
+            );
+        }
+    }
+
+    /// Positive control for #4758: an unpinned entry whose body has the size
+    /// its sidecar records is served, exactly as before.
+    #[tokio::test]
+    async fn test_open_cached_stream_serves_a_consistent_unpinned_entry_4758() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4758-healthy/__content__";
+        backend.put_object(content_key, b"real-tarball-bytes").await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+        let mut metadata = stale_positive_sidecar(18);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+
+        let opened = proxy
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
+            .await
+            .expect("consistent entry opens")
+            .expect("a consistent unpinned entry is a hit");
+
+        assert_eq!(opened.content_length, Some(18));
+        assert_eq!(
+            drain_body(opened.body).await,
+            b"real-tarball-bytes".to_vec()
+        );
+        assert!(backend.exists(content_key).await.unwrap());
+    }
+
+    /// #4758 on the stale-if-error reader, which takes `Content-Length` off the
+    /// sidecar itself: an unpinned entry whose body is empty is refused (the
+    /// upstream error propagates) and evicted.
+    #[tokio::test]
+    async fn test_stale_if_error_refuses_an_unpinned_entry_whose_body_disagrees_4758() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-proxy/4758-stale-emptied/__content__";
+        backend.put_object(content_key, b"").await;
+        backend
+            .put_sidecar(&sidecar_key_of(content_key), &stale_positive_sidecar(5594))
+            .await;
+
+        let served = serve_stale_if_error(backend.clone(), "4758-stale-emptied").await;
+
+        match served {
+            Err(AppError::BadGateway(_)) => {}
+            Err(other) => panic!("expected the upstream error to propagate, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error served a sidecar claiming 5594 bytes over {} stored bytes \
+                 (#4758)",
+                bytes.len()
+            ),
+        }
+        assert!(!backend.exists(content_key).await.unwrap());
+    }
+
+    /// #4759: a streaming upstream body that ends before its first byte
+    /// although it advertised a length is an upstream error naming the
+    /// repository and both counts; a body that delivers its first byte is
+    /// handed on whole; no length (or a zero length) passes through.
+    #[tokio::test]
+    async fn test_await_first_upstream_bytes_4759() {
+        let empty: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::empty());
+        match await_first_upstream_bytes(empty, Some(4096), "generic-remote", "k").await {
+            Err(AppError::CodedBadGateway { code, message }) => {
+                assert_eq!(code, "UPSTREAM_SHORT_BODY");
+                assert!(
+                    message.contains("'generic-remote'")
+                        && message.contains("4096")
+                        && message.contains("after 0 bytes"),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected UPSTREAM_SHORT_BODY, got {other:?}"),
+            Ok(_) => panic!("an empty body under Content-Length: 4096 must not be handed on"),
+        }
+
+        let failing: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::new()),
+            Err(AppError::Storage("connection closed".into())),
+        ]));
+        assert!(matches!(
+            await_first_upstream_bytes(failing, Some(10), "r", "k").await,
+            Err(AppError::CodedBadGateway { .. })
+        ));
+
+        let healthy: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"def")),
+        ]));
+        let body = await_first_upstream_bytes(healthy, Some(6), "r", "k")
+            .await
+            .expect("a body that started is handed on");
+        assert_eq!(drain_body(body).await, b"abcdef".to_vec());
+
+        for length in [None, Some(0)] {
+            let empty: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::empty());
+            let body = await_first_upstream_bytes(empty, length, "r", "k")
+                .await
+                .expect("no advertised bytes, nothing to wait for");
+            assert!(drain_body(body).await.is_empty());
         }
     }
 
@@ -12798,6 +13920,78 @@ mod tests {
         }
     }
 
+    /// #4630 read-path regression, on the reader that does NOT go through
+    /// `open_cached_stream`.
+    ///
+    /// stale-if-error opens the body itself and takes `Content-Length`
+    /// straight off the sidecar, so the guard added to `open_cached_stream`
+    /// and to `CacheStore::is_fresh` does not reach it. Without its own
+    /// check, a poisoned entry reproduces #4630 exactly -- `Content-Length:
+    /// 5594` ahead of an empty body, the connection aborted mid-response --
+    /// and does it on the one path that cannot refetch to heal itself,
+    /// because reaching it means upstream is already down.
+    ///
+    /// The sidecar here is the production one from #4630: the real tarball's
+    /// size against `d41d8cd9...`, the MD5 of zero bytes.
+    #[tokio::test]
+    async fn test_stale_if_error_refuses_a_sidecar_pinning_an_empty_object_4630() {
+        let backend = CacheObjectBackend::new();
+        // The object is PRESENT and empty, which is the whole difficulty:
+        // every absent-object path already self-heals.
+        backend
+            .put_object("proxy-cache/npm-proxy/4630-stale-poisoned/__content__", b"")
+            .await;
+        let mut poisoned = stale_positive_sidecar(5594);
+        poisoned.storage_etag = Some("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string());
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/4630-stale-poisoned/__cache_meta__.json",
+                &poisoned,
+            )
+            .await;
+
+        let served = serve_stale_if_error(backend, "4630-stale-poisoned").await;
+
+        match served {
+            Err(AppError::BadGateway(_)) => {}
+            Err(other) => panic!("expected the upstream error to propagate, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error served a sidecar claiming 5594 bytes over {} actual bytes; \
+                 that response is aborted mid-flight and renders as a 500 (#4630)",
+                bytes.len()
+            ),
+        }
+    }
+
+    /// Positive control for the guard above: stale-if-error must keep serving
+    /// an entry whose sidecar and object agree, including one that pins a
+    /// perfectly ordinary ETag. Without this, hard-coding the new check to
+    /// always refuse would pass.
+    #[tokio::test]
+    async fn test_stale_if_error_serves_an_entry_whose_pin_is_consistent_4630() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object(
+                "proxy-cache/npm-proxy/4630-stale-healthy/__content__",
+                b"STALE-BUT-REAL",
+            )
+            .await;
+        let mut healthy = stale_positive_sidecar(14);
+        healthy.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/4630-stale-healthy/__cache_meta__.json",
+                &healthy,
+            )
+            .await;
+
+        let served = serve_stale_if_error(backend, "4630-stale-healthy")
+            .await
+            .expect("a consistent entry is exactly what stale-if-error is for");
+
+        assert_eq!(served, b"STALE-BUT-REAL");
+    }
+
     /// Package Age Policy parity (#1770 / #2075). The fresh hit path and the
     /// `ServeStaleIfError` revalidation arm both run `check_quarantine_until`
     /// before streaming a cached body; this arm did not, so a held entry was
@@ -12824,6 +14018,200 @@ mod tests {
                 bytes.len()
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #4640: `on_upstream_not_found = keep` — what a `keep` repository serves
+    // when upstream answers a definitive 404/410 for a path it still holds a
+    // cached copy of. The helpers below are the two readers the negative-cache
+    // arms consult before falling back to the default (delete + marker).
+    // -----------------------------------------------------------------------
+
+    /// A vetted positive entry is served, and — the whole point of #4640 —
+    /// nothing is deleted on the way.
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_serves_a_vetted_entry_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-kept/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"KEPT-BYTES").await;
+        let mut metadata = stale_positive_sidecar(10);
+        metadata.checksum_sha256 = StorageService::calculate_hash(b"KEPT-BYTES");
+        backend.put_sidecar(&metadata_key, &metadata).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let kept = proxy
+            .kept_on_upstream_not_found(content_key, &metadata_key)
+            .await
+            .expect("a vetted positive entry must be servable");
+
+        assert_eq!(&kept.0[..], b"KEPT-BYTES");
+        assert_eq!(kept.1.as_deref(), Some("application/gzip"));
+        assert!(
+            backend.exists(content_key).await.unwrap()
+                && backend.exists(&metadata_key).await.unwrap(),
+            "#4640 keeps the cached copy: neither the body nor the sidecar may be deleted"
+        );
+    }
+
+    /// A negative marker vouches for no body at all; a leftover body underneath
+    /// one is never served (#3147), so the caller negative-caches as before.
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_refuses_a_negative_marker_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-negative/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"LEFTOVER-BYTES").await;
+        let mut marker = stale_positive_sidecar(0);
+        marker.negative_cached_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        marker.checksum_sha256 = String::new();
+        backend.put_sidecar(&metadata_key, &marker).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .is_none(),
+            "a leftover body under a negative marker is not a cached copy"
+        );
+    }
+
+    /// A path with no cached copy (sidecar but no body, or nothing at all) is
+    /// still a 404: `keep` only keeps what is there.
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_is_none_without_a_body_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-uncached/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend
+            .put_sidecar(&metadata_key, &stale_positive_sidecar(10))
+            .await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .is_none(),
+            "a sidecar whose body never landed is not a cached copy"
+        );
+
+        let orphan = "proxy-cache/npm-remote/4640-orphan/__content__";
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(orphan, &sidecar_key_of(orphan))
+                .await
+                .is_none(),
+            "an uncached path is not a cached copy"
+        );
+    }
+
+    /// The Package Age Policy still gates a kept copy: a hold is never served
+    /// just because upstream deleted the object (#1770, #3912).
+    #[tokio::test]
+    async fn test_kept_on_upstream_not_found_respects_a_package_age_hold_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-held/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"HELD-BYTES").await;
+        let mut held = stale_positive_sidecar(10);
+        held.checksum_sha256 = StorageService::calculate_hash(b"HELD-BYTES");
+        held.quarantine_until = Some(Utc::now() + chrono::Duration::hours(6));
+        backend.put_sidecar(&metadata_key, &held).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .is_none(),
+            "a Package-Age-Policy hold must still gate a kept copy (#1770/#3912)"
+        );
+    }
+
+    /// Streaming twin of the serving case: the same bytes, handed over as a
+    /// stream so a kept `.nupkg` is never buffered into memory.
+    #[tokio::test]
+    async fn test_kept_stream_on_upstream_not_found_serves_a_vetted_entry_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-stream/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"KEPT-BYTES").await;
+        backend
+            .put_sidecar(&metadata_key, &stale_positive_sidecar(10))
+            .await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let handle = proxy
+            .kept_stream_on_upstream_not_found(content_key, &metadata_key)
+            .await
+            .expect("a vetted positive entry must open")
+            .expect("a vetted positive entry must be servable");
+
+        assert_eq!(handle.headers.content_length, Some(10));
+        assert_eq!(drain_body(handle.body).await, b"KEPT-BYTES".to_vec());
+        assert!(backend.exists(content_key).await.unwrap());
+    }
+
+    /// Streaming twin of the negative-marker refusal.
+    #[tokio::test]
+    async fn test_kept_stream_on_upstream_not_found_refuses_a_negative_marker_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-stream-negative/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"LEFTOVER-BYTES").await;
+        let mut marker = stale_positive_sidecar(0);
+        marker.negative_cached_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        marker.checksum_sha256 = String::new();
+        backend.put_sidecar(&metadata_key, &marker).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        assert!(
+            proxy
+                .kept_stream_on_upstream_not_found(content_key, &metadata_key)
+                .await
+                .expect("a negative marker is never an error")
+                .is_none(),
+            "a leftover body under a negative marker is not a cached copy"
+        );
+    }
+
+    /// Streaming twin of the age-hold refusal: the hold surfaces as the
+    /// conflict it is, rather than being swallowed into a 404.
+    #[tokio::test]
+    async fn test_kept_stream_on_upstream_not_found_respects_a_package_age_hold_4640() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4640-stream-held/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"HELD-BYTES").await;
+        let mut held = stale_positive_sidecar(10);
+        held.quarantine_until = Some(Utc::now() + chrono::Duration::hours(6));
+        backend.put_sidecar(&metadata_key, &held).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let held = proxy
+            .kept_stream_on_upstream_not_found(content_key, &metadata_key)
+            .await;
+        assert!(
+            matches!(
+                held,
+                Err(AppError::Conflict(_)) | Err(AppError::Authorization(_))
+            ),
+            "the Package-Age-Policy hold must surface from the kept-stream reader (#4640)"
+        );
+    }
+
+    /// `EtagProbe` collapses back to the pre-#4640 boolean exactly as
+    /// `check_etag_changed` promises: only `Unchanged` is "not changed".
+    #[test]
+    fn test_etag_probe_is_changed_preserves_the_boolean_answer() {
+        assert!(!EtagProbe::Unchanged.is_changed());
+        assert!(EtagProbe::Changed.is_changed());
+        assert!(
+            EtagProbe::Gone.is_changed(),
+            "a `delete` repository must keep refilling (and negative-caching) on a 404/410"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -13177,10 +14565,340 @@ mod tests {
         assert!(deletes[0].starts_with(TEE_STAGING_KEY_PREFIX));
     }
 
+    // -----------------------------------------------------------------------
+    // #4630: a publish that reports success while landing a zero-byte object.
+    //
+    // #1365's guard classifies the STAGING write, which was good: the sidecar
+    // that reached production carried the real tarball's size (5594) and
+    // SHA-256 over an empty `__content__`, plus a `storage_etag` of
+    // `d41d8cd98f00b204e9800998ecf8427e` -- the MD5 of zero bytes, HEADed off
+    // the live key after the publish and recorded without being checked.
+    //
+    // Streaming reads then sent `Content-Length: 5594` ahead of an empty body
+    // forever: `open_cached_stream` self-healed only on `NotFound`, and the
+    // object was present. The write-path check stops new entries; the sidecar
+    // check lets the ones already on disk heal on the next request.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn etag_is_empty_object_accepts_the_bare_and_quoted_forms_4630() {
+        assert!(etag_is_empty_object("d41d8cd98f00b204e9800998ecf8427e"));
+        assert!(etag_is_empty_object("\"d41d8cd98f00b204e9800998ecf8427e\""));
+        // S3 ETags are hex; a backend that upper-cases must still be caught.
+        assert!(etag_is_empty_object("\"D41D8CD98F00B204E9800998ECF8427E\""));
+        assert!(!etag_is_empty_object(
+            "\"ac0a54faa6e8c861ec913465610119f4\""
+        ));
+        assert!(!etag_is_empty_object(""));
+    }
+
+    /// #2120's trap: a multipart ETag is an opaque per-upload value, never a
+    /// content hash. One that happens to carry the empty MD5 as its part-digest
+    /// hash is NOT an empty object, and must not be read as one.
+    #[test]
+    fn multipart_etag_is_never_read_as_an_empty_object_4630() {
+        assert!(is_multipart_etag("\"d41d8cd98f00b204e9800998ecf8427e-3\""));
+        assert!(!etag_is_empty_object(
+            "\"d41d8cd98f00b204e9800998ecf8427e-3\""
+        ));
+        assert!(!sidecar_pins_empty_object(
+            5594,
+            Some("\"d41d8cd98f00b204e9800998ecf8427e-3\"")
+        ));
+    }
+
+    /// The production sidecar, verbatim: 5594 bytes vouched for, empty-object
+    /// ETag pinned. No object of 5594 bytes has the ETag of an empty one.
+    #[test]
+    fn sidecar_pinning_an_empty_object_with_a_non_zero_size_is_contradictory_4630() {
+        assert!(sidecar_pins_empty_object(
+            5594,
+            Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        ));
+    }
+
+    /// Negative controls. The guard must stay silent wherever there is nothing
+    /// to judge, or every filesystem and pre-#1051 entry becomes a permanent
+    /// cache miss.
+    #[test]
+    fn sidecar_without_a_contradiction_is_left_alone_4630() {
+        // Filesystem / legacy entry: no pin at all.
+        assert!(!sidecar_pins_empty_object(5594, None));
+        // A healthy sibling: the pin is the real object's MD5.
+        assert!(!sidecar_pins_empty_object(
+            5553,
+            Some("\"ac0a54faa6e8c861ec913465610119f4\"")
+        ));
+        // A genuinely empty entry is self-consistent. #1365 means one should
+        // not exist, and serving it sends `Content-Length: 0` with no body,
+        // which is a correct response rather than an aborted one.
+        assert!(!sidecar_pins_empty_object(
+            0,
+            Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        ));
+    }
+
+    /// Drive one streaming cache write of `b"first-chunk"` — 11 bytes, which
+    /// is also the `Content-Length` the upstream declared, so the staging
+    /// write classifies as `Commit` — through `backend`, and wait for the
+    /// writer task to reach its exit. Shared by the #4630 write-path cases so
+    /// each of them is only its own assertions (jscpd). The metadata key is
+    /// unique per call: the #3335 publish registry and the metadata LRU are
+    /// both process-global.
+    async fn tee_publish_once(backend: &Arc<TeeRecordingBackend>, expect_commit: bool) -> Vec<u8> {
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            format!(
+                "proxy-cache/tee-4630-{}/__cache_meta__.json",
+                Uuid::new_v4()
+            ),
+            template(),
+            Some(11),
+            None,
+        );
+        let mut served = Vec::new();
+        while let Some(chunk) = client.next().await {
+            served.extend_from_slice(&chunk.unwrap());
+        }
+        wait_for_tee_writer_exit(backend, expect_commit).await;
+        served
+    }
+
+    /// Every key the writer deleted, in call order.
+    async fn tee_deletes(backend: &Arc<TeeRecordingBackend>) -> Vec<String> {
+        backend.deletes.lock().await.clone()
+    }
+
+    /// Write-path regression. The publish reports success and leaves the live
+    /// key empty; no sidecar may be written, so the next request refetches.
+    /// Before the guard this committed a sidecar with the right size and
+    /// checksum over a zero-byte body.
+    #[tokio::test]
+    async fn test_tee_publish_that_lands_an_empty_object_is_not_cached_4630() {
+        let backend = TeeRecordingBackend::publish_lands_empty();
+
+        let served = tee_publish_once(&backend, /* expect_commit = */ false).await;
+
+        assert_eq!(
+            served,
+            b"first-chunk".to_vec(),
+            "the client still gets the upstream bytes; only the cache write is abandoned"
+        );
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a sidecar must never vouch for bytes the live key does not hold (#4630)"
+        );
+        assert_eq!(
+            backend.copies.lock().await.len(),
+            1,
+            "the publish was attempted and reported OK"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes.iter().any(|k| k == "cache-key"),
+            "the empty object the publish left on the LIVE key must be dropped too: a refill \
+             leaves the previous sidecar in place, and its pin is that empty object's correct \
+             MD5, so nothing downstream can catch it (#4630). deletes={deletes:?}"
+        );
+        assert!(
+            deletes
+                .iter()
+                .any(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "the staging object must be discarded. deletes={deletes:?}"
+        );
+        assert_eq!(deletes.len(), 2, "exactly those two. deletes={deletes:?}");
+
+        // The refusal is also the only diagnostic anyone gets, so it must
+        // record what the SOURCE of the copy measured, not just the
+        // destination: 0 there points at the staging write or filer lag, the
+        // staged size points at `copy()` itself. The log field is not
+        // observable from here; the HEAD behind it is.
+        let size_keys = backend.size_keys.lock().await;
+        assert!(
+            size_keys.iter().any(|k| k == "cache-key"),
+            "the live key must be measured — that is the guard. size_keys={size_keys:?}"
+        );
+        assert!(
+            size_keys
+                .iter()
+                .any(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "and the staging key must be measured too, or the warning cannot say which side \
+             of the copy went wrong (#4630). size_keys={size_keys:?}"
+        );
+    }
+
+    /// A publish that lands *some* of the staged bytes is refused the same
+    /// way. The empty case is the one production produced; a truncated one is
+    /// the same contradiction with a different number, and unlike the empty
+    /// case no ETag pin would ever reveal it.
+    #[tokio::test]
+    async fn test_tee_publish_that_lands_a_truncated_object_is_not_cached_4630() {
+        let backend = TeeRecordingBackend::publish_lands_truncated(4);
+
+        let served = tee_publish_once(&backend, /* expect_commit = */ false).await;
+
+        assert_eq!(
+            served,
+            b"first-chunk".to_vec(),
+            "the client still gets all 11 upstream bytes"
+        );
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a sidecar claiming 11 bytes must not be written over a 4-byte object (#4630)"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes.iter().any(|k| k == "cache-key"),
+            "the truncated object must not be left on the live key. deletes={deletes:?}"
+        );
+    }
+
+    /// Positive control for the guards above: an honest publish still commits.
+    /// Without this, hard-coding the check to always reject would pass.
+    #[tokio::test]
+    async fn test_tee_publish_that_lands_the_staged_bytes_is_cached_4630() {
+        let backend = TeeRecordingBackend::ok();
+
+        tee_publish_once(&backend, /* expect_commit = */ true).await;
+
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "a publish that lands the staged bytes must still write its sidecar"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes
+                .iter()
+                .all(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "a good publish must never have its live key deleted. deletes={deletes:?}"
+        );
+    }
+
+    /// The size probe is best-effort, like the #1051 ETag pin beside it. A
+    /// backend that cannot answer the HEAD has not said the publish was bad,
+    /// and failing closed here would turn read-after-write lag on an
+    /// S3-compatible endpoint into "this deployment no longer caches
+    /// anything", announced by nothing louder than a `warn`.
+    #[tokio::test]
+    async fn test_tee_publish_commits_when_the_live_key_cannot_be_measured_4630() {
+        let backend = TeeRecordingBackend::publish_unmeasurable(None);
+
+        tee_publish_once(&backend, /* expect_commit = */ true).await;
+
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "an unmeasurable live key must degrade to the pre-#4630 behaviour, not to a \
+             permanent cache bypass"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes
+                .iter()
+                .all(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "a failed HEAD is not evidence against the object; the live key must survive it. \
+             deletes={deletes:?}"
+        );
+    }
+
+    /// ...but the ETag pinned a line later is read off that same live key, so
+    /// when it is the empty-object MD5 while a non-zero body was staged, the
+    /// publish is proven bad with no extra storage call — which is what makes
+    /// the arm above safe to leave best-effort. (`size()` is what fails here;
+    /// the pin is the only evidence left.)
+    #[tokio::test]
+    async fn test_tee_publish_refuses_when_the_pin_proves_the_live_key_empty_4630() {
+        let backend =
+            TeeRecordingBackend::publish_unmeasurable(Some("\"d41d8cd98f00b204e9800998ecf8427e\""));
+
+        tee_publish_once(&backend, /* expect_commit = */ false).await;
+
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a pin that is the empty-object MD5 over 11 staged bytes must not reach a sidecar \
+             (#4630)"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes.iter().any(|k| k == "cache-key"),
+            "and the object it describes must not stay on the live key. deletes={deletes:?}"
+        );
+    }
+
+    /// Read-path regression, with the production sidecar against a live key
+    /// that really is empty. Before the guard this returned a stream handle
+    /// advertising `Content-Length: 5594` over zero bytes, which hyper aborts
+    /// mid-response and a reverse proxy renders as a 500, on every retry
+    /// forever.
+    #[tokio::test]
+    async fn test_open_cached_stream_refuses_a_sidecar_pinning_an_empty_object_4630() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4630-poisoned/__content__";
+        backend.put_object(content_key, b"").await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let mut metadata = stale_positive_sidecar(5594);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.storage_etag = Some("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string());
+
+        let opened = proxy
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
+            .await
+            .expect("the guard reports a miss, never an error");
+        assert!(
+            opened.is_none(),
+            "a sidecar that pins an empty object while claiming 5594 bytes must be a miss \
+             (#4630), so the caller refetches and the entry self-heals"
+        );
+    }
+
+    /// Positive control: the same read path still serves an entry whose sidecar
+    /// and object agree.
+    #[tokio::test]
+    async fn test_open_cached_stream_serves_a_consistent_entry_4630() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4630-healthy/__content__";
+        backend.put_object(content_key, b"real-tarball-bytes").await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let mut metadata = stale_positive_sidecar(18);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+
+        let opened = proxy
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
+            .await
+            .expect("consistent entry opens");
+        let opened = opened.expect("a consistent entry is a hit");
+        assert_eq!(opened.content_length, Some(18));
+        assert_eq!(
+            drain_body(opened.body).await,
+            b"real-tarball-bytes".to_vec()
+        );
+    }
+
     /// Two concurrent tee_stream calls for the same cache key — one reject,
     /// one commit — must never let the rejected write touch the live key,
     /// regardless of interleaving. Every put_stream call targets a per-write
     /// staging key, never `cache_key` directly, so there's nothing to race.
+    ///
+    /// #4630 narrowed what that sentence can claim, so this records what it
+    /// still guarantees rather than leaving the two to contradict each other.
+    /// A write rejected *before* the publish — the case here, and every
+    /// reject arm #3153 was written about — still never reads, writes or
+    /// deletes the live key. One arm added since does delete it: the
+    /// post-copy measurement, which runs only after a `copy()` this writer
+    /// issued reported success on that key.
+    ///
+    /// That arm is not reached below, and not by accident: the rejecting
+    /// writer sends an empty body, so `classify_stream_write` turns it away
+    /// before `copy()` is ever called. The `deletes` assertion therefore
+    /// still holds for the reason it always did, and the test is unchanged.
+    /// What the new arm can cost a concurrent writer is bounded by
+    /// `test_a_clobbered_good_publish_costs_one_miss_not_corruption_4630`.
     #[tokio::test]
     async fn test_tee_concurrent_reject_and_commit_never_touch_live_key_directly() {
         let backend = TeeRecordingBackend::ok();
@@ -13260,6 +14978,57 @@ mod tests {
         let copies = backend.copies.lock().await;
         assert_eq!(copies.len(), 1, "only the commit publishes via copy()");
         assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// The bound on the race `discard_bad_publish` deliberately re-opens
+    /// (#4630, answering #3153's carve-out).
+    ///
+    /// #3153 declined a reactive delete-on-mismatch because it "could clobber
+    /// a concurrent writer's just-published good object". It still could:
+    /// cross-replica single-flight (#1609) is off by default, so two replicas
+    /// publishing the same cold key at once is ordinary traffic. What that
+    /// now costs is what this pins. The clobbered writer's sidecar survives,
+    /// describing a key that holds nothing, and the next read is a MISS — not
+    /// a hit advertising a `Content-Length` over an empty body, and not an
+    /// error. One extra upstream fetch, after which the entry is correct.
+    ///
+    /// Before #3147 the same mistake handed a client the corrupt bytes, which
+    /// is why the carve-out was right when it was written and why the
+    /// calculus inverted afterwards.
+    ///
+    /// Reached as an end state rather than by driving two writers:
+    /// `TeeRecordingBackend` records calls instead of modelling object state,
+    /// so a concurrent pair could only assert which calls were made, never
+    /// what a later reader is served — which is the claim that matters here.
+    #[tokio::test]
+    async fn test_a_clobbered_good_publish_costs_one_miss_not_corruption_4630() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4630-clobbered/__content__";
+
+        // Replica B published the real bytes and committed its sidecar.
+        backend.put_object(content_key, b"real-tarball-bytes").await;
+        let mut metadata = stale_positive_sidecar(18);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        // Replica A measured its own empty publish a moment later and
+        // dropped the live key — which by then held B's good object.
+        backend
+            .delete(content_key)
+            .await
+            .expect("the clobbering delete succeeds");
+
+        let opened = proxy
+            .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
+            .await
+            .expect("a missing object is a miss, never an error");
+
+        assert!(
+            opened.is_none(),
+            "a surviving sidecar over a deleted object must take the `NotFound` self-heal: \
+             the worst case of a wrong delete is a cache miss, not corruption (#4630 / #3153)"
+        );
     }
 
     /// The `Err` arm: an upstream error mid-stream must leave the live key
@@ -14320,6 +16089,11 @@ mod tests {
     struct TeeEtagBackend {
         inner: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         etag: Option<String>,
+        /// Bytes the staging `put_stream` recorded, which `copy()` then
+        /// publishes onto the live key. #4630's write-path check measures the
+        /// published object, so a stub that always reported 0 here would make
+        /// every commit look like an empty publish.
+        published: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -14347,7 +16121,7 @@ mod tests {
             Ok(())
         }
         async fn size(&self, _k: &str) -> Result<u64> {
-            Ok(0)
+            Ok(self.published.load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn put_stream(
             &self,
@@ -14363,6 +16137,8 @@ mod tests {
                 hasher.update(&chunk);
                 total += chunk.len() as u64;
             }
+            self.published
+                .store(total, std::sync::atomic::Ordering::SeqCst);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
@@ -14378,6 +16154,7 @@ mod tests {
         let backend = Arc::new(TeeEtagBackend {
             inner: tokio::sync::Mutex::new(Vec::new()),
             etag: Some("\"after-put-etag\"".to_string()),
+            published: std::sync::atomic::AtomicU64::new(0),
         });
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
@@ -14410,6 +16187,7 @@ mod tests {
         let backend = Arc::new(TeeEtagBackend {
             inner: tokio::sync::Mutex::new(Vec::new()),
             etag: None,
+            published: std::sync::atomic::AtomicU64::new(0),
         });
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
@@ -17434,6 +19212,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// An upstream that answers `200` with `Content-Length: declared`, writes
+    /// `sent` bytes of body and closes the connection (#4759). wiremock cannot
+    /// model this: its server derives `Content-Length` from the body it sends.
+    /// Returns the base URL and a counter of the requests it answered.
+    async fn spawn_short_body_upstream(
+        declared: usize,
+        sent: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind short-body upstream");
+        let addr = listener.local_addr().expect("local addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/java-archive\r\n\
+                         Content-Length: {declared}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&vec![b'p'; sent]).await;
+                    let _ = socket.flush().await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// #4758 end to end, on the filesystem backend (which pins no
+    /// `storage_etag`): a cached `__content__` that no longer has the size its
+    /// sidecar vouches for must not be served. Before the fix the hit path
+    /// answered `Content-Length: 4096` over an empty body without contacting
+    /// upstream, on every request, forever (the #4630 symptom the ETag guard
+    /// cannot see when nothing is pinned).
+    #[tokio::test]
+    async fn test_streaming_hit_refetches_an_unpinned_entry_shorter_than_its_sidecar_4758() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let jar_path = "org/example/lib/1.0.0/lib-1.0.0.jar";
+        let jar: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{jar_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-4758-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_key = format!("maven-4758-{}", Uuid::new_v4());
+        let repo = remote_repo_for(&repo_key, &server.uri(), tmp.to_str().unwrap());
+
+        let first = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("cold fetch");
+        assert_eq!(drain_stream(first.body).await, jar);
+        tdh::wait_for_cache_commit(&tmp, jar.len() as u64).await;
+        let sidecar = tdh::proxy_sidecar_path(&tmp, &repo_key, jar_path);
+        let content = sidecar.with_file_name("__content__");
+        let pinned: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("sidecar")).unwrap();
+        assert!(
+            pinned["storage_etag"].is_null(),
+            "the filesystem backend pins no ETag; this is the case #4758 is about"
+        );
+
+        // The #4630 shape: the body is gone, the sidecar still vouches for it.
+        std::fs::write(&content, b"").expect("empty the cached body");
+
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::WARN);
+        let second = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("a poisoned entry is a miss, never an error");
+        let second_len = second.content_length;
+        let second_body = drain_stream(second.body).await;
+        drop(guard);
+
+        let upstream_gets = server.received_requests().await.unwrap_or_default().len();
+        assert_eq!(
+            second_body.len(),
+            jar.len(),
+            "the hit path served {} bytes under Content-Length {:?} instead of refetching (#4758)",
+            second_body.len(),
+            second_len
+        );
+        assert_eq!(second_body, jar);
+        assert_eq!(
+            upstream_gets, 2,
+            "the poisoned entry must fall through to upstream"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.contains("WARN") && logs.contains(&repo_key) && logs.contains("4758"),
+            "the eviction must be logged at warn with the key: {logs}"
+        );
+
+        // The refetch republished the entry and it is a hit again.
+        tdh::wait_for_cache_commit(&tmp, jar.len() as u64).await;
+        let third = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("healed hit");
+        assert_eq!(drain_stream(third.body).await, jar);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            2,
+            "the healed entry is served from cache"
+        );
+    }
+
+    /// #4759 at the handler boundary: an upstream that promises
+    /// `Content-Length: 4096` and closes without a body must answer the client
+    /// `502 UPSTREAM_SHORT_BODY` naming the repository and both byte counts.
+    /// Before the fix the 200 headers were already handed back, so the client
+    /// saw the connection drop with no status at all (curl exit 52).
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // reads a small test error body (#1608)
+    async fn test_streaming_proxy_answers_502_for_an_upstream_body_that_never_came_4759() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (upstream, hits) = spawn_short_body_upstream(4096, 0).await;
+        let tmp = std::env::temp_dir().join(format!("ak-4759-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_key = format!("generic-4759-{}", Uuid::new_v4());
+        let path = "f/empty.bin";
+
+        let response = match crate::api::handlers::proxy_helpers::proxy_fetch_streaming(
+            &proxy,
+            Uuid::new_v4(),
+            &repo_key,
+            &upstream,
+            path,
+            "application/octet-stream",
+        )
+        .await
+        {
+            Ok(response) | Err(response) => response,
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&body).into_owned();
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "an upstream body that ended before its first byte must be a 502, not a \
+             200 whose connection is then dropped (#4759); body: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+        assert_eq!(json["code"], "UPSTREAM_SHORT_BODY");
+        let message = json["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&repo_key) && message.contains("4096") && message.contains(" 0 "),
+            "the message names the repository and the expected/received counts: {message}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sidecar = tdh::proxy_sidecar_path(&tmp, &repo_key, path);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            !sidecar.exists(),
+            "nothing is cached for a body that never came"
+        );
+    }
+
+    /// #4759, the other half: once bytes have been forwarded the headers are
+    /// gone and closing the connection is the only honest signal left. The
+    /// client stream must end in an error (never a clean short body), a warn
+    /// must name the key with the expected and received counts, and nothing is
+    /// cached.
+    #[tokio::test]
+    async fn test_streaming_proxy_closes_and_warns_when_upstream_body_ends_mid_stream_4759() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (upstream, _hits) = spawn_short_body_upstream(4096, 1000).await;
+        let tmp = std::env::temp_dir().join(format!("ak-4759-short-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_key = format!("maven-4759-{}", Uuid::new_v4());
+        let jar_path = "org/example/short/1.0.0/short-1.0.0.jar";
+        let repo = remote_repo_for(&repo_key, &upstream, tmp.to_str().unwrap());
+
+        let capture = tdh::LogCapture::default();
+        let guard = capture.install(tracing::Level::WARN);
+        let handle = proxy
+            .fetch_artifact_streaming(&repo, jar_path)
+            .await
+            .expect("bytes arrived, so the response has started");
+        assert_eq!(handle.content_length, Some(4096));
+        let mut body = handle.body;
+        let mut received = 0usize;
+        let mut ended_in_error = false;
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(bytes) => received += bytes.len(),
+                Err(_) => {
+                    ended_in_error = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(guard);
+        let logs = capture.text();
+        let sidecar = tdh::proxy_sidecar_path(&tmp, &repo_key, jar_path);
+        let cached = sidecar.exists();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(received, 1000);
+        assert!(
+            ended_in_error,
+            "a short body must end the client stream in an error"
+        );
+        assert!(!cached, "a short body is never committed to the cache");
+        let line = logs
+            .lines()
+            .find(|l| l.contains("WARN") && l.contains("4759"))
+            .unwrap_or_else(|| panic!("no #4759 warn was logged: {logs}"));
+        assert!(
+            line.contains(&repo_key)
+                && line.contains("expected_bytes=4096")
+                && line.contains("received_bytes=1000"),
+            "the warn names the key and both counts: {line}"
+        );
+    }
+
     async fn drain_stream(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
         let mut body = body;
         let mut out = Vec::new();
@@ -17674,8 +19710,15 @@ mod tests {
 
         let keys =
             CacheKeys::derive(&ProxyCacheScope::unscoped(), "pypi-remote", cache_path).unwrap();
+        // The sidecar vouches for the body actually stored: the hit path
+        // checks an unpinned entry's size against it (#4758).
+        let mut sidecar: CacheMetadata = serde_json::from_slice(&fresh_metadata_bytes()).unwrap();
+        sidecar.size_bytes = wheel_body.len() as i64;
         let mut entries = std::collections::HashMap::new();
-        entries.insert(keys.metadata.clone(), fresh_metadata_bytes());
+        entries.insert(
+            keys.metadata.clone(),
+            Bytes::from(serde_json::to_vec(&sidecar).unwrap()),
+        );
         entries.insert(keys.content.clone(), wheel_body.clone());
 
         let storage = Arc::new(RecordingMapStorage {
@@ -18258,6 +20301,10 @@ mod tests {
         let anon =
             anonymous_token_refused_error(StatusCode::UNAUTHORIZED, "https://u:p@r.test/v2/x");
         assert!(upstream_request_auth_refusal(&anon).is_none(), "{anon:?}");
+        assert!(is_anonymous_token_refusal(&anon), "{anon:?}");
+        assert!(!is_anonymous_token_refusal(
+            &validate_upstream_status(StatusCode::UNAUTHORIZED, "https://r.test/v2/x").unwrap_err()
+        ));
         assert!(!format!("{anon:?}").contains("u:p"), "{anon:?}");
     }
 

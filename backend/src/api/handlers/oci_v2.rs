@@ -49,6 +49,7 @@ use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
+use crate::services::metrics_service::AuthFailureReason;
 use crate::services::repository_service::{format_handler_key, parse_format_str};
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 
@@ -97,6 +98,15 @@ fn oci_error_detail(
     message: &str,
     detail: Option<serde_json::Value>,
 ) -> Response {
+    // The database sites pass `db_status(&e)` with `INTERNAL_ERROR`; when
+    // that status is a 503 (saturated pool, unreachable database) the error is
+    // transient, so it carries the same `UNAVAILABLE` code the other
+    // retryable 503s here use rather than claiming a server fault (#4765).
+    let code = if status == StatusCode::SERVICE_UNAVAILABLE && code == "INTERNAL_ERROR" {
+        "UNAVAILABLE"
+    } else {
+        code
+    };
     let body = OciErrorResponse {
         errors: vec![OciErrorEntry {
             code: code.to_string(),
@@ -260,15 +270,62 @@ async fn validate_token(
     db: &PgPool,
     config: &crate::config::Config,
     headers: &HeaderMap,
-) -> Result<crate::services::auth_service::Claims, ()> {
-    let token = extract_bearer_token(headers).ok_or(())?;
+) -> Result<crate::services::auth_service::Claims, OciAuthError> {
+    let token = extract_bearer_token(headers).ok_or(OciAuthError::Invalid)?;
     let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
     // Replica-safe variant (#1173): consults the DB credential-change watermark
     // so a credential change on replica A is honoured on replica B.
     auth_service
         .validate_access_token_async(&token)
         .await
-        .map_err(|_| ())
+        .map_err(|e| OciAuthError::classify(&e))
+}
+
+/// Why an OCI credential did not authenticate (#4750).
+///
+/// `Invalid` is the client's problem (unknown, wrong, expired or revoked
+/// credential) and answers the 401 challenge. `Unavailable` means validation
+/// could not be completed: the database could not answer
+/// ([`AppError::is_db_unavailable`]) or the bcrypt concurrency cap shed the
+/// request. That answers a retryable 503, because docker and CI clients abort
+/// or re-prompt on 401 but retry on 503.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OciAuthError {
+    Invalid,
+    Unavailable,
+}
+
+impl OciAuthError {
+    fn classify(e: &AppError) -> Self {
+        if e.is_db_unavailable() || matches!(e, AppError::ServiceUnavailable(_)) {
+            Self::Unavailable
+        } else {
+            Self::Invalid
+        }
+    }
+}
+
+/// 503 for a credential check that could not be completed (#4750).
+fn oci_auth_unavailable() -> Response {
+    let mut resp = oci_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "UNAVAILABLE",
+        "authentication temporarily unavailable, retry shortly",
+    );
+    resp.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    resp
+}
+
+/// The response for a failed `/v2` authentication: the 401 challenge for a
+/// bad credential, a retryable 503 when validation could not be completed.
+fn oci_auth_failure(error: OciAuthError, base_url: &str, scope: Option<&str>) -> Response {
+    match error {
+        OciAuthError::Invalid => unauthorized_challenge_with_scope(base_url, scope),
+        OciAuthError::Unavailable => oci_auth_unavailable(),
+    }
 }
 
 /// Credential extracted from an OCI request's Authorization header.
@@ -335,7 +392,7 @@ async fn authenticate_oci_read(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(pair) => pair,
-            Err(()) => return Err(unauthorized_challenge_with_scope(base_url, Some(scope))),
+            Err(e) => return Err(oci_auth_failure(e, base_url, Some(scope))),
         };
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_READ) {
         return Err(oci_forbidden_scope(OCI_SCOPE_READ));
@@ -353,8 +410,28 @@ async fn authenticate_oci_with_scopes(
     db: &PgPool,
     config: &crate::config::Config,
     headers: &HeaderMap,
-) -> Result<(crate::services::auth_service::Claims, Option<Vec<String>>), ()> {
-    let credential = extract_oci_credential(headers).ok_or(())?;
+) -> Result<(crate::services::auth_service::Claims, Option<Vec<String>>), OciAuthError> {
+    let result = verify_oci_credential(db, config, headers).await;
+    // The OCI surface authenticates in the handler rather than through the
+    // auth middleware; note the principal for the `Request completed` log
+    // line's `user` field all the same (#4674).
+    if let Ok((claims, _)) = &result {
+        crate::api::middleware::request_span::record_user(&claims.username);
+    }
+    result
+}
+
+/// The credential check behind [`authenticate_oci_with_scopes`].
+async fn verify_oci_credential(
+    db: &PgPool,
+    config: &crate::config::Config,
+    headers: &HeaderMap,
+) -> Result<(crate::services::auth_service::Claims, Option<Vec<String>>), OciAuthError> {
+    let credential = extract_oci_credential(headers).ok_or(OciAuthError::Invalid)?;
+    // Any attempt that fails because validation could not be completed ends
+    // the whole chain with `Unavailable` (#4750): trying the next credential
+    // shape would only turn an outage into a misleading 401.
+    let unavailable = |e: &AppError| OciAuthError::classify(e) == OciAuthError::Unavailable;
 
     match credential {
         OciCredential::Bearer(token) => {
@@ -367,14 +444,23 @@ async fn authenticate_oci_with_scopes(
             // `scopes: None` (unrestricted); a JWT exchanged from a scoped API
             // token carries `Some(ceiling)` (#2430). Surface whatever the JWT
             // carries so a laundered exchange JWT keeps its ceiling here.
-            if let Ok(claims) = auth_service.validate_access_token_async(&token).await {
-                let scopes = claims.scopes.clone();
-                return Ok((claims, scopes));
+            match auth_service.validate_access_token_async(&token).await {
+                Ok(claims) => {
+                    let scopes = claims.scopes.clone();
+                    return Ok((claims, scopes));
+                }
+                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
+                Err(_) => {}
             }
             // Otherwise, accept a raw API token in the Bearer slot (common
             // for `docker login --password-stdin` with API token). Surface
             // the scopes so the caller can enforce GHSA-vvc3-h39c-mrq5.
-            if let Ok(validation) = auth_service.validate_api_token(&token).await {
+            let validated = match auth_service.validate_api_token(&token).await {
+                Ok(validation) => Some(validation),
+                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
+                Err(_) => None,
+            };
+            if let Some(validation) = validated {
                 let scopes = validation.scopes.clone();
                 // Thread the API token's declared repository allow-list onto
                 // the minted OCI claims so `enforce_token_repo_scope` confines
@@ -401,15 +487,15 @@ async fn authenticate_oci_with_scopes(
                     validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
                     .generate_tokens_with_repo_scope(&validation.user, allowed_repo_ids)
-                    .map_err(|_| ())
+                    .map_err(|_| OciAuthError::Invalid)
                     .and_then(|tokens| {
                         auth_service
                             .validate_access_token(&tokens.access_token)
-                            .map_err(|_| ())
+                            .map_err(|_| OciAuthError::Invalid)
                     })?;
                 return Ok((claims, Some(scopes)));
             }
-            Err(())
+            Err(OciAuthError::Invalid)
         }
         OciCredential::Basic { username, password } => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
@@ -425,7 +511,12 @@ async fn authenticate_oci_with_scopes(
             // pad on miss so this reorder is safe. The username from Basic
             // auth is ignored when an API token validates (matching the
             // /v2/token behavior): the token itself identifies the user.
-            if let Ok(validation) = auth_service.validate_api_token(&password).await {
+            let validated = match auth_service.validate_api_token(&password).await {
+                Ok(validation) => Some(validation),
+                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
+                Err(_) => None,
+            };
+            if let Some(validation) = validated {
                 let scopes = validation.scopes.clone();
                 // Thread the API token's declared repository allow-list onto
                 // the minted OCI claims so `enforce_token_repo_scope` confines
@@ -444,11 +535,11 @@ async fn authenticate_oci_with_scopes(
                     validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
                     .generate_tokens_with_repo_scope(&validation.user, allowed_repo_ids)
-                    .map_err(|_| ())
+                    .map_err(|_| OciAuthError::Invalid)
                     .and_then(|tokens| {
                         auth_service
                             .validate_access_token(&tokens.access_token)
-                            .map_err(|_| ())
+                            .map_err(|_| OciAuthError::Invalid)
                     })?;
                 return Ok((claims, Some(scopes)));
             }
@@ -456,14 +547,19 @@ async fn authenticate_oci_with_scopes(
             // Fall through to username/password authentication. Re-generate
             // short-lived claims so downstream code has a consistent Claims
             // value regardless of the authentication method.
-            if let Ok((user, _tokens)) = auth_service.authenticate(&username, &password).await {
+            let authenticated = match auth_service.authenticate(&username, &password).await {
+                Ok(pair) => Some(pair),
+                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
+                Err(_) => None,
+            };
+            if let Some((user, _tokens)) = authenticated {
                 let claims = auth_service
                     .generate_tokens(&user)
-                    .map_err(|_| ())
+                    .map_err(|_| OciAuthError::Invalid)
                     .and_then(|tokens| {
                         auth_service
                             .validate_access_token(&tokens.access_token)
-                            .map_err(|_| ())
+                            .map_err(|_| OciAuthError::Invalid)
                     })?;
                 return Ok((claims, None));
             }
@@ -471,7 +567,12 @@ async fn authenticate_oci_with_scopes(
             // Final fallback: accept a valid AK access token (JWT) as the Docker
             // password. Enables the CI/CD keyless push flow where the token from
             // the OIDC exchange is used directly as the Docker credential.
-            if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
+            let jwt_claims = match auth_service.validate_access_token_async(&password).await {
+                Ok(claims) => Some(claims),
+                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
+                Err(_) => None,
+            };
+            if let Some(claims) = jwt_claims {
                 // Preserve the presented JWT's action-scope ceiling (#2430): a
                 // JWT-as-password that was itself exchanged from a scoped API
                 // token must keep its `Some(ceiling)` here, not reset to full.
@@ -497,24 +598,31 @@ async fn authenticate_oci_with_scopes(
                 // dropped scan pin fails closed (the scanner bypass in the read
                 // gate simply does not engage), so this is inert.
                 let allowed_repo_ids = claims.allowed_repo_ids.clone();
-                if let Ok(user) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                let user = match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
                     .bind(claims.sub)
                     .fetch_one(db)
                     .await
                 {
+                    Ok(user) => Some(user),
+                    Err(ref e) if unavailable(&AppError::Database(e.to_string())) => {
+                        return Err(OciAuthError::Unavailable)
+                    }
+                    Err(_) => None,
+                };
+                if let Some(user) = user {
                     return auth_service
                         .generate_tokens_with_repo_scope(&user, allowed_repo_ids)
-                        .map_err(|_| ())
+                        .map_err(|_| OciAuthError::Invalid)
                         .and_then(|tokens| {
                             auth_service
                                 .validate_access_token(&tokens.access_token)
-                                .map_err(|_| ())
+                                .map_err(|_| OciAuthError::Invalid)
                         })
                         .map(|claims| (claims, scopes));
                 }
             }
 
-            Err(())
+            Err(OciAuthError::Invalid)
         }
     }
 }
@@ -1994,8 +2102,28 @@ fn storage_concat_stream(
                 continue;
             }
             let mut stream = storage.get_stream(&part.storage_key).await?;
+            let mut read: i64 = 0;
             while let Some(chunk) = stream.next().await {
-                yield chunk?;
+                let chunk = chunk?;
+                read += chunk.len() as i64;
+                yield chunk;
+            }
+            // #4646: a part whose stored object is not the length its PATCH
+            // recorded is a storage fault, not a client digest error. Fail the
+            // concatenation (500) and say which part, instead of hashing short
+            // bytes and answering DIGEST_INVALID with a digest the client
+            // never sent.
+            if read != part.size_bytes {
+                tracing::error!(
+                    storage_key = %part.storage_key,
+                    expected_bytes = part.size_bytes,
+                    stored_bytes = read,
+                    "OCI upload part length in storage does not match the length recorded at PATCH"
+                );
+                Err(AppError::Storage(format!(
+                    "upload part {} holds {} bytes, expected {}",
+                    part.storage_key, read, part.size_bytes
+                )))?;
             }
         }
     })
@@ -5017,6 +5145,14 @@ fn offline_access_type_from_query(offline_token: Option<&str>) -> Option<String>
 /// `refresh_token_jti.revoked_at`, so any of (a) deactivated user,
 /// (b) password change since issue, (c) TOTP enable/disable since issue,
 /// (d) logout/admin family revocation, will surface here as a 401.
+/// Count one credential `/v2/token` rejected (#4676).
+fn record_token_auth_failure(reason: AuthFailureReason) {
+    crate::services::metrics_service::record_auth_failure(
+        crate::services::metrics_service::AuthFailureSurface::V2Token,
+        reason,
+    );
+}
+
 async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response {
     let refresh = match form.refresh_token.as_deref() {
         Some(s) if !s.is_empty() => s,
@@ -5034,7 +5170,12 @@ async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response
         .await
     {
         Ok(pair) => pair,
-        Err(_) => {
+        Err(e) => {
+            crate::services::metrics_service::record_auth_failure_for_error(
+                crate::services::metrics_service::AuthFailureSurface::V2Token,
+                &e,
+                AuthFailureReason::InvalidToken,
+            );
             return oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -5163,7 +5304,14 @@ async fn token(
             // consults the DB credential-change watermark (#1173), so a
             // deactivated user's token fails here too.
             let had_bearer_header = extract_bearer_token(&headers).is_some();
-            if let Ok(claims) = validate_token(&state.db, &state.config, &headers).await {
+            let bearer_claims = match validate_token(&state.db, &state.config, &headers).await {
+                Ok(claims) => Some(claims),
+                // #4750: an outage while checking a presented JWT is a
+                // retryable 503, not "invalid credentials".
+                Err(OciAuthError::Unavailable) => return oci_auth_unavailable(),
+                Err(OciAuthError::Invalid) => None,
+            };
+            if let Some(claims) = bearer_claims {
                 let auth_service =
                     AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
                 // `AND is_active = true` mirrors `auth_service::authenticate`,
@@ -5186,6 +5334,9 @@ async fn token(
                 .await
                 {
                     Ok(Some(u)) => u,
+                    Err(ref e) if AppError::Database(e.to_string()).is_db_unavailable() => {
+                        return oci_auth_unavailable()
+                    }
                     _ => {
                         return oci_error(
                             StatusCode::UNAUTHORIZED,
@@ -5270,6 +5421,7 @@ async fn token(
             // to anonymous. Falling through to anonymous would mask the
             // revocation and hand the caller a usable pull token.
             if had_bearer_header {
+                record_token_auth_failure(AuthFailureReason::InvalidToken);
                 return oci_error(
                     StatusCode::UNAUTHORIZED,
                     "UNAUTHORIZED",
@@ -5341,6 +5493,11 @@ async fn token(
         .validate_api_token(&credentials.1)
         .await
     {
+        // #4750: validation that could not be completed is a retryable 503;
+        // falling through to the next credential shape would end in a 401.
+        Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+            return oci_auth_unavailable()
+        }
         Ok(validation) => {
             // Carry the API token's declared repository allow-list onto the
             // minted OCI bearer so the resource handlers enforce it (#2290).
@@ -5373,11 +5530,14 @@ async fn token(
             (user, tokens, true)
         }
         Err(_) => match auth_service
-            .authenticate(&credentials.0, &credentials.1)
+            .authenticate_with_reason(&credentials.0, &credentials.1)
             .await
         {
             Ok((user, tokens)) => (user, tokens, false),
-            Err(_) => {
+            Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
+                return oci_auth_unavailable()
+            }
+            Err(password_failure) => {
                 // Final fallback: accept a valid AK access token (JWT) as the
                 // Docker password. This enables the CI/CD keyless push flow:
                 //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
@@ -5396,6 +5556,11 @@ async fn token(
                                 .await
                             {
                                 Ok(u) => u,
+                                Err(ref e)
+                                    if AppError::Database(e.to_string()).is_db_unavailable() =>
+                                {
+                                    return oci_auth_unavailable()
+                                }
                                 Err(_) => {
                                     return oci_error(
                                         StatusCode::UNAUTHORIZED,
@@ -5427,12 +5592,22 @@ async fn token(
                         // Treat like an API token: bypass the TOTP guard below.
                         (user, tokens, true)
                     }
+                    Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+                        return oci_auth_unavailable()
+                    }
                     Err(_) => {
+                        // Neither an API token, a password nor an access
+                        // token: count it as the password rejection (#4676).
+                        record_token_auth_failure(
+                            password_failure
+                                .metric_reason()
+                                .unwrap_or(AuthFailureReason::BadPassword),
+                        );
                         return oci_error(
                             StatusCode::UNAUTHORIZED,
                             "UNAUTHORIZED",
                             "invalid username or password",
-                        )
+                        );
                     }
                 }
             }
@@ -5520,37 +5695,49 @@ async fn version_check(
     base_url: RequestBaseUrl,
 ) -> Response {
     // Accept Bearer token (standard Docker client flow)
-    if validate_token(&state.db, &state.config, &headers)
-        .await
-        .is_ok()
-    {
-        return version_check_ok();
+    match validate_token(&state.db, &state.config, &headers).await {
+        Ok(_) => return version_check_ok(),
+        // #4750: a presented credential that could not be checked is a
+        // retryable 503, not a 401 that makes `docker login` give up.
+        Err(OciAuthError::Unavailable) => return oci_auth_unavailable(),
+        Err(OciAuthError::Invalid) => {}
     }
 
     // Accept Basic Auth directly (curl -u user:pass, HTTP clients)
     if let Some((username, password)) = extract_basic_credentials(&headers) {
         let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-        if auth_service
-            .authenticate(&username, &password)
-            .await
-            .is_ok()
-        {
-            return version_check_ok();
+        // Each attempt: Ok answers 200, an outage answers a retryable 503
+        // (#4750), anything else tries the next credential shape.
+        let outcome = |r: Result<(), AppError>| match r {
+            Ok(()) => Some(version_check_ok()),
+            Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+                Some(oci_auth_unavailable())
+            }
+            Err(_) => None,
+        };
+        if let Some(resp) = outcome(
+            auth_service
+                .authenticate(&username, &password)
+                .await
+                .map(|_| ()),
+        ) {
+            return resp;
         }
 
         // Fall back to API token in the password field
-        if auth_service.validate_api_token(&password).await.is_ok() {
-            return version_check_ok();
+        if let Some(resp) = outcome(auth_service.validate_api_token(&password).await.map(|_| ())) {
+            return resp;
         }
 
         // Final fallback: accept AK JWT access token in the Basic password field.
         // This enables CI keyless flows that use `docker login -u <ci-user> -p <access_token>`.
-        if auth_service
-            .validate_access_token_async(&password)
-            .await
-            .is_ok()
-        {
-            return version_check_ok();
+        if let Some(resp) = outcome(
+            auth_service
+                .validate_access_token_async(&password)
+                .await
+                .map(|_| ()),
+        ) {
+            return resp;
         }
     }
 
@@ -5569,7 +5756,7 @@ async fn version_check(
 ///   "test/python/manifests/latest" → ("test/python", "manifests", "latest")
 ///   "test/python/blobs/uploads/"   → ("test/python", "uploads", None)
 ///   "test/python/blobs/uploads/uuid" → ("test/python", "uploads", "uuid")
-fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
+pub(crate) fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
     let path = path.trim_start_matches('/');
     if let Some(name) = path.strip_suffix("/tags/list") {
         return Some((
@@ -6460,7 +6647,7 @@ async fn handle_start_upload(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+            Err(e) => return oci_auth_failure(e, base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: a read-scoped API token must not be accepted
     // for an OCI blob upload (`docker push`). Enforce the write scope.
@@ -6502,6 +6689,20 @@ async fn handle_start_upload(
         {
             return resp;
         }
+    }
+
+    // #4672: a declared body over the cap is refused with 413 before anything
+    // is registered or a byte is read, exactly as PATCH does. Streaming it
+    // first only failed once the cap was crossed, and a client that declared
+    // more than it sent sat until the stall watchdog's 408. Answering before
+    // the body is polled also lets HTTP/2 deliver the status and then reset
+    // the request stream, instead of the client seeing a bare stream error.
+    if let Some(resp) = reject_oversized_content_length(
+        headers,
+        upload_session_body_limit(0, state.config.max_upload_size_bytes),
+        state.config.max_upload_size_bytes,
+    ) {
+        return resp;
     }
 
     let storage = match state.storage_for_repo(&location) {
@@ -6903,7 +7104,7 @@ async fn handle_patch_upload(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+            Err(e) => return oci_auth_failure(e, base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PATCH on an upload session is a write operation.
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
@@ -7153,7 +7354,7 @@ async fn handle_cancel_upload(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+            Err(e) => return oci_auth_failure(e, base_url, Some(&scope)),
         };
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
         return oci_forbidden_scope(OCI_SCOPE_WRITE);
@@ -7397,7 +7598,7 @@ async fn handle_get_upload_status(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+            Err(e) => return oci_auth_failure(e, base_url, Some(&scope)),
         };
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
         return oci_forbidden_scope(OCI_SCOPE_WRITE);
@@ -7455,7 +7656,7 @@ async fn handle_complete_upload(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+            Err(e) => return oci_auth_failure(e, base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: completing an upload session writes the blob.
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
@@ -8040,6 +8241,20 @@ async fn handle_complete_upload(
             }
         };
         if computed != requested_digest {
+            // #4646: enough to tell a client that sent other bytes from a
+            // server that assembled the parts wrong, without the client logs.
+            warn!(
+                upload_session_id = %session_id,
+                bytes_received = session.bytes_received,
+                assembled_bytes = put_result.bytes_written,
+                parts = ?parts
+                    .iter()
+                    .map(|p| (p.storage_key.as_str(), p.size_bytes))
+                    .collect::<Vec<_>>(),
+                computed = %computed.as_prefixed(),
+                provided = %digest,
+                "OCI chunked upload digest mismatch"
+            );
             delete_storage_key_best_effort(
                 &storage,
                 &completion_temp_key,
@@ -11227,6 +11442,13 @@ where
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
     let artifact_name = format!("{}:{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    // #4725: deliberately NOT queued for peer push sync here, unlike the other
+    // native-format upload handlers. Layer blobs live in `oci_blobs`, not
+    // `artifacts`, so the artifact-driven sync worker can only ever transfer
+    // the manifest bytes. A peer that received the manifest alone would serve
+    // an image whose blobs 404 — worse than having nothing. Replicating an
+    // image needs a blob-aware transfer (manifest + its blob closure), which
+    // is a separate design from this artifact-row fan-out.
     // NO-QUOTA-ADMISSION: a manifest row records the image size, whose bytes
     // are admitted blob by blob; the usage ledger excludes `oci-manifests/%`
     // rows (#4545, migration 288), so the row adds 0 (a push, a migration
@@ -11271,7 +11493,7 @@ async fn handle_put_manifest(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+            Err(e) => return oci_auth_failure(e, base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PUT manifest is the final step of `docker push`.
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
@@ -12390,11 +12612,11 @@ async fn handle_catalog(
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let base_url = base_url.as_str();
-    let Ok((claims, token_scopes)) =
-        authenticate_oci_with_scopes(&state.db, &state.config, &headers).await
-    else {
-        return unauthorized_challenge(base_url);
-    };
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, &headers).await {
+            Ok(pair) => pair,
+            Err(e) => return oci_auth_failure(e, base_url, None),
+        };
     // #3408: `_catalog` is a read verb, so it takes the same action ceiling as
     // every other pull. Gated here rather than left to the per-repository
     // filter below, which would answer a too-narrow token with an empty
@@ -12662,7 +12884,7 @@ async fn handle_delete_manifest(
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+            Err(e) => return oci_auth_failure(e, base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: deleting a manifest is destructive. Require the
     // delete scope on API tokens. JWT/password callers pass through.
@@ -13330,6 +13552,53 @@ mod tests {
     use chrono::Utc;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use std::sync::Arc;
+
+    /// #4765: an OCI upload-session lookup that hits a database outage must
+    /// answer a retryable 503 with `Retry-After: 1` and the registry's
+    /// `UNAVAILABLE` code (as the `/v2/` credential check already does), not
+    /// `500 INTERNAL_ERROR`. Drives the real lookup against a closed pool.
+    #[tokio::test]
+    async fn test_fetch_oci_upload_session_db_unavailable_is_503_unavailable_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+
+        let response = match fetch_oci_upload_session(&pool, Uuid::new_v4(), Uuid::new_v4()).await {
+            Ok(_) => panic!("a closed pool cannot read an upload session"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("OCI error envelope");
+        assert_eq!(body["errors"][0]["code"], "UNAVAILABLE");
+    }
+
+    /// A query error is still a server fault: the OCI envelope keeps
+    /// `500 INTERNAL_ERROR` and no `Retry-After` (#4765 only widens the
+    /// unavailable class).
+    #[test]
+    fn test_oci_db_error_query_fault_stays_500_internal_error_4765() {
+        let raw = "error returned from database: relation \"t\" does not exist";
+        let response = oci_error(
+            crate::api::handlers::db_status(raw),
+            "INTERNAL_ERROR",
+            crate::api::handlers::db_err_message(raw),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+    }
 
     // -----------------------------------------------------------------------
     // /v2/token: accept repeated `?scope=` query parameters (multi-scope)
@@ -15651,22 +15920,32 @@ mod tests {
     #[tokio::test]
     async fn test_version_check_rejects_basic_password_invalid_jwt() {
         let secret = "test-secret-at-least-32-bytes-long-for-testing";
-        let state = test_state_with_secret(secret);
         let basic =
             base64::engine::general_purpose::STANDARD.encode("ci-user:not-a-valid-access-token");
+        let call = |state: SharedState| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Basic {}", basic)).expect("header value"),
+            );
+            version_check(
+                State(state),
+                headers,
+                RequestBaseUrl("http://localhost:8080".to_string()),
+            )
+        };
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {}", basic)).expect("header value"),
-        );
+        // #4750: with the database unreachable the username/password check
+        // cannot run, so the answer is a retryable 503, not a 401.
+        let resp = call(test_state_with_secret(secret)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let resp = version_check(
-            State(state),
-            headers,
-            RequestBaseUrl("http://localhost:8080".to_string()),
-        )
-        .await;
+        // With the database up, the unknown user / non-JWT password is a 401
+        // challenge.
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let resp = call(test_state_with_secret_and_pool(secret, pool)).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(resp.headers().get("WWW-Authenticate").is_some());
     }
@@ -18892,6 +19171,84 @@ mod token_lockout_regression_tests {
     /// it here keeps that invariant from regressing if anyone later
     /// "optimizes" the dummy-hash code path without realizing the OCI handler
     /// depends on it.
+    /// #4676: `/v2/token` counts the credentials it rejects in
+    /// `ak_auth_failures_total{surface="v2_token"}`, bucketed by the password
+    /// rejection: a wrong password, an unknown username, and a presented
+    /// Bearer that does not validate. A request with no credential is not.
+    #[test]
+    fn rejected_token_exchanges_are_counted_4676() {
+        use crate::services::metrics_service::capture_counters_async;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(pool) = tdh::try_pool().await else {
+                return false;
+            };
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+            sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+                .bind(&pwd_hash)
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("update password_hash");
+            let storage_dir = std::env::temp_dir().join(format!("oci-4676-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+            let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let app = router(None).with_state(state);
+            let send = |authorization: Option<String>| {
+                let app = app.clone();
+                async move {
+                    let mut req = Request::builder().method("GET").uri("/token");
+                    if let Some(value) = authorization {
+                        req = req.header("Authorization", value);
+                    }
+                    app.oneshot(req.body(Body::empty()).unwrap())
+                        .await
+                        .expect("oneshot")
+                        .status()
+                }
+            };
+            let basic = |user: &str, password: &str| {
+                Some(format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+                ))
+            };
+            let wrong = send(basic(&username, "wrong-password")).await;
+            let unknown = send(basic(&format!("ghost-{}", Uuid::new_v4()), "x")).await;
+            let bad_bearer = send(Some("Bearer not-a-jwt".to_string())).await;
+            let anonymous = send(None).await;
+
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+            assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+            assert_eq!(unknown, StatusCode::UNAUTHORIZED);
+            assert_eq!(bad_bearer, StatusCode::UNAUTHORIZED);
+            // 200 (anonymous pull token) or 401 (guest access off): either
+            // way no credential was presented, so nothing is counted.
+            assert!(matches!(
+                anonymous,
+                StatusCode::OK | StatusCode::UNAUTHORIZED
+            ));
+            true
+        });
+        if !ran {
+            return;
+        }
+        let get = |reason: &str| {
+            counted.get(
+                "ak_auth_failures_total",
+                &[("surface", "v2_token"), ("reason", reason)],
+            )
+        };
+        assert_eq!(get("bad_password"), 1);
+        assert_eq!(get("unknown_user"), 1);
+        assert_eq!(get("invalid_token"), 1);
+        assert_eq!(counted.get("ak_auth_failures_total", &[]), 3);
+    }
+
     #[tokio::test]
     async fn password_basic_auth_falls_through_to_authenticate() {
         let Some(pool) = tdh::try_pool().await else {
@@ -23617,6 +23974,82 @@ mod oci_blob_upload_streaming_tests {
         f.teardown().await;
     }
 
+    /// Upload-session and journal rows a refused start must not leave behind.
+    async fn upload_rows(f: &OciUploadFixture) -> (i64, i64) {
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(f.inner.repo_id)
+                .fetch_one(&f.inner.pool)
+                .await
+                .expect("count upload sessions");
+        let journal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE repository_id = $1",
+        )
+        .bind(f.inner.repo_id)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count cleanup keys");
+        (sessions, journal)
+    }
+
+    /// #4672: `POST /blobs/uploads/` (session create with a body, and the
+    /// monolithic `?digest=` form) refuses an over-limit declared
+    /// Content-Length with 413 before polling the body or registering
+    /// anything, like PATCH. It used to stream until the cap or, for a client
+    /// that declared more than it sent, until the stall watchdog's 408.
+    #[tokio::test]
+    async fn start_upload_rejects_oversized_content_length_before_reading_body() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app_with_max_upload_size(4);
+        let digest = compute_sha256(b"12345");
+        for uri in [
+            format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+            format!(
+                "/{}/image/blobs/uploads/?digest={}",
+                f.inner.repo_key, digest
+            ),
+        ] {
+            let chunks_read = Arc::new(AtomicUsize::new(0));
+            let body = counted_body(Arc::clone(&chunks_read), vec![Bytes::from_static(b"12345")]);
+            let (status, _headers, body) = send(
+                app.clone(),
+                request_with_body(Method::POST, uri.clone(), &f.authorization, 5, body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}: {body:?}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("BLOB_UPLOAD_INVALID"),
+                "{uri}: {body:?}"
+            );
+            assert_eq!(
+                chunks_read.load(AtomicOrdering::SeqCst),
+                0,
+                "{uri}: oversized start should be rejected from Content-Length before polling body"
+            );
+        }
+        let rows = upload_rows(&f).await;
+        assert_eq!(oci_blob_count(&f, &digest).await, 0);
+
+        // A declared length within the cap is still accepted.
+        let (status, _headers, body) = send(
+            app,
+            request_with_body(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                4,
+                Body::from(Bytes::from_static(b"1234")),
+            ),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(rows, (0, 0), "a refused start must register nothing");
+        assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
+    }
+
     #[tokio::test]
     async fn first_patch_respects_configured_max_upload_size() {
         let Some(f) = OciUploadFixture::setup().await else {
@@ -25913,6 +26346,377 @@ mod oci_blob_upload_streaming_tests {
         .expect("heartbeat must invalidate the lease when its token no longer owns the row");
         assert!(!heartbeat.lease_is_valid());
 
+        f.teardown().await;
+    }
+
+    fn patch_request(
+        uri: String,
+        authorization: &str,
+        start: usize,
+        chunk: Bytes,
+        with_range: bool,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::PATCH)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .header(CONTENT_LENGTH, chunk.len().to_string());
+        if with_range {
+            builder = builder.header(
+                "Content-Range",
+                format!("{}-{}", start, start + chunk.len() - 1),
+            );
+        }
+        builder.body(Body::from(chunk)).expect("build PATCH")
+    }
+
+    async fn start_session(f: &OciUploadFixture, app: &Router) -> Uuid {
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "start upload: {:?}", body);
+        headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID")
+    }
+
+    fn patterned_chunk(seed: u64, len: usize) -> Bytes {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        Bytes::from(out)
+    }
+
+    /// One session of the #4646 stress: two PATCH chunks, each raced against a
+    /// duplicate of itself (a client/proxy retry while the first is still
+    /// streaming), a replayed PATCH of chunk 0 after it landed, an out-of-order
+    /// chunk, then the commit. Whatever wins each race, the committed blob must
+    /// be exactly chunk0 || chunk1.
+    async fn chunked_upload_under_retries(
+        f: Arc<OciUploadFixture>,
+        app: Router,
+        seed: u64,
+        chunk_len: usize,
+        with_range: bool,
+    ) {
+        let chunk0 = patterned_chunk(seed, chunk_len);
+        let chunk1 = patterned_chunk(seed + 1_000_000, chunk_len);
+        let mut whole = chunk0.to_vec();
+        whole.extend_from_slice(&chunk1);
+        let digest = compute_sha256(&whole);
+        let uuid = start_session(&f, &app).await;
+        let uri = format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, uuid);
+
+        for (start, chunk) in [(0, &chunk0), (chunk_len, &chunk1)] {
+            if start > 0 && with_range {
+                // Out-of-order: a chunk that skips ahead is refused, not appended.
+                let (status, _, _) = send(
+                    app.clone(),
+                    patch_request(
+                        uri.clone(),
+                        &f.authorization,
+                        start + chunk_len,
+                        chunk.clone(),
+                        true,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+            }
+            let (a, b) = tokio::join!(
+                send(
+                    app.clone(),
+                    patch_request(
+                        uri.clone(),
+                        &f.authorization,
+                        start,
+                        chunk.clone(),
+                        with_range
+                    )
+                ),
+                send(
+                    app.clone(),
+                    patch_request(
+                        uri.clone(),
+                        &f.authorization,
+                        start,
+                        chunk.clone(),
+                        with_range
+                    )
+                ),
+            );
+            let accepted = [a.0, b.0]
+                .iter()
+                .filter(|s| **s == StatusCode::ACCEPTED)
+                .count();
+            if with_range {
+                assert_eq!(
+                    accepted, 1,
+                    "exactly one of two racing PATCHes for the same range may land: {} / {}",
+                    a.0, b.0
+                );
+            } else if accepted == 2 {
+                // Without Content-Range a PATCH is a plain append (the OCI
+                // streaming upload); a duplicate that lands after the first is
+                // appended by design. That session cannot commit chunk0||chunk1,
+                // so stop here; the race itself must still not corrupt state.
+                let (status, _, _) = send(
+                    app.clone(),
+                    request(
+                        Method::PUT,
+                        format!("{}?digest={}", uri, digest),
+                        &f.authorization,
+                        Bytes::new(),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                return;
+            }
+            for (status, _, body) in [&a, &b] {
+                assert!(
+                    *status == StatusCode::ACCEPTED
+                        || *status == StatusCode::CONFLICT
+                        || *status == StatusCode::RANGE_NOT_SATISFIABLE,
+                    "unexpected PATCH status {}: {:?}",
+                    status,
+                    body
+                );
+            }
+            if with_range {
+                // A replay of the range that already landed is refused.
+                let (status, _, _) = send(
+                    app.clone(),
+                    patch_request(uri.clone(), &f.authorization, start, chunk.clone(), true),
+                )
+                .await;
+                assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+            }
+        }
+
+        let (status, _, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!("{}?digest={}", uri, digest),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "commit of chunk0||chunk1 refused: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            f.storage().get(&blob_storage_key(&digest)).await.unwrap(),
+            Bytes::from(whole)
+        );
+    }
+
+    /// #4646: many concurrent chunked sessions with racing, replayed and
+    /// out-of-order PATCHes, interleaved with monolithic pushes to the same
+    /// repository, must never commit or reject on a wrong digest.
+    /// `AK_OCI_4646_SESSIONS` / `AK_OCI_4646_CHUNK_BYTES` scale it up locally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunked_upload_stress_retries_and_races_keep_digest_exact() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let f = Arc::new(f);
+        let app = f.app();
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let sessions = env("AK_OCI_4646_SESSIONS", 8);
+        let chunk_len = env("AK_OCI_4646_CHUNK_BYTES", 256 * 1024);
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..sessions {
+            tasks.spawn(chunked_upload_under_retries(
+                Arc::clone(&f),
+                app.clone(),
+                i as u64,
+                chunk_len,
+                i % 4 != 3,
+            ));
+            if i % 3 == 0 {
+                let (f, app) = (Arc::clone(&f), app.clone());
+                tasks.spawn(async move {
+                    let blob = patterned_chunk(7_000_000 + i as u64, 2 * chunk_len);
+                    let digest = compute_sha256(&blob);
+                    let (status, _, body) = send(
+                        app,
+                        request(
+                            Method::POST,
+                            format!(
+                                "/{}/image/blobs/uploads/?digest={}",
+                                f.inner.repo_key, digest
+                            ),
+                            &f.authorization,
+                            blob,
+                        ),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "monolithic: {:?}", body);
+                });
+            }
+        }
+        let mut failure = None;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
+                failure.get_or_insert(e);
+            }
+        }
+        f.teardown().await;
+        if let Some(e) = failure {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+
+    /// #4646: a PATCH part whose stored object is shorter than the length the
+    /// PATCH recorded (what a silently failed final write left behind) must
+    /// fail the commit as a server-side storage error, not answer the client
+    /// DIGEST_INVALID with the digest of bytes it never sent.
+    #[tokio::test]
+    async fn truncated_stored_part_fails_commit_as_storage_error_not_digest_invalid() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let chunk0 = patterned_chunk(1, 64 * 1024);
+        let chunk1 = patterned_chunk(2, 64 * 1024);
+        let mut whole = chunk0.to_vec();
+        whole.extend_from_slice(&chunk1);
+        let digest = compute_sha256(&whole);
+        let uuid = start_session(&f, &app).await;
+        let uri = format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, uuid);
+        for (start, chunk) in [(0, &chunk0), (chunk0.len(), &chunk1)] {
+            let (status, _, body) = send(
+                app.clone(),
+                patch_request(uri.clone(), &f.authorization, start, chunk.clone(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "PATCH: {:?}", body);
+        }
+
+        let part0_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM oci_upload_parts WHERE upload_session_id = $1 AND part_index = 0",
+        )
+        .bind(uuid)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("part 0 key");
+        f.storage()
+            .put(&part0_key, chunk0.slice(..chunk0.len() - 4096))
+            .await
+            .expect("truncate part 0");
+
+        let (status, _, body) = send(
+            app.clone(),
+            request(
+                Method::PUT,
+                format!("{}?digest={}", uri, digest),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a short stored part is a storage fault: {}",
+            body
+        );
+        assert!(!body.contains("DIGEST_INVALID"), "{}", body);
+        assert!(body.contains(&part0_key), "names the bad part: {}", body);
+        f.teardown().await;
+    }
+
+    /// #4750: the evidence from the #4646 stress runs. With the database pool
+    /// exhausted, a `/v2` upload carrying a perfectly valid Bearer JWT was
+    /// answered `401 UNAUTHORIZED "authentication required"`, because
+    /// `authenticate_oci_with_scopes` collapsed every failure into `Err(())`.
+    /// It must be a retryable 503; once the pool frees up the same request is
+    /// accepted, and a bad credential is still a 401.
+    #[tokio::test]
+    async fn oci_auth_db_pool_exhausted_is_503_not_401_4750() {
+        use std::str::FromStr;
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let tiny_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_with(sqlx::postgres::PgConnectOptions::from_str(&url).unwrap())
+            .await
+            .expect("connect single-connection pool");
+        let mut state = (*f.inner.state).clone();
+        state.db = tiny_pool.clone();
+        let app = router(None).with_state(Arc::new(state));
+        let start = || {
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            )
+        };
+
+        let held = tiny_pool.acquire().await.expect("hold the only connection");
+        let (status, headers, body) = send(app.clone(), start()).await;
+        drop(held);
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        let (status, _, body) = send(app.clone(), start()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{:?}", body);
+
+        let (status, _, _) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                "Bearer not-a-valid-token",
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        tiny_pool.close().await;
         f.teardown().await;
     }
 }
@@ -29558,6 +30362,61 @@ mod oci_write_authz_and_size_tests {
             reject_oversized_content_length(&headers, 10, 10).is_none(),
             "a declared Content-Length within the limit must not be rejected"
         );
+    }
+
+    /// #4125: a hosted `docker push` must start a scan when the repository has
+    /// `scan_enabled` + `scan_on_upload`, and must start none when
+    /// `scan_on_upload` is off. Returns the probe scan rows the push produced.
+    async fn manifest_push_probe_scans(on_upload: bool, budget: Duration) -> Option<i64> {
+        let fx = tdh::Fixture::setup("local", "docker").await?;
+        let auth = tdh::bearer_for(&fx.state, fx.user_id).await;
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 37,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{}", "1".repeat(64)),
+                "size": 17,
+            }],
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/scanme/manifests/1.0", fx.repo_key))
+            .header(AUTHORIZATION, auth)
+            .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+            .unwrap();
+        let scans = tdh::native_upload_probe_scans(&fx, router(None), req, on_upload, budget).await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        Some(scans)
+    }
+
+    #[tokio::test]
+    async fn manifest_push_starts_scan_when_scan_on_upload_is_on_4125() {
+        let Some(scans) = manifest_push_probe_scans(true, Duration::from_secs(30)).await else {
+            return;
+        };
+        assert!(
+            scans > 0,
+            "a docker push into a scan_on_upload repository must start a scan (#4125)"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_push_starts_no_scan_when_scan_on_upload_is_off_4125() {
+        let Some(scans) = manifest_push_probe_scans(false, Duration::from_secs(3)).await else {
+            return;
+        };
+        assert_eq!(scans, 0, "scan_on_upload is off, so the push must not scan");
     }
 }
 
@@ -38075,6 +38934,9 @@ mod remote_pull_through_cache_tests {
         let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
+        // A second live dispatcher, so the captures below see callsites a
+        // sibling test registered first on a thread without a subscriber.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
         let mut seen = Vec::new();
         for (key, credentialed) in [(&repo_key, true), (&anon_key, false)] {
             for name in ["private", "basic401", "basic403"] {
@@ -38152,6 +39014,14 @@ mod remote_pull_through_cache_tests {
                 assert!(
                     logs.contains("refused an anonymous manifest request")
                         || logs.contains("anonymous bearer token"),
+                    "{name}: {logs}"
+                );
+                // #4526: the refusal is logged once at INFO; the generic
+                // proxy failure line must not repeat it as a WARN per pull.
+                assert!(
+                    !logs
+                        .lines()
+                        .any(|l| l.contains("WARN") && l.contains("Proxy fetch failed")),
                     "{name}: {logs}"
                 );
             }
@@ -42310,8 +43180,10 @@ mod oci_v2_resolution_db_error_leak_3761 {
                 serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
             assert_eq!(
                 parsed["errors"][0]["code"].as_str(),
-                Some("INTERNAL_ERROR"),
-                "{label}: the spec envelope and its code are unchanged: {body}"
+                // A retryable 503 carries the registry's `UNAVAILABLE` code
+                // since #4765 (it said `INTERNAL_ERROR` before).
+                Some("UNAVAILABLE"),
+                "{label}: the spec envelope carries the retryable code: {body}"
             );
             assert_eq!(
                 parsed["errors"][0]["message"].as_str(),

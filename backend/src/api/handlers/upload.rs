@@ -4587,9 +4587,11 @@ mod tests {
         )
         .await
         .expect_err("a failed terminal update must not report success");
+        // A closed pool is a database outage, which answers a retryable 503
+        // since #4765 (it was 500); either way, never a 200.
         assert_eq!(
             map_upload_err(err).status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             "the handler must not return 200 after losing the terminal update"
         );
 

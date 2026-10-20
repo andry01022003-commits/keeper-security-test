@@ -1716,6 +1716,7 @@ async fn store_crate_artifact(
     checksum: &str,
     cargo_metadata: serde_json::Value,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<(), Response> {
     // Captured before `cargo_metadata` is handed to the metadata INSERT: the
     // catalog registration below reads the manifest description from it.
@@ -1837,6 +1838,17 @@ async fn store_crate_artifact(
     .execute(&state.db)
     .await;
 
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
     Ok(())
 }
 
@@ -1899,6 +1911,7 @@ async fn publish(
         &checksum,
         cargo_metadata,
         user_id,
+        &headers,
     )
     .await?;
 
@@ -6624,6 +6637,69 @@ mod tests {
             &dl_body[..],
             crate_data,
             "the advertised download URL must serve the published .crate bytes"
+        );
+    }
+
+    /// #4725: a `cargo publish` to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and a publish that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn cargo_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "cargo").await;
+
+        let metadata = serde_json::json!({
+            "name": "repl-crate",
+            "vers": "1.0.0",
+            "description": "replicated crate",
+        });
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/api/v1/crates/new", fx.repo_key),
+                make_publish_payload(&metadata, b"fake-crate-tarball-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "cargo publish must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the crate
+        // but must not queue another task.
+        let metadata = serde_json::json!({
+            "name": "repl-crate",
+            "vers": "2.0.0",
+            "description": "replicated crate",
+        });
+        let mut req = tdh::put(
+            format!("/{}/api/v1/crates/new", fx.repo_key),
+            make_publish_payload(&metadata, b"fake-crate-tarball-bytes"),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated cargo publish must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["repl-crate/1.0.0/repl-crate-1.0.0.crate".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
         );
     }
 }

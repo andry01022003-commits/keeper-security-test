@@ -21,6 +21,9 @@ use crate::error::{AppError, Result};
 use crate::models::quality::{QualityGateEvaluation, QualityGateViolation};
 use crate::models::repository::{RepositoryType, RepositoryVisibility};
 use crate::models::sbom::PolicyAction;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
@@ -721,6 +724,84 @@ async fn fetch_source_artifact(
     .await
 }
 
+/// Audit context of one promotion request (#4710): who promoted, between
+/// which repositories, and whether the policy check was overridden. Each
+/// artifact's outcome is recorded through [`PromotionAudit::record`].
+struct PromotionAudit<'a> {
+    state: &'a SharedState,
+    auth: &'a AuthExtension,
+    source_repository: &'a str,
+    target_repository: &'a str,
+    skip_policy_check: bool,
+    bulk: bool,
+}
+
+impl PromotionAudit<'_> {
+    /// Record `ARTIFACT_PROMOTED` for a promotion, or `PROMOTION_REFUSED` for
+    /// a quality-gate, policy or promotion-rule refusal, with a summary of the
+    /// gate results (how many rules were evaluated, which ones failed).
+    async fn record(&self, artifact_id: Uuid, artifact_path: &str, resp: &PromotionResponse) {
+        let action = if resp.promoted {
+            AuditAction::ArtifactPromoted
+        } else {
+            AuditAction::PromotionRefused
+        };
+        let failed_rules: Vec<&str> = resp
+            .gate_results
+            .iter()
+            .filter(|g| !g.passed)
+            .map(|g| g.rule.as_str())
+            .collect();
+        let details = serde_json::json!({
+            "artifact_id": artifact_id,
+            "artifact_path": artifact_path,
+            "source_repository": self.source_repository,
+            "target_repository": self.target_repository,
+            "promotion_id": resp.promotion_id,
+            "skip_policy_check": self.skip_policy_check,
+            "bulk": self.bulk,
+            "gate_results": {
+                "evaluated": resp.gate_results.len(),
+                "failed": failed_rules.len(),
+                "failed_rules": failed_rules,
+            },
+            "policy_violations": resp.policy_violations.len(),
+            "message": if resp.promoted { None } else { resp.message.as_deref() },
+        });
+        audit_fire_and_forget(
+            self.state.db.clone(),
+            AuditEntry::for_principal(action, ResourceType::Artifact, self.auth)
+                .resource(artifact_id)
+                .resource_name(artifact_path)
+                .details(details),
+        )
+        .await;
+    }
+}
+
+/// The refusal a quality-gate block produces, as a [`PromotionResponse`]
+/// (shared by the single route's 409 audit row and the bulk item result).
+fn gate_block_refusal(
+    source: String,
+    target: String,
+    eval: &QualityGateEvaluation,
+) -> PromotionResponse {
+    let message = gate_block_message(eval);
+    PromotionResponse {
+        gate_results: vec![quality_gate_block_result(&message)],
+        ..failed_response(source, target, message)
+    }
+}
+
+/// The failed `quality-gate` [`GateResult`] a gate block reports.
+fn quality_gate_block_result(message: &str) -> GateResult {
+    GateResult {
+        rule: "quality-gate".to_string(),
+        passed: false,
+        reason: message.to_string(),
+    }
+}
+
 fn failed_response(source: String, target: String, message: String) -> PromotionResponse {
     PromotionResponse {
         promoted: false,
@@ -794,11 +875,7 @@ fn screen_bulk_item(
     if let GateOutcome::Block(ref eval) = gate_outcome {
         let message = gate_block_message(eval);
         return BulkItemScreening::Refused {
-            gate_results: vec![GateResult {
-                rule: "quality-gate".to_string(),
-                passed: false,
-                reason: message.clone(),
-            }],
+            gate_results: vec![quality_gate_block_result(&message)],
             message,
             violations: vec![],
         };
@@ -1012,6 +1089,14 @@ pub async fn promote_artifact(
         req.skip_policy_check,
     )
     .await?;
+    let audit = PromotionAudit {
+        state: &state,
+        auth: &auth,
+        source_repository: &repo_key,
+        target_repository: &target_key,
+        skip_policy_check: req.skip_policy_check,
+        bulk: false,
+    };
 
     // Tenant-ownership gate (campaign-#4 systemic authz). The admin-capability
     // check above does NOT bind the caller to a tenant; without this, an
@@ -1061,6 +1146,12 @@ pub async fn promote_artifact(
     })?;
 
     if let GateOutcome::Block(ref eval) = gate_outcome {
+        let refusal = gate_block_refusal(
+            build_promotion_source_display(&repo_key, &artifact.path),
+            build_promotion_target_display(&target_key, &artifact.path),
+            eval,
+        );
+        audit.record(artifact_id, &artifact.path, &refusal).await;
         return Err(gate_block_error(eval));
     }
 
@@ -1134,7 +1225,7 @@ pub async fn promote_artifact(
         gate_results = eval_result.gate_results.clone();
 
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
-            return Ok(Json(PromotionResponse {
+            let refusal = PromotionResponse {
                 promoted: false,
                 source: build_promotion_source_display(&repo_key, &artifact.path),
                 target: build_promotion_target_display(&target_key, &artifact.path),
@@ -1142,7 +1233,9 @@ pub async fn promote_artifact(
                 policy_violations,
                 message: Some("Promotion blocked by policy violations".to_string()),
                 gate_results,
-            }));
+            };
+            audit.record(artifact_id, &artifact.path, &refusal).await;
+            return Ok(Json(refusal));
         }
     }
 
@@ -1159,7 +1252,7 @@ pub async fn promote_artifact(
             .evaluate_for_promotion(artifact_id, source_repo.id, target_repo.id)
             .await?;
         if !failing.is_empty() {
-            return Ok(Json(PromotionResponse {
+            let refusal = PromotionResponse {
                 promoted: false,
                 source: build_promotion_source_display(&repo_key, &artifact.path),
                 target: build_promotion_target_display(&target_key, &artifact.path),
@@ -1170,7 +1263,9 @@ pub async fn promote_artifact(
                     .into_iter()
                     .chain(rule_failures_to_gate_results(&failing))
                     .collect(),
-            }));
+            };
+            audit.record(artifact_id, &artifact.path, &refusal).await;
+            return Ok(Json(refusal));
         }
     }
 
@@ -1323,6 +1418,7 @@ pub async fn promote_artifact(
         policy_violations,
     );
     response.gate_results = gate_results;
+    audit.record(artifact_id, &artifact.path, &response).await;
     Ok(Json(response))
 }
 
@@ -1361,6 +1457,15 @@ pub async fn promote_artifacts_bulk(
         req.skip_policy_check,
     )
     .await?;
+
+    let audit = PromotionAudit {
+        state: &state,
+        auth: &auth,
+        source_repository: &repo_key,
+        target_repository: &target_key,
+        skip_policy_check: req.skip_policy_check,
+        bulk: true,
+    };
 
     // #4203: record the break-glass override once per request; each promoted
     // item also carries the `policy_check_skipped` marker in its
@@ -1514,6 +1619,7 @@ pub async fn promote_artifacts_bulk(
                     let mut resp = failed_response(source_display, target_display, message);
                     resp.policy_violations = violations;
                     resp.gate_results = gate_results;
+                    audit.record(*artifact_id, &artifact.path, &resp).await;
                     results.push(resp);
                     continue;
                 }
@@ -1553,6 +1659,7 @@ pub async fn promote_artifacts_bulk(
                         .cloned()
                         .chain(rule_failures_to_gate_results(&failing))
                         .collect();
+                    audit.record(*artifact_id, &artifact.path, &resp).await;
                     results.push(resp);
                     continue;
                 }
@@ -1724,7 +1831,7 @@ pub async fn promote_artifacts_bulk(
             .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
 
         promoted += 1;
-        results.push(PromotionResponse {
+        let resp = PromotionResponse {
             promoted: true,
             source: source_display,
             target: target_display,
@@ -1732,7 +1839,9 @@ pub async fn promote_artifacts_bulk(
             policy_violations: item_violations,
             message: Some("Promoted successfully".to_string()),
             gate_results: item_gate_results,
-        });
+        };
+        audit.record(*artifact_id, &artifact.path, &resp).await;
+        results.push(resp);
     }
 
     tracing::info!(
@@ -1839,6 +1948,24 @@ pub async fn reject_artifact(
         reason = %req.reason,
         "Artifact rejected"
     );
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(
+            AuditAction::PromotionRejected,
+            ResourceType::Artifact,
+            &auth,
+        )
+        .resource(artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": artifact_id,
+            "source_repository": repo_key,
+            "rejection_id": rejection_id,
+            "reason": req.reason,
+            "notes": req.notes,
+        })),
+    )
+    .await;
 
     Ok(Json(build_rejection_response(
         artifact_id,
@@ -5031,8 +5158,21 @@ mod tests {
                 target_has_artifact(&pool, tgt, "sok").await,
                 "rule-met single promote must copy the artifact into the target"
             );
+            // #4710: the promotion is audited with the actor and both repos.
+            let row = tdh::audit_row_eventually(&pool, artifact, "ARTIFACT_PROMOTED").await;
 
             cleanup(&pool, &[src, tgt], user).await;
+
+            assert_eq!(row.user_id, Some(user));
+            assert_eq!(row.resource_type, "artifact");
+            assert_eq!(row.details["source_repository"], src_key.as_str());
+            assert_eq!(row.details["target_repository"], tgt_key.as_str());
+            assert_eq!(
+                row.details["promotion_id"],
+                res.0.promotion_id.expect("promotion id").to_string()
+            );
+            assert_eq!(row.details["bulk"], false);
+            assert!(row.details["gate_results"]["evaluated"].is_u64());
         }
 
         // ---- F9: promotion carries the artifact's metadata --------------------
@@ -5288,8 +5428,60 @@ mod tests {
                 !target_has_artifact(&pool, tgt, "sno").await,
                 "a rule-blocked single promote must NOT copy the artifact"
             );
+            // #4710: the refusal is audited with the failing rule.
+            let row = tdh::audit_row_eventually(&pool, artifact, "PROMOTION_REFUSED").await;
 
             cleanup(&pool, &[src, tgt], user).await;
+
+            assert_eq!(row.user_id, Some(user));
+            assert_eq!(row.details["target_repository"], tgt_key.as_str());
+            assert!(row.details["promotion_id"].is_null());
+            assert!(row.details["gate_results"]["failed"].as_u64() >= Some(1));
+            assert!(row.details["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("promotion rule"));
+        }
+
+        /// #4710: rejecting an artifact in a staging repository is audited
+        /// with the reason.
+        #[tokio::test]
+        async fn test_reject_artifact_is_audited() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4710-rej-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "rej4710", &sdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            sqlx::query("UPDATE repositories SET repo_type = 'staging' WHERE id = $1")
+                .bind(src)
+                .execute(&pool)
+                .await
+                .expect("make staging");
+            let user = make_admin(&pool, "rej4710").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "rej4710").await;
+
+            let res = reject_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(RejectArtifactRequest {
+                    reason: "license".to_string(),
+                    notes: None,
+                }),
+            )
+            .await;
+            let row = tdh::audit_row_eventually(&pool, artifact, "PROMOTION_REJECTED").await;
+
+            cleanup(&pool, &[src], user).await;
+
+            let res = res.expect("reject must succeed");
+            assert_eq!(row.user_id, Some(user));
+            assert_eq!(row.details["source_repository"], src_key.as_str());
+            assert_eq!(row.details["reason"], "license");
+            assert_eq!(row.details["rejection_id"], res.0.rejection_id.to_string());
         }
 
         // ---- single-promote handler: skip_policy_check override --------------
@@ -5429,8 +5621,17 @@ mod tests {
                 !target_has_artifact(&pool, no_t, "bno").await,
                 "a rule-blocked bulk item must NOT copy the artifact"
             );
+            // #4710: one audit row per bulk item, promoted or refused.
+            let promoted_row = tdh::audit_row_eventually(&pool, met_art, "ARTIFACT_PROMOTED").await;
+            let refused_row = tdh::audit_row_eventually(&pool, no_art, "PROMOTION_REFUSED").await;
 
             cleanup(&pool, &[met_s, met_t, no_s, no_t], user).await;
+
+            assert_eq!(promoted_row.user_id, Some(user));
+            assert_eq!(promoted_row.details["bulk"], true);
+            assert_eq!(refused_row.user_id, Some(user));
+            assert_eq!(refused_row.details["bulk"], true);
+            assert!(refused_row.details["gate_results"]["failed"].as_u64() >= Some(1));
         }
 
         // ---- max_cve_severity default fix (shared evaluator) -----------------

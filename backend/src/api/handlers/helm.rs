@@ -24,7 +24,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Extension;
@@ -956,6 +956,7 @@ async fn upload_chart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -1225,6 +1226,31 @@ async fn upload_chart(
             }),
         )
         .await;
+    }
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+    if let Some(prov_artifact_id) = prov_artifact_id {
+        if let Some(prov_put) = prov_put.as_ref() {
+            // #4725: fan out to subscribed push peers.
+            super::queue_push_sync_tasks_for_upload(
+                &state.db,
+                &headers,
+                repo.id,
+                prov_artifact_id,
+                &prov_artifact_path,
+                prov_put.bytes_written as i64,
+            )
+            .await;
+        }
     }
 
     let prov_stored = prov_artifact_id.is_some();
@@ -2606,6 +2632,73 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(version, "0.1.0");
 
         f.teardown().await;
+    }
+
+    /// #4725: a ChartMuseum upload to a hosted repository must queue a push
+    /// sync task for a subscribed push peer — one for the chart row and one for
+    /// its `.prov` row — and a push that arrives as peer replication must not
+    /// be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn helm_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "helm").await;
+
+        let tgz = build_tgz(
+            "replchart/Chart.yaml",
+            b"apiVersion: v2\nname: replchart\nversion: 0.1.0\n",
+        );
+        let (status, body) = upload_parts(
+            &f,
+            &[
+                ("chart", "replchart-0.1.0.tgz", &tgz),
+                ("prov", "replchart-0.1.0.tgz.prov", REAL_PROV),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "chart push must succeed: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated push (as the sync worker sends it) stores the chart but
+        // must not queue another task.
+        let tgz2 = build_tgz(
+            "replchart/Chart.yaml",
+            b"apiVersion: v2\nname: replchart\nversion: 0.2.0\n",
+        );
+        let app = f.router_with_auth(super::router());
+        let mut req = tdh::post(
+            format!("/{}/api/charts", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart_body("BOUNDARY", &[("chart", "replchart-0.2.0.tgz", &tgz2)]),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "replicated chart push must succeed: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![
+                "replchart/0.1.0/replchart-0.1.0.tgz".to_string(),
+                "replchart/0.1.0/replchart-0.1.0.tgz.prov".to_string(),
+            ],
+            "only the client push queues push tasks; the replicated one must not"
+        );
     }
 
     /// The advertised layout must resolve: take the URL out of `index.yaml`,

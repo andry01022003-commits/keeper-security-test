@@ -291,16 +291,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // pins the enforcement so this message and the behaviour cannot drift apart
     // again.
 
-    // Initialize WASM plugin system (T068)
     let plugins_dir =
         PathBuf::from(std::env::var("PLUGINS_DIR").unwrap_or_else(|_| "./plugins".to_string()));
-    let (plugin_registry, wasm_plugin_service) = initialize_wasm_plugins(
-        db_pool.clone(),
-        plugins_dir,
-        config.plugins_require_signed,
-        config.plugins_trusted_pubkey.clone(),
-    )
-    .await?;
+    let plugin_services =
+        initialize_wasm_plugins_if_enabled(&config, db_pool.clone(), plugins_dir).await?;
 
     // Initialize OpenSearch (optional, graceful fallback)
     let search_service = match &config.opensearch_url {
@@ -420,9 +414,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             target: "security",
             allowlist = %list,
             "AK_SSRF_ALLOW_PRIVATE_CIDRS (or alias UPSTREAM_PRIVATE_IP_ALLOWLIST) \
-             is set; upstream URLs may now target listed private CIDRs. Cloud \
+             is set; outbound targets (upstream and migration URLs, LDAP, \
+             SSO/OIDC, webhooks) may now be in the listed private CIDRs. Cloud \
              metadata IPs and loopback remain blocked. SSRF risk surface \
-             widened (issues #976, #1224)."
+             widened (issues #976, #1224, #4638)."
         );
     } else {
         if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
@@ -741,6 +736,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #4133: a CI OIDC provider whose audience is a Kubernetes API server's
+    // accepts every pod's default ServiceAccount token. Create and update
+    // refuse one now; name those stored before, once per boot, unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::ci_oidc_service::warn_kubernetes_api_server_audiences(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // #1331: name every signing key that is bound to Debian/RPM metadata
     // signing but cannot produce OpenPGP signatures (legacy PEM / X.509 keys),
     // once per boot; with SIGNING_AUTO_MIGRATE_LEGACY_KEYS=true, replace each
@@ -759,7 +767,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Initialize security scanner service
     let advisory_client = {
-        let mut client = AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok());
+        let mut client = AdvisoryClient::new(env_secret_or_log(
+            "GITHUB_TOKEN",
+            "continuing without a GitHub token",
+        ));
         // #4055: the client's answer cache is where new advisory data enters
         // the system; report detected changes so the leased scheduler tick
         // can re-evaluate stored environments against them.
@@ -838,16 +849,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     let scanner_service = Arc::new(scanner_service);
 
-    // Create application state with WASM plugin support
     let scheduler_storage = primary_storage.clone();
-    let mut app_state = api::AppState::with_wasm_plugins(
-        config.clone(),
-        db_pool.clone(),
-        primary_storage,
-        storage_registry.clone(),
-        plugin_registry,
-        wasm_plugin_service,
-    );
+    let mut app_state = match plugin_services {
+        Some((plugin_registry, wasm_plugin_service)) => api::AppState::with_wasm_plugins(
+            config.clone(),
+            db_pool.clone(),
+            primary_storage,
+            storage_registry.clone(),
+            plugin_registry,
+            wasm_plugin_service,
+        ),
+        None => api::AppState::new(
+            config.clone(),
+            db_pool.clone(),
+            primary_storage,
+            storage_registry.clone(),
+        ),
+    };
     app_state.set_scanner_service(scanner_service);
 
     // Initialize quality check service for health scoring and quality gates
@@ -1157,6 +1175,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         [artifact_keeper_backend::api::middleware::rate_limit::CidrRange],
     > = config.rate_limit_trusted_proxy_cidrs.clone().into();
 
+    // With trusted proxies configured but no XFF_TRUSTED_FOR_AUTHZ
+    // assertion, authorization-grade client-IP resolution fails closed:
+    // IP-conditioned permission rules (#1849) deny every proxied request and
+    // auth-audit rows record NULL for the client IP. That is the safe
+    // default — a proxy that does not append XFF leaves the chain wholly
+    // attacker-controlled — but it surprises operators whose topology IS
+    // appending, so say so loudly at startup.
+    if !config.rate_limit_trusted_proxy_cidrs.is_empty() && !config.xff_trusted_for_authz {
+        tracing::warn!(
+            "RATE_LIMIT_TRUSTED_PROXY_CIDRS is set but XFF_TRUSTED_FOR_AUTHZ is not: \
+             IP-conditioned permission rules (allowed_cidrs) and auth-audit IP attribution \
+             resolve the client as UNKNOWN for requests arriving through trusted proxies \
+             (fail closed). Set XFF_TRUSTED_FOR_AUTHZ=true only after confirming every \
+             trusted proxy APPENDS X-Forwarded-For (Caddy and ingress-nginx do; Envoy \
+             Gateway passes inbound XFF through unsanitized)."
+        );
+    }
+
     // Build router
     let app = Router::new()
         .merge(api::routes::create_router(state))
@@ -1365,6 +1401,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         );
         let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
+        let header_read_timeout = config.http_header_read_timeout();
         tokio::spawn(async move {
             let metrics_app = Router::new()
                 .route(
@@ -1375,9 +1412,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             match tokio::net::TcpListener::bind(metrics_addr).await {
                 Ok(listener) => {
                     tracing::info!("Metrics listener on {}", metrics_addr);
-                    if let Err(e) = axum::serve(listener, metrics_app)
-                        .with_graceful_shutdown(async move { metrics_shutdown.cancelled().await })
-                        .await
+                    if let Err(e) = artifact_keeper_backend::api::serve::serve(
+                        listener,
+                        metrics_app.into_make_service(),
+                        header_read_timeout,
+                        async move { metrics_shutdown.cancelled().await },
+                    )
+                    .await
                     {
                         tracing::error!("Metrics listener error: {}", e);
                     }
@@ -1391,7 +1432,28 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     }
 
     let http_shutdown_token = shutdown_token.clone();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // #4647: the accept queue a CPU-starved process drains slowly. Logged so
+    // an operator can see what the kernel actually granted.
+    let listen_backlog = config.http_listen_backlog();
+    let somaxconn = artifact_keeper_backend::api::serve::read_somaxconn();
+    let listener = artifact_keeper_backend::api::serve::bind_listener(addr, listen_backlog).await?;
+    tracing::info!(
+        requested = ?listen_backlog,
+        somaxconn = ?somaxconn,
+        effective = ?artifact_keeper_backend::api::serve::effective_listen_backlog(
+            listen_backlog,
+            somaxconn
+        ),
+        "HTTP listener accept backlog (HTTP_LISTEN_BACKLOG; unset = OS maximum)"
+    );
+    if let (Some(requested), Some(cap)) = (listen_backlog, somaxconn) {
+        if requested > cap {
+            tracing::warn!(
+                "HTTP_LISTEN_BACKLOG={requested} exceeds net.core.somaxconn={cap}; the kernel \
+                 caps the accept queue at {cap}. Raise the sysctl to use the larger value."
+            );
+        }
+    }
     // Install `ConnectInfo<SocketAddr>` so the TCP peer address is available
     // in request extensions. Without it, `extract_client_ip_addr` never sees
     // a peer and the per-IP rate-limit key degenerates to the constant
@@ -1411,9 +1473,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // injecting `ConnectInfo` fails here at startup. Gated to the serve path
     // so unit tests that build the Router directly never trip it.
     assert_connect_info_wired(app.clone()).await;
-    axum::serve(listener, connect_info_make_service(app))
-        .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
-        .await?;
+    //
+    // Served through `api::serve` rather than `axum::serve` so slow clients
+    // are bounded by HTTP_HEADER_READ_TIMEOUT_SECS (#4665): axum 0.7 sets no
+    // hyper timer, so a client trickling its request head held the socket
+    // indefinitely.
+    artifact_keeper_backend::api::serve::serve(
+        listener,
+        connect_info_make_service(app),
+        config.http_header_read_timeout(),
+        async move { http_shutdown_token.cancelled().await },
+    )
+    .await?;
 
     tracing::info!("HTTP server shut down");
 
@@ -1421,7 +1492,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 }
 
 /// The single source of truth for installing `ConnectInfo<SocketAddr>` on the
-/// HTTP serve path (#2023). Both the real `axum::serve` call and the boot-time
+/// HTTP serve path (#2023). Both the real `api::serve::serve` call and the boot-time
 /// guard route through this adapter, so the guard validates exactly the wiring
 /// that is served — reverting it (e.g. to a plain `into_make_service()`) is a
 /// one-line change here that the guard then catches at startup.
@@ -1548,6 +1619,29 @@ fn main() -> Result<()> {
 ///
 /// Creates the plugin registry, loads active plugins from the database,
 /// and returns both the registry and the plugin service.
+async fn initialize_wasm_plugins_if_enabled(
+    config: &Config,
+    db_pool: sqlx::PgPool,
+    plugins_dir: PathBuf,
+) -> Result<Option<(Arc<PluginRegistry>, Arc<WasmPluginService>)>> {
+    if !config.plugins_enabled {
+        tracing::info!(
+            event = "plugins_disabled_by_operator",
+            "WASM plugin runtime disabled by operator"
+        );
+        return Ok(None);
+    }
+
+    initialize_wasm_plugins(
+        db_pool,
+        plugins_dir,
+        config.plugins_require_signed,
+        config.plugins_trusted_pubkey.clone(),
+    )
+    .await
+    .map(Some)
+}
+
 async fn initialize_wasm_plugins(
     db_pool: sqlx::PgPool,
     plugins_dir: PathBuf,
@@ -1837,6 +1931,20 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a secret for a path where a broken `<NAME>_FILE` must not take the
+/// process down (#4142): log the error — naming the variable and the path,
+/// never the contents — and treat the secret as absent, exactly as if the
+/// variable were unset.
+fn env_secret_or_log(name: &str, on_error: &str) -> Option<String> {
+    match artifact_keeper_backend::config::secret_or_env(name) {
+        Ok(secret) => secret,
+        Err(e) => {
+            tracing::error!(error = %e, "{name}_FILE is set but unusable; {on_error}");
+            None
+        }
+    }
+}
+
 /// Build a CreateOidcConfigRequest from OIDC_* environment variables.
 /// Returns None if any of the three required env vars are missing or empty.
 ///
@@ -1854,7 +1962,7 @@ fn build_oidc_bootstrap_request(
         name: std::env::var("OIDC_NAME").ok(),
         issuer: std::env::var("OIDC_ISSUER").ok(),
         client_id: std::env::var("OIDC_CLIENT_ID").ok(),
-        client_secret: std::env::var("OIDC_CLIENT_SECRET").ok(),
+        client_secret: env_secret_or_log("OIDC_CLIENT_SECRET", "not bootstrapping OIDC"),
         scopes: std::env::var("OIDC_SCOPES").ok(),
         groups_claim: std::env::var("OIDC_GROUPS_CLAIM").ok(),
         admin_group: std::env::var("OIDC_ADMIN_GROUP").ok(),
@@ -1936,7 +2044,7 @@ fn build_ldap_bootstrap_request(
         url: std::env::var("LDAP_URL").ok(),
         base_dn: std::env::var("LDAP_BASE_DN").ok(),
         bind_dn: std::env::var("LDAP_BIND_DN").ok(),
-        bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
+        bind_password: env_secret_or_log("LDAP_BIND_PASSWORD", "not bootstrapping LDAP"),
         user_filter: std::env::var("LDAP_USER_FILTER").ok(),
         username_attr: std::env::var("LDAP_USERNAME_ATTR").ok(),
         email_attr: std::env::var("LDAP_EMAIL_ATTR").ok(),
@@ -1978,6 +2086,13 @@ async fn provision_admin_user(
         );
         return Ok(false);
     }
+
+    // #4142: ADMIN_PASSWORD may also come from a mounted secret file
+    // (ADMIN_PASSWORD_FILE). Resolve it once so every read below sees the
+    // same value; a configured-but-unusable file aborts startup rather than
+    // silently degrading to a generated password.
+    let admin_password = artifact_keeper_backend::config::secret_or_env("ADMIN_PASSWORD")
+        .map_err(artifact_keeper_backend::error::AppError::Config)?;
 
     // #2803: a password preset by the deployment (env var, or a mounted
     // secret file) is consulted ONLY on the create branch below, so a restart
@@ -2058,16 +2173,47 @@ async fn provision_admin_user(
     // `external_id IS NOT NULL` routes that case to the create branch, whose
     // upsert is itself guarded against clobbering a federated row.
     //
+    // The row examined here is the built-in `admin` account and only that one
+    // (#4634). Everything that follows -- arming the setup gate, regenerating
+    // `admin.password`, rewriting the password hash -- is about that account
+    // (every write below is keyed on `username = 'admin'`, and the password
+    // file and the setup instructions name it). The lookup used to be
+    // `LIMIT 1` over EVERY local admin with no `ORDER BY`, so an unrelated
+    // admin created in the UI with a temporary password and not yet logged in
+    // could be the row returned: the gate armed on its flag and the real
+    // `admin`, with nothing pending, had its password replaced. Other admins
+    // with a pending change are still forced to rotate at their own login.
+    //
     // `is_active` is read alongside, NOT filtered on (#3723): filtering would
     // route a deactivated built-in admin to the create branch, whose upsert
     // overwrites its hash and re-arms the gate on every boot.
     let admin_row: Option<(bool, bool)> = sqlx::query_as(
         "SELECT must_change_password, is_active FROM users \
-         WHERE is_admin = true AND external_id IS NULL LIMIT 1",
+         WHERE username = 'admin' AND is_admin = true AND external_id IS NULL",
     )
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    // No built-in `admin`, but another local admin exists (the operator renamed
+    // or removed it): an admin account is already provisioned, so there is
+    // nothing to create, no password to regenerate and no gate to arm. This is
+    // the "an admin exists" half of the old lookup, kept as a plain existence
+    // check that cannot depend on row order.
+    if admin_row.is_none() {
+        let other_local_admin: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true AND external_id IS NULL)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        if other_local_admin {
+            tx.commit()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            return Ok(false);
+        }
+    }
 
     let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
 
@@ -2088,11 +2234,11 @@ async fn provision_admin_user(
         // It only seeds the admin on first boot, so editing it afterwards (a
         // quickstart user trying to "set" the password in .env) used to
         // change nothing and leave no trace of why the login kept failing.
-        admin_password_env_ignored(&mut tx, std::env::var("ADMIN_PASSWORD").ok()).await?;
+        admin_password_env_ignored(&mut tx, admin_password.clone()).await?;
 
         if !must_change && !demo_mode {
-            if let Ok(env_pw) = std::env::var("ADMIN_PASSWORD") {
-                if is_insecure_default_password(&env_pw) {
+            if let Some(env_pw) = admin_password.as_deref() {
+                if is_insecure_default_password(env_pw) {
                     tracing::warn!("ADMIN_PASSWORD matches a well-known default.");
                     sqlx::query(
                         "UPDATE users SET must_change_password = true WHERE username = 'admin'",
@@ -2203,7 +2349,7 @@ async fn provision_admin_user(
         must_change,
         preset_from,
     } = match decide_initial_admin_credential(
-        std::env::var("ADMIN_PASSWORD").ok(),
+        admin_password.clone(),
         preset_password,
         demo_mode,
         policy,
@@ -2314,7 +2460,7 @@ async fn provision_admin_user(
         // password came from ADMIN_PASSWORD but matched an insecure default,
         // it was already supplied by the operator and is presumably logged
         // elsewhere; we still force a change but don't re-emit it.
-        let echo = std::env::var("ADMIN_PASSWORD").ok().is_none();
+        let echo = admin_password.is_none();
         log_admin_setup_banner(&password_file, echo.then_some(password.as_str()));
         Ok(true)
     } else {
@@ -2819,10 +2965,9 @@ mod tests {
     /// creating tests outside it. Un-ignore with the fix in #3796.
     #[tokio::test]
     async fn provision_admin_user_does_not_arm_gate_for_inactive_admin_3723() {
-        // Runs on its own freshly-migrated database (#3796): the function's
-        // existing-admin lookup is `LIMIT 1` over every local admin, so the
-        // shared unit-test database, where hundreds of tests create admins,
-        // could never guarantee the precondition this test needs.
+        // Runs on its own freshly-migrated database (#3796): the shared
+        // unit-test database, where hundreds of tests create admins, could
+        // never guarantee the precondition this test needs.
         let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
             return;
         };
@@ -2836,9 +2981,8 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clear leftover");
-        // The lookup under test is `LIMIT 1` over every local admin, so any
-        // other local admin row (a leftover from an aborted run of another
-        // DB-backed test) would make its result arbitrary. Say so up front
+        // Any other local admin row (a leftover from an aborted run of another
+        // DB-backed test) would change which branch runs. Say so up front
         // rather than failing a later assertion for an unrelated reason.
         sqlx::query(
             "INSERT INTO users (username, email, password_hash, auth_provider, is_admin,                                 must_change_password, is_active)              VALUES ('admin', $1, 'seed-hash-3723', 'local', true, true, false)",
@@ -2912,6 +3056,85 @@ mod tests {
         );
         assert!(file_written, "the missing password file is regenerated");
         assert_ne!(hash_after, "seed-hash-3723");
+    }
+
+    /// #4634: an unrelated admin that still holds a temporary password must
+    /// not arm the setup gate or cause the built-in `admin`'s password to be
+    /// regenerated. The pending admin is inserted FIRST, so a sequential scan
+    /// (what the old `LIMIT 1` lookup did on a table this small) returns it
+    /// before `admin`.
+    #[tokio::test]
+    async fn provision_admin_user_ignores_other_admins_pending_change_4634() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = iso.pool.clone();
+        for (username, hash, must_change) in [
+            ("pending-4634", "seed-hash-pending", true),
+            ("admin", "seed-hash-admin", false),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (username, email, password_hash, auth_provider, is_admin, \
+                                    must_change_password) \
+                 VALUES ($1, $2, $3, 'local', true, $4)",
+            )
+            .bind(username)
+            .bind(format!("{username}@test.local"))
+            .bind(hash)
+            .bind(must_change)
+            .execute(&pool)
+            .await
+            .expect("seed admin");
+        }
+        async fn hash_of(pool: &sqlx::PgPool, username: &str) -> Option<String> {
+            sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_optional(pool)
+                .await
+                .expect("read hash")
+        }
+
+        let dir = std::env::temp_dir().join(format!("ak-provision-4634-{}", uuid::Uuid::new_v4()));
+        let password_file = dir.join("admin.password");
+        let policy = PasswordPolicyConfig::default();
+
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("provision_admin_user");
+        let admin_hash = hash_of(&pool, "admin").await;
+        let pending_hash = hash_of(&pool, "pending-4634").await;
+        let file_written = password_file.exists();
+
+        // No built-in `admin` at all (renamed or removed), another admin still
+        // pending: nothing is created, regenerated or armed either.
+        sqlx::query("DELETE FROM users WHERE username = 'admin'")
+            .execute(&pool)
+            .await
+            .expect("remove built-in admin");
+        let armed_without_builtin = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("provision_admin_user (no built-in admin)");
+        let recreated = hash_of(&pool, "admin").await;
+        let file_written_without_builtin = password_file.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !armed,
+            "another admin's pending change must not arm the gate"
+        );
+        assert_eq!(
+            admin_hash.as_deref(),
+            Some("seed-hash-admin"),
+            "the built-in admin's password must not be regenerated"
+        );
+        assert_eq!(pending_hash.as_deref(), Some("seed-hash-pending"));
+        assert!(!file_written, "no admin.password may be written");
+        assert!(
+            !armed_without_builtin,
+            "a missing built-in admin with another admin present arms nothing"
+        );
+        assert_eq!(recreated, None, "an existing admin means no new admin");
+        assert!(!file_written_without_builtin);
     }
 
     // -----------------------------------------------------------------
@@ -3573,6 +3796,42 @@ mod tests {
         hasher.update(embedded.as_bytes());
         let hash = hasher.finalize();
         assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_skip_runtime_directory_and_database_loading() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("must-not-be-created");
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake").unwrap();
+        let config = Config {
+            plugins_enabled: false,
+            ..Default::default()
+        };
+        let services = initialize_wasm_plugins_if_enabled(&config, pool, plugins_dir.clone())
+            .await
+            .expect("disabled plugins must not initialize runtime state");
+        assert!(services.is_none());
+        assert!(!plugins_dir.exists());
+    }
+
+    /// The default (`PLUGINS_ENABLED` unset) still builds the runtime: the
+    /// registry and service come back and the plugins directory is created,
+    /// exactly as before the gate existed (#4650).
+    #[tokio::test]
+    async fn enabled_plugins_initialize_runtime_and_create_directory() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        let config = Config::default();
+        assert!(config.plugins_enabled, "the runtime is on by default");
+        let services =
+            initialize_wasm_plugins_if_enabled(&config, iso.pool.clone(), plugins_dir.clone())
+                .await
+                .expect("enabled plugins initialize the runtime");
+        assert!(services.is_some());
+        assert!(plugins_dir.is_dir());
     }
 }
 // warm cache benchmark

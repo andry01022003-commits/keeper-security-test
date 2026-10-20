@@ -653,8 +653,46 @@ fn redact_proxy_path_for_diagnostics(path: &str) -> String {
 ///   but the client gets a retry-friendly status).
 /// * **Everything else** (timeouts, TLS errors, auth challenge parse
 ///   failures, body read errors) stays at `warn` because those genuinely
-///   warrant operator attention.
+///   warrant operator attention, except an upstream refusal of an anonymous
+///   request, which is a miss already logged at `info` (see
+///   [`proxy_fetch_failure_level`], #4526).
 fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
+    map_proxy_error_classified(repo_key, path, e, false)
+}
+
+/// The level of the generic "Proxy fetch failed" line for a proxy error that
+/// reached the 502 catch-all of [`map_proxy_error`] (#4526).
+///
+/// An upstream `401`/`403` to a request that carried NO credentials (an
+/// anonymous OCI Remote asking for an image that does not exist, which is how
+/// Docker Hub answers) is an expected miss: the client gets
+/// `MANIFEST_UNKNOWN`, and the refusal was already logged once at INFO where
+/// it was classified. It drops to DEBUG so a client pulling a missing image
+/// in a loop does not log one WARN per pull. `anonymous_refusal` is that
+/// classification for an upstream refusal of the plain request
+/// ([`crate::services::proxy_service::oci_registry_auth_error`] without
+/// credentials); a refusal of an anonymous bearer token carries it in the
+/// error itself. Upstream 5xx that are not folded into 503, transport
+/// failures and refusals of a credentialed request stay at WARN.
+fn proxy_fetch_failure_level(
+    e: &crate::error::AppError,
+    anonymous_refusal: bool,
+) -> tracing::Level {
+    if anonymous_refusal || crate::services::proxy_service::is_anonymous_token_refusal(e) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    }
+}
+
+/// [`map_proxy_error`] for a caller that already knows whether `e` is an
+/// upstream refusal of an anonymous request ([`proxy_fetch_failure_level`]).
+fn map_proxy_error_classified(
+    repo_key: &str,
+    path: &str,
+    e: crate::error::AppError,
+    anonymous_refusal: bool,
+) -> Response {
     let diagnostic_path = redact_proxy_path_for_diagnostics(path);
     match &e {
         crate::error::AppError::NotFound(_) => {
@@ -743,13 +781,42 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
             response.extensions_mut().insert(UpstreamAuthFailure);
             response
         }
-        _ => {
+        // #4759: a 502 that names its own cause (e.g. `UPSTREAM_SHORT_BODY`,
+        // an upstream body that ended before its `Content-Length`). The
+        // message was written for the client -- it names the repository and
+        // the byte counts, never the upstream URL -- so it is returned as the
+        // standard `{code, message}` error body instead of the opaque text
+        // below.
+        crate::error::AppError::CodedBadGateway { code, message } => {
             tracing::warn!(
                 repo_key = %repo_key,
                 path = %diagnostic_path,
+                code = %code,
                 "Proxy fetch failed: {}",
-                e
+                message
             );
+            (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({ "code": code, "message": message })),
+            )
+                .into_response()
+        }
+        _ => {
+            if proxy_fetch_failure_level(&e, anonymous_refusal) == tracing::Level::DEBUG {
+                tracing::debug!(
+                    repo_key = %repo_key,
+                    path = %diagnostic_path,
+                    "Proxy fetch failed (upstream refused an anonymous request): {}",
+                    e
+                );
+            } else {
+                tracing::warn!(
+                    repo_key = %repo_key,
+                    path = %diagnostic_path,
+                    "Proxy fetch failed: {}",
+                    e
+                );
+            }
             (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
         }
     }
@@ -942,6 +1009,7 @@ pub async fn proxy_fetch_capped_with_accept(
     // sends credentials is an upstream authentication failure like a
     // refusing token service (#4453), not an indeterminate miss. Without
     // credentials it stays a miss (see `oci_registry_auth_error`).
+    let mut anonymous_refusal = false;
     let error = if repo.format == RepositoryFormat::Docker
         && crate::services::proxy_service::upstream_request_auth_refusal(&error).is_some()
     {
@@ -953,6 +1021,7 @@ pub async fn proxy_fetch_capped_with_accept(
         // A refusal of an anonymous bearer token never gets here (#4527), so
         // for what does, configured credentials were sent to the upstream.
         let credentials_sent = proxy_service.has_upstream_credentials(repo_id).await;
+        anonymous_refusal = !credentials_sent;
         crate::services::proxy_service::oci_registry_auth_error(
             error,
             repo_id,
@@ -962,7 +1031,12 @@ pub async fn proxy_fetch_capped_with_accept(
     } else {
         error
     };
-    Err(map_proxy_error(repo_key, path, error))
+    Err(map_proxy_error_classified(
+        repo_key,
+        path,
+        error,
+        anonymous_refusal,
+    ))
 }
 
 /// As [`proxy_fetch_capped`], but also reports the upstream `Content-Encoding`
@@ -9415,6 +9489,57 @@ pub(crate) async fn gate_proxy_scan_serve(
     identity: ProxyScanIdentity,
     mode: ProxyScanMode,
 ) -> ProxyScanServeOutcome {
+    let outcome = decide_proxy_scan_serve(
+        state,
+        repo_id,
+        filename,
+        digest,
+        synthetic,
+        bytes,
+        action,
+        severity_gate,
+        identity,
+        mode,
+    )
+    .await;
+    record_proxy_scan_outcome(&outcome);
+    outcome
+}
+
+/// The `(verdict, action)` labels of `ak_proxy_scan_verdicts_total` for one
+/// gate outcome (#4676). A denial is told apart by its status: 403 is a
+/// vulnerable verdict blocked, anything else (423) an inconclusive scan
+/// locked under fail-closed.
+fn proxy_scan_outcome_labels(outcome: &ProxyScanServeOutcome) -> (&'static str, &'static str) {
+    match outcome {
+        ProxyScanServeOutcome::Serve(ProxyScanServed::Clean) => ("clean", "served"),
+        ProxyScanServeOutcome::Serve(ProxyScanServed::Pending) => ("pending", "served"),
+        ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded) => ("vulnerable", "recorded"),
+        ProxyScanServeOutcome::Deny(resp) if resp.status() == StatusCode::FORBIDDEN => {
+            ("vulnerable", "blocked")
+        }
+        ProxyScanServeOutcome::Deny(_) => ("inconclusive", "locked"),
+    }
+}
+
+fn record_proxy_scan_outcome(outcome: &ProxyScanServeOutcome) {
+    let (verdict, action) = proxy_scan_outcome_labels(outcome);
+    crate::services::metrics_service::record_proxy_scan_verdict(verdict, action);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_proxy_scan_serve(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+    synthetic: crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    identity: ProxyScanIdentity,
+    mode: ProxyScanMode,
+) -> ProxyScanServeOutcome {
     use crate::services::proxy_scan_service::{decide_serve, ProxyScanService, ServeDecision};
 
     let pss = ProxyScanService::new(state.db.clone());
@@ -9827,6 +9952,7 @@ async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
                 repo_id = %req.repo_id, file = %req.filename, format = F::LABEL,
                 "proxy object exceeds scan byte cap; fail-closed -> 423"
             );
+            crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "locked");
             Err(scan_pending_locked_response(req.filename))
         }
         InconclusiveOutcome::ServePending => {
@@ -9835,6 +9961,7 @@ async fn serve_oversized_proxy_file<F: ScannedProxyFile>(
                 "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
             );
             let mut resp = file.serve_unscanned_stream(state, req).await?;
+            crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "served");
             record_scanned_proxy_download(state, req).await;
             resp.headers_mut()
                 .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
@@ -11293,6 +11420,68 @@ mod tests {
             ),
             "inconclusive under fail-open must still serve loudly pending"
         );
+    }
+
+    /// #4676: every gate decision is counted in
+    /// `ak_proxy_scan_verdicts_total{verdict,action}`: here an inconclusive
+    /// scan locked under fail-closed and a first pull served pending under
+    /// fail-open.
+    #[test]
+    fn inline_gate_outcomes_are_counted_by_verdict_and_action_4676() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::metrics_service::capture_counters_async;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        let (ran, counted) = capture_counters_async(|| async {
+            let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+                return false;
+            };
+            run_gate(&fx.state, ProxyScanAction::FailClosed).await;
+            run_gate(&fx.state, ProxyScanAction::FailOpen).await;
+            fx.teardown().await;
+            true
+        });
+        if !ran {
+            return;
+        }
+        let get = |verdict: &str, action: &str| {
+            counted.get(
+                "ak_proxy_scan_verdicts_total",
+                &[("verdict", verdict), ("action", action)],
+            )
+        };
+        assert_eq!(get("inconclusive", "locked"), 1);
+        assert_eq!(get("pending", "served"), 1);
+        assert_eq!(counted.get("ak_proxy_scan_verdicts_total", &[]), 2);
+    }
+
+    /// #4676: the label mapping for every outcome the gate can return.
+    #[test]
+    fn proxy_scan_outcome_labels_cover_every_outcome_4676() {
+        let cases = [
+            (
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
+                ("clean", "served"),
+            ),
+            (
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Pending),
+                ("pending", "served"),
+            ),
+            (
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded),
+                ("vulnerable", "recorded"),
+            ),
+            (
+                ProxyScanServeOutcome::Deny(scan_blocked_response("f")),
+                ("vulnerable", "blocked"),
+            ),
+            (
+                ProxyScanServeOutcome::Deny(scan_pending_locked_response("f")),
+                ("inconclusive", "locked"),
+            ),
+        ];
+        for (outcome, labels) in cases {
+            assert_eq!(proxy_scan_outcome_labels(&outcome), labels);
+        }
     }
 
     /// ScanFailed arm: a CVE-authoritative scanner that hard-errors is
@@ -12928,6 +13117,98 @@ mod tests {
         assert!(!is_upstream_auth_failure(&resp));
     }
 
+    /// #4526: an upstream refusal of an ANONYMOUS request (a missing image on
+    /// an anonymous OCI Remote) is an expected miss and logs the generic
+    /// failure line at DEBUG; an upstream 502, a transport failure and a
+    /// refusal of a credentialed request stay at WARN.
+    #[test]
+    fn test_proxy_fetch_failure_level_quiets_anonymous_refusals_4526() {
+        use crate::error::AppError;
+        use tracing::Level;
+        let url = "https://registry-1.docker.io/v2/library/missing/manifests/latest";
+        // The shape `validate_upstream_status` gives an upstream 401.
+        let refused_401 = || {
+            AppError::BadGateway(format!(
+                "Upstream returned error status {}: {url}",
+                reqwest::StatusCode::UNAUTHORIZED
+            ))
+        };
+        let anonymous_token = AppError::BadGateway(format!(
+            "Upstream returned error status 401 Unauthorized for an anonymous bearer token: {url}"
+        ));
+        let upstream_502 = AppError::BadGateway(format!(
+            "Upstream returned error status {}: {url}",
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+
+        assert!(
+            crate::services::proxy_service::upstream_request_auth_refusal(&refused_401()).is_some()
+        );
+        assert_eq!(
+            proxy_fetch_failure_level(&refused_401(), true),
+            Level::DEBUG
+        );
+        assert_eq!(
+            proxy_fetch_failure_level(&anonymous_token, false),
+            Level::DEBUG
+        );
+        assert_eq!(
+            proxy_fetch_failure_level(&refused_401(), false),
+            Level::WARN
+        );
+        assert_eq!(proxy_fetch_failure_level(&upstream_502, false), Level::WARN);
+        assert_eq!(
+            proxy_fetch_failure_level(&AppError::Storage("connection reset".into()), false),
+            Level::WARN
+        );
+    }
+
+    /// #4526 regression: `map_proxy_error` must not log a WARN for an
+    /// upstream refusal of an anonymous bearer token, while the response is
+    /// still the 502 the OCI handlers turn into `MANIFEST_UNKNOWN`.
+    #[test]
+    fn test_map_proxy_error_does_not_warn_for_anonymous_refusal_4526() {
+        use crate::api::handlers::test_db_helpers::LogCapture;
+        let url = "https://registry-1.docker.io/v2/library/missing/manifests/latest";
+        // With a single registered dispatcher, tracing-core computes a new
+        // callsite's interest from the REGISTERING thread's default, so a
+        // sibling test reaching these lines first (no subscriber on its
+        // thread) would cache "never" for them. A second live dispatcher makes
+        // registration consult every one.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+        let capture = LogCapture::default();
+        let guard = capture.install(tracing::Level::DEBUG);
+        let anonymous = map_proxy_error(
+            "w6-dh-anon",
+            "v2/library/missing/manifests/latest",
+            crate::error::AppError::BadGateway(format!(
+                "Upstream returned error status 401 Unauthorized for an anonymous bearer token: {url}"
+            )),
+        );
+        let quiet = capture.text();
+        let transient = map_proxy_error(
+            "w6-dh-anon",
+            "v2/library/missing/manifests/latest",
+            crate::error::AppError::BadGateway(
+                "Upstream returned error status 502 Bad Gateway".into(),
+            ),
+        );
+        drop(guard);
+        let all = capture.text();
+        assert_eq!(anonymous.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(transient.status(), StatusCode::BAD_GATEWAY);
+        assert!(!quiet.contains("WARN"), "{quiet}");
+        assert!(
+            quiet.contains("DEBUG") && quiet.contains("Proxy fetch failed"),
+            "{quiet}"
+        );
+        let later = &all[quiet.len()..];
+        assert!(
+            later.contains("WARN") && later.contains("Proxy fetch failed"),
+            "{later}"
+        );
+    }
+
     #[test]
     fn test_map_proxy_error_marks_upstream_auth_failure_4453() {
         let resp = map_proxy_error(
@@ -12938,6 +13219,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(is_upstream_auth_failure(&resp));
         assert!(!is_member_policy_block_response(&resp));
+    }
+
+    #[tokio::test]
+    async fn test_map_proxy_error_returns_coded_bad_gateway_body_4759() {
+        let resp = map_proxy_error(
+            "generic-remote",
+            "f/empty.bin",
+            crate::error::AppError::CodedBadGateway {
+                code: "UPSTREAM_SHORT_BODY",
+                message: "upstream of repository 'generic-remote' promised 4096 bytes".into(),
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_upstream_auth_failure(&resp));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "UPSTREAM_SHORT_BODY");
+        assert_eq!(
+            json["message"],
+            "upstream of repository 'generic-remote' promised 4096 bytes"
+        );
     }
 
     // ── promotion_only direct-upload gate ───────────────────────────
@@ -15194,6 +15498,7 @@ mod tests {
                 setup_password_hint: None,
                 grpc_reflection_enabled: false,
                 swagger_enabled: false,
+                plugins_enabled: true,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 conda_attestation_require_verified: true,
@@ -15232,9 +15537,12 @@ mod tests {
                 database_acquire_timeout_secs: 30,
                 database_idle_timeout_secs: 600,
                 database_max_lifetime_secs: 1800,
+                database_tcp_keepalives: true,
                 auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
+                http_header_read_timeout_secs: 10,
+                http_listen_backlog: 0,
                 upload_progress_window_secs: 60,
                 upload_min_progress_bytes: 16 * 1024,
                 upload_max_in_flight_per_principal: 64,
@@ -15256,6 +15564,7 @@ mod tests {
                 rate_limit_exempt_service_accounts: false,
                 rate_limit_trusted_cidrs: Vec::new(),
                 rate_limit_trusted_proxy_cidrs: Vec::new(),
+                xff_trusted_for_authz: false,
                 account_lockout_threshold: 5,
                 account_lockout_duration_minutes: 30,
                 quarantine_enabled: false,

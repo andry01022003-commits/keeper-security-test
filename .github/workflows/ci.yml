@@ -2201,7 +2201,7 @@ jobs:
         id: download
         if: steps.mb.outputs.rust_changed == 'true'
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: lcov-shard-*
           path: coverage-shards
@@ -2330,7 +2330,7 @@ jobs:
       - name: Setup Node.js for jscpd
         if: ${{ !cancelled() && steps.mb.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: '20'
 
@@ -2625,9 +2625,9 @@ jobs:
     # run 35878583014) against 3.5-6.5 min on ak-e2e-runners the same day.
     # The docker daemon and the compose plugin ship with the hosted image;
     # the two steps below that wait for / install them are no-ops there.
-    # The in-cluster suites (e2e.yml, scheduled-tests.yml, mesh, cache-
-    # correctness, concurrency, the scheduled trivy scan) stay on
-    # ak-e2e-runners.
+    # The in-cluster suites (e2e.yml, cache-correctness, concurrency, the
+    # scheduled trivy scan) stay on ak-e2e-runners; scheduled-tests.yml's
+    # nightly smoke moved here too, onto a prebuilt image (#4723).
     runs-on: ubuntu-24.04
     # Depend on the required fast-CI gates as well as the image build so a
     # known-red Check Rust or unit-test run never launches smoke. Smoke only
@@ -2690,7 +2690,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Download backend image from build job
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: backend-image
           path: /tmp

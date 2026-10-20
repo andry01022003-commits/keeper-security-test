@@ -149,6 +149,78 @@ pub enum AuditAction {
     /// A repository admin set, changed or removed the package allowlist of a
     /// virtual conda channel (#4576). Appended at the END of the enum.
     RepositoryAllowlistChanged,
+
+    // Core privileged actions (#4710). Each records the acting principal, the
+    // target, and the before/after that matters; never a secret, token, key
+    // material or webhook secret value. Appended at the END of the enum.
+    /// An admin released an artifact (or a held proxy-cache entry) from
+    /// quarantine.
+    QuarantineReleased,
+    /// An admin rejected a quarantined artifact.
+    QuarantineRejected,
+    /// An admin approved a promotion request; the promotion was executed.
+    PromotionApprovalGranted,
+    /// An admin rejected a promotion request.
+    PromotionApprovalDenied,
+    /// An artifact was promoted from a staging repository to a release one.
+    ArtifactPromoted,
+    /// A promotion was refused by the quality gate, the promotion policy or a
+    /// promotion rule.
+    PromotionRefused,
+    /// A principal rejected an artifact in a staging repository.
+    PromotionRejected,
+    /// A fine-grained permission rule was created, updated or deleted.
+    PermissionRuleCreated,
+    PermissionRuleUpdated,
+    PermissionRuleDeleted,
+    /// An SSO (OIDC, LDAP or SAML) provider configuration changed.
+    SsoProviderCreated,
+    SsoProviderUpdated,
+    SsoProviderDeleted,
+    SsoProviderEnabled,
+    SsoProviderDisabled,
+    /// A signing key was rotated (a successor generated) or revoked.
+    SigningKeyRotated,
+    SigningKeyRevoked,
+    /// An outbound webhook was created, updated (enabled / disabled), deleted,
+    /// or had its signing secret rotated.
+    WebhookCreated,
+    WebhookUpdated,
+    WebhookDeleted,
+    WebhookSecretRotated,
+    /// A peer sync policy was created, updated (including enable / disable)
+    /// or deleted.
+    SyncPolicyCreated,
+    SyncPolicyUpdated,
+    SyncPolicyDeleted,
+
+    // Conda channel lifecycle (#4709). Appended at the END of the enum.
+    /// An administrator withdrew a hosted conda package
+    /// (`DELETE /conda/{key}/{subdir}/{file}`): permanent hold plus a CEP-6
+    /// channel notice.
+    CondaPackageWithdrawn,
+    /// A CEP-27 attestation uploaded for a package verified and was stored.
+    AttestationVerified,
+    /// A CEP-27 attestation uploaded for a package did not verify: refused,
+    /// or (under the explicit `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`
+    /// opt-out) stored with its failed verification record.
+    AttestationRejected,
+    /// A lockfile was ingested as a stored environment (new or replaced).
+    EnvironmentRegistered,
+    /// A stored environment was deleted.
+    EnvironmentDeleted,
+
+    // Detection gaps (#4677). Appended at the END of the enum.
+    /// A login (`POST /api/v1/auth/login`) or OCI credential exchange
+    /// (`/v2/token`) was refused 429 by a login rate limiter. Recorded at most
+    /// once per source IP per limiter window so a flood cannot turn the
+    /// limiter into an audit-table DoS.
+    LoginRateLimited,
+    /// An external scanner's findings were ingested
+    /// (`POST /api/v1/security/findings/external`): a new completed scan row
+    /// that every gate and the repository score read, including any `MAL-*`
+    /// finding classed `malicious`.
+    ExternalFindingsIngested,
 }
 
 impl AuditAction {
@@ -214,6 +286,37 @@ impl AuditAction {
             AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
             AuditAction::StorageReindexRun => "STORAGE_REINDEX_RUN",
             AuditAction::RepositoryAllowlistChanged => "REPOSITORY_ALLOWLIST_CHANGED",
+            AuditAction::QuarantineReleased => "QUARANTINE_RELEASED",
+            AuditAction::QuarantineRejected => "QUARANTINE_REJECTED",
+            AuditAction::PromotionApprovalGranted => "PROMOTION_APPROVAL_GRANTED",
+            AuditAction::PromotionApprovalDenied => "PROMOTION_APPROVAL_DENIED",
+            AuditAction::ArtifactPromoted => "ARTIFACT_PROMOTED",
+            AuditAction::PromotionRefused => "PROMOTION_REFUSED",
+            AuditAction::PromotionRejected => "PROMOTION_REJECTED",
+            AuditAction::PermissionRuleCreated => "PERMISSION_RULE_CREATED",
+            AuditAction::PermissionRuleUpdated => "PERMISSION_RULE_UPDATED",
+            AuditAction::PermissionRuleDeleted => "PERMISSION_RULE_DELETED",
+            AuditAction::SsoProviderCreated => "SSO_PROVIDER_CREATED",
+            AuditAction::SsoProviderUpdated => "SSO_PROVIDER_UPDATED",
+            AuditAction::SsoProviderDeleted => "SSO_PROVIDER_DELETED",
+            AuditAction::SsoProviderEnabled => "SSO_PROVIDER_ENABLED",
+            AuditAction::SsoProviderDisabled => "SSO_PROVIDER_DISABLED",
+            AuditAction::SigningKeyRotated => "SIGNING_KEY_ROTATED",
+            AuditAction::SigningKeyRevoked => "SIGNING_KEY_REVOKED",
+            AuditAction::WebhookCreated => "WEBHOOK_CREATED",
+            AuditAction::WebhookUpdated => "WEBHOOK_UPDATED",
+            AuditAction::WebhookDeleted => "WEBHOOK_DELETED",
+            AuditAction::WebhookSecretRotated => "WEBHOOK_SECRET_ROTATED",
+            AuditAction::SyncPolicyCreated => "SYNC_POLICY_CREATED",
+            AuditAction::SyncPolicyUpdated => "SYNC_POLICY_UPDATED",
+            AuditAction::SyncPolicyDeleted => "SYNC_POLICY_DELETED",
+            AuditAction::CondaPackageWithdrawn => "CONDA_PACKAGE_WITHDRAWN",
+            AuditAction::AttestationVerified => "ATTESTATION_VERIFIED",
+            AuditAction::AttestationRejected => "ATTESTATION_REJECTED",
+            AuditAction::EnvironmentRegistered => "ENVIRONMENT_REGISTERED",
+            AuditAction::EnvironmentDeleted => "ENVIRONMENT_DELETED",
+            AuditAction::LoginRateLimited => "LOGIN_RATE_LIMITED",
+            AuditAction::ExternalFindingsIngested => "EXTERNAL_FINDINGS_INGESTED",
         }
     }
 }
@@ -231,6 +334,15 @@ pub enum ResourceType {
     Setting,
     Plugin,
     ScanResult,
+    // #4710
+    PromotionApproval,
+    PermissionRule,
+    SsoProvider,
+    SigningKey,
+    Webhook,
+    SyncPolicy,
+    /// A stored environment (ingested lockfile graph, #4054 / #4709).
+    Environment,
 }
 
 impl ResourceType {
@@ -246,6 +358,13 @@ impl ResourceType {
             ResourceType::Setting => "setting",
             ResourceType::Plugin => "plugin",
             ResourceType::ScanResult => "scan_result",
+            ResourceType::PromotionApproval => "promotion_approval",
+            ResourceType::PermissionRule => "permission_rule",
+            ResourceType::SsoProvider => "sso_provider",
+            ResourceType::SigningKey => "signing_key",
+            ResourceType::Webhook => "webhook",
+            ResourceType::SyncPolicy => "sync_policy",
+            ResourceType::Environment => "environment",
         }
     }
 }
@@ -409,6 +528,15 @@ impl AuditEntry {
     /// previous behavior; jobs that emit several related events should group
     /// them under one explicit [`AuditEntry::correlation`] value per logical
     /// operation.
+    ///
+    /// The client IP likewise defaults to the in-flight request's VERIFIED
+    /// client IP (#4762), the address [`AuditEntry::with_request_client_ip`]
+    /// resolves (#3888/#4681): the TCP peer, or a forwarded address only
+    /// under `XFF_TRUSTED_FOR_AUTHZ` behind a trusted proxy. Every writer
+    /// that builds its entry while handling a request records the same
+    /// address, whether or not it opts in. Outside a request scope, or when
+    /// the address is not verified, it stays `None` (`NULL` in the row);
+    /// [`AuditEntry::ip`] still overrides it.
     pub fn new(action: AuditAction, resource_type: ResourceType) -> Self {
         Self {
             event_id: Uuid::new_v4(),
@@ -418,7 +546,7 @@ impl AuditEntry {
             resource_id: None,
             resource_name: None,
             details: None,
-            ip_address: None,
+            ip_address: crate::api::middleware::client_ip::current_verified_client_ip(),
             correlation_id: crate::api::middleware::tracing::current_correlation_id()
                 .map(crate::api::middleware::tracing::CorrelationId::into_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -426,6 +554,21 @@ impl AuditEntry {
             outcome_override: None,
             actor_id_override: None,
         }
+    }
+
+    /// Start an entry attributed to the authenticated request principal
+    /// (#4710): `user_id`, the actor display name, and the verified client IP
+    /// when one is in scope. The shared shape for admin-initiated state
+    /// changes, so every such emitter records its actor the same way.
+    pub fn for_principal(
+        action: AuditAction,
+        resource_type: ResourceType,
+        auth: &crate::api::middleware::auth::AuthExtension,
+    ) -> Self {
+        Self::new(action, resource_type)
+            .user(auth.user_id)
+            .actor_name(auth.username.clone())
+            .with_request_client_ip()
     }
 
     pub fn user(mut self, user_id: Uuid) -> Self {
@@ -489,17 +632,19 @@ impl AuditEntry {
         self
     }
 
-    /// Attach the in-flight request's client IP, resolved by
-    /// `client_ip_context_middleware` (#3888): the TCP peer, with
-    /// `X-Forwarded-For` believed only under the configured trusted-proxy
-    /// policy (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`). Outside a request scope —
-    /// background jobs, startup, detached tasks — or when the address could
-    /// not be resolved, the entry keeps `ip_address: NULL`: the audit row
-    /// records "unknown", never a sentinel. Authentication emitters call this
-    /// so login/logout/refresh events carry the address the credential was
-    /// presented from.
+    /// Attach the in-flight request's VERIFIED client IP, resolved by
+    /// `client_ip_context_middleware` (#3888): the kernel-verified TCP
+    /// peer, or an `X-Forwarded-For`-derived address ONLY under the
+    /// operator's `XFF_TRUSTED_FOR_AUTHZ` assertion. Outside a
+    /// request scope — background jobs, startup, detached tasks — or when
+    /// the address could not be verified (unresolvable, or behind a
+    /// trusted proxy without the assertion), the entry keeps
+    /// `ip_address: NULL`: the audit row records an honest "unknown",
+    /// never a sentinel and never an unverifiable attacker-supplied
+    /// address. Authentication emitters call this so login/logout/refresh
+    /// events carry the address the credential was presented from.
     pub fn with_request_client_ip(mut self) -> Self {
-        if let Some(ip) = crate::api::middleware::client_ip::current_client_ip() {
+        if let Some(ip) = crate::api::middleware::client_ip::current_verified_client_ip() {
             self.ip_address = Some(ip);
         }
         self
@@ -942,6 +1087,28 @@ impl AuditService {
     }
 }
 
+/// Top-level keys whose values differ between two JSON snapshots of the same
+/// object (#4710), sorted, ignoring the bookkeeping timestamps. Lets an
+/// `*_UPDATED` row say WHAT changed without copying whole configurations into
+/// the trail. Both snapshots must already be secret-free (API response
+/// shapes, which expose `has_secret`-style flags, never the secret).
+pub fn changed_fields(before: &serde_json::Value, after: &serde_json::Value) -> Vec<String> {
+    const IGNORED: [&str; 2] = ["created_at", "updated_at"];
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| !IGNORED.contains(&k.as_str()))
+        .filter(|k| before.get(*k) != after.get(*k))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 /// Fire-and-forget audit write for auth-event and token-lifecycle emitters
 /// (#1617 Phase 1: auth-event audit completeness).
 ///
@@ -1308,6 +1475,41 @@ mod tests {
         assert_eq!(AuditAction::PermissionDenied.as_str(), "PERMISSION_DENIED");
     }
 
+    #[test]
+    fn test_audit_action_as_str_conda_lifecycle() {
+        // #4709: conda withdraw, attestation outcomes, environment lifecycle.
+        assert_eq!(
+            AuditAction::CondaPackageWithdrawn.as_str(),
+            "CONDA_PACKAGE_WITHDRAWN"
+        );
+        assert_eq!(
+            AuditAction::AttestationVerified.as_str(),
+            "ATTESTATION_VERIFIED"
+        );
+        assert_eq!(
+            AuditAction::AttestationRejected.as_str(),
+            "ATTESTATION_REJECTED"
+        );
+        assert_eq!(
+            AuditAction::EnvironmentRegistered.as_str(),
+            "ENVIRONMENT_REGISTERED"
+        );
+        assert_eq!(
+            AuditAction::EnvironmentDeleted.as_str(),
+            "ENVIRONMENT_DELETED"
+        );
+    }
+
+    #[test]
+    fn test_audit_action_as_str_detection_gaps() {
+        // #4677: rate-limited logins and external findings ingest.
+        assert_eq!(AuditAction::LoginRateLimited.as_str(), "LOGIN_RATE_LIMITED");
+        assert_eq!(
+            AuditAction::ExternalFindingsIngested.as_str(),
+            "EXTERNAL_FINDINGS_INGESTED"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ResourceType::as_str
     // -----------------------------------------------------------------------
@@ -1324,6 +1526,178 @@ mod tests {
         assert_eq!(ResourceType::Setting.as_str(), "setting");
         assert_eq!(ResourceType::Plugin.as_str(), "plugin");
         assert_eq!(ResourceType::ScanResult.as_str(), "scan_result");
+        assert_eq!(
+            ResourceType::PromotionApproval.as_str(),
+            "promotion_approval"
+        );
+        assert_eq!(ResourceType::PermissionRule.as_str(), "permission_rule");
+        assert_eq!(ResourceType::SsoProvider.as_str(), "sso_provider");
+        assert_eq!(ResourceType::SigningKey.as_str(), "signing_key");
+        assert_eq!(ResourceType::Webhook.as_str(), "webhook");
+        assert_eq!(ResourceType::SyncPolicy.as_str(), "sync_policy");
+        assert_eq!(ResourceType::Environment.as_str(), "environment");
+    }
+
+    /// #4710: the core privileged-action vocabulary. The names are a published
+    /// contract (`docs/audit-events.md`, SIEM rules key on them), so pin every
+    /// one together with its export outcome.
+    #[test]
+    fn test_core_privileged_action_names_and_outcomes() {
+        use crate::services::audit_export::Outcome;
+        let cases = [
+            (
+                AuditAction::QuarantineReleased,
+                "QUARANTINE_RELEASED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::QuarantineRejected,
+                "QUARANTINE_REJECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PromotionApprovalGranted,
+                "PROMOTION_APPROVAL_GRANTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PromotionApprovalDenied,
+                "PROMOTION_APPROVAL_DENIED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::ArtifactPromoted,
+                "ARTIFACT_PROMOTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PromotionRefused,
+                "PROMOTION_REFUSED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::PromotionRejected,
+                "PROMOTION_REJECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PermissionRuleCreated,
+                "PERMISSION_RULE_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PermissionRuleUpdated,
+                "PERMISSION_RULE_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::PermissionRuleDeleted,
+                "PERMISSION_RULE_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderCreated,
+                "SSO_PROVIDER_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderUpdated,
+                "SSO_PROVIDER_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderDeleted,
+                "SSO_PROVIDER_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderEnabled,
+                "SSO_PROVIDER_ENABLED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SsoProviderDisabled,
+                "SSO_PROVIDER_DISABLED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SigningKeyRotated,
+                "SIGNING_KEY_ROTATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SigningKeyRevoked,
+                "SIGNING_KEY_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookCreated,
+                "WEBHOOK_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookUpdated,
+                "WEBHOOK_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookDeleted,
+                "WEBHOOK_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::WebhookSecretRotated,
+                "WEBHOOK_SECRET_ROTATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SyncPolicyCreated,
+                "SYNC_POLICY_CREATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SyncPolicyUpdated,
+                "SYNC_POLICY_UPDATED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SyncPolicyDeleted,
+                "SYNC_POLICY_DELETED",
+                Outcome::Success,
+            ),
+        ];
+        for (action, name, outcome) in cases {
+            assert_eq!(action.as_str(), name);
+            assert_eq!(action.outcome(), outcome, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_for_principal_records_actor() {
+        let auth = crate::api::handlers::test_db_helpers::make_auth(Uuid::new_v4(), "alice");
+        let entry =
+            AuditEntry::for_principal(AuditAction::WebhookCreated, ResourceType::Webhook, &auth);
+        assert_eq!(entry.user_id(), Some(auth.user_id));
+        assert_eq!(entry.actor_name_ref(), Some("alice"));
+        assert_eq!(entry.resource_type().as_str(), "webhook");
+    }
+
+    #[test]
+    fn test_changed_fields_lists_differing_keys_only() {
+        let before = serde_json::json!({
+            "name": "a", "is_enabled": true, "has_secret": true,
+            "updated_at": "t1", "created_at": "t0", "gone": 1
+        });
+        let after = serde_json::json!({
+            "name": "b", "is_enabled": true, "has_secret": true,
+            "updated_at": "t2", "created_at": "t0", "added": 2
+        });
+        assert_eq!(
+            changed_fields(&before, &after),
+            vec!["added", "gone", "name"]
+        );
+        assert!(changed_fields(&before, &before).is_empty());
+        assert!(changed_fields(&serde_json::json!(1), &after).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1591,6 +1965,64 @@ mod tests {
         let entry =
             AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip();
         assert!(entry.ip_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn with_request_client_ip_records_null_when_verified_ip_is_unknown() {
+        // A best-effort (XFF-derived, unverifiable) address with NO
+        // verified grade — the topology behind a trusted proxy without
+        // XFF_TRUSTED_FOR_AUTHZ — must NOT be attributed in the audit row:
+        // NULL is the honest record.
+        let best = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33));
+        let entry =
+            crate::api::middleware::client_ip::with_client_ip_context(Some(best), None, async {
+                AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+            })
+            .await;
+        assert_eq!(entry.ip_address, None);
+
+        // And the verified grade, when present, is the one attributed.
+        let verified = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
+        let entry = crate::api::middleware::client_ip::with_client_ip_context(
+            Some(best),
+            Some(verified),
+            async {
+                AuditEntry::new(AuditAction::Login, ResourceType::User).with_request_client_ip()
+            },
+        )
+        .await;
+        assert_eq!(entry.ip_address, Some(verified));
+    }
+
+    #[tokio::test]
+    async fn new_entry_defaults_to_the_verified_request_client_ip_4762() {
+        // #4762: a writer that never opts in still records the verified
+        // client IP of the request it runs in; only the verified grade is
+        // used, and an explicit `.ip(..)` still wins.
+        use crate::api::middleware::client_ip::with_client_ip_context;
+        let best = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33));
+        let verified = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 62));
+        let entry = with_client_ip_context(Some(best), Some(verified), async {
+            AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(verified));
+
+        let entry = with_client_ip_context(Some(best), None, async {
+            AuditEntry::new(AuditAction::UserCreated, ResourceType::User)
+        })
+        .await;
+        assert_eq!(
+            entry.ip_address, None,
+            "an unverified address is never recorded"
+        );
+
+        let explicit = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let entry = with_client_ip_context(Some(best), Some(verified), async {
+            AuditEntry::new(AuditAction::UserCreated, ResourceType::User).ip(explicit)
+        })
+        .await;
+        assert_eq!(entry.ip_address, Some(explicit));
     }
 
     #[test]
