@@ -231,23 +231,6 @@ pub(crate) fn validate_create_token_exclusivity(
     Ok(())
 }
 
-/// The repository scope one token actually presents: its explicit ids, or its
-/// selector resolved the way authentication resolves it, or unrestricted
-/// (#4215). Selector resolution touches the database, so this returns the
-/// inputs and [`resolve_scopes`] does the work.
-fn resolved_token_scope(
-    _state: &SharedState,
-    explicit: Vec<Uuid>,
-    selector: Option<serde_json::Value>,
-    repository_restricted: bool,
-) -> PendingScope {
-    PendingScope {
-        explicit,
-        selector,
-        repository_restricted,
-    }
-}
-
 /// A token scope that may still need the selector service to resolve it.
 struct PendingScope {
     explicit: Vec<Uuid>,
@@ -594,12 +577,11 @@ pub async fn list_tokens(
             let selector = selector_map.get(&t.id).and_then(|s| s.clone());
             (
                 t.id,
-                resolved_token_scope(
-                    &state,
+                PendingScope {
                     explicit,
                     selector,
-                    restrictions.get(&t.id).copied().unwrap_or(false),
-                ),
+                    repository_restricted: restrictions.get(&t.id).copied().unwrap_or(false),
+                },
             )
         })
         .collect();
@@ -821,6 +803,11 @@ pub async fn preview_repo_selector(
     // the entitlement half is unknowable, so the preview stays as it was.
     let unreachable = match service_account_id {
         Some(account_id) => {
+            // Only a service account's grants are analysed here, like the
+            // token list and the per-token analysis.
+            ServiceAccountService::new(state.db.clone())
+                .get(account_id)
+                .await?;
             token_scope_service::analyze(&state.db, Some(account_id), Some(matched_ids)).await?
         }
         None => Vec::new(),
@@ -855,6 +842,7 @@ pub async fn token_scope_analysis(
     Path((id, token_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<TokenScopeAnalysisResponse>> {
     auth.require_admin()?;
+    ServiceAccountService::new(state.db.clone()).get(id).await?;
 
     // The token must belong to the account in the path, or one account's id
     // would answer for another's token.
@@ -1057,6 +1045,56 @@ mod tests {
                 .iter()
                 .any(|t| t["id"] == token_id.to_string() && t["scope_error"] == error));
         }
+        // Selector preview on behalf of an account: a virtual the account may
+        // read, with one member it holds no grant on, reports that member.
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&f.pool, "virtual", "nuget").await;
+        let (member_id, member_key, member_dir) = tdh::create_repo(&f.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&f.pool, virtual_id, member_id, 1).await;
+        tdh::grant_repo_access(&f.pool, virtual_id, f.user_id).await;
+        let (person_id, _) = tdh::create_user(&f.pool).await;
+        let preview = |account: Uuid| {
+            tdh::send(
+                super::router()
+                    .with_state(f.state.clone())
+                    .layer(axum::Extension(actor.clone())),
+                tdh::post(
+                    "/repo-selector/preview".to_string(),
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({
+                        "repo_selector": {"match_repos": [virtual_id]},
+                        "service_account_id": account,
+                    }))
+                    .unwrap()
+                    .into(),
+                ),
+            )
+        };
+        let (status, body) = preview(f.user_id).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["unreachable"],
+            serde_json::json!([{
+                "virtual_repo_key": virtual_key,
+                "members": [{"repo_key": member_key, "reason": "no_grant"}],
+            }])
+        );
+        // Only a service account's entitlements are analysed.
+        let (status, _) = preview(person_id).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(person_id)
+            .execute(&f.pool)
+            .await;
+        tdh::cleanup_member_repo(&f.pool, member_id, &member_dir).await;
+        tdh::cleanup_member_repo(&f.pool, virtual_id, &virtual_dir).await;
+
         let (status, _) = tdh::send(
             super::router()
                 .with_state(f.state.clone())
