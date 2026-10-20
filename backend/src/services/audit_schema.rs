@@ -295,6 +295,7 @@ mod tests {
                     project_change: None,
                     allow_public_with_upstream_credentials: None,
                     upstream_auth_change: None,
+                    age_gate_change: None,
                 }),
         ];
         for entry in &entries {
@@ -380,6 +381,13 @@ mod tests {
                 }),
                 allow_public_with_upstream_credentials: None,
                 upstream_auth_change: None,
+                age_gate_change: Some(details::AgeGateChangeDetails {
+                    previous_enabled: true,
+                    previous_min_age_days: 30,
+                    previous_mode: "first_seen".into(),
+                    actor_tier: "repository_admin".into(),
+                    relaxed: true,
+                }),
             })
             .unwrap(),
         );

@@ -115,6 +115,7 @@ impl AuditAction {
             | AuditAction::ArtifactDeleted
             | AuditAction::ArtifactMetadataUpdated
             | AuditAction::ArtifactRestored
+            | AuditAction::ArtifactPurged
             | AuditAction::BackupStarted
             | AuditAction::BackupCompleted
             | AuditAction::RestoreStarted
@@ -141,6 +142,8 @@ impl AuditAction {
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
             | AuditAction::AgeGateReopened
+            | AuditAction::AgeGateLockSet
+            | AuditAction::AgeGateLockReleased
             | AuditAction::CurationSyncTriggered
             | AuditAction::CurationVersionCreated
             | AuditAction::CurationVersionPublished
@@ -164,6 +167,7 @@ impl AuditAction {
             | AuditAction::SsoProviderDisabled
             | AuditAction::SigningKeyRotated
             | AuditAction::SigningKeyRevoked
+            | AuditAction::SigningKeyTrustAttested
             | AuditAction::WebhookCreated
             | AuditAction::WebhookUpdated
             | AuditAction::WebhookDeleted
@@ -466,6 +470,12 @@ pub mod details {
         /// changed; the credential values themselves are never recorded.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub upstream_auth_change: Option<UpstreamAuthChangeAudit>,
+        /// What an age-gate policy change REPLACED and who made it (#4238).
+        /// Present only on the age-gate policy endpoint: since repository
+        /// admins can change the gate, a weakening has to be visible in the
+        /// trail, not just the values it ended at.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub age_gate_change: Option<AgeGateChangeDetails>,
     }
 
     /// Before/after of a repository's upstream URL, with userinfo stripped
@@ -513,6 +523,19 @@ pub mod details {
         pub severity_threshold: String,
         /// `fail_open` / `fail_closed` / `record_only`.
         pub proxy_scan_action: String,
+    }
+
+    /// The prior policy and the actor's tier for one age-gate policy change.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct AgeGateChangeDetails {
+        pub previous_enabled: bool,
+        pub previous_min_age_days: i32,
+        pub previous_mode: String,
+        /// `instance_admin` or `repository_admin`.
+        pub actor_tier: String,
+        /// The change made the gate less strict: disabled it, lowered the
+        /// minimum age, or switched the age source.
+        pub relaxed: bool,
     }
 
     /// `ROLE_ASSIGNED` / `ROLE_REVOKED` / `REPOSITORY_PERMISSION_CHANGED`.
@@ -1292,6 +1315,7 @@ mod tests {
             project_change: None,
             allow_public_with_upstream_credentials: None,
             upstream_auth_change: None,
+            age_gate_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

@@ -117,7 +117,8 @@ the remaining actions is an incremental follow-up.
 
 | Actions | `details` shape |
 | --- | --- |
-| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026) |
+| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`) |
+| `AGE_GATE_LOCK_SET` / `AGE_GATE_LOCK_RELEASED` | `lock` (`policy` / `review`), `actor_tier`, `repository_key`, and the policy (`age_gate_*`) or review (`review_id`, `package`, `version`, `status`) at that moment. A release is always a relaxation. |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
 | `LOGIN_FAILED`, `PERMISSION_DENIED`, `LOGIN_RATE_LIMITED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
@@ -150,6 +151,7 @@ such as `credential_replaced` or `secret_rotated`.
 | `SSO_PROVIDER_ENABLED` / `_DISABLED` | `sso_provider` | `provider_type`, `name`, `is_enabled` |
 | `SIGNING_KEY_ROTATED` | `signing_key` (the old key) | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id`, `new_key_id`, `new_fingerprint` |
 | `SIGNING_KEY_REVOKED` | `signing_key` | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id` |
+| `SIGNING_KEY_TRUST_ATTESTED` | `signing_key` | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id`, `issuer_fingerprint`, `issuer_name`, `verification_status` |
 | `WEBHOOK_CREATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `signing_mode`, `signed` |
 | `WEBHOOK_UPDATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `is_enabled` (written by enable and disable) |
 | `WEBHOOK_DELETED` | `webhook` | `name`, `url`, `events`, `repository_id` |

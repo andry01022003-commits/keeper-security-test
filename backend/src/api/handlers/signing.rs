@@ -14,13 +14,16 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryFormat;
-use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
+use crate::models::signing_key::{
+    RepositorySigningConfig, SigningKeyPublic, SigningKeyTrustAttestation,
+};
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::repository_service::RepositoryService;
 use crate::services::signing_service::{
-    normalize_key_type, validate_key_spec, CreateKeyRequest, SigningService,
+    normalize_key_type, validate_key_spec, CreateKeyRequest, SigningKeyTrustChallenge,
+    SigningService, VerifyTrustAttestationRequest,
 };
 
 /// Create signing key management routes.
@@ -32,6 +35,18 @@ pub fn router() -> Router<SharedState> {
         .route("/keys/:key_id/revoke", post(revoke_key))
         .route("/keys/:key_id/rotate", post(rotate_key))
         .route("/keys/:key_id/public", get(get_public_key))
+        .route(
+            "/keys/:key_id/trust-attestation",
+            get(get_key_trust_attestation),
+        )
+        .route(
+            "/keys/:key_id/trust-attestation/challenge",
+            get(get_key_trust_attestation_challenge),
+        )
+        .route(
+            "/keys/:key_id/trust-attestation/verify",
+            post(verify_key_trust_attestation),
+        )
         // Repository signing config
         .route(
             "/repositories/:repo_id/config",
@@ -92,6 +107,23 @@ pub struct SigningConfigResponse {
     pub sign_packages: bool,
     pub require_signatures: bool,
     pub key: Option<SigningKeyPublic>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrustAttestationChallengeResponse {
+    pub signing_key_id: Uuid,
+    pub payload: String,
+    pub key_public_key_armored: String,
+    pub key_fingerprint: Option<String>,
+    pub key_type: String,
+    pub algorithm: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VerifyTrustAttestationPayload {
+    pub issuer_name: Option<String>,
+    pub issuer_public_key_armored: String,
+    pub signature_armored: String,
 }
 
 // --- Handlers ---
@@ -413,6 +445,120 @@ async fn get_public_key(
     Ok(key.public_key_pem)
 }
 
+/// Get the stored trust attestation for a signing key, if any.
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}/trust-attestation",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Stored trust attestation, or null", body = Option<SigningKeyTrustAttestation>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_key_trust_attestation(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<Option<SigningKeyTrustAttestation>>> {
+    let svc = signing_service(&state);
+    let _ = svc.get_key(key_id).await?;
+    let attestation = svc.get_trust_attestation(key_id).await?;
+    Ok(Json(attestation))
+}
+
+/// Challenge payload an external issuer key must sign.
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}/trust-attestation/challenge",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Attestation challenge", body = TrustAttestationChallengeResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_key_trust_attestation_challenge(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<TrustAttestationChallengeResponse>> {
+    let svc = signing_service(&state);
+    let challenge: SigningKeyTrustChallenge = svc.get_trust_attestation_challenge(key_id).await?;
+    Ok(Json(TrustAttestationChallengeResponse {
+        signing_key_id: challenge.signing_key_id,
+        payload: challenge.payload,
+        key_public_key_armored: challenge.key_public_key_armored,
+        key_fingerprint: challenge.key_fingerprint,
+        key_type: challenge.key_type,
+        algorithm: challenge.algorithm,
+    }))
+}
+
+/// Verify a detached OpenPGP signature over the challenge payload and store it.
+///
+/// Success means the signature is cryptographically valid (`signature_valid`),
+/// not that the issuer is a pinned trust anchor (#2462).
+#[utoipa::path(
+    post,
+    path = "/keys/{key_id}/trust-attestation/verify",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    request_body = VerifyTrustAttestationPayload,
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Stored attestation", body = SigningKeyTrustAttestation),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "A different issuer already attested this key", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn verify_key_trust_attestation(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(key_id): Path<Uuid>,
+    Json(payload): Json<VerifyTrustAttestationPayload>,
+) -> Result<Json<SigningKeyTrustAttestation>> {
+    require_signing_admin(&auth)?;
+    let svc = signing_service(&state);
+    let key = svc.get_key(key_id).await?;
+    let attestation = svc
+        .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
+            signing_key_id: key_id,
+            issuer_name: payload.issuer_name,
+            issuer_public_key_armored: payload.issuer_public_key_armored,
+            signature_armored: payload.signature_armored,
+            created_by: Some(auth.user_id),
+        })
+        .await?;
+    audit_signing_key(
+        &state,
+        &auth,
+        AuditAction::SigningKeyTrustAttested,
+        &key,
+        serde_json::json!({
+            "issuer_fingerprint": attestation.issuer_fingerprint,
+            "issuer_name": attestation.issuer_name,
+            "verification_status": attestation.verification_status,
+        }),
+    )
+    .await;
+    Ok(Json(attestation))
+}
+
 /// Get signing configuration for a repository.
 #[utoipa::path(
     get,
@@ -691,6 +837,9 @@ fn signing_config_fields(
         revoke_key,
         rotate_key,
         get_public_key,
+        get_key_trust_attestation,
+        get_key_trust_attestation_challenge,
+        verify_key_trust_attestation,
         get_repo_signing_config,
         update_repo_signing_config,
         get_repo_public_key,
@@ -702,6 +851,9 @@ fn signing_config_fields(
         UpdateSigningConfigPayload,
         KeyListResponse,
         SigningConfigResponse,
+        TrustAttestationChallengeResponse,
+        VerifyTrustAttestationPayload,
+        SigningKeyTrustAttestation,
         SignArtifactResponse,
     ))
 )]
@@ -931,6 +1083,7 @@ mod tests {
             "rotate_key",
             "update_repo_signing_config",
             "sign_artifact",
+            "verify_key_trust_attestation",
         ] {
             assert!(
                 signing_handler_body(name).contains("require_signing_admin"),
@@ -1638,6 +1791,108 @@ mod tests {
                 "a signing-key audit row must not carry key material: {text}"
             );
         }
+    }
+
+    /// #4282: verifying a trust attestation through the handler stores it,
+    /// writes one SIGNING_KEY_TRUST_ATTESTED audit row naming the admin and
+    /// the issuer fingerprint, and refuses an over-long issuer name with a
+    /// validation error instead of a database error.
+    #[tokio::test]
+    async fn test_verify_trust_attestation_is_audited() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let mut admin = admin_jwt();
+        admin.user_id = user_id;
+        let sdir = std::env::temp_dir().join(format!("sk4282-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let svc = signing_service(&state);
+        let mk = |name: &str| CreateKeyRequest {
+            repository_id: Some(repo_id),
+            name: format!("{name}-{}", &Uuid::new_v4().to_string()[..8]),
+            key_type: "gpg".to_string(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: Some("AK 4282".to_string()),
+            uid_email: None,
+            created_by: None,
+        };
+        let target = svc
+            .create_key(mk("k4282-target"))
+            .await
+            .expect("target key");
+        let issuer = svc
+            .create_key(mk("k4282-issuer"))
+            .await
+            .expect("issuer key");
+        let issuer_full: crate::models::signing_key::SigningKey =
+            sqlx::query_as("SELECT * FROM signing_keys WHERE id = $1")
+                .bind(issuer.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load issuer key");
+        let challenge = svc
+            .get_trust_attestation_challenge(target.id)
+            .await
+            .expect("challenge");
+        let signature = svc
+            .sign_openpgp_detached_with_key(&issuer_full, challenge.payload.as_bytes())
+            .await
+            .expect("issuer signature");
+
+        let too_long = verify_key_trust_attestation(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path(target.id),
+            Json(VerifyTrustAttestationPayload {
+                issuer_name: Some("x".repeat(256)),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature.clone(),
+            }),
+        )
+        .await;
+        let stored = verify_key_trust_attestation(
+            State(state.clone()),
+            Extension(admin),
+            Path(target.id),
+            Json(VerifyTrustAttestationPayload {
+                issuer_name: Some("offline-root".to_string()),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature,
+            }),
+        )
+        .await;
+        let row = tdh::audit_row_eventually(&pool, target.id, "SIGNING_KEY_TRUST_ATTESTED").await;
+
+        for sql in [
+            "DELETE FROM repository_signing_config WHERE repository_id = $1",
+            "DELETE FROM signing_keys WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(repo_id).execute(&pool).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            matches!(too_long, Err(AppError::Validation(_))),
+            "an over-long issuer_name is a validation error: {too_long:?}"
+        );
+        let stored = stored.expect("verify attestation").0;
+        assert_eq!(stored.verification_status, "signature_valid");
+        assert_eq!(row.user_id, Some(user_id));
+        assert_eq!(row.resource_type, "signing_key");
+        assert_eq!(row.details["key_id"], target.id.to_string());
+        assert_eq!(
+            row.details["issuer_fingerprint"],
+            stored.issuer_fingerprint.as_str()
+        );
+        assert_eq!(row.details["issuer_name"], "offline-root");
+        assert!(
+            !row.details.to_string().contains("BEGIN"),
+            "the attestation audit row must not carry key material"
+        );
     }
 
     fn json_or_null(value: &Option<String>) -> serde_json::Value {

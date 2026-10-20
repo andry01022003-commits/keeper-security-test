@@ -41,6 +41,8 @@ pub enum AuditAction {
     ArtifactMetadataUpdated,
     /// A soft-deleted artifact was restored from the trash (#2072).
     ArtifactRestored,
+    /// A trashed artifact was permanently deleted before storage GC reached it.
+    ArtifactPurged,
 
     // System operations
     BackupStarted,
@@ -96,6 +98,12 @@ pub enum AuditAction {
     AgeGateApproved,
     AgeGateRejected,
     AgeGateReopened,
+    /// An instance administrator's decision locked an age-gate policy or
+    /// review against relaxation by the repository's own admins (#4238).
+    AgeGateLockSet,
+    /// An instance administrator released such a lock: handed a policy back
+    /// to the repository's admins, or reopened a review (#4238).
+    AgeGateLockReleased,
 
     // Authorization decisions (#2366 functional audit log). Recorded when an
     // authenticated principal is refused a privileged operation (e.g. a
@@ -182,6 +190,9 @@ pub enum AuditAction {
     /// A signing key was rotated (a successor generated) or revoked.
     SigningKeyRotated,
     SigningKeyRevoked,
+    /// An out-of-band issuer signature over a signing key was verified and
+    /// recorded (#4282). A cryptographic check, not a trust-anchor decision.
+    SigningKeyTrustAttested,
     /// An outbound webhook was created, updated (enabled / disabled), deleted,
     /// or had its signing secret rotated.
     WebhookCreated,
@@ -247,6 +258,7 @@ impl AuditAction {
             AuditAction::ArtifactDeleted => "ARTIFACT_DELETED",
             AuditAction::ArtifactMetadataUpdated => "ARTIFACT_METADATA_UPDATED",
             AuditAction::ArtifactRestored => "ARTIFACT_RESTORED",
+            AuditAction::ArtifactPurged => "ARTIFACT_PURGED",
             AuditAction::BackupStarted => "BACKUP_STARTED",
             AuditAction::BackupCompleted => "BACKUP_COMPLETED",
             AuditAction::BackupFailed => "BACKUP_FAILED",
@@ -277,6 +289,8 @@ impl AuditAction {
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
             AuditAction::AgeGateReopened => "AGE_GATE_REOPENED",
+            AuditAction::AgeGateLockSet => "AGE_GATE_LOCK_SET",
+            AuditAction::AgeGateLockReleased => "AGE_GATE_LOCK_RELEASED",
             AuditAction::PermissionDenied => "PERMISSION_DENIED",
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
             AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",
@@ -303,6 +317,7 @@ impl AuditAction {
             AuditAction::SsoProviderDisabled => "SSO_PROVIDER_DISABLED",
             AuditAction::SigningKeyRotated => "SIGNING_KEY_ROTATED",
             AuditAction::SigningKeyRevoked => "SIGNING_KEY_REVOKED",
+            AuditAction::SigningKeyTrustAttested => "SIGNING_KEY_TRUST_ATTESTED",
             AuditAction::WebhookCreated => "WEBHOOK_CREATED",
             AuditAction::WebhookUpdated => "WEBHOOK_UPDATED",
             AuditAction::WebhookDeleted => "WEBHOOK_DELETED",
@@ -1419,6 +1434,7 @@ mod tests {
             "ARTIFACT_METADATA_UPDATED"
         );
         assert_eq!(AuditAction::ArtifactRestored.as_str(), "ARTIFACT_RESTORED");
+        assert_eq!(AuditAction::ArtifactPurged.as_str(), "ARTIFACT_PURGED");
     }
 
     #[test]
@@ -1628,6 +1644,11 @@ mod tests {
             (
                 AuditAction::SigningKeyRevoked,
                 "SIGNING_KEY_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SigningKeyTrustAttested,
+                "SIGNING_KEY_TRUST_ATTESTED",
                 Outcome::Success,
             ),
             (
