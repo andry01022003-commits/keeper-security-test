@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::Result;
+use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
@@ -169,9 +170,33 @@ pub async fn purge_trashed_artifact(
     Path(id): Path<Uuid>,
 ) -> Result<Json<PurgedArtifact>> {
     auth.require_admin()?;
+    require_purge_in_token_scope(&state, &auth, id).await?;
     let purged = trash_service(&state).purge(id).await?;
     audit_purge(&state, &auth, &purged).await;
     Ok(Json(purged))
+}
+
+/// A repository-restricted admin token stays restricted (#4225): it may only
+/// purge artifacts of repositories in its allow-list. Out-of-scope ids read as
+/// 404, exactly like ids that do not exist, so the token learns nothing about
+/// other repositories. Unrestricted principals skip the lookup.
+async fn require_purge_in_token_scope(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+) -> Result<()> {
+    if matches!(auth.access_scope(), AccessScope::Admin) {
+        return Ok(());
+    }
+    let repository_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    match repository_id {
+        Some(repo_id) if auth.can_access_repo(repo_id) => Ok(()),
+        _ => Err(AppError::NotFound("Artifact not found".to_string())),
+    }
 }
 
 /// Record an `ARTIFACT_PURGED` audit entry.
@@ -262,5 +287,39 @@ mod tests {
         assert_eq!(purged["id"], id.to_string());
         assert_eq!(purged["storage_reclaimed"], true);
         assert_eq!(again, StatusCode::NOT_FOUND);
+    }
+
+    /// An admin token restricted to other repositories cannot purge this
+    /// repository's trash (404, nothing deleted); one restricted to it can.
+    #[tokio::test]
+    async fn purge_endpoint_honours_a_repository_restricted_admin_token() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = format!("generic/api-scoped-{}", Uuid::new_v4().simple());
+        let id = crate::services::trash_service::tests::seed_trashed(&fx, &path, true).await;
+        let uri = format!("/{id}");
+        let scoped_app = |repo_ids: Vec<Uuid>| {
+            let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+            auth.is_admin = true;
+            auth.is_api_token = true;
+            auth.allowed_repo_ids = AccessScope::Restricted(repo_ids);
+            tdh::router_with_auth_ext(router(), fx.state.clone(), auth)
+        };
+        let delete = |uri: &str| Request::delete(uri).body(Body::empty()).unwrap();
+
+        let (out_of_scope, _) = tdh::send(scoped_app(vec![Uuid::new_v4()]), delete(&uri)).await;
+        let row_kept: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM artifacts WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        let (in_scope, _) = tdh::send(scoped_app(vec![fx.repo_id]), delete(&uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(out_of_scope, StatusCode::NOT_FOUND);
+        assert!(row_kept, "an out-of-scope purge deletes nothing");
+        assert_eq!(in_scope, StatusCode::OK);
     }
 }

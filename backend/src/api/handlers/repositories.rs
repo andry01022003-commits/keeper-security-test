@@ -11390,14 +11390,6 @@ pub async fn delete_artifact(
     }
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    // Refused before the soft delete so a request never ends half done.
-    if query.permanent
-        && crate::services::repository_service::format_handler_key(&repo.format) == "oci"
-    {
-        return Err(AppError::Conflict(
-            crate::services::trash_service::OCI_PURGE_BLOCKED_REASON.to_string(),
-        ));
-    }
     require_repo_write_access(&auth, &repo, &repo_service).await?;
     // Action gate (#2603 G1): the tenant gate above admits any grantee (incl. a
     // write-only or read-only one), collapsing write/delete. Route the `delete`
@@ -11405,6 +11397,16 @@ pub async fn delete_artifact(
     // (deny-by-default) so a write-only grantee cannot destroy artifacts and a
     // rules-less/public repo confers no delete. Mirrors the upload `write` gate.
     require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // Refused before the soft delete so a request never ends half done, and
+    // after the access gates so it says nothing about a repository the caller
+    // cannot write to.
+    if query.permanent
+        && crate::services::repository_service::format_handler_key(&repo.format) == "oci"
+    {
+        return Err(AppError::Conflict(
+            crate::services::trash_service::OCI_PURGE_BLOCKED_REASON.to_string(),
+        ));
+    }
 
     // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
     // version-segmented path the tarball is actually stored under (#2269),
