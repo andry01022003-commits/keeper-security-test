@@ -1743,6 +1743,36 @@ fn check_public_upstream_credentials(
     }
 }
 
+/// Refuse upstream credentials sent without the type that says how to use
+/// them (#4825).
+///
+/// `upstream_username` / `upstream_password` are only stored under an
+/// `upstream_auth_type`; without one (absent, empty or `"none"`) the create
+/// used to answer 201 and silently drop them, leaving an unauthenticated
+/// Remote the operator believed was authenticated, and skipping the #4662
+/// public-remote check. The type is not inferred: `PUT .../upstream-auth`
+/// requires `auth_type` too, and a password alone is ambiguous between
+/// `basic` and `bearer`. Empty strings count as absent.
+fn require_upstream_auth_type_for_credentials(
+    auth_type: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    let typed =
+        crate::services::upstream_auth::filter_auth_type(auth_type.map(str::to_string)).is_some();
+    let has_credentials = [username, password]
+        .into_iter()
+        .any(|v| v.is_some_and(|v| !v.is_empty()));
+    if has_credentials && !typed {
+        return Err(AppError::Validation(
+            "upstream_username/upstream_password require upstream_auth_type \
+             ('basic' or 'bearer'); nothing was created"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Apply [`check_public_upstream_credentials`]: refuse with 400
 /// `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`, or log the accepted override at WARN.
 /// Returns whether the override is what allowed the write, which the caller
@@ -4300,6 +4330,13 @@ pub async fn create_repository(
     require_public_visibility_allowed(
         visibility.allows_anonymous_read(),
         state.guest_access_policy.is_enabled().await,
+    )?;
+    // #4825: credentials without a type would be dropped; refuse them before
+    // the row exists, and before the #4662 check that only sees typed ones.
+    require_upstream_auth_type_for_credentials(
+        payload.upstream_auth_type.as_deref(),
+        payload.upstream_username.as_deref(),
+        payload.upstream_password.as_deref(),
     )?;
     // #4662: a public repository with upstream credentials spends them for
     // anonymous callers. Refused before the row exists unless accepted.
@@ -29737,6 +29774,145 @@ mod tests {
                 .await;
             tdh::cleanup(&pool, id, user_id).await;
         }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4825: upstream credentials without upstream_auth_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upstream_credentials_require_an_auth_type_4825() {
+        let refused = |t: Option<&str>, u: Option<&str>, p: Option<&str>| {
+            matches!(
+                require_upstream_auth_type_for_credentials(t, u, p),
+                Err(AppError::Validation(ref m)) if m.contains("upstream_auth_type")
+            )
+        };
+        assert!(refused(None, Some("u"), Some("p")));
+        assert!(refused(None, None, Some("token")));
+        assert!(refused(None, Some("u"), None));
+        assert!(refused(Some(""), Some("u"), Some("p")));
+        assert!(refused(Some("none"), Some("u"), Some("p")));
+        for (t, u, p) in [
+            (None, None, None),
+            (None, Some(""), Some("")),
+            (Some("none"), None, None),
+            (Some("basic"), Some("u"), Some("p")),
+            (Some("bearer"), None, Some("token")),
+        ] {
+            assert!(
+                require_upstream_auth_type_for_credentials(t, u, p).is_ok(),
+                "{t:?} {u:?} {p:?}"
+            );
+        }
+    }
+
+    /// DB-backed (#4825): a create carrying upstream credentials but no
+    /// `upstream_auth_type` is refused with 400 `VALIDATION_ERROR` and leaves
+    /// no repository, instead of answering 201 with the credentials dropped.
+    /// With the type, the credentials are stored, and on a public Remote the
+    /// #4662 refusal fires as before.
+    #[tokio::test]
+    async fn test_create_remote_credentials_without_auth_type_refused_db_4825() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upauth-4825-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let suffix = Uuid::new_v4().simple().to_string();
+        let remote = |key: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api",
+                "upstream_username": "u",
+                "upstream_password": "p"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            make_create_request(key, key, "generic", body)
+        };
+        let exists = |key: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE key = $1)",
+                )
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        // No type (private and public): 400 VALIDATION_ERROR, no row.
+        let untyped_key = format!("upauth-4825-n-{suffix}");
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({ "is_public": true }),
+            serde_json::json!({ "upstream_auth_type": "none" }),
+        ] {
+            let err = create_repository(State(state.clone()), auth(), remote(&untyped_key, extra))
+                .await
+                .expect_err("credentials without upstream_auth_type must be refused");
+            assert!(
+                matches!(err, AppError::Validation(ref m) if m.contains("upstream_auth_type")),
+                "{err:?}"
+            );
+        }
+        assert!(
+            !exists(untyped_key).await,
+            "a refused create must not leave a row"
+        );
+
+        // Typed, public, no override: the #4662 refusal still fires.
+        let public_key = format!("upauth-4825-p-{suffix}");
+        let err = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &public_key,
+                serde_json::json!({ "is_public": true, "upstream_auth_type": "basic" }),
+            ),
+        )
+        .await
+        .expect_err("public remote with basic credentials must be refused (#4662)");
+        assert!(is_public_credentials_refusal(&err), "{err:?}");
+        assert!(!exists(public_key).await);
+
+        // Typed, private: created with the credentials stored.
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &format!("upauth-4825-b-{suffix}"),
+                serde_json::json!({ "upstream_auth_type": "basic" }),
+            ),
+        )
+        .await
+        .expect("private remote with basic credentials is created");
+        assert_eq!(created.upstream_auth_type.as_deref(), Some("basic"));
+        assert_eq!(
+            crate::services::upstream_auth::get_upstream_auth_type(&pool, created.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("basic")
+        );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(created.id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
