@@ -4301,14 +4301,23 @@ pub async fn create_repository(
         visibility.allows_anonymous_read(),
         state.guest_access_policy.is_enabled().await,
     )?;
+    // #4825: resolve the auth type BEFORE the #4662 refusal below, so a
+    // username/password payload with no explicit type is recognised as the
+    // credentials it is. Consulting `payload.upstream_auth_type` alone let the
+    // public-remote refusal sail straight past such a payload, because it saw
+    // no auth type and therefore "no credentials".
+    let upstream_auth_type = effective_upstream_auth_type(
+        payload.upstream_auth_type.as_deref(),
+        payload.upstream_username.as_deref(),
+        payload.upstream_password.as_deref(),
+    );
     // #4662: a public repository with upstream credentials spends them for
     // anonymous callers. Refused before the row exists unless accepted.
     let public_credentials_override = enforce_public_upstream_credentials(
         &payload.key,
         false,
         visibility.allows_anonymous_read(),
-        crate::services::upstream_auth::filter_auth_type(payload.upstream_auth_type.clone())
-            .is_some()
+        upstream_auth_type.is_some()
             || upstream_url_has_credentials(payload.upstream_url.as_deref()),
         payload.allow_public_with_upstream_credentials == Some(true),
     )?;
@@ -4504,8 +4513,10 @@ pub async fn create_repository(
         }
     }
 
-    // Store upstream auth credentials if provided
-    if let Some(ref auth_type) = payload.upstream_auth_type {
+    // Store upstream auth credentials if provided. #4825: the effective type
+    // is inferred from a username/password payload when none is given, so the
+    // credentials are actually stored instead of being silently dropped.
+    if let Some(ref auth_type) = upstream_auth_type {
         let credentials_json = build_upstream_credentials(
             auth_type,
             payload.upstream_username.as_deref(),
@@ -4600,7 +4611,10 @@ pub async fn create_repository(
         new_repository_storage(&repo_type_out)
     };
     let mut response = repo_to_display_response(repo, storage);
-    if let Some(ref at) = payload.upstream_auth_type {
+    // #4825: echo the effective (possibly inferred) type so the create
+    // response round-trips with a subsequent GET instead of reporting the
+    // credentials were dropped.
+    if let Some(ref at) = upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
     }
@@ -13618,6 +13632,48 @@ fn build_upstream_credentials(
     };
 
     Ok(build_credentials_json(&auth))
+}
+
+/// Resolve the effective upstream auth type of a create request (#4825).
+///
+/// `upstream_auth_type` was the only field consulted, so a payload that sent
+/// `upstream_username` / `upstream_password` without a type silently stored no
+/// credentials at all: the create answered 201, `upstream_auth_configured`
+/// reported `false`, and every upstream fetch went out unauthenticated. The
+/// operator believed the Remote was authenticated when it was not, and the
+/// #4662 public-remote refusal never fired because nothing was stored.
+///
+/// Inference mirrors what a username-and-password payload can only mean, and
+/// matches the intent the field names carry: basic auth. An explicit type
+/// always wins; `none` (or an empty string) is honoured as "no auth" and does
+/// NOT get upgraded to `basic`, so a caller that deliberately clears the type
+/// is not silently given credentials. Returns `None` when the payload carries
+/// no usable auth type.
+fn effective_upstream_auth_type(
+    upstream_auth_type: Option<&str>,
+    upstream_username: Option<&str>,
+    upstream_password: Option<&str>,
+) -> Option<String> {
+    use crate::services::upstream_auth::filter_auth_type;
+
+    if let Some(explicit) = filter_auth_type(upstream_auth_type.map(str::to_string)) {
+        return Some(explicit);
+    }
+    // A type WAS sent and it was `none` or empty: the caller explicitly asked
+    // for no auth. Honour that instead of inferring basic from the credentials
+    // that ride along (a Terraform apply echoing an existing object, for
+    // example), which would silently re-authenticate a repository the caller
+    // was clearing.
+    if upstream_auth_type.is_some() {
+        return None;
+    }
+    // No type at all: a username AND password together can only mean basic
+    // auth. A lone username with no password has nothing to store, and
+    // `build_upstream_credentials` would reject it anyway; leave it to the
+    // caller's validation rather than inferring a type that cannot be built.
+    let has_username = upstream_username.is_some_and(|u| !u.trim().is_empty());
+    let has_password = upstream_password.is_some_and(|p| !p.is_empty());
+    (has_username && has_password).then(|| "basic".to_string())
 }
 
 /// Convert a VirtualMemberRow into a VirtualMemberResponse.
@@ -23760,6 +23816,44 @@ mod tests {
         assert_credentials_err("oauth2", Some("u"), Some("p"), "Invalid auth_type");
     }
 
+    /// #4825: a username and password with no explicit type means basic auth.
+    #[test]
+    fn effective_upstream_auth_type_infers_basic_from_username_and_password_4825() {
+        assert_eq!(
+            effective_upstream_auth_type(None, Some("u"), Some("p")).as_deref(),
+            Some("basic")
+        );
+        // An explicit type always wins, whatever the credentials look like.
+        assert_eq!(
+            effective_upstream_auth_type(Some("bearer"), Some("u"), Some("p")).as_deref(),
+            Some("bearer")
+        );
+    }
+
+    /// #4825: inference must not invent credentials that were not sent, and
+    /// must not override a caller that deliberately cleared the type.
+    #[test]
+    fn effective_upstream_auth_type_does_not_over_infer_4825() {
+        // No type and no usable credentials: nothing to store.
+        assert_eq!(effective_upstream_auth_type(None, None, None), None);
+        assert_eq!(effective_upstream_auth_type(None, Some("u"), None), None);
+        assert_eq!(effective_upstream_auth_type(None, None, Some("p")), None);
+        // Whitespace-only username is not a username.
+        assert_eq!(
+            effective_upstream_auth_type(None, Some("   "), Some("p")),
+            None
+        );
+        // An explicit `none`/empty type is honoured, not upgraded to basic.
+        assert_eq!(
+            effective_upstream_auth_type(Some("none"), Some("u"), Some("p")),
+            None
+        );
+        assert_eq!(
+            effective_upstream_auth_type(Some(""), Some("u"), Some("p")),
+            None
+        );
+    }
+
     // -----------------------------------------------------------------------
     // extract_name_version_from_path (generic artifact path parsing)
     // -----------------------------------------------------------------------
@@ -29736,6 +29830,141 @@ mod tests {
                 .execute(&pool)
                 .await;
             tdh::cleanup(&pool, id, user_id).await;
+        }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4825: username/password with no `upstream_auth_type` must not be
+    // silently dropped
+    // -----------------------------------------------------------------------
+
+    /// A Remote created with `upstream_username` / `upstream_password` and no
+    /// `upstream_auth_type` must store those credentials as basic auth, report
+    /// `upstream_auth_configured: true`, and behave like the equivalent
+    /// explicit-`basic` create. Before the fix the credentials were silently
+    /// discarded and the create answered 201 with no auth configured (#4825).
+    #[tokio::test]
+    async fn create_remote_infers_basic_auth_from_username_and_password_4825() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("auth-4825-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        let remote = |key: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            make_create_request(key, key, "generic", body)
+        };
+
+        // The bug payload: username + password, no auth type.
+        let key = format!("auth-4825-i-{suffix}");
+        let Json(inferred) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            remote(
+                &key,
+                serde_json::json!({ "upstream_username": "u", "upstream_password": "p" }),
+            ),
+        )
+        .await
+        .expect("username/password without a type must be accepted");
+        assert_eq!(inferred.upstream_auth_type.as_deref(), Some("basic"));
+        assert!(inferred.upstream_auth_configured);
+
+        // The stored type matches, and a subsequent GET reports it too.
+        assert_eq!(
+            crate::services::upstream_auth::get_upstream_auth_type(&pool, inferred.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("basic")
+        );
+        let Json(got) = get_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+        )
+        .await
+        .expect("get");
+        assert_eq!(got.upstream_auth_type.as_deref(), Some("basic"));
+        assert!(got.upstream_auth_configured);
+
+        // A username alone is not a usable credential and must not be inferred
+        // into a basic type that cannot be built (the create reports no auth).
+        let lone_key = format!("auth-4825-l-{suffix}");
+        let Json(lone) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            remote(&lone_key, serde_json::json!({ "upstream_username": "u" })),
+        )
+        .await
+        .expect("a lone username is accepted as no auth");
+        assert_eq!(lone.upstream_auth_type, None);
+        assert!(!lone.upstream_auth_configured);
+
+        // An explicit `none` is honoured, not upgraded to basic.
+        let none_key = format!("auth-4825-n-{suffix}");
+        let Json(none) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            remote(
+                &none_key,
+                serde_json::json!({
+                    "upstream_auth_type": "none", "upstream_username": "u", "upstream_password": "p"
+                }),
+            ),
+        )
+        .await
+        .expect("an explicit none is accepted");
+        assert_eq!(none.upstream_auth_type, None);
+        assert!(!none.upstream_auth_configured);
+
+        // #4662 interaction: the inferred credentials make a public Remote a
+        // credentialed one, so the public refusal fires instead of letting the
+        // payload sail past it (issue #4825 "interacts with #4662").
+        let refused_key = format!("auth-4825-p-{suffix}");
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            remote(
+                &refused_key,
+                serde_json::json!({
+                    "is_public": true, "upstream_username": "u", "upstream_password": "p"
+                }),
+            ),
+        )
+        .await
+        .expect_err("public + inferred credentials must be refused");
+        assert!(is_public_credentials_refusal(&err), "{err:?}");
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repositories WHERE key = $1)")
+                .bind(&refused_key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!exists, "a refused create must not leave a row");
+
+        for created in [inferred.id, lone.id, none.id] {
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(created)
+                .execute(&pool)
+                .await;
+            tdh::cleanup(&pool, created, user_id).await;
         }
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
