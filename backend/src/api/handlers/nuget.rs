@@ -1496,43 +1496,68 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
     let mut entries = Vec::new();
     let mut current: Option<Current> = None;
     let mut field: Option<&'static str> = None;
+    let mut text = String::new();
     loop {
         match reader.read_event() {
             Err(_) | Ok(Event::Eof) => break,
-            Ok(Event::Start(element)) => match element.local_name().as_ref() {
-                "entry" => current = Some(Current::default()),
-                "title" => field = Some("id"),
-                "Id" => field = Some("id"),
-                "Version" => field = Some("version"),
-                "Authors" => field = Some("authors"),
-                "Description" => field = Some("description"),
-                "PackageHash" => field = Some("hash"),
-                "PackageSize" => field = Some("size"),
-                _ => field = None,
-            },
-            Ok(Event::Text(text)) => {
-                let (Some(entry), Some(target)) = (current.as_mut(), field) else {
-                    continue;
-                };
-                let value: &str = &text;
-                let value = value.trim();
-                if value.is_empty() {
-                    continue;
+            Ok(Event::Start(element)) => {
+                match element.local_name().as_ref() {
+                    "entry" => current = Some(Current::default()),
+                    "title" => field = Some("id"),
+                    "Id" => field = Some("id"),
+                    "Version" => field = Some("version"),
+                    "Authors" => field = Some("authors"),
+                    "Description" => field = Some("description"),
+                    "PackageHash" => field = Some("hash"),
+                    "PackageSize" => field = Some("size"),
+                    _ => field = None,
                 }
-                match target {
-                    // `<title>` comes first; a later `<d:Id>` is authoritative.
-                    "id" => entry.id = value.to_string(),
-                    "version" if entry.version.is_empty() => entry.version = value.to_string(),
-                    "authors" => entry.authors = value.to_string(),
-                    "description" => entry.description = value.to_string(),
-                    "hash" => entry.hash = Some(value.to_string()),
-                    "size" => entry.size = value.parse().unwrap_or(0),
-                    _ => {}
+                text.clear();
+            }
+            Ok(Event::Text(t)) => {
+                text.push_str(&t);
+            }
+            Ok(Event::CData(c)) => {
+                text.push_str(&c);
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(Some(resolved)) = e.resolve_char_ref() {
+                    text.push(resolved);
+                } else {
+                    let name: &str = &e;
+                    match name {
+                        "amp" => text.push('&'),
+                        "lt" => text.push('<'),
+                        "gt" => text.push('>'),
+                        "quot" => text.push('"'),
+                        "apos" => text.push('\''),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(element)) => {
+                let local_name = element.local_name();
+                let local_name_ref = local_name.as_ref();
+                if let (Some(entry), Some(target)) = (current.as_mut(), field) {
+                    let value = text.trim();
+                    if !value.is_empty() {
+                        match target {
+                            // `<title>` comes first; a later `<d:Id>` is authoritative.
+                            "id" => entry.id = value.to_string(),
+                            "version" if entry.version.is_empty() => {
+                                entry.version = value.to_string()
+                            }
+                            "authors" => entry.authors = value.to_string(),
+                            "description" => entry.description = value.to_string(),
+                            "hash" => entry.hash = Some(value.to_string()),
+                            "size" => entry.size = value.parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                }
+                text.clear();
                 field = None;
-                if element.local_name().as_ref() == "entry" {
+                if local_name_ref == "entry" {
                     if let Some(entry) = current.take() {
                         if !entry.id.is_empty() && !entry.version.is_empty() {
                             entries.push(V2Entry {
@@ -1547,7 +1572,9 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
                     }
                 }
             }
-            Ok(_) => {}
+            Ok(_) => {
+                text.clear();
+            }
         }
     }
     entries
@@ -7399,6 +7426,32 @@ mod read_db_tests {
         assert_eq!(entries[0].authors, "James");
         assert_eq!(entries[0].size, 700);
         assert_eq!(entries[1].version, "12.0.3");
+    }
+
+    /// quick-xml reports entity and character references as their own
+    /// `GeneralRef` events and CDATA as its own `CData` event, so a value like
+    /// `Fish &amp; chips` arrives as several fragments. The parser must
+    /// reassemble them rather than letting the last fragment overwrite the
+    /// field (#4816).
+    #[test]
+    fn v2_feed_entries_reassemble_entity_references_and_cdata() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <entry>
+    <title type="text">DtfXml.Pkg</title>
+    <m:properties>
+      <d:Id>DtfXml.Pkg</d:Id><d:Version>1.0.0</d:Version>
+      <d:Authors>Ren&#233;e &amp; J&#xF6;rg</d:Authors>
+      <d:Description>Fish &amp; chips &lt;b&gt;caf&#233;&lt;/b&gt; <![CDATA[über &amp; out]]></d:Description>
+    </m:properties>
+  </entry>
+</feed>"#;
+        let entries = parse_v2_feed_entries(xml);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].authors, "Renée & Jörg");
+        assert_eq!(
+            entries[0].description,
+            "Fish & chips <b>café</b> über &amp; out"
+        );
     }
 
     /// A truncated document keeps the entries already read.
