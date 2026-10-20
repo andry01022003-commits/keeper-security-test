@@ -1050,4 +1050,54 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// #4818: a `repository-owner` role member holds the repository `admin`
+    /// action through the role, with no fine-grained grant, and may manage
+    /// the repository's email subscriptions (the 1.11.0 CHANGELOG promised
+    /// owners were unaffected by GHSA-mvmh-g8wm-r3cp #4).
+    #[tokio::test]
+    async fn email_subscriptions_allow_repository_owner_role_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        tdh::grant_repo_role(&pool, repo_id, user_id, "repository-owner").await;
+        let state = || tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let owner = tdh::make_auth(user_id, &username);
+
+        let (status, Json(created)) = create_subscription(
+            State(state()),
+            Extension(Some(owner.clone())),
+            Path(key.clone()),
+            Json(CreateEmailSubscriptionRequest {
+                recipients: vec!["owner@example.com".to_string()],
+                event_types: vec!["artifact.uploaded".to_string()],
+                enabled: true,
+            }),
+        )
+        .await
+        .expect("repository-owner member creates a subscription");
+        assert_eq!(status, StatusCode::CREATED);
+        let Json(listed) = list_subscriptions(
+            State(state()),
+            Extension(Some(owner.clone())),
+            Path(key.clone()),
+        )
+        .await
+        .expect("repository-owner member lists subscriptions");
+        assert_eq!(listed.subscriptions.len(), 1);
+        delete_subscription(
+            State(state()),
+            Extension(Some(owner)),
+            Path((key.clone(), created.id)),
+        )
+        .await
+        .expect("repository-owner member deletes a subscription");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
