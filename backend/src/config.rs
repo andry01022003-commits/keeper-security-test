@@ -191,12 +191,23 @@ pub fn secret_or_env(name: &str) -> std::result::Result<Option<String>, String> 
     let path = env::var(&file_var).ok().filter(|p| !p.trim().is_empty());
     let direct = env::var(name).ok();
 
-    let direct_usable = direct.as_deref().is_some_and(|v| !v.trim().is_empty());
+    // Treat the placeholder baked into published images as unset so that
+    // <NAME>_FILE can take effect (#4819).
+    let direct_usable = direct.as_deref().is_some_and(|v| {
+        let trimmed = v.trim();
+        !trimmed.is_empty() && trimmed != "set-database-url-at-runtime"
+    });
     if direct_usable {
         return Ok(direct);
     }
 
     let Some(path) = path else {
+        if direct
+            .as_deref()
+            .is_some_and(|v| v.trim() == "set-database-url-at-runtime")
+        {
+            return Ok(None);
+        }
         return Ok(direct);
     };
 
