@@ -49,6 +49,7 @@ use uuid::Uuid;
 
 use crate::api::dto::{Pagination, PaginationQuery};
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::storage::{StorageLocation, StorageRegistry};
 
 /// Largest `per_page` the list endpoint honours.
@@ -304,31 +305,47 @@ impl TrashService {
     }
 
     /// List trashed artifacts, most recently deleted first, optionally only
-    /// those of one repository.
+    /// those of one repository, and only of repositories `scope` grants.
     pub async fn list(
         &self,
         repository_key: Option<&str>,
+        scope: &AccessScope,
         page: Option<u32>,
         per_page: Option<u32>,
     ) -> Result<TrashPage> {
         let paging = clamp_trash_paging(page, per_page);
         let limit = i64::from(paging.per_page());
         let offset = i64::from(paging.page() - 1) * limit;
-        let filter = "FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
-                      WHERE a.is_deleted = true AND ($1::text IS NULL OR r.key = $1)";
-        let total: i64 =
-            sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!("SELECT COUNT(*) {filter}")))
-                .bind(repository_key)
-                .fetch_one(&self.db)
-                .await?;
+        let allowed: Option<&[Uuid]> = match scope {
+            AccessScope::Admin => None,
+            AccessScope::Restricted(ids) => Some(ids),
+        };
+        // `$1` is the repository key; `scope_param` the allowed repository ids.
+        let filter = |scope_param: &str| {
+            format!(
+                "FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+                 WHERE a.is_deleted = true AND ($1::text IS NULL OR r.key = $1) \
+                 AND ({scope_param}::uuid[] IS NULL OR a.repository_id = ANY({scope_param}))"
+            )
+        };
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
+            "SELECT COUNT(*) {}",
+            filter("$2")
+        )))
+        .bind(repository_key)
+        .bind(allowed)
+        .fetch_one(&self.db)
+        .await?;
         let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-            "SELECT {TRASH_COLUMNS_SQL} {filter} \
+            "SELECT {TRASH_COLUMNS_SQL} {} \
              ORDER BY a.deleted_at DESC NULLS LAST, a.id \
-             LIMIT $2 OFFSET $3"
+             LIMIT $2 OFFSET $3",
+            filter("$4")
         )))
         .bind(repository_key)
         .bind(limit)
         .bind(offset)
+        .bind(allowed)
         .fetch_all(&self.db)
         .await?;
         Ok(TrashPage {
@@ -628,11 +645,11 @@ pub(crate) mod tests {
         let oci = seed_trashed(&fx, &format!("oci-manifests/sha256:{uid}"), false).await;
 
         let page = service(&fx, 14)
-            .list(Some(&fx.repo_key), None, None)
+            .list(Some(&fx.repo_key), &AccessScope::Admin, None, None)
             .await
             .expect("list");
         let other = service(&fx, 14)
-            .list(Some("no-such-repo-key"), Some(1), None)
+            .list(Some("no-such-repo-key"), &AccessScope::Admin, Some(1), None)
             .await
             .expect("list other");
         fx.teardown().await;
