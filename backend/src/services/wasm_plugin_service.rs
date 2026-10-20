@@ -20,6 +20,8 @@ use crate::models::plugin_manifest::{ManifestValidationError, PluginManifest};
 
 use super::plugin_registry::PluginRegistry;
 
+mod git_transport;
+
 /// Result of a plugin installation operation.
 #[derive(Debug, Clone)]
 pub struct PluginInstallResult {
@@ -1009,7 +1011,14 @@ impl WasmPluginService {
     }
 
     /// Clone a Git repository to the target directory.
+    ///
+    /// `http(s)` fetches go through `git_transport`, which connects only to
+    /// addresses the SSRF policy admits at connect time, so a host that
+    /// passed `validate_git_source_url` and then changed its address is not
+    /// fetched from (GHSA-p28r-8m4q-w9pg).
     async fn clone_repository(&self, url: &str, target: &Path) -> Result<git2::Repository> {
+        git_transport::ensure_registered().map_err(AppError::Internal)?;
+
         let url = url.to_string();
         let target = target.to_path_buf();
 
@@ -1020,7 +1029,12 @@ impl WasmPluginService {
 
         result.map_err(|e| {
             let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("404") {
+            if msg.contains("blocked by SSRF policy") {
+                AppError::Validation(format!(
+                    "Plugin git URL: the host resolved to an address that outbound \
+                     requests may not reach (see AK_SSRF_ALLOW_PRIVATE_CIDRS): {msg}"
+                ))
+            } else if msg.contains("not found") || msg.contains("404") {
                 AppError::NotFound(format!("Git repository not found: {}", msg))
             } else if msg.contains("timeout") {
                 AppError::Internal("Git clone timed out".to_string())
@@ -3273,5 +3287,154 @@ timeout_secs = 30
             WasmPluginService::validate_git_source_url("file:///etc/passwd"),
             Err(AppError::Validation(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Clones connect only to addresses the SSRF policy admits
+    // (GHSA-p28r-8m4q-w9pg)
+    //
+    // `validate_git_source_url` resolves the host before a clone; the clone
+    // must not resolve it again on its own and connect wherever it points by
+    // then. A host that resolves to loopback at clone time stands in for one
+    // whose address changed after the URL check.
+    // -----------------------------------------------------------------------
+
+    /// A service whose pool is never used (clone touches no table).
+    fn clone_only_service() -> WasmPluginService {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@127.0.0.1:1/none")
+            .expect("lazy pool");
+        WasmPluginService::new(
+            pool,
+            Arc::new(PluginRegistry::new().expect("plugin registry")),
+            std::env::temp_dir().join("ak-plugin-clone-tests"),
+            false,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_clone_does_not_connect_to_a_host_resolving_to_a_blocked_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let svc = clone_only_service();
+        let target = tempfile::tempdir().expect("tempdir");
+        let target_path = target.path().join("repo");
+
+        let url = format!("http://localhost:{port}/plugin.git");
+        let clone = tokio::spawn(async move { svc.clone_repository(&url, &target_path).await });
+
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "the clone connected to a loopback address the SSRF policy blocks"
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), clone)
+            .await
+            .expect("clone finished")
+            .expect("clone task");
+        let Err(err) = outcome else {
+            panic!("a clone of a blocked address must fail");
+        };
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("Plugin git URL")),
+            "the refusal reads like the URL check's: {err:?}"
+        );
+    }
+
+    /// A one-commit repository and the pack an upload-pack server would send
+    /// for it.
+    fn single_commit_pack(files: &[(&str, &[u8])]) -> (git2::Oid, Vec<u8>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init_bare(dir.path()).expect("init");
+        let mut tree = repo.treebuilder(None).expect("treebuilder");
+        for (name, content) in files {
+            let blob = repo.blob(content).expect("blob");
+            tree.insert(name, blob, 0o100644).expect("insert");
+        }
+        let tree = repo
+            .find_tree(tree.write().expect("tree"))
+            .expect("find tree");
+        let sig = git2::Signature::now("t", "t@example.com").expect("signature");
+        let commit = repo
+            .commit(None, &sig, &sig, "plugin", &tree, &[])
+            .expect("commit");
+        let mut builder = repo.packbuilder().expect("packbuilder");
+        builder.insert_commit(commit).expect("insert commit");
+        let mut buf = git2::Buf::new();
+        builder.write_buf(&mut buf).expect("write pack");
+        (commit, buf.to_vec())
+    }
+
+    fn pkt_line(payload: &str) -> String {
+        format!("{:04x}{payload}", payload.len() + 4)
+    }
+
+    #[tokio::test]
+    async fn test_clone_over_smart_http_through_the_guarded_client() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (commit, pack) = single_commit_pack(&[("plugin.toml", b"name = \"x\"\n")]);
+        let advertisement = format!(
+            "{}0000{}{}0000",
+            pkt_line("# service=git-upload-pack\n"),
+            pkt_line(&format!("{commit} HEAD\0symref=HEAD:refs/heads/main\n")),
+            pkt_line(&format!("{commit} refs/heads/main\n")),
+        );
+        let mut result = b"0008NAK\n".to_vec();
+        result.extend_from_slice(&pack);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plugin.git/info/refs"))
+            .and(query_param("service", "git-upload-pack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/x-git-upload-pack-advertisement",
+                    )
+                    .set_body_bytes(advertisement.into_bytes()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/plugin.git/git-upload-pack"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-git-upload-pack-result")
+                    .set_body_bytes(result),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = clone_only_service();
+        let target = tempfile::tempdir().expect("tempdir");
+        let target_path = target.path().join("repo");
+        // An IP literal is never re-resolved, so the loopback mock is
+        // reachable; the URL check (not exercised here) is what refuses it.
+        let url = format!("{}/plugin.git", server.uri());
+        let repo = svc
+            .clone_repository(&url, &target_path)
+            .await
+            .expect("clone over smart HTTP");
+
+        assert_eq!(repo.head().expect("head").target(), Some(commit));
+        assert_eq!(
+            std::fs::read(target_path.join("plugin.toml")).expect("checked out"),
+            b"name = \"x\"\n"
+        );
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(
+            requests.iter().all(|r| r
+                .headers
+                .get("user-agent")
+                .is_some_and(|v| v == "git/2.0 (artifact-keeper)")),
+            "every git request went through the guarded client"
+        );
     }
 }
