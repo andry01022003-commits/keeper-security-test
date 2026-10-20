@@ -7,37 +7,37 @@
 //!
 //! Client credentials (Authorization, Cookie, `x-nuget-apikey`, `buf-token`)
 //! are Artifact Keeper tokens and MUST NOT be forwarded upstream. Only an
-//! allowlist of Connect headers is copied. Responses never copy `Set-Cookie`.
-//! Only read-only `buf.registry.*` RPCs are proxied; the body is not cached.
+//! allowlist of Connect headers is copied each way. Only read-only
+//! `buf.registry.module.v1` RPCs are proxied; the body is not cached. The
+//! upstream host is always the repository's configured `upstream_url`, and an
+//! upstream error is answered with a Connect error of our own, never the
+//! upstream body.
 
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::header::{HeaderMap, HeaderName, AUTHORIZATION, CONTENT_TYPE, HOST};
+use axum::http::header::{HeaderMap, HeaderName, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use uuid::Uuid;
 
+use super::protobuf::connect_error;
 use super::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::proxy_service::redact_url_for_diagnostics;
 
 /// Hard ceiling for a single buffered BSR Connect response body (#1608).
-const MAX_BSR_PROXY_BODY: usize = 128 * 1024 * 1024;
+/// Every allowlisted RPC answers with module metadata (never module
+/// content, which `Download` serves through `proxy_service`), so this is the
+/// same 16 MiB metadata bound the npm audit/meta passthrough uses.
+const MAX_BSR_PROXY_BODY: usize = 16 * 1024 * 1024;
 
-fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = serde_json::json!({ "code": code, "message": message });
-    super::with_retry_after_on_503(
-        Response::builder()
-            .status(status)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap(),
-    )
-}
+/// Total time allowed for one upstream BSR call, body included.
+const BSR_PROXY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Request headers copied onto the upstream BSR call. Everything else —
 /// including Cookie, Authorization, and package-manager API keys — is dropped.
@@ -52,23 +52,31 @@ fn allowed_request_header(name: &HeaderName) -> bool {
     )
 }
 
-fn hop_by_hop_response_headers() -> &'static [HeaderName] {
-    use std::sync::OnceLock;
-    static NAMES: OnceLock<Vec<HeaderName>> = OnceLock::new();
-    NAMES.get_or_init(|| {
-        [
-            HeaderName::from_static("connection"),
-            HeaderName::from_static("keep-alive"),
-            HeaderName::from_static("transfer-encoding"),
-            HeaderName::from_static("content-length"),
-            HeaderName::from_static("set-cookie"),
-        ]
-        .into()
-    })
+/// Response headers copied back from a successful upstream call: the
+/// content type plus Connect's own `connect-*` and unary `trailer-*`
+/// metadata. Everything else (Set-Cookie, WWW-Authenticate, Location,
+/// hop-by-hop and length headers) is dropped; the body is rebuilt here.
+fn allowed_response_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name == "content-type" || name.starts_with("connect-") || name.starts_with("trailer-")
 }
 
-fn skip_response_header(name: &HeaderName) -> bool {
-    hop_by_hop_response_headers().iter().any(|h| h == name)
+/// The Connect error we answer with when the upstream returns a non-2xx
+/// status. The upstream body is never relayed: it is not ours to vouch for
+/// and may carry upstream detail. 404 stays 404 so a virtual walk moves on to
+/// the next member; 400 stays a client error; anything else is the upstream
+/// failing, which is a 502 to our caller.
+fn upstream_status_error(status: reqwest::StatusCode) -> Response {
+    let (ours, code) = match status.as_u16() {
+        404 => (StatusCode::NOT_FOUND, "not_found"),
+        400 => (StatusCode::BAD_REQUEST, "invalid_argument"),
+        _ => (StatusCode::BAD_GATEWAY, "unavailable"),
+    };
+    connect_error(
+        ours,
+        code,
+        &format!("Upstream BSR returned HTTP {}", status.as_u16()),
+    )
 }
 
 /// True when `service` is a Buf registry Connect service (`buf.registry.*`).
@@ -180,15 +188,20 @@ pub(crate) async fn proxy_connect_rpc(
     }
     let url = join_bsr_upstream_url(upstream_base, bsr_path)?;
     crate::api::validation::validate_outbound_url(&url, "protobuf BSR upstream").map_err(|e| {
+        tracing::warn!(
+            upstream = %redact_url_for_diagnostics(&url),
+            error = %e,
+            "refusing protobuf BSR upstream"
+        );
         connect_error(
             StatusCode::BAD_GATEWAY,
             "unavailable",
-            &format!("Refusing protobuf BSR upstream: {e}"),
+            "The repository's upstream URL is not allowed",
         )
     })?;
 
     let client = crate::services::http_client::default_client();
-    let mut req = client.post(&url).timeout(Duration::from_secs(120));
+    let mut req = client.post(&url).timeout(BSR_PROXY_TIMEOUT);
     for (name, value) in incoming.iter() {
         if !allowed_request_header(name) {
             continue;
@@ -203,31 +216,50 @@ pub(crate) async fn proxy_connect_rpc(
         req = crate::services::upstream_auth::apply_upstream_auth(req, &upstream_auth);
     }
 
-    let resp = req.body(body).send().await.map_err(|e| {
-        connect_error(
-            StatusCode::BAD_GATEWAY,
-            "unavailable",
-            &format!("Upstream BSR request failed: {e}"),
-        )
-    })?;
+    let resp = crate::services::upstream_tracing::send_upstream(req.body(body))
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                upstream = %redact_url_for_diagnostics(&url),
+                error = %e,
+                "protobuf BSR upstream request failed"
+            );
+            connect_error(
+                StatusCode::BAD_GATEWAY,
+                "unavailable",
+                "Upstream BSR request failed",
+            )
+        })?;
 
     let status = resp.status();
+    if !status.is_success() {
+        tracing::debug!(
+            upstream = %redact_url_for_diagnostics(&url),
+            status = %status,
+            "protobuf BSR upstream returned non-success"
+        );
+        return Err(upstream_status_error(status));
+    }
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in resp.headers() {
-        if skip_response_header(name) {
-            continue;
+        if allowed_response_header(name) {
+            builder = builder.header(name, value);
         }
-        builder = builder.header(name, value);
     }
     // STREAMING: capped chunked read — never `Response::bytes()` (#1608).
     let mut stream = resp.bytes_stream();
     let mut buf = BytesMut::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
+            tracing::warn!(
+                upstream = %redact_url_for_diagnostics(&url),
+                error = %e,
+                "protobuf BSR upstream body failed"
+            );
             connect_error(
                 StatusCode::BAD_GATEWAY,
                 "unavailable",
-                &format!("Upstream BSR body failed: {e}"),
+                "Upstream BSR response could not be read",
             )
         })?;
         if buf.len().saturating_add(chunk.len()) > MAX_BSR_PROXY_BODY {
@@ -240,7 +272,13 @@ pub(crate) async fn proxy_connect_rpc(
         buf.extend_from_slice(&chunk);
     }
     let payload = buf.freeze();
-    Ok(builder.body(Body::from(payload)).unwrap())
+    builder.body(Body::from(payload)).map_err(|_| {
+        connect_error(
+            StatusCode::BAD_GATEWAY,
+            "unavailable",
+            "Upstream BSR response could not be relayed",
+        )
+    })
 }
 
 /// If this repo (or a virtual member) should be served by upstream Connect
@@ -358,11 +396,13 @@ pub(crate) async fn dispatch_unknown_bsr(
     }
     let repo = super::protobuf::resolve_protobuf_repo(&state.db, &repo_key).await?;
     if !is_allowed_bsr_read_rpc(&bsr_path) {
-        proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+        // Writes have their own routes (CreateModules, Upload, ...), which
+        // refuse remote and virtual repositories; anything else that lands
+        // here is a method this server neither implements nor proxies.
         return Err(connect_error(
             StatusCode::NOT_FOUND,
             "unimplemented",
-            &format!("BSR method '{bsr_path}' is not implemented on hosted protobuf repos"),
+            &format!("BSR method '{bsr_path}' is not implemented or proxied"),
         ));
     }
     if let Some(resp) = maybe_proxy(
@@ -388,9 +428,11 @@ pub(crate) async fn dispatch_unknown_bsr(
     ))
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header::{AUTHORIZATION, HOST};
     use axum::http::HeaderValue;
 
     #[test]
@@ -514,9 +556,43 @@ mod tests {
     }
 
     #[test]
-    fn test_response_strips_set_cookie() {
-        assert!(skip_response_header(&HeaderName::from_static("set-cookie")));
-        assert!(!skip_response_header(&CONTENT_TYPE));
+    fn test_response_header_allowlist() {
+        assert!(allowed_response_header(&CONTENT_TYPE));
+        assert!(allowed_response_header(&HeaderName::from_static(
+            "connect-content-encoding"
+        )));
+        assert!(allowed_response_header(&HeaderName::from_static(
+            "trailer-x-request-id"
+        )));
+        for dropped in [
+            "set-cookie",
+            "www-authenticate",
+            "location",
+            "content-length",
+            "transfer-encoding",
+            "x-upstream-internal",
+        ] {
+            assert!(
+                !allowed_response_header(&HeaderName::from_static(dropped)),
+                "{dropped} must not be relayed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_status_error_maps_without_upstream_body() {
+        let cases = [
+            (404, StatusCode::NOT_FOUND),
+            (400, StatusCode::BAD_REQUEST),
+            (401, StatusCode::BAD_GATEWAY),
+            (403, StatusCode::BAD_GATEWAY),
+            (500, StatusCode::BAD_GATEWAY),
+            (503, StatusCode::BAD_GATEWAY),
+        ];
+        for (upstream, ours) in cases {
+            let resp = upstream_status_error(reqwest::StatusCode::from_u16(upstream).unwrap());
+            assert_eq!(resp.status(), ours, "upstream {upstream}");
+        }
     }
 
     #[tokio::test]
@@ -702,6 +778,134 @@ mod tests {
             ae.is_empty() || ae.eq_ignore_ascii_case("identity"),
             "client Accept-Encoding must not force gzip on upstream (got {ae:?})"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // reads one small, bounded error body (#1608)
+    async fn proxy_connect_rpc_never_relays_an_upstream_error_body() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (upstream, _ssrf) = tdh::non_loopback_mock_server().await;
+        let _no_proxy = pin_no_proxy(&upstream);
+        Mock::given(method("POST"))
+            .and(path("/buf.registry.module.v1.ModuleService/ListModules"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("www-authenticate", "Basic realm=upstream-internal")
+                    .set_body_string(r#"{"code":"internal","message":"db at 10.0.0.7 down"}"#),
+            )
+            .mount(&upstream)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tdh::build_state(pool, tmp.path().to_str().unwrap());
+        let mut incoming = HeaderMap::new();
+        incoming.insert(CONTENT_TYPE, HeaderValue::from_static("application/proto"));
+        let err = proxy_connect_rpc(
+            &state,
+            uuid::Uuid::new_v4(),
+            upstream.uri().as_str(),
+            "buf.registry.module.v1.ModuleService/ListModules",
+            &incoming,
+            Bytes::from_static(b"\x00list"),
+        )
+        .await
+        .expect_err("an upstream 500 is an error to our caller");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert!(err.headers().get("www-authenticate").is_none());
+        let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("10.0.0.7") && !text.contains("upstream-internal"),
+            "the upstream error body must not be relayed: {text}"
+        );
+        assert!(
+            text.contains("\"unavailable\""),
+            "Connect error code: {text}"
+        );
+    }
+
+    /// Through the real `/proto` router: an allowlisted read with no local
+    /// handler reaches the remote repository's upstream without the caller's
+    /// cookie or token; a non-allowlisted `buf.registry.*` method and a
+    /// non-`buf.registry` service never reach the upstream.
+    #[tokio::test]
+    async fn router_catch_all_forwards_only_allowlisted_reads() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::Request;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "protobuf").await else {
+            return;
+        };
+        let (upstream, _ssrf) = tdh::non_loopback_mock_server().await;
+        let _no_proxy = pin_no_proxy(&upstream);
+        Mock::given(method("POST"))
+            .and(path("/buf.registry.module.v1.ModuleService/ListModules"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/proto")
+                    .set_body_bytes(b"\x00modules"),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri().as_str())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set remote upstream");
+
+        let call = |rpc: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{}/{rpc}", fx.repo_key))
+                .header("content-type", "application/proto")
+                .header("connect-protocol-version", "1")
+                .header("cookie", "ak_access_token=caller-session")
+                .header("authorization", "Bearer caller-token")
+                .body(Body::from(&b"\x00req"[..]))
+                .unwrap()
+        };
+        let app = || tdh::router_anon(super::super::protobuf::router(), fx.state.clone());
+
+        let (ok_status, ok_body) = tdh::send(
+            app(),
+            call("buf.registry.module.v1.ModuleService/ListModules"),
+        )
+        .await;
+        let (owner_status, _) =
+            tdh::send(app(), call("buf.registry.owner.v1.OwnerService/GetOwner")).await;
+        let (write_status, _) = tdh::send(
+            app(),
+            call("buf.registry.module.v1.ModuleService/DeleteModules"),
+        )
+        .await;
+        let (foreign_status, _) = tdh::send(app(), call("grpc.health.v1.Health/Check")).await;
+        let received = upstream.received_requests().await.unwrap_or_default();
+        fx.teardown().await;
+
+        assert_eq!(ok_status, StatusCode::OK);
+        assert_eq!(&ok_body[..], b"\x00modules");
+        assert_eq!(owner_status, StatusCode::NOT_FOUND);
+        assert_eq!(write_status, StatusCode::NOT_FOUND);
+        assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            received.len(),
+            1,
+            "only the allowlisted read may reach the upstream"
+        );
+        assert!(received[0].headers.get("cookie").is_none());
+        assert!(received[0].headers.get("authorization").is_none());
     }
 
     #[tokio::test]

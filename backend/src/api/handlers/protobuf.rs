@@ -390,7 +390,7 @@ struct GetResourcesResponse {
 // Connect RPC error helper
 // ---------------------------------------------------------------------------
 
-fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
+pub(crate) fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
     // The database sites pass `db_status(&e)` with `internal`; a 503 there
     // (saturated pool, unreachable database) is Connect's retryable
     // `unavailable`, the code Connect itself maps HTTP 503 to (#4765).
