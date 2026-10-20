@@ -30,7 +30,9 @@ it.
 | `DEVICE_AUTH_MAX_FAILED_ATTEMPTS_PER_IP` | `20` | Wrong user codes one client IP may enter per window (1 to 1000). |
 | `DEVICE_AUTH_FAILED_ATTEMPT_WINDOW_SECS` | `900` | Window for both failed-attempt budgets (60 to 86400). |
 
-Values outside the ranges are clamped. Behind a reverse proxy, set
+Values outside the ranges are clamped. Refusals by the request limiters are
+counted in `ak_rate_limit_rejections_total` under `limiter="device_code"`,
+`"device_token"` and `"device_approval"`. Behind a reverse proxy, set
 `RATE_LIMIT_TRUSTED_PROXY_CIDRS` so the per-IP limits see the real client
 address rather than the proxy's. `GET /api/v1/system/config` reports
 `auth.device_authorization_enabled`.
@@ -115,8 +117,9 @@ granted scopes.
 
 The user opens `/device`, types the code, and sees the scopes the device will
 receive, including any requested scope their own account cannot grant (those
-are dropped). The page never shows the client-chosen `client_id`, because it is
-unverified text.
+are dropped), how long ago the request was started and from which client IP
+address (RFC 8628 §5.4), and when the code expires. The page never shows the
+client-chosen `client_id`, because it is unverified text.
 
 Only an interactive session can verify, approve or deny: a session JWT from a
 normal sign-in. The following are refused with 403 and audited:
@@ -125,7 +128,8 @@ normal sign-in. The following are refused with 403 and audited:
 - service accounts;
 - download tickets;
 - Basic username and password;
-- any JWT that carries a scope list or a repository restriction.
+- any JWT that carries a scope list or a repository restriction;
+- a locked, deactivated or service account.
 
 Without this, a narrow or expiring credential could approve its own request and
 receive a broader, refreshable session.
@@ -134,29 +138,39 @@ The tokens are capped at the requested scopes the approver may grant. A
 non-admin cannot grant the admin-only scopes (`delete:artifacts`,
 `delete:repositories`, `promote:artifacts`, `trigger:sync`, `write:users`,
 `write:findings`). If none of the requested scopes can be granted, approval is
-refused. At redemption the approver is checked again: an account disabled,
-deleted or turned into a service account since approving receives nothing, and
-one that lost admin loses the admin-only scopes.
+refused. The tokens carry no repository restriction, because only an
+unrestricted session can approve. At redemption the approver is checked again:
+an account disabled, deleted, locked or turned into a service account since
+approving receives nothing, and one that lost admin loses the admin-only
+scopes.
 
-An approval is also void if, after it was given, anything invalidated the
-approver's sessions. Changing or resetting the password, a forced password
-change, enabling or disabling TOTP, and a role or admin change all make the
-device's next poll answer `invalid_grant` with a `DEVICE_TOKEN_REJECTED` audit
-row. So does revoking any of the approver's refresh families, which includes
-signing out of a single session. Changing your password therefore also stops a
-device you approved but that has not yet collected its tokens. Tokens a device
+An approval is measured from the moment the approving session token was
+issued, not from the click. If, after that token was issued, anything
+invalidated the approver's sessions, the token cannot approve (verify, approve
+and deny answer 401, audited as `DEVICE_AUTHORIZATION_FAILED`), and an approval
+it already gave is void: the device's next poll answers `invalid_grant` with a
+`DEVICE_TOKEN_REJECTED` audit row. The signals are changing or resetting the
+password, a forced password change, enabling or disabling TOTP, a role or admin
+change, and revoking any of the approver's refresh families, which includes
+signing out of a single session. An access token from a session that was
+signed out therefore cannot be turned into a new refresh family, and changing
+your password also stops a device you approved but that has not yet collected
+its tokens. A user who gets the 401 signs in again and retries. Tokens a device
 has already collected are revoked like any other session.
 
 Wrong, malformed, expired or already-decided codes count against the per-user
 and per-IP failed-attempt budgets. Once either budget is spent, verify, approve
-and deny answer 429 until the window passes. These budgets ignore
+and deny answer 429 until the window passes. Each attempt reserves its unit
+before the code is looked up and gets it back unless the code was wrong, so
+concurrent guesses cannot overrun a budget. These budgets ignore
 `RATE_LIMIT_ENABLED` and the rate-limit exemptions, because they guard a secret
 rather than shed load. They are kept per process, so each replica keeps its own.
 
 User codes are 8 characters from `BCDFGHJKLMNPQRSTVWXZ` (no vowels, no digits;
 about 2^34.6 possibilities) and are case- and hyphen-insensitive.
 
-At most 10,000 unexpired flows exist instance-wide; past that,
+At most 10,000 unexpired flows exist instance-wide (enforced under a database
+lock, so concurrent requests cannot overshoot it); past that,
 `/device/code` answers 503 `temporarily_unavailable` until the sweep removes
 expired ones. With the per-IP limit (10 per window) and the 10-minute lifetime,
 roughly 100 client IPs acting together can fill that pool and deny new device
@@ -178,7 +192,7 @@ accounts, there is currently no sign-in page to create that session.
 | `DEVICE_CODE_ISSUED` | A client started a flow (anonymous actor; client IP, `client_id`, scopes). |
 | `DEVICE_AUTHORIZATION_APPROVED` | A user approved (granted and withheld scopes). |
 | `DEVICE_AUTHORIZATION_DENIED` | A user denied. |
-| `DEVICE_AUTHORIZATION_FAILED` | A refused verify/approve/deny, with `reason`: `invalid_or_expired_code`, `throttled`, `no_grantable_scope`, `account_not_eligible`, or the credential kind that was refused. |
+| `DEVICE_AUTHORIZATION_FAILED` | A refused verify/approve/deny, with `reason`: `invalid_or_expired_code`, `throttled`, `no_grantable_scope`, `account_not_eligible`, the credential kind that was refused, or the session invalidation that voided the calling token (`approver_credential_changed`, `approver_must_change_password`, `approver_sessions_revoked`). |
 | `LOGIN` (`auth_method: device_flow`) | Tokens were issued. |
 | `DEVICE_TOKEN_REJECTED` | A redeemed code was presented again (`replay`), or the approver can no longer receive tokens (`approver_not_eligible`, `approver_inactive`, `approver_credential_changed`, `approver_must_change_password`, `approver_sessions_revoked`, `no_grantable_scope`). |
 | `DEVICE_AUTHORIZATION_EXPIRED` | An approved code expired without being redeemed. |

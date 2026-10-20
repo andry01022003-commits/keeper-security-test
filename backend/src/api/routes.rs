@@ -774,15 +774,30 @@ fn api_v1_routes(
     // (DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW, default 10). Token polling gets
     // a bucket sized like the other public auth endpoints but separate from
     // theirs, so a polling CLI never spends a user's refresh/logout budget;
-    // per-code pacing is enforced by `slow_down` itself.
-    let device_code_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.device_auth.code_requests_per_window,
-        state.config.rate_limit_window_secs,
-    ));
-    let device_token_rate_limiter = Arc::new(RateLimiter::new(
-        state.config.rate_limit_auth_per_window,
-        state.config.rate_limit_window_secs,
-    ));
+    // per-code pacing is enforced by `slow_down` itself. The signed-in
+    // verify/approve/deny calls get a per-user bucket of the same size, also
+    // separate from refresh/logout.
+    let device_code_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.device_auth.code_requests_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_code"),
+    );
+    let device_token_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_token"),
+    );
+    let device_approval_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_approval"),
+    );
     // Failed user-code budgets (per user and per IP) for verify/approve/deny.
     // Always on: see `DeviceApprovalThrottle`.
     let device_approval_throttle = handlers::device::DeviceApprovalThrottle::new(
@@ -851,7 +866,7 @@ fn api_v1_routes(
         trusted_proxies: Arc::clone(&trusted_proxies),
     };
     let device_approval_rate_limit_state = RateLimitState {
-        limiter: Arc::clone(&auth_rate_limiter),
+        limiter: Arc::clone(&device_approval_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
         trusted_proxies: Arc::clone(&trusted_proxies),
@@ -870,6 +885,7 @@ fn api_v1_routes(
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         let device_code_cleanup = Arc::clone(&device_code_rate_limiter);
         let device_token_cleanup = Arc::clone(&device_token_rate_limiter);
+        let device_approval_cleanup = Arc::clone(&device_approval_rate_limiter);
         let device_throttle_cleanup = device_approval_throttle.clone();
         let device_db = state.db.clone();
         tokio::spawn(async move {
@@ -886,6 +902,7 @@ fn api_v1_routes(
                 password_change_cleanup.cleanup_expired().await;
                 device_code_cleanup.cleanup_expired().await;
                 device_token_cleanup.cleanup_expired().await;
+                device_approval_cleanup.cleanup_expired().await;
                 device_throttle_cleanup.cleanup_expired().await;
                 // Delete expired device authorizations (and audit approvals
                 // nobody redeemed). Runs whether or not the grant is enabled,
@@ -1687,7 +1704,16 @@ mod tests {
         assert_eq!(login.inner.limiter.name(), "login");
         assert_eq!(login.backstop.name(), "login_global");
         assert_eq!(token.inner.limiter.name(), "token");
-        for name in ["auth", "api", "search", "presign", "password_change"] {
+        for name in [
+            "auth",
+            "api",
+            "search",
+            "presign",
+            "password_change",
+            "device_code",
+            "device_token",
+            "device_approval",
+        ] {
             assert!(
                 ROUTES_RS_SRC.contains(&format!(".named(\"{name}\")")),
                 "the {name} limiter must be named for ak_rate_limit_rejections_total"

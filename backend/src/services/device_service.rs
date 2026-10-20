@@ -13,6 +13,8 @@
 //! the database clock, so replicas with skewed clocks agree on expiry and on
 //! the polling interval.
 
+use std::net::IpAddr;
+
 use chrono::{DateTime, Utc};
 use rand::RngExt;
 use sha2::{Digest, Sha256};
@@ -20,6 +22,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::auth_service::CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS;
 
 /// User-code alphabet: the 20 consonants RFC 8628 §6.1 suggests. No vowels
 /// (so a code cannot spell a word) and no digits (no 0/O or 1/I confusion).
@@ -48,7 +51,11 @@ pub struct DeviceSession {
     pub status: String,
     pub decided_by_user_id: Option<Uuid>,
     pub granted_scopes: Option<Vec<String>>,
-    pub allowed_repo_ids: Option<Vec<Uuid>>,
+    /// Issued-at of the session token that approved (see
+    /// [`DeviceService::approver_invalidated_since`]).
+    pub approver_iat: Option<DateTime<Utc>>,
+    /// Client IP that started the flow, shown on the approval page.
+    pub requester_ip: Option<String>,
     pub interval_secs: i32,
     pub expires_at: DateTime<Utc>,
     pub last_polled_at: Option<DateTime<Utc>>,
@@ -158,26 +165,36 @@ impl DeviceService {
     /// Start a device authorization. `scopes` must already be validated.
     ///
     /// Refuses with `ServiceUnavailable` once [`MAX_LIVE_SESSIONS`] unexpired
-    /// authorizations exist. A user-code collision (possible, if rare, since
-    /// the digest is `UNIQUE`) is retried with fresh codes.
+    /// authorizations exist. The count and the insert run under one
+    /// transaction-scoped advisory lock, so concurrent requests cannot
+    /// overshoot the cap. A user-code collision (possible, if rare, since the
+    /// digest is `UNIQUE`) is retried with fresh codes.
     pub async fn create_session(
         &self,
         client_id: &str,
         scopes: &[String],
         ttl_secs: u32,
         interval_secs: u32,
+        requester_ip: Option<IpAddr>,
     ) -> Result<NewDeviceSession> {
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let mut tx = self.db.begin().await.map_err(db_err)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('device_sessions_live_cap'))")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         let live: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM device_sessions WHERE expires_at > now()")
-                .fetch_one(&self.db)
+                .fetch_one(&mut *tx)
                 .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+                .map_err(db_err)?;
         if live >= MAX_LIVE_SESSIONS {
             return Err(AppError::ServiceUnavailable(
                 "Too many device authorizations are in progress. Retry later.".into(),
             ));
         }
 
+        let requester_ip = requester_ip.map(|ip| ip.to_string());
         for _ in 0..5 {
             let device_code = Self::generate_device_code();
             let user_code = Self::generate_user_code();
@@ -185,11 +202,11 @@ impl DeviceService {
                 r#"
                 INSERT INTO device_sessions
                     (device_code_hash, user_code_hash, client_id, requested_scopes,
-                     interval_secs, expires_at)
-                VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))
+                     interval_secs, expires_at, requester_ip)
+                VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7)
                 ON CONFLICT DO NOTHING
                 RETURNING id, client_id, requested_scopes, status, decided_by_user_id,
-                          granted_scopes, allowed_repo_ids, interval_secs, expires_at,
+                          granted_scopes, approver_iat, requester_ip, interval_secs, expires_at,
                           last_polled_at, poll_count, decided_at, consumed_at, created_at
                 "#,
             )
@@ -199,10 +216,12 @@ impl DeviceService {
             .bind(scopes)
             .bind(interval_secs as i32)
             .bind(f64::from(ttl_secs))
-            .fetch_optional(&self.db)
+            .bind(requester_ip.as_deref())
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(db_err)?;
             if let Some(session) = inserted {
+                tx.commit().await.map_err(db_err)?;
                 return Ok(NewDeviceSession {
                     session,
                     device_code,
@@ -220,7 +239,7 @@ impl DeviceService {
         sqlx::query_as::<_, DeviceSession>(
             r#"
             SELECT id, client_id, requested_scopes, status, decided_by_user_id,
-                   granted_scopes, allowed_repo_ids, interval_secs, expires_at,
+                   granted_scopes, approver_iat, requester_ip, interval_secs, expires_at,
                    last_polled_at, poll_count, decided_at, consumed_at, created_at
             FROM device_sessions
             WHERE user_code_hash = $1 AND status = 'pending' AND expires_at > now()
@@ -233,14 +252,15 @@ impl DeviceService {
     }
 
     /// Approve pending session `id` for `user_id` with the already-capped
-    /// `granted_scopes`. Returns `false` if the session is no longer pending
-    /// and unexpired (a concurrent approval or denial won, or it expired).
+    /// `granted_scopes`. `approver_iat` is the issued-at of the session token
+    /// that approved. Returns `false` if the session is no longer pending and
+    /// unexpired (a concurrent approval or denial won, or it expired).
     pub async fn approve(
         &self,
         id: Uuid,
         user_id: Uuid,
         granted_scopes: &[String],
-        allowed_repo_ids: Option<&[Uuid]>,
+        approver_iat: DateTime<Utc>,
     ) -> Result<bool> {
         let rows = sqlx::query(
             r#"
@@ -249,14 +269,14 @@ impl DeviceService {
                 decided_by_user_id = $2,
                 decided_at = now(),
                 granted_scopes = $3,
-                allowed_repo_ids = $4
+                approver_iat = $4
             WHERE id = $1 AND status = 'pending' AND expires_at > now()
             "#,
         )
         .bind(id)
         .bind(user_id)
         .bind(granted_scopes)
-        .bind(allowed_repo_ids)
+        .bind(approver_iat)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -326,7 +346,7 @@ impl DeviceService {
                     WHERE device_code_hash = $1 AND client_id = $2
                       AND status = 'approved' AND expires_at > now()
                     RETURNING id, client_id, requested_scopes, status, decided_by_user_id,
-                              granted_scopes, allowed_repo_ids, interval_secs, expires_at,
+                              granted_scopes, approver_iat, requester_ip, interval_secs, expires_at,
                               last_polled_at, poll_count, decided_at, consumed_at, created_at
                     "#,
                 )
@@ -353,7 +373,7 @@ impl DeviceService {
         let row = sqlx::query_as::<_, Classified>(
             r#"
             SELECT id, client_id, requested_scopes, status, decided_by_user_id,
-                   granted_scopes, allowed_repo_ids, interval_secs, expires_at,
+                   granted_scopes, approver_iat, requester_ip, interval_secs, expires_at,
                    last_polled_at, poll_count, decided_at, consumed_at, created_at,
                    expires_at <= now() AS expired
             FROM device_sessions
@@ -396,33 +416,47 @@ impl DeviceService {
         Ok(PollOutcome::SlowDown { interval_secs })
     }
 
-    /// Why the approver's authority lapsed after they approved at
-    /// `decided_at`, or `None` if it still stands.
+    /// Why the approver's authority lapsed after the session token they
+    /// approved with was issued (`approver_iat`), or after the approval itself
+    /// (`decided_at`, `None` while still deciding), or `None` if it stands.
     ///
     /// Redemption must never be weaker than a refresh: every invalidation
     /// that stops the approver's existing sessions must also void an approval
-    /// they gave before it. Checked in the database's own clock (the same one
-    /// that stamped `decided_at`), so replica clock skew cannot open a window:
+    /// they gave with one of them. Measuring from the token's issued-at, not
+    /// from the approval, also covers an access token that outlived its own
+    /// session: a JWT from a signed-out session (or one issued before a TOTP
+    /// enable) stays valid until it expires, but cannot approve, and an
+    /// approval it made is never redeemed.
+    ///
+    /// `approver_iat` is stamped by the API host's clock and the signals below
+    /// by the database's, so it gets the same
+    /// [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] the access-token watermark
+    /// check uses. `decided_at` is a database timestamp and needs none; the
+    /// earlier of the two thresholds applies.
     ///
     /// * `approver_inactive`: deactivated or deleted (`is_active`).
     /// * `approver_credential_changed`: the refresh path's credential
     ///   watermark, `GREATEST(password_changed_at, totp_verified_at,
-    ///   privileges_changed_at)`, moved at or after the approval (password
+    ///   privileges_changed_at)`, moved at or after the threshold (password
     ///   change or reset, TOTP enrolment, role or admin change).
     /// * `approver_must_change_password`: an admin forced a password change.
     /// * `approver_sessions_revoked`: a refresh family of the approver was
-    ///   revoked at or after the approval. Every "sign out everywhere" path
+    ///   revoked at or after the threshold. Every "sign out everywhere" path
     ///   (password change/reset, forced change, TOTP enable/disable,
     ///   deactivation, SSO offboarding) revokes all families, and TOTP disable
     ///   and forced change leave no other cross-replica trace. This also
-    ///   voids a pending approval when the approver signs out of any single
-    ///   session, or refresh replay detection revokes a family; failing closed
-    ///   there only means the device starts a new flow.
+    ///   voids an approval when the approver signs out of any single session,
+    ///   or refresh replay detection revokes a family; failing closed there
+    ///   only means the user signs in again or the device starts a new flow.
     pub async fn approver_invalidated_since(
         &self,
         user_id: Uuid,
-        decided_at: DateTime<Utc>,
+        approver_iat: DateTime<Utc>,
+        decided_at: Option<DateTime<Utc>>,
     ) -> Result<Option<&'static str>> {
+        let from_iat =
+            approver_iat + chrono::Duration::milliseconds(CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS);
+        let since = decided_at.map_or(from_iat, |decided| decided.min(from_iat));
         let row = sqlx::query_as::<_, (bool, bool, bool, bool)>(
             r#"
             SELECT
@@ -442,7 +476,7 @@ impl DeviceService {
             "#,
         )
         .bind(user_id)
-        .bind(decided_at)
+        .bind(since)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -578,7 +612,7 @@ mod tests {
         };
         let service = DeviceService::new(pool.clone());
         let created = service
-            .create_session("digest-client", &scopes(&["read:artifacts"]), 600, 5)
+            .create_session("digest-client", &scopes(&["read:artifacts"]), 600, 5, None)
             .await
             .expect("create session");
 
@@ -602,7 +636,7 @@ mod tests {
         let user_id = seed_user(&pool).await;
         let service = DeviceService::new(pool.clone());
         let created = service
-            .create_session("once-client", &scopes(&["read:artifacts"]), 600, 1)
+            .create_session("once-client", &scopes(&["read:artifacts"]), 600, 1, None)
             .await
             .expect("create session");
         let pending = service
@@ -611,7 +645,12 @@ mod tests {
             .expect("find")
             .expect("pending session");
         assert!(service
-            .approve(pending.id, user_id, &scopes(&["read:artifacts"]), None)
+            .approve(
+                pending.id,
+                user_id,
+                &scopes(&["read:artifacts"]),
+                Utc::now()
+            )
             .await
             .expect("approve"));
 
@@ -648,7 +687,7 @@ mod tests {
         let user_id = seed_user(&pool).await;
         let service = DeviceService::new(pool.clone());
         let created = service
-            .create_session("race-client", &scopes(&["read:artifacts"]), 600, 1)
+            .create_session("race-client", &scopes(&["read:artifacts"]), 600, 1, None)
             .await
             .expect("create session");
         let pending = service
@@ -657,7 +696,12 @@ mod tests {
             .expect("find")
             .expect("pending");
         assert!(service
-            .approve(pending.id, user_id, &scopes(&["read:artifacts"]), None)
+            .approve(
+                pending.id,
+                user_id,
+                &scopes(&["read:artifacts"]),
+                Utc::now()
+            )
             .await
             .expect("approve"));
 
@@ -687,7 +731,7 @@ mod tests {
         };
         let service = DeviceService::new(pool.clone());
         let created = service
-            .create_session("slow-client", &scopes(&["read:artifacts"]), 600, 5)
+            .create_session("slow-client", &scopes(&["read:artifacts"]), 600, 5, None)
             .await
             .expect("create session");
 
@@ -760,7 +804,7 @@ mod tests {
 
         // Unknown device code, and a real code presented by another client.
         let created = service
-            .create_session("bound-client", &scopes(&["read:artifacts"]), 600, 1)
+            .create_session("bound-client", &scopes(&["read:artifacts"]), 600, 1, None)
             .await
             .expect("create session");
         assert!(matches!(
@@ -802,7 +846,7 @@ mod tests {
 
         // Expired, even after approval: not redeemable, not approvable.
         let expiring = service
-            .create_session("bound-client", &scopes(&["read:artifacts"]), 600, 1)
+            .create_session("bound-client", &scopes(&["read:artifacts"]), 600, 1, None)
             .await
             .expect("create session");
         let pending = service
@@ -811,7 +855,12 @@ mod tests {
             .unwrap()
             .expect("pending");
         assert!(service
-            .approve(pending.id, user_id, &scopes(&["read:artifacts"]), None)
+            .approve(
+                pending.id,
+                user_id,
+                &scopes(&["read:artifacts"]),
+                Utc::now()
+            )
             .await
             .unwrap());
         sqlx::query(
@@ -831,7 +880,7 @@ mod tests {
 
         // An expired pending code cannot be approved either.
         let stale = service
-            .create_session("bound-client", &scopes(&["read:artifacts"]), 600, 1)
+            .create_session("bound-client", &scopes(&["read:artifacts"]), 600, 1, None)
             .await
             .expect("create session");
         sqlx::query(
@@ -851,7 +900,7 @@ mod tests {
                 stale.session.id,
                 user_id,
                 &scopes(&["read:artifacts"]),
-                None
+                Utc::now()
             )
             .await
             .unwrap());
@@ -884,7 +933,13 @@ mod tests {
         let second = seed_user(&pool).await;
         let service = DeviceService::new(pool.clone());
         let created = service
-            .create_session("overwrite-client", &scopes(&["read:artifacts"]), 600, 1)
+            .create_session(
+                "overwrite-client",
+                &scopes(&["read:artifacts"]),
+                600,
+                1,
+                None,
+            )
             .await
             .expect("create session");
         assert!(service
@@ -892,7 +947,7 @@ mod tests {
                 created.session.id,
                 first,
                 &scopes(&["read:artifacts"]),
-                None
+                Utc::now()
             )
             .await
             .unwrap());
@@ -901,7 +956,7 @@ mod tests {
                 created.session.id,
                 second,
                 &scopes(&["read:artifacts"]),
-                None
+                Utc::now()
             )
             .await
             .unwrap());
@@ -930,7 +985,7 @@ mod tests {
         let user_id = seed_user(&pool).await;
         let service = DeviceService::new(pool.clone());
         let created = service
-            .create_session("cascade-client", &scopes(&["read:artifacts"]), 600, 1)
+            .create_session("cascade-client", &scopes(&["read:artifacts"]), 600, 1, None)
             .await
             .expect("create session");
         assert!(service
@@ -938,7 +993,7 @@ mod tests {
                 created.session.id,
                 user_id,
                 &scopes(&["read:artifacts"]),
-                None
+                Utc::now()
             )
             .await
             .unwrap());

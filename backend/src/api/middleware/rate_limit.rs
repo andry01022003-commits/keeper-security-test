@@ -391,6 +391,22 @@ impl RateLimiter {
         entry.0 = entry.0.saturating_add(1);
     }
 
+    /// Give back one unit [`Self::check_rate_limit`] took from `key`, for a
+    /// budget that reserves up front and charges only failures (the device
+    /// user-code throttle, #3461). Reserving atomically and refunding
+    /// successes, rather than peeking and charging failures afterwards, means
+    /// N concurrent attempts cannot all pass the check before any is charged.
+    /// A no-op once the window has rolled over or nothing is left to give back.
+    pub fn refund_attempt(&self, key: &str) {
+        let now = Instant::now();
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = requests.get_mut(key) {
+            if now.duration_since(entry.1) < self.window {
+                entry.0 = entry.0.saturating_sub(1);
+            }
+        }
+    }
+
     /// The length of this limiter's window.
     pub(crate) fn window(&self) -> Duration {
         self.window

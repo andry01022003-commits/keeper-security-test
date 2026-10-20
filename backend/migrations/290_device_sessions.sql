@@ -18,6 +18,11 @@ CREATE TABLE IF NOT EXISTS device_sessions (
     -- the audit trail.
     client_id TEXT NOT NULL
         CHECK (char_length(client_id) BETWEEN 1 AND 128),
+    -- Client IP that started the flow (resolved through the trusted proxies),
+    -- shown on the approval page so the user can spot a request that is not
+    -- theirs (RFC 8628 section 5.4). NULL when it could not be determined.
+    requester_ip TEXT
+        CHECK (requester_ip IS NULL OR char_length(requester_ip) <= 64),
     requested_scopes TEXT[] NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approved', 'denied', 'consumed')),
@@ -26,8 +31,11 @@ CREATE TABLE IF NOT EXISTS device_sessions (
     decided_by_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     -- Scopes actually granted: requested_scopes capped by the approver.
     granted_scopes TEXT[],
-    -- Repository allow-list inherited from the approver (NULL = unrestricted).
-    allowed_repo_ids UUID[],
+    -- Issued-at of the session token that approved. Every later credential
+    -- change or session revocation of the approver is measured from here, so
+    -- an approval made with an access token from an already signed-out
+    -- session cannot be redeemed.
+    approver_iat TIMESTAMPTZ,
     interval_secs INTEGER NOT NULL
         CHECK (interval_secs BETWEEN 1 AND 300),
     expires_at TIMESTAMPTZ NOT NULL,
@@ -41,7 +49,10 @@ CREATE TABLE IF NOT EXISTS device_sessions (
         OR (decided_by_user_id IS NOT NULL AND decided_at IS NOT NULL)
     ),
     CONSTRAINT device_sessions_grant_recorded CHECK (
-        status NOT IN ('approved', 'consumed') OR granted_scopes IS NOT NULL
+        CASE WHEN status IN ('approved', 'consumed')
+            THEN granted_scopes IS NOT NULL AND approver_iat IS NOT NULL
+            ELSE granted_scopes IS NULL AND approver_iat IS NULL
+        END
     ),
     CONSTRAINT device_sessions_consumed_at CHECK (
         (status = 'consumed') = (consumed_at IS NOT NULL)
@@ -50,3 +61,7 @@ CREATE TABLE IF NOT EXISTS device_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_device_sessions_expires_at
     ON device_sessions (expires_at);
+
+-- The approver FK cascades on user deletion.
+CREATE INDEX IF NOT EXISTS idx_device_sessions_decided_by_user_id
+    ON device_sessions (decided_by_user_id);

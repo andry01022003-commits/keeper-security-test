@@ -44,6 +44,7 @@
 //!   error shape.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Extension, Request, State};
@@ -52,6 +53,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
@@ -185,6 +187,13 @@ pub struct VerifyUserCodeResponse {
     pub withheld_scopes: Vec<String>,
     /// Seconds until the code expires.
     pub expires_in: i64,
+    /// Seconds since the device started this request (RFC 8628 §5.4: the
+    /// page shows when and from where the request came, so a user can spot
+    /// one that is not theirs).
+    pub requested_seconds_ago: i64,
+    /// Client IP that started the request, as resolved through the trusted
+    /// proxies, if known.
+    pub requested_from: Option<String>,
 }
 
 /// Outcome of an approve or deny.
@@ -269,6 +278,12 @@ pub async fn oauth_rate_limit_response(request: Request, next: Next) -> Response
 /// * per client IP (resolved through `RATE_LIMIT_TRUSTED_PROXY_CIDRS`): one
 ///   host cannot multiply its guesses across many accounts.
 ///
+/// Every attempt reserves one unit from both budgets atomically before it
+/// looks at the code, and the reservation is refunded unless the attempt
+/// turns out to be a bad code ([`ThrottleReservation`]). Peeking first and
+/// charging afterwards would let N concurrent wrong guesses all pass the
+/// check before any of them was charged.
+///
 /// This is a security control, not load shedding, so unlike the request
 /// limiters it honours neither the rate-limit exemptions nor
 /// `RATE_LIMIT_ENABLED=false`. Budgets are per process: N replicas allow up to
@@ -300,24 +315,59 @@ impl DeviceApprovalThrottle {
         (format!("device-user:{user_id}"), format!("device-ip:{ip}"))
     }
 
-    /// `Err(retry_after_secs)` when either budget is spent.
-    async fn check(&self, user_id: Uuid, ip: Option<IpAddr>) -> std::result::Result<(), u64> {
+    /// Reserve one attempt from both budgets, or `Err(retry_after_secs)` when
+    /// either is spent (nothing stays reserved then).
+    async fn reserve(
+        &self,
+        user_id: Uuid,
+        ip: Option<IpAddr>,
+    ) -> std::result::Result<ThrottleReservation, u64> {
         let (user_key, ip_key) = Self::keys(user_id, ip);
-        self.per_user.peek_rate_limit(&user_key).await?;
-        self.per_ip.peek_rate_limit(&ip_key).await?;
-        Ok(())
-    }
-
-    async fn record_failure(&self, user_id: Uuid, ip: Option<IpAddr>) {
-        let (user_key, ip_key) = Self::keys(user_id, ip);
-        self.per_user.record_attempt(&user_key).await;
-        self.per_ip.record_attempt(&ip_key).await;
+        self.per_user.check_rate_limit(&user_key).await?;
+        if let Err(retry_after) = self.per_ip.check_rate_limit(&ip_key).await {
+            self.per_user.refund_attempt(&user_key);
+            return Err(retry_after);
+        }
+        Ok(ThrottleReservation {
+            throttle: self.clone(),
+            user_key,
+            ip_key,
+            charged: AtomicBool::new(false),
+        })
     }
 
     /// Drop expired buckets; called from the periodic limiter sweep.
     pub async fn cleanup_expired(&self) {
         self.per_user.cleanup_expired().await;
         self.per_ip.cleanup_expired().await;
+    }
+}
+
+/// One attempt reserved from both [`DeviceApprovalThrottle`] budgets. It is
+/// refunded when dropped unless [`Self::charge`] marked the attempt a failure,
+/// so every exit path that is not a bad code (success, a concurrent decision,
+/// a database error) gives the unit back.
+#[derive(Debug)]
+struct ThrottleReservation {
+    throttle: DeviceApprovalThrottle,
+    user_key: String,
+    ip_key: String,
+    charged: AtomicBool,
+}
+
+impl ThrottleReservation {
+    /// Keep the reserved unit: this attempt was a bad code.
+    fn charge(&self) {
+        self.charged.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ThrottleReservation {
+    fn drop(&mut self) {
+        if !self.charged.load(Ordering::Relaxed) {
+            self.throttle.per_user.refund_attempt(&self.user_key);
+            self.throttle.per_ip.refund_attempt(&self.ip_key);
+        }
     }
 }
 
@@ -376,6 +426,7 @@ pub async fn device_page() -> impl IntoResponse {
     <p>A device is asking to act as you with these permissions:</p>
     <ul id="scopes"></ul>
     <p id="withheld" class="note" hidden></p>
+    <p id="origin" class="note"></p>
     <p id="expiry" class="note"></p>
     <p>Approve only if you started this sign-in yourself.</p>
     <div class="actions">
@@ -455,6 +506,7 @@ pub async fn device_page_script() -> impl IntoResponse {
   }
   function failure(res) {
     if (res.status === 429) { return 'Too many incorrect codes. Wait a few minutes and try again.'; }
+    if (res.status === 401) { return 'Your sign-in session is no longer valid. Sign in again, then come back to this page.'; }
     if (res.status === 403) { return 'This sign-in cannot approve devices. Sign in to the web UI with your own account.'; }
     if (res.status === 400 || res.status === 404 || res.status === 409) {
       return 'That code is not valid or has expired. Check the code on your device.';
@@ -507,6 +559,10 @@ pub async fn device_page_script() -> impl IntoResponse {
       $('withheld').textContent = withheld.length
         ? 'Also requested, but not granted because your account cannot grant them: ' + withheld.join(', ')
         : '';
+      var ago = Math.round((res.body.requested_seconds_ago || 0) / 60);
+      $('origin').textContent = 'Requested ' + (ago < 1 ? 'less than a minute' : 'about ' + ago + ' minute(s)')
+        + ' ago' + (res.body.requested_from ? ' from IP address ' + String(res.body.requested_from) : '')
+        + '. If that is not you, deny it.';
       var mins = Math.max(1, Math.round((res.body.expires_in || 0) / 60));
       $('expiry').textContent = 'This code expires in about ' + mins + ' minute(s).';
       $('enter').hidden = true;
@@ -675,6 +731,11 @@ pub async fn create_device_code(
         Err(message) => return oauth_error(StatusCode::BAD_REQUEST, "invalid_scope", message),
     };
 
+    let ip = client_ip(
+        &headers,
+        connect.as_ref(),
+        &state.config.rate_limit_trusted_proxy_cidrs,
+    );
     let config = &state.config.device_auth;
     let created = match DeviceService::new(state.db.clone())
         .create_session(
@@ -682,6 +743,7 @@ pub async fn create_device_code(
             &scopes,
             config.code_ttl_secs,
             config.poll_interval_secs,
+            ip,
         )
         .await
     {
@@ -704,11 +766,7 @@ pub async fn create_device_code(
             "scopes": scopes,
         }),
     );
-    if let Some(ip) = client_ip(
-        &headers,
-        connect.as_ref(),
-        &state.config.rate_limit_trusted_proxy_cidrs,
-    ) {
+    if let Some(ip) = ip {
         entry = entry.ip(ip);
     }
     audit_fire_and_forget(state.db.clone(), entry).await;
@@ -849,7 +907,13 @@ async fn redeem(state: &SharedState, session: DeviceSession, ip: Option<IpAddr>)
         .fetch_optional(&state.db)
         .await
     {
-        Ok(Some(user)) if user.is_active && !user.is_service_account => user,
+        Ok(Some(user))
+            if user.is_active
+                && !user.is_service_account
+                && !AuthService::is_account_locked(user.locked_until, Utc::now()) =>
+        {
+            user
+        }
         Ok(_) => {
             audit_token_rejected(state, &session, ip, "approver_not_eligible").await;
             return invalid_grant();
@@ -857,26 +921,26 @@ async fn redeem(state: &SharedState, session: DeviceSession, ip: Option<IpAddr>)
         Err(error) => return oauth_server_error("load approver", &AppError::from(error)),
     };
 
-    // Everything that invalidates the approver's own sessions after they
-    // approved voids the approval too (see `approver_invalidated_since`).
-    // The freshly minted pair would otherwise carry an `iat` after the
-    // credential change and sail past the watermark check that kills every
-    // other session. The DB signals are authoritative across replicas; the
-    // in-memory watermark additionally catches an invalidation on this
-    // replica (`invalidate_user_tokens*`) with the same `<=` the sync
-    // access-token check applies.
-    let Some(decided_at) = session.decided_at else {
+    // Everything that invalidates the session the approver approved with,
+    // after that session's token was issued, voids the approval too (see
+    // `approver_invalidated_since`). The freshly minted pair would otherwise
+    // carry an `iat` after the credential change and sail past the watermark
+    // check that kills every other session. The DB signals are authoritative
+    // across replicas; the in-memory watermark additionally catches an
+    // invalidation on this replica (`invalidate_user_tokens*`) with the same
+    // `<=` the sync access-token check applies to the approving token.
+    let (Some(decided_at), Some(approver_iat)) = (session.decided_at, session.approver_iat) else {
         return oauth_server_error(
-            "consumed device session has no decision time",
+            "consumed device session has no decision record",
             &AppError::Internal(format!("device session {}", session.id)),
         );
     };
     let lapsed = match DeviceService::new(state.db.clone())
-        .approver_invalidated_since(user.id, decided_at)
+        .approver_invalidated_since(user.id, approver_iat, Some(decided_at))
         .await
     {
         Ok(reason) => reason.or_else(|| {
-            is_token_invalidated(user.id, decided_at.timestamp_millis())
+            is_token_invalidated(user.id, approver_iat.timestamp_millis())
                 .then_some("approver_credential_changed")
         }),
         Err(error) => return oauth_server_error("re-check approver", &error),
@@ -900,14 +964,7 @@ async fn redeem(state: &SharedState, session: DeviceSession, ip: Option<IpAddr>)
     }
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let tokens = match mint_device_tokens(
-        &auth_service,
-        &user,
-        granted.clone(),
-        session.allowed_repo_ids.clone(),
-    )
-    .await
-    {
+    let tokens = match mint_device_tokens(&auth_service, &user, granted.clone()).await {
         Ok(tokens) => tokens,
         Err(error) => return oauth_server_error("mint device tokens", &error),
     };
@@ -945,14 +1002,14 @@ async fn redeem(state: &SharedState, session: DeviceSession, ip: Option<IpAddr>)
 
 /// Mint the pair through the scoped minter and register the refresh `jti`,
 /// so the family takes part in rotation, replay detection and logout
-/// revocation like any other session (#1819).
+/// revocation like any other session (#1819). Never repository-restricted:
+/// only unrestricted approvers can approve (`refusal_reason`).
 async fn mint_device_tokens(
     auth_service: &AuthService,
     user: &User,
     scopes: Vec<String>,
-    allowed_repo_ids: Option<Vec<Uuid>>,
 ) -> Result<TokenPair> {
-    let tokens = auth_service.generate_tokens_with_scope(user, Some(scopes), allowed_repo_ids)?;
+    let tokens = auth_service.generate_tokens_with_scope(user, Some(scopes), None)?;
     auth_service
         .persist_refresh_jti_from_pair(&tokens, user.id)
         .await?;
@@ -1065,8 +1122,13 @@ impl Step {
 struct Approver {
     user: User,
     ip: Option<IpAddr>,
+    /// Issued-at of the session token making the call.
+    iat: DateTime<Utc>,
     /// Canonical user code, or `None` if the input could not be one.
     user_code: Option<String>,
+    /// This attempt's unit of the failed-code budgets; refunded on drop
+    /// unless [`bad_code`] charges it.
+    reservation: ThrottleReservation,
 }
 
 async fn audit_approval(
@@ -1097,8 +1159,15 @@ fn too_many_attempts(retry_after: u64) -> Response {
     response
 }
 
-/// Principal gate, then throttle gate, then user-code parsing. Returns the
-/// ready [`Approver`] or the response to send.
+/// The issued-at of a session JWT principal. [`refusal_reason`] has already
+/// refused every principal without one.
+fn principal_iat(auth: &AuthExtension) -> Option<DateTime<Utc>> {
+    auth.iat_ms.and_then(DateTime::<Utc>::from_timestamp_millis)
+}
+
+/// Principal gate, account gate, session-validity gate, then throttle gate
+/// and user-code parsing. Returns the ready [`Approver`] or the response to
+/// send.
 async fn admit(
     state: &SharedState,
     auth: &AuthExtension,
@@ -1108,38 +1177,46 @@ async fn admit(
     step: Step,
     raw_user_code: &str,
 ) -> std::result::Result<Approver, Response> {
-    if let Some(reason) = refusal_reason(auth, via_download_ticket) {
+    let refused = |reason: &'static str, user_id: Uuid| {
         audit_approval(
             state,
             AuditAction::DeviceAuthorizationFailed,
-            auth.user_id,
+            user_id,
             ip,
             serde_json::json!({"auth_method": "device_flow", "step": step.as_str(), "reason": reason}),
         )
-        .await;
-        return Err(AppError::Authorization(
-            "Device authorizations can only be verified, approved or denied from an \
-             interactive sign-in session"
-                .into(),
-        )
-        .into_response());
-    }
+    };
+
+    let iat = match (
+        refusal_reason(auth, via_download_ticket),
+        principal_iat(auth),
+    ) {
+        (None, Some(iat)) => iat,
+        (reason, _) => {
+            refused(reason.unwrap_or("not_a_session"), auth.user_id).await;
+            return Err(AppError::Authorization(
+                "Device authorizations can only be verified, approved or denied from an \
+                 interactive sign-in session"
+                    .into(),
+            )
+            .into_response());
+        }
+    };
 
     let user = match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(auth.user_id)
         .fetch_optional(&state.db)
         .await
     {
-        Ok(Some(user)) if user.is_active && !user.is_service_account => user,
+        Ok(Some(user))
+            if user.is_active
+                && !user.is_service_account
+                && !AuthService::is_account_locked(user.locked_until, Utc::now()) =>
+        {
+            user
+        }
         Ok(_) => {
-            audit_approval(
-                state,
-                AuditAction::DeviceAuthorizationFailed,
-                auth.user_id,
-                ip,
-                serde_json::json!({"auth_method": "device_flow", "step": step.as_str(), "reason": "account_not_eligible"}),
-            )
-            .await;
+            refused("account_not_eligible", auth.user_id).await;
             return Err(AppError::Authorization(
                 "This account cannot approve device authorizations".into(),
             )
@@ -1148,34 +1225,48 @@ async fn admit(
         Err(error) => return Err(AppError::from(error).into_response()),
     };
 
-    if let Err(retry_after) = throttle.check(user.id, ip).await {
-        audit_approval(
-            state,
-            AuditAction::DeviceAuthorizationFailed,
-            user.id,
-            ip,
-            serde_json::json!({"auth_method": "device_flow", "step": step.as_str(), "reason": "throttled"}),
-        )
-        .await;
-        return Err(too_many_attempts(retry_after));
+    // An access JWT outlives its session: after a sign-out, a password
+    // change or a TOTP enable it stays valid until it expires. Such a token
+    // must not be able to turn itself into a fresh refresh family through a
+    // device approval, so the same signals that void a pending approval also
+    // refuse the call.
+    match DeviceService::new(state.db.clone())
+        .approver_invalidated_since(user.id, iat, None)
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            refused(reason, user.id).await;
+            return Err(AppError::Authentication(
+                "Your sign-in session is no longer valid. Sign in again to approve devices.".into(),
+            )
+            .into_response());
+        }
+        Err(error) => return Err(error.into_response()),
     }
+
+    let reservation = match throttle.reserve(user.id, ip).await {
+        Ok(reservation) => reservation,
+        Err(retry_after) => {
+            refused("throttled", user.id).await;
+            return Err(too_many_attempts(retry_after));
+        }
+    };
 
     Ok(Approver {
         user,
         ip,
+        iat,
         user_code: normalize_user_code(raw_user_code),
+        reservation,
     })
 }
 
-/// A wrong, malformed, expired or already-decided user code: charge the
-/// failed-attempt budgets, audit, and answer with one indistinguishable 400.
-async fn bad_code(
-    state: &SharedState,
-    throttle: &DeviceApprovalThrottle,
-    approver: &Approver,
-    step: Step,
-) -> Response {
-    throttle.record_failure(approver.user.id, approver.ip).await;
+/// A wrong, malformed, expired or already-decided user code: keep the
+/// reserved failed-attempt unit, audit, and answer with one indistinguishable
+/// 400.
+async fn bad_code(state: &SharedState, approver: &Approver, step: Step) -> Response {
+    approver.reservation.charge();
     audit_approval(
         state,
         AuditAction::DeviceAuthorizationFailed,
@@ -1236,14 +1327,14 @@ pub async fn verify_user_code(
         Err(response) => return response,
     };
     let Some(code) = approver.user_code.as_deref() else {
-        return bad_code(&state, &throttle, &approver, step).await;
+        return bad_code(&state, &approver, step).await;
     };
     let session = match DeviceService::new(state.db.clone())
         .find_pending(code)
         .await
     {
         Ok(Some(session)) => session,
-        Ok(None) => return bad_code(&state, &throttle, &approver, step).await,
+        Ok(None) => return bad_code(&state, &approver, step).await,
         Err(error) => return error.into_response(),
     };
 
@@ -1255,9 +1346,9 @@ pub async fn verify_user_code(
         axum::Json(VerifyUserCodeResponse {
             scopes,
             withheld_scopes,
-            expires_in: (session.expires_at - chrono::Utc::now())
-                .num_seconds()
-                .max(0),
+            expires_in: (session.expires_at - Utc::now()).num_seconds().max(0),
+            requested_seconds_ago: (Utc::now() - session.created_at).num_seconds().max(0),
+            requested_from: session.requester_ip.clone(),
         }),
     )
         .into_response()
@@ -1310,12 +1401,12 @@ pub async fn approve_device(
         Err(response) => return response,
     };
     let Some(code) = approver.user_code.as_deref() else {
-        return bad_code(&state, &throttle, &approver, step).await;
+        return bad_code(&state, &approver, step).await;
     };
     let service = DeviceService::new(state.db.clone());
     let session = match service.find_pending(code).await {
         Ok(Some(session)) => session,
-        Ok(None) => return bad_code(&state, &throttle, &approver, step).await,
+        Ok(None) => return bad_code(&state, &approver, step).await,
         Err(error) => return error.into_response(),
     };
 
@@ -1342,20 +1433,23 @@ pub async fn approve_device(
         )
         .into_response();
     }
-    // Defense in depth: refusal_reason already rejected restricted
-    // credentials, so this is `None` for every caller that gets here.
-    let allowed_repo_ids = match auth.mint_repo_ceiling(false) {
-        Ok(ids) => ids,
+    // Device-issued pairs carry no repository restriction: a refresh would
+    // drop it anyway, so a restricted approver must never get this far.
+    // `refusal_reason` already refused every restricted credential; this is
+    // defense in depth, failing closed.
+    match auth.mint_repo_ceiling(false) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return AppError::Authorization(
+                "A repository-restricted sign-in cannot approve devices".into(),
+            )
+            .into_response()
+        }
         Err(error) => return error.into_response(),
-    };
+    }
 
     match service
-        .approve(
-            session.id,
-            approver.user.id,
-            &granted,
-            allowed_repo_ids.as_deref(),
-        )
+        .approve(session.id, approver.user.id, &granted, approver.iat)
         .await
     {
         Ok(true) => {}
@@ -1433,14 +1527,14 @@ pub async fn deny_device(
         Err(response) => return response,
     };
     let Some(code) = approver.user_code.as_deref() else {
-        return bad_code(&state, &throttle, &approver, step).await;
+        return bad_code(&state, &approver, step).await;
     };
     let session_id = match DeviceService::new(state.db.clone())
         .deny(code, approver.user.id)
         .await
     {
         Ok(Some(id)) => id,
-        Ok(None) => return bad_code(&state, &throttle, &approver, step).await,
+        Ok(None) => return bad_code(&state, &approver, step).await,
         Err(error) => return error.into_response(),
     };
 
@@ -2906,5 +3000,298 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["refresh_token"].is_string());
         cleanup_user(&pool, user_id).await;
+    }
+
+    // --- 2026-09-26 review: approving-token validity, atomic throttle,
+    // request context ----------------------------------------------------
+
+    /// Review finding 1: an access JWT from a session that was signed out
+    /// (its refresh family revoked after the JWT was issued) is still valid
+    /// until it expires, but it must not approve: the approval would turn it
+    /// into a fresh refresh family.
+    #[tokio::test]
+    async fn token_from_a_signed_out_session_cannot_approve() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (user_id, username) = h::create_user(&pool).await;
+        // The account predates the stale token below.
+        sqlx::query(
+            "UPDATE users SET password_changed_at = now() - interval '1 hour', \
+             privileges_changed_at = now() - interval '1 hour' WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let browser = auth_service.generate_tokens(&user).unwrap();
+        auth_service
+            .persist_refresh_jti_from_pair(&browser, user_id)
+            .await
+            .unwrap();
+        // The access token was issued a minute ago; the session was signed
+        // out (its family revoked) since.
+        let stale = AuthExtension {
+            iat_ms: Some((Utc::now() - chrono::Duration::minutes(1)).timestamp_millis()),
+            ..h::make_auth(user_id, &username)
+        };
+        auth_service
+            .revoke_refresh_token_family_for(&browser.refresh_token)
+            .await
+            .unwrap();
+
+        let (device_code, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
+        for path in ["/verify", "/approve"] {
+            let (status, _, body) = send(
+                app(&state, Some(stale.clone()), &throttle),
+                json(path, serde_json::json!({"user_code": user_code})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+        }
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("pending")
+        );
+        assert!(
+            audit_count(
+                &pool,
+                "DEVICE_AUTHORIZATION_FAILED",
+                ("details->>'reason'", "approver_sessions_revoked".into())
+            )
+            .await
+                >= 1
+        );
+        let (_, _, body) = send(app(&state, None, &throttle), token_form(&device_code)).await;
+        assert_eq!(body["error"], "authorization_pending", "{body}");
+
+        // A token issued after the sign-out (a fresh sign-in) approves.
+        let (status, _, body) = send(
+            app(&state, Some(session(user_id, &username)), &throttle),
+            json("/approve", serde_json::json!({"user_code": user_code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// The approval records the approving token's issued-at, and redemption
+    /// measures invalidations from it.
+    #[tokio::test]
+    async fn approval_records_the_approving_token_iat() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (user_id, username) = h::create_user(&pool).await;
+        let auth = session(user_id, &username);
+        let (_, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
+        let (status, _, _) = send(
+            app(&state, Some(auth.clone()), &throttle),
+            json("/approve", serde_json::json!({"user_code": user_code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let iat: chrono::DateTime<Utc> = sqlx::query_scalar(
+            "SELECT approver_iat FROM device_sessions WHERE decided_by_user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(Some(iat.timestamp_millis()), auth.iat_ms);
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// A locked account (failed-login lockout) can neither approve nor have
+    /// an earlier approval redeemed.
+    #[tokio::test]
+    async fn locked_account_cannot_approve_or_redeem() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (device_code, user_id) = approved_flow(&pool, &state, &throttle).await;
+        sqlx::query("UPDATE users SET locked_until = now() + interval '10 minutes' WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_redemption_refused(
+            &pool,
+            &state,
+            &throttle,
+            &device_code,
+            user_id,
+            "approver_not_eligible",
+        )
+        .await;
+
+        let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (_, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
+        let (status, _, _) = send(
+            app(&state, Some(session(user_id, &username)), &throttle),
+            json("/approve", serde_json::json!({"user_code": user_code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("pending")
+        );
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// Review finding 2: concurrent wrong guesses cannot all slip past the
+    /// failed-attempt budget before any of them is charged.
+    #[tokio::test]
+    async fn concurrent_wrong_codes_cannot_overrun_the_budget() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username) = h::create_user(&pool).await;
+        let state = state(pool.clone(), |config| {
+            config.max_failed_attempts_per_user = 3;
+            config.max_failed_attempts_per_ip = 1000;
+        });
+        let throttle = throttle(&state);
+        let approver = app(&state, Some(session(user_id, &username)), &throttle);
+        let guesses = (0..24).map(|_| {
+            let approver = approver.clone();
+            async move {
+                send(
+                    approver,
+                    json("/verify", serde_json::json!({"user_code": "ZZZZ-ZZZZ"})),
+                )
+                .await
+                .0
+            }
+        });
+        let statuses = futures::future::join_all(guesses).await;
+        let wrong = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::BAD_REQUEST)
+            .count();
+        let throttled = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        assert!(
+            wrong <= 3,
+            "{wrong} wrong guesses were evaluated, budget is 3"
+        );
+        assert_eq!(wrong + throttled, statuses.len(), "{statuses:?}");
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// Successful look-ups are refunded: they never spend the failed-attempt
+    /// budget, however many there are.
+    #[tokio::test]
+    async fn correct_codes_do_not_spend_the_budget() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username) = h::create_user(&pool).await;
+        let state = state(pool.clone(), |config| {
+            config.max_failed_attempts_per_user = 1;
+            config.max_failed_attempts_per_ip = 1;
+        });
+        let throttle = throttle(&state);
+        let (_, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
+        let approver = app(&state, Some(session(user_id, &username)), &throttle);
+        for _ in 0..5 {
+            let (status, _, body) = send(
+                approver.clone(),
+                json("/verify", serde_json::json!({"user_code": user_code})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, _, _) = send(
+            approver.clone(),
+            json("/approve", serde_json::json!({"user_code": user_code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The one failure the budget allows is still available.
+        let (status, _, _) = send(
+            approver.clone(),
+            json("/verify", serde_json::json!({"user_code": "ZZZZ-ZZZZ"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = send(
+            approver,
+            json("/verify", serde_json::json!({"user_code": "ZZZZ-ZZZZ"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// Review finding 3: the approval page learns when and from where the
+    /// request was started (RFC 8628 section 5.4).
+    #[tokio::test]
+    async fn verify_reports_when_and_from_where_the_request_came() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (user_id, username) = h::create_user(&pool).await;
+        let mut request = form("/code", &format!("client_id={CLIENT}&scope=read:artifacts"));
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000))));
+        let (status, _, body) = send(app(&state, None, &throttle), request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let user_code = body["user_code"].as_str().unwrap().to_string();
+
+        let (status, _, body) = send(
+            app(&state, Some(session(user_id, &username)), &throttle),
+            json("/verify", serde_json::json!({"user_code": user_code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["requested_from"], "203.0.113.7", "{body}");
+        let ago = body["requested_seconds_ago"].as_i64().unwrap();
+        assert!((0..60).contains(&ago), "{body}");
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn page_shows_request_origin_and_handles_a_lapsed_session() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool, |_| {});
+        let throttle = throttle(&state);
+        let get = |uri: &str| HttpRequest::get(uri).body(Body::empty()).unwrap();
+        let (status, page, _) =
+            h::send_with_headers(app(&state, None, &throttle), get("/device")).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = String::from_utf8_lossy(&page);
+        assert!(page.contains(r#"<p id="origin" class="note"></p>"#));
+        let (status, script, _) =
+            h::send_with_headers(app(&state, None, &throttle), get("/device/app.js")).await;
+        assert_eq!(status, StatusCode::OK);
+        let script = String::from_utf8_lossy(&script);
+        assert!(script.contains("res.body.requested_from"));
+        assert!(script.contains("$('origin').textContent"));
+        assert!(script.contains("res.status === 401"));
     }
 }

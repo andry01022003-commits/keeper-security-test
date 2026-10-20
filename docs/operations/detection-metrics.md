@@ -57,6 +57,9 @@ listener.
 | `search` | search routes |
 | `presign` | routes that mint presigned download URLs, per source IP |
 | `password_change` | self-service password change, per user |
+| `device_code` | `POST /api/v1/auth/device/code`, per source IP |
+| `device_token` | `POST /api/v1/auth/device/token` polling, per source IP |
+| `device_approval` | device code verify, approve and deny, per user |
 | `upload` | a principal already at its concurrent-upload limit (`UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`) |
 | `proxy_rescan` | a proxy rescan asked for inside the per-repository cooldown |
 
