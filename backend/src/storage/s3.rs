@@ -1403,6 +1403,43 @@ fn strip_key_prefix(prefix: Option<&str>, key: &str) -> String {
     }
 }
 
+/// The object key `get`/`put` address for `key`: object_store's [`ObjectPath`]
+/// percent-encodes, segment by segment, every non-ASCII byte, the characters
+/// AWS and GCS advise against in object names (`%`, `<`, `>`, `#`, `[`, `~`,
+/// ...), and a `.`/`..` segment. An empty segment (a trailing `/`) is kept,
+/// so the result can scope a listing prefix (#4817).
+fn stored_key_form(key: &str) -> String {
+    key.split('/')
+        .map(|segment| {
+            object_store::path::PathPart::from(segment)
+                .as_ref()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Inverse of [`stored_key_form`] for a key a listing returned: the key
+/// `get`/`put` accept for the object stored under `stored`.
+///
+/// A listing returns stored keys, so without this a row path `uni-café.jar`
+/// lists as `uni-caf%C3%A9.jar`, and the storage reindex reports the row's
+/// object missing and the object a ghost (#4817). `None` for a key that no
+/// `put` produces and no `get` can read (an object another tool wrote with a
+/// raw `~` or a stray `%41`), and for one that decodes to a `.`/`..` segment.
+fn key_from_stored(stored: &str) -> Option<String> {
+    let mut segments = Vec::new();
+    for segment in stored.split('/') {
+        let decoded = urlencoding::decode(segment).ok()?;
+        if decoded == "." || decoded == ".." {
+            return None;
+        }
+        segments.push(decoded.into_owned());
+    }
+    let key = segments.join("/");
+    (ObjectPath::from(key.as_str()).as_ref() == stored).then_some(key)
+}
+
 /// Whether `S3_PREFIX` names (or sits inside) one of the reserved bucket-root
 /// namespaces, which makes the bucket layout ambiguous.
 ///
@@ -2003,6 +2040,28 @@ impl S3Backend {
     /// Strip the prefix from an S3 key
     fn strip_prefix(&self, key: &str) -> String {
         strip_key_prefix(self.prefix.as_deref(), key)
+    }
+
+    /// A listed object as the key `get`/`put` accept: decoded from its
+    /// stored form (#4817), then with the prefix stripped, the inverse of
+    /// `full_key` followed by the [`ObjectPath`] conversion every write does.
+    fn listed_key(
+        &self,
+        stored: &str,
+        last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<super::ListedKey> {
+        let Some(full_key) = key_from_stored(stored) else {
+            tracing::warn!(
+                key = %stored,
+                "S3 listing: skipping an object whose key is not the stored form of any \
+                 key Artifact Keeper reads or writes (#4817)"
+            );
+            return None;
+        };
+        Some(super::ListedKey {
+            key: self.strip_prefix(&full_key),
+            last_modified,
+        })
     }
 
     /// Try to generate an Artifactory fallback path from a native path
@@ -2746,9 +2805,8 @@ impl S3Backend {
                 Ok(objects) => {
                     let keys: Vec<super::ListedKey> = objects
                         .into_iter()
-                        .map(|meta| super::ListedKey {
-                            key: self.strip_prefix(meta.location.as_ref()),
-                            last_modified: Some(meta.last_modified),
+                        .filter_map(|meta| {
+                            self.listed_key(meta.location.as_ref(), Some(meta.last_modified))
                         })
                         .collect();
                     tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
@@ -2771,13 +2829,12 @@ impl S3Backend {
             }
         }
 
-        let full_keys = self.rest_list_objects(&search_prefix).await?;
+        let full_keys = self
+            .rest_list_objects(&stored_key_form(&search_prefix))
+            .await?;
         let keys: Vec<super::ListedKey> = full_keys
             .iter()
-            .map(|(key, last_modified)| super::ListedKey {
-                key: self.strip_prefix(key),
-                last_modified: *last_modified,
-            })
+            .filter_map(|(key, last_modified)| self.listed_key(key, *last_modified))
             .collect();
 
         tracing::debug!(
@@ -7651,6 +7708,224 @@ mod tests {
             keys,
             vec!["a.txt".to_string(), "b.txt".to_string()],
             "a truncated page must be followed, or a bucket over 1000 keys lists short"
+        );
+    }
+
+    /// Every key a `put` can write decodes back from its stored form to
+    /// itself, and a stored key no `put` writes decodes to nothing (#4817).
+    #[test]
+    fn test_key_from_stored_inverts_the_object_path_encoding_4817() {
+        let mut keys: Vec<String> = ROW_KEYS_4817.iter().map(|k| k.to_string()).collect();
+        keys.push("a/über straße/日本語/r&d'x.tar.gz".to_string());
+        keys.push("p/%/%25/%2E%2E/x".to_string());
+        keys.push(
+            (0x20u8..0x7f)
+                .map(char::from)
+                .filter(|c| *c != '/')
+                .collect(),
+        );
+        for key in &keys {
+            let stored = ObjectPath::from(key.as_str()).as_ref().to_owned();
+            assert_eq!(stored_key_form(key), stored, "{key}");
+            assert_eq!(
+                key_from_stored(&stored).as_deref(),
+                Some(key.as_str()),
+                "{key}"
+            );
+        }
+        for stray in ["a~b", "x%41", "x%2", "a/%2E%2E/b", "a/%2E", "%FF", "a//b"] {
+            assert_eq!(key_from_stored(stray), None, "{stray}");
+        }
+        assert_eq!(stored_key_form("maven/café/"), "maven/caf%C3%A9/");
+    }
+
+    /// A `ListObjectsV2` body listing `keys` (already in their stored form),
+    /// XML-escaped the way S3 escapes them.
+    fn list_body_4817(keys: &[String]) -> String {
+        let contents: String = keys
+            .iter()
+            .map(|k| {
+                let k = k
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&apos;");
+                format!(
+                    "<Contents><Key>{k}</Key><LastModified>2026-10-01T00:00:00.000Z</LastModified>\
+                     <ETag>\"e\"</ETag><Size>4</Size></Contents>"
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+             <Name>example-bucket</Name><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+        )
+    }
+
+    /// Row paths the storage reindex compares listed keys against (#4817):
+    /// non-ASCII, a space, `&`, every character object_store percent-encodes,
+    /// and a row path that itself looks percent-encoded.
+    const ROW_KEYS_4817: &[&str] = &[
+        "maven/r1/com/dtf/uni/1.0/uni-1.0-café.jar",
+        "maven/r1/com/dtf/sp/1.0/sp-1.0-a b.jar",
+        "maven/r1/com/dtf/amp/1.0/amp-1.0-r&d.jar",
+        "maven/r1/com/dtf/res/1.0/res-1.0-<x>[1]{2}#~|^`\"\\*?%.jar",
+        "maven/r1/com/dtf/pct/1.0/pct-1.0-caf%C3%A9.jar",
+    ];
+
+    /// `list` must return every key in the form `get`/`put` accept, even
+    /// though object_store stores non-ASCII and reserved characters
+    /// percent-encoded; otherwise the storage reindex reports the row as a
+    /// missing object and its stored key as a ghost (#4817).
+    #[tokio::test]
+    async fn test_list_returns_keys_get_and_put_accept_4817() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"e\""))
+            .mount(&server)
+            .await;
+        let backend = S3Backend::new(S3Config::new(
+            "example-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(server.uri()),
+            Some("example-prefix".to_string()),
+        ))
+        .await
+        .expect("S3Backend::new");
+        assert_eq!(backend.provider, S3Provider::Generic);
+
+        // Write every row path through the backend and record the object key
+        // each PUT actually created: the request path minus the bucket, URL
+        // decoded once (the HTTP layer's own encoding, not the key's).
+        for key in ROW_KEYS_4817 {
+            StorageBackendTrait::put(&backend, key, Bytes::from_static(b"body"))
+                .await
+                .expect("put");
+        }
+        let mut stored: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| {
+                let p = r.url.path().strip_prefix("/example-bucket/").unwrap();
+                urlencoding::decode(p).unwrap().into_owned()
+            })
+            .collect();
+        assert!(
+            stored.contains(
+                &"example-prefix/maven/r1/com/dtf/uni/1.0/uni-1.0-caf%C3%A9.jar".to_string()
+            ),
+            "precondition: object_store percent-encodes a non-ASCII key on write: {stored:?}"
+        );
+        // An unregistered object written by another tool (a ghost), and one
+        // whose raw `~` no `put` can produce and no `get` can read.
+        stored.push("example-prefix/maven/r1/com/dtf/ghost/1.0/ghost-1.0-o'r&d.jar".to_string());
+        stored.push("example-prefix/maven/r1/stray/a~b.jar".to_string());
+
+        Mock::given(method("GET"))
+            .and(query_param("list-type", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(list_body_4817(&stored), "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/example-bucket/example-prefix/maven/r1/com/dtf/uni/1.0/uni-1.0-caf%25C3%25A9.jar",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "4")
+                    .insert_header("last-modified", "Thu, 01 Oct 2026 00:00:00 GMT")
+                    .insert_header("etag", "\"e\"")
+                    .set_body_bytes(b"body".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let mut listed: Vec<String> = StorageBackendTrait::list_keys(&backend, "maven/r1/")
+            .await
+            .expect("list")
+            .expect("S3 can enumerate")
+            .into_iter()
+            .map(|l| l.key)
+            .collect();
+        listed.sort();
+        let mut expected: Vec<String> = ROW_KEYS_4817.iter().map(|k| k.to_string()).collect();
+        expected.push("maven/r1/com/dtf/ghost/1.0/ghost-1.0-o'r&d.jar".to_string());
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "listed keys must equal the row paths they were written under"
+        );
+
+        // The listed key reads the very object it names.
+        let body = StorageBackendTrait::get(&backend, "maven/r1/com/dtf/uni/1.0/uni-1.0-café.jar")
+            .await
+            .expect("get of a listed key");
+        assert_eq!(&body[..], b"body");
+    }
+
+    /// The #3593 REST fallback returns the same decoded keys, and scopes the
+    /// listing to the stored (encoded) form of a non-ASCII prefix (#4817).
+    #[tokio::test]
+    async fn test_rest_list_fallback_decodes_stored_keys_4817() {
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        let stored = vec![
+            "maven/caf%C3%A9/1.0/uni-1.0-caf%C3%A9.jar".to_string(),
+            "maven/caf%C3%A9/1.0/sp-1.0-a b.jar".to_string(),
+            "maven/caf%C3%A9/1.0/pct-1.0-caf%25C3%25A9.jar".to_string(),
+            "maven/caf%C3%A9/1.0/%2E%2E".to_string(),
+            "maven/caf%C3%A9/1.0/stray-%41.jar".to_string(),
+        ];
+        Mock::given(method("GET"))
+            .and(path_regex("^/example-bucket/?$"))
+            .and(query_param("list-type", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(list_body_4817(&stored), "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        let backend = S3Backend::new(
+            S3Config::new(
+                "example-bucket".to_string(),
+                "cn-east-1".to_string(),
+                Some(server.uri()),
+                None,
+            )
+            .with_provider(S3Provider::Oss),
+        )
+        .await
+        .expect("S3Backend::new");
+
+        let keys = backend.list(Some("maven/café/")).await.expect("list");
+        assert_eq!(
+            keys,
+            vec![
+                "maven/café/1.0/uni-1.0-café.jar".to_string(),
+                "maven/café/1.0/sp-1.0-a b.jar".to_string(),
+                "maven/café/1.0/pct-1.0-caf%C3%A9.jar".to_string(),
+            ],
+            "stored keys must decode to the keys get/put accept; a key no put can produce, \
+             or one that decodes to a `..` segment, is left out"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let query = requests[0].url.query().unwrap_or_default();
+        assert!(
+            query.contains("prefix=maven%2Fcaf%25C3%25A9%2F"),
+            "the listing must be scoped to the stored form of the prefix, got {query}"
         );
     }
 
