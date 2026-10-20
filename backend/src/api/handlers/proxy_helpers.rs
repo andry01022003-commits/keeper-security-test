@@ -15499,6 +15499,7 @@ mod tests {
                 grpc_reflection_enabled: false,
                 swagger_enabled: false,
                 plugins_enabled: true,
+                terraform_default_repo: None,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 conda_attestation_require_verified: true,
