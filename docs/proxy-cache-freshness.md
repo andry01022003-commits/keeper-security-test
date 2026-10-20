@@ -27,12 +27,43 @@ conditional request:
 - **304 Not Modified** → the TTL is extended and the cached body is served.
 - **200 with new content** → the body is refilled.
 - **5xx, timeout or transport error** → **stale-if-error** (RFC 5861): the stale
-  body is served for up to 3600 s (1 h) past expiry. This is the *only* case
-  where expired content is served.
+  body is served for up to the repository's grace window past expiry (3600 s by
+  default, see [below](#the-stale-if-error-grace-window-4581)) and is marked as
+  stale. This is the *only* case where expired content is served as a fallback.
 - **404 or 410** → **not** stale-if-error. A definitive "not here" is treated as
   a real answer and **deletes the cached body** (see below) — unless the
   repository opts into `on_upstream_not_found = keep` (#4640), which serves the
   cached body instead (see below).
+
+## The stale-if-error grace window (#4581)
+
+The grace window bounds how long past its expiry a cached body is still served
+when upstream is unreachable. It applies on every fetch path (buffered and
+streaming, revalidation and a refill whose upstream fetch fails), measured from
+the entry's stamped expiry. Past it, the upstream error is returned instead.
+
+- **Instance default**: `PROXY_STALE_IF_ERROR_GRACE_SECS`, default `3600`
+  (the previously hard-coded value), clamped to `[0, 2592000]` (30 days). `0`
+  disables serving stale bodies.
+- **Per repository** (Remote only), same administrative tier as the cache TTL:
+
+```bash
+curl -X PUT "$AK/api/v1/repositories/<key>/stale-if-error-grace" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"stale_if_error_grace_seconds":600}'
+
+# Read it back: the override, the effective value and when this replica last
+# served a stale response for the repository (within the past day).
+curl "$AK/api/v1/repositories/<key>/stale-if-error-grace" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+A response served under the grace carries `Warning: 110 - "Response is stale"`
+and `X-AK-Stale-Since: <RFC 3339 instant the entry expired>`, including a
+virtual repository merge with a stale member, and increments
+`ak_proxy_stale_if_error_responses_total{repo="<key>"}`. A fresh hit, a body
+confirmed by a `304` revalidation and a copy served under
+`on_upstream_not_found = keep` carry neither header.
 
 ## Negative caching
 
@@ -151,7 +182,8 @@ above (#4640).
 
 - `backend/src/services/cache_classifier.rs` — classification rules and TTL
   constants (`MUTABLE_DEFAULT_TTL_SECS`, `NEGATIVE_CACHE_TTL_SECS`,
-  `STALE_IF_ERROR_GRACE_SECS`, `MAX_CACHE_TTL_SECS`).
+  `STALE_IF_ERROR_GRACE_SECS`, `STALE_IF_ERROR_GRACE_MAX_SECS`,
+  `MAX_CACHE_TTL_SECS`).
 - `backend/src/services/upstream_not_found_policy.rs` — the
   `on_upstream_not_found` policy shared by the proxy and the npm packument
   cache (#4640).
