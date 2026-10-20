@@ -13,6 +13,27 @@ startup:
 `artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info`). The audit
 stream (`AUDIT_STREAM`) is separate; see [audit-events.md](../audit-events.md).
 
+## OpenTelemetry export (`OTEL_EXPORTER_OTLP_ENDPOINT`)
+
+When the backend is pointed at an OTLP endpoint, the same diagnostics events
+are *also* exported as OpenTelemetry log records, alongside spans and metrics
+(#4337). Stdout output is unchanged — OTLP is a second destination, not a
+replacement, and the events exported are exactly those `RUST_LOG` lets through.
+
+| Variable | Values | Default | Effect |
+|---|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | a URL | unset (export off) | Enables OTLP export of all three signals. |
+| `OTEL_LOGS_EXPORTER` | `otlp`, `none` | `otlp` | `none` disables log-record export. |
+| `OTEL_TRACES_EXPORTER` | `otlp`, `none` | `otlp` | `none` disables span export. |
+| `OTEL_METRICS_EXPORTER` | `otlp`, `none` | `otlp` | `none` disables metric export. |
+
+Exported log records carry the `trace_id` / `span_id` of the span the event was
+emitted under, so a log line correlates with its trace in a backend such as
+Grafana Tempo. Events emitted outside any span are exported without one. SQL
+text (`sqlx::query` events) stays stdout-only (#4455); slow statements still
+appear as `CLIENT` spans. Metrics are fanned out beside Prometheus, so
+`/metrics` keeps reporting exactly what it did before.
+
 ## ANSI colour (`LOG_ANSI`)
 
 Before 1.11.2 the `text` format always coloured its output, including in a

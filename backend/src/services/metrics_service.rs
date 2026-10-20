@@ -3,9 +3,24 @@
 //! HTTP request instrumentation lives in `crate::api::middleware::metrics`.
 //! This module provides helpers for recording domain-specific metrics such as
 //! artifact uploads/downloads, security scans, backups, and storage gauges.
+//!
+//! The `metrics` facade fans out to more than one recorder: `/metrics` is
+//! always served from the Prometheus recorder, and when OpenTelemetry export is
+//! configured an OTel recorder is added alongside it by
+//! [`install_otel_recorder`] (#4337). The handle returned by [`init_metrics`]
+//! keeps rendering the Prometheus half.
+
+use std::sync::{Arc, Mutex};
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+
+/// The process-global Prometheus recorder, so an OpenTelemetry recorder can be
+/// fanned out with it. `None` until [`init_metrics`] has run. Wrapped in an
+/// `Arc` because the recorder itself is not `Clone`, and both the fan-out and
+/// the `metrics` facade need to own it.
+static PROMETHEUS_RECORDER: Mutex<Option<Arc<metrics_exporter_prometheus::PrometheusRecorder>>> =
+    Mutex::new(None);
 
 /// Name of the HTTP request latency histogram recorded by
 /// `crate::api::middleware::metrics`.
@@ -41,9 +56,43 @@ pub fn prometheus_builder() -> PrometheusBuilder {
 
 /// Initialize the Prometheus metrics recorder and return the handle for rendering.
 pub fn init_metrics() -> PrometheusHandle {
-    prometheus_builder()
-        .install_recorder()
-        .expect("failed to install Prometheus recorder")
+    let recorder = Arc::new(prometheus_builder().build_recorder());
+    let handle = recorder.handle();
+    *PROMETHEUS_RECORDER.lock().expect("metrics recorder lock") = Some(Arc::clone(&recorder));
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus recorder");
+    handle
+}
+
+/// Install `recorder` as the OpenTelemetry half of a fan-out, with the
+/// Prometheus recorder installed by [`init_metrics`] as the other half (#4337).
+///
+/// Called by `telemetry::init_with_otel` when OTLP metrics export is enabled,
+/// *after* `main` has installed the Prometheus recorder. Until then the OTel
+/// pipeline is built but not attached, so a deployment that never calls this
+/// keeps the plain Prometheus-only recorder.
+///
+/// The already-installed recorder cannot be read back out of the `metrics`
+/// facade, which is why the Prometheus recorder is kept beside it: the
+/// replacement is a fan-out of the same two recorders, so `/metrics` keeps
+/// reporting exactly what it did before.
+pub fn install_otel_recorder(otel: impl metrics::Recorder + Sync + 'static) {
+    let prometheus = PROMETHEUS_RECORDER
+        .lock()
+        .expect("metrics recorder lock")
+        .take();
+    let Some(prometheus) = prometheus else {
+        // No Prometheus recorder yet: `metrics` has not been initialized, and
+        // there is nothing to fan out with. The OTel pipeline still exists;
+        // this only happens in tests that call `init_tracing` directly.
+        return;
+    };
+    let fanout: metrics_util::layers::Fanout = metrics_util::layers::FanoutBuilder::default()
+        .add_recorder(prometheus)
+        .add_recorder(otel)
+        .build();
+    if let Err(e) = metrics::set_global_recorder(fanout) {
+        eprintln!("Failed to install OTel metrics fan-out recorder: {e}");
+    }
 }
 
 /// Count one HTTP connection closed because the client did not deliver a
