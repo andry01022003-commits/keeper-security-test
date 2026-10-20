@@ -229,6 +229,14 @@ pub(crate) async fn require_repo_action(
 /// by `set_cache_ttl` / `set_npm_scope_policy` / `invalidate_cache`. Callers
 /// should invoke this AFTER [`require_repo_write_access`] (the tenant gate).
 ///
+/// The decision goes through
+/// [`crate::services::permission_service::PermissionService::check_repository_action`],
+/// the same resolver `require_repo_action` uses, so the `admin` action can come
+/// from a fine-grained rule OR a role assignment carrying `admin` (the
+/// `repository-owner` role, which repository creation grants to the creator).
+/// `check_permission` reads the `permissions` table only and refused every
+/// role-derived owner (#4818).
+///
 /// `pub(crate)` so sibling handler modules with repository-configuration
 /// subresources (e.g. the per-repo scan/security config in `security.rs`,
 /// #2750) can apply the same gate instead of duplicating it.
@@ -241,7 +249,7 @@ pub(crate) async fn require_repo_admin(
         return Ok(());
     }
     let has_admin = permission_service
-        .check_permission(auth.user_id, "repository", repo_id, "admin", false)
+        .check_repository_action(auth.user_id, repo_id, "admin", false)
         .await?;
     if has_admin {
         Ok(())
@@ -21595,6 +21603,51 @@ mod tests {
     // -----------------------------------------------------------------------
     // require_repo_admin (repository-configuration admin gate, #2603)
     // -----------------------------------------------------------------------
+
+    /// DB-backed (#4818): the repository `admin` action can come from a role.
+    /// A member of the `repository-owner` role (`{read,write,delete,admin}`,
+    /// auto-granted to a repository's creator) passes `require_repo_admin` on
+    /// that repository, as `require_repo_action` already lets it write and
+    /// delete. The role does not reach another repository, a `developer`
+    /// (`{read,write}`) member is still refused, and an owner's role still wins
+    /// over a narrower fine-grained rule naming the same user, matching
+    /// `check_repository_action`.
+    #[tokio::test]
+    async fn require_repo_admin_honours_repository_owner_role_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (dev_id, dev_name) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (other_id, _other_key, other_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_role(&pool, repo_id, owner_id, "repository-owner").await;
+        tdh::grant_repo_role(&pool, repo_id, dev_id, "developer").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let perms = &state.permission_service;
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let dev = tdh::make_auth(dev_id, &dev_name);
+        let forbidden = |r: &Result<()>| matches!(r, Err(AppError::Authorization(_)));
+
+        let r = require_repo_admin(&owner, repo_id, perms).await;
+        assert!(r.is_ok(), "repository-owner member must pass: {r:?}");
+
+        let r = require_repo_admin(&owner, other_id, perms).await;
+        assert!(forbidden(&r), "owner role is per repository: {r:?}");
+
+        let r = require_repo_admin(&dev, repo_id, perms).await;
+        assert!(forbidden(&r), "developer member lacks admin: {r:?}");
+
+        tdh::grant_repo_actions(&pool, repo_id, owner_id, &["read"]).await;
+        let r = require_repo_admin(&owner, repo_id, perms).await;
+        assert!(r.is_ok(), "owner role wins over a narrower rule: {r:?}");
+
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup(&pool, other_id, dev_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
+    }
 
     /// DB-backed: a non-admin member holding only `write` (developer role via
     /// `grant_repo_access`, no fine-grained `admin` grant) is DENIED
