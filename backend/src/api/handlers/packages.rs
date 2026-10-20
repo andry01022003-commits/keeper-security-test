@@ -644,43 +644,6 @@ mod tests {
     use chrono::Utc;
     use serde_json;
 
-    /// True when the package is owned by a member of the virtual repository named
-    /// `virtual_key`. Used by the by-id detail lookup to report the virtual key
-    /// when the caller is viewing the package through that virtual repo, keeping
-    /// the detail view consistent with the virtual repo's listing.
-    async fn package_in_virtual_repo(
-        db: &sqlx::PgPool,
-        package_id: Uuid,
-        virtual_key: &str,
-    ) -> Result<bool> {
-        let virtual_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM repositories WHERE key = $1 AND repo_type = 'virtual'",
-        )
-        .bind(virtual_key)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        let Some(virtual_id) = virtual_id else {
-            return Ok(false);
-        };
-        // Same recursive member walk as the listing paths (#3840): a package
-        // owned by a leaf of a NESTED virtual still reports the top virtual's key.
-        let member_ids =
-            crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, virtual_id)
-                .await
-                .map_err(|resp| {
-                    crate::api::handlers::proxy_helpers::member_walk_app_error(&resp)
-                })?;
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM packages p WHERE p.id = $1 AND p.repository_id = ANY($2))",
-        )
-        .bind(package_id)
-        .bind(&member_ids)
-        .fetch_one(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))
-    }
-
     fn make_package_row() -> PackageRow {
         let now = Utc::now();
         PackageRow {
@@ -1717,57 +1680,6 @@ mod tests {
                     .as_str()
                     .expect("repo key"),
                 virtual_key
-            );
-
-            sqlx::query("DELETE FROM repositories WHERE id = $1")
-                .bind(virtual_id)
-                .execute(&member.pool)
-                .await
-                .expect("delete virtual repo");
-            let _ = std::fs::remove_dir_all(&virtual_dir);
-            member.teardown().await;
-        }
-
-        // -------------------------------------------------------------------
-        // package_in_virtual_repo: by-id virtual context helper
-        // -------------------------------------------------------------------
-
-        #[tokio::test]
-        async fn package_in_virtual_repo_detects_membership() {
-            let Some(member) = tdh::Fixture::setup("local", "docker").await else {
-                return;
-            };
-            let (virtual_id, virtual_key, virtual_dir) =
-                tdh::create_repo(&member.pool, "virtual", "docker").await;
-            sqlx::query(
-                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-                 VALUES ($1, $2, 1)",
-            )
-            .bind(virtual_id)
-            .bind(member.repo_id)
-            .execute(&member.pool)
-            .await
-            .expect("link member into virtual repo");
-
-            let pkg = seed_package(&member.pool, member.repo_id).await;
-
-            assert!(
-                package_in_virtual_repo(&member.pool, pkg, &virtual_key)
-                    .await
-                    .expect("membership check"),
-                "package owned by a member is part of the virtual repo"
-            );
-            assert!(
-                !package_in_virtual_repo(&member.pool, pkg, "some-other-virtual")
-                    .await
-                    .expect("membership check"),
-                "a different virtual key must not match"
-            );
-            assert!(
-                !package_in_virtual_repo(&member.pool, pkg, &member.repo_key)
-                    .await
-                    .expect("membership check"),
-                "a hosted (non-virtual) key must not match"
             );
 
             sqlx::query("DELETE FROM repositories WHERE id = $1")
