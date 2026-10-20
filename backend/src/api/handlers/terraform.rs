@@ -2012,7 +2012,7 @@ async fn download_provider(
     // Per the Provider Registry Protocol this endpoint returns the package
     // *document*, not the package: `download_url` points at the separate route
     // that streams the archive (`download_provider_binary`).
-    let download_url =
+    let binary_path =
         build_provider_binary_url(&repo_key, &namespace, &type_name, &version, &os, &arch);
 
     // Protocols the uploader declared (or the manifest in the archive did); a
@@ -2028,13 +2028,54 @@ async fn download_provider(
     // Only a hosted repo can vouch for its packages: it holds the bytes the
     // checksum list is computed from. A repo with no usable OpenPGP key keeps
     // the legacy, unsigned package document (see the module docs).
-    let signing = if classify_mirror_repo(&repo.repo_type, false, false) == MirrorGuard::Local {
+    let mut signing = if classify_mirror_repo(&repo.repo_type, false, false) == MirrorGuard::Local {
         active_openpgp_key(&state, repo.id)
             .await?
             .map(|key| provider_signing_doc(&key, &repo_key, &namespace, &type_name, &version))
     } else {
         None
     };
+
+    // Terraform/OpenTofu fetch `download_url`, `shasums_url` and
+    // `shasums_signature_url` without the registry credentials they sent for
+    // this document, so a private repo would answer each with 401. As for the
+    // mirror archives (#3588), an authenticated caller gets single-use tickets
+    // bound to each exact path; an anonymous caller (public repo) gets the
+    // plain paths it can already reach.
+    let download_url = ticketed_path(
+        mint_path_ticket(
+            &state,
+            auth.as_ref(),
+            &binary_path,
+            "terraform-provider-archive",
+        )
+        .await,
+        binary_path,
+    );
+    if let Some(doc) = signing.as_mut() {
+        let shasums_path = std::mem::take(&mut doc.shasums_url);
+        let signature_path = std::mem::take(&mut doc.shasums_signature_url);
+        doc.shasums_url = ticketed_path(
+            mint_path_ticket(
+                &state,
+                auth.as_ref(),
+                &shasums_path,
+                "terraform-provider-shasums",
+            )
+            .await,
+            shasums_path,
+        );
+        doc.shasums_signature_url = ticketed_path(
+            mint_path_ticket(
+                &state,
+                auth.as_ref(),
+                &signature_path,
+                "terraform-provider-shasums-sig",
+            )
+            .await,
+            signature_path,
+        );
+    }
 
     let json = build_provider_download_json(
         &os,
@@ -2127,6 +2168,23 @@ async fn provider_shasums(
         .unwrap())
 }
 
+/// How long a `SHA256SUMS.sig` is reused. Far below the minimum signature
+/// expiry the signing service allows (`MIN_SIGNATURE_EXPIRY_SECONDS`), so a
+/// cached signature is never served stale.
+const SHASUMS_SIGNATURE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Binary `SHA256SUMS.sig` per (signing key id, SHA-256 of the signed
+/// `SHA256SUMS`). `try_get_with` single-flights a miss; a failed signing is
+/// never cached. Per replica: each replica signs at most once per entry.
+static SHASUMS_SIGNATURE_CACHE: once_cell::sync::Lazy<
+    moka::future::Cache<(uuid::Uuid, [u8; 32]), Bytes>,
+> = once_cell::sync::Lazy::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(SHASUMS_SIGNATURE_TTL)
+        .build()
+});
+
 /// Convert an ASCII-armored detached signature into the binary OpenPGP packet
 /// stream. Terraform/OpenTofu read `SHA256SUMS.sig` as raw packets (the same
 /// bytes `gpg --detach-sign` writes without `--armor`) and reject armor.
@@ -2147,11 +2205,21 @@ async fn provider_shasums_signature(
     let (key, shasums) =
         load_provider_shasums(&state, &repo_key, &namespace, &type_name, &version).await?;
 
-    // No signature expiry: this signature is served separately from the data
-    // and fetched at `init` time by clients that may cache the lock.
-    let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = svc
-        .sign_openpgp_detached_with_key(&key, shasums.as_bytes())
+    // The signature carries the configured signature expiry, like every other
+    // detached signature the signing service makes. Signing decrypts the
+    // private key, so a signature is reused for a short while per
+    // (key, SHA256SUMS digest); a key rotation or a changed package set is a
+    // different cache key and is signed afresh.
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(shasums.as_bytes()).into();
+    let signature = SHASUMS_SIGNATURE_CACHE
+        .try_get_with((key.id, digest), async {
+            let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+            let armored = svc
+                .sign_openpgp_detached_with_key(&key, shasums.as_bytes())
+                .await?;
+            let _ = svc.mark_key_used(key.id).await;
+            dearmor_signature(&armored).map(Bytes::from)
+        })
         .await
         .map_err(|e| {
             (
@@ -2160,14 +2228,6 @@ async fn provider_shasums_signature(
             )
                 .into_response()
         })?;
-    let _ = svc.mark_key_used(key.id).await;
-    let signature = dearmor_signature(&signature).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::internal_err_message("Failed to encode provider signature", &e),
-        )
-            .into_response()
-    })?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -3158,34 +3218,60 @@ async fn mint_mirror_archive_tickets(
     platforms: &[(String, String)],
 ) -> std::collections::HashMap<(String, String), String> {
     let mut tickets = std::collections::HashMap::new();
-    let Some(auth) = auth else {
+    if auth.is_none() {
         return tickets;
-    };
+    }
     for (os, arch) in platforms {
         let resource_path = coords.download_request_path(os, arch);
-        // The ticket carries the caller's repository restriction
-        // (GHSA-2mfv-xg68-gq4p).
-        match crate::services::auth_config_service::AuthConfigService::create_download_ticket_with_ttl(
-            &state.db,
-            auth.user_id,
-            &auth.allowed_repo_ids,
-            "terraform-mirror-archive",
-            Some(&resource_path),
-            MIRROR_TICKET_TTL_SECS,
-        )
-        .await
+        if let Some(ticket) =
+            mint_path_ticket(state, auth, &resource_path, "terraform-mirror-archive").await
         {
-            Ok(ticket) => {
-                tickets.insert((os.clone(), arch.clone()), ticket);
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "terraform mirror: could not mint archive download ticket for {}",
-                resource_path
-            ),
+            tickets.insert((os.clone(), arch.clone()), ticket);
         }
     }
     tickets
+}
+
+/// Mint one single-use download ticket bound to exactly `resource_path` for
+/// the authenticated caller, or `None` for an anonymous caller or when minting
+/// fails (the URL then behaves exactly as it would without a ticket).
+async fn mint_path_ticket(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    resource_path: &str,
+    purpose: &str,
+) -> Option<String> {
+    let auth = auth?;
+    // The ticket carries the caller's repository restriction
+    // (GHSA-2mfv-xg68-gq4p).
+    match crate::services::auth_config_service::AuthConfigService::create_download_ticket_with_ttl(
+        &state.db,
+        auth.user_id,
+        &auth.allowed_repo_ids,
+        purpose,
+        Some(resource_path),
+        MIRROR_TICKET_TTL_SECS,
+    )
+    .await
+    {
+        Ok(ticket) => Some(ticket),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "terraform: could not mint download ticket for {}",
+                resource_path
+            );
+            None
+        }
+    }
+}
+
+/// `path?ticket=<t>` when a ticket was minted, else `path` unchanged.
+fn ticketed_path(ticket: Option<String>, path: String) -> String {
+    match ticket {
+        Some(t) => format!("{path}?ticket={t}"),
+        None => path,
+    }
 }
 
 /// GET /:repo_key/:hostname/:namespace/:type/index.json — mirror version list.
@@ -7530,7 +7616,7 @@ mod origin_registry_tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, body) in entries {
                 w.start_file(*name, opts).unwrap();
@@ -7855,6 +7941,119 @@ mod origin_registry_tests {
         // Unknown version.
         let (status, _) = get_path(&fx, "9.9.9/SHA256SUMS").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        fx.teardown().await;
+    }
+
+    /// Terraform/OpenTofu fetch `download_url`, `shasums_url` and
+    /// `shasums_signature_url` without the credentials they sent for the
+    /// package document, so an authenticated caller must get a single-use
+    /// ticket bound to each exact path (as for the #3588 mirror archives),
+    /// and an anonymous caller the plain paths.
+    #[tokio::test]
+    async fn package_document_tickets_every_advertised_url_for_an_authenticated_caller() {
+        use crate::services::auth_config_service::AuthConfigService;
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip: &[u8] = b"PK placeholder provider zip for tickets";
+        assert!(upload(&fx, "2.0.0", "linux/amd64", zip, None)
+            .await
+            .is_success());
+        attach_key(&fx, "gpg").await;
+
+        let doc_path = format!(
+            "{}/{}/v1/providers/ns/ty/2.0.0/download/linux/amd64",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let (status, body) =
+            tdh::send(fx.router_with_auth(mounted()), tdh::get(doc_path.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let base = format!("{}/{}/v1/providers/ns/ty/2.0.0", MOUNT_PREFIX, fx.repo_key);
+        let expected = [
+            (
+                "download_url",
+                format!("{base}/binary/linux/amd64"),
+                "terraform-provider-archive",
+            ),
+            (
+                "shasums_url",
+                format!("{base}/SHA256SUMS"),
+                "terraform-provider-shasums",
+            ),
+            (
+                "shasums_signature_url",
+                format!("{base}/SHA256SUMS.sig"),
+                "terraform-provider-shasums-sig",
+            ),
+        ];
+        let mut redeemed = Vec::new();
+        for (field, path, _) in &expected {
+            let url = doc[*field].as_str().unwrap_or_default().to_string();
+            let (url_path, ticket) = url
+                .split_once("?ticket=")
+                .unwrap_or_else(|| panic!("{field} must carry a ticket, got {url:?}"));
+            assert_eq!(url_path, path, "{field} path");
+            redeemed.push(
+                AuthConfigService::validate_download_ticket(&fx.pool, ticket)
+                    .await
+                    .unwrap_or_else(|e| panic!("{field} ticket must be live: {e}")),
+            );
+        }
+
+        let (status, body) = tdh::send(fx.router_anon(mounted()), tdh::get(doc_path.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let anon: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let user_id = fx.user_id;
+        fx.teardown().await;
+
+        for ((field, path, purpose), ticket) in expected.iter().zip(redeemed) {
+            assert_eq!(ticket.user_id, user_id, "{field} ticket owner");
+            assert_eq!(ticket.purpose, *purpose, "{field} ticket purpose");
+            assert_eq!(
+                ticket.resource_path.as_deref(),
+                Some(path.as_str()),
+                "{field} ticket must be bound to exactly the advertised path"
+            );
+            assert!(
+                ticket.repo_scope.is_some(),
+                "{field} ticket must carry the caller's repository scope"
+            );
+            assert_eq!(anon[*field], *path, "anonymous {field} carries no ticket");
+        }
+    }
+
+    /// A `SHA256SUMS.sig` is reused per (key, checksum list) instead of
+    /// decrypting the private key on every anonymous request.
+    #[tokio::test]
+    async fn checksum_signature_is_reused_for_the_same_key_and_checksums() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        assert!(upload(&fx, "3.0.0", "linux/amd64", b"PK sig cache", None)
+            .await
+            .is_success());
+        attach_key(&fx, "gpg").await;
+
+        let (status, first) = get_path(&fx, "3.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, second) = get_path(&fx, "3.0.0/SHA256SUMS.sig").await;
+        // A fresh signature embeds a new creation time, so identical bytes
+        // mean the cached one was served.
+        assert_eq!(first, second);
+
+        // A new package changes the checksum list, which is signed afresh.
+        assert!(
+            upload(&fx, "3.0.0", "linux/arm64", b"PK sig cache arm", None)
+                .await
+                .is_success()
+        );
+        let (status, third) = get_path(&fx, "3.0.0/SHA256SUMS.sig").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(first, third);
 
         fx.teardown().await;
     }

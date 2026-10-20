@@ -41,8 +41,21 @@ providers uploaded before this feature work with no re-upload:
 
 One line per published platform, lowercase hex, sorted by filename, a single
 trailing newline. The bytes are deterministic for a given set of artifacts.
-`SHA256SUMS.sig` is a fresh signature over those bytes on each request (an
-OpenPGP signature embeds its creation time), and every one verifies.
+`SHA256SUMS.sig` is a detached signature over those bytes. Signing decrypts
+the private key, so each replica reuses a signature for five minutes per
+(signing key, `SHA256SUMS` content); a new upload or a key rotation changes the
+cache key and is signed afresh. The signature carries the instance's configured
+signature expiry, as the RPM and Debian signatures do.
+
+### Private repositories
+
+Terraform and OpenTofu send registry credentials when they fetch the package
+document, but not when they then fetch `download_url`, `shasums_url` and
+`shasums_signature_url`. For an authenticated caller the package document
+therefore appends a `?ticket=` to each of the three URLs: a single-use download
+ticket bound to that exact path, carrying the caller's identity and repository
+restriction, valid for ten minutes (the same mechanism the network-mirror
+archive URLs use). Anonymous callers of a public repository get the plain URLs.
 
 ### Signing key: fail closed, never auto-provisioned
 
