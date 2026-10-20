@@ -89,8 +89,14 @@ pub async fn list_trash(
     Query(query): Query<TrashListQuery>,
 ) -> Result<Json<TrashPage>> {
     auth.require_admin()?;
+    // A repository-restricted admin token lists only its repositories' trash.
     let page = trash_service(&state)
-        .list(query.repository.as_deref(), query.page, query.per_page)
+        .list(
+            query.repository.as_deref(),
+            &auth.access_scope(),
+            query.page,
+            query.per_page,
+        )
         .await?;
     Ok(Json(page))
 }
@@ -122,6 +128,7 @@ pub async fn restore_trashed_artifact(
     Path(id): Path<Uuid>,
 ) -> Result<Json<TrashedArtifact>> {
     auth.require_admin()?;
+    require_trashed_in_token_scope(&state, &auth, id).await?;
     let restored = trash_service(&state).restore(id).await?;
 
     let entry = AuditEntry::new(AuditAction::ArtifactRestored, ResourceType::Artifact)
@@ -170,17 +177,18 @@ pub async fn purge_trashed_artifact(
     Path(id): Path<Uuid>,
 ) -> Result<Json<PurgedArtifact>> {
     auth.require_admin()?;
-    require_purge_in_token_scope(&state, &auth, id).await?;
+    require_trashed_in_token_scope(&state, &auth, id).await?;
     let purged = trash_service(&state).purge(id).await?;
     audit_purge(&state, &auth, &purged).await;
     Ok(Json(purged))
 }
 
 /// A repository-restricted admin token stays restricted (#4225): it may only
-/// purge artifacts of repositories in its allow-list. Out-of-scope ids read as
-/// 404, exactly like ids that do not exist, so the token learns nothing about
-/// other repositories. Unrestricted principals skip the lookup.
-async fn require_purge_in_token_scope(
+/// restore or purge artifacts of repositories in its allow-list (#4813).
+/// Out-of-scope ids read as 404, exactly like ids that do not exist, so the
+/// token learns nothing about other repositories. Unrestricted principals
+/// skip the lookup.
+async fn require_trashed_in_token_scope(
     state: &SharedState,
     auth: &AuthExtension,
     id: Uuid,
@@ -320,6 +328,84 @@ mod tests {
 
         assert_eq!(out_of_scope, StatusCode::NOT_FOUND);
         assert!(row_kept, "an out-of-scope purge deletes nothing");
+        assert_eq!(in_scope, StatusCode::OK);
+    }
+
+    /// An admin token restricted to other repositories does not see this
+    /// repository's trash in the listing; one restricted to it does.
+    #[tokio::test]
+    async fn list_endpoint_honours_a_repository_restricted_admin_token() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = format!("generic/api-scoped-list-{}", Uuid::new_v4().simple());
+        let _id = crate::services::trash_service::tests::seed_trashed(&fx, &path, true).await;
+        let scoped_app = |repo_ids: Vec<Uuid>| {
+            let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+            auth.is_admin = true;
+            auth.is_api_token = true;
+            auth.allowed_repo_ids = AccessScope::Restricted(repo_ids);
+            tdh::router_with_auth_ext(router(), fx.state.clone(), auth)
+        };
+        let get = |uri: &str| Request::get(uri).body(Body::empty()).unwrap();
+        let filtered = format!("/?repository={}", fx.repo_key);
+
+        let (s1, unfiltered_out) = tdh::send(scoped_app(vec![Uuid::new_v4()]), get("/")).await;
+        let (s2, filtered_out) = tdh::send(scoped_app(vec![Uuid::new_v4()]), get(&filtered)).await;
+        let (s3, filtered_in) = tdh::send(scoped_app(vec![fx.repo_id]), get(&filtered)).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (s1, s2, s3),
+            (StatusCode::OK, StatusCode::OK, StatusCode::OK)
+        );
+        let unfiltered_out: serde_json::Value = serde_json::from_slice(&unfiltered_out).unwrap();
+        assert!(
+            unfiltered_out["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["path"] != path),
+            "an out-of-scope token must not list this repository's trash: {unfiltered_out}"
+        );
+        let filtered_out: serde_json::Value = serde_json::from_slice(&filtered_out).unwrap();
+        assert_eq!(filtered_out["pagination"]["total"], 0, "{filtered_out}");
+        let filtered_in: serde_json::Value = serde_json::from_slice(&filtered_in).unwrap();
+        assert_eq!(filtered_in["pagination"]["total"], 1, "{filtered_in}");
+        assert_eq!(filtered_in["items"][0]["path"], path);
+    }
+
+    /// An admin token restricted to other repositories cannot restore this
+    /// repository's trash (404, still trashed); one restricted to it can.
+    #[tokio::test]
+    async fn restore_endpoint_honours_a_repository_restricted_admin_token() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = format!("generic/api-scoped-restore-{}", Uuid::new_v4().simple());
+        let id = crate::services::trash_service::tests::seed_trashed(&fx, &path, true).await;
+        let uri = format!("/{id}/restore");
+        let scoped_app = |repo_ids: Vec<Uuid>| {
+            let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+            auth.is_admin = true;
+            auth.is_api_token = true;
+            auth.allowed_repo_ids = AccessScope::Restricted(repo_ids);
+            tdh::router_with_auth_ext(router(), fx.state.clone(), auth)
+        };
+        let post = |uri: &str| Request::post(uri).body(Body::empty()).unwrap();
+
+        let (out_of_scope, _) = tdh::send(scoped_app(vec![Uuid::new_v4()]), post(&uri)).await;
+        let still_trashed: bool =
+            sqlx::query_scalar("SELECT is_deleted FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        let (in_scope, _) = tdh::send(scoped_app(vec![fx.repo_id]), post(&uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(out_of_scope, StatusCode::NOT_FOUND);
+        assert!(still_trashed, "an out-of-scope restore changes nothing");
         assert_eq!(in_scope, StatusCode::OK);
     }
 }

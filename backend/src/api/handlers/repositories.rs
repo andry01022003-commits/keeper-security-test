@@ -230,6 +230,14 @@ pub(crate) async fn require_repo_action(
 /// by `set_cache_ttl` / `set_npm_scope_policy` / `invalidate_cache`. Callers
 /// should invoke this AFTER [`require_repo_write_access`] (the tenant gate).
 ///
+/// The decision goes through
+/// [`crate::services::permission_service::PermissionService::check_repository_action`],
+/// the same resolver `require_repo_action` uses, so the `admin` action can come
+/// from a fine-grained rule OR a role assignment carrying `admin` (the
+/// `repository-owner` role, which repository creation grants to the creator).
+/// `check_permission` reads the `permissions` table only and refused every
+/// role-derived owner (#4818).
+///
 /// `pub(crate)` so sibling handler modules with repository-configuration
 /// subresources (e.g. the per-repo scan/security config in `security.rs`,
 /// #2750) can apply the same gate instead of duplicating it.
@@ -242,7 +250,7 @@ pub(crate) async fn require_repo_admin(
         return Ok(());
     }
     let has_admin = permission_service
-        .check_permission(auth.user_id, "repository", repo_id, "admin", false)
+        .check_repository_action(auth.user_id, repo_id, "admin", false)
         .await?;
     if has_admin {
         Ok(())
@@ -1743,6 +1751,36 @@ fn check_public_upstream_credentials(
     }
 }
 
+/// Refuse upstream credentials sent without the type that says how to use
+/// them (#4825).
+///
+/// `upstream_username` / `upstream_password` are only stored under an
+/// `upstream_auth_type`; without one (absent, empty or `"none"`) the create
+/// used to answer 201 and silently drop them, leaving an unauthenticated
+/// Remote the operator believed was authenticated, and skipping the #4662
+/// public-remote check. The type is not inferred: `PUT .../upstream-auth`
+/// requires `auth_type` too, and a password alone is ambiguous between
+/// `basic` and `bearer`. Empty strings count as absent.
+fn require_upstream_auth_type_for_credentials(
+    auth_type: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    let typed =
+        crate::services::upstream_auth::filter_auth_type(auth_type.map(str::to_string)).is_some();
+    let has_credentials = [username, password]
+        .into_iter()
+        .any(|v| v.is_some_and(|v| !v.is_empty()));
+    if has_credentials && !typed {
+        return Err(AppError::Validation(
+            "upstream_username/upstream_password require upstream_auth_type \
+             ('basic' or 'bearer'); nothing was created"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Apply [`check_public_upstream_credentials`]: refuse with 400
 /// `PUBLIC_REMOTE_UPSTREAM_CREDENTIALS`, or log the accepted override at WARN.
 /// Returns whether the override is what allowed the write, which the caller
@@ -2601,10 +2639,13 @@ pub async fn set_cache_ttl(
 // default TTL; tightening the read path would break them.
 pub async fn get_cache_ttl(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<CacheTtlResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    // #4815: a repository the caller may not read answers like a missing key.
+    require_visible(&repo, &auth, &service).await?;
 
     // Read from repository_config table
     let result: Option<(String,)> = sqlx::query_as(
@@ -2765,10 +2806,13 @@ pub async fn set_on_upstream_not_found(
 // UI probing a repository's settings gets the default rather than an error.
 pub async fn get_on_upstream_not_found(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<OnUpstreamNotFoundResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    // #4815: a repository the caller may not read answers like a missing key.
+    require_visible(&repo, &auth, &service).await?;
 
     // Read from repository_config table
     let result: Option<(String,)> = sqlx::query_as(
@@ -2932,10 +2976,13 @@ pub async fn set_stale_if_error_grace(
 // probes call this for every repo type and expect a 200.
 pub async fn get_stale_if_error_grace(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<StaleIfErrorGraceResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    // #4815: a repository the caller may not read answers like a missing key.
+    require_visible(&repo, &auth, &service).await?;
 
     let result: Option<(String,)> = sqlx::query_as(
         r#"
@@ -3625,10 +3672,13 @@ fn require_pypi_tracks_repo(repo: &crate::models::repository::Repository) -> Res
 )]
 pub async fn list_pypi_tracks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<PypiTracksListResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    // #4815: a repository the caller may not read answers like a missing key.
+    require_visible(&repo, &auth, &service).await?;
 
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT normalized_name, tracks_url FROM pypi_project_tracks \
@@ -4300,6 +4350,13 @@ pub async fn create_repository(
     require_public_visibility_allowed(
         visibility.allows_anonymous_read(),
         state.guest_access_policy.is_enabled().await,
+    )?;
+    // #4825: credentials without a type would be dropped; refuse them before
+    // the row exists, and before the #4662 check that only sees typed ones.
+    require_upstream_auth_type_for_credentials(
+        payload.upstream_auth_type.as_deref(),
+        payload.upstream_username.as_deref(),
+        payload.upstream_password.as_deref(),
     )?;
     // #4662: a public repository with upstream credentials spends them for
     // anonymous callers. Refused before the row exists unless accepted.
@@ -12850,10 +12907,13 @@ pub struct RoutingRulesResponse {
 )]
 pub async fn get_routing_rules(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<RoutingRulesResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    // #4815: a repository the caller may not read answers like a missing key.
+    require_visible(&repo, &auth, &service).await?;
 
     let result: Option<(String,)> = sqlx::query_as(
         r#"
@@ -19661,9 +19721,13 @@ mod tests {
             )
         };
 
-        let before = get_stale_if_error_grace(State(state.clone()), Path(key.clone()))
-            .await
-            .expect("get default");
+        let before = get_stale_if_error_grace(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+        )
+        .await
+        .expect("get default");
         let denied = put(user, &key, 60).await;
         let too_big = put(
             admin.clone(),
@@ -19673,9 +19737,13 @@ mod tests {
         .await;
         let not_remote = put(admin.clone(), &local_key, 60).await;
         let set = put(admin.clone(), &key, 0).await.expect("admin sets 0");
-        let after = get_stale_if_error_grace(State(state.clone()), Path(key.clone()))
-            .await
-            .expect("get override");
+        let after = get_stale_if_error_grace(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+        )
+        .await
+        .expect("get override");
 
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
             .bind(repo_id)
@@ -19701,6 +19769,89 @@ mod tests {
         assert_eq!(set.0.override_seconds, Some(0));
         assert_eq!(after.0.override_seconds, Some(0));
         assert_eq!(after.0.stale_if_error_grace_seconds, 0);
+    }
+
+    /// #4815: the per-repository settings reads answer like `GET /{key}`:
+    /// an anonymous caller, a user with no grant and a token scoped to other
+    /// repositories get the same 404 as for a missing key on a private
+    /// repository; a user with a grant and an admin read them.
+    #[tokio::test]
+    async fn repository_settings_reads_hide_a_private_repository_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (granted_id, granted_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        sqlx::query("UPDATE repositories SET visibility = 'private' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make private");
+        tdh::grant_repo_access(&pool, repo_id, granted_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        let reads = [
+            "cache-ttl",
+            "on-upstream-not-found",
+            "stale-if-error-grace",
+            "routing-rules",
+            "pypi-tracks",
+        ];
+        let anon = || tdh::router_anon(router(), state.clone());
+        let as_user = |auth: AuthExtension| tdh::router_with_auth(router(), state.clone(), auth);
+        let scoped_elsewhere = AuthExtension {
+            is_admin: true,
+            is_api_token: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..tdh::make_auth(user_id, &username)
+        };
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let mut seen = Vec::new();
+        for read in reads {
+            let uri = format!("/{key}/{read}");
+            let get = || Request::get(&uri).body(Body::empty()).unwrap();
+            seen.push((
+                read,
+                tdh::send(anon(), get()).await.0,
+                tdh::send(as_user(tdh::make_auth(user_id, &username)), get())
+                    .await
+                    .0,
+                tdh::send(as_user(scoped_elsewhere.clone()), get()).await.0,
+                tdh::send(as_user(tdh::make_auth(granted_id, &granted_name)), get())
+                    .await
+                    .0,
+                tdh::send(as_user(admin.clone()), get()).await.0,
+            ));
+        }
+
+        tdh::cleanup(&pool, repo_id, granted_id).await;
+        tdh::cleanup(&pool, Uuid::nil(), user_id).await;
+
+        for (read, anonymous, no_grant, other_scope, granted, admin) in seen {
+            assert_eq!(
+                (anonymous, no_grant, other_scope),
+                (
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND
+                ),
+                "{read}: anonymous, no-grant and other-repository callers"
+            );
+            assert_eq!(
+                (granted, admin),
+                (StatusCode::OK, StatusCode::OK),
+                "{read}: granted user and admin"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -22197,6 +22348,51 @@ mod tests {
     // require_repo_admin (repository-configuration admin gate, #2603)
     // -----------------------------------------------------------------------
 
+    /// DB-backed (#4818): the repository `admin` action can come from a role.
+    /// A member of the `repository-owner` role (`{read,write,delete,admin}`,
+    /// auto-granted to a repository's creator) passes `require_repo_admin` on
+    /// that repository, as `require_repo_action` already lets it write and
+    /// delete. The role does not reach another repository, a `developer`
+    /// (`{read,write}`) member is still refused, and an owner's role still wins
+    /// over a narrower fine-grained rule naming the same user, matching
+    /// `check_repository_action`.
+    #[tokio::test]
+    async fn require_repo_admin_honours_repository_owner_role_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (dev_id, dev_name) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (other_id, _other_key, other_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_role(&pool, repo_id, owner_id, "repository-owner").await;
+        tdh::grant_repo_role(&pool, repo_id, dev_id, "developer").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let perms = &state.permission_service;
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let dev = tdh::make_auth(dev_id, &dev_name);
+        let forbidden = |r: &Result<()>| matches!(r, Err(AppError::Authorization(_)));
+
+        let r = require_repo_admin(&owner, repo_id, perms).await;
+        assert!(r.is_ok(), "repository-owner member must pass: {r:?}");
+
+        let r = require_repo_admin(&owner, other_id, perms).await;
+        assert!(forbidden(&r), "owner role is per repository: {r:?}");
+
+        let r = require_repo_admin(&dev, repo_id, perms).await;
+        assert!(forbidden(&r), "developer member lacks admin: {r:?}");
+
+        tdh::grant_repo_actions(&pool, repo_id, owner_id, &["read"]).await;
+        let r = require_repo_admin(&owner, repo_id, perms).await;
+        assert!(r.is_ok(), "owner role wins over a narrower rule: {r:?}");
+
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup(&pool, other_id, dev_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
     /// DB-backed: a non-admin member holding only `write` (developer role via
     /// `grant_repo_access`, no fine-grained `admin` grant) is DENIED
     /// `set_routing_rules`; granting the repository `admin` action lets it
@@ -22919,7 +23115,7 @@ mod tests {
             RepositoryFormat::Docker,
         );
         let reported = |fx: &tdh::Fixture| {
-            let router = fx.router_anon(super::router());
+            let router = fx.router_with_auth(super::router());
             let uri = format!("/{}/cache-ttl", fx.repo_key);
             async move {
                 let (status, body) = tdh::send(router, tdh::get(uri)).await;
@@ -22983,7 +23179,7 @@ mod tests {
         };
 
         let read = |fx: &tdh::Fixture| {
-            let app = fx.router_anon(super::router());
+            let app = fx.router_with_auth(super::router());
             let uri = format!("/{}/on-upstream-not-found", fx.repo_key);
             async move {
                 let (status, body) = tdh::send(app, tdh::get(uri)).await;
@@ -29737,6 +29933,145 @@ mod tests {
                 .await;
             tdh::cleanup(&pool, id, user_id).await;
         }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4825: upstream credentials without upstream_auth_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upstream_credentials_require_an_auth_type_4825() {
+        let refused = |t: Option<&str>, u: Option<&str>, p: Option<&str>| {
+            matches!(
+                require_upstream_auth_type_for_credentials(t, u, p),
+                Err(AppError::Validation(ref m)) if m.contains("upstream_auth_type")
+            )
+        };
+        assert!(refused(None, Some("u"), Some("p")));
+        assert!(refused(None, None, Some("token")));
+        assert!(refused(None, Some("u"), None));
+        assert!(refused(Some(""), Some("u"), Some("p")));
+        assert!(refused(Some("none"), Some("u"), Some("p")));
+        for (t, u, p) in [
+            (None, None, None),
+            (None, Some(""), Some("")),
+            (Some("none"), None, None),
+            (Some("basic"), Some("u"), Some("p")),
+            (Some("bearer"), None, Some("token")),
+        ] {
+            assert!(
+                require_upstream_auth_type_for_credentials(t, u, p).is_ok(),
+                "{t:?} {u:?} {p:?}"
+            );
+        }
+    }
+
+    /// DB-backed (#4825): a create carrying upstream credentials but no
+    /// `upstream_auth_type` is refused with 400 `VALIDATION_ERROR` and leaves
+    /// no repository, instead of answering 201 with the credentials dropped.
+    /// With the type, the credentials are stored, and on a public Remote the
+    /// #4662 refusal fires as before.
+    #[tokio::test]
+    async fn test_create_remote_credentials_without_auth_type_refused_db_4825() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upauth-4825-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let suffix = Uuid::new_v4().simple().to_string();
+        let remote = |key: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api",
+                "upstream_username": "u",
+                "upstream_password": "p"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            make_create_request(key, key, "generic", body)
+        };
+        let exists = |key: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE key = $1)",
+                )
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        // No type (private and public): 400 VALIDATION_ERROR, no row.
+        let untyped_key = format!("upauth-4825-n-{suffix}");
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({ "is_public": true }),
+            serde_json::json!({ "upstream_auth_type": "none" }),
+        ] {
+            let err = create_repository(State(state.clone()), auth(), remote(&untyped_key, extra))
+                .await
+                .expect_err("credentials without upstream_auth_type must be refused");
+            assert!(
+                matches!(err, AppError::Validation(ref m) if m.contains("upstream_auth_type")),
+                "{err:?}"
+            );
+        }
+        assert!(
+            !exists(untyped_key).await,
+            "a refused create must not leave a row"
+        );
+
+        // Typed, public, no override: the #4662 refusal still fires.
+        let public_key = format!("upauth-4825-p-{suffix}");
+        let err = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &public_key,
+                serde_json::json!({ "is_public": true, "upstream_auth_type": "basic" }),
+            ),
+        )
+        .await
+        .expect_err("public remote with basic credentials must be refused (#4662)");
+        assert!(is_public_credentials_refusal(&err), "{err:?}");
+        assert!(!exists(public_key).await);
+
+        // Typed, private: created with the credentials stored.
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &format!("upauth-4825-b-{suffix}"),
+                serde_json::json!({ "upstream_auth_type": "basic" }),
+            ),
+        )
+        .await
+        .expect("private remote with basic credentials is created");
+        assert_eq!(created.upstream_auth_type.as_deref(), Some("basic"));
+        assert_eq!(
+            crate::services::upstream_auth::get_upstream_auth_type(&pool, created.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("basic")
+        );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(created.id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
