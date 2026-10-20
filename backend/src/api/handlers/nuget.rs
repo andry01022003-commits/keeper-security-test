@@ -1496,43 +1496,71 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
     let mut entries = Vec::new();
     let mut current: Option<Current> = None;
     let mut field: Option<&'static str> = None;
+    let mut text = String::new();
     loop {
         match reader.read_event() {
             Err(_) | Ok(Event::Eof) => break,
-            Ok(Event::Start(element)) => match element.local_name().as_ref() {
-                b"entry" => current = Some(Current::default()),
-                b"title" => field = Some("id"),
-                b"Id" => field = Some("id"),
-                b"Version" => field = Some("version"),
-                b"Authors" => field = Some("authors"),
-                b"Description" => field = Some("description"),
-                b"PackageHash" => field = Some("hash"),
-                b"PackageSize" => field = Some("size"),
-                _ => field = None,
-            },
-            Ok(Event::Text(text)) => {
-                let (Some(entry), Some(target)) = (current.as_mut(), field) else {
-                    continue;
-                };
-                let Ok(value) = text.decode() else { continue };
-                let value = value.trim();
-                if value.is_empty() {
-                    continue;
+            Ok(Event::Start(element)) => {
+                match element.local_name().as_ref() {
+                    b"entry" => current = Some(Current::default()),
+                    b"title" => field = Some("id"),
+                    b"Id" => field = Some("id"),
+                    b"Version" => field = Some("version"),
+                    b"Authors" => field = Some("authors"),
+                    b"Description" => field = Some("description"),
+                    b"PackageHash" => field = Some("hash"),
+                    b"PackageSize" => field = Some("size"),
+                    _ => field = None,
                 }
-                match target {
-                    // `<title>` comes first; a later `<d:Id>` is authoritative.
-                    "id" => entry.id = value.to_string(),
-                    "version" if entry.version.is_empty() => entry.version = value.to_string(),
-                    "authors" => entry.authors = value.to_string(),
-                    "description" => entry.description = value.to_string(),
-                    "hash" => entry.hash = Some(value.to_string()),
-                    "size" => entry.size = value.parse().unwrap_or(0),
-                    _ => {}
+                text.clear();
+            }
+            Ok(Event::Text(t)) => {
+                if let Ok(decoded) = t.decode() {
+                    text.push_str(&decoded);
+                }
+            }
+            Ok(Event::CData(c)) => {
+                if let Ok(decoded) = c.decode() {
+                    text.push_str(&decoded);
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(Some(resolved)) = e.resolve_char_ref() {
+                    text.push(resolved);
+                } else {
+                    match &*e {
+                        b"amp" => text.push('&'),
+                        b"lt" => text.push('<'),
+                        b"gt" => text.push('>'),
+                        b"quot" => text.push('"'),
+                        b"apos" => text.push('\''),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(element)) => {
+                let local_name = element.local_name();
+                let local_name_ref = local_name.as_ref();
+                if let (Some(entry), Some(target)) = (current.as_mut(), field) {
+                    let value = text.trim();
+                    if !value.is_empty() {
+                        match target {
+                            // `<title>` comes first; a later `<d:Id>` is authoritative.
+                            "id" => entry.id = value.to_string(),
+                            "version" if entry.version.is_empty() => {
+                                entry.version = value.to_string()
+                            }
+                            "authors" => entry.authors = value.to_string(),
+                            "description" => entry.description = value.to_string(),
+                            "hash" => entry.hash = Some(value.to_string()),
+                            "size" => entry.size = value.parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                }
+                text.clear();
                 field = None;
-                if element.local_name().as_ref() == b"entry" {
+                if local_name_ref == b"entry" {
                     if let Some(entry) = current.take() {
                         if !entry.id.is_empty() && !entry.version.is_empty() {
                             entries.push(V2Entry {
@@ -1547,6 +1575,8 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
                     }
                 }
             }
+            // Decl, Comment, PI, DocType and self-closing elements carry no
+            // value; a comment inside a field must not drop the text before it.
             Ok(_) => {}
         }
     }
@@ -7394,6 +7424,90 @@ mod read_db_tests {
         assert_eq!(entries[0].authors, "James");
         assert_eq!(entries[0].size, 700);
         assert_eq!(entries[1].version, "12.0.3");
+    }
+
+    /// quick-xml reports entity and character references as their own
+    /// `GeneralRef` events and CDATA as its own `CData` event, so a value like
+    /// `Fish &amp; chips` arrives as several fragments. The parser must
+    /// reassemble them rather than letting the last fragment overwrite the
+    /// field (#4816).
+    #[test]
+    fn v2_feed_entries_reassemble_entity_references_and_cdata() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <entry>
+    <title type="text">DtfXml.Pkg</title>
+    <m:properties>
+      <d:Id>DtfXml.Pkg</d:Id><d:Version>1.0.0</d:Version>
+      <d:Authors>Ren&#233;e &amp; J&#xF6;rg</d:Authors>
+      <d:Description>Fish &amp; chips &lt;b&gt;caf&#233;&lt;/b&gt; <![CDATA[über &amp; out]]></d:Description>
+    </m:properties>
+  </entry>
+</feed>"#;
+        let entries = parse_v2_feed_entries(xml);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].authors, "Renée & Jörg");
+        assert_eq!(
+            entries[0].description,
+            "Fish & chips <b>café</b> über &amp; out"
+        );
+    }
+
+    /// The exact upstream body the DTF `deps-1.12.0-controls` tier serves
+    /// (#4816): literal non-ASCII next to named and hex character references.
+    #[test]
+    fn v2_feed_entries_keep_text_around_references_in_the_dtf_payload() {
+        let xml = concat!(
+            "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+            r#"<feed xml:base="http://up/" xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">"#,
+            r#"<title type="text">Packages</title>"#,
+            r#"<entry><id>http://up/Packages(Id='DtfXml.Pkg',Version='1.0.0')</id><title type="text">DtfXml.Pkg</title>"#,
+            r#"<content type="application/zip" src="http://up/package/DtfXml.Pkg/1.0.0"/><m:properties>"#,
+            r#"<d:Id>DtfXml.Pkg</d:Id><d:Version>1.0.0</d:Version>"#,
+            r#"<d:Authors>Renée &amp; J&#xF6;rg</d:Authors>"#,
+            r#"<d:Description>Fish &amp; chips &lt;b&gt;caf&#233;&lt;/b&gt; über</d:Description>"#,
+            r#"<d:PackageHash>AAAA</d:PackageHash><d:PackageSize>1234</d:PackageSize></m:properties></entry>"#,
+            "</feed>"
+        );
+        let entries = parse_v2_feed_entries(xml);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "DtfXml.Pkg");
+        assert_eq!(entries[0].version, "1.0.0");
+        assert_eq!(entries[0].authors, "Renée & Jörg");
+        assert_eq!(entries[0].description, "Fish & chips <b>café</b> über");
+        assert_eq!(entries[0].hash_sha256_b64.as_deref(), Some("AAAA"));
+        assert_eq!(entries[0].size, 1234);
+    }
+
+    /// Every field the reader consumes is reassembled the same way, including
+    /// `<title>`, `<d:Id>`, `<d:Version>`, `<d:PackageHash>` and
+    /// `<d:PackageSize>`, and a comment inside a value does not drop the text
+    /// before it (#4816).
+    #[test]
+    fn v2_feed_entries_reassemble_every_consumed_field() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <entry>
+    <title type="text">A&amp;B.Title</title>
+    <m:properties>
+      <d:Version>1.0.0-rc&#46;1</d:Version>
+      <d:PackageHash>ab<![CDATA[c+/]]>d&#61;</d:PackageHash>
+      <d:PackageSize>1<!-- c -->2&#51;</d:PackageSize>
+      <d:Authors>Ann<!-- note -->, Bob</d:Authors>
+    </m:properties>
+  </entry>
+  <entry>
+    <title type="text">Ignored</title>
+    <m:properties><d:Id>Q&apos;s&#x2E;Pkg</d:Id><d:Version>2.0.0</d:Version></m:properties>
+  </entry>
+</feed>"#;
+        let entries = parse_v2_feed_entries(xml);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "A&B.Title");
+        assert_eq!(entries[0].version, "1.0.0-rc.1");
+        assert_eq!(entries[0].hash_sha256_b64.as_deref(), Some("abc+/d="));
+        assert_eq!(entries[0].size, 123);
+        assert_eq!(entries[0].authors, "Ann, Bob");
+        assert_eq!(entries[1].id, "Q's.Pkg");
+        assert_eq!(entries[1].version, "2.0.0");
     }
 
     /// A truncated document keeps the entries already read.
