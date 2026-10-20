@@ -21,7 +21,7 @@ use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -297,6 +297,7 @@ async fn push_gem(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -414,6 +415,18 @@ async fn push_gem(
     )
     .await;
 
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
     info!(
         "RubyGems push: {} {} ({}) to repo {}",
         gem_name, gem_version, filename, repo_key
@@ -486,10 +499,20 @@ async fn query_gem_specs(
 /// the stored coordinate columns. Byte-identical for natively published gems;
 /// corrects bare-path generic uploads. See
 /// [`crate::formats::rubygems::coordinates_from_gem_filename`].
+///
+/// #4645: when the stored basename is exactly `{name}-{version}.gem` (or
+/// `{name}-{version}-{platform}.gem`) for the stored columns, those columns
+/// came from the gem's own gemspec at push time and are authoritative; the
+/// filename is only re-split when it does not agree with them. A name such as
+/// `qa-gem-2` cannot be recovered from `qa-gem-2-1.0.0.gem` by splitting alone.
 fn spec_index_coordinates(path: &str, name: String, version: String) -> (String, String) {
-    path.rsplit('/')
-        .next()
-        .filter(|f| !f.is_empty())
+    let basename = path.rsplit('/').next().filter(|f| !f.is_empty());
+    let stem = basename.and_then(|f| f.strip_suffix(".gem"));
+    let full_name = format!("{}-{}", name, version);
+    if stem.is_some_and(|s| s == full_name || s.starts_with(&format!("{}-", full_name))) {
+        return (name, version);
+    }
+    basename
         .and_then(crate::formats::rubygems::coordinates_from_gem_filename)
         .unwrap_or((name, version))
 }
@@ -2187,17 +2210,63 @@ mod tests {
         f.teardown().await;
     }
 
-    /// #2561: an authenticated gem push decodes the gemspec through the
-    /// permit-scoped decode (uncontended) and stores the gem.
+    /// #4725: a `gem push` to a hosted repository must queue a push sync task
+    /// for a subscribed push peer, and a push that arrives as peer replication
+    /// must not be fanned back out. Fails on `main` (nothing queued).
     #[tokio::test]
-    async fn test_rubygems_push_gem_succeeds_2561() {
+    async fn gem_push_queues_push_sync_task_4725() {
         let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
             return;
         };
-        // A .gem is a plain tar carrying a gzip'd gemspec-YAML `metadata.gz`.
-        let yaml = b"--- !ruby/object:Gem::Specification\nname: pushgem\nversion: 1.0.0\n";
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "rubygems").await;
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from(build_test_gem("repl-gem", "1.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "gem push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated push (as the sync worker sends it) stores the gem but
+        // must not queue another task.
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(build_test_gem("repl-gem", "2.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated gem push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["repl-gem/1.0.0/repl-gem-1.0.0.gem".to_string()],
+            "only the client push queues a push task; the replicated one must not"
+        );
+    }
+
+    /// A minimal `.gem`: a plain tar carrying a gzip'd gemspec-YAML `metadata.gz`.
+    fn build_test_gem(name: &str, version: &str) -> Vec<u8> {
+        let yaml =
+            format!("--- !ruby/object:Gem::Specification\nname: {name}\nversion: {version}\n");
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut gz, yaml).unwrap();
+        std::io::Write::write_all(&mut gz, yaml.as_bytes()).unwrap();
         let metadata_gz = gz.finish().unwrap();
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -2205,7 +2274,71 @@ mod tests {
         header.set_size(metadata_gz.len() as u64);
         header.set_cksum();
         builder.append(&header, &metadata_gz[..]).unwrap();
-        let gem = builder.into_inner().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    /// #4645: a pushed gem whose NAME contains a hyphen-digit segment
+    /// (`qa-gem-2`) must be advertised in the spec indices under the name and
+    /// version from its own gemspec, not re-split from the stored filename at
+    /// the first hyphen-digit boundary (`qa-gem` / `2-1.0.0`). Fails on `main`.
+    #[tokio::test]
+    async fn test_rubygems_push_hyphen_digit_name_indexed_correctly_4645() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from(build_test_gem("qa-gem-2", "1.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "gem push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let want = crate::formats::rubygems::marshal_specs_index(&[("qa-gem-2", "1.0.0", "ruby")]);
+        for index in ["specs.4.8.gz", "latest_specs.4.8.gz"] {
+            let app = f.router_anon(super::router());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", f.repo_key, index))).await;
+            assert_eq!(status, StatusCode::OK, "{index}");
+            let mut specs = Vec::new();
+            GzDecoder::new(&body[..])
+                .read_to_end(&mut specs)
+                .expect("gunzip specs");
+            assert_eq!(
+                specs, want,
+                "{index} must advertise [qa-gem-2, 1.0.0, ruby]"
+            );
+        }
+
+        // The download filename a client reconstructs from those coordinates
+        // resolves.
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/gems/qa-gem-2-1.0.0.gem", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// #2561: an authenticated gem push decodes the gemspec through the
+    /// permit-scoped decode (uncontended) and stores the gem.
+    #[tokio::test]
+    async fn test_rubygems_push_gem_succeeds_2561() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let gem = build_test_gem("pushgem", "1.0.0");
 
         let mut events = f.state.event_bus.subscribe();
         let app = f.router_with_auth(super::router());

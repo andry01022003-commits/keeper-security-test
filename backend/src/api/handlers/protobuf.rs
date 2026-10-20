@@ -20,7 +20,7 @@ use std::io::Write;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Extension;
@@ -380,6 +380,14 @@ struct GetResourcesResponse {
 // ---------------------------------------------------------------------------
 
 fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
+    // The database sites pass `db_status(&e)` with `internal`; a 503 there
+    // (saturated pool, unreachable database) is Connect's retryable
+    // `unavailable`, the code Connect itself maps HTTP 503 to (#4765).
+    let code = if status == StatusCode::SERVICE_UNAVAILABLE && code == "internal" {
+        "unavailable"
+    } else {
+        code
+    };
     let body = serde_json::json!({ "code": code, "message": message });
     super::with_retry_after_on_503(
         Response::builder()
@@ -592,7 +600,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
 #[allow(clippy::result_large_err)]
 fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response> {
     use crate::util::bounded_archive::{
-        budgeted, read_capped, MAX_INGEST_ARCHIVE_ENTRIES, MAX_INGEST_METADATA_ENTRY_BYTES,
+        budgeted, max_ingest_archive_entries, read_capped, MAX_INGEST_METADATA_ENTRY_BYTES,
     };
 
     // This extractor reads EVERY entry into memory and base64-encodes it (~1.33x
@@ -604,6 +612,7 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
     let mut archive = tar::Archive::new(budgeted(gz_decoder));
 
     let mut files = Vec::new();
+    let max_entries = max_ingest_archive_entries();
     let mut entries_seen: u64 = 0;
 
     for entry_result in archive.entries().map_err(|e| {
@@ -622,13 +631,13 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
         })?;
 
         entries_seen += 1;
-        if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+        if entries_seen > max_entries {
             return Err(connect_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_argument",
                 &format!(
                     "Bundle contains too many entries (> {}); refusing suspected decompression bomb",
-                    MAX_INGEST_ARCHIVE_ENTRIES
+                    max_entries
                 ),
             ));
         }
@@ -1098,6 +1107,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<UploadRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1322,6 +1332,17 @@ async fn upload(
             size_bytes,
             &commit_digest,
             None,
+        )
+        .await;
+
+        // #4725: fan out to subscribed push peers.
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            &headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
         )
         .await;
 
@@ -2095,6 +2116,37 @@ mod tests {
         assert_eq!(json["message"], "Database operation failed");
     }
 
+    /// #4765: a database outage in a Connect handler is Connect's retryable
+    /// `unavailable` at 503 with `Retry-After: 1`, not `internal` at 500.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_connect_db_error_db_unavailable_is_503_unavailable_4765() {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        pool.close().await;
+        let e = sqlx::query("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect_err("a closed pool cannot run a query");
+
+        let response = connect_db_error(e);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "unavailable");
+    }
+
     #[test]
     fn test_connect_error_returns_correct_status_and_body() {
         let resp = connect_error(StatusCode::NOT_FOUND, "not_found", "thing missing");
@@ -2794,6 +2846,94 @@ mod tests {
         let edges = extract_graph_edges(&meta, "c1");
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to_commit_id, "valid/dep");
+    }
+
+    /// #4725: a `buf push` to a hosted repository must queue a push sync task
+    /// for a subscribed push peer. The registry-generated `_labels` row carries
+    /// no stored bytes, so it must not be queued, and a push that arrives as
+    /// peer replication must not be fanned back out. Fails on `main` (nothing
+    /// queued).
+    #[tokio::test]
+    async fn protobuf_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "protobuf").await;
+
+        let file = (
+            "acme/repl/v1/repl.proto".to_string(),
+            b"syntax = \"proto3\";\n".as_slice().to_vec(),
+        );
+        let digest = compute_commit_digest(std::slice::from_ref(&file));
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "repl" },
+                "files": [{
+                    "path": file.0,
+                    "content": base64::engine::general_purpose::STANDARD.encode(&file.1),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // A replicated push (as the sync worker sends it) stores the commit but
+        // must not queue another task.
+        let body2 = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "repl" },
+                "files": [{
+                    "path": "acme/repl/v1/repl.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n// v2\n"),
+                }],
+            }],
+        });
+        let mut req = tdh::post(
+            format!(
+                "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                fx.repo_key
+            ),
+            "application/json",
+            bytes::Bytes::from(serde_json::to_vec(&body2).unwrap()),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated push must succeed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec![format!("modules/acme/repl/commits/{digest}")],
+            "only the client push queues a task; the _labels index and the replicated push must not"
+        );
     }
 }
 

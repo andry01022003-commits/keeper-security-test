@@ -619,14 +619,16 @@ pub async fn update_user(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    // #3723: the setup gate is latched off at runtime once no ACTIVE admin is
-    // pending a password change, and is never re-evaluated on its own.
-    // Reactivating a local admin that is still flagged recreates exactly the
-    // row that arms it, so re-arm the latch here: the next gated request on
-    // this replica re-checks the DB and refuses until the password is
-    // rotated. Other replicas re-arm at their next restart, as with
-    // boot-time arming.
+    // #3723: the setup gate is latched off at runtime once the ACTIVE built-in
+    // admin is no longer pending a password change, and is never re-evaluated
+    // on its own. Reactivating that account while it is still flagged
+    // recreates exactly the row that arms it, so re-arm the latch here: the
+    // next gated request on this replica re-checks the DB and refuses until
+    // the password is rotated. Other replicas re-arm at their next restart,
+    // as with boot-time arming. Only the built-in `admin` arms the gate
+    // (#4634); another admin's pending change is enforced per user instead.
     if matches!(payload.is_active, Some(true))
+        && user.username == crate::api::BUILTIN_ADMIN_USERNAME
         && user.is_admin
         && user.must_change_password
         && user.external_id.is_none()
@@ -1452,9 +1454,16 @@ async fn change_password_inner(
     )
     .await;
 
-    // If this user had must_change_password, check if setup mode should be unlocked
-    if had_must_change && state.setup_required.load(Ordering::Relaxed) {
-        state.setup_required.store(false, Ordering::Relaxed);
+    // If this user had must_change_password, check if setup mode should be
+    // unlocked. Only the built-in admin's rotation completes setup (#4634), so
+    // ask the DB rather than assuming: another admin rotating its temporary
+    // password must not drop the gate while `admin` is still pending.
+    // `setup_still_required` latches the flag off once nothing is pending and
+    // keeps the lock if the DB cannot be reached.
+    if had_must_change
+        && state.setup_required.load(Ordering::Relaxed)
+        && !state.setup_still_required().await
+    {
         tracing::info!("Setup complete. API fully unlocked.");
 
         // Delete the password file (best-effort).
@@ -4010,6 +4019,42 @@ mod router_split_tests {
 
         delete_user_row(&pool, caller_id).await;
         delete_user_row(&pool, target_id).await;
+    }
+
+    /// #4762: the `USER_CREATED` audit row records the request's client IP
+    /// (the TCP peer under the #4681 resolution; a spoofed XFF from an
+    /// untrusted peer is ignored), like login and the #4710 rows.
+    #[tokio::test]
+    async fn test_4762_user_created_audit_row_records_client_ip() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let app = tdh::with_client_ip_middleware(build_admin_app(
+            state,
+            tdh::admin_auth(user_id, &username),
+        ));
+        let new_name = format!("ip4762-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let req = tdh::request_from_peer(
+            "/",
+            json!({ "username": new_name, "email": format!("{new_name}@test.local") }),
+            "203.0.113.62:4762",
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let created_id: Uuid = created["user"]["id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("created user id");
+
+        let ip = tdh::audit_row_ip(&pool, "USER_CREATED", created_id).await;
+        delete_user_row(&pool, created_id).await;
+        delete_user_row(&pool, user_id).await;
+        assert_eq!(
+            ip,
+            Some(Some("203.0.113.62".to_string())),
+            "the USER_CREATED row must carry the request peer IP (#4762)"
+        );
     }
 }
 

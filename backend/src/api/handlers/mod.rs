@@ -12,6 +12,50 @@ pub(crate) fn is_replication_request(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Queue push sync tasks for a freshly committed hosted upload so every
+/// subscribed push/mirror peer receives it (#4725).
+///
+/// The native-format handlers write their artifact rows directly, so they do
+/// not pass through `ArtifactService::finalize_upload`, which queues these
+/// tasks for the generic upload path. This helper is the shared replacement:
+/// call it once the artifact row (and its metadata) is committed, with the
+/// request's headers so a peer replication write is never fanned back out to
+/// other peers.
+pub(crate) async fn queue_push_sync_tasks_for_upload(
+    db: &sqlx::PgPool,
+    headers: &HeaderMap,
+    repository_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    path: &str,
+    size_bytes: i64,
+) {
+    if is_replication_request(headers) {
+        return;
+    }
+    queue_push_sync_tasks_now(db, repository_id, artifact_id, path, size_bytes).await;
+}
+
+/// [`queue_push_sync_tasks_for_upload`] for a call site that already knows the
+/// write is not a replication (it threaded an `enqueue_sync_tasks: bool` down
+/// from its handler instead of the `HeaderMap`).
+pub(crate) async fn queue_push_sync_tasks_now(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    path: &str,
+    size_bytes: i64,
+) {
+    crate::services::peer_instance_service::PeerInstanceService::new(db.clone())
+        .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+            id: artifact_id,
+            repository_id,
+            path,
+            size_bytes,
+            created_at: chrono::Utc::now(),
+        })
+        .await;
+}
+
 /// Remove any soft-deleted artifact at the given `(repository_id, path)` so
 /// that a subsequent INSERT won't violate the UNIQUE constraint.  This is a
 /// fire-and-forget cleanup: if the DELETE fails or finds nothing we just
@@ -154,15 +198,31 @@ pub fn db_err(e: impl std::fmt::Display) -> axum::response::Response {
     error_helpers::map_db_err(e.to_string())
 }
 
+/// Whether a database error, as its rendered text, means the database could
+/// not be reached or could not answer (#4750). Format handlers only hold the
+/// error's `Display` (a `sqlx::Error`, or the `String` a cache or service
+/// wrapped it in), so this routes it through the same
+/// [`crate::error::AppError::is_db_unavailable`] the generic path uses
+/// instead of keeping a second list of markers (#4765).
+fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
+    crate::error::AppError::Database(e.to_string()).is_db_unavailable()
+}
+
 /// Pick the HTTP status for a database error when the response envelope is
 /// format-specific (npm/OCI/Git-LFS/etc.) and cannot go through `db_err`.
 ///
 /// A saturated sqlx pool is transient capacity, so it must surface as 503
-/// (clients back off); every other DB failure stays 500. Callers keep their
-/// own format-specific error body and pass this for the status argument
-/// (#2083).
+/// (clients back off) (#2083). So must a database that cannot be reached or
+/// cannot answer: a closed pool, a lost or refused connection, a statement
+/// timeout, a server shutting down. That is the same classification
+/// [`crate::error::AppError::is_db_unavailable`] gives the generic path
+/// (#4750), so an `npm install`, a `docker pull` or a Git LFS batch during an
+/// outage sees a retryable 503 rather than a 500 (#4765). Every other DB
+/// failure (a query or data error) stays 500. Callers keep their own
+/// format-specific error body and pass this for the status argument; the
+/// envelope helpers add `Retry-After` through [`with_retry_after_on_503`].
 pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
-    if crate::error::is_pool_timeout(&e.to_string()) {
+    if is_db_unavailable_display(e) {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -185,12 +245,17 @@ pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode
 ///
 /// Pool saturation is transient capacity rather than a fault, so it gets the
 /// same wording (and `WARN` level) as the `db_err` path; pair this with
-/// [`db_status`] for the matching 503 (#2083).
+/// [`db_status`] for the matching 503 (#2083). An unreachable database
+/// (#4750's classification) gets its own retry wording, logged at `ERROR`,
+/// matching the 503 `db_status` now picks for it (#4765).
 pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
     let raw = e.to_string();
     if crate::error::is_pool_timeout(&raw) {
         tracing::warn!(error = %raw, code = "POOL_EXHAUSTED", "Request error");
         "Database connection pool is saturated, retry shortly"
+    } else if is_db_unavailable_display(&raw) {
+        tracing::error!(error = %raw, code = "DATABASE_UNAVAILABLE", "Request error");
+        "Database is temporarily unavailable, retry shortly"
     } else {
         tracing::error!(error = %raw, code = "DATABASE_ERROR", "Request error");
         "Database operation failed"
@@ -306,6 +371,12 @@ pub(crate) mod test_db_helpers;
 #[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod virtual_token_scope_tests;
+
+/// #4690: router-level tests that a virtual's REST listings explain an empty
+/// result to a caller granted the virtual but none of its members.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod virtual_members_notice_tests;
 
 /// #4498: router-level tests that an unreadable repository answers exactly
 /// like a missing one on the REST read endpoints.
@@ -585,7 +656,9 @@ mod tests {
 
     #[test]
     fn test_db_err_returns_500() {
-        let resp = db_err("connection refused");
+        // A query error, not an outage: an unreachable database is a 503
+        // since #4756.
+        let resp = db_err("error returned from database: relation \"t\" does not exist");
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -598,17 +671,48 @@ mod tests {
     }
 
     #[test]
-    fn test_db_status_sheds_pool_timeout_only() {
+    fn test_db_status_sheds_pool_timeout_and_outage_only() {
         // Format-specific envelopes (npm/OCI/Git-LFS/etc.) keep their body and
-        // pass db_status for the status: 503 on pool timeout, 500 otherwise.
+        // pass db_status for the status: 503 on pool timeout (#2083) or an
+        // unreachable database (#4765), 500 for a query or data error.
         assert_eq!(
             db_status(&sqlx::Error::PoolTimedOut.to_string()),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
-        assert_eq!(
-            db_status("connection refused"),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        for outage in [
+            sqlx::Error::PoolClosed.to_string(),
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Connection refused (os error 111)",
+            ))
+            .to_string(),
+            "error returned from database: canceling statement due to statement timeout"
+                .to_string(),
+        ] {
+            assert_eq!(
+                db_status(&outage),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{outage}"
+            );
+            assert_eq!(
+                db_err_message(&outage),
+                "Database is temporarily unavailable, retry shortly",
+                "{outage}"
+            );
+        }
+        for fault in [
+            sqlx::Error::RowNotFound.to_string(),
+            "error returned from database: relation \"t\" does not exist".to_string(),
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#
+                .to_string(),
+        ] {
+            assert_eq!(
+                db_status(&fault),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{fault}"
+            );
+            assert_eq!(db_err_message(&fault), "Database operation failed");
+        }
     }
 
     #[test]

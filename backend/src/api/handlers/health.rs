@@ -169,12 +169,21 @@ impl DependencyStatus {
     }
 }
 
-/// Run `probe` with the `/readyz` deadline; a timeout is an unhealthy result.
-async fn with_readyz_deadline<F>(name: &str, probe: F) -> CheckStatus
+/// How much later than the probe deadline the outer `/readyz` deadline (the
+/// one that bounds the cache-lock wait) fires. It must never fire first: that
+/// would drop the cached probe before it stores its timed-out result (#4781).
+const READYZ_LOCK_WAIT_MARGIN: Duration = Duration::from_millis(100);
+
+/// Run `probe` until `deadline`; a timeout is an unhealthy result.
+async fn with_readyz_deadline<F>(
+    name: &str,
+    deadline: tokio::time::Instant,
+    probe: F,
+) -> CheckStatus
 where
     F: std::future::Future<Output = CheckStatus>,
 {
-    match tokio::time::timeout(READYZ_DEPENDENCY_TIMEOUT, probe).await {
+    match tokio::time::timeout_at(deadline, probe).await {
         Ok(check) => check,
         Err(_) => CheckStatus {
             status: STATUS_UNHEALTHY.to_string(),
@@ -191,6 +200,13 @@ where
 /// is cached for the TTL like any other result instead of costing every
 /// `/readyz` the full deadline. The outer deadline bounds the wait for the
 /// cache lock when a slower `/health` probe of the same dependency holds it.
+///
+/// Both deadlines derive from one `Instant` taken before the lock wait, and
+/// the outer one is [`READYZ_LOCK_WAIT_MARGIN`] later, so the inner timeout
+/// always fires first and its result is stored. Two independent
+/// `timeout(READYZ_DEPENDENCY_TIMEOUT)` calls raced: the inner timer starts
+/// only once the lock is held, so the outer could fire first and drop the
+/// probe before the store (#4781).
 async fn readyz_cached<F, Fut>(
     name: &str,
     cache: &HealthCache,
@@ -201,9 +217,11 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = CheckStatus>,
 {
+    let deadline = tokio::time::Instant::now() + READYZ_DEPENDENCY_TIMEOUT;
     with_readyz_deadline(
         name,
-        cached_check(cache, ttl, || with_readyz_deadline(name, probe())),
+        deadline + READYZ_LOCK_WAIT_MARGIN,
+        cached_check(cache, ttl, || with_readyz_deadline(name, deadline, probe())),
     )
     .await
 }
@@ -2732,6 +2750,117 @@ mod tests {
             "a cold-cache burst must produce exactly one probe, got {}",
             probes.load(AtomicOrdering::SeqCst)
         );
+    }
+
+    /// A probe that never answers, counting how often `readyz_cached` runs it.
+    fn hung_probe(
+        probes: &Arc<AtomicUsize>,
+    ) -> impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = CheckStatus> + Send>>
+    {
+        let probes = probes.clone();
+        move || {
+            probes.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// #4781: the outer `/readyz` deadline used to start before the cache
+    /// lock was taken and the inner probe deadline only after, both 2 s, so
+    /// any lock wait let the outer timer fire first and drop the probe
+    /// before it stored its timeout. Holding the lock for 500 ms (an earlier
+    /// prober that went away without storing) makes that gap deterministic
+    /// under paused time: the timeout must still be cached, and the next
+    /// call within the TTL must not probe again.
+    #[tokio::test(start_paused = true)]
+    async fn readyz_cached_stores_timeout_even_after_a_lock_wait() {
+        let cache: Arc<HealthCache> = Arc::new(Mutex::new(None));
+        let ttl = Duration::from_secs(60);
+        let probes = Arc::new(AtomicUsize::new(0));
+
+        let held = cache.clone().lock_owned().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(held);
+        });
+
+        let start = tokio::time::Instant::now();
+        let first = readyz_cached("OpenSearch", &cache, ttl, hung_probe(&probes)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(first.status, STATUS_UNHEALTHY);
+        assert_eq!(
+            first.message.as_deref(),
+            Some("OpenSearch probe timed out (2s)")
+        );
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            elapsed, READYZ_DEPENDENCY_TIMEOUT,
+            "the probe deadline, not the later lock-wait one, ends the call"
+        );
+        assert!(
+            cache.lock().await.is_some(),
+            "the timed-out result must be cached"
+        );
+
+        let start = tokio::time::Instant::now();
+        let second = readyz_cached("OpenSearch", &cache, ttl, hung_probe(&probes)).await;
+        assert_eq!(second.message, first.message);
+        assert_eq!(
+            probes.load(AtomicOrdering::SeqCst),
+            1,
+            "a cached timeout is not paid again"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// The lock wait stays bounded: a holder that never lets go costs the
+    /// deadline plus the margin, and the waiter does not probe.
+    #[tokio::test(start_paused = true)]
+    async fn readyz_cached_bounds_the_lock_wait() {
+        let cache: Arc<HealthCache> = Arc::new(Mutex::new(None));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let _held = cache.clone().lock_owned().await;
+
+        let start = tokio::time::Instant::now();
+        let result = readyz_cached(
+            "Scanner",
+            &cache,
+            Duration::from_secs(60),
+            hung_probe(&probes),
+        )
+        .await;
+        assert_eq!(result.status, STATUS_UNHEALTHY);
+        assert_eq!(
+            start.elapsed(),
+            READYZ_DEPENDENCY_TIMEOUT + READYZ_LOCK_WAIT_MARGIN
+        );
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// A healthy dependency is unchanged: answered at once, cached, probed once.
+    #[tokio::test(start_paused = true)]
+    async fn readyz_cached_healthy_probe_is_cached_and_immediate() {
+        let cache: HealthCache = Mutex::new(None);
+        let ttl = Duration::from_secs(60);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe = || {
+            let probes = probes.clone();
+            async move {
+                probes.fetch_add(1, AtomicOrdering::SeqCst);
+                CheckStatus {
+                    status: STATUS_HEALTHY.to_string(),
+                    message: None,
+                }
+            }
+        };
+
+        let start = tokio::time::Instant::now();
+        for _ in 0..3 {
+            let check = readyz_cached("LDAP", &cache, ttl, probe).await;
+            assert_eq!(check.status, STATUS_HEALTHY);
+            assert!(check.message.is_none());
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
     }
 
     /// `/livez` must stay genuinely dependency-free: it is the probe

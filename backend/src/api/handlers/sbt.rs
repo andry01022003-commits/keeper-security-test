@@ -13,7 +13,7 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
@@ -492,6 +492,7 @@ async fn upload_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, artifact_path)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "ivy", "write:artifacts")?.user_id;
@@ -677,6 +678,17 @@ async fn upload_artifact(
         )
         .await;
     }
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
 
     info!(
         "SBT upload: {} {} to repo {}",
@@ -1196,6 +1208,63 @@ mod catalog_registration_tests {
         assert!(
             filename_keyed.is_none(),
             "the catalog must not be keyed on the filename stem"
+        );
+    }
+
+    /// #4725: a hosted Ivy upload must queue a push sync task for a
+    /// subscribed push peer, and an upload arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn sbt_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "sbt").await;
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!(
+                    "/{}/com.example/push-sync/1.0.0/jars/push-sync-1.0.0.jar",
+                    fx.repo_key
+                ),
+                bytes::Bytes::from_static(b"jar-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "sbt upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the artifact
+        // but must not queue another task.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/com.example/push-sync/2.0.0/jars/push-sync-2.0.0.jar",
+                fx.repo_key
+            ))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(bytes::Bytes::from_static(
+                b"jar-bytes",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated sbt upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["com.example/push-sync/1.0.0/jars/push-sync-1.0.0.jar".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
         );
     }
 }

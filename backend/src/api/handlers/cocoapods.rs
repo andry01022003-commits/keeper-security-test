@@ -24,7 +24,7 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -541,6 +541,7 @@ async fn push_pod(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "cocoapods", "write:artifacts")?.user_id;
@@ -718,6 +719,17 @@ async fn push_pod(
         size_bytes,
         &computed_sha256,
         podspec.summary.as_deref().filter(|d| !d.is_empty()),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -1943,6 +1955,57 @@ mod db_cov_tests {
         let (status, _) = tdh::send(app, tdh::get(format!("/{}/all_specs", fx.repo_key))).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         fx.teardown().await;
+    }
+
+    /// #4725: a pod push to a hosted repository must queue a push sync task for
+    /// a subscribed push peer, and a push that arrives as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn cocoapods_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "cocoapods").await;
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(pod_archive("Repl4725", "1.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "pod push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // A replicated push (as the sync worker sends it) stores the pod but
+        // must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(pod_archive("Repl4725", "2.0.0")))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated pod push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["Repl4725/1.0.0/Repl4725-1.0.0.tar.gz".to_string()],
+            "only the client push queues a push task; the replicated one must not"
+        );
     }
 }
 

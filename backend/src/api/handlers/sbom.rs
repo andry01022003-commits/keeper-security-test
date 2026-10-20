@@ -291,6 +291,37 @@ pub struct EnvironmentSbomQuery {
     pub filename: String,
     /// `cyclonedx` (default) or `spdx`.
     pub format: Option<String>,
+    /// Render only the graphs of this named environment (`pixi.lock`).
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Render only the graphs of this platform / conda subdir (`linux-64`).
+    #[serde(default)]
+    pub platform: Option<String>,
+}
+
+/// Ceiling on one `/sbom/environment` response body (#4670).
+///
+/// A document per (environment, platform) graph amplifies its input: a
+/// 31 MiB lockfile rendered as a 162 MB body, built whole in memory per
+/// request. The body is now serialized graph by graph into a buffer that
+/// refuses to grow past this, so the worst case is this ceiling plus one
+/// graph's document, not the whole environment. Twice the lockfile ceiling,
+/// which is far above any real solved environment's documents.
+pub const MAX_ENVIRONMENT_SBOM_RESPONSE_BYTES: usize =
+    2 * environment_lock::DEFAULT_MAX_LOCKFILE_BYTES as usize;
+
+/// The JSON body of [`generate_environment_sbom`], already serialized.
+#[derive(Debug)]
+pub struct EnvironmentSbomBody(pub Vec<u8>);
+
+impl axum::response::IntoResponse for EnvironmentSbomBody {
+    fn into_response(self) -> axum::response::Response {
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            self.0,
+        )
+            .into_response()
+    }
 }
 
 /// Render an uploaded lockfile as environment SBOM documents (#4053).
@@ -303,6 +334,11 @@ pub struct EnvironmentSbomQuery {
 /// regenerated per request, like the proxy SBOM above. The caller's own bytes
 /// are the only input, which is why this needs authentication but no
 /// repository permission: no stored data of any tenant is read.
+///
+/// `environment` / `platform` select a subset of the graphs. A response that
+/// would exceed [`MAX_ENVIRONMENT_SBOM_RESPONSE_BYTES`] is refused with 422
+/// `UNPROCESSABLE_ENTITY` naming the graphs, so the caller can fetch them one
+/// at a time (#4670).
 #[utoipa::path(
     post,
     path = "/environment",
@@ -316,9 +352,10 @@ pub struct EnvironmentSbomQuery {
     ),
     responses(
         (status = 200, description = "One SBOM document per (environment, platform) graph", body = Object),
-        (status = 400, description = "Unrecognized, unhandled or unparseable lockfile", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Unrecognized, unhandled or unparseable lockfile, or an environment/platform filter that matches no graph", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
         (status = 413, description = "Lockfile exceeds the size ceiling", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "The rendered documents exceed the response size ceiling; request fewer graphs with `platform` / `environment`", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -326,37 +363,109 @@ async fn generate_environment_sbom(
     Extension(_auth): Extension<AuthExtension>,
     Query(query): Query<EnvironmentSbomQuery>,
     body: Bytes,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<EnvironmentSbomBody> {
     let format = parse_proxy_sbom_format(query.format.as_deref())?;
     let env = environment_lock::parse_named_lockfile(&query.filename, body.as_ref())?;
-    Ok(Json(environment_sbom_envelope(
+    let selection = ScopeSelection {
+        environment: query.environment.as_deref(),
+        platform: query.platform.as_deref(),
+    };
+    render_environment_sbom(
         &query.filename,
         &env,
         format,
-    )))
+        &selection,
+        MAX_ENVIRONMENT_SBOM_RESPONSE_BYTES,
+    )
+    .map(EnvironmentSbomBody)
 }
 
-/// The response envelope for [`generate_environment_sbom`]: the documents,
-/// the scope each one covers, and the parser's coverage summary so "we
-/// understood 380 of 400 packages" travels with the graphs. Pure, so the
-/// response shape is unit-testable without a `SharedState`.
-pub(crate) fn environment_sbom_envelope(
+/// Which graphs of an environment to render: `None` on an axis selects all.
+#[derive(Debug, Default)]
+pub(crate) struct ScopeSelection<'a> {
+    pub environment: Option<&'a str>,
+    pub platform: Option<&'a str>,
+}
+
+impl ScopeSelection<'_> {
+    fn selects(&self, scope: &environment_lock::Scope) -> bool {
+        let axis = |want: Option<&str>, have: &Option<String>| {
+            want.is_none_or(|w| have.as_deref() == Some(w))
+        };
+        axis(self.environment, &scope.environment) && axis(self.platform, &scope.platform)
+    }
+}
+
+/// An `io::Write` sink that refuses to grow past `limit` bytes, so a
+/// serialization that would exceed the response ceiling stops there instead
+/// of finishing in memory first.
+struct BoundedBuffer {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedBuffer {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.limit {
+            return Err(std::io::Error::other("environment SBOM response ceiling"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The response envelope for [`generate_environment_sbom`], serialized: the
+/// documents, the scope each one covers, and the parser's coverage summary so
+/// "we understood 380 of 400 packages" travels with the graphs.
+///
+/// Built one graph at a time into a buffer capped at `max_bytes` (#4670):
+/// only one graph's document is ever held as a `Value`, and a body that would
+/// pass the ceiling is refused with a 422 that names the graphs, rather than
+/// built whole. Pure, so it is unit-testable without a `SharedState`.
+pub(crate) fn render_environment_sbom(
     filename: &str,
     env: &LockedEnvironment,
     format: SbomFormat,
-) -> serde_json::Value {
+    selection: &ScopeSelection<'_>,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    use std::io::Write;
+
     let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
-    let generated = environment_sbom::generate_environment_sbom(env, name, format);
+    let all_scopes = env.scopes();
+    let scopes: Vec<&environment_lock::Scope> =
+        all_scopes.iter().filter(|s| selection.selects(s)).collect();
+    if scopes.is_empty() && !all_scopes.is_empty() {
+        return Err(AppError::Validation(format!(
+            "No graph in this lockfile matches the requested environment/platform. Graphs: {}",
+            scope_list(&all_scopes)
+        )));
+    }
+
     let summary = env.summary();
-    serde_json::json!({
+    let too_large = || {
+        AppError::UnprocessableEntity(format!(
+            "The environment SBOM for {} graph(s) exceeds the {} MiB response limit. \
+             Request fewer graphs with ?platform=<platform> (and ?environment=<name> \
+             for pixi.lock). Graphs in this lockfile: {}",
+            scopes.len(),
+            max_bytes / (1024 * 1024),
+            scope_list(&all_scopes)
+        ))
+    };
+
+    let mut out = BoundedBuffer {
+        buf: Vec::new(),
+        limit: max_bytes,
+    };
+    let head = serde_json::json!({
         "lockfile": name,
         "lockfileFormat": env.format.as_str(),
         "sbomFormat": format.as_str(),
-        "graphs": generated.documents.iter().map(|doc| serde_json::json!({
-            "environment": doc.scope.environment,
-            "platform": doc.scope.platform,
-            "document": doc.document,
-        })).collect::<Vec<_>>(),
         "summary": {
             "scopes": summary.scopes,
             "memberships": summary.memberships,
@@ -367,7 +476,37 @@ pub(crate) fn environment_sbom_envelope(
             "explainedAbsences": summary.explained_absences,
             "ambiguous": summary.ambiguous,
         },
-    })
+    });
+    // `head` is an object; its closing brace is replaced by the graphs array.
+    let head = serde_json::to_vec(&head)?;
+    out.write_all(&head[..head.len() - 1])
+        .and_then(|()| out.write_all(b",\"graphs\":["))
+        .map_err(|_| too_large())?;
+    for (i, scope) in scopes.iter().enumerate() {
+        let document = environment_sbom::generate_scope_document(env, name, format, scope);
+        let graph = serde_json::json!({
+            "environment": scope.environment,
+            "platform": scope.platform,
+            "document": document,
+        });
+        if i > 0 {
+            out.write_all(b",").map_err(|_| too_large())?;
+        }
+        serde_json::to_writer(&mut out, &graph).map_err(|_| too_large())?;
+    }
+    out.write_all(b"]}").map_err(|_| too_large())?;
+    Ok(out.buf)
+}
+
+/// The graphs of an environment as a caller would name them in a filter,
+/// truncated so the error message stays bounded too.
+fn scope_list(scopes: &[environment_lock::Scope]) -> String {
+    const SHOWN: usize = 32;
+    let mut names: Vec<String> = scopes.iter().take(SHOWN).map(|s| s.to_string()).collect();
+    if scopes.len() > SHOWN {
+        names.push(format!("... and {} more", scopes.len() - SHOWN));
+    }
+    names.join(", ")
 }
 
 /// Create SBOM routes.
@@ -2347,6 +2486,24 @@ package:
 "#
     }
 
+    /// Test view of [`render_environment_sbom`]: every graph, no ceiling to
+    /// speak of, parsed back into a `Value`.
+    fn environment_sbom_envelope(
+        filename: &str,
+        env: &LockedEnvironment,
+        format: SbomFormat,
+    ) -> serde_json::Value {
+        let bytes = render_environment_sbom(
+            filename,
+            env,
+            format,
+            &ScopeSelection::default(),
+            MAX_ENVIRONMENT_SBOM_RESPONSE_BYTES,
+        )
+        .expect("renders");
+        serde_json::from_slice(&bytes).expect("the envelope is JSON")
+    }
+
     #[test]
     fn environment_sbom_envelope_shape() {
         let env = environment_lock::parse_named_lockfile(
@@ -2412,14 +2569,17 @@ package:
         let query = EnvironmentSbomQuery {
             filename: "conda-lock.yml".to_string(),
             format: None,
+            environment: None,
+            platform: None,
         };
-        let Json(body) = generate_environment_sbom(
+        let EnvironmentSbomBody(body) = generate_environment_sbom(
             Extension(auth),
             Query(query),
             Bytes::from_static(environment_lock_fixture().as_bytes()),
         )
         .await
         .expect("handler renders the lockfile");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
 
         let graphs = body["graphs"].as_array().expect("graphs array");
         assert_eq!(graphs.len(), 2, "one document per platform");
@@ -2473,6 +2633,8 @@ package:
         let query = EnvironmentSbomQuery {
             filename: "conda-lock.yml".to_string(),
             format: Some("spdx".to_string()),
+            environment: None,
+            platform: None,
         };
         let err = generate_environment_sbom(
             Extension(auth),
@@ -2481,6 +2643,117 @@ package:
         )
         .await;
         assert!(err.is_err(), "unparseable bytes must be rejected");
+    }
+
+    /// #4670: the response is bounded. A body that would pass the ceiling is
+    /// a 422 naming the graphs (so the caller can ask for them one at a
+    /// time), never a buffered response of whatever size the lockfile
+    /// amplifies to; a per-platform request under the same ceiling renders.
+    #[test]
+    fn environment_sbom_is_refused_past_the_response_ceiling() {
+        let env = environment_lock::parse_named_lockfile(
+            "conda-lock.yml",
+            environment_lock_fixture().as_bytes(),
+        )
+        .expect("fixture parses");
+        let whole = render_environment_sbom(
+            "conda-lock.yml",
+            &env,
+            SbomFormat::CycloneDX,
+            &ScopeSelection::default(),
+            usize::MAX,
+        )
+        .expect("renders uncapped");
+        let linux = render_environment_sbom(
+            "conda-lock.yml",
+            &env,
+            SbomFormat::CycloneDX,
+            &ScopeSelection {
+                environment: None,
+                platform: Some("linux-64"),
+            },
+            usize::MAX,
+        )
+        .expect("renders one platform");
+        assert!(linux.len() < whole.len());
+
+        // A ceiling between the one-platform and the whole-environment size.
+        let ceiling = whole.len() - 1;
+        let err = render_environment_sbom(
+            "conda-lock.yml",
+            &env,
+            SbomFormat::CycloneDX,
+            &ScopeSelection::default(),
+            ceiling,
+        )
+        .expect_err("a body past the ceiling must be refused");
+        match &err {
+            AppError::UnprocessableEntity(msg) => {
+                assert!(msg.contains("?platform="), "points at the filter: {msg}");
+                assert!(
+                    msg.contains("linux-64") && msg.contains("osx-64"),
+                    "names the graphs: {msg}"
+                );
+            }
+            other => panic!("expected 422 UnprocessableEntity, got {other:?}"),
+        }
+
+        let filtered = render_environment_sbom(
+            "conda-lock.yml",
+            &env,
+            SbomFormat::CycloneDX,
+            &ScopeSelection {
+                environment: None,
+                platform: Some("linux-64"),
+            },
+            ceiling,
+        )
+        .expect("one platform fits under the same ceiling");
+        let v: serde_json::Value = serde_json::from_slice(&filtered).expect("json");
+        let graphs = v["graphs"].as_array().expect("graphs");
+        assert_eq!(graphs.len(), 1);
+        assert_eq!(graphs[0]["platform"], "linux-64");
+        assert_eq!(
+            v["summary"]["scopes"], 2,
+            "the summary still describes the whole lockfile"
+        );
+
+        // A ceiling smaller than the envelope itself is refused too.
+        assert!(matches!(
+            render_environment_sbom(
+                "conda-lock.yml",
+                &env,
+                SbomFormat::SPDX,
+                &ScopeSelection::default(),
+                8,
+            ),
+            Err(AppError::UnprocessableEntity(_))
+        ));
+    }
+
+    /// A filter that matches no graph is a 400 naming the graphs there are,
+    /// not an empty 200 that reads as an environment with nothing in it.
+    #[tokio::test]
+    async fn environment_sbom_filter_matching_nothing_is_a_validation_error() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let auth = tdh::make_auth(Uuid::new_v4(), "env-sbom-tester");
+        let query = EnvironmentSbomQuery {
+            filename: "conda-lock.yml".to_string(),
+            format: None,
+            environment: None,
+            platform: Some("win-64".to_string()),
+        };
+        let err = generate_environment_sbom(
+            Extension(auth),
+            Query(query),
+            Bytes::from_static(environment_lock_fixture().as_bytes()),
+        )
+        .await
+        .expect_err("no win-64 graph");
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("osx-64"), "{msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     /// The envelope names only the base name, never a caller-supplied path.

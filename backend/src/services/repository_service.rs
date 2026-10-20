@@ -256,9 +256,9 @@ pub struct UpdateRepositoryRequest {
     /// it unchanged.
     pub versioning_enabled: Option<bool>,
     /// When `Some`, sets the repository's project assignment (#2472);
-    /// `None` leaves it unchanged. Mirrors `quota_bytes`: the outer `Option`
-    /// is the "field present" marker and the inner value is what is stored
-    /// (P1 exposes set-only, so handlers pass `Some(Some(id))`).
+    /// `None` leaves it unchanged. The outer `Option` is the "field present"
+    /// marker and the inner value is what is stored: `Some(Some(id))` assigns,
+    /// `Some(None)` clears the assignment (#4026).
     pub project_id: Option<Option<Uuid>>,
     /// When `Some`, updates the trusted upstream GPG key (#2568): the outer
     /// `Option` is the "field present" marker and the inner value is stored
@@ -1838,6 +1838,17 @@ impl RepositoryService {
             if crate::services::rpm_layout::depth_change_requested(&mut tx, id, depth).await? {
                 crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
             }
+        }
+        // Project unassignment (#4026). The main UPDATE below reads a NULL
+        // bind as "leave alone" (COALESCE), so clearing is a targeted write in
+        // the same transaction, ahead of it, and the row it RETURNs already
+        // carries the cleared value. Assigning still goes through COALESCE.
+        if matches!(req.project_id, Some(None)) {
+            sqlx::query("UPDATE repositories SET project_id = NULL WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
         }
         let repo = sqlx::query_as!(
             Repository,

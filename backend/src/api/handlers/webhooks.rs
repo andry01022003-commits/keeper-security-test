@@ -13,6 +13,9 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::cluster_work::{Claimed, WorkerIdentity};
 use crate::services::webhook_payloads::{self, PayloadTemplate};
 use crate::services::webhook_secret_crypto;
@@ -795,6 +798,18 @@ pub async fn create_webhook(
         created_at: webhook.get("created_at"),
     };
 
+    audit_webhook_change(
+        &state,
+        &auth,
+        AuditAction::WebhookCreated,
+        response.id,
+        serde_json::json!({
+            "signing_mode": response.signing_mode,
+            "signed": prepared.digest.is_some(),
+        }),
+    )
+    .await;
+
     Ok(Json(WebhookSecretCreatedResponse {
         webhook: response,
         secret: prepared.raw_secret,
@@ -1041,6 +1056,14 @@ pub async fn delete_webhook(
     // creator/repo-access gate, matching the contract `create_webhook` uses.
     auth.require_admin()?;
 
+    // Snapshot for the audit row before the row is gone (#4710).
+    let snapshot: Option<(String, String, Vec<String>, Option<Uuid>)> =
+        sqlx::query_as("SELECT name, url, events, repository_id FROM webhooks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
     let result = sqlx::query!("DELETE FROM webhooks WHERE id = $1", id)
         .execute(&state.db)
         .await
@@ -1050,7 +1073,84 @@ pub async fn delete_webhook(
         return Err(AppError::NotFound("Webhook not found".to_string()));
     }
 
+    let snapshot = snapshot.map_or(serde_json::json!({}), |(name, url, events, repo)| {
+        webhook_audit_snapshot(name, url, events, repo)
+    });
+    audit_webhook_change(&state, &auth, AuditAction::WebhookDeleted, id, snapshot).await;
+
     Ok(())
+}
+
+/// The webhook URL as recorded in the audit trail (#4710): scheme, host,
+/// port and path only. Userinfo, query string and fragment are dropped,
+/// since receivers commonly carry a token there; headers and the signing
+/// secret are never recorded at all.
+fn webhook_url_for_audit(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => "[unparseable]".to_string(),
+    }
+}
+
+/// Record a webhook change (#4710), best-effort. `details` identifies the
+/// webhook (id, name, URL without credentials, events, repository) plus
+/// `extra`; for a secret rotation it records THAT the secret rotated, never
+/// the value.
+async fn audit_webhook_change(
+    state: &SharedState,
+    auth: &AuthExtension,
+    action: AuditAction,
+    id: Uuid,
+    extra: serde_json::Value,
+) {
+    use sqlx::Row;
+    // Best-effort snapshot; the webhook may already be gone (delete reads it
+    // first and passes it in `extra`).
+    let row = sqlx::query("SELECT name, url, events, repository_id FROM webhooks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let mut details = match row {
+        Some(row) => webhook_audit_snapshot(
+            row.get("name"),
+            row.get("url"),
+            row.get("events"),
+            row.get("repository_id"),
+        ),
+        None => serde_json::json!({}),
+    };
+    if let (Some(map), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(action, ResourceType::Webhook, auth)
+            .resource(id)
+            .details(details),
+    )
+    .await;
+}
+
+fn webhook_audit_snapshot(
+    name: String,
+    url: String,
+    events: Vec<String>,
+    repository_id: Option<Uuid>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "url": webhook_url_for_audit(&url),
+        "events": events,
+        "repository_id": repository_id,
+    })
 }
 
 /// Set webhook enabled state, returning NotFound if the webhook does not exist.
@@ -1091,7 +1191,16 @@ pub async fn enable_webhook(
 ) -> Result<()> {
     // GHSA-qcmj: enabling a webhook is a management action -> admin only.
     auth.require_admin()?;
-    set_webhook_enabled(&state, id, true).await
+    set_webhook_enabled(&state, id, true).await?;
+    audit_webhook_change(
+        &state,
+        &auth,
+        AuditAction::WebhookUpdated,
+        id,
+        serde_json::json!({ "is_enabled": true }),
+    )
+    .await;
+    Ok(())
 }
 
 /// Disable webhook
@@ -1116,7 +1225,16 @@ pub async fn disable_webhook(
 ) -> Result<()> {
     // GHSA-qcmj: disabling a webhook is a management action -> admin only.
     auth.require_admin()?;
-    set_webhook_enabled(&state, id, false).await
+    set_webhook_enabled(&state, id, false).await?;
+    audit_webhook_change(
+        &state,
+        &auth,
+        AuditAction::WebhookUpdated,
+        id,
+        serde_json::json!({ "is_enabled": false }),
+    )
+    .await;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1629,6 +1747,19 @@ pub async fn rotate_webhook_secret(
             },
         };
     }
+
+    // #4710: record THAT the secret rotated, never the secret or its digest.
+    audit_webhook_change(
+        &state,
+        &auth,
+        AuditAction::WebhookSecretRotated,
+        id,
+        serde_json::json!({
+            "secret_rotated": true,
+            "previous_secret_expires_at": previous_expires_at,
+        }),
+    )
+    .await;
 
     // GHSA-qcmj: return success + non-reversible metadata only. The raw
     // `new_secret` is never echoed in the response body; it is stored
@@ -5870,6 +6001,94 @@ mod tests {
             .is_ok());
 
             cleanup(&pool, &[], &[creator]).await;
+        }
+
+        /// #4710: create, enable, disable, secret rotation and delete each
+        /// write one audit row naming the admin and the webhook. The URL is
+        /// recorded without its query string, and no row ever carries the
+        /// signing secret.
+        #[tokio::test]
+        async fn webhook_lifecycle_is_audited() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            super::set_test_secret_key();
+            let admin = create_user(&pool, true).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let ext = || axum::Extension(auth_for(admin, true));
+
+            let created = create_webhook(
+                axum::extract::State(state.clone()),
+                ext(),
+                axum::Json(CreateWebhookRequest {
+                    name: format!("audit4710-{}", &admin.to_string()[..8]),
+                    url: "http://198.51.100.9/hook?token=leak4710".to_string(),
+                    events: vec!["artifact_uploaded".to_string()],
+                    repository_id: None,
+                    headers: None,
+                    secret: None,
+                    payload_template: Default::default(),
+                    event_schema_version: None,
+                    signing_mode: Default::default(),
+                }),
+            )
+            .await
+            .expect("create webhook")
+            .0;
+            let id = created.webhook.id;
+            let raw_secret = created.secret.clone().unwrap_or_default();
+            let path = || axum::extract::Path(id);
+            let state_ = || axum::extract::State(state.clone());
+            assert!(disable_webhook(state_(), ext(), path()).await.is_ok());
+            assert!(enable_webhook(state_(), ext(), path()).await.is_ok());
+            let rotated = rotate_webhook_secret(state_(), ext(), path())
+                .await
+                .expect("rotate secret");
+            assert_eq!(rotated.status(), axum::http::StatusCode::OK);
+            assert!(delete_webhook(state_(), ext(), path()).await.is_ok());
+
+            let mut rows = Vec::new();
+            for action in [
+                "WEBHOOK_CREATED",
+                "WEBHOOK_SECRET_ROTATED",
+                "WEBHOOK_DELETED",
+            ] {
+                rows.push(tdh::audit_row_eventually(&pool, id, action).await);
+            }
+            tdh::audit_count_eventually(&pool, id, "WEBHOOK_UPDATED", 2).await;
+            let updates: Vec<serde_json::Value> = sqlx::query_scalar(
+                "SELECT details FROM audit_log WHERE resource_id = $1 \
+                 AND action = 'WEBHOOK_UPDATED' ORDER BY created_at",
+            )
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .expect("update rows");
+            cleanup(&pool, &[], &[admin]).await;
+
+            for row in &rows {
+                assert_eq!(row.user_id, Some(admin));
+                assert_eq!(row.resource_type, "webhook");
+                assert_eq!(row.details["url"], "http://198.51.100.9/hook");
+                assert_eq!(
+                    row.details["events"],
+                    serde_json::json!(["artifact_uploaded"])
+                );
+                let text = row.details.to_string();
+                assert!(!text.contains("leak4710"), "query string recorded: {text}");
+                assert!(
+                    raw_secret.is_empty() || !text.contains(&raw_secret),
+                    "webhook secret recorded: {text}"
+                );
+            }
+            assert_eq!(rows[1].details["secret_rotated"], true);
+            // Detached writes: the two rows may land in either order.
+            let mut toggles: Vec<String> = updates
+                .iter()
+                .map(|d| d["is_enabled"].to_string())
+                .collect();
+            toggles.sort();
+            assert_eq!(toggles, vec!["false", "true"]);
         }
 
         /// #4419: an event name the producer never emits (here the dotted

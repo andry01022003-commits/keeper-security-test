@@ -27,7 +27,7 @@ use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Extension, Router};
@@ -613,6 +613,7 @@ async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, filename)): Path<(String, String)>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -625,7 +626,7 @@ async fn upload(
         Some(RepoFile::Package {
             filename,
             signature: false,
-        }) => store_package(&state, &repo, filename, body, user_id).await,
+        }) => store_package(&state, &repo, filename, body, user_id, &headers).await,
         Some(RepoFile::Package {
             filename,
             signature: true,
@@ -717,6 +718,7 @@ async fn store_package(
     filename: &str,
     body: Bytes,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<Response, Response> {
     // #2561: hold an ingest-decompression permit across the blocking walk.
     let data = body.clone();
@@ -803,6 +805,17 @@ async fn store_package(
         size_bytes,
         &sha256,
         info.pkgdesc.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -1350,6 +1363,42 @@ mod db_tests {
         );
 
         fx.teardown().await;
+    }
+
+    /// #4725: a pacman package upload to a hosted repository must queue a push
+    /// sync task for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing
+    /// queued).
+    #[tokio::test]
+    async fn pacman_upload_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "pacman").await;
+
+        let (filename, pkg) = build_package("replpkg", "1.0-1", "any");
+        let queued_path = format!("any/{filename}");
+        assert_eq!(put(&fx, &filename, pkg).await, StatusCode::CREATED);
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let (filename2, pkg2) = build_package("replpkg", "2.0-1", "any");
+        let mut req = tdh::put(format!("/{}/{}", fx.repo_key, filename2), pkg2.into());
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, _) = send(&fx, req).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec![queued_path],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 
     /// With a gpg key attached, `{repo}.db.sig` is a binary detached

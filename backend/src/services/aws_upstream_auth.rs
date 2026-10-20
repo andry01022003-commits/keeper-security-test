@@ -702,8 +702,8 @@ async fn signed_post(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Result<reqwest::Response> {
-    // `AwsAuthorizer::authorize` parses the URI and unwraps; refuse anything it
-    // could panic on before handing it over.
+    // `AwsAuthorizer::try_authorize` still parses the URI and unwraps; refuse
+    // anything it could panic on before handing it over.
     reqwest::Url::parse(url)
         .map_err(|e| AppError::Config(format!("Invalid AWS endpoint {url}: {e}")))?;
 
@@ -721,7 +721,9 @@ async fn signed_post(
         request.headers_mut().insert(name, value);
     }
 
-    AwsAuthorizer::new(credential, service, region).authorize(&mut request, None);
+    AwsAuthorizer::new(credential, service, region)
+        .try_authorize(&mut request, None)
+        .map_err(|e| AppError::Internal(format!("Could not sign the AWS API request: {e}")))?;
 
     let mut outgoing = client
         .post(url)

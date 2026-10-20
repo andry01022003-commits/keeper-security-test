@@ -90,10 +90,11 @@ fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> 
 
     // Defence-in-depth entry-count cap (#2556): the per-entry byte cap already
     // bounds memory, but reject entry-count bombs before walking the archive.
-    if archive.len() as u64 > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+    let max_entries = crate::util::bounded_archive::max_ingest_archive_entries();
+    if archive.len() as u64 > max_entries {
         tracing::debug!(
             entries = archive.len(),
-            cap = crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+            cap = max_entries,
             "swift manifest extraction: too many zip entries"
         );
         return None;
@@ -118,7 +119,13 @@ fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> 
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(e) => {
+                tracing::debug!(index = i, error = %e, "swift manifest extraction: skipped entry with undecodable name");
+                continue;
+            }
+        };
         let is_top_level = name == "Package.swift";
         let is_nested = name.ends_with("/Package.swift");
         if !is_top_level && !is_nested {
@@ -187,18 +194,24 @@ fn swift_json_response(status: StatusCode, body: serde_json::Value) -> Response 
 }
 
 /// Build an error response with the Content-Version: 1 header.
+///
+/// A 503 (the database sites pass `db_status`, which picks it for a saturated
+/// pool or an unreachable database) carries `Retry-After` like every other
+/// format's envelope (#4765).
 fn swift_error_response(status: StatusCode, detail: &str) -> Response {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/problem+json")
-        .header("Content-Version", "1")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "detail": detail,
-            }))
+    super::with_retry_after_on_503(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/problem+json")
+            .header("Content-Version", "1")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "detail": detail,
+                }))
+                .unwrap(),
+            ))
             .unwrap(),
-        ))
-        .unwrap()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1239,18 @@ async fn publish_release(
         size_bytes,
         &computed_sha256,
         release_description.as_deref(),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers now that the row, its metadata
+    // and its catalog entry are committed.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -2371,7 +2396,7 @@ mod catalog_registration_tests {
         let mut buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
             writer.start_file("Package.swift", opts).unwrap();
             writer.write_all(b"// swift-tools-version:5.9\n").unwrap();
             writer.finish().unwrap();
@@ -2431,6 +2456,74 @@ mod catalog_registration_tests {
         assert_eq!(
             row.description.as_deref(),
             Some("a catalogued swift package")
+        );
+    }
+
+    /// #4725: a SE-0292 publish to a hosted repository must queue a push sync
+    /// task for a subscribed push peer, and a publish that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing
+    /// queued).
+    #[tokio::test]
+    async fn swift_publish_queues_push_sync_task_4725() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "swift").await;
+
+        let archive = source_zip();
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{CATALOG_BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"source-archive\"\r\n");
+        body.extend_from_slice(b"Content-Type: application/zip\r\n");
+        body.extend_from_slice(b"Content-Transfer-Encoding: binary\r\n\r\n");
+        body.extend_from_slice(&archive);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{CATALOG_BOUNDARY}--\r\n").as_bytes());
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/example/ExamplePackage/1.0.0", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={CATALOG_BOUNDARY}"),
+            )
+            .body(axum::body::Body::from(body.clone()))
+            .expect("build publish request");
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "swift publish must succeed: {status} {}",
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the
+        // release but must not queue another task.
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/example/ExamplePackage/2.0.0", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={CATALOG_BOUNDARY}"),
+            )
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::from(body))
+            .expect("build replicated publish request");
+        let (status, resp) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "replicated swift publish must succeed: {status} {}",
+            String::from_utf8_lossy(&resp[..])
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["example/ExamplePackage/1.0.0/ExamplePackage.zip".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
         );
     }
 }

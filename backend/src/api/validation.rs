@@ -139,6 +139,17 @@ pub enum OutboundUrlContext {
 }
 
 impl OutboundUrlContext {
+    /// The `surface` label of `ak_ssrf_blocks_total` for this trust class
+    /// (#4676).
+    pub(crate) fn ssrf_surface(self) -> &'static str {
+        match self {
+            OutboundUrlContext::Upstream => "upstream",
+            OutboundUrlContext::Webhook => "webhook",
+            OutboundUrlContext::SsoDiscovery => "sso",
+            OutboundUrlContext::TrustedInternal => "internal",
+        }
+    }
+
     /// Name of the env var that, when set to a truthy value, exempts
     /// RFC1918 / IPv6 unique-local addresses for this context.
     fn env_var(self) -> &'static str {
@@ -198,26 +209,10 @@ pub fn validate_outbound_webhook_url(url_str: &str, label: &str) -> Result<()> {
 ///
 /// When a request is blocked because the target resolved to a private /
 /// internal address, the returned error names the config knobs the
-/// operator can use, so the failure is actionable instead of opaque.
+/// operator can use, so the failure is actionable instead of opaque (see
+/// [`blocked_ip_message`]).
 pub fn validate_outbound_sso_url(url_str: &str, label: &str) -> Result<()> {
-    match validate_outbound_url_with(url_str, label, OutboundUrlContext::SsoDiscovery) {
-        Ok(()) => Ok(()),
-        // Only the private/internal-IP block is operator-fixable via an
-        // allowlist knob; surface guidance for it. Hostname blocks (cloud
-        // metadata service names) and loopback are deliberate hard-blocks
-        // and must not advertise a bypass.
-        Err(AppError::Validation(msg)) if msg.contains("private/internal network") => {
-            Err(AppError::Validation(format!(
-                "{msg}. The identity provider resolves to a private/internal \
-                 address. If this IdP is trusted, allow it by setting \
-                 AK_SSRF_ALLOW_PRIVATE_CIDRS to the IdP host/CIDR (preferred, \
-                 e.g. AK_SSRF_ALLOW_PRIVATE_CIDRS=10.10.0.8/32) or \
-                 SSO_ALLOW_PRIVATE_IPS=true to allow all private IPs for SSO. \
-                 Cloud metadata, loopback and link-local addresses stay blocked."
-            )))
-        }
-        Err(other) => Err(other),
-    }
+    validate_outbound_url_with(url_str, label, OutboundUrlContext::SsoDiscovery)
 }
 
 /// Validate an **operator-configured, trusted internal endpoint** URL
@@ -275,8 +270,12 @@ pub fn validate_outbound_ldap_url(url_str: &str, label: &str) -> Result<()> {
     }
 
     if let Some(reason) = is_blocked_host_str(host, OutboundUrlContext::Upstream) {
-        record_block(label, &reason);
-        return Err(block_reason_to_error(label, reason));
+        record_block(label, &reason, "ldap");
+        return Err(block_reason_to_error(
+            label,
+            reason,
+            OutboundUrlContext::Upstream,
+        ));
     }
 
     Ok(())
@@ -359,8 +358,8 @@ fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContex
     }
 
     if let Some(reason) = is_blocked_url_in(&parsed, ctx) {
-        record_block(label, &reason);
-        return Err(block_reason_to_error(label, reason));
+        record_block(label, &reason, ssrf_surface(ctx, label));
+        return Err(block_reason_to_error(label, reason, ctx));
     }
 
     Ok(())
@@ -370,16 +369,48 @@ fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContex
 /// the standard message wording. Shared by [`validate_outbound_url_with`]
 /// and [`validate_outbound_ldap_url`] so the host/IP messages stay
 /// identical across surfaces.
-fn block_reason_to_error(label: &str, reason: BlockReason) -> AppError {
+fn block_reason_to_error(label: &str, reason: BlockReason, ctx: OutboundUrlContext) -> AppError {
     match reason {
         BlockReason::Hostname(host) => {
             AppError::Validation(format!("{} host '{}' is not allowed", label, host))
         }
-        BlockReason::Ip(ip) => AppError::Validation(format!(
-            "{} IP '{}' is not allowed (private/internal network)",
-            label, ip
-        )),
+        BlockReason::Ip(ip) => AppError::Validation(blocked_ip_message(label, ip, ctx)),
     }
+}
+
+/// User-facing refusal for a blocked IP. When the address is one an
+/// operator can admit (RFC1918, CGNAT, IPv6 unique-local) the message names
+/// the setting that admits it, so an LDAP server, IdP or upstream on a
+/// private network is a configuration step rather than a dead end (#4638).
+/// Cloud-metadata, loopback, link-local and unspecified addresses can never
+/// be admitted, so their refusal advertises nothing.
+fn blocked_ip_message(label: &str, ip: std::net::IpAddr, ctx: OutboundUrlContext) -> String {
+    let base = format!("{label} IP '{ip}' is not allowed (private/internal network)");
+    // TrustedInternal refuses only the hard-blocked addresses.
+    if is_blocked_ip_in(ip, OutboundUrlContext::TrustedInternal) {
+        return base;
+    }
+    let toggle = match ctx {
+        OutboundUrlContext::Webhook | OutboundUrlContext::SsoDiscovery => {
+            format!(
+                ", or set {}=true to allow every private address",
+                ctx.env_var()
+            )
+        }
+        OutboundUrlContext::Upstream | OutboundUrlContext::TrustedInternal => String::new(),
+    };
+    format!(
+        "{base}. If this target is trusted, add it to AK_SSRF_ALLOW_PRIVATE_CIDRS \
+         (comma-separated CIDRs or IPs, e.g. AK_SSRF_ALLOW_PRIVATE_CIDRS={ip}){toggle}. \
+         Cloud metadata, loopback and link-local addresses stay blocked"
+    )
+}
+
+/// Refusal for a resolved address in the upstream context (the LDAP
+/// connectivity probe), worded like the write-time validator so the same
+/// setting is named on both paths (#4638).
+pub fn blocked_resolved_ip_error(label: &str, ip: std::net::IpAddr) -> AppError {
+    AppError::Validation(blocked_ip_message(label, ip, OutboundUrlContext::Upstream))
 }
 
 /// Decide whether a parsed URL targets a blocked address. Used by the
@@ -844,7 +875,21 @@ fn ipv6_in_prefix(net: std::net::Ipv6Addr, ip: std::net::Ipv6Addr, prefix: u8) -
     (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
-fn record_block(label: &str, reason: &BlockReason) {
+/// The `surface` label of `ak_ssrf_blocks_total` for one validation (#4676):
+/// the plugin and peer endpoints validate in the upstream trust class but are
+/// separate attack surfaces, so they are told apart by their field label;
+/// everything else is the trust class itself.
+fn ssrf_surface(ctx: OutboundUrlContext, label: &str) -> &'static str {
+    if label.starts_with("Plugin ") {
+        "plugin"
+    } else if label.starts_with("Peer ") {
+        "peer"
+    } else {
+        ctx.ssrf_surface()
+    }
+}
+
+fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
     let detail = match reason {
         BlockReason::Hostname(host) => host.clone(),
         BlockReason::Ip(ip) => ip.to_string(),
@@ -857,6 +902,7 @@ fn record_block(label: &str, reason: &BlockReason) {
         "outbound URL blocked"
     );
     crate::services::metrics_service::record_outbound_url_blocked(reason.metric_label(), label);
+    crate::services::metrics_service::record_ssrf_block(surface);
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -2328,5 +2374,129 @@ mod tests {
         assert!(is_blocked_resolved_ip("::1".parse().unwrap()));
         // A public IP passes.
         assert!(!is_blocked_resolved_ip("93.184.216.34".parse().unwrap()));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4638: an operator whose LDAP server (or any other outbound target)
+    // lives on a private network must be told which setting admits it. The
+    // allowlist itself is AK_SSRF_ALLOW_PRIVATE_CIDRS (shared by every
+    // surface); the refusal must name it, and must NOT advertise it for a
+    // cloud-metadata / loopback / link-local address it can never admit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ldap_private_ip_refusal_names_allowlist_setting_4638() {
+        let _g = AllowlistGuard::new();
+        let err = validate_outbound_ldap_url("ldap://10.10.10.10:389", "LDAP server URL")
+            .expect_err("private LDAP IP must be refused by default");
+        let msg = err.to_string();
+        assert!(msg.contains("private/internal network"), "msg: {msg}");
+        assert!(
+            msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+            "refusal must name the allowlist setting, got: {msg}"
+        );
+
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.10.10.0/24");
+        assert!(
+            validate_outbound_ldap_url("ldap://10.10.10.10:389", "LDAP server URL").is_ok(),
+            "listed CIDR must admit the LDAP server"
+        );
+    }
+
+    #[test]
+    fn test_metadata_refusal_does_not_advertise_allowlist_4638() {
+        let _g = AllowlistGuard::new();
+        // Even with the containing range listed, metadata stays refused and
+        // the message must not suggest a setting that cannot admit it.
+        std::env::set_var(
+            "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+            "169.254.0.0/16,100.64.0.0/10,192.0.0.0/24,fd00::/8",
+        );
+        for url in [
+            "ldap://169.254.169.254:389",
+            "ldap://[::ffff:169.254.169.254]:389",
+            "ldap://100.100.100.200",
+            "ldap://192.0.0.192",
+            "ldap://[fd00:ec2::254]",
+            "ldaps://127.0.0.1:636",
+        ] {
+            let msg = validate_outbound_ldap_url(url, "LDAP server URL")
+                .expect_err(&format!("{url} must stay refused"))
+                .to_string();
+            assert!(msg.contains("private/internal network"), "{url}: {msg}");
+            assert!(!msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "{url}: {msg}");
+        }
+        for (res, what) in [
+            (
+                validate_outbound_url("http://169.254.169.254/", "Test URL"),
+                "upstream",
+            ),
+            (
+                validate_outbound_sso_url("http://169.254.169.254/", "OIDC issuer URL"),
+                "sso",
+            ),
+        ] {
+            let msg = res.expect_err(what).to_string();
+            assert!(
+                !msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+                "{what}: {msg}"
+            );
+            assert!(!msg.contains("SSO_ALLOW_PRIVATE_IPS"), "{what}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_private_refusal_names_context_settings_4638() {
+        let _g = AllowlistGuard::new();
+        let upstream = validate_outbound_url("http://10.1.2.3/", "Remote URL")
+            .expect_err("upstream private refused")
+            .to_string();
+        assert!(
+            upstream.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+            "{upstream}"
+        );
+        let webhook = validate_outbound_webhook_url("http://10.1.2.3/", "Webhook URL")
+            .expect_err("webhook private refused")
+            .to_string();
+        assert!(webhook.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "{webhook}");
+        assert!(webhook.contains("WEBHOOK_ALLOW_PRIVATE_IPS"), "{webhook}");
+        let sso = validate_outbound_sso_url("http://10.1.2.3/", "OIDC issuer URL")
+            .expect_err("sso private refused")
+            .to_string();
+        assert!(sso.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "{sso}");
+        assert!(sso.contains("SSO_ALLOW_PRIVATE_IPS"), "{sso}");
+        // The hint is given once, not stacked by the SSO wrapper.
+        assert_eq!(sso.matches("SSO_ALLOW_PRIVATE_IPS").count(), 1, "{sso}");
+    }
+
+    /// #4676: every SSRF refusal is counted in `ak_ssrf_blocks_total` under
+    /// the bounded surface that asked. Cloud metadata is hard-blocked in every
+    /// trust class, so no env toggle can change the outcome here.
+    #[test]
+    fn test_ssrf_blocks_are_counted_by_surface_4676() {
+        use crate::services::metrics_service::capture_counters;
+        let metadata = "http://169.254.169.254/latest/meta-data/";
+        let ((), counted) = capture_counters(|| {
+            assert!(validate_outbound_url(metadata, "Upstream URL").is_err());
+            assert!(validate_outbound_url(metadata, "Cargo upstream download URL").is_err());
+            assert!(validate_outbound_webhook_url(metadata, "Webhook URL").is_err());
+            assert!(validate_outbound_sso_url(metadata, "OIDC token endpoint").is_err());
+            assert!(validate_outbound_internal_url(metadata, "Scanner adapter URL").is_err());
+            assert!(validate_outbound_url(metadata, "Plugin callback URL").is_err());
+            assert!(validate_outbound_url(metadata, "Peer endpoint URL").is_err());
+            assert!(validate_outbound_ldap_url("ldap://169.254.169.254:389", "LDAP URL").is_err());
+            // Allowed and malformed URLs are not SSRF blocks.
+            assert!(validate_outbound_url("https://example.com/", "Upstream URL").is_ok());
+            assert!(validate_outbound_url("ftp://example.com/", "Upstream URL").is_err());
+        });
+        let get = |surface: &str| counted.get("ak_ssrf_blocks_total", &[("surface", surface)]);
+        assert_eq!(get("upstream"), 2);
+        assert_eq!(get("webhook"), 1);
+        assert_eq!(get("sso"), 1);
+        assert_eq!(get("internal"), 1);
+        assert_eq!(get("plugin"), 1);
+        assert_eq!(get("peer"), 1);
+        assert_eq!(get("ldap"), 1);
+        assert_eq!(counted.get("ak_ssrf_blocks_total", &[]), 8);
     }
 }

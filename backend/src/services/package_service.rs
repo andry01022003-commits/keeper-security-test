@@ -592,7 +592,25 @@ impl PackageService {
                     )
                     .await
                 {
-                    Ok(_) => report.packages_registered += 1,
+                    Ok(_) => {
+                        report.packages_registered += 1;
+                        // #4633: the upsert just reset the version to this
+                        // one file's size; a Maven version is its files' sum,
+                        // as the publish path records it.
+                        if matches!(row.format.as_str(), "maven" | "gradle") {
+                            if let Some(directory) =
+                                crate::api::handlers::maven::maven_version_directory(&row.path)
+                            {
+                                self.try_set_version_size_to_directory_total(
+                                    row.repository_id,
+                                    &name,
+                                    &version,
+                                    directory,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     Err(e) => {
                         report.artifacts_failed += 1;
                         warn!("Catalog backfill failed for {name}@{version}: {e}");
@@ -679,6 +697,117 @@ impl PackageService {
         if let Err(e) = result {
             warn!("Failed to bump package size for {name}@{version} in repo {repository_id}: {e}");
         }
+    }
+
+    /// Set the recorded size of a catalog version to the TOTAL of the live
+    /// artifact files stored directly under `directory` (#4633).
+    ///
+    /// A Maven version (GAV) is one directory holding several distinct files
+    /// (jar, pom, sources, javadoc, classifiers, `.module`), each registered
+    /// through [`Self::create_or_update_from_artifact`] with its own size. The
+    /// smallest-`(checksum, size)` guard there keeps ONE of those files as the
+    /// representative row, so the Packages page showed one file's size (often
+    /// the pom's few KB) for a version whose jar was megabytes. The files are
+    /// parts of the version, not alternative measurements of it, so the
+    /// version's size is their sum; a sum is order-independent too, so peers
+    /// that process the files in different orders still converge (#2110).
+    ///
+    /// `directory` is the version directory with its trailing `/`. Only files
+    /// directly inside it count (a deeper path is another coordinate), and
+    /// only rows that are not soft-deleted. Checksum sidecars and
+    /// `maven-metadata.xml` are row-less puts, so they never appear here.
+    ///
+    /// Call it right after each registration of a file of the version: the
+    /// registration may have reset the size to that one file, and this
+    /// recomputes it from the `artifacts` rows. The version row is locked
+    /// first and the total is read in a later statement, so two concurrent
+    /// uploads of files of one version serialize here and the second sees the
+    /// first's committed row; the last writer always records the full total.
+    /// The `packages` row is synchronized only while it still points at this
+    /// version, as [`Self::try_bump_version_size`] does.
+    ///
+    /// Like every catalog write it never creates a row and never fails the
+    /// publish: errors are logged and swallowed.
+    pub async fn try_set_version_size_to_directory_total(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        version: &str,
+        directory: &str,
+    ) {
+        if let Err(e) = self
+            .set_version_size_to_directory_total(repository_id, name, version, directory)
+            .await
+        {
+            warn!(
+                "Failed to set package size for {name}@{version} in repo {repository_id} to \
+                 its files' total: {e}"
+            );
+        }
+    }
+
+    async fn set_version_size_to_directory_total(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        version: &str,
+        directory: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.db.begin().await?;
+        let version_row: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT pv.id
+              FROM package_versions pv
+              JOIN packages p ON p.id = pv.package_id
+             WHERE p.repository_id = $1
+               AND p.name = $2
+               AND pv.version = $3
+               FOR UPDATE OF pv
+            "#,
+        )
+        .bind(repository_id)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(version_row) = version_row else {
+            return tx.commit().await;
+        };
+
+        // `idx_artifacts_repo_path_pattern` (migration 110) serves the
+        // left-anchored LIKE; the `strpos` arm keeps only direct children.
+        let pattern = format!("{}%", crate::api::handlers::escape_like_literal(directory));
+        sqlx::query(
+            r#"
+            WITH total AS (
+                SELECT COALESCE(SUM(a.size_bytes), 0)::BIGINT AS size_bytes
+                  FROM artifacts a
+                 WHERE a.repository_id = $1
+                   AND a.path LIKE $2 ESCAPE '\'
+                   AND strpos(substr(a.path, $3 + 1), '/') = 0
+                   AND a.is_deleted = false
+            ),
+            updated AS (
+                UPDATE package_versions pv
+                   SET size_bytes = total.size_bytes
+                  FROM total
+                 WHERE pv.id = $4
+                RETURNING pv.package_id, pv.version, pv.size_bytes
+            )
+            UPDATE packages
+               SET size_bytes = updated.size_bytes
+              FROM updated
+             WHERE packages.id = updated.package_id
+               AND packages.version = updated.version
+            "#,
+        )
+        .bind(repository_id)
+        .bind(&pattern)
+        .bind(directory.chars().count() as i32)
+        .bind(version_row)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
     }
 
     /// Fire-and-forget wrapper that logs errors instead of propagating them.
@@ -1203,6 +1332,86 @@ mod tests {
 mod catalog_maintenance_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #4633: a Maven version's size is the sum of the live files directly
+    /// in its version directory. A soft-deleted file, a file in a deeper
+    /// directory and a file in a directory that only matches as a LIKE
+    /// wildcard (`_`) do not count, and the admin catalog backfill, which
+    /// replays every file through the single-file upsert, ends on the sum too.
+    #[tokio::test]
+    async fn maven_version_size_is_the_total_of_its_directory_4633() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let rows: [(&str, i64, bool); 6] = [
+            ("org/x4633/lib/1_0/lib-1_0.jar", 1000, false),
+            ("org/x4633/lib/1_0/lib-1_0.pom", 20, false),
+            ("org/x4633/lib/1_0/lib-1_0-sources.jar", 300, false),
+            ("org/x4633/lib/1_0/lib-1_0-javadoc.jar", 4000, true),
+            ("org/x4633/lib/1_0/nested/extra.jar", 50000, false),
+            ("org/x4633/lib/1a0/lib-1a0.jar", 600000, false),
+        ];
+        for (i, (path, size, deleted)) in rows.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'lib', '1_0', $3, $4, 'application/octet-stream', $2, $5)",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .bind(size)
+            .bind(format!("{i:064}"))
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .expect("seed artifact");
+        }
+        let svc = PackageService::new(pool.clone());
+        // Register the version from its smallest file, as the old rule would
+        // have left it, then recompute.
+        svc.create_or_update_from_artifact(
+            repo_id,
+            "org.x4633:lib",
+            "1_0",
+            20,
+            &format!("{:064}", 1),
+            None,
+            None,
+        )
+        .await
+        .expect("register version");
+        svc.try_set_version_size_to_directory_total(
+            repo_id,
+            "org.x4633:lib",
+            "1_0",
+            "org/x4633/lib/1_0/",
+        )
+        .await;
+        let read = |pool: sqlx::PgPool| async move {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT pv.size_bytes, p.size_bytes FROM packages p \
+                 JOIN package_versions pv ON pv.package_id = p.id \
+                 WHERE p.repository_id = $1 AND p.name = 'org.x4633:lib' AND pv.version = '1_0'",
+            )
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("catalog row")
+        };
+        let after_publish = read(pool.clone()).await;
+        let report = svc.backfill_catalog(Some(repo_id)).await;
+        let after_backfill = read(pool.clone()).await;
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        assert_eq!(after_publish, (1320, 1320), "jar + pom + sources");
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(
+            after_backfill.0, 1320,
+            "the backfill must end on the sum too"
+        );
+    }
 
     // -- backfill_catalog_coordinates (pure) --------------------------------
 

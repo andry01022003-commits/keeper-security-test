@@ -2745,13 +2745,16 @@ async fn collect_local_group_prefixes(
 /// The plain-text error the metadata cache's load failure becomes. The
 /// cache surfaces the sqlx error as `Arc<String>`; the status still sheds a
 /// saturated pool to 503 (#2083) and the body is the stable text, never the
-/// driver's (#3667).
+/// driver's (#3667). An unreachable database is a 503 too, and every 503
+/// carries `Retry-After` (#4765).
 fn metadata_cache_error_response(err: &str) -> Response {
-    (
-        crate::api::handlers::db_status(err),
-        crate::api::handlers::db_err_message(err),
+    crate::api::handlers::with_retry_after_on_503(
+        (
+            crate::api::handlers::db_status(err),
+            crate::api::handlers::db_err_message(err),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 async fn generate_metadata_for_artifact(
@@ -3452,6 +3455,13 @@ fn compute_checksum(data: &[u8], checksum_type: ChecksumType) -> String {
     }
 }
 
+/// The version directory of a Maven file path, with its trailing `/`
+/// (`com/acme/demo/1.0/demo-1.0.jar` -> `com/acme/demo/1.0/`): the directory
+/// whose files together make up the version (#4633).
+pub(crate) fn maven_version_directory(path: &str) -> Option<&str> {
+    path.rfind('/').map(|i| &path[..=i])
+}
+
 fn maven_package_name(coords: &MavenCoordinates) -> String {
     format!("{}:{}", coords.group_id, coords.artifact_id)
 }
@@ -3484,76 +3494,6 @@ fn build_maven_package_catalog_metadata(
 
 fn should_enqueue_maven_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
-}
-
-async fn queue_maven_sync_tasks(
-    state: &SharedState,
-    repo_id: uuid::Uuid,
-    artifact_id: uuid::Uuid,
-    artifact_path: &str,
-    artifact_size: i64,
-    artifact_created: chrono::DateTime<chrono::Utc>,
-) {
-    #[derive(sqlx::FromRow)]
-    struct SubWithFilter {
-        peer_instance_id: uuid::Uuid,
-        artifact_filter: Option<serde_json::Value>,
-    }
-
-    let subscriptions = match sqlx::query_as::<_, SubWithFilter>(
-        r#"
-        SELECT prs.peer_instance_id, sp.artifact_filter
-        FROM peer_repo_subscriptions prs
-        LEFT JOIN sync_policies sp ON sp.id = prs.policy_id
-        WHERE prs.repository_id = $1
-          AND prs.sync_enabled = true
-          AND prs.replication_mode::text IN ('push', 'mirror')
-        "#,
-    )
-    .bind(repo_id)
-    .fetch_all(&state.db)
-    .await
-    {
-        Ok(subs) => subs,
-        Err(e) => {
-            warn!(
-                "Failed to query Maven peer subscriptions for repo {} artifact {}: {}",
-                repo_id, artifact_id, e
-            );
-            return;
-        }
-    };
-
-    for sub in subscriptions {
-        let filter: crate::services::sync_policy_service::ArtifactFilter = sub
-            .artifact_filter
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        if !filter.matches(artifact_path, artifact_size, artifact_created) {
-            continue;
-        }
-
-        if let Err(e) = sqlx::query(
-            r#"
-            INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority)
-            VALUES ($1, $2, 0)
-            ON CONFLICT (peer_instance_id, artifact_id, task_type)
-            DO UPDATE SET priority = GREATEST(sync_tasks.priority, 0)
-            "#,
-        )
-        .bind(sub.peer_instance_id)
-        .bind(artifact_id)
-        .execute(&state.db)
-        .await
-        {
-            warn!(
-                "Failed to queue Maven sync task for peer {} artifact {}: {}",
-                sub.peer_instance_id, artifact_id, e
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3946,17 +3886,29 @@ async fn upload(
         package_metadata,
     )
     .await;
+    // #4633: the version's size is the total of its files, not the one file
+    // the registration above kept as the representative row.
+    if let Some(directory) = maven_version_directory(&path) {
+        crate::services::package_service::PackageService::new(state.db.clone())
+            .try_set_version_size_to_directory_total(
+                repo.id,
+                &package_name,
+                &coords.version,
+                directory,
+            )
+            .await;
+    }
 
     if should_enqueue_maven_sync_tasks(&headers) {
-        queue_maven_sync_tasks(
-            &state,
-            repo.id,
-            artifact_id,
-            &path,
-            size_bytes,
-            artifact_created,
-        )
-        .await;
+        crate::services::peer_instance_service::PeerInstanceService::new(state.db.clone())
+            .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo.id,
+                path: &path,
+                size_bytes,
+                created_at: artifact_created,
+            })
+            .await;
     }
 
     // Update repository timestamp
@@ -5644,6 +5596,102 @@ mod tests {
         assert_eq!(
             rows, 1,
             "the upsert must leave exactly one row for the contended path"
+        );
+    }
+
+    /// #4633: a Maven version's catalog size is the total of its files. The
+    /// smallest-`(checksum, size)` guard kept one file's size as the version's,
+    /// so the Packages page showed the pom's few bytes (or whichever file's
+    /// hash sorted first) for a version whose jar was far larger. A file of a
+    /// neighbouring version must not count toward it.
+    #[tokio::test]
+    async fn test_maven_version_size_is_total_of_its_files_4633() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+
+        let dir = "com/example/size4633/demo-lib";
+        let pom = bytes::Bytes::from_static(
+            br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example.size4633</groupId>
+  <artifactId>demo-lib</artifactId>
+  <version>1.0.0</version>
+</project>"#,
+        );
+        let jar = bytes::Bytes::from(vec![b'j'; 40_000]);
+        let sources = bytes::Bytes::from(vec![b's'; 7_000]);
+        let other_version = bytes::Bytes::from(vec![b'o'; 1_000]);
+        let uploads = [
+            (format!("{dir}/1.0.0/demo-lib-1.0.0.jar"), jar.clone()),
+            (format!("{dir}/1.0.0/demo-lib-1.0.0.pom"), pom.clone()),
+            (
+                format!("{dir}/1.0.0/demo-lib-1.0.0-sources.jar"),
+                sources.clone(),
+            ),
+            (
+                format!("{dir}/1.0.01/demo-lib-1.0.01.jar"),
+                other_version.clone(),
+            ),
+        ];
+        let mut statuses = Vec::new();
+        for (path, body) in &uploads {
+            let router = tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+            let (status, _) = tdh::send(
+                router,
+                tdh::put(format!("/{repo_key}/{path}"), body.clone()),
+            )
+            .await;
+            statuses.push((path.clone(), status));
+        }
+
+        let sizes: Vec<(String, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT pv.version, pv.size_bytes, p.size_bytes
+            FROM packages p
+            JOIN package_versions pv ON pv.package_id = p.id
+            WHERE p.repository_id = $1
+              AND p.name = 'com.example.size4633:demo-lib'
+            ORDER BY pv.version
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query package catalog");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        for (path, status) in statuses {
+            assert!(status.is_success(), "PUT {path} answered {status}");
+        }
+        let expected = (jar.len() + pom.len() + sources.len()) as i64;
+        let version_size = sizes
+            .iter()
+            .find(|(v, _, _)| v == "1.0.0")
+            .map(|(_, pv, _)| *pv);
+        assert_eq!(
+            version_size,
+            Some(expected),
+            "version 1.0.0 must be jar + pom + sources: {sizes:?}"
+        );
+        let other = sizes
+            .iter()
+            .find(|(v, _, _)| v == "1.0.01")
+            .map(|(_, pv, p)| (*pv, *p));
+        assert_eq!(
+            other,
+            Some((other_version.len() as i64, other_version.len() as i64)),
+            "the neighbouring version counts only its own file, and is the \
+             package's latest version: {sizes:?}"
         );
     }
 
@@ -9774,6 +9822,105 @@ mod tests {
             "5.2.0 must come from the LOCAL member, not upstream \
              (owned-GAV protection must be retained, #2328)"
         );
+    }
+
+    /// #4124: an `mvn deploy` (the native `PUT` of a jar) into a repository
+    /// with `scan_enabled` + `scan_on_upload` must start a scan, and must
+    /// start none when `scan_on_upload` is off. Returns the probe scan rows.
+    async fn deploy_probe_scans(on_upload: bool, budget: std::time::Duration) -> Option<i64> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let fx = tdh::Fixture::setup("local", "maven").await?;
+        let req = tdh::put(
+            format!(
+                "/{}/org/example/ak/scanme/1.0.0/scanme-1.0.0.jar",
+                fx.repo_key
+            ),
+            bytes::Bytes::from_static(b"maven jar bytes for the scan-on-upload test"),
+        );
+        let scans =
+            tdh::native_upload_probe_scans(&fx, super::router(), req, on_upload, budget).await;
+        fx.teardown().await;
+        Some(scans)
+    }
+
+    #[tokio::test]
+    async fn deploy_starts_scan_when_scan_on_upload_is_on_4124() {
+        let Some(scans) = deploy_probe_scans(true, std::time::Duration::from_secs(30)).await else {
+            return;
+        };
+        assert!(
+            scans > 0,
+            "an mvn deploy into a scan_on_upload repository must start a scan (#4124)"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_starts_no_scan_when_scan_on_upload_is_off_4124() {
+        let Some(scans) = deploy_probe_scans(false, std::time::Duration::from_secs(3)).await else {
+            return;
+        };
+        assert_eq!(
+            scans, 0,
+            "scan_on_upload is off, so the deploy must not scan"
+        );
+    }
+
+    /// #4642: `ak_artifact_uploads_total` and `ak_artifact_upload_size_bytes`
+    /// were defined but never recorded, so a `/metrics` scrape had no upload
+    /// series at all. An `mvn deploy` of one jar must count one upload for the
+    /// repository and format, sized by the jar.
+    #[test]
+    fn deploy_counts_upload_metrics_4642() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use metrics_util::debugging::DebugValue;
+        const JAR: &[u8] = b"jar bytes for the upload metrics test";
+        let (repo_key, captured) = tdh::capture_metrics(|| async {
+            let fx = tdh::Fixture::setup("local", "maven").await?;
+            let (status, body) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(
+                    format!(
+                        "/{}/org/example/ak/metered/1.0.0/metered-1.0.0.jar",
+                        fx.repo_key
+                    ),
+                    bytes::Bytes::from_static(JAR),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "Maven PUT failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let key = fx.repo_key.clone();
+            fx.teardown().await;
+            Some(key)
+        });
+        let Some(repo_key) = repo_key else {
+            return;
+        };
+        assert_eq!(
+            tdh::captured_metric(
+                &captured,
+                "ak_artifact_uploads_total",
+                &[("repository", &repo_key), ("format", "maven")],
+            ),
+            Some(&DebugValue::Counter(1)),
+            "one deploy must count one upload (#4642); captured: {captured:?}"
+        );
+        match tdh::captured_metric(
+            &captured,
+            "ak_artifact_upload_size_bytes",
+            &[("format", "maven")],
+        ) {
+            Some(DebugValue::Histogram(samples)) => assert_eq!(
+                samples.iter().map(|s| s.into_inner()).collect::<Vec<_>>(),
+                vec![JAR.len() as f64],
+                "the upload histogram must record the jar size"
+            ),
+            other => panic!("no upload size sample recorded: {other:?}"),
+        }
     }
 }
 

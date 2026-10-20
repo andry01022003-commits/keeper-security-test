@@ -12,7 +12,7 @@
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -337,6 +337,7 @@ async fn publish_module(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "puppet", "write:artifacts")?.user_id;
@@ -460,6 +461,17 @@ async fn publish_module(
         puppet_metadata
             .pointer("/module_json/summary")
             .and_then(|d| d.as_str()),
+    )
+    .await;
+
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
     )
     .await;
 
@@ -779,5 +791,67 @@ mod tests {
         let row = row.expect("a puppet publish must write a packages row");
         assert_eq!(row.version, "2.0.1");
         assert_eq!(row.description.as_deref(), Some("time sync"));
+    }
+
+    /// #4725: a hosted puppet publish must queue a push sync task for a
+    /// subscribed push peer, and a publish arriving as peer replication must
+    /// not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn puppet_upload_queues_push_sync_task_4725() {
+        let Some(f) = tdh::Fixture::setup("local", "puppet").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "puppet").await;
+
+        fn multipart_body(version: &str) -> String {
+            let module = format!(
+                r#"{{"owner":"acme","name":"ntp","version":"{version}","summary":"time sync"}}"#
+            );
+            format!(
+                "--B\r\nContent-Disposition: form-data; name=\"module\"\r\n\r\n{module}\r\n\
+                 --B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"m.tar.gz\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\nmodule-bytes\r\n--B--\r\n"
+            )
+        }
+
+        let (status, resp) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/v3/releases", f.repo_key),
+                "multipart/form-data; boundary=B",
+                bytes::Bytes::from(multipart_body("2.0.1")),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "puppet publish failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // A replicated publish (as the sync worker sends it) stores the module
+        // but must not queue another task.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/v3/releases", f.repo_key))
+            .header("x-artifact-keeper-replication", "true")
+            .header("content-type", "multipart/form-data; boundary=B")
+            .body(axum::body::Body::from(multipart_body("3.0.1")))
+            .unwrap();
+        let (status, resp) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated puppet publish failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["acme-ntp/2.0.1/acme-ntp-2.0.1.tar.gz".to_string()],
+            "only the client publish queues a push task; the replicated one must not"
+        );
     }
 }

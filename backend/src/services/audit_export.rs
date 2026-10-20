@@ -79,11 +79,22 @@ impl AuditAction {
                 Outcome::Failure
             }
             AuditAction::PermissionDenied | AuditAction::AgeGateRejected => Outcome::Denied,
+            // #4710: a promotion the gate / policy / rules refused, and a
+            // promotion request a reviewer turned down, are refusals of the
+            // requesting principal, like `AGE_GATE_REJECTED`.
+            AuditAction::PromotionRefused | AuditAction::PromotionApprovalDenied => Outcome::Denied,
+            // #4709: an attestation that did not verify. Refused by default;
+            // the emitter overrides to `Failure` when the operator opt-out
+            // stored it anyway.
+            AuditAction::AttestationRejected => Outcome::Denied,
             // #2805: the password was correct, but the 2FA enforcement policy
             // withheld the session pending enrollment. Not a success (no session
             // was issued) and not a credential failure — it is a policy denial,
             // which is what `Denied` means in this envelope.
             AuditAction::TotpEnrollmentRequired => Outcome::Denied,
+            // #4677: the limiter refused the attempt before any credential
+            // was checked; a refusal of the caller, not a credential failure.
+            AuditAction::LoginRateLimited => Outcome::Denied,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -137,7 +148,34 @@ impl AuditAction {
             | AuditAction::CiOidcGroupBindingReconciled
             | AuditAction::StorageScrubRun
             | AuditAction::StorageReindexRun
-            | AuditAction::RepositoryAllowlistChanged => Outcome::Success,
+            | AuditAction::RepositoryAllowlistChanged
+            | AuditAction::QuarantineReleased
+            | AuditAction::QuarantineRejected
+            | AuditAction::PromotionApprovalGranted
+            | AuditAction::ArtifactPromoted
+            | AuditAction::PromotionRejected
+            | AuditAction::PermissionRuleCreated
+            | AuditAction::PermissionRuleUpdated
+            | AuditAction::PermissionRuleDeleted
+            | AuditAction::SsoProviderCreated
+            | AuditAction::SsoProviderUpdated
+            | AuditAction::SsoProviderDeleted
+            | AuditAction::SsoProviderEnabled
+            | AuditAction::SsoProviderDisabled
+            | AuditAction::SigningKeyRotated
+            | AuditAction::SigningKeyRevoked
+            | AuditAction::WebhookCreated
+            | AuditAction::WebhookUpdated
+            | AuditAction::WebhookDeleted
+            | AuditAction::WebhookSecretRotated
+            | AuditAction::SyncPolicyCreated
+            | AuditAction::SyncPolicyUpdated
+            | AuditAction::SyncPolicyDeleted
+            | AuditAction::CondaPackageWithdrawn
+            | AuditAction::AttestationVerified
+            | AuditAction::EnvironmentRegistered
+            | AuditAction::EnvironmentDeleted
+            | AuditAction::ExternalFindingsIngested => Outcome::Success,
         }
     }
 }
@@ -412,6 +450,22 @@ pub mod details {
         /// An `upstream_url` change on update (#4467), userinfo redacted.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub upstream_change: Option<UpstreamChangeAudit>,
+        /// A project assignment change on update (#4026): the project the
+        /// repository left (`null` when it had none) and the one it is now
+        /// in (`null` when the assignment was cleared).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub project_change: Option<ProjectChangeAudit>,
+        /// `true` when this write made (or kept) a repository public while it
+        /// carries upstream credentials, accepted only because the caller sent
+        /// `allow_public_with_upstream_credentials` (#4662): anonymous reads
+        /// spend those credentials upstream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub allow_public_with_upstream_credentials: Option<bool>,
+        /// An upstream-auth change on `PUT .../upstream-auth` (#4529). Records
+        /// the auth types before and after and whether the credential material
+        /// changed; the credential values themselves are never recorded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub upstream_auth_change: Option<UpstreamAuthChangeAudit>,
     }
 
     /// Before/after of a repository's upstream URL, with userinfo stripped
@@ -421,6 +475,30 @@ pub mod details {
     pub struct UpstreamChangeAudit {
         pub previous_upstream_url: Option<String>,
         pub upstream_url: Option<String>,
+        pub credentials_changed: bool,
+    }
+
+    /// Before/after of a repository's project assignment (#4026).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ProjectChangeAudit {
+        pub previous_project_id: Option<Uuid>,
+        pub project_id: Option<Uuid>,
+    }
+
+    /// Before/after of a Remote's upstream auth (#4529). Only the auth types
+    /// and whether the stored credential material changed are recorded; no
+    /// credential value (username, password, token or AWS provider secret) is
+    /// ever carried.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct UpstreamAuthChangeAudit {
+        /// Auth type before the change; `null` when no upstream auth was
+        /// configured.
+        pub previous_auth_type: Option<String>,
+        /// Auth type after the change; `null` when upstream auth was removed.
+        pub auth_type: Option<String>,
+        /// Whether the stored credential material actually changed: a first
+        /// configuration (`set`), a rotation (`changed`) or a removal
+        /// (`removed`). `false` for a re-save of identical credentials.
         pub credentials_changed: bool,
     }
 
@@ -587,6 +665,26 @@ pub mod details {
                 reason: None,
                 provider: Some(provider.to_owned()),
                 auth_method: Some("federated".to_owned()),
+            }
+        }
+
+        /// A login refused 429 by a login rate limiter (#4677). `username`
+        /// is the attempted name exactly as `failed_login` records it (never
+        /// a password); `limiter` names the bucket that refused it and goes
+        /// in `reason`.
+        pub fn rate_limited(
+            username: Option<&str>,
+            path: &str,
+            method: &str,
+            limiter: &str,
+        ) -> Self {
+            Self {
+                username: username.map(str::to_owned),
+                path: Some(path.to_owned()),
+                method: Some(method.to_owned()),
+                reason: Some(limiter.to_owned()),
+                provider: None,
+                auth_method: None,
             }
         }
 
@@ -920,6 +1018,8 @@ mod tests {
     fn test_outcome_denied_variants() {
         assert_eq!(AuditAction::PermissionDenied.outcome(), Outcome::Denied);
         assert_eq!(AuditAction::AgeGateRejected.outcome(), Outcome::Denied);
+        assert_eq!(AuditAction::AttestationRejected.outcome(), Outcome::Denied);
+        assert_eq!(AuditAction::LoginRateLimited.outcome(), Outcome::Denied);
     }
 
     #[test]
@@ -934,6 +1034,11 @@ mod tests {
             AuditAction::BackupCompleted,
             AuditAction::AgeGateApproved,
             AuditAction::AgeGateReopened,
+            AuditAction::CondaPackageWithdrawn,
+            AuditAction::AttestationVerified,
+            AuditAction::EnvironmentRegistered,
+            AuditAction::EnvironmentDeleted,
+            AuditAction::ExternalFindingsIngested,
         ] {
             assert_eq!(a.outcome(), Outcome::Success, "{}", a.as_str());
         }
@@ -1184,6 +1289,9 @@ mod tests {
             previous_scan_config: None,
             scan_config_changed: None,
             upstream_change: None,
+            project_change: None,
+            allow_public_with_upstream_credentials: None,
+            upstream_auth_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

@@ -13,7 +13,7 @@
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.jlap       - JLAP incremental updates
 //!   GET  /conda/{repo_key}/{subdir}/current_repodata.json    - Current (latest) repodata
 //!   GET  /conda/{repo_key}/{subdir}/run_exports.json         - Run exports metadata (CEP-12)
-//!   GET  /conda/{repo_key}/{subdir}/patch_instructions.json  - Repodata patch instructions
+//!   GET  /conda/{repo_key}/{subdir}/patch_instructions.json  - Repodata patch instructions (remote only)
 //!   GET  /conda/{repo_key}/{subdir}/repodata_shards.msgpack.zst - CEP-16 shard index
 //!   GET  /conda/{repo_key}/{subdir}/shards/{hash}.msgpack.zst   - CEP-16 individual shard
 //!   GET  /conda/{repo_key}/{subdir}/{filename}               - Download package
@@ -51,6 +51,10 @@ use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope,
 use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::audit_export::Outcome;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::auth_service::AuthService;
 use crate::services::conda_identity::{
     self, CondaArchiveType, CondaIdentity, CondaIdentityInput, NoarchKind,
@@ -58,6 +62,7 @@ use crate::services::conda_identity::{
 use crate::services::curation::attestation_verify::{self, cep27};
 use crate::services::signing_service::SigningService;
 
+mod current_repodata;
 mod merge_gate;
 mod virtual_merge;
 
@@ -970,9 +975,10 @@ async fn repodata_json_bz2_with_token(
 
 async fn repodata_json_sig_with_token(
     state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
     Path((_token, repo_key, subdir)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    repodata_json_sig(state, Path((repo_key, subdir))).await
+    repodata_json_sig(state, auth, Path((repo_key, subdir))).await
 }
 
 async fn repodata_json_zst_with_token(
@@ -995,18 +1001,20 @@ async fn repodata_json_jlap_with_token(
 
 async fn current_repodata_json_with_token(
     state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((_token, repo_key, subdir)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    current_repodata_json(state, headers, Path((repo_key, subdir))).await
+    current_repodata_json(state, auth, headers, Path((repo_key, subdir))).await
 }
 
 async fn run_exports_json_with_token(
     state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((_token, repo_key, subdir)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    run_exports_json(state, headers, Path((repo_key, subdir))).await
+    run_exports_json(state, auth, headers, Path((repo_key, subdir))).await
 }
 
 async fn patch_instructions_json_with_token(
@@ -1344,6 +1352,104 @@ fn merge_channeldata_fields(
 }
 
 // ---------------------------------------------------------------------------
+// Remote channel documents
+// ---------------------------------------------------------------------------
+
+/// Proxy one channel document of a Remote repository from its upstream.
+///
+/// The fetch is the capped one `repodata.json` uses: the LARGE tier (128 MiB),
+/// because conda-forge's channel documents outgrow the 8 MiB default, reserved
+/// against the process-wide buffered-metadata budget (#2684), because these
+/// endpoints are anonymously reachable on a public repo and the per-request
+/// cap alone does not bound the sum of concurrent buffers (#2915). The
+/// upstream content coding is forwarded, and an upstream failure is the
+/// client's failure: an upstream 404 answers 404 (conda falls back from
+/// `current_repodata.json` to `repodata.json` on exactly that), anything else
+/// the proxy's error. Never a locally built stand-in, which a client would
+/// read as authoritative.
+async fn proxy_remote_document(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    upstream_path: &str,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let (content, upstream_encoding, _budget_permit) =
+        match proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            upstream_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await?
+        {
+            proxy_helpers::CappedMetadataGet::Buffered {
+                content,
+                content_encoding,
+                budget_permit,
+                ..
+            } => (content, content_encoding, budget_permit),
+            // No streaming fallback for these documents: render the same 502
+            // the pre-#4149 helper produced for an over-cap document.
+            proxy_helpers::CappedMetadataGet::OverCap => {
+                return Err(
+                    (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
+                );
+            }
+        };
+    // `_budget_permit` is held until this function returns, i.e. across
+    // response construction (including the gzip pass), which is the window
+    // where the buffer is resident AND being copied. Same lifetime as the
+    // debian dists path (#2684).
+    Ok(
+        cacheable_response_coded(content, content_type, upstream_encoding.as_deref(), headers)
+            .await,
+    )
+}
+
+/// Serve a subdir document of a Remote repository from its upstream (#4708):
+/// `current_repodata.json`, `run_exports.json`, `patch_instructions.json` and
+/// `repodata.json.sig`. A remote with no upstream (or no proxy service) has no
+/// such document and answers 404, the "not published" answer clients fall
+/// back from.
+async fn serve_remote_subdir_document(
+    state: &SharedState,
+    repo: &RepoInfo,
+    subdir: &str,
+    filename: &str,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    validate_read_subdir(subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+    let upstream_path = format!("{subdir}/{filename}");
+    match (state.proxy_service.as_deref(), repo.upstream_url.as_deref()) {
+        (Some(proxy), Some(upstream_url)) => {
+            proxy_remote_document(
+                proxy,
+                repo,
+                upstream_url,
+                &upstream_path,
+                content_type,
+                headers,
+            )
+            .await
+        }
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "Remote conda repository '{}' has no upstream to proxy {upstream_path} from",
+                repo.key
+            ),
+        )
+            .into_response()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET /conda/{repo_key}/channeldata.json
 // ---------------------------------------------------------------------------
 
@@ -1394,42 +1500,15 @@ async fn channeldata_json(
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                let (content, upstream_encoding, _budget_permit) =
-                    match proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        "channeldata.json",
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    )
-                    .await?
-                    {
-                        proxy_helpers::CappedMetadataGet::Buffered {
-                            content,
-                            content_encoding,
-                            budget_permit,
-                            ..
-                        } => (content, content_encoding, budget_permit),
-                        // No streaming fallback on this endpoint: render the
-                        // same 502 the pre-#4149 helper produced for an
-                        // over-cap document.
-                        proxy_helpers::CappedMetadataGet::OverCap => {
-                            return Err((StatusCode::BAD_GATEWAY, "Failed to fetch from upstream")
-                                .into_response());
-                        }
-                    };
-                // `_budget_permit` is held until this function returns, i.e.
-                // across response construction (including the gzip pass), which
-                // is the window where the buffer is resident AND being copied.
-                // Same lifetime as the debian dists path (#2684).
-                return Ok(cacheable_response_coded(
-                    content,
+                return proxy_remote_document(
+                    proxy,
+                    &repo,
+                    upstream_url,
+                    "channeldata.json",
                     "application/json",
-                    upstream_encoding.as_deref(),
                     &headers,
                 )
-                .await);
+                .await;
             }
         }
     }
@@ -1691,12 +1770,47 @@ async fn append_channel_notice(
 ///
 /// Returns run_exports data per package so conda-build can determine
 /// runtime dependencies without downloading full packages.
+///
+/// By repository type (#4708): a Remote proxies its upstream's document (a 404
+/// passes through), a Virtual merges its members' under the ownership guard
+/// and allowlist `repodata.json` applies ([`build_virtual_run_exports`]), and
+/// a hosted repository builds it from its own packages.
 async fn run_exports_json(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    match RepositoryType::from_db_str(&repo.repo_type) {
+        Some(RepositoryType::Remote) => {
+            return serve_remote_subdir_document(
+                &state,
+                &repo,
+                &subdir,
+                "run_exports.json",
+                "application/json",
+                &headers,
+            )
+            .await;
+        }
+        Some(RepositoryType::Virtual) => {
+            let merged =
+                build_virtual_run_exports(&state, auth.as_ref(), repo.id, &repo_key, &subdir)
+                    .await?;
+            return serve_virtual_merge(
+                &state.db,
+                repo.id,
+                &repo_key,
+                &format!("{subdir}/run_exports.json"),
+                merged,
+                "application/json",
+                &headers,
+            )
+            .await;
+        }
+        _ => {}
+    }
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
 
@@ -1710,13 +1824,9 @@ async fn run_exports_json(
 
         // Extract run_exports from metadata if available. The upload path
         // persists `info/run_exports.json` under the same key (#4038).
-        let run_exports = package_run_exports(artifact.metadata.as_ref());
-
         packages.insert(
             filename.to_string(),
-            serde_json::json!({
-                "run_exports": run_exports,
-            }),
+            run_exports_entry(artifact.metadata.as_ref()),
         );
     }
 
@@ -1735,29 +1845,38 @@ async fn run_exports_json(
 
 /// Patch instructions endpoint.
 ///
-/// Returns an object of per-package patches that should be applied to
-/// repodata.json. Allows channel maintainers to fix dependency metadata,
-/// revoke packages, or update license info without re-uploading packages.
-///
-/// Currently returns an empty patch set. Future: store patch instructions
-/// in the database per repository/subdir.
+/// `patch_instructions.json` is upstream-authored hotfix metadata: the
+/// instructions a channel's maintainers apply to `repodata.json` to correct
+/// dependency metadata, or remove or revoke packages, without re-uploading
+/// them. A Remote repository proxies its upstream's document (a 404 passes
+/// through). A hosted or virtual repository has no local hotfix instructions,
+/// so it answers 404 (#4708): the empty document it used to serve asserted
+/// "there are no patches", which is a statement about the channel nobody made.
 async fn patch_instructions_json(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let _repo = resolve_conda_repo(&state.db, &repo_key).await?;
-
-    let response = serde_json::json!({
-        "info": { "subdir": subdir },
-        "packages": {},
-        "packages.conda": {},
-        "remove": [],
-        "revoke": [],
-    });
-
-    let body = serde_json::to_vec_pretty(&response).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers).await)
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    if repo.repo_type == RepositoryType::Remote {
+        return serve_remote_subdir_document(
+            &state,
+            &repo,
+            &subdir,
+            "patch_instructions.json",
+            "application/json",
+            &headers,
+        )
+        .await;
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        format!(
+            "Conda repository '{repo_key}' publishes no patch instructions; only a remote \
+             repository proxies its upstream's"
+        ),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2156,18 +2275,59 @@ async fn repodata_json_bz2(
 ///
 /// Conda uses raw (non-PGP-armored) signatures. Returns 404 if the repository
 /// has no active signing key configured.
+///
+/// The signature covers the bytes `repodata.json` serves for the repository
+/// type (#4708): a hosted repository's own build, and a virtual's merged
+/// document (signed with the virtual's key, as a degraded merge is served when
+/// the virtual allows one). A Remote repository's `repodata.json` is upstream
+/// content we never sign with our key: its upstream's `.sig` is proxied when
+/// there is one, and otherwise this answers 404.
 async fn repodata_json_sig(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
-
-    // Use pretty-printed JSON to match what repodata_json() serves,
-    // so clients can verify the signature against the downloaded repodata.
-    let json_bytes = serde_json::to_string_pretty(&repodata)
-        .unwrap()
-        .into_bytes();
+    let mut partial = None;
+    let json_bytes: Bytes = match RepositoryType::from_db_str(&repo.repo_type) {
+        Some(RepositoryType::Remote) => {
+            return serve_remote_subdir_document(
+                &state,
+                &repo,
+                &subdir,
+                "repodata.json.sig",
+                "application/octet-stream",
+                &HeaderMap::new(),
+            )
+            .await;
+        }
+        Some(RepositoryType::Virtual) => {
+            let merged = build_virtual_repodata(
+                &state,
+                auth.as_ref(),
+                repo.id,
+                &repo_key,
+                &subdir,
+                RepodataEncoding::Json,
+            )
+            .await?;
+            partial = virtual_merge_failure_policy(
+                &state.db,
+                repo.id,
+                &repo_key,
+                &format!("{subdir}/repodata.json"),
+                &merged,
+            )
+            .await?;
+            merged.body.clone()
+        }
+        _ => {
+            let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
+            // Use pretty-printed JSON to match what repodata_json() serves,
+            // so clients can verify the signature against the downloaded repodata.
+            Bytes::from(serde_json::to_vec_pretty(&repodata).unwrap())
+        }
+    };
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     let signature = signing_svc
@@ -2182,12 +2342,18 @@ async fn repodata_json_sig(
         })?;
 
     match signature {
-        Some(sig_bytes) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .header(CONTENT_LENGTH, sig_bytes.len().to_string())
-            .body(Body::from(sig_bytes))
-            .unwrap()),
+        Some(sig_bytes) => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_LENGTH, sig_bytes.len().to_string())
+                .body(Body::from(sig_bytes))
+                .unwrap();
+            if let Some(missing) = partial {
+                virtual_merge::mark_partial(&mut response, &missing);
+            }
+            Ok(response)
+        }
         None => Err((
             StatusCode::NOT_FOUND,
             "No signing key configured for this repository",
@@ -2385,12 +2551,48 @@ async fn repo_public_key(
 // GET /conda/{repo_key}/{subdir}/current_repodata.json
 // ---------------------------------------------------------------------------
 
+/// `current_repodata.json`, by repository type (#4708). conda asks for it
+/// before `repodata.json` and falls back only on a 404, so an empty 200 makes a
+/// populated channel look empty. A Remote proxies its upstream's (a 404 passes
+/// through), a Virtual derives it from the merged `repodata.json` it serves
+/// ([`build_virtual_current_repodata`]), and a hosted repository builds it from
+/// its own packages.
 async fn current_repodata_json(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    match RepositoryType::from_db_str(&repo.repo_type) {
+        Some(RepositoryType::Remote) => {
+            return serve_remote_subdir_document(
+                &state,
+                &repo,
+                &subdir,
+                "current_repodata.json",
+                "application/json",
+                &headers,
+            )
+            .await;
+        }
+        Some(RepositoryType::Virtual) => {
+            let current =
+                build_virtual_current_repodata(&state, auth.as_ref(), repo.id, &repo_key, &subdir)
+                    .await?;
+            return serve_virtual_merge(
+                &state.db,
+                repo.id,
+                &repo_key,
+                &format!("{subdir}/current_repodata.json"),
+                current,
+                "application/json",
+                &headers,
+            )
+            .await;
+        }
+        _ => {}
+    }
     let repodata = build_repodata(&state.db, repo.id, &subdir, true).await?;
 
     let body = serde_json::to_string_pretty(&repodata)
@@ -3299,6 +3501,7 @@ async fn build_virtual_shard_index(
                         upstream_url: upstream_url.to_string(),
                         shards_base,
                     });
+                    let mut member_not_allowed = 0usize;
                     for (name, hash) in upstream.shards {
                         if merged.owned.contains(&name.to_ascii_lowercase()) {
                             dropped.owned += 1;
@@ -3310,7 +3513,7 @@ async fn build_virtual_shard_index(
                             .as_deref()
                             .is_some_and(|a| !a.admits_all_versions(&name, subdir))
                         {
-                            dropped.not_allowed += 1;
+                            member_not_allowed += 1;
                             merged.refused.insert(hash.to_vec());
                             continue;
                         }
@@ -3323,6 +3526,12 @@ async fn build_virtual_shard_index(
                                 .insert(name, VirtualShardSource::Remote(position));
                         }
                     }
+                    dropped.not_allowed += member_not_allowed;
+                    virtual_merge::count_allowlist_drops(
+                        &virtual_repo_key,
+                        &member.key,
+                        member_not_allowed,
+                    );
                 }
                 if dropped.owned > 0 {
                     tracing::info!(
@@ -4055,6 +4264,7 @@ fn shard_index_info(
             created_at: None,
             repodata_revisions: Default::default(),
             channel_relations: None,
+            virtual_package_detectors: None,
         });
     info.subdir = subdir.to_string();
     info.base_url = PACKAGES_BASE_URL.to_string();
@@ -4551,11 +4761,121 @@ async fn build_virtual_repodata(
     subdir: &str,
     encoding: RepodataEncoding,
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
+    build_virtual_package_document(
+        state,
+        auth,
+        VirtualPackageDocument {
+            virtual_repo_id,
+            virtual_repo_key,
+            subdir,
+            kind: merge_gate::MergeKind::Repodata,
+            filename: encoding.upstream_filename(),
+            candidates: virtual_merge::repodata_candidates(subdir),
+            plain_json: matches!(encoding, RepodataEncoding::Json),
+        },
+        build_artifact_entry,
+        move |virtual_repo_key, subdir, hosted, remote, owned, allowlist| {
+            virtual_merge::merge_repodata(
+                virtual_repo_key,
+                subdir,
+                hosted,
+                remote,
+                owned,
+                allowlist,
+                encoding,
+            )
+        },
+    )
+    .await
+}
+
+/// Build merged `run_exports.json` for a virtual repository (#4708): hosted
+/// members contribute their own packages' run exports, remote members their
+/// upstream's `run_exports.json` (none when the upstream publishes none),
+/// under the same ownership guard and allowlist as [`build_virtual_repodata`].
+async fn build_virtual_run_exports(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    subdir: &str,
+) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
+    build_virtual_package_document(
+        state,
+        auth,
+        VirtualPackageDocument {
+            virtual_repo_id,
+            virtual_repo_key,
+            subdir,
+            kind: merge_gate::MergeKind::RunExports,
+            filename: "run_exports.json",
+            candidates: virtual_merge::run_exports_candidates(subdir),
+            plain_json: true,
+        },
+        |artifact, _filename, _subdir| run_exports_entry(artifact.metadata.as_ref()),
+        virtual_merge::merge_run_exports,
+    )
+    .await
+}
+
+/// One `run_exports.json` package entry, as the hosted document serves it.
+fn run_exports_entry(metadata: Option<&serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({ "run_exports": package_run_exports(metadata) })
+}
+
+/// Which per-package document of a subdir a virtual merge builds.
+struct VirtualPackageDocument<'a> {
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &'a str,
+    subdir: &'a str,
+    kind: merge_gate::MergeKind,
+    /// The document's file name inside the subdir.
+    filename: &'static str,
+    /// The upstream files a remote member's document is read from.
+    candidates: Vec<(String, virtual_merge::FileCodec)>,
+    /// Whether the merged body is plain JSON (gzip-coded on request).
+    plain_json: bool,
+}
+
+/// Build a merged per-package document (keyed by package filename) for a
+/// virtual repository: `entry` renders each hosted package's record, remote
+/// members' documents are fetched from `doc.candidates`, and `merge` combines
+/// them on a blocking thread. Shared by `repodata.json` and `run_exports.json`
+/// so both read the same member set, ownership guard and allowlist and go
+/// through the same [`merge_gate`].
+async fn build_virtual_package_document<E, M>(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    doc: VirtualPackageDocument<'_>,
+    entry: E,
+    merge: M,
+) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response>
+where
+    E: Fn(&CondaArtifact, &str, &str) -> serde_json::Value,
+    M: FnOnce(
+            &str,
+            &str,
+            &[virtual_merge::HostedRecord],
+            &[virtual_merge::MemberDocument],
+            &std::collections::HashSet<String>,
+            Option<&crate::services::conda_allowlist::CompiledAllowlist>,
+        ) -> virtual_merge::PackageMerge
+        + Send
+        + 'static,
+{
+    let VirtualPackageDocument {
+        virtual_repo_id,
+        virtual_repo_key,
+        subdir,
+        kind,
+        filename,
+        candidates,
+        plain_json,
+    } = doc;
     validate_read_subdir(subdir)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
 
-    let document = format!("{subdir}/{}", encoding.upstream_filename());
-    let kind = merge_gate::MergeKind::Repodata;
+    let document = format!("{subdir}/{filename}");
     let VirtualMergeInputs {
         members,
         owned,
@@ -4582,11 +4902,11 @@ async fn build_virtual_repodata(
             if !is_conda_package(filename) {
                 continue;
             }
-            let entry = build_artifact_entry(artifact, filename, subdir);
+            let record = entry(artifact, filename, subdir);
             hosted.push(virtual_merge::HostedRecord {
                 filename: filename.to_string(),
                 is_v2: is_conda_v2(filename),
-                record: serde_json::value::to_raw_value(&entry)
+                record: serde_json::value::to_raw_value(&record)
                     .map_err(virtual_merge::internal_error)?,
             });
         }
@@ -4614,14 +4934,13 @@ async fn build_virtual_repodata(
                 let (documents, mut failed) = virtual_merge::fetch_remote_members(
                     proxy.as_deref(),
                     &members,
-                    &virtual_merge::repodata_candidates(&subdir),
+                    &candidates,
                     virtual_merge::MemberLimits::from_env(),
                     true,
                     &mut account,
                 )
                 .await;
                 let decoded_bytes: usize = documents.iter().map(|d| d.json.len()).sum();
-                let plain_json = matches!(encoding, RepodataEncoding::Json);
                 account.track(merge_gate::merge_working_set(decoded_bytes, plain_json));
                 let all_validated = documents.iter().all(|d| d.validator.is_some());
                 let validators = documents
@@ -4630,14 +4949,15 @@ async fn build_virtual_repodata(
                     .collect();
                 let enforced = allowlist.is_some();
                 let merge_subdir = subdir.clone();
+                let merge_virtual_key = virtual_repo_key.clone();
                 let (body, parse_failures, dropped) = tokio::task::spawn_blocking(move || {
-                    virtual_merge::merge_repodata(
+                    merge(
+                        &merge_virtual_key,
                         &merge_subdir,
                         &hosted,
                         &documents,
                         &owned,
                         allowlist.as_deref(),
-                        encoding,
                     )
                 })
                 .await
@@ -4646,6 +4966,7 @@ async fn build_virtual_repodata(
                     tracing::info!(
                         virtual_repo = %virtual_repo_key,
                         subdir = %subdir,
+                        kind = kind.label(),
                         dropped = dropped.owned,
                         "excluded remote conda records whose names a hosted member owns"
                     );
@@ -4654,6 +4975,7 @@ async fn build_virtual_repodata(
                     tracing::info!(
                         virtual_repo = %virtual_repo_key,
                         subdir = %subdir,
+                        kind = kind.label(),
                         dropped = dropped.not_allowed,
                         "excluded remote conda records the virtual's allowlist does not admit"
                     );
@@ -4681,6 +5003,71 @@ async fn build_virtual_repodata(
                     all_validated,
                     stats,
                     plain_json,
+                ))
+            },
+        )
+        .await
+        .map_err(merge_gate::SharedResponse::into_response)
+}
+
+/// Derive a virtual's `current_repodata.json` from the merged `repodata.json`
+/// it serves (#4708), or reuse the derivation kept for that merge.
+///
+/// The derived document inherits the merge's member failures, allowlist
+/// count and member validators, so the failure policy, the
+/// `x-ak-allowlist-dropped` header and cache freshness all follow the merge it
+/// came from; it is keyed by the merged document's ETag, so a new merge is a
+/// new derivation.
+async fn build_virtual_current_repodata(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    subdir: &str,
+) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
+    let merged = build_virtual_repodata(
+        state,
+        auth,
+        virtual_repo_id,
+        virtual_repo_key,
+        subdir,
+        RepodataEncoding::Json,
+    )
+    .await?;
+    let kind = merge_gate::MergeKind::CurrentRepodata;
+    let document = format!("{subdir}/current_repodata.json");
+    let mut key = merge_gate::MergeKeyBuilder::new(kind);
+    key.part(virtual_repo_id.as_bytes())
+        .part(document.as_bytes())
+        .part(merged.etag.as_bytes());
+    let validate_proxy = state.proxy_service.clone();
+    merge_gate::gate_for(virtual_repo_id)
+        .get_or_merge(
+            kind,
+            key.finish(),
+            Some(format!("{virtual_repo_id}/{document}")),
+            move |doc| merge_validators_fresh(validate_proxy, doc),
+            move |mut account| async move {
+                let input = merged.body.clone();
+                account.track(merge_gate::merge_working_set(input.len(), true));
+                let body = tokio::task::spawn_blocking(move || current_repodata::derive(&input))
+                    .await
+                    .map_err(virtual_merge::internal_error)?
+                    .map_err(virtual_merge::internal_error)?;
+                let stats = merge_gate::MergeStats {
+                    decoded_bytes: merged.body.len(),
+                    output_bytes: body.len(),
+                    reserved: account.reserved(),
+                    peak_need: account.peak_need(),
+                };
+                Ok(merge_gate::MergedDocument::new(
+                    body,
+                    merged.failed.clone(),
+                    merged.allowlist_dropped,
+                    merged.validators.clone(),
+                    merged.cacheable,
+                    stats,
+                    true,
                 ))
             },
         )
@@ -4750,6 +5137,7 @@ async fn build_virtual_channeldata(
         key.part(name.as_bytes()).part(entry.get().as_bytes());
     }
 
+    let virtual_repo_key = virtual_repo_key.to_string();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
     merge_gate::gate_for(virtual_repo_id)
@@ -4779,8 +5167,10 @@ async fn build_virtual_channeldata(
                     .filter_map(|d| d.validator.clone())
                     .collect();
                 let enforced = allowlist.is_some();
+                let merge_virtual_key = virtual_repo_key.clone();
                 let (body, parse_failures, not_allowed) = tokio::task::spawn_blocking(move || {
                     virtual_merge::merge_channeldata(
+                        &merge_virtual_key,
                         &hosted,
                         &documents,
                         &owned,
@@ -4823,6 +5213,24 @@ async fn build_virtual_channeldata(
         .map_err(merge_gate::SharedResponse::into_response)
 }
 
+/// Apply the virtual's member-failure policy (#4192) to a merge: `Ok(None)`
+/// when every member contributed, `Ok(Some(members))` for a degraded merge the
+/// virtual opted in to serving, or the strict 502.
+async fn virtual_merge_failure_policy(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    document: &str,
+    merged: &merge_gate::MergedDocument,
+) -> Result<Option<String>, Response> {
+    let policy = if merged.failed.is_empty() {
+        virtual_merge::FailurePolicy::Strict
+    } else {
+        virtual_merge::FailurePolicy::load(db, virtual_repo_id).await
+    };
+    virtual_merge::apply_failure_policy(policy, virtual_repo_key, document, &merged.failed)
+}
+
 /// Serve a virtual merge under the repository's member-failure policy
 /// (#4192): strict by default (502 naming the failed members), or a degraded
 /// document marked partial and uncacheable when the virtual opts in through
@@ -4842,13 +5250,9 @@ async fn serve_virtual_merge(
 ) -> Result<Response, Response> {
     use crate::api::handlers::cache_headers;
 
-    let policy = if merged.failed.is_empty() {
-        virtual_merge::FailurePolicy::Strict
-    } else {
-        virtual_merge::FailurePolicy::load(db, virtual_repo_id).await
-    };
     let partial =
-        virtual_merge::apply_failure_policy(policy, virtual_repo_key, document, &merged.failed)?;
+        virtual_merge_failure_policy(db, virtual_repo_id, virtual_repo_key, document, &merged)
+            .await?;
 
     let not_modified = if partial.is_none() {
         check_conditional_request(headers, &merged.etag)
@@ -5510,6 +5914,155 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Audit trail (#4709)
+// ---------------------------------------------------------------------------
+
+/// The package coordinates a conda audit row carries in `details.package`.
+fn conda_audit_package(
+    name: Option<&str>,
+    version: Option<&str>,
+    build: Option<&str>,
+    subdir: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build": build,
+        "subdir": subdir,
+        "filename": filename,
+    })
+}
+
+/// [`conda_audit_package`] with name, version and build parsed out of the
+/// CEP-26 filename; a filename that does not parse keeps them `null`.
+fn conda_audit_package_from_path(subdir: &str, filename: &str) -> serde_json::Value {
+    let parsed = CondaNativeHandler::parse_path(&build_conda_artifact_path(subdir, filename)).ok();
+    let parsed = parsed.as_ref();
+    conda_audit_package(
+        parsed.and_then(|p| p.name.as_deref()),
+        parsed.and_then(|p| p.version.as_deref()),
+        parsed.and_then(|p| p.build.as_deref()),
+        subdir,
+        filename,
+    )
+}
+
+/// `details` for a conda audit row: the repository, the package
+/// coordinates, then the action-specific `extra` fields.
+fn conda_audit_details(
+    repo: &RepoInfo,
+    package: serde_json::Value,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "repository": repo.key,
+        "repository_id": repo.id,
+        "repository_type": repo.repo_type,
+        "package": package,
+    });
+    if let (Some(map), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    details
+}
+
+/// Write one conda audit row for an action on `artifact_id`, best-effort
+/// (an audit-table outage never fails the request).
+async fn audit_conda_artifact(
+    state: &SharedState,
+    action: AuditAction,
+    user_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    resource_name: String,
+    details: serde_json::Value,
+    outcome: Option<Outcome>,
+) {
+    let mut entry = AuditEntry::new(action, ResourceType::Artifact)
+        .user(user_id)
+        .resource(artifact_id)
+        .resource_name(resource_name)
+        .with_request_client_ip()
+        .details(details);
+    if let Some(outcome) = outcome {
+        entry = entry.outcome(outcome);
+    }
+    audit_fire_and_forget(state.db.clone(), entry).await;
+}
+
+/// `ARTIFACT_UPLOADED` for a native conda publish: the native path inserts
+/// its own artifact row instead of going through the audited
+/// `ArtifactService` upload, so it writes the row itself. `details` is the
+/// shared `ArtifactDetails` shape plus the repository key and the conda
+/// coordinates under `package`.
+async fn audit_conda_upload(
+    state: &SharedState,
+    repo: &RepoInfo,
+    user_id: uuid::Uuid,
+    artifact_id: uuid::Uuid,
+    artifact: crate::services::audit_export::details::ArtifactDetails,
+    package: serde_json::Value,
+) {
+    let resource_name = artifact.path.clone();
+    let artifact = serde_json::to_value(artifact).unwrap_or_default();
+    audit_conda_artifact(
+        state,
+        AuditAction::ArtifactUploaded,
+        user_id,
+        artifact_id,
+        resource_name,
+        conda_audit_details(repo, package, artifact),
+        None,
+    )
+    .await;
+}
+
+/// `ATTESTATION_VERIFIED` / `ATTESTATION_REJECTED` for one attestation PUT.
+/// `stored` is whether the bundle was kept (always for a verified one; for a
+/// failed one only under the `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`
+/// opt-out). `reason` is the refusal reason the API returned.
+#[allow(clippy::too_many_arguments)]
+async fn audit_attestation_outcome(
+    state: &SharedState,
+    user_id: uuid::Uuid,
+    repo: &RepoInfo,
+    subdir: &str,
+    filename: &str,
+    artifact_id: uuid::Uuid,
+    verdict: Option<&attestation_verify::AttestationVerdict>,
+    reason: Option<&str>,
+    stored: bool,
+) {
+    let verified = verdict.is_some_and(|v| v.is_verified());
+    let (action, outcome) = match (verified, stored) {
+        (true, _) => (AuditAction::AttestationVerified, None),
+        (false, false) => (AuditAction::AttestationRejected, None),
+        (false, true) => (AuditAction::AttestationRejected, Some(Outcome::Failure)),
+    };
+    let extra = serde_json::json!({
+        "artifact_id": artifact_id,
+        "stored": stored,
+        "reason": reason,
+        "method": verdict.and_then(|v| v.method),
+        "identity": verdict.and_then(|v| v.identity.as_deref()),
+        "issuer": verdict.and_then(|v| v.issuer.as_deref()),
+        "key_fingerprint": verdict.and_then(|v| v.key_fingerprint.as_deref()),
+        "statement_type": verdict.and_then(|v| v.statement_type.as_deref()),
+        "checks_passed": verdict.map(|v| v.checks_passed),
+    });
+    audit_conda_artifact(
+        state,
+        action,
+        user_id,
+        artifact_id,
+        build_conda_artifact_path(subdir, filename),
+        conda_audit_details(repo, conda_audit_package_from_path(subdir, filename), extra),
+        outcome,
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // DELETE /conda/{repo_key}/{subdir}/{filename} - Withdraw package (#4059)
 // ---------------------------------------------------------------------------
 
@@ -5606,13 +6159,15 @@ async fn withdraw_package(
             .await
             .map_err(|e| e.into_response())?;
 
+    let reason_supplied = reason.is_some();
     let reason_text = reason.unwrap_or_else(|| "Withdrawn by administrator".to_string());
+    let notice_message = format!(
+        "Package {} was withdrawn from this channel: {}",
+        filename, reason_text
+    );
     let notice = serde_json::json!({
         "id": uuid::Uuid::new_v4().to_string(),
-        "message": format!(
-            "Package {} was withdrawn from this channel: {}",
-            filename, reason_text
-        ),
+        "message": notice_message,
         "level": "warning",
         "created_at": chrono::Utc::now().to_rfc3339(),
         "package": filename,
@@ -5633,6 +6188,26 @@ async fn withdraw_package(
         "Conda withdraw: {} from repo {} by {} (artifact {}): {}",
         filename, repo_key, ext.username, artifact_id, reason_text
     );
+    audit_conda_artifact(
+        &state,
+        AuditAction::CondaPackageWithdrawn,
+        ext.user_id,
+        artifact_id,
+        artifact_path,
+        conda_audit_details(
+            &repo,
+            conda_audit_package_from_path(&subdir, &filename),
+            serde_json::json!({
+                "artifact_id": artifact_id,
+                "reason": reason_text,
+                "reason_supplied": reason_supplied,
+                "hold": { "quarantine_status": new_status, "permanent": true },
+                "notice": { "id": notice_id, "message": notice_message },
+            }),
+        ),
+        None,
+    )
+    .await;
     state.event_bus.emit(
         "artifact.quarantine.quarantined",
         artifact_id,
@@ -5662,6 +6237,7 @@ async fn upload_package_put(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -5678,7 +6254,16 @@ async fn upload_package_put(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, Some(&subdir), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        Some(&subdir),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -5716,7 +6301,16 @@ async fn upload_post(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, subdir.as_deref(), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        subdir.as_deref(),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -5728,6 +6322,7 @@ async fn upload_package_put_with_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
@@ -5750,7 +6345,16 @@ async fn upload_package_put_with_token(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, Some(&subdir), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        Some(&subdir),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 /// POST upload using URL path token: /conda/t/<TOKEN>/<repo_key>/upload
@@ -5790,7 +6394,16 @@ async fn upload_post_with_token(
             .into_response());
     }
 
-    store_conda_package(&state, &repo, subdir.as_deref(), &filename, body, user_id).await
+    store_conda_package(
+        &state,
+        &repo,
+        subdir.as_deref(),
+        &filename,
+        &headers,
+        body,
+        user_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -5813,7 +6426,12 @@ fn validate_conda_package(content: &[u8], filename: &str) -> Result<(), String> 
 
         // Check for info-*.tar.zst
         let file_names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+            .filter_map(|i| {
+                archive
+                    .by_index(i)
+                    .ok()
+                    .and_then(|f| f.name().ok().map(|n| n.into_owned()))
+            })
             .collect();
 
         let has_info = file_names
@@ -6123,6 +6741,7 @@ fn walk_bounded_tar<R: std::io::Read>(
         }
     };
 
+    let max_entries = crate::util::bounded_archive::max_ingest_archive_entries();
     let mut entries_seen: u64 = 0;
     for entry in entries {
         // A truncated or over-budget archive keeps whatever it already yielded
@@ -6137,7 +6756,7 @@ fn walk_bounded_tar<R: std::io::Read>(
         };
 
         entries_seen += 1;
-        if entries_seen > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+        if entries_seen > max_entries {
             tracing::debug!("{} exceeds the entry-count cap; stopping the walk", what);
             outcome.truncated = true;
             break;
@@ -6659,7 +7278,7 @@ fn collect_conda_v2_scripts(content: &[u8]) -> CondaScriptHarvest {
         .filter(|idx| {
             archive
                 .by_index(*idx)
-                .is_ok_and(|f| is_conda_v2_scannable_member(f.name()))
+                .is_ok_and(|f| f.name().is_ok_and(|n| is_conda_v2_scannable_member(&n)))
         })
         .collect();
 
@@ -6667,7 +7286,10 @@ fn collect_conda_v2_scripts(content: &[u8]) -> CondaScriptHarvest {
         let Ok(file) = archive.by_index(idx) else {
             continue;
         };
-        let what = format!("conda member {}", file.name());
+        let what = match file.name() {
+            Ok(name) => format!("conda member {name}"),
+            Err(_) => format!("conda member #{idx}"),
+        };
         match zstd::Decoder::new(file) {
             Ok(decoder) => harvest.absorb(collect_conda_scripts_from_tar(decoder, &what)),
             Err(e) => {
@@ -6685,6 +7307,42 @@ fn collect_conda_v2_scripts(content: &[u8]) -> CondaScriptHarvest {
 fn collect_conda_v1_scripts(content: &[u8]) -> CondaScriptHarvest {
     // `MultiBzDecoder`: pbzip2/lbzip2 v1 packages are multi-stream (#4067).
     collect_conda_scripts_from_tar(bzip2::read::MultiBzDecoder::new(content), "conda v1 tar")
+}
+
+/// Count the install scripts a harvest found in
+/// `ak_conda_install_script_findings_total`, by hook kind (#4711).
+///
+/// A `.conda` carries a script twice when the recipe archived a copy in
+/// `info-*.tar.zst` beside the payload's; like `package_analysis_service`,
+/// identical bodies of one kind count once. A script that matched but could
+/// not be read is still a finding, counted once per path.
+fn count_conda_install_script_findings(repo_key: &str, harvest: &CondaScriptHarvest) {
+    use crate::services::conda_scripts::classify_script_path;
+    let mut bodies: HashSet<(&'static str, &[u8])> = HashSet::new();
+    let mut unreadable: HashSet<(&'static str, &str)> = HashSet::new();
+    for (path, body) in &harvest.scripts {
+        if let Some(kind) = classify_script_path(path) {
+            bodies.insert((kind.as_str(), body.as_slice()));
+        }
+    }
+    for path in &harvest.unreadable {
+        if let Some(kind) = classify_script_path(path) {
+            unreadable.insert((kind.as_str(), path.as_str()));
+        }
+    }
+    let mut per_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for kind in bodies
+        .iter()
+        .map(|(k, _)| *k)
+        .chain(unreadable.iter().map(|(k, _)| *k))
+    {
+        *per_kind.entry(kind).or_default() += 1;
+    }
+    for (kind, count) in per_kind {
+        crate::services::metrics_service::record_conda_install_script_findings(
+            repo_key, kind, count,
+        );
+    }
 }
 
 /// Harvest the install scripts of an uploaded conda package.
@@ -6709,6 +7367,18 @@ fn collect_conda_install_scripts(content: &[u8], filename: &str) -> CondaScriptH
 /// Maximum body size for attestation uploads (1 MB). Attestations are small
 /// JSON documents; anything larger is suspicious.
 const ATTESTATION_MAX_BODY_SIZE: usize = 1024 * 1024;
+
+/// The `ak_conda_attestation_total` outcome of one attestation PUT (#4711):
+/// `verified` when the bundle verified, otherwise `rejected` when verification
+/// is required (nothing is stored) or `failed` under the explicit opt-out (the
+/// bundle is stored with its failed record).
+fn attestation_outcome(verified: bool, require_verified: bool) -> &'static str {
+    match (verified, require_verified) {
+        (true, _) => "verified",
+        (false, true) => "rejected",
+        (false, false) => "failed",
+    }
+}
 
 /// Core logic for storing a CEP-27 attestation, shared by both main and
 /// token-authenticated handlers.
@@ -6736,6 +7406,7 @@ async fn store_attestation(
     subdir: &str,
     filename: &str,
     body: &Bytes,
+    user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
     // Enforce attestation-specific body size limit (H3)
     if body.len() > ATTESTATION_MAX_BODY_SIZE {
@@ -6766,8 +7437,25 @@ async fn store_attestation(
     // Parse the attestation (a Sigstore bundle per CEP-27; a bare Statement
     // parses too and is rejected by the verifier with the reason that says
     // why — see `cep27::BARE_STATEMENT_REASON`).
-    let attestation: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid JSON body").into_response())?;
+    let attestation: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(attestation) => attestation,
+        Err(_) => {
+            const INVALID_JSON: &str = "Invalid JSON body";
+            audit_attestation_outcome(
+                state,
+                user_id,
+                repo,
+                subdir,
+                filename,
+                artifact_id,
+                None,
+                Some(INVALID_JSON),
+                false,
+            )
+            .await;
+            return Err((StatusCode::BAD_REQUEST, INVALID_JSON).into_response());
+        }
+    };
 
     // Hash the exact package bytes the attestation claims to bind, streamed
     // out of storage rather than buffered: a `.conda` package can run to
@@ -6830,22 +7518,37 @@ async fn store_attestation(
     )
     .await;
 
-    if state.config.conda_attestation_require_verified && !verdict.is_verified() {
+    let outcome = attestation_outcome(
+        verdict.is_verified(),
+        state.config.conda_attestation_require_verified,
+    );
+    if outcome == "rejected" {
+        crate::services::metrics_service::record_conda_attestation(repo_key, outcome);
         info!(
             repo = %repo_key,
             package = %filename,
             error = ?verdict.error,
             "CEP-27 attestation refused: verification required and the bundle did not verify"
         );
+        let reason = verdict
+            .error
+            .as_deref()
+            .unwrap_or("attestation did not verify");
+        audit_attestation_outcome(
+            state,
+            user_id,
+            repo,
+            subdir,
+            filename,
+            artifact_id,
+            Some(&verdict),
+            Some(reason),
+            false,
+        )
+        .await;
         return Err((
             StatusCode::BAD_REQUEST,
-            format!(
-                "CEP-27 attestation verification failed: {}",
-                verdict
-                    .error
-                    .as_deref()
-                    .unwrap_or("attestation did not verify")
-            ),
+            format!("CEP-27 attestation verification failed: {reason}"),
         )
             .into_response());
     }
@@ -6877,6 +7580,7 @@ async fn store_attestation(
             }
         })?;
 
+    crate::services::metrics_service::record_conda_attestation(repo_key, outcome);
     info!(
         repo = %repo_key,
         package = %filename,
@@ -6884,6 +7588,18 @@ async fn store_attestation(
         appended = appended.appended,
         "CEP-27 attestation stored"
     );
+    audit_attestation_outcome(
+        state,
+        user_id,
+        repo,
+        subdir,
+        filename,
+        artifact_id,
+        Some(&verdict),
+        verdict.error.as_deref(),
+        true,
+    )
+    .await;
 
     let status = if appended.appended {
         StatusCode::CREATED
@@ -7445,9 +8161,9 @@ async fn put_attestation(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
+    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
 }
 
 /// GET /conda/{repo_key}/{subdir}/{filename}/attestation
@@ -7475,13 +8191,13 @@ async fn put_attestation_with_token(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = if auth.is_some() {
+    let user_id = if auth.is_some() {
         require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
+    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
 }
 
 /// GET /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
@@ -7719,6 +8435,7 @@ async fn store_conda_package(
     repo: &RepoInfo,
     requested_subdir: Option<&str>,
     filename: &str,
+    headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
@@ -7958,6 +8675,7 @@ async fn store_conda_package(
     .execute(&state.db)
     .await;
 
+    count_conda_install_script_findings(&repo.key, &install_scripts);
     record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
 
     // Surface the package on the Packages page (#3659), keyed on the conda
@@ -7988,10 +8706,48 @@ async fn store_conda_package(
     .execute(&state.db)
     .await;
 
+    // #4725: fan out to subscribed push peers.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &artifact_path,
+        size_bytes,
+    )
+    .await;
+
+    // #4711: a package arrives with no attestation of its own; CEP-27
+    // attestations are attached afterwards by PUT and counted there.
+    crate::services::metrics_service::record_conda_attestation(&repo.key, "absent");
+
     info!(
         "Conda upload: {}-{}-{} ({}) to repo {}/{}",
         pkg_name, pkg_version, build_string, filename, repo.id, subdir
     );
+    audit_conda_upload(
+        state,
+        repo,
+        user_id,
+        artifact_id,
+        crate::services::audit_export::details::ArtifactDetails {
+            repository_id: repo.id,
+            path: artifact_path.clone(),
+            name: pkg_name.clone(),
+            version: Some(pkg_version.clone()),
+            size_bytes: u64::try_from(size_bytes).ok(),
+            digest: Some(format!("sha256:{computed_sha256}")),
+            uploaded_by: Some(user_id),
+        },
+        conda_audit_package(
+            Some(&pkg_name),
+            Some(&pkg_version),
+            Some(&build_string),
+            subdir,
+            filename,
+        ),
+    )
+    .await;
 
     Ok(Response::builder()
         .status(StatusCode::CREATED)
@@ -12915,7 +13671,6 @@ mod tests {
                 "noarch/repodata.json.zst",
                 "noarch/current_repodata.json",
                 "noarch/run_exports.json",
-                "noarch/patch_instructions.json",
                 "noarch/repodata.json.jlap",
                 "channeldata.json",
                 "notices.json",
@@ -12948,13 +13703,18 @@ mod tests {
             // Signing-key routes have no key configured for the fixture repo,
             // so they 404 -- but the handler is reached (repo key bound),
             // exercising the token-aware wrappers.
-            for suffix in ["keys/repo.pub", "noarch/repodata.json.sig"] {
+            // patch_instructions.json too: a hosted channel publishes none (#4708).
+            for suffix in [
+                "keys/repo.pub",
+                "noarch/repodata.json.sig",
+                "noarch/patch_instructions.json",
+            ] {
                 let app = fx.router_with_auth(token_router());
                 let (status, _b) = tdh::send(app, tdh::get(format!("/{tok}/{key}/{suffix}"))).await;
                 assert_eq!(
                     status,
                     StatusCode::NOT_FOUND,
-                    "signing route `{suffix}` reaches the handler and 404s (no key)"
+                    "`{suffix}` reaches the handler and 404s (no key / no patch instructions)"
                 );
             }
         };
@@ -15474,7 +16234,7 @@ mod tests {
     #[test]
     fn test_conda_payload_entry_cap_truncates_and_is_partial() {
         let filler: Vec<(String, Vec<u8>)> = (0
-            ..crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES + 1)
+            ..crate::util::bounded_archive::max_ingest_archive_entries() + 1)
             .map(|i| (format!("lib/f{i}.py"), Vec::new()))
             .collect();
         let mut payload: Vec<(&str, Vec<u8>)> = filler
@@ -15554,6 +16314,116 @@ mod tests {
         assert_eq!(
             collect_conda_install_scripts(b"whatever", "pkg.whl"),
             CondaScriptHarvest::default()
+        );
+    }
+
+    /// #4711: every install script the harvest finds is counted in
+    /// `ak_conda_install_script_findings_total` by hook kind. The recipe's
+    /// archived copy in `info-*.tar.zst` is the same script, so it counts once.
+    #[test]
+    fn test_install_script_findings_are_counted_by_kind_4711() {
+        let mut info = minimal_info_files();
+        info.push((
+            "info/recipe/parent/post-link.sh",
+            TEST_POST_LINK_SH.to_vec(),
+        ));
+        let package = build_test_conda_v2_package_with_payload(
+            &info,
+            &[
+                ("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec()),
+                ("bin/.numpy-pre-unlink.sh", b"#!/bin/sh\nrm -f x\n".to_vec()),
+                ("Scripts/.numpy-pre-unlink.bat", b"del x\r\n".to_vec()),
+            ],
+        );
+
+        let (harvest, counters) = crate::services::metrics_service::capture_counters(|| {
+            let harvest =
+                collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+            count_conda_install_script_findings("local-conda", &harvest);
+            harvest
+        });
+
+        assert_eq!(harvest.scripts.len(), 4, "fixture precondition");
+        let findings = |kind| {
+            counters.get(
+                "ak_conda_install_script_findings_total",
+                &[("repository", "local-conda"), ("kind", kind)],
+            )
+        };
+        assert_eq!(
+            findings("post-link"),
+            1,
+            "the archived copy is not a second finding"
+        );
+        assert_eq!(findings("pre-unlink"), 2);
+        assert_eq!(findings("pre-link"), 0);
+    }
+
+    /// #4711: a package with no install scripts adds no series.
+    #[test]
+    fn test_install_script_findings_ignore_a_package_without_hooks_4711() {
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[("lib/x.py", b"x = 1\n".to_vec())],
+        );
+        let ((), counters) = crate::services::metrics_service::capture_counters(|| {
+            let harvest =
+                collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+            count_conda_install_script_findings("local-conda", &harvest);
+        });
+        assert_eq!(
+            counters.get("ak_conda_install_script_findings_total", &[]),
+            0
+        );
+    }
+
+    /// #4711: a hosted upload is counted as `outcome="absent"` (an attestation
+    /// arrives later, by PUT), and its install scripts are counted under the
+    /// repository's key — through the real upload handler.
+    #[test]
+    fn test_upload_counts_absent_attestation_and_install_scripts_4711() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec())],
+        );
+        let (repo_key, counters) =
+            crate::services::metrics_service::capture_counters_async(|| async move {
+                let fx = tdh::Fixture::setup("local", "conda").await?;
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/{}/upload", fx.repo_key))
+                    .header("X-Conda-Subdir", "linux-64")
+                    .header("X-Package-Filename", "numpy-1.26.4-py312h02b7e37_0.conda")
+                    .body(axum::body::Body::from(package))
+                    .unwrap();
+                let (status, body) = tdh::send(fx.router_with_auth(router()), req).await;
+                assert_eq!(
+                    status,
+                    StatusCode::CREATED,
+                    "{}",
+                    String::from_utf8_lossy(&body)
+                );
+                let key = fx.repo_key.clone();
+                fx.teardown().await;
+                Some(key)
+            });
+        let Some(repo_key) = repo_key else {
+            return;
+        };
+        assert_eq!(
+            counters.get(
+                "ak_conda_attestation_total",
+                &[("repository", &repo_key), ("outcome", "absent")]
+            ),
+            1
+        );
+        assert_eq!(
+            counters.get(
+                "ak_conda_install_script_findings_total",
+                &[("repository", &repo_key), ("kind", "post-link")]
+            ),
+            1
         );
     }
 
@@ -15655,6 +16525,78 @@ mod tests {
         assert_eq!(sha, hex::encode(Sha256::digest(text.as_bytes())));
         assert_eq!(attestations_sha256_of(Some(&legacy)), Some(sha));
         assert_eq!(attestations_sha256_of(Some(&stored)), Some("abc".into()));
+    }
+
+    /// #4725: a conda upload to a hosted repository must queue a push sync task
+    /// for a subscribed push peer, and an upload that arrives as peer
+    /// replication must not be fanned back out. Fails on `main` (nothing queued).
+    #[tokio::test]
+    async fn conda_upload_queues_push_sync_task_4725() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "conda").await;
+
+        // The embedded index.json must agree with the filename's coordinates
+        // (`check_filename_matches_metadata`), so each upload builds its own.
+        let package = |version: &str| {
+            let info = vec![(
+                "info/index.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "numpy",
+                    "version": version,
+                    "build": "py312h02b7e37_0",
+                    "build_number": 0,
+                }))
+                .unwrap(),
+            )];
+            build_test_conda_v2_package_with_payload(&info, &[])
+        };
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "linux-64")
+            .header("X-Package-Filename", "numpy-1.26.4-py312h02b7e37_0.conda")
+            .body(axum::body::Body::from(package("1.26.4")))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "conda upload must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated upload (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "linux-64")
+            .header("X-Package-Filename", "numpy-1.27.0-py312h02b7e37_0.conda")
+            .body(axum::body::Body::from(package("1.27.0")))
+            .unwrap();
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated conda upload must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["linux-64/numpy-1.26.4-py312h02b7e37_0.conda".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
     }
 }
 
@@ -16123,6 +17065,62 @@ mod withdrawal_tests {
         assert!(!is_withdrawn(Some("released"), None, now));
         assert!(!is_withdrawn(Some("clean"), None, now));
         assert!(!is_withdrawn(Some("quarantined"), Some(past), now));
+    }
+
+    /// #4709: a withdrawal writes `CONDA_PACKAGE_WITHDRAWN` for the withdrawn
+    /// package only, with the reason, the hold and the CEP-6 notice.
+    #[tokio::test]
+    async fn withdraw_writes_a_conda_package_withdrawn_audit_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let (good_id, bad_id) = seed_pair(&fx).await;
+        let (status, body) = tdh::send(
+            admin_router(&fx),
+            delete_req(
+                format!("/{}/noarch/{BAD}", fx.repo_key),
+                Some("compromised maintainer key"),
+            ),
+        )
+        .await;
+        let row = tdh::audit_row_eventually(&fx.pool, bad_id, "CONDA_PACKAGE_WITHDRAWN").await;
+        let good_rows = tdh::audit_count(&fx.pool, good_id, "CONDA_PACKAGE_WITHDRAWN").await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tdh::AuditRow {
+            user_id, details, ..
+        } = row;
+        assert_eq!(good_rows, 0, "only the withdrawn package is audited");
+        assert_eq!(user_id, Some(fx.user_id));
+        assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+        assert_eq!(details["reason"], "compromised maintainer key");
+        assert_eq!(details["reason_supplied"], true);
+        assert_eq!(
+            details["hold"],
+            serde_json::json!({
+                "quarantine_status": response["quarantine_status"],
+                "permanent": true,
+            })
+        );
+        assert_eq!(details["notice"]["id"], response["notice_id"]);
+        assert!(
+            details["notice"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("compromised maintainer key") && m.contains(BAD)),
+            "{details}"
+        );
+        assert_eq!(
+            details["package"],
+            serde_json::json!({
+                "name": "bad",
+                "version": "2.0",
+                "build": "0",
+                "subdir": "noarch",
+                "filename": BAD,
+            })
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -16880,6 +17878,29 @@ mod attestation_verification_tests {
             .unwrap()
     }
 
+    /// #4709: the module's single seeded package.
+    async fn seeded_artifact_id(fx: &tdh::Fixture) -> uuid::Uuid {
+        sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 LIMIT 1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("seeded artifact")
+    }
+
+    /// #4709: the newest `action` audit row for the seeded package, after
+    /// checking the actor and repository every attestation row carries.
+    async fn attestation_audit(fx: &tdh::Fixture, action: &str) -> serde_json::Value {
+        let artifact_id = seeded_artifact_id(fx).await;
+        let tdh::AuditRow {
+            user_id, details, ..
+        } = tdh::audit_row_eventually(&fx.pool, artifact_id, action).await;
+        assert_eq!(user_id, Some(fx.user_id), "the actor is the uploader");
+        assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+        assert_eq!(details["artifact_id"], artifact_id.to_string(), "{details}");
+        assert_eq!(details["package"]["subdir"], "noarch", "{details}");
+        details
+    }
+
     async fn stored_metadata(fx: &tdh::Fixture) -> Option<serde_json::Value> {
         sqlx::query_scalar(
             "SELECT am.metadata FROM artifact_metadata am \
@@ -16937,6 +17958,18 @@ mod attestation_verification_tests {
              only inside a Sigstore bundle: {text}"
         );
 
+        // #4709: each of the three refusals left an ATTESTATION_REJECTED row
+        // and none a verified one.
+        let artifact_id = seeded_artifact_id(&fx).await;
+        assert_eq!(
+            tdh::audit_count_eventually(&fx.pool, artifact_id, "ATTESTATION_REJECTED", 3).await,
+            3
+        );
+        assert_eq!(
+            tdh::audit_count(&fx.pool, artifact_id, "ATTESTATION_VERIFIED").await,
+            0
+        );
+
         fx.teardown().await;
     }
 
@@ -16978,6 +18011,18 @@ mod attestation_verification_tests {
             stored_metadata(&fx).await.is_none(),
             "a refused attestation must leave nothing behind"
         );
+
+        // #4709: the refusal is audited with the reason the API returned.
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        let reason = audit["reason"].as_str().expect("reason recorded");
+        assert!(reason.contains("predicateType"), "{audit}");
+        assert_eq!(
+            text,
+            format!("CEP-27 attestation verification failed: {reason}"),
+            "the audit reason is the API's vocabulary"
+        );
+        assert_eq!(audit["stored"], false, "{audit}");
+        assert_eq!(audit["package"]["filename"], WHL_NAME, "{audit}");
 
         fx.teardown().await;
     }
@@ -17044,7 +18089,94 @@ mod attestation_verification_tests {
             "the stored record must read back as Failed: {verdict:?}"
         );
 
+        // #4709: stored under the opt-out, but audited as rejected and
+        // flagged as stored, never as verified.
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        assert_eq!(audit["stored"], true, "{audit}");
+        assert_eq!(audit["reason"], record["error"], "{audit}");
+        assert_eq!(
+            tdh::audit_count(
+                &fx.pool,
+                seeded_artifact_id(&fx).await,
+                "ATTESTATION_VERIFIED"
+            )
+            .await,
+            0
+        );
+
         fx.teardown().await;
+    }
+
+    /// #4711: the outcome each verification result maps to.
+    #[test]
+    fn attestation_outcome_covers_every_decision_4711() {
+        assert_eq!(attestation_outcome(true, true), "verified");
+        assert_eq!(attestation_outcome(true, false), "verified");
+        assert_eq!(attestation_outcome(false, true), "rejected");
+        assert_eq!(attestation_outcome(false, false), "failed");
+    }
+
+    /// PUT the captured bundle with verification required (`true`, the
+    /// default) or opted out, and return the status and what was counted.
+    /// `None` when no database is available.
+    fn put_bundle_counting(
+        require_verified: bool,
+    ) -> (
+        Option<(StatusCode, String)>,
+        crate::services::metrics_service::CounterCapture,
+    ) {
+        crate::services::metrics_service::capture_counters_async(|| async move {
+            let fx = tdh::Fixture::setup("local", "conda").await?;
+            seed_wheel(&fx).await;
+            let state =
+                tdh::build_state_with(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), |c| {
+                    c.conda_attestation_require_verified = require_verified
+                });
+            let fx = tdh::Fixture { state, ..fx };
+            let (status, _) =
+                tdh::send(write_router(&fx), put_attestation_req(&fx, &bundle())).await;
+            let key = fx.repo_key.clone();
+            fx.teardown().await;
+            Some((status, key))
+        })
+    }
+
+    /// #4711: a bundle refused because verification is required is counted
+    /// as `outcome="rejected"`, and as nothing else.
+    #[test]
+    fn refused_attestation_counts_as_rejected_4711() {
+        let (result, counters) = put_bundle_counting(true);
+        let Some((status, repo_key)) = result else {
+            return;
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let outcome = |o| {
+            counters.get(
+                "ak_conda_attestation_total",
+                &[("repository", repo_key.as_str()), ("outcome", o)],
+            )
+        };
+        assert_eq!(outcome("rejected"), 1);
+        assert_eq!(outcome("failed") + outcome("verified"), 0);
+    }
+
+    /// #4711: under the explicit opt-out the unverified bundle is stored and
+    /// counted as `outcome="failed"`.
+    #[test]
+    fn opted_out_attestation_counts_as_failed_4711() {
+        let (result, counters) = put_bundle_counting(false);
+        let Some((status, repo_key)) = result else {
+            return;
+        };
+        assert_eq!(status, StatusCode::CREATED);
+        let outcome = |o| {
+            counters.get(
+                "ak_conda_attestation_total",
+                &[("repository", repo_key.as_str()), ("outcome", o)],
+            )
+        };
+        assert_eq!(outcome("failed"), 1);
+        assert_eq!(outcome("rejected") + outcome("verified"), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -17259,6 +18391,28 @@ mod attestation_verification_tests {
             metadata[SIDECAR_SHA256_METADATA_KEY],
             "{repodata}"
         );
+
+        // #4709: ATTESTATION_VERIFIED names the method, signer and package.
+        let audit = attestation_audit(&fx, "ATTESTATION_VERIFIED").await;
+        assert_eq!(audit["method"], "sigstore-key", "{audit}");
+        assert_eq!(audit["identity"], "acme-ci", "{audit}");
+        assert_eq!(audit["issuer"], "key:8ef972c8a32ae989", "{audit}");
+        assert_eq!(
+            audit["key_fingerprint"], record["key_fingerprint"],
+            "{audit}"
+        );
+        assert_eq!(audit["stored"], true, "{audit}");
+        assert!(audit["reason"].is_null(), "{audit}");
+        assert_eq!(
+            audit["package"],
+            serde_json::json!({
+                "name": "acme-core",
+                "version": "1.0",
+                "build": "py_0",
+                "subdir": "noarch",
+                "filename": COSIGN_PKG_NAME,
+            })
+        );
         fx.teardown().await;
     }
 
@@ -17283,6 +18437,39 @@ mod attestation_verification_tests {
             .await
             .map(|m| m.get("attestation").is_none())
             .unwrap_or(true));
+
+        // #4709: the refusal is audited, with the API's reason.
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        assert!(
+            audit["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("not a configured trusted key")),
+            "{audit}"
+        );
+        assert_eq!(audit["stored"], false, "{audit}");
+        assert_eq!(audit["package"]["name"], "acme-core", "{audit}");
+        fx.teardown().await;
+    }
+
+    /// #4709: a body that is not JSON is refused and audited as rejected.
+    #[tokio::test]
+    async fn malformed_attestation_body_is_audited_as_rejected() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        seed_wheel(&fx).await;
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/noarch/{WHL_NAME}/attestation", fx.repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let (status, body) = tdh::send(write_router(&fx), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let audit = attestation_audit(&fx, "ATTESTATION_REJECTED").await;
+        assert_eq!(audit["reason"], String::from_utf8_lossy(&body).as_ref());
+        assert_eq!(audit["stored"], false, "{audit}");
+        assert!(audit["method"].is_null(), "{audit}");
         fx.teardown().await;
     }
 
@@ -18001,6 +19188,7 @@ mod virtual_channel_tests {
         pub pool: sqlx::PgPool,
         pub hosted_id: uuid::Uuid,
         pub remote_id: uuid::Uuid,
+        pub remote_key: String,
         pub virtual_id: uuid::Uuid,
         pub virtual_key: String,
         pub state: crate::api::SharedState,
@@ -18010,7 +19198,7 @@ mod virtual_channel_tests {
     impl VirtualRig {
         pub(super) async fn new(pool: sqlx::PgPool, upstream_url: &str) -> Self {
             let (hosted_id, _hk, _hd) = tdh::create_repo(&pool, "local", "conda").await;
-            let (remote_id, _rk, _rd) = tdh::create_repo(&pool, "remote", "conda").await;
+            let (remote_id, remote_key, _rd) = tdh::create_repo(&pool, "remote", "conda").await;
             sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
                 .bind(upstream_url)
                 .bind(remote_id)
@@ -18031,6 +19219,7 @@ mod virtual_channel_tests {
                 pool,
                 hosted_id,
                 remote_id,
+                remote_key,
                 virtual_id,
                 virtual_key,
                 state,
@@ -18251,6 +19440,7 @@ mod virtual_channel_tests {
             },
         ];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
+            "virtual",
             "noarch",
             &hosted,
             &remote,
@@ -18848,6 +20038,7 @@ mod virtual_channel_tests {
             validator: None,
         }];
         let (body, failures, dropped) = virtual_merge::merge_repodata(
+            "virtual",
             "noarch",
             &hosted,
             &remote,
@@ -18867,6 +20058,117 @@ mod virtual_channel_tests {
         );
         assert_eq!(dropped.not_allowed, 3);
         assert_eq!(dropped.owned, 0);
+    }
+
+    /// #4711: the records a virtual's allowlist drops from a repodata merge
+    /// are counted per remote member, under the virtual's key.
+    #[test]
+    fn merge_repodata_counts_allowlist_drops_per_member_4711() {
+        let allowlist = crate::services::conda_allowlist::CondaAllowlist {
+            enabled: true,
+            entries: vec![crate::services::conda_allowlist::AllowlistEntry {
+                name: "rich".into(),
+                version: None,
+                subdirs: vec![],
+            }],
+        }
+        .compile()
+        .unwrap();
+        let remote = vec![
+            member_doc("remote-a", &["rich-13.0-0.conda", "numpy-2.0-0.conda"]),
+            member_doc(
+                "remote-b",
+                &[
+                    "rich-13.1-0.conda",
+                    "numpy-2.1-0.conda",
+                    "scipy-1.0-0.conda",
+                ],
+            ),
+            member_doc("remote-c", &["rich-12.0-0.conda"]),
+        ];
+        let (dropped, counters) = crate::services::metrics_service::capture_counters(|| {
+            virtual_merge::merge_repodata(
+                "conda-virtual",
+                "noarch",
+                &[],
+                &remote,
+                &Default::default(),
+                Some(&allowlist),
+                RepodataEncoding::Json,
+            )
+            .2
+        });
+        assert_eq!(dropped.not_allowed, 3);
+        let member = |m| {
+            counters.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("repository", "conda-virtual"), ("member", m)],
+            )
+        };
+        assert_eq!(member("remote-a"), 1);
+        assert_eq!(member("remote-b"), 2);
+        assert_eq!(
+            member("remote-c"),
+            0,
+            "a member that lost nothing adds no series"
+        );
+    }
+
+    /// #4711: channeldata allowlist drops are counted per member as well, and
+    /// a virtual without an allowlist counts nothing.
+    #[test]
+    fn merge_channeldata_counts_allowlist_drops_per_member_4711() {
+        let allowlist = crate::services::conda_allowlist::CondaAllowlist {
+            enabled: true,
+            entries: vec![crate::services::conda_allowlist::AllowlistEntry {
+                name: "rich".into(),
+                version: None,
+                subdirs: vec![],
+            }],
+        }
+        .compile()
+        .unwrap();
+        let doc = |member: &str, names: &[&str]| virtual_merge::MemberDocument {
+            member: member.into(),
+            json: serde_json::to_vec(&serde_json::json!({
+                "packages": names
+                    .iter()
+                    .map(|n| (n.to_string(), serde_json::json!({"version": "1.0"})))
+                    .collect::<serde_json::Map<_, _>>(),
+            }))
+            .unwrap(),
+            validator: None,
+        };
+        let remote = vec![doc("remote-a", &["rich", "numpy", "scipy"])];
+        let (not_allowed, counters) = crate::services::metrics_service::capture_counters(|| {
+            virtual_merge::merge_channeldata(
+                "conda-virtual",
+                &[],
+                &remote,
+                &Default::default(),
+                Some(&allowlist),
+            )
+            .2
+        });
+        assert_eq!(not_allowed, 2);
+        assert_eq!(
+            counters.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("repository", "conda-virtual"), ("member", "remote-a")]
+            ),
+            2
+        );
+
+        let ((), unfiltered) = crate::services::metrics_service::capture_counters(|| {
+            let _ = virtual_merge::merge_channeldata(
+                "conda-virtual",
+                &[],
+                &remote,
+                &Default::default(),
+                None,
+            );
+        });
+        assert_eq!(unfiltered.get("ak_conda_allowlist_dropped_total", &[]), 0);
     }
 
     #[test]
@@ -19240,6 +20542,450 @@ mod virtual_channel_tests {
             assert!(stats.reserved < budget, "{document}: {stats:?}");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // #4708: the repodata siblings (current_repodata.json, run_exports.json,
+    // repodata.json.sig, patch_instructions.json) branch on the repository
+    // type like repodata.json does. On main every one of them was built from
+    // the repository's OWN rows, so a remote or virtual channel answered an
+    // empty 200 (and a signature over that empty document).
+    // -----------------------------------------------------------------------
+
+    /// The remote's noarch packages in the #4708 fixtures: two `rich`
+    /// versions the allowlist admits, a `colorama` it does not, and an
+    /// `acme-core` impostor of the hosted package.
+    const SIBLING_UPSTREAM_NOARCH: [&str; 4] = [
+        "rich-13.0-pyh_0.conda",
+        "rich-12.0-pyh_0.conda",
+        "colorama-0.4.6-pyhd8ed1ab_1.conda",
+        "acme-core-99.0-0.conda",
+    ];
+
+    /// An upstream `run_exports.json` with one weak export per filename.
+    fn upstream_run_exports(subdir: &str, filenames: &[&str]) -> serde_json::Value {
+        let conda: serde_json::Map<String, serde_json::Value> = filenames
+            .iter()
+            .map(|f| {
+                (
+                    f.to_string(),
+                    serde_json::json!({"run_exports": {"weak": [format!("from-{f}")]}}),
+                )
+            })
+            .collect();
+        serde_json::json!({"info": {"subdir": subdir}, "packages": {}, "packages.conda": conda})
+    }
+
+    /// A virtual over a hosted `acme-core 1.0` (which declares a run export)
+    /// and a remote serving [`SIBLING_UPSTREAM_NOARCH`], with an allowlist
+    /// admitting `ri*` only.
+    async fn sibling_rig(server: &MockServer) -> VirtualRig {
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_repodata("noarch", &SIBLING_UPSTREAM_NOARCH)),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/run_exports.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_run_exports("noarch", &SIBLING_UPSTREAM_NOARCH)),
+            )
+            .mount(server)
+            .await;
+        let rig = VirtualRig::new(tdh::try_pool().await.expect("pool"), &server.uri()).await;
+        let id =
+            seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata || $2 WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .bind(serde_json::json!({"run_exports": {"weak": ["acme-core >=1.0"]}}))
+        .execute(&rig.pool)
+        .await
+        .expect("declare hosted run exports");
+        set_allowlist(
+            &rig,
+            serde_json::json!({"enabled": true, "entries": [{"name": "ri*"}]}),
+        )
+        .await;
+        rig
+    }
+
+    /// #4708: a virtual's `current_repodata.json` is the newest version of
+    /// each package of the merged `repodata.json` it serves (hosted and
+    /// remote), so it honours the allowlist and the hosted-name guard; its
+    /// `run_exports.json` merges the hosted package's run exports with the
+    /// remote's under the same rules. On main both were built from the
+    /// virtual's own (nonexistent) rows: an empty 200, which conda reads as an
+    /// empty channel.
+    #[tokio::test]
+    async fn virtual_current_repodata_and_run_exports_merge_members_4708() {
+        if tdh::try_pool().await.is_none() {
+            return;
+        }
+        let server = MockServer::start().await;
+        let rig = sibling_rig(&server).await;
+        let v = rig.virtual_key.clone();
+
+        let (cur_status, cur_body, cur_headers) =
+            rig.get(format!("/{v}/noarch/current_repodata.json")).await;
+        let (re_status, re_body, re_headers) =
+            rig.get(format!("/{v}/noarch/run_exports.json")).await;
+        let (_, full_body, _) = rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let token_app = tdh::router_anon(token_router(), rig.state.clone());
+        let (tok_status, tok_body, _) = tdh::send_with_headers(
+            token_app,
+            tdh::get(format!(
+                "/ak_url_token_placeholder/{v}/noarch/current_repodata.json"
+            )),
+        )
+        .await;
+        rig.cleanup().await;
+
+        assert_eq!(
+            cur_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&cur_body)
+        );
+        let current: serde_json::Value = serde_json::from_slice(&cur_body).unwrap();
+        assert_eq!(
+            listed(&current),
+            vec!["acme-core-1.0-0.conda", "rich-13.0-pyh_0.conda"],
+            "newest version per name, allowlist and hosted-name guard applied: {current}"
+        );
+        assert_eq!(current["info"]["subdir"], "noarch");
+        let full: serde_json::Value = serde_json::from_slice(&full_body).unwrap();
+        assert_eq!(
+            current["packages.conda"]["rich-13.0-pyh_0.conda"],
+            full["packages.conda"]["rich-13.0-pyh_0.conda"],
+            "a current_repodata record is the repodata.json record"
+        );
+        assert_eq!(
+            cur_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "the merge it derives from dropped colorama"
+        );
+
+        assert_eq!(
+            re_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&re_body)
+        );
+        let run_exports: serde_json::Value = serde_json::from_slice(&re_body).unwrap();
+        assert_eq!(
+            listed(&run_exports),
+            vec![
+                "acme-core-1.0-0.conda",
+                "rich-12.0-pyh_0.conda",
+                "rich-13.0-pyh_0.conda"
+            ],
+            "run exports of every admitted package, none for colorama or the impostor"
+        );
+        assert_eq!(
+            run_exports["packages.conda"]["acme-core-1.0-0.conda"]["run_exports"]["weak"][0],
+            "acme-core >=1.0",
+            "the hosted member contributes its own run exports"
+        );
+        assert_eq!(
+            run_exports["packages.conda"]["rich-13.0-pyh_0.conda"]["run_exports"]["weak"][0],
+            "from-rich-13.0-pyh_0.conda",
+            "the remote member contributes its upstream's"
+        );
+        assert_eq!(
+            re_headers
+                .get(ALLOWLIST_DROPPED_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        assert_eq!(tok_status, StatusCode::OK, "token form");
+        assert_eq!(
+            tok_body, cur_body,
+            "the /t/<token>/ form serves the same current_repodata.json"
+        );
+    }
+
+    /// #4708: a virtual whose remote member fails follows the member-failure
+    /// policy on the siblings exactly as on repodata.json: strict by default
+    /// (502 naming the member), never an empty 200.
+    #[tokio::test]
+    async fn virtual_siblings_follow_the_member_failure_policy_4708() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        for p in ["/noarch/repodata.json.zst", "/noarch/run_exports.json"] {
+            Mock::given(method("GET"))
+                .and(wm_path(p))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+        }
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let v = rig.virtual_key.clone();
+        let (cur_status, cur_body, _) = rig.get(format!("/{v}/noarch/current_repodata.json")).await;
+        let (re_status, re_body, _) = rig.get(format!("/{v}/noarch/run_exports.json")).await;
+        let remote_key = rig.remote_key.clone();
+        rig.cleanup().await;
+        for (doc, status, body) in [
+            ("current_repodata.json", cur_status, cur_body),
+            ("run_exports.json", re_status, re_body),
+        ] {
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{doc}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                String::from_utf8_lossy(&body).contains(&remote_key),
+                "{doc}"
+            );
+        }
+    }
+
+    /// #4708: a virtual's `repodata.json.sig` verifies against the
+    /// `repodata.json` bytes the virtual serves (the merged document), with
+    /// the virtual's key. On main it signed the virtual's own empty hosted
+    /// build, a valid signature over bytes no client downloads.
+    #[tokio::test]
+    async fn virtual_repodata_sig_verifies_against_served_repodata_4708() {
+        use rsa::pkcs1v15::{Signature, VerifyingKey};
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::signature::Verifier;
+
+        if tdh::try_pool().await.is_none() {
+            return;
+        }
+        let server = MockServer::start().await;
+        let rig = sibling_rig(&server).await;
+        let v = rig.virtual_key.clone();
+        let svc = SigningService::new(rig.pool.clone(), &rig.state.config.jwt_secret);
+        let key = svc
+            .create_key(crate::services::signing_service::CreateKeyRequest {
+                repository_id: Some(rig.virtual_id),
+                name: format!("conda-sig-{v}"),
+                key_type: "rsa".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(rig.virtual_id, Some(key.id), true, false, false)
+            .await
+            .expect("attach signing key");
+
+        let (repo_status, repodata, _) = rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (sig_status, sig, _) = rig.get(format!("/{v}/noarch/repodata.json.sig")).await;
+        let (_, pem, _) = rig.get(format!("/{v}/keys/repo.pub")).await;
+        let _ = sqlx::query("DELETE FROM repository_signing_config WHERE repository_id = $1")
+            .bind(rig.virtual_id)
+            .execute(&rig.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM signing_keys WHERE id = $1")
+            .bind(key.id)
+            .execute(&rig.pool)
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(repo_status, StatusCode::OK);
+        assert_eq!(
+            sig_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&sig)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&repodata).unwrap();
+        assert!(
+            !listed(&doc).is_empty(),
+            "the served repodata is the merge, not an empty hosted build"
+        );
+        let public = rsa::RsaPublicKey::from_public_key_pem(std::str::from_utf8(&pem).unwrap())
+            .expect("repo.pub parses");
+        let verifier = VerifyingKey::<sha2::Sha256>::new(public);
+        let signature = Signature::try_from(&sig[..]).expect("signature bytes");
+        assert!(
+            verifier.verify(&repodata, &signature).is_ok(),
+            "the signature must cover the repodata.json bytes the virtual serves"
+        );
+    }
+
+    /// #4708: a remote channel proxies `current_repodata.json`,
+    /// `run_exports.json`, `patch_instructions.json` and `repodata.json.sig`
+    /// from its upstream byte for byte, and passes an upstream 404 through as
+    /// 404 (conda falls back from current_repodata.json to repodata.json on a
+    /// 404 and nothing else). On main the first three were the remote's own
+    /// empty hosted build (200 in every subdir) and the signature a 404 (no
+    /// key) or, worse, our key over that empty build.
+    #[tokio::test]
+    async fn remote_channel_proxies_repodata_siblings_and_passes_404_4708() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let documents: [(&str, Vec<u8>); 4] = [
+            (
+                "current_repodata.json",
+                br#"{"info":{"subdir":"noarch"},"packages":{},"packages.conda":{"up-1.0-0.conda":{"name":"up","version":"1.0"}},"repodata_version":1}"#.to_vec(),
+            ),
+            (
+                "run_exports.json",
+                br#"{"info":{"subdir":"noarch"},"packages.conda":{"up-1.0-0.conda":{"run_exports":{"weak":["up"]}}}}"#.to_vec(),
+            ),
+            (
+                "patch_instructions.json",
+                br#"{"packages":{},"packages.conda":{"up-0.9-0.conda":{"depends":["x <2"]}},"remove":[],"revoke":[]}"#.to_vec(),
+            ),
+            ("repodata.json.sig", b"\x01upstream-signature\xff".to_vec()),
+        ];
+        for (file, body) in &documents {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/noarch/{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .mount(&server)
+                .await;
+        }
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let r = rig.remote_key.clone();
+        let mut served = Vec::new();
+        for (file, _) in &documents {
+            served.push(rig.get(format!("/{r}/noarch/{file}")).await);
+        }
+        let mut missing = Vec::new();
+        for (file, _) in &documents {
+            missing.push(rig.get(format!("/{r}/linux-64/{file}")).await);
+        }
+        let token_app = tdh::router_anon(token_router(), rig.state.clone());
+        let (tok_status, tok_body, _) = tdh::send_with_headers(
+            token_app,
+            tdh::get(format!(
+                "/ak_url_token_placeholder/{r}/noarch/current_repodata.json"
+            )),
+        )
+        .await;
+        rig.cleanup().await;
+
+        for ((file, upstream), (status, body, _)) in documents.iter().zip(&served) {
+            assert_eq!(*status, StatusCode::OK, "{file}");
+            assert_eq!(&body[..], &upstream[..], "{file} must be upstream's bytes");
+        }
+        for ((file, _), (status, body, _)) in documents.iter().zip(&missing) {
+            assert_eq!(
+                *status,
+                StatusCode::NOT_FOUND,
+                "{file}: an upstream 404 passes through, got {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(tok_status, StatusCode::OK);
+        assert_eq!(&tok_body[..], &documents[0].1[..], "token form proxies too");
+    }
+
+    /// #4708: hosted and virtual channels have no local hotfix instructions,
+    /// so `patch_instructions.json` answers 404 rather than an empty document
+    /// that asserts "no patches". On main both answered 200 with the stub.
+    #[tokio::test]
+    async fn hosted_and_virtual_patch_instructions_are_404_4708() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let hosted_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.hosted_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+        let (h_status, _, _) = rig
+            .get(format!("/{hosted_key}/noarch/patch_instructions.json"))
+            .await;
+        let (v_status, _, _) = rig
+            .get(format!(
+                "/{}/noarch/patch_instructions.json",
+                rig.virtual_key
+            ))
+            .await;
+        rig.cleanup().await;
+        assert_eq!(h_status, StatusCode::NOT_FOUND, "hosted");
+        assert_eq!(v_status, StatusCode::NOT_FOUND, "virtual");
+    }
+
+    /// The current_repodata filter (conda-index's rule, #4708): every build of
+    /// the newest version per name in either archive format, plus the newest
+    /// records satisfying a dependency the kept records do not already
+    /// satisfy; dependencies on packages the document lacks add nothing;
+    /// records and other top-level keys pass through unchanged.
+    #[test]
+    fn current_repodata_keeps_newest_versions_and_their_unmet_dependencies_4708() {
+        let rec = |name: &str, version: &str, build: &str, depends: &[&str]| {
+            serde_json::json!({
+                "name": name, "version": version, "build": build, "depends": depends,
+            })
+        };
+        let doc = serde_json::json!({
+            "info": {"subdir": "linux-64"},
+            "packages": {
+                "python-3.12.1-h_0.tar.bz2": rec("python", "3.12.1", "h_0", &[]),
+                "python-3.11.9-h_0.tar.bz2": rec("python", "3.11.9", "h_0", &[]),
+                "python-3.10.0-h_0.tar.bz2": rec("python", "3.10.0", "h_0", &[]),
+                "app-2.0-py_0.tar.bz2": rec("app", "2.0", "py_0", &["python >=3.11,<3.12", "__glibc >=2.17", "libx"]),
+            },
+            "packages.conda": {
+                "app-2.0-py_0.conda": rec("app", "2.0", "py_0", &["python >=3.11,<3.12"]),
+                "app-2.0-py_1.conda": rec("app", "2.0", "py_1", &["python"]),
+                "app-1.0-py_0.conda": rec("app", "1.0", "py_0", &[]),
+                "tool-10.0a1-0.conda": rec("tool", "10.0a1", "0", &[]),
+                "tool-2.0-0.conda": rec("tool", "2.0", "0", &[]),
+                "libx-1.0-0.conda": rec("libx", "1.0", "0", &[]),
+                "libx-0.9-0.conda": rec("libx", "0.9", "0", &[]),
+            },
+            "removed": ["gone-1.0-0.conda"],
+            "repodata_version": 1,
+        });
+        let out = current_repodata::derive(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let keys = |m: &str| -> Vec<String> {
+            let mut k: Vec<String> = out[m].as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys("packages"),
+            vec![
+                "app-2.0-py_0.tar.bz2",
+                "python-3.11.9-h_0.tar.bz2",
+                "python-3.12.1-h_0.tar.bz2"
+            ],
+            "python 3.12 is newest; 3.11.9 is the newest that satisfies app's pin"
+        );
+        assert_eq!(
+            keys("packages.conda"),
+            vec![
+                "app-2.0-py_0.conda",
+                "app-2.0-py_1.conda",
+                "libx-1.0-0.conda",
+                "tool-10.0a1-0.conda",
+            ],
+            "every build of the newest version in both formats; 10.0a1 is newer than 2.0"
+        );
+        assert_eq!(out["removed"], doc["removed"]);
+        assert_eq!(out["repodata_version"], 1);
+        assert_eq!(out["info"], doc["info"]);
+        assert_eq!(
+            out["packages"]["python-3.11.9-h_0.tar.bz2"],
+            doc["packages"]["python-3.11.9-h_0.tar.bz2"]
+        );
+        assert!(current_repodata::derive(b"[]").is_err());
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -19339,6 +21085,76 @@ mod upload_subdir_tests {
             String::from_utf8_lossy(&post_body)
         );
         assert_eq!(paths, vec![format!("linux-64/{filename}")]);
+    }
+
+    /// #4709: a native publish to a hosted or staging channel writes one
+    /// `ARTIFACT_UPLOADED` row carrying the actor, the repository and the
+    /// conda coordinates.
+    #[tokio::test]
+    async fn native_publish_is_audited_with_conda_coordinates() {
+        for repo_type in ["local", "staging"] {
+            let Some(fx) = tdh::Fixture::setup(repo_type, "conda").await else {
+                return;
+            };
+            let filename = "acme-audited-2.1-h7_3.tar.bz2";
+            let package = v1_package_for("acme-audited", "2.1", "h7_3", "linux-64");
+            let (status, body) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(
+                    format!("/{}/linux-64/{filename}", fx.repo_key),
+                    Bytes::from(package),
+                ),
+            )
+            .await;
+            let artifact_id: Option<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("linux-64/{filename}"))
+            .fetch_optional(&fx.pool)
+            .await
+            .unwrap();
+            let (row, count) = match artifact_id {
+                Some(id) => (
+                    Some(tdh::audit_row_eventually(&fx.pool, id, "ARTIFACT_UPLOADED").await),
+                    tdh::audit_count(&fx.pool, id, "ARTIFACT_UPLOADED").await,
+                ),
+                None => (None, 0),
+            };
+            fx.teardown().await;
+
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{repo_type}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let tdh::AuditRow {
+                user_id, details, ..
+            } = row.expect("ARTIFACT_UPLOADED row");
+            assert_eq!(count, 1, "{repo_type}: exactly one upload row");
+            assert_eq!(user_id, Some(fx.user_id), "{repo_type}");
+            assert_eq!(details["repository"], fx.repo_key.as_str(), "{details}");
+            assert_eq!(details["repository_type"], repo_type, "{details}");
+            assert_eq!(details["path"], format!("linux-64/{filename}"));
+            assert!(
+                details["digest"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("sha256:")),
+                "{details}"
+            );
+            assert_eq!(
+                details["package"],
+                serde_json::json!({
+                    "name": "acme-audited",
+                    "version": "2.1",
+                    "build": "h7_3",
+                    "subdir": "linux-64",
+                    "filename": filename,
+                }),
+                "{repo_type}"
+            );
+        }
     }
 }
 
@@ -20370,6 +22186,7 @@ mod cep16_proxy_tests {
             created_at: None,
             repodata_revisions: Default::default(),
             channel_relations: None,
+            virtual_package_detectors: None,
         };
         let digests: Vec<(String, Vec<u8>)> = shards
             .iter()

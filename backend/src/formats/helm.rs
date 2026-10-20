@@ -191,11 +191,12 @@ impl HelmHandler {
     /// the entry-count cap bounds entry-count bombs. The matched entry is still
     /// read through the existing per-entry `MAX_METADATA_ENTRY_BYTES` cap.
     fn find_capped_chart_entry<R: Read>(reader: R, filename: &str) -> Result<Option<String>> {
-        use crate::util::bounded_archive::{budgeted, MAX_INGEST_ARCHIVE_ENTRIES};
+        use crate::util::bounded_archive::{budgeted, max_ingest_archive_entries};
 
         let gz = GzDecoder::new(reader);
         let mut archive = Archive::new(budgeted(gz));
 
+        let max_entries = max_ingest_archive_entries();
         let mut entries_seen: u64 = 0;
         for entry in archive
             .entries()
@@ -205,10 +206,10 @@ impl HelmHandler {
                 entry.map_err(|e| AppError::Validation(format!("Invalid chart entry: {}", e)))?;
 
             entries_seen += 1;
-            if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+            if entries_seen > max_entries {
                 return Err(AppError::Validation(format!(
                     "Chart package contains too many entries (> {}); refusing suspected decompression bomb",
-                    MAX_INGEST_ARCHIVE_ENTRIES
+                    max_entries
                 )));
             }
 

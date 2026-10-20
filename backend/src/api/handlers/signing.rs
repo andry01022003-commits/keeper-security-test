@@ -15,6 +15,9 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryFormat;
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::repository_service::RepositoryService;
 use crate::services::signing_service::{
     normalize_key_type, validate_key_spec, CreateKeyRequest, SigningService,
@@ -325,7 +328,16 @@ async fn revoke_key(
 ) -> Result<Json<serde_json::Value>> {
     require_signing_admin(&auth)?;
     let svc = signing_service(&state);
+    let key = svc.get_key(key_id).await?;
     svc.revoke_key(key_id, Some(auth.user_id)).await?;
+    audit_signing_key(
+        &state,
+        &auth,
+        AuditAction::SigningKeyRevoked,
+        &key,
+        serde_json::json!({}),
+    )
+    .await;
     Ok(Json(serde_json::json!({"revoked": true})))
 }
 
@@ -361,7 +373,19 @@ async fn rotate_key(
 ) -> Result<Json<SigningKeyPublic>> {
     require_signing_admin(&auth)?;
     let svc = signing_service(&state);
+    let old_key = svc.get_key(key_id).await?;
     let new_key = svc.rotate_key(key_id, Some(auth.user_id)).await?;
+    audit_signing_key(
+        &state,
+        &auth,
+        AuditAction::SigningKeyRotated,
+        &old_key,
+        serde_json::json!({
+            "new_key_id": new_key.id,
+            "new_fingerprint": new_key.fingerprint,
+        }),
+    )
+    .await;
     Ok(Json(new_key))
 }
 
@@ -598,6 +622,37 @@ async fn sign_artifact(
         algorithm: signed.algorithm,
         signature_sha256: signed.signature_sha256,
     }))
+}
+
+/// Record a signing-key rotation or revocation (#4710), best-effort, against
+/// the key acted on. Identifies the key (id, name, type, algorithm,
+/// fingerprint, repository); never key material, public or private.
+async fn audit_signing_key(
+    state: &SharedState,
+    auth: &AuthExtension,
+    action: AuditAction,
+    key: &SigningKeyPublic,
+    extra: serde_json::Value,
+) {
+    let mut details = serde_json::json!({
+        "key_id": key.id,
+        "name": key.name,
+        "key_type": key.key_type,
+        "algorithm": key.algorithm,
+        "fingerprint": key.fingerprint,
+        "repository_id": key.repository_id,
+    });
+    if let (Some(map), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::for_principal(action, ResourceType::SigningKey, auth)
+            .resource(key.id)
+            .resource_name(key.name.clone())
+            .details(details),
+    )
+    .await;
 }
 
 /// Admin gate shared by the signing-key/repo-config mutation handlers.
@@ -1509,5 +1564,85 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, member).await;
         tdh::cleanup_user(&pool, outsider).await;
+    }
+
+    /// #4710: rotating and revoking a signing key each write one audit row
+    /// naming the admin and the key (id, algorithm, fingerprint), never key
+    /// material.
+    #[tokio::test]
+    async fn test_rotate_and_revoke_are_audited() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let mut admin = admin_jwt();
+        admin.user_id = user_id;
+        let sdir = std::env::temp_dir().join(format!("sk4710-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let payload = CreateKeyPayload {
+            repository_id: Some(repo_id),
+            name: format!("k4710-{}", &Uuid::new_v4().to_string()[..8]),
+            key_type: Some("rsa".to_string()),
+            algorithm: Some("rsa2048".to_string()),
+            uid_name: None,
+            uid_email: None,
+        };
+        let created = create_key(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Json(payload),
+        )
+        .await
+        .expect("create key")
+        .0;
+
+        let rotated = rotate_key(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path(created.id),
+        )
+        .await
+        .expect("rotate key")
+        .0;
+        let revoked = revoke_key(State(state.clone()), Extension(admin), Path(rotated.id)).await;
+        let rotate_row = tdh::audit_row_eventually(&pool, created.id, "SIGNING_KEY_ROTATED").await;
+        let revoke_row = tdh::audit_row_eventually(&pool, rotated.id, "SIGNING_KEY_REVOKED").await;
+
+        for sql in [
+            "DELETE FROM repository_signing_config WHERE repository_id = $1",
+            "DELETE FROM signing_keys WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(repo_id).execute(&pool).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(revoked.is_ok(), "revoke must succeed: {revoked:?}");
+        assert_eq!(rotate_row.user_id, Some(user_id));
+        assert_eq!(rotate_row.resource_type, "signing_key");
+        assert_eq!(rotate_row.details["key_id"], created.id.to_string());
+        assert_eq!(rotate_row.details["new_key_id"], rotated.id.to_string());
+        assert_eq!(rotate_row.details["algorithm"], created.algorithm.as_str());
+        assert_eq!(revoke_row.user_id, Some(user_id));
+        assert_eq!(revoke_row.details["key_id"], rotated.id.to_string());
+        assert_eq!(
+            revoke_row.details["fingerprint"],
+            json_or_null(&rotated.fingerprint)
+        );
+        for row in [&rotate_row, &revoke_row] {
+            let text = row.details.to_string();
+            assert!(
+                !text.contains("BEGIN"),
+                "a signing-key audit row must not carry key material: {text}"
+            );
+        }
+    }
+
+    fn json_or_null(value: &Option<String>) -> serde_json::Value {
+        value
+            .as_deref()
+            .map_or(serde_json::Value::Null, serde_json::Value::from)
     }
 }

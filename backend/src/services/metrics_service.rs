@@ -46,16 +46,224 @@ pub fn init_metrics() -> PrometheusHandle {
         .expect("failed to install Prometheus recorder")
 }
 
-/// Record an artifact upload event.
+/// Count one HTTP connection closed because the client did not deliver a
+/// complete request head within `HTTP_HEADER_READ_TIMEOUT_SECS` (#4665): a
+/// slow or stalled client, the slow-loris shape. Idle keep-alive connections
+/// closed by the same timer are not counted.
+pub fn record_http_header_read_timeout() {
+    counter!("ak_http_header_read_timeouts_total").increment(1);
+}
+
+/// Count one database pool connection failure (#4549), labelled by `stage`:
+///
+///   * `startup` — an initial pool-connect attempt failed at boot: Postgres
+///     refusing sessions (`FATAL: sorry, too many clients already` seen from
+///     this side as a connect error) or the attempt hitting
+///     `DATABASE_ACQUIRE_TIMEOUT_SECS`. Each of the bounded startup retries
+///     increments once, so a refusal storm shows its shape before the process
+///     exits or recovers.
+///   * `request` — a pool acquire timed out while serving a request and the
+///     caller was answered `503 POOL_EXHAUSTED`.
+///
+/// The server-side `FATAL` lines themselves are only visible in the Postgres
+/// log: a pool growth attempt that fails is absorbed by sqlx's internal
+/// retry-until-acquire-timeout loop and leaves no other client-side trace.
+/// Together the two stages cover the two places #4549's saturation became
+/// visible — a replacement pod dying at startup and requests shedding load.
+pub fn record_db_pool_connection_failure(stage: &'static str) {
+    counter!("ak_db_pool_connection_failures_total", "stage" => stage.to_string()).increment(1);
+}
+
+/// Connections currently held open by the HTTP accept loop (#4676): every
+/// accepted TCP connection, from accept until hyper finishes with it,
+/// including idle keep-alive connections and ones still sending a request
+/// head. A slow-connection hold shows as this gauge climbing while request
+/// throughput does not.
+pub const HTTP_CONNECTIONS_OPEN_METRIC: &str = "ak_http_connections_open";
+
+/// Holds one unit of [`HTTP_CONNECTIONS_OPEN_METRIC`] for as long as it lives,
+/// so a connection task that ends any way (return, panic, cancellation)
+/// releases it.
+pub struct OpenConnectionGuard(());
+
+impl OpenConnectionGuard {
+    pub fn open() -> Self {
+        gauge!(HTTP_CONNECTIONS_OPEN_METRIC).increment(1.0);
+        Self(())
+    }
+}
+
+impl Drop for OpenConnectionGuard {
+    fn drop(&mut self) {
+        gauge!(HTTP_CONNECTIONS_OPEN_METRIC).decrement(1.0);
+    }
+}
+
+/// Count one request refused with 429 by a rate limiter (#4676). `limiter` is
+/// the limiter's fixed name (`login`, `login_global`, `token`, `auth`, `api`,
+/// `search`, `presign`, `password_change`, `upload`, `proxy_rescan`), never a
+/// key, user or address.
+pub fn record_rate_limit_rejection(limiter: &'static str) {
+    counter!("ak_rate_limit_rejections_total", "limiter" => limiter).increment(1);
+}
+
+/// Count one outbound URL refused by the SSRF guard (#4676), by the bounded
+/// surface that asked: `upstream`, `webhook`, `sso`, `ldap`, `plugin`,
+/// `peer`, `internal`. Recorded beside [`record_outbound_url_blocked`], whose
+/// `label` is the caller's free-text field name; this one is the series to
+/// alert on.
+pub fn record_ssrf_block(surface: &'static str) {
+    counter!("ak_ssrf_blocks_total", "surface" => surface).increment(1);
+}
+
+/// Where a rejected credential was presented, for `ak_auth_failures_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureSurface {
+    /// `POST /api/v1/auth/login`, and a Bearer JWT, API token or `X-API-Key`
+    /// presented to any HTTP route.
+    Api,
+    /// HTTP Basic `username:password` presented to any HTTP route.
+    Basic,
+    /// The OCI credential exchange, `/v2/token`.
+    V2Token,
+    /// The CI OIDC token exchange, `POST /api/v1/auth/ci/token`.
+    CiOidc,
+    /// OIDC, SAML and LDAP sign-in.
+    Sso,
+}
+
+impl AuthFailureSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Basic => "basic",
+            Self::V2Token => "v2_token",
+            Self::CiOidc => "ci_oidc",
+            Self::Sso => "sso",
+        }
+    }
+}
+
+/// Why a credential was rejected, bucketed for `ak_auth_failures_total`. A
+/// closed set so no username, token or message text can become a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureReason {
+    /// Wrong password for an account that can sign in locally (or a rejected
+    /// LDAP bind).
+    BadPassword,
+    /// No account that can sign in with a password: unknown or inactive
+    /// username, a federated account, or one with no stored password.
+    UnknownUser,
+    /// A token or assertion past its expiry.
+    Expired,
+    /// A wrong password against an account whose lockout is in force.
+    Lockout,
+    /// A token, assertion or header that did not validate.
+    InvalidToken,
+    /// A valid assertion that no policy admits (no CI OIDC mapping matches,
+    /// or the identity provider's user is refused by the provider's rules).
+    Scope,
+}
+
+impl AuthFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BadPassword => "bad_password",
+            Self::UnknownUser => "unknown_user",
+            Self::Expired => "expired",
+            Self::Lockout => "lockout",
+            Self::InvalidToken => "invalid_token",
+            Self::Scope => "scope",
+        }
+    }
+
+    /// Bucket a rejected token's error: `Expired` when the validator said it
+    /// had expired (`jsonwebtoken`'s `ExpiredSignature`, "API token expired",
+    /// an expired SAML assertion), otherwise `fallback`. A message that does
+    /// not commit either way ("Invalid or expired SSO state") is `fallback`.
+    pub fn for_token_error(err: &crate::error::AppError, fallback: Self) -> Self {
+        let message = err.to_string().to_ascii_lowercase();
+        if message.contains("expired") && !message.contains("invalid or expired") {
+            Self::Expired
+        } else {
+            fallback
+        }
+    }
+
+    /// Bucket a local password rejection by the reason its audit event
+    /// records (`auth_service::LoginFailure::reason`).
+    pub fn for_login_audit_reason(reason: &str) -> Self {
+        match reason {
+            "invalid_password" => Self::BadPassword,
+            "account_locked" => Self::Lockout,
+            _ => Self::UnknownUser,
+        }
+    }
+}
+
+/// Count one rejected credential (#4676). Only a presented credential that
+/// failed counts: a request with no credential at all, and a check that could
+/// not complete (a 503 for a database outage or the bcrypt cap), do not.
+pub fn record_auth_failure(surface: AuthFailureSurface, reason: AuthFailureReason) {
+    counter!(
+        "ak_auth_failures_total",
+        "surface" => surface.as_str(),
+        "reason" => reason.as_str(),
+    )
+    .increment(1);
+}
+
+/// [`record_auth_failure`] for an error a credential check returned, counted
+/// only when the error is a credential or policy refusal (`Authentication`,
+/// `Unauthorized`, `Authorization`), never for an outage or a malformed
+/// request.
+pub fn record_auth_failure_for_error(
+    surface: AuthFailureSurface,
+    err: &crate::error::AppError,
+    fallback: AuthFailureReason,
+) {
+    use crate::error::AppError;
+    if matches!(
+        err,
+        AppError::Authentication(_) | AppError::Unauthorized(_) | AppError::Authorization(_)
+    ) {
+        record_auth_failure(surface, AuthFailureReason::for_token_error(err, fallback));
+    }
+}
+
+/// Count one proxy-scan decision on a pull (#4676). `verdict` is what the
+/// pull was judged as (`clean`, `vulnerable`, `pending` for a first pull
+/// served before its scan, `inconclusive` for an over-cap object or a scan
+/// that could not finish); `action` is what was done with it (`served`,
+/// `blocked` 403, `locked` 423, `recorded` for a record-only repository
+/// serving a vulnerable verdict). A vulnerable verdict below the
+/// repository's opted-in severity threshold is served as `clean`.
+pub fn record_proxy_scan_verdict(verdict: &'static str, action: &'static str) {
+    counter!(
+        "ak_proxy_scan_verdicts_total",
+        "verdict" => verdict,
+        "action" => action,
+    )
+    .increment(1);
+}
+
+/// Record one committed artifact upload: `ak_artifact_uploads_total` and the
+/// `ak_artifact_upload_size_bytes` histogram. Called from
+/// `scanner_service::trigger_scan_on_upload`, the post-commit step every
+/// upload path reaches (#4642). Labels are the repository key and format only,
+/// never an artifact name, so the series count stays bounded.
 pub fn record_artifact_upload(repo_key: &str, format: &str, size_bytes: u64) {
     counter!("ak_artifact_uploads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
     histogram!("ak_artifact_upload_size_bytes", "format" => format.to_string())
         .record(size_bytes as f64);
 }
 
-/// Record an artifact download event.
-pub fn record_artifact_download(repo_key: &str, format: &str) {
-    counter!("ak_artifact_downloads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
+/// Count `count` served artifact downloads in `ak_artifact_downloads_total`.
+/// Called by the download-event dispatcher once it has persisted the
+/// `download_statistics` rows (#4642), so the counter moves by the rows a
+/// flush wrote. Same bounded labels as [`record_artifact_upload`].
+pub fn record_artifact_downloads(repo_key: &str, format: &str, count: u64) {
+    counter!("ak_artifact_downloads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(count);
 }
 
 /// Record a proxy-cache lookup. `result` is a stable low-cardinality
@@ -126,6 +334,60 @@ pub fn set_conda_virtual_merge_inflight(merges: usize) {
 /// merges (fetch buffers, decoded member documents and merge output).
 pub fn set_conda_virtual_merge_bytes_reserved(bytes: usize) {
     gauge!("ak_conda_virtual_merge_bytes_reserved").set(bytes as f64);
+}
+
+/// Outcome of a CEP-27 publish attestation decision (#4711). `outcome` is one
+/// of [`CONDA_ATTESTATION_OUTCOMES`]; `repository` is the repository key.
+///
+/// * `verified`: an attestation PUT whose bundle verified, and was stored.
+/// * `failed`: an attestation PUT whose bundle did not verify, stored anyway
+///   because `CONDA_ATTESTATION_REQUIRE_VERIFIED` is explicitly off.
+/// * `rejected`: an attestation PUT whose bundle did not verify, refused
+///   because verification is required (the default).
+/// * `absent`: a hosted package upload, which carries no attestation of its
+///   own (CEP-27 attestations are attached afterwards by PUT).
+pub fn record_conda_attestation(repo_key: &str, outcome: &'static str) {
+    debug_assert!(CONDA_ATTESTATION_OUTCOMES.contains(&outcome));
+    counter!(
+        "ak_conda_attestation_total",
+        "repository" => repo_key.to_string(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+/// The bounded `outcome` label values of `ak_conda_attestation_total`.
+pub const CONDA_ATTESTATION_OUTCOMES: [&str; 4] = ["verified", "failed", "absent", "rejected"];
+
+/// Install scripts found in an uploaded conda package's payload (#4711).
+/// `kind` is the conda hook the script implements (`pre-link`, `post-link`,
+/// `pre-unlink`), as `conda_scripts::classify_script_path` classifies it.
+pub fn record_conda_install_script_findings(repo_key: &str, kind: &'static str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!(
+        "ak_conda_install_script_findings_total",
+        "repository" => repo_key.to_string(),
+        "kind" => kind,
+    )
+    .increment(count);
+}
+
+/// Remote records a virtual conda channel's package allowlist (#4576)
+/// dropped from one merge, per remote member (#4711). `repository` is the
+/// virtual repository's key and `member` the remote member's key. Counted
+/// once per merge, so cached and single-flighted requests add nothing.
+pub fn record_conda_allowlist_dropped(virtual_repo_key: &str, member: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!(
+        "ak_conda_allowlist_dropped_total",
+        "repository" => virtual_repo_key.to_string(),
+        "member" => member.to_string(),
+    )
+    .increment(count);
 }
 
 /// Record a lookup against the npm attestation negative cache (#3764),
@@ -439,6 +701,90 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
     .increment(1);
 }
 
+/// Record a proxy serve that kept a cached body because upstream answered a
+/// definitive 404/410 and the repository's `on_upstream_not_found` policy is
+/// `keep` (#4640). The counter is the observable signal that a served body no
+/// longer exists upstream, so an operator can list (and evict) content that is
+/// being kept past its upstream life.
+pub fn record_proxy_kept_on_upstream_not_found(repo_key: &str) {
+    counter!(
+        "ak_proxy_kept_on_upstream_not_found_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
+/// Counters recorded while a test ran, as `(name, labels, value)`; read one
+/// with [`CounterCapture::get`].
+#[cfg(test)]
+pub(crate) struct CounterCapture(Vec<CapturedCounter>);
+
+/// One captured counter series: name, labels, value.
+#[cfg(test)]
+type CapturedCounter = (String, Vec<(String, String)>, u64);
+
+#[cfg(test)]
+impl CounterCapture {
+    /// The sum of every `name` series whose labels include all of `labels`.
+    pub(crate) fn get(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        self.0
+            .iter()
+            .filter(|(n, ls, _)| {
+                n == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| ls.iter().any(|(lk, lv)| lk == k && lv == v))
+            })
+            .map(|(_, _, v)| *v)
+            .sum()
+    }
+}
+
+/// Run `f` against a thread-local debugging recorder and return what it
+/// counted. Async work must run inside `f` on a current-thread runtime, so
+/// the increments happen on this thread.
+#[cfg(test)]
+pub(crate) fn capture_counters<R>(f: impl FnOnce() -> R) -> (R, CounterCapture) {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, f);
+    let counters = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(ck, _, _, value)| match value {
+            DebugValue::Counter(v) => {
+                let key = ck.key();
+                Some((
+                    key.name().to_string(),
+                    key.labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect(),
+                    v,
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    (out, CounterCapture(counters))
+}
+
+/// Run an async test body on a current-thread runtime under
+/// [`capture_counters`].
+#[cfg(test)]
+pub(crate) fn capture_counters_async<F: std::future::Future>(
+    f: impl FnOnce() -> F,
+) -> (F::Output, CounterCapture) {
+    capture_counters(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(f())
+    })
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
@@ -508,6 +854,146 @@ mod tests {
         assert!(b.windows(2).all(|w| w[0] < w[1]));
     }
 
+    /// #4711: the conda counters carry only bounded labels, and a zero
+    /// count creates no series.
+    #[test]
+    fn test_conda_security_counters_record_bounded_labels_4711() {
+        let ((), c) = capture_counters(|| {
+            for outcome in CONDA_ATTESTATION_OUTCOMES {
+                record_conda_attestation("local", outcome);
+            }
+            record_conda_install_script_findings("local", "post-link", 2);
+            record_conda_install_script_findings("local", "pre-link", 0);
+            record_conda_allowlist_dropped("virt", "remote-a", 5);
+            record_conda_allowlist_dropped("virt", "remote-b", 0);
+        });
+        for outcome in CONDA_ATTESTATION_OUTCOMES {
+            assert_eq!(
+                c.get(
+                    "ak_conda_attestation_total",
+                    &[("repository", "local"), ("outcome", outcome)]
+                ),
+                1
+            );
+        }
+        assert_eq!(
+            c.get(
+                "ak_conda_install_script_findings_total",
+                &[("repository", "local"), ("kind", "post-link")]
+            ),
+            2
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_install_script_findings_total",
+                &[("kind", "pre-link")]
+            ),
+            0
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("repository", "virt"), ("member", "remote-a")]
+            ),
+            5
+        );
+        assert_eq!(
+            c.get(
+                "ak_conda_allowlist_dropped_total",
+                &[("member", "remote-b")]
+            ),
+            0
+        );
+    }
+
+    /// #4676: auth-failure reasons come from a closed set; message text only
+    /// ever selects between them.
+    #[test]
+    fn test_auth_failure_reason_bucketing_4676() {
+        use crate::error::AppError;
+        let expired = [
+            AppError::Authentication("Invalid token: ExpiredSignature".into()),
+            AppError::Authentication("API token expired".into()),
+            AppError::Authentication("Assertion has expired".into()),
+            AppError::Authentication("CI JWT validation failed: ExpiredSignature".into()),
+        ];
+        for err in expired {
+            assert_eq!(
+                AuthFailureReason::for_token_error(&err, AuthFailureReason::InvalidToken),
+                AuthFailureReason::Expired,
+                "{err}"
+            );
+        }
+        for err in [
+            AppError::Authentication("Invalid token: InvalidSignature".into()),
+            AppError::Authentication("Invalid or expired SSO state".into()),
+            AppError::Unauthorized("Token has been revoked".into()),
+        ] {
+            assert_eq!(
+                AuthFailureReason::for_token_error(&err, AuthFailureReason::InvalidToken),
+                AuthFailureReason::InvalidToken,
+                "{err}"
+            );
+        }
+        assert_eq!(
+            AuthFailureReason::for_login_audit_reason("invalid_password"),
+            AuthFailureReason::BadPassword
+        );
+        assert_eq!(
+            AuthFailureReason::for_login_audit_reason("account_locked"),
+            AuthFailureReason::Lockout
+        );
+        for reason in [
+            "unknown_or_inactive_user",
+            "federated_account",
+            "no_password_hash",
+        ] {
+            assert_eq!(
+                AuthFailureReason::for_login_audit_reason(reason),
+                AuthFailureReason::UnknownUser
+            );
+        }
+    }
+
+    /// #4676: only a credential or policy refusal counts; an outage or a
+    /// malformed request does not.
+    #[test]
+    fn test_auth_failure_for_error_counts_only_refusals_4676() {
+        use crate::error::AppError;
+        let ((), c) = capture_counters(|| {
+            for err in [
+                AppError::Authentication("Invalid token: ExpiredSignature".into()),
+                AppError::Unauthorized("Token has been revoked".into()),
+                AppError::Authorization("no automatic account creation".into()),
+                AppError::Database("connection refused".into()),
+                AppError::ServiceUnavailable("at capacity".into()),
+                AppError::Validation("Invalid request body".into()),
+                AppError::Internal("JWKS fetch failed".into()),
+            ] {
+                record_auth_failure_for_error(
+                    AuthFailureSurface::Sso,
+                    &err,
+                    AuthFailureReason::Scope,
+                );
+            }
+        });
+        assert_eq!(
+            c.get(
+                "ak_auth_failures_total",
+                &[("surface", "sso"), ("reason", "expired")]
+            ),
+            1
+        );
+        assert_eq!(
+            c.get(
+                "ak_auth_failures_total",
+                &[("surface", "sso"), ("reason", "scope")]
+            ),
+            2
+        );
+        assert_eq!(c.get("ak_auth_failures_total", &[]), 3);
+    }
+
     #[test]
     fn test_record_artifact_upload_does_not_panic() {
         // Metrics macros are no-ops when no recorder is installed.
@@ -515,8 +1001,8 @@ mod tests {
     }
 
     #[test]
-    fn test_record_artifact_download_does_not_panic() {
-        record_artifact_download("my-repo", "npm");
+    fn test_record_artifact_downloads_does_not_panic() {
+        record_artifact_downloads("my-repo", "npm", 3);
     }
 
     #[test]

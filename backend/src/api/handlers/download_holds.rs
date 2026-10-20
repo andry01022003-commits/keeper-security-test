@@ -11,8 +11,7 @@ use uuid::Uuid;
 use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::{AppError, Result};
-use crate::models::access_scope::AccessScope;
+use crate::error::Result;
 use crate::services::download_holds_service::{
     classify_hold, parse_hold_kinds, remaining_seconds, DownloadHoldsService, HoldKind,
     QuarantineHoldRow,
@@ -77,13 +76,7 @@ pub struct QuarantineHoldListResponse {
 /// repository A must not read repository B's holds with it, so such tokens
 /// are refused outright rather than silently narrowed.
 fn require_queue_admin(auth: &AuthExtension) -> Result<()> {
-    auth.require_admin()?;
-    if matches!(auth.allowed_repo_ids, AccessScope::Restricted(_)) {
-        return Err(AppError::Authorization(
-            "Repository-scoped tokens cannot read the admin hold queues".into(),
-        ));
-    }
-    Ok(())
+    auth.require_unscoped_admin("the admin hold queues")
 }
 
 fn svc(state: &SharedState) -> DownloadHoldsService {
@@ -188,6 +181,8 @@ pub struct DownloadHoldsApiDoc;
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::error::AppError;
+    use crate::models::access_scope::AccessScope;
     use uuid::Uuid;
 
     fn admin() -> AuthExtension {
@@ -662,104 +657,18 @@ mod tests {
 #[cfg(test)]
 mod router_tests {
     use crate::api::handlers::test_db_helpers as tdh;
-    use axum::http::StatusCode;
 
     const ROUTES: [&str; 2] = [
         "/api/v1/admin/holds/summary",
         "/api/v1/admin/holds/quarantine",
     ];
 
-    async fn status_for(
-        state: &crate::api::SharedState,
-        credential: Option<&str>,
-    ) -> Vec<StatusCode> {
-        let mut out = Vec::new();
-        for uri in ROUTES {
-            let mut req = tdh::get(uri.to_string());
-            if let Some(c) = credential {
-                req.headers_mut().insert(
-                    "authorization",
-                    c.parse::<axum::http::HeaderValue>().expect("auth header"),
-                );
-            }
-            let app = crate::api::routes::create_router(state.clone());
-            let (status, _) = tdh::send(app, req).await;
-            out.push(status);
-        }
-        out
-    }
-
     #[tokio::test]
     async fn hold_queues_gate_anonymous_non_admin_and_repo_scoped_admin_tokens() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
-        let (admin_id, _) = tdh::create_user(&fx.pool).await;
-        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
-            .bind(admin_id)
-            .execute(&fx.pool)
-            .await
-            .expect("promote admin");
-
-        let auth_service = crate::services::auth_service::AuthService::new(
-            fx.state.db.clone(),
-            std::sync::Arc::new(fx.state.config.clone()),
-        );
-        // Admin-owned API tokens carrying the `admin` scope: one unrestricted,
-        // one pinned to the fixture repository through `api_token_repositories`.
-        let (open_token, _) = auth_service
-            .generate_api_token(admin_id, "holds-open", vec!["admin".into()], None)
-            .await
-            .expect("mint unrestricted admin token");
-        let (pinned_token, pinned_id) = auth_service
-            .generate_api_token(admin_id, "holds-pinned", vec!["admin".into()], None)
-            .await
-            .expect("mint repo-scoped admin token");
-        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
-            .bind(pinned_id)
-            .bind(fx.repo_id)
-            .execute(&fx.pool)
-            .await
-            .expect("pin token to the fixture repository");
-        // A repository-scoped JWT for the same admin.
-        let admin_user =
-            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
-                .bind(admin_id)
-                .fetch_one(&fx.pool)
-                .await
-                .expect("load admin");
-        let scoped_jwt = auth_service
-            .generate_tokens_with_repo_scope(&admin_user, Some(vec![fx.repo_id]))
-            .expect("mint repo-scoped JWT")
-            .access_token;
-
-        let user_bearer = tdh::bearer_for(&fx.state, fx.user_id).await;
-        let admin_bearer = tdh::bearer_for(&fx.state, admin_id).await;
-
-        let anonymous = status_for(&fx.state, None).await;
-        let non_admin = status_for(&fx.state, Some(&user_bearer)).await;
-        let admin = status_for(&fx.state, Some(&admin_bearer)).await;
-        let open = status_for(&fx.state, Some(&format!("Bearer {open_token}"))).await;
-        let pinned = status_for(&fx.state, Some(&format!("Bearer {pinned_token}"))).await;
-        let scoped = status_for(&fx.state, Some(&format!("Bearer {scoped_jwt}"))).await;
-
-        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
-            .bind(admin_id)
-            .execute(&fx.pool)
-            .await;
-        tdh::cleanup_user(&fx.pool, admin_id).await;
+        tdh::assert_admin_routes_refuse_repo_scoped_tokens(&fx, &ROUTES).await;
         fx.teardown().await;
-
-        let all = |s: StatusCode| vec![s; ROUTES.len()];
-        assert_eq!(anonymous, all(StatusCode::UNAUTHORIZED), "anonymous");
-        assert_eq!(non_admin, all(StatusCode::FORBIDDEN), "non-admin JWT");
-        assert_eq!(admin, all(StatusCode::OK), "admin JWT");
-        assert_eq!(open, all(StatusCode::OK), "unrestricted admin API token");
-        assert_eq!(
-            pinned,
-            all(StatusCode::FORBIDDEN),
-            "repo-pinned admin API token"
-        );
-        assert_eq!(scoped, all(StatusCode::FORBIDDEN), "repo-scoped admin JWT");
     }
 }

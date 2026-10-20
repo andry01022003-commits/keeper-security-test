@@ -197,3 +197,32 @@ policies can still be previewed but cannot be executed live. Scheduled execution
 and execute-all skip unassigned policies. OCI cleanup uses only the same concrete
 repositories selected for execution, including recovery of previously stale
 soft-deleted references in those repositories.
+
+### Preview before assigning is not enough for a new policy
+
+A policy with no `cron_schedule` and no `last_run_at` is due on the very next
+scheduler tick: the default six-hour cadence treats "never run" as due
+immediately. Assigning an already-enabled policy to a Remote repository
+therefore makes it eligible to evict proxy-cache entries at once, so a preview
+read afterwards can arrive after the eviction it was meant to show. "Run a
+preview first" is correct for the artifact policies it was written for, but a
+Remote proxy-cache eviction can win the race.
+
+Create disabled, preview, then enable:
+
+1. Create the policy with `"enabled": false`, optionally together with its
+   `repository_ids` in the same `POST /api/v1/admin/lifecycle`. It is not
+   eligible for a scheduled run yet.
+2. `POST /api/v1/admin/lifecycle/{id}/preview` and read
+   `proxy_cache.entries_matched` / `entries_removed`. A disabled policy can
+   still be previewed.
+3. `PATCH /api/v1/admin/lifecycle/{id}` with `{"enabled": true}` once the
+   preview matches what you intend to reclaim.
+
+A `cron_schedule` does not avoid this. A never-run policy is due immediately
+even when it has one — the scheduler treats a null `last_run_at` as due,
+whichever path computes it — and a cron schedule is recurring, not a one-shot
+delay, so it cannot be used to schedule a single future run. Creating the
+policy disabled is the only reliable order. This is what the changelog's
+"preview before assigning" (#3734) should have said for a Remote proxy cache,
+and what the repository UI should follow.
