@@ -164,6 +164,7 @@ impl AuditAction {
             | AuditAction::SsoProviderDisabled
             | AuditAction::SigningKeyRotated
             | AuditAction::SigningKeyRevoked
+            | AuditAction::SigningKeyTrustAttested
             | AuditAction::WebhookCreated
             | AuditAction::WebhookUpdated
             | AuditAction::WebhookDeleted

@@ -150,6 +150,7 @@ such as `credential_replaced` or `secret_rotated`.
 | `SSO_PROVIDER_ENABLED` / `_DISABLED` | `sso_provider` | `provider_type`, `name`, `is_enabled` |
 | `SIGNING_KEY_ROTATED` | `signing_key` (the old key) | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id`, `new_key_id`, `new_fingerprint` |
 | `SIGNING_KEY_REVOKED` | `signing_key` | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id` |
+| `SIGNING_KEY_TRUST_ATTESTED` | `signing_key` | `key_id`, `name`, `key_type`, `algorithm`, `fingerprint`, `repository_id`, `issuer_fingerprint`, `issuer_name`, `verification_status` |
 | `WEBHOOK_CREATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `signing_mode`, `signed` |
 | `WEBHOOK_UPDATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `is_enabled` (written by enable and disable) |
 | `WEBHOOK_DELETED` | `webhook` | `name`, `url`, `events`, `repository_id` |

@@ -213,6 +213,8 @@ fn openpgp_signature_hash(algorithm: PublicKeyAlgorithm) -> HashAlgorithm {
 }
 
 const MIN_ATTESTATION_RSA_BITS: usize = 2048;
+/// Matches `signing_key_trust_attestations.issuer_name VARCHAR(255)`.
+const MAX_ATTESTATION_ISSUER_NAME_CHARS: usize = 255;
 
 fn mpi_bit_len(n: &pgp::types::Mpi) -> usize {
     let bytes = n.as_bytes();
@@ -1285,6 +1287,13 @@ created_at:{created_at}\n",
             return Err(AppError::Validation(
                 "Cannot attest a revoked or inactive signing key".to_string(),
             ));
+        }
+        if let Some(name) = req.issuer_name.as_deref() {
+            if name.chars().count() > MAX_ATTESTATION_ISSUER_NAME_CHARS {
+                return Err(AppError::Validation(format!(
+                    "issuer_name must be at most {MAX_ATTESTATION_ISSUER_NAME_CHARS} characters"
+                )));
+            }
         }
         let payload = Self::signing_key_attestation_payload(&key);
 

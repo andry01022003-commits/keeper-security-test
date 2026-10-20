@@ -182,6 +182,9 @@ pub enum AuditAction {
     /// A signing key was rotated (a successor generated) or revoked.
     SigningKeyRotated,
     SigningKeyRevoked,
+    /// An out-of-band issuer signature over a signing key was verified and
+    /// recorded (#4282). A cryptographic check, not a trust-anchor decision.
+    SigningKeyTrustAttested,
     /// An outbound webhook was created, updated (enabled / disabled), deleted,
     /// or had its signing secret rotated.
     WebhookCreated,
@@ -303,6 +306,7 @@ impl AuditAction {
             AuditAction::SsoProviderDisabled => "SSO_PROVIDER_DISABLED",
             AuditAction::SigningKeyRotated => "SIGNING_KEY_ROTATED",
             AuditAction::SigningKeyRevoked => "SIGNING_KEY_REVOKED",
+            AuditAction::SigningKeyTrustAttested => "SIGNING_KEY_TRUST_ATTESTED",
             AuditAction::WebhookCreated => "WEBHOOK_CREATED",
             AuditAction::WebhookUpdated => "WEBHOOK_UPDATED",
             AuditAction::WebhookDeleted => "WEBHOOK_DELETED",
@@ -1628,6 +1632,11 @@ mod tests {
             (
                 AuditAction::SigningKeyRevoked,
                 "SIGNING_KEY_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::SigningKeyTrustAttested,
+                "SIGNING_KEY_TRUST_ATTESTED",
                 Outcome::Success,
             ),
             (

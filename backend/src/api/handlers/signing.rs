@@ -534,6 +534,7 @@ async fn verify_key_trust_attestation(
 ) -> Result<Json<SigningKeyTrustAttestation>> {
     require_signing_admin(&auth)?;
     let svc = signing_service(&state);
+    let key = svc.get_key(key_id).await?;
     let attestation = svc
         .verify_and_store_trust_attestation(VerifyTrustAttestationRequest {
             signing_key_id: key_id,
@@ -543,6 +544,18 @@ async fn verify_key_trust_attestation(
             created_by: Some(auth.user_id),
         })
         .await?;
+    audit_signing_key(
+        &state,
+        &auth,
+        AuditAction::SigningKeyTrustAttested,
+        &key,
+        serde_json::json!({
+            "issuer_fingerprint": attestation.issuer_fingerprint,
+            "issuer_name": attestation.issuer_name,
+            "verification_status": attestation.verification_status,
+        }),
+    )
+    .await;
     Ok(Json(attestation))
 }
 
@@ -1778,6 +1791,108 @@ mod tests {
                 "a signing-key audit row must not carry key material: {text}"
             );
         }
+    }
+
+    /// #4282: verifying a trust attestation through the handler stores it,
+    /// writes one SIGNING_KEY_TRUST_ATTESTED audit row naming the admin and
+    /// the issuer fingerprint, and refuses an over-long issuer name with a
+    /// validation error instead of a database error.
+    #[tokio::test]
+    async fn test_verify_trust_attestation_is_audited() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let mut admin = admin_jwt();
+        admin.user_id = user_id;
+        let sdir = std::env::temp_dir().join(format!("sk4282-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+        let svc = signing_service(&state);
+        let mk = |name: &str| CreateKeyRequest {
+            repository_id: Some(repo_id),
+            name: format!("{name}-{}", &Uuid::new_v4().to_string()[..8]),
+            key_type: "gpg".to_string(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: Some("AK 4282".to_string()),
+            uid_email: None,
+            created_by: None,
+        };
+        let target = svc
+            .create_key(mk("k4282-target"))
+            .await
+            .expect("target key");
+        let issuer = svc
+            .create_key(mk("k4282-issuer"))
+            .await
+            .expect("issuer key");
+        let issuer_full: crate::models::signing_key::SigningKey =
+            sqlx::query_as("SELECT * FROM signing_keys WHERE id = $1")
+                .bind(issuer.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load issuer key");
+        let challenge = svc
+            .get_trust_attestation_challenge(target.id)
+            .await
+            .expect("challenge");
+        let signature = svc
+            .sign_openpgp_detached_with_key(&issuer_full, challenge.payload.as_bytes())
+            .await
+            .expect("issuer signature");
+
+        let too_long = verify_key_trust_attestation(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path(target.id),
+            Json(VerifyTrustAttestationPayload {
+                issuer_name: Some("x".repeat(256)),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature.clone(),
+            }),
+        )
+        .await;
+        let stored = verify_key_trust_attestation(
+            State(state.clone()),
+            Extension(admin),
+            Path(target.id),
+            Json(VerifyTrustAttestationPayload {
+                issuer_name: Some("offline-root".to_string()),
+                issuer_public_key_armored: issuer.public_key_pem.clone(),
+                signature_armored: signature,
+            }),
+        )
+        .await;
+        let row = tdh::audit_row_eventually(&pool, target.id, "SIGNING_KEY_TRUST_ATTESTED").await;
+
+        for sql in [
+            "DELETE FROM repository_signing_config WHERE repository_id = $1",
+            "DELETE FROM signing_keys WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(repo_id).execute(&pool).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            matches!(too_long, Err(AppError::Validation(_))),
+            "an over-long issuer_name is a validation error: {too_long:?}"
+        );
+        let stored = stored.expect("verify attestation").0;
+        assert_eq!(stored.verification_status, "signature_valid");
+        assert_eq!(row.user_id, Some(user_id));
+        assert_eq!(row.resource_type, "signing_key");
+        assert_eq!(row.details["key_id"], target.id.to_string());
+        assert_eq!(
+            row.details["issuer_fingerprint"],
+            stored.issuer_fingerprint.as_str()
+        );
+        assert_eq!(row.details["issuer_name"], "offline-root");
+        assert!(
+            !row.details.to_string().contains("BEGIN"),
+            "the attestation audit row must not carry key material"
+        );
     }
 
     fn json_or_null(value: &Option<String>) -> serde_json::Value {
