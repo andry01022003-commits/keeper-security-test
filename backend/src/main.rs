@@ -503,6 +503,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             String,
             Arc<dyn artifact_keeper_backend::storage::StorageBackend>,
         > = HashMap::new();
+        // A backend that was configured but could not be initialized is
+        // recorded here as well as logged, so a repository on it answers a
+        // 503 naming the backend instead of a bare 500 STORAGE_ERROR (#4530).
+        let mut skipped_backends: HashMap<String, String> = HashMap::new();
 
         // Register the primary backend under its type name if it is not filesystem
         if config.storage_backend != "filesystem" {
@@ -521,7 +525,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 // case and stays silent; a malformed public endpoint is an
                 // operator mistake worth surfacing (#4417).
                 Err(e) if e.to_string().contains("S3_PUBLIC_ENDPOINT") => {
-                    tracing::warn!(error = %e, "Additional S3 storage backend skipped");
+                    // ERROR rather than WARN: the backend is dead until the
+                    // operator fixes its configuration, so it must be
+                    // distinguishable from a cosmetic warning (#4530).
+                    tracing::error!(error = %e, "Additional S3 storage backend skipped");
+                    skipped_backends.insert("s3".to_string(), e.to_string());
                 }
                 Err(_) => {}
             }
@@ -529,27 +537,51 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         if config.storage_backend != "azure" {
             match artifact_keeper_backend::storage::azure::AzureConfig::from_env() {
                 Ok(azure_cfg) => {
-                    if let Ok(azure) =
-                        artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
+                    match artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg)
+                        .await
                     {
-                        tracing::info!("Additional Azure storage backend registered");
-                        backends.insert("azure".to_string(), Arc::new(azure));
+                        Ok(azure) => {
+                            tracing::info!("Additional Azure storage backend registered");
+                            backends.insert("azure".to_string(), Arc::new(azure));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Additional Azure storage backend skipped"
+                            );
+                            skipped_backends.insert("azure".to_string(), e.to_string());
+                        }
                     }
                 }
                 Err(e) if e.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT") => {
-                    tracing::warn!(error = %e, "Additional Azure storage backend skipped");
+                    tracing::error!(error = %e, "Additional Azure storage backend skipped");
+                    skipped_backends.insert("azure".to_string(), e.to_string());
                 }
                 Err(_) => {}
             }
         }
         if config.storage_backend != "gcs" {
-            if let Ok(gcs_cfg) = artifact_keeper_backend::storage::gcs::GcsConfig::from_env() {
-                if let Ok(gcs) =
-                    artifact_keeper_backend::storage::gcs::GcsBackend::new(gcs_cfg).await
-                {
-                    tracing::info!("Additional GCS storage backend registered");
-                    backends.insert("gcs".to_string(), Arc::new(gcs));
+            match artifact_keeper_backend::storage::gcs::GcsConfig::from_env() {
+                Ok(gcs_cfg) => {
+                    match artifact_keeper_backend::storage::gcs::GcsBackend::new(gcs_cfg).await {
+                        Ok(gcs) => {
+                            tracing::info!("Additional GCS storage backend registered");
+                            backends.insert("gcs".to_string(), Arc::new(gcs));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Additional GCS storage backend skipped");
+                            skipped_backends.insert("gcs".to_string(), e.to_string());
+                        }
+                    }
                 }
+                // `GCS_BUCKET not set` is the ordinary "not configured" case
+                // and stays silent; any other configuration error means the
+                // operator asked for GCS and its configuration is broken.
+                Err(e) if !e.to_string().contains("GCS_BUCKET not set") => {
+                    tracing::error!(error = %e, "Additional GCS storage backend skipped");
+                    skipped_backends.insert("gcs".to_string(), e.to_string());
+                }
+                Err(_) => {}
             }
         }
 
@@ -559,19 +591,34 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             names
         };
         tracing::info!("Storage backends available: {:?}", available);
+        if !skipped_backends.is_empty() {
+            let mut skipped: Vec<String> = skipped_backends.keys().cloned().collect();
+            skipped.sort();
+            // The metric is a gauge because the set is fixed for the process
+            // lifetime: a scrape either sees 0 (everything configured works)
+            // or the number of dead backends to alert on (#4530).
+            metrics::gauge!("ak_storage_backends_skipped").set(skipped.len() as f64);
+            tracing::error!(
+                skipped = ?skipped,
+                "Storage backends configured but skipped at startup; repositories on them will \
+                 answer 503 until the configuration is fixed (#4530)"
+            );
+        }
 
-        Arc::new(
-            artifact_keeper_backend::storage::StorageRegistry::new(
-                backends,
-                config.storage_backend.clone(),
-            )
-            // #3368: filesystem locations are rooted at the repository's own
-            // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
-            // writes through a handle rooted at `STORAGE_PATH`. Hand the
-            // registry the global root so reserved bucket-root namespaces
-            // resolve to the same file through either handle.
-            .with_filesystem_bucket_root(&config.storage_path),
+        let mut registry = artifact_keeper_backend::storage::StorageRegistry::new(
+            backends,
+            config.storage_backend.clone(),
         )
+        // #3368: filesystem locations are rooted at the repository's own
+        // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
+        // writes through a handle rooted at `STORAGE_PATH`. Hand the
+        // registry the global root so reserved bucket-root namespaces
+        // resolve to the same file through either handle.
+        .with_filesystem_bucket_root(&config.storage_path);
+        for (name, error) in skipped_backends {
+            registry.record_skipped_backend(name, error);
+        }
+        Arc::new(registry)
     };
 
     // One-shot backfill of oci_manifest_refs for index manifests that
