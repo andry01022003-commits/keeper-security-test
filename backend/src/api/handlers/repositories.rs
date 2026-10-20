@@ -12165,6 +12165,7 @@ async fn audit_upstream_auth_change(
                     auth_type,
                     credentials_changed,
                 )),
+                age_gate_change: None,
             }),
     )
     .await;
