@@ -254,7 +254,7 @@ pub fn legacy_vsix_metadata(publisher: &str, name: &str, version: &str) -> Resul
 
 /// `normalized_value` resolves only the five predefined XML entities, and an
 /// unresolvable reference yields `None`, as in `curation_sync`.
-fn vsix_attr(element: &BytesStart<'_>, key: &[u8]) -> Option<String> {
+fn vsix_attr(element: &BytesStart<'_>, key: &str) -> Option<String> {
     for attr in element.attributes().flatten() {
         if attr.key.as_ref() == key {
             return attr
@@ -283,17 +283,17 @@ pub fn parse_vsix_package_manifest(xml: &str) -> Result<VsixPackageManifest> {
             Ok(Event::Eof) => break,
             Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
                 match element.local_name().as_ref() {
-                    b"Identity" => {
+                    "Identity" => {
                         saw_identity = true;
                         // The gallery compares platforms casefolded.
-                        out.target_platform = vsix_text(vsix_attr(&element, b"TargetPlatform"))
+                        out.target_platform = vsix_text(vsix_attr(&element, "TargetPlatform"))
                             .map(|platform| platform.to_ascii_lowercase());
                     }
-                    b"Property"
-                        if vsix_attr(&element, b"Id").as_deref()
+                    "Property"
+                        if vsix_attr(&element, "Id").as_deref()
                             == Some(VSIX_PRERELEASE_PROPERTY) =>
                     {
-                        out.prerelease = vsix_attr(&element, b"Value")
+                        out.prerelease = vsix_attr(&element, "Value")
                             .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
                     }
                     _ => {}

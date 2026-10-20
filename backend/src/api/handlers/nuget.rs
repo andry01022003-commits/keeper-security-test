@@ -1500,21 +1500,21 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
         match reader.read_event() {
             Err(_) | Ok(Event::Eof) => break,
             Ok(Event::Start(element)) => match element.local_name().as_ref() {
-                b"entry" => current = Some(Current::default()),
-                b"title" => field = Some("id"),
-                b"Id" => field = Some("id"),
-                b"Version" => field = Some("version"),
-                b"Authors" => field = Some("authors"),
-                b"Description" => field = Some("description"),
-                b"PackageHash" => field = Some("hash"),
-                b"PackageSize" => field = Some("size"),
+                "entry" => current = Some(Current::default()),
+                "title" => field = Some("id"),
+                "Id" => field = Some("id"),
+                "Version" => field = Some("version"),
+                "Authors" => field = Some("authors"),
+                "Description" => field = Some("description"),
+                "PackageHash" => field = Some("hash"),
+                "PackageSize" => field = Some("size"),
                 _ => field = None,
             },
             Ok(Event::Text(text)) => {
                 let (Some(entry), Some(target)) = (current.as_mut(), field) else {
                     continue;
                 };
-                let Ok(value) = text.decode() else { continue };
+                let value: &str = &text;
                 let value = value.trim();
                 if value.is_empty() {
                     continue;
@@ -1532,7 +1532,7 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
             }
             Ok(Event::End(element)) => {
                 field = None;
-                if element.local_name().as_ref() == b"entry" {
+                if element.local_name().as_ref() == "entry" {
                     if let Some(entry) = current.take() {
                         if !entry.id.is_empty() && !entry.version.is_empty() {
                             entries.push(V2Entry {

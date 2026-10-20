@@ -208,9 +208,9 @@ pub struct SamlAssertion {
 /// Returns `None` if the attribute is not present.
 fn get_xml_attr(e: &quick_xml::events::BytesStart<'_>, attr_name: &str) -> Option<String> {
     e.attributes().flatten().find_map(|attr| {
-        let key = String::from_utf8_lossy(attr.key.as_ref());
+        let key: &str = attr.key.as_ref();
         if key == attr_name {
-            Some(String::from_utf8_lossy(&attr.value).to_string())
+            Some(attr.value.to_string())
         } else {
             None
         }
@@ -222,8 +222,8 @@ fn collect_xml_attrs(e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, Stri
     e.attributes()
         .flatten()
         .map(|attr| {
-            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-            let value = String::from_utf8_lossy(&attr.value).to_string();
+            let key = attr.key.as_ref().to_string();
+            let value = attr.value.to_string();
             (key, value)
         })
         .collect()
@@ -333,7 +333,7 @@ impl SamlResponseParser {
 
     /// Handle an `Event::Start` element.
     fn handle_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+        let name = e.local_name().as_ref().to_string();
         self.current_element = name.clone();
         // Start of a new element: reset the leaf-text accumulator so each
         // element's text is committed fresh on its own `End`.
@@ -363,7 +363,7 @@ impl SamlResponseParser {
 
     /// Handle an `Event::Empty` (self-closing) element.
     fn handle_empty(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+        let name = e.local_name().as_ref().to_string();
         match name.as_str() {
             "StatusCode" => self.handle_status_code(e),
             "AuthnStatement" => self.handle_authn_statement(e),
@@ -375,8 +375,8 @@ impl SamlResponseParser {
 
     /// Handle an `Event::Text` node.
     fn handle_text(&mut self, e: &quick_xml::events::BytesText<'_>) {
-        let raw = String::from_utf8_lossy(e.as_ref());
-        let text = unescape(&raw)
+        let raw: &str = e;
+        let text = unescape(raw)
             .map(|c| c.to_string())
             .unwrap_or_else(|_| raw.to_string());
 
@@ -394,7 +394,7 @@ impl SamlResponseParser {
 
     /// Handle an `Event::End` element.
     fn handle_end(&mut self, e: &quick_xml::events::BytesEnd<'_>) {
-        let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+        let name = e.local_name().as_ref().to_string();
         match name.as_str() {
             "Assertion" => {
                 self.in_assertion = false;

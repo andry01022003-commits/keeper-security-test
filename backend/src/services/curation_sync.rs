@@ -182,16 +182,16 @@ enum ListKind {
 }
 
 impl ListKind {
-    fn from_local(name: &[u8]) -> Option<Self> {
+    fn from_local(name: &str) -> Option<Self> {
         match name {
-            b"provides" => Some(Self::Provides),
-            b"requires" => Some(Self::Requires),
-            b"conflicts" => Some(Self::Conflicts),
-            b"obsoletes" => Some(Self::Obsoletes),
-            b"recommends" => Some(Self::Recommends),
-            b"suggests" => Some(Self::Suggests),
-            b"supplements" => Some(Self::Supplements),
-            b"enhances" => Some(Self::Enhances),
+            "provides" => Some(Self::Provides),
+            "requires" => Some(Self::Requires),
+            "conflicts" => Some(Self::Conflicts),
+            "obsoletes" => Some(Self::Obsoletes),
+            "recommends" => Some(Self::Recommends),
+            "suggests" => Some(Self::Suggests),
+            "supplements" => Some(Self::Supplements),
+            "enhances" => Some(Self::Enhances),
             _ => None,
         }
     }
@@ -340,9 +340,9 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
                 let local = local_name.as_ref();
 
                 match local {
-                    b"package" => {
+                    "package" => {
                         // Only capture rpm packages; a non-rpm `type` is ignored.
-                        let is_rpm = attr_value(&e, b"type").map(|t| t == "rpm").unwrap_or(true);
+                        let is_rpm = attr_value(&e, "type").map(|t| t == "rpm").unwrap_or(true);
                         if is_rpm {
                             pkg = Some(PkgBuilder::default());
                             pkg_start = pos;
@@ -353,78 +353,78 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
                         }
                     }
                     _ if pkg.is_none() => {}
-                    b"name" if !in_format => text_target = Some(TextTarget::Name),
-                    b"arch" => text_target = Some(TextTarget::Arch),
-                    b"summary" => text_target = Some(TextTarget::Summary),
-                    b"description" => text_target = Some(TextTarget::Description),
-                    b"packager" => text_target = Some(TextTarget::Packager),
-                    b"url" => text_target = Some(TextTarget::Url),
-                    b"version" if !in_format => {
+                    "name" if !in_format => text_target = Some(TextTarget::Name),
+                    "arch" => text_target = Some(TextTarget::Arch),
+                    "summary" => text_target = Some(TextTarget::Summary),
+                    "description" => text_target = Some(TextTarget::Description),
+                    "packager" => text_target = Some(TextTarget::Packager),
+                    "url" => text_target = Some(TextTarget::Url),
+                    "version" if !in_format => {
                         if let Some(p) = pkg.as_mut() {
-                            if let Some(v) = attr_value(&e, b"epoch") {
+                            if let Some(v) = attr_value(&e, "epoch") {
                                 p.epoch = v;
                             }
-                            if let Some(v) = attr_value(&e, b"ver") {
+                            if let Some(v) = attr_value(&e, "ver") {
                                 p.version = v;
                             }
-                            if let Some(v) = attr_value(&e, b"rel") {
+                            if let Some(v) = attr_value(&e, "rel") {
                                 p.release = v;
                             }
                         }
                     }
-                    b"checksum" => {
+                    "checksum" => {
                         if let Some(p) = pkg.as_mut() {
-                            if let Some(v) = attr_value(&e, b"type") {
+                            if let Some(v) = attr_value(&e, "type") {
                                 p.checksum_type = v;
                             }
-                            p.checksum_pkgid = attr_value(&e, b"pkgid")
+                            p.checksum_pkgid = attr_value(&e, "pkgid")
                                 .map(|v| v.eq_ignore_ascii_case("yes") || v == "1")
                                 .unwrap_or(false);
                             p.checksum_value.clear();
                         }
                         text_target = Some(TextTarget::Checksum);
                     }
-                    b"size" => {
+                    "size" => {
                         if let Some(p) = pkg.as_mut() {
                             p.size = RpmSize {
-                                package: attr_u64(&e, b"package"),
-                                installed: attr_u64(&e, b"installed"),
-                                archive: attr_u64(&e, b"archive"),
+                                package: attr_u64(&e, "package"),
+                                installed: attr_u64(&e, "installed"),
+                                archive: attr_u64(&e, "archive"),
                             };
                         }
                     }
-                    b"time" => {
+                    "time" => {
                         if let Some(p) = pkg.as_mut() {
                             p.time = RpmTime {
-                                file: attr_i64(&e, b"file"),
-                                build: attr_i64(&e, b"build"),
+                                file: attr_i64(&e, "file"),
+                                build: attr_i64(&e, "build"),
                             };
                         }
                     }
                     // The upstream `<location href>` is captured ONLY for the
                     // `upstream_path` fetch column, never into the trusted
                     // metadata: the published location is rebuilt from NEVRA.
-                    b"location" => {
+                    "location" => {
                         if let Some(p) = pkg.as_mut() {
-                            if let Some(href) = attr_value(&e, b"href") {
+                            if let Some(href) = attr_value(&e, "href") {
                                 p.location_href = href;
                             }
                         }
                     }
-                    b"format" => in_format = true,
-                    b"license" if in_format => text_target = Some(TextTarget::License),
-                    b"vendor" if in_format => text_target = Some(TextTarget::Vendor),
-                    b"group" if in_format => text_target = Some(TextTarget::Group),
-                    b"buildhost" if in_format => text_target = Some(TextTarget::BuildHost),
-                    b"sourcerpm" if in_format => text_target = Some(TextTarget::SourceRpm),
-                    b"header-range" if in_format => {
+                    "format" => in_format = true,
+                    "license" if in_format => text_target = Some(TextTarget::License),
+                    "vendor" if in_format => text_target = Some(TextTarget::Vendor),
+                    "group" if in_format => text_target = Some(TextTarget::Group),
+                    "buildhost" if in_format => text_target = Some(TextTarget::BuildHost),
+                    "sourcerpm" if in_format => text_target = Some(TextTarget::SourceRpm),
+                    "header-range" if in_format => {
                         if let Some(p) = pkg.as_mut() {
                             p.format.header_range =
-                                Some((attr_u64(&e, b"start"), attr_u64(&e, b"end")));
+                                Some((attr_u64(&e, "start"), attr_u64(&e, "end")));
                         }
                     }
-                    b"file" if in_format => {
-                        let kind = attr_value(&e, b"type");
+                    "file" if in_format => {
+                        let kind = attr_value(&e, "type");
                         if let Some(p) = pkg.as_mut() {
                             if p.format.files.len() >= MAX_LIST_ENTRIES {
                                 dropped = true;
@@ -437,16 +437,16 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
                         }
                         text_target = Some(TextTarget::File);
                     }
-                    b"entry" if in_format => {
+                    "entry" if in_format => {
                         if let Some(list) = cur_list {
                             if let Some(p) = pkg.as_mut() {
                                 let entry = RpmEntry {
-                                    name: attr_value(&e, b"name").unwrap_or_default(),
-                                    flags: attr_value(&e, b"flags"),
-                                    epoch: attr_value(&e, b"epoch"),
-                                    ver: attr_value(&e, b"ver"),
-                                    rel: attr_value(&e, b"rel"),
-                                    pre: attr_value(&e, b"pre"),
+                                    name: attr_value(&e, "name").unwrap_or_default(),
+                                    flags: attr_value(&e, "flags"),
+                                    epoch: attr_value(&e, "epoch"),
+                                    ver: attr_value(&e, "ver"),
+                                    rel: attr_value(&e, "rel"),
+                                    pre: attr_value(&e, "pre"),
                                 };
                                 push_entry(&mut p.format, list, entry, &mut dropped);
                             }
@@ -465,10 +465,7 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
             // SEPARATELY (see `GeneralRef` below), so this is literal content.
             Ok(Event::Text(t)) => {
                 if let (Some(target), Some(p)) = (text_target, pkg.as_mut()) {
-                    match t.xml10_content() {
-                        Ok(txt) => apply_text(p, target, &txt),
-                        Err(_) => dropped = true,
-                    }
+                    apply_text(p, target, &t.xml10_content());
                 }
             }
 
@@ -476,10 +473,7 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
             // cannot inject markup into the published document.
             Ok(Event::CData(c)) => {
                 if let (Some(target), Some(p)) = (text_target, pkg.as_mut()) {
-                    match c.decode() {
-                        Ok(txt) => apply_text(p, target, &txt),
-                        Err(_) => dropped = true,
-                    }
+                    apply_text(p, target, &c);
                 }
             }
 
@@ -505,7 +499,7 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
                 let local_name = e.local_name();
                 let local = local_name.as_ref();
                 match local {
-                    b"package" => {
+                    "package" => {
                         let over = pos.saturating_sub(pkg_start) > MAX_PACKAGE_BYTES;
                         if let Some(builder) = pkg.take() {
                             if !dropped && !over {
@@ -517,12 +511,12 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
                         in_format = false;
                         cur_list = None;
                     }
-                    b"format" => {
+                    "format" => {
                         in_format = false;
                         cur_list = None;
                     }
-                    b"provides" | b"requires" | b"conflicts" | b"obsoletes" | b"recommends"
-                    | b"suggests" | b"supplements" | b"enhances" => {
+                    "provides" | "requires" | "conflicts" | "obsoletes" | "recommends"
+                    | "suggests" | "supplements" | "enhances" => {
                         cur_list = None;
                     }
                     _ => {}
@@ -605,8 +599,8 @@ fn resolve_builtin_ref(r: &quick_xml::events::BytesRef<'_>) -> Option<String> {
         Ok(None) => {}
     }
     // Named reference: only the five XML predefined entities are honoured.
-    let name = r.decode().ok()?;
-    match name.as_ref() {
+    let name: &str = r;
+    match name {
         "lt" => Some("<".to_string()),
         "gt" => Some(">".to_string()),
         "amp" => Some("&".to_string()),
@@ -619,7 +613,7 @@ fn resolve_builtin_ref(r: &quick_xml::events::BytesRef<'_>) -> Option<String> {
 /// Decode a named attribute's value. `normalized_value` resolves ONLY the
 /// predefined XML entities (no custom/DTD entities), and any unresolvable
 /// reference yields `None` so the caller fails closed.
-fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref() == key {
             return attr
@@ -631,13 +625,13 @@ fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<Strin
     None
 }
 
-fn attr_u64(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> u64 {
+fn attr_u64(e: &quick_xml::events::BytesStart<'_>, key: &str) -> u64 {
     attr_value(e, key)
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0)
 }
 
-fn attr_i64(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> i64 {
+fn attr_i64(e: &quick_xml::events::BytesStart<'_>, key: &str) -> i64 {
     attr_value(e, key)
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0)

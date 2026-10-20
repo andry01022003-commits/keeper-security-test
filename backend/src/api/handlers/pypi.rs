@@ -5566,7 +5566,7 @@ impl XmlRpcParser<'_> {
                     xmlrpc_echo_text(&e.to_string())
                 ))
             })?;
-            let name = |raw: &[u8]| String::from_utf8_lossy(raw).into_owned();
+            let name = |raw: &str| raw.to_owned();
             // quick-xml validates syntax, not the `Char` production: a NUL
             // or U+0001 passes through as text. Refuse it here so it can
             // neither reach a jsonb bind (#3673) nor be echoed.
@@ -5583,17 +5583,8 @@ impl XmlRpcParser<'_> {
                 Event::Start(e) => XmlRpcToken::Start(name(e.name().as_ref())),
                 Event::End(e) => XmlRpcToken::End(name(e.name().as_ref())),
                 Event::Empty(e) => XmlRpcToken::Empty(name(e.name().as_ref())),
-                Event::Text(t) => checked(
-                    t.decode()
-                        .map_err(|e| {
-                            XmlRpcFault::parse(format!(
-                                "malformed XML: {}",
-                                xmlrpc_echo_text(&e.to_string())
-                            ))
-                        })?
-                        .into_owned(),
-                )?,
-                Event::CData(c) => checked(String::from_utf8_lossy(&c).into_owned())?,
+                Event::Text(t) => checked(t.to_string())?,
+                Event::CData(c) => checked(c.to_string())?,
                 // Character references and the five predefined entities are
                 // the only references XML without a DTD can carry; anything
                 // else would need the DTD refused below.
@@ -5601,13 +5592,13 @@ impl XmlRpcParser<'_> {
                     let resolved = if r.is_char_ref() {
                         r.resolve_char_ref().ok().flatten().map(|c| c.to_string())
                     } else {
-                        let entity: &[u8] = &r;
+                        let entity: &str = &r;
                         match entity {
-                            b"amp" => Some("&".to_string()),
-                            b"lt" => Some("<".to_string()),
-                            b"gt" => Some(">".to_string()),
-                            b"quot" => Some("\"".to_string()),
-                            b"apos" => Some("'".to_string()),
+                            "amp" => Some("&".to_string()),
+                            "lt" => Some("<".to_string()),
+                            "gt" => Some(">".to_string()),
+                            "quot" => Some("\"".to_string()),
+                            "apos" => Some("'".to_string()),
                             _ => None,
                         }
                     };
@@ -21303,14 +21294,14 @@ mod legacy_json_xmlrpc_unit_tests {
             loop {
                 match reader.read_event().expect("well-formed fault XML") {
                     quick_xml::events::Event::Eof => break,
-                    quick_xml::events::Event::Text(t) => current.push_str(&t.decode().unwrap()),
+                    quick_xml::events::Event::Text(t) => current.push_str(&t),
                     quick_xml::events::Event::GeneralRef(r) => {
-                        let entity: &[u8] = &r;
+                        let entity: &str = &r;
                         current.push_str(match entity {
-                            b"quot" => "\"",
-                            b"amp" => "&",
-                            b"lt" => "<",
-                            b"gt" => ">",
+                            "quot" => "\"",
+                            "amp" => "&",
+                            "lt" => "<",
+                            "gt" => ">",
                             _ => "?",
                         });
                     }

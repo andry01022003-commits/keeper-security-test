@@ -675,8 +675,8 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
-    fn local(name: &[u8]) -> String {
-        String::from_utf8_lossy(name).into_owned()
+    fn local(name: &str) -> String {
+        name.to_owned()
     }
 
     let mut reader = Reader::from_str(xml);
@@ -699,24 +699,23 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 stack.push(name);
                 text.clear();
             }
-            // `quick-xml` 0.41 reports an entity reference as its own event
+            // `quick-xml` reports an entity reference as its own event
             // rather than expanding it into the surrounding text, so a value
             // like `a&amp;b` arrives as Text("a"), GeneralRef("amp"),
             // Text("b") and the three fragments have to be reassembled here.
             Ok(Event::Text(e)) => {
-                if let Ok(decoded) = e.decode() {
-                    text.push_str(&decoded);
-                }
+                text.push_str(&e);
             }
             Ok(Event::GeneralRef(e)) => {
                 if let Ok(Some(resolved)) = e.resolve_char_ref() {
                     // Numeric reference: `&#38;` / `&#x26;`.
                     text.push(resolved);
-                } else if let Ok(name) = e.decode() {
+                } else {
                     // XML defines exactly these five named entities, and a
                     // list response has no DTD to declare any others. An
                     // unknown name is dropped rather than guessed at.
-                    match name.as_ref() {
+                    let name: &str = &e;
+                    match name {
                         "amp" => text.push('&'),
                         "lt" => text.push('<'),
                         "gt" => text.push('>'),
@@ -727,7 +726,7 @@ fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
                 }
             }
             // CDATA is literal by definition -- no entity expansion.
-            Ok(Event::CData(e)) => text.push_str(&String::from_utf8_lossy(&e)),
+            Ok(Event::CData(e)) => text.push_str(&e),
             Ok(Event::End(e)) => {
                 let closed = stack
                     .pop()
