@@ -142,7 +142,6 @@ fn is_allowlisted(path: &str) -> bool {
             | "/v2/token"
             | "/.well-known/terraform.json"
             | "/device"
-            | "/device/"
             | "/device/app.js"
             | "/device/app.css"
     ) || path.starts_with("/api/v1/auth/")
@@ -424,7 +423,13 @@ mod tests {
         for p in ["/device", "/device/app.js", "/device/app.css"] {
             assert!(is_allowlisted(p), "{p} should be allowlisted");
         }
-        for p in ["/device/other", "/devices", "/device/app.js/x", "/deviceX"] {
+        for p in [
+            "/device/",
+            "/device/other",
+            "/devices",
+            "/device/app.js/x",
+            "/deviceX",
+        ] {
             assert!(!is_allowlisted(p), "{p} must stay gated");
         }
     }
