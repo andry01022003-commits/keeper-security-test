@@ -4306,6 +4306,25 @@ pub async fn create_repository(
         payload.upstream_username.as_deref(),
         payload.upstream_password.as_deref(),
     )?;
+    // #4843: the remaining invalid credential shapes — an unknown
+    // `upstream_auth_type`, `basic` without a password, an AWS type without an
+    // `aws` block — used to be caught only while persisting, after the
+    // repository row had been inserted. A refused create left a
+    // half-configured Remote behind and a retry hit 409 on the key. Build (and
+    // so validate) the credentials here, before the insert, and reuse the
+    // result afterwards instead of rebuilding it.
+    let upstream_credentials = match payload.upstream_auth_type.as_deref() {
+        Some(auth_type) => Some((
+            auth_type.to_string(),
+            build_upstream_credentials(
+                auth_type,
+                payload.upstream_username.as_deref(),
+                payload.upstream_password.as_deref(),
+                None,
+            )?,
+        )),
+        None => None,
+    };
     // #4662: a public repository with upstream credentials spends them for
     // anonymous callers. Refused before the row exists unless accepted.
     let public_credentials_override = enforce_public_upstream_credentials(
@@ -4509,19 +4528,14 @@ pub async fn create_repository(
         }
     }
 
-    // Store upstream auth credentials if provided
-    if let Some(ref auth_type) = payload.upstream_auth_type {
-        let credentials_json = build_upstream_credentials(
-            auth_type,
-            payload.upstream_username.as_deref(),
-            payload.upstream_password.as_deref(),
-            None,
-        )?;
+    // Store upstream auth credentials if provided. Already built and validated
+    // before the insert (#4843), so this only writes them.
+    if let Some((ref auth_type, ref credentials_json)) = upstream_credentials {
         crate::services::upstream_auth::save_upstream_auth(
             &state.db,
             repo.id,
             auth_type,
-            &credentials_json,
+            credentials_json,
         )
         .await?;
     }
@@ -30213,6 +30227,76 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// DB-backed (#4843): the remaining invalid credential shapes — an unknown
+    /// `upstream_auth_type`, `basic` without a password, an AWS type without an
+    /// `aws` block — must be refused *before* the repository row is inserted,
+    /// so a refused create leaves nothing behind (previously the 400 came back
+    /// with the row already committed, and a retry hit 409).
+    #[tokio::test]
+    async fn test_create_remote_invalid_credentials_leave_no_row_db_4843() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upauth-4843-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // Each `extra` is a credential shape the handler must reject with 400
+        // VALIDATION_ERROR while building the credentials, before the insert.
+        let invalid_shapes = [
+            // Unknown auth type.
+            serde_json::json!({ "upstream_auth_type": "kerberos" }),
+            // `basic` without a password.
+            serde_json::json!({ "upstream_auth_type": "basic", "upstream_username": "u" }),
+            // An AWS type with no `aws` block (the create payload has none).
+            serde_json::json!({ "upstream_auth_type": "aws_ecr" }),
+        ];
+
+        for (idx, extra) in invalid_shapes.into_iter().enumerate() {
+            let key = format!("upauth-4843-{idx}-{suffix}");
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            let err = create_repository(
+                State(state.clone()),
+                auth(),
+                make_create_request(&key, &key, "generic", body),
+            )
+            .await
+            .expect_err("an invalid credential shape must be refused");
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "expected a validation error for {key}, got {err:?}"
+            );
+
+            // The point of #4843: the refusal happens before the insert, so the
+            // row must not exist and a retry is not a 409.
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repositories WHERE key = $1)")
+                    .bind(&key)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                !exists,
+                "a refused create ({key}) must not leave a repository row"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
