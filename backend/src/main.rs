@@ -591,13 +591,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             names
         };
         tracing::info!("Storage backends available: {:?}", available);
+        // The metric is a gauge because the set is fixed for the process
+        // lifetime: a scrape either sees 0 (everything configured works) or
+        // the number of dead backends to alert on (#4530). Set on every start
+        // so 0 is an observed value, not an absent series.
+        metrics::gauge!("ak_storage_backends_skipped").set(skipped_backends.len() as f64);
         if !skipped_backends.is_empty() {
             let mut skipped: Vec<String> = skipped_backends.keys().cloned().collect();
             skipped.sort();
-            // The metric is a gauge because the set is fixed for the process
-            // lifetime: a scrape either sees 0 (everything configured works)
-            // or the number of dead backends to alert on (#4530).
-            metrics::gauge!("ak_storage_backends_skipped").set(skipped.len() as f64);
             tracing::error!(
                 skipped = ?skipped,
                 "Storage backends configured but skipped at startup; repositories on them will \

@@ -104,9 +104,9 @@ impl StorageRegistry {
     /// registry's map of shared instances.
     ///
     /// A backend that was configured but skipped at startup (#4530) answers a
-    /// [`AppError::ServiceUnavailable`] naming the backend and the
-    /// configuration error, so a repository on it fails with a 503 that says
-    /// why instead of a generic 500 `STORAGE_ERROR`. An unknown name that was
+    /// [`AppError::ServiceUnavailable`] naming the backend (the configuration
+    /// error itself stays on `/health` and in the log), so a repository on it
+    /// fails with a 503 that says why instead of a generic 500 `STORAGE_ERROR`. An unknown name that was
     /// never configured stays a [`AppError::Storage`].
     pub fn backend_for(&self, location: &StorageLocation) -> Result<Arc<dyn StorageBackend>> {
         if location.backend == "filesystem" {
@@ -117,11 +117,15 @@ impl StorageRegistry {
             }));
         }
 
-        if let Some(error) = self.skipped_backends.get(&location.backend) {
+        if self.skipped_backends.contains_key(&location.backend) {
+            // The configuration error itself is NOT in this message: it goes to
+            // every client of the repository, anonymous ones included, and can
+            // name internal endpoints. Operators read it on `/health` and in
+            // the startup ERROR log.
             return Err(AppError::ServiceUnavailable(format!(
                 "storage backend '{}' is unavailable: it was configured but skipped at startup \
-                 because of a configuration error ({})",
-                location.backend, error
+                 because of a configuration error",
+                location.backend
             )));
         }
 
@@ -550,8 +554,8 @@ mod tests {
             "message must say the backend was skipped: {msg}"
         );
         assert!(
-            msg.contains("S3_PUBLIC_ENDPOINT"),
-            "message must carry the configuration error: {msg}"
+            !msg.contains("S3_PUBLIC_ENDPOINT") && !msg.contains("s3.example.com"),
+            "the client-facing message must not carry the configuration error: {msg}"
         );
 
         assert_eq!(
