@@ -1986,13 +1986,30 @@ fn build_oidc_bootstrap_request(
 /// admin-API-set values for the rest (#3904); the rule lives in
 /// `services::ldap_env_bootstrap`.
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
+    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
     use artifact_keeper_backend::services::ldap_env_bootstrap::{
         reconcile_ldap_from_env, warn_discarded_fields, LdapEnvOutcome,
     };
 
     let req = match build_ldap_bootstrap_request() {
         Some(r) => r,
-        None => return Ok(()),
+        None => {
+            // LDAP_* is not set: disable any provider the env bootstrap still
+            // manages (#4857, the #2819 OIDC pattern), so the login page
+            // stops offering only an LDAP form for a directory the operator
+            // removed and local login recovers once no enabled provider
+            // remains. Admin-created providers, and env-seeded ones an
+            // administrator re-enabled, are untouched.
+            for name in AuthConfigService::disable_env_managed_ldap(db).await? {
+                tracing::warn!(
+                    "Disabled LDAP provider '{}': it was seeded from LDAP_* environment \
+                     variables that are no longer set. Re-enable it via the admin API to keep \
+                     using it (that also takes manual ownership of it).",
+                    name
+                );
+            }
+            return Ok(());
+        }
     };
     let wanted = req.name.clone();
 
