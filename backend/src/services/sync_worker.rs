@@ -1242,15 +1242,15 @@ fn parse_oci_manifest_path(path: &str) -> Option<(&str, &str)> {
 /// One content object to transfer for an OCI manifest task: a blob, or a
 /// manifest (the image's own, a child of an index, or the index itself).
 #[derive(Clone)]
-struct OciTransferItem {
+pub(crate) struct OciTransferItem {
     /// `true` for a manifest (sent to the manifest route), `false` for a blob.
-    is_manifest: bool,
+    pub(crate) is_manifest: bool,
     /// Canonical `sha256:<hex>` digest the receiver verifies bytes against.
-    digest: String,
+    pub(crate) digest: String,
     /// Local storage key the bytes are read from.
-    storage_key: String,
+    pub(crate) storage_key: String,
     /// Media type; only meaningful for a manifest.
-    content_type: String,
+    pub(crate) content_type: String,
 }
 
 /// Build the ordered transfer plan for a manifest: every blob BEFORE the
@@ -1262,7 +1262,7 @@ struct OciTransferItem {
 /// exactly what a native push recorded. Bounded by `MAX_DEPTH` against a
 /// pathological self-referential index; a cycle is impossible on the
 /// content-addressed write path but the guard keeps the walk cheap and total.
-async fn build_oci_transfer_plan(
+pub(crate) async fn build_oci_transfer_plan(
     db: &PgPool,
     repo_id: Uuid,
     top: &OciTransferItem,

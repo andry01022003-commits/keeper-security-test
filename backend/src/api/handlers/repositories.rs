@@ -931,8 +931,8 @@ pub fn router() -> Router<SharedState> {
         // Immutable revision history for versioned artifacts (#2367).
         .route("/:key/versions/*path", get(list_artifact_versions))
         // Peer replication receive path for OCI/Docker images (#4790). These
-        // exist only for a peer's push-replication worker (guarded by the
-        // replication header + a service credential); OCI clients use the
+        // exist only for a peer's push-replication worker (the replication
+        // header, then the generic upload's write gates); OCI clients use the
         // `/v2/*` routes. The sync worker sends a manifest's blob closure here
         // first and the manifest last, so a replicated image is never visible
         // with missing blobs.
@@ -10044,7 +10044,7 @@ async fn stage_multipart_field(
 /// Authorize a generic artifact write: resolve the repository and enforce the
 /// write gates shared by the raw-`PUT` and multipart upload entry points, before
 /// any request body is consumed.
-async fn authorize_generic_upload(
+pub(crate) async fn authorize_generic_upload(
     state: &SharedState,
     auth: &AuthExtension,
     key: &str,

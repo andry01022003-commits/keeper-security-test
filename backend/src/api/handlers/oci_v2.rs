@@ -11462,30 +11462,32 @@ const REPLICATION_IMAGE_HEADER: &str = "x-oci-image";
 /// digest for a by-digest child). Only a tag produces an `oci_tags` row.
 const REPLICATION_REFERENCE_HEADER: &str = "x-oci-reference";
 
-/// Require an authenticated caller on a replication route, mapping the
-/// authentication failure to a response. Mirrors `repositories::require_auth`.
-#[allow(clippy::result_large_err)]
-fn require_replication_auth(
-    auth: Option<crate::api::middleware::auth::AuthExtension>,
-) -> Result<crate::api::middleware::auth::AuthExtension, Response> {
-    auth.ok_or_else(|| {
-        AppError::Authentication("Authentication required".to_string()).into_response()
-    })
-}
-
-/// Refuse a replication content write that is not a replication request.
+/// Authorize a peer replication content write (#4790).
 ///
-/// The OCI content surface is otherwise served by the `/v2/*` client routes,
-/// which authenticate a Docker client; these `/api/v1` routes exist only for a
-/// peer's push-replication worker and must never accept a client write. They
-/// also refuse a non-`local` (hosted) repository, matching the generic
-/// replication PUT (`authorize_generic_upload`).
-#[allow(clippy::result_large_err)]
-fn require_oci_replication_route(
+/// These `/api/v1` routes exist only for a peer's push-replication worker (OCI
+/// clients use `/v2/*`), so the request must carry the replication header. The
+/// header is not a credential: past it the caller takes exactly the gates the
+/// generic replication PUT takes (`authorize_generic_upload`): the
+/// `write:artifacts` token scope, the repository-scoped token ceiling, tenant
+/// access plus the `write` action on this repository, a hosted repository, and
+/// no direct write into a promotion-only repository. A peer whose API key can
+/// replicate generic artifacts into a repository can replicate images into it;
+/// any other caller cannot.
+async fn authorize_oci_replication_write(
+    state: &SharedState,
+    auth: Option<crate::api::middleware::auth::AuthExtension>,
     headers: &HeaderMap,
-    auth: &crate::api::middleware::auth::AuthExtension,
-    repo: &crate::models::repository::Repository,
-) -> Result<(), Response> {
+    key: &str,
+) -> Result<
+    (
+        crate::api::middleware::auth::AuthExtension,
+        crate::models::repository::Repository,
+    ),
+    Response,
+> {
+    let auth = auth.ok_or_else(|| {
+        AppError::Authentication("Authentication required".to_string()).into_response()
+    })?;
     if !crate::api::handlers::is_replication_request(headers) {
         return Err(oci_error(
             StatusCode::FORBIDDEN,
@@ -11493,23 +11495,44 @@ fn require_oci_replication_route(
             "these routes accept peer replication requests only",
         ));
     }
-    if !auth.is_admin && !auth.is_service_account {
-        // A peer authenticates with an API key (a service-account-shaped
-        // credential). A plain user session must not write OCI content here.
-        return Err(oci_error(
-            StatusCode::FORBIDDEN,
-            "DENIED",
-            "peer replication writes require a service credential",
-        ));
+    auth.require_scope("write:artifacts")
+        .map_err(|e| e.into_response())?;
+    let (_, repo) =
+        crate::api::handlers::repositories::authorize_generic_upload(state, &auth, key).await?;
+    Ok((auth, repo))
+}
+
+/// An image name a replicated manifest may be committed under: `/`-separated
+/// non-empty segments of ASCII alphanumerics, `.`, `_` and `-`, never `.` or
+/// `..`. The name becomes the `oci_tags` row and the `artifacts.path`, so a
+/// header value is not taken on trust.
+fn is_valid_replication_image_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+}
+
+/// The reference a replicated manifest may be committed under: the manifest's
+/// own digest (a by-digest child), or an OCI tag
+/// (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`).
+fn is_valid_replication_reference(reference: &str, digest: &str) -> bool {
+    if reference == digest {
+        return true;
     }
-    if repo.repo_type != RepositoryType::Local {
-        return Err(oci_error(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "UNSUPPORTED",
-            "replication writes are accepted only on hosted repositories",
-        ));
-    }
-    Ok(())
+    let bytes = reference.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Receive one image blob from a replication peer (#4790).
@@ -11527,19 +11550,10 @@ pub async fn replicate_oci_blob(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let auth = match require_replication_auth(auth) {
-        Ok(a) => a,
+    let (_auth, repo) = match authorize_oci_replication_write(&state, auth, &headers, &key).await {
+        Ok(v) => v,
         Err(resp) => return resp,
     };
-    let repo_service =
-        crate::services::repository_service::RepositoryService::new(state.db.clone());
-    let repo = match repo_service.get_by_key(&key).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(resp) = require_oci_replication_route(&headers, &auth, &repo) {
-        return resp;
-    }
     if !is_digest_reference(&digest) {
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -11665,19 +11679,10 @@ pub async fn replicate_oci_manifest(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let auth = match require_replication_auth(auth) {
-        Ok(a) => a,
+    let (auth, repo) = match authorize_oci_replication_write(&state, auth, &headers, &key).await {
+        Ok(v) => v,
         Err(resp) => return resp,
     };
-    let repo_service =
-        crate::services::repository_service::RepositoryService::new(state.db.clone());
-    let repo = match repo_service.get_by_key(&key).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(resp) = require_oci_replication_route(&headers, &auth, &repo) {
-        return resp;
-    }
     if !is_digest_reference(&digest) {
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -11694,14 +11699,20 @@ pub async fn replicate_oci_manifest(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .unwrap_or_else(|| digest.clone());
-    if image.as_deref().is_none_or(str::is_empty) {
+    let Some(image) = image.filter(|name| is_valid_replication_image_name(name)) else {
         return oci_error(
             StatusCode::BAD_REQUEST,
             "NAME_INVALID",
-            "manifest replication requires the x-oci-image header",
+            "manifest replication requires a valid x-oci-image header",
+        );
+    };
+    if !is_valid_replication_reference(&reference, &digest) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "TAG_INVALID",
+            "x-oci-reference must be a tag or the manifest digest",
         );
     }
-    let image = image.unwrap();
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -44300,12 +44311,35 @@ mod oci_push_replication_4790_tests {
             &[&layer_digest],
             &[layer_body.len() as i64],
         );
+        let manifest_body_bytes = manifest_body.clone();
         let (status, body) =
             push_manifest_v2(&fx.state, &fx.repo_key, &auth, "v1", manifest_body).await;
         assert_eq!(status, StatusCode::CREATED, "manifest push failed: {body}");
         assert!(body.contains("Docker-Content-Digest") || status == StatusCode::CREATED);
 
         let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+
+        // The sync worker's plan for that task: the blob closure first, the
+        // manifest last, read from what the push recorded.
+        let manifest_digest = format!("sha256:{}", sha256_hex(manifest_body_bytes.as_bytes()));
+        let top = crate::services::sync_worker::OciTransferItem {
+            is_manifest: true,
+            digest: manifest_digest.clone(),
+            storage_key: format!("oci-manifests/{manifest_digest}"),
+            content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+        };
+        let plan =
+            crate::services::sync_worker::build_oci_transfer_plan(&fx.pool, fx.repo_id, &top)
+                .await
+                .expect("transfer plan");
+        let plan_shape: Vec<(bool, String)> = plan
+            .iter()
+            .map(|item| (item.is_manifest, item.digest.clone()))
+            .collect();
+        let mut blobs = vec![config_digest.clone(), layer_digest.clone()];
+        blobs.sort();
+        let mut expected: Vec<(bool, String)> = blobs.into_iter().map(|d| (false, d)).collect();
+        expected.push((true, manifest_digest));
         tdh::delete_push_peer(&fx.pool, peer_id).await;
         let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
             .bind(fx.user_id)
@@ -44331,5 +44365,269 @@ mod oci_push_replication_4790_tests {
             vec!["v2/myimage/manifests/v1".to_string()],
             "a client push must queue only the manifest task; the sync worker handles the blob closure"
         );
+        assert_eq!(
+            plan_shape, expected,
+            "the transfer plan sends the config and layer blobs before the manifest"
+        );
+    }
+
+    fn replication_headers(extra: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-artifact-keeper-replication", "true".parse().unwrap());
+        for (name, value) in extra {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    async fn replicate_blob_as(
+        fx: &tdh::Fixture,
+        auth: crate::api::middleware::auth::AuthExtension,
+        headers: HeaderMap,
+        digest: &str,
+        body: &[u8],
+    ) -> StatusCode {
+        replicate_oci_blob(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((fx.repo_key.clone(), digest.to_string())),
+            headers,
+            Body::from(body.to_vec()),
+        )
+        .await
+        .status()
+    }
+
+    async fn replicate_manifest_as(
+        fx: &tdh::Fixture,
+        auth: crate::api::middleware::auth::AuthExtension,
+        image: &str,
+        reference: &str,
+        body: &str,
+    ) -> StatusCode {
+        let digest = format!("sha256:{}", sha256_hex(body.as_bytes()));
+        let headers = replication_headers(&[
+            ("x-oci-image", image),
+            ("x-oci-reference", reference),
+            ("content-type", "application/vnd.oci.image.manifest.v1+json"),
+        ]);
+        replicate_oci_manifest(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((fx.repo_key.clone(), digest)),
+            headers,
+            Body::from(body.to_string()),
+        )
+        .await
+        .status()
+    }
+
+    async fn cleanup_oci_rows(fx: &tdh::Fixture) {
+        for table in [
+            "manifest_blob_refs",
+            "oci_manifest_refs",
+            "oci_blobs",
+            "oci_tags",
+            "artifacts",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE repository_id = $1");
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(fx.repo_id)
+                .execute(&fx.pool)
+                .await;
+        }
+    }
+
+    /// #4790 receive path: a peer key with `write` on the repository lands the
+    /// blobs and then the manifest (tag row committed), and the replicated
+    /// write is not fanned back out to this node's own push peers. Bytes that
+    /// do not hash to the claimed digest and header values that are not an
+    /// image name / tag are refused.
+    #[tokio::test]
+    async fn oci_replication_receive_commits_image_without_fan_out() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        // The fixture user is a `developer` (read, write) on the repository.
+        let writer = || tdh::make_auth(fx.user_id, &fx.username);
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "oci-recv").await;
+
+        let config_body = b"replicated-config-4790";
+        let layer_body = b"replicated-layer-4790";
+        let config_digest = format!("sha256:{}", sha256_hex(config_body));
+        let layer_digest = format!("sha256:{}", sha256_hex(layer_body));
+
+        // Bytes that do not hash to the path digest are refused.
+        let mismatch = replicate_blob_as(
+            &fx,
+            writer(),
+            replication_headers(&[]),
+            &config_digest,
+            layer_body,
+        )
+        .await;
+
+        let config_status = replicate_blob_as(
+            &fx,
+            writer(),
+            replication_headers(&[]),
+            &config_digest,
+            config_body,
+        )
+        .await;
+        let layer_status = replicate_blob_as(
+            &fx,
+            writer(),
+            replication_headers(&[]),
+            &layer_digest,
+            layer_body,
+        )
+        .await;
+
+        let manifest = make_image_manifest(
+            &config_digest,
+            config_body.len() as i64,
+            &[&layer_digest],
+            &[layer_body.len() as i64],
+        );
+        let bad_reference =
+            replicate_manifest_as(&fx, writer(), "myimage", "../v1", &manifest).await;
+        let bad_image = replicate_manifest_as(&fx, writer(), "../myimage", "v1", &manifest).await;
+        let manifest_status =
+            replicate_manifest_as(&fx, writer(), "myimage", "v1", &manifest).await;
+
+        let manifest_digest = format!("sha256:{}", sha256_hex(manifest.as_bytes()));
+        let tagged: Option<String> = sqlx::query_scalar(
+            "SELECT manifest_digest FROM oci_tags \
+             WHERE repository_id = $1 AND name = 'myimage' AND tag = 'v1'",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .unwrap();
+        let held_blobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        cleanup_oci_rows(&fx).await;
+        fx.teardown().await;
+
+        assert_eq!(mismatch, StatusCode::BAD_REQUEST, "digest mismatch");
+        assert_eq!(config_status, StatusCode::CREATED, "config blob");
+        assert_eq!(layer_status, StatusCode::CREATED, "layer blob");
+        assert_eq!(bad_reference, StatusCode::BAD_REQUEST, "invalid reference");
+        assert_eq!(bad_image, StatusCode::BAD_REQUEST, "invalid image name");
+        assert_eq!(manifest_status, StatusCode::CREATED, "manifest");
+        assert_eq!(tagged.as_deref(), Some(manifest_digest.as_str()));
+        assert_eq!(held_blobs, 2, "both blobs are held");
+        assert!(
+            queued.is_empty(),
+            "a replicated write must not be queued for this node's peers: {queued:?}"
+        );
+    }
+
+    /// #4790 receive path authorization: the replication header is a routing
+    /// marker, not a credential. A caller without `write` on the repository
+    /// (a service account with no grant, a `reader`), a request without the
+    /// header, a token without `write:artifacts`, and a write into a
+    /// promotion-only repository are all refused, and nothing is stored.
+    #[tokio::test]
+    async fn oci_replication_receive_requires_repository_write() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (sa_id, sa_name) = tdh::create_service_account(&fx.pool).await;
+        let (reader_id, reader_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_role(&fx.pool, fx.repo_id, reader_id, "reader").await;
+
+        let body = b"unauthorized-blob-4790";
+        let digest = format!("sha256:{}", sha256_hex(body));
+
+        let service_account = crate::api::middleware::auth::AuthExtension {
+            is_service_account: true,
+            is_api_token: true,
+            ..tdh::make_auth(sa_id, &sa_name)
+        };
+        let sa_status = replicate_blob_as(
+            &fx,
+            service_account,
+            replication_headers(&[]),
+            &digest,
+            body,
+        )
+        .await;
+        let reader_status = replicate_blob_as(
+            &fx,
+            tdh::make_auth(reader_id, &reader_name),
+            replication_headers(&[]),
+            &digest,
+            body,
+        )
+        .await;
+        let no_header_status = replicate_blob_as(
+            &fx,
+            tdh::make_auth(fx.user_id, &fx.username),
+            HeaderMap::new(),
+            &digest,
+            body,
+        )
+        .await;
+        let read_scoped = crate::api::middleware::auth::AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+            ..tdh::make_auth(fx.user_id, &fx.username)
+        };
+        let read_scope_status =
+            replicate_blob_as(&fx, read_scoped, replication_headers(&[]), &digest, body).await;
+        fx.set_promotion_only(true).await;
+        let promotion_status = replicate_blob_as(
+            &fx,
+            tdh::make_auth(fx.user_id, &fx.username),
+            replication_headers(&[]),
+            &digest,
+            body,
+        )
+        .await;
+        fx.set_promotion_only(false).await;
+
+        let held_blobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+
+        cleanup_oci_rows(&fx).await;
+        tdh::cleanup_user(&fx.pool, sa_id).await;
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(reader_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, reader_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            sa_status,
+            StatusCode::FORBIDDEN,
+            "a service account without write on the repository"
+        );
+        assert_eq!(reader_status, StatusCode::FORBIDDEN, "a reader");
+        assert_eq!(
+            no_header_status,
+            StatusCode::FORBIDDEN,
+            "no replication header"
+        );
+        assert_eq!(
+            read_scope_status,
+            StatusCode::FORBIDDEN,
+            "a read-only token"
+        );
+        assert_eq!(promotion_status, StatusCode::FORBIDDEN, "promotion-only");
+        assert_eq!(held_blobs, 0, "a refused write stores nothing");
     }
 }
