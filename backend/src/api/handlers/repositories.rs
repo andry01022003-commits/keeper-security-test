@@ -5602,6 +5602,13 @@ async fn collect_repo_artifact_object_keys(
     repo_id: Uuid,
     location: &crate::storage::StorageLocation,
 ) -> std::collections::BTreeSet<String> {
+    // A key is spared only when another repository resolves it to the SAME
+    // object: any repository on the same cloud backend (one shared keyspace),
+    // but on `filesystem` only one rooted at the same `storage_path`, because
+    // every other repository keeps its own copy in its own tree (#4833). The
+    // scope is the one `trash_service`'s `KEY_STILL_REFERENCED_SQL` uses, and
+    // a surviving repository's older revision (`artifact_versions`) protects
+    // the key as well as its live rows do.
     let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
@@ -5609,11 +5616,21 @@ async fn collect_repo_artifact_object_keys(
            AND a.storage_key NOT LIKE 'oci-manifests/%' \
            AND a.storage_key NOT LIKE 'oci-blobs/%' \
            AND NOT EXISTS ( \
-               SELECT 1 FROM artifacts b \
+               SELECT 1 FROM artifacts b JOIN repositories rb ON rb.id = b.repository_id \
                WHERE b.storage_key = a.storage_key AND b.repository_id <> $1 \
+                 AND rb.storage_backend = $2 \
+                 AND (rb.storage_backend <> 'filesystem' OR rb.storage_path = $3) \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifact_versions v JOIN repositories rv ON rv.id = v.repository_id \
+               WHERE v.storage_key = a.storage_key AND v.repository_id <> $1 \
+                 AND rv.storage_backend = $2 \
+                 AND (rv.storage_backend <> 'filesystem' OR rv.storage_path = $3) \
            )",
     )
     .bind(repo_id)
+    .bind(&location.backend)
+    .bind(&location.path)
     .fetch_all(&state.db)
     .await
     .unwrap_or_else(|e| {
@@ -5954,6 +5971,27 @@ pub async fn delete_repository(
     // object deletion is deferred below.
     let location = repo.storage_location();
     let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
+
+    // The keys the purge spares because another repository on the same
+    // storage still holds them lose their last record of THIS repository's
+    // reference with the cascade below. Hand them to GC's candidate set, whose
+    // sweep deletes each object once no surviving repository references it, so
+    // a key spared for a repository that is deleted next (or concurrently)
+    // cannot leak (#4833). Best-effort, like the OCI hand-off below.
+    if let Err(e) = crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
+        &state.db,
+        repo.id,
+        &location,
+        &artifact_object_keys,
+    )
+    .await
+    {
+        tracing::warn!(
+            repo_id = %repo.id,
+            error = %e,
+            "Failed to record spared artifact objects as GC candidates before repository delete"
+        );
+    }
 
     // Committed OCI objects are deliberately NOT in `artifact_object_keys`:
     // they are content-addressed and can be shared cross-repo through
@@ -25695,8 +25733,15 @@ mod tests {
         insert_artifact(fx.repo_id, "a/owned.bin", owned_key.clone()).await;
 
         // Object whose storage_key is also referenced by a SECOND repository
-        // (content-addressed dedup): must NOT be purged.
+        // on the same storage root (content-addressed dedup, the shape of every
+        // cloud backend): must NOT be purged.
         let (other_repo_id, _key, _dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+            .bind(&location.path)
+            .bind(other_repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("share the storage root");
         let shared_key = format!("generic/{}/shared.bin", Uuid::new_v4());
         storage
             .put(&shared_key, bytes::Bytes::from_static(b"shared"))
@@ -25732,6 +25777,151 @@ mod tests {
             .await
             .expect("delete other repo");
         fx.teardown().await;
+    }
+
+    /// #4833: on `filesystem` every repository roots its own tree, so two
+    /// repositories holding the same bytes under one content-addressed key
+    /// hold two files. Deleting one must remove ITS file; the other
+    /// repository's copy (a different file) must not shield it, and must
+    /// itself be left alone and still served.
+    #[tokio::test]
+    async fn delete_repository_purges_own_copy_of_key_another_filesystem_repo_holds_4833() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let loc_a = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let loc_b = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: dir_b.to_string_lossy().into_owned(),
+        };
+        let storage_a = state.storage_for_repo(&loc_a).expect("storage A");
+        let storage_b = state.storage_for_repo(&loc_b).expect("storage B");
+
+        let sha = format!("{:0>64}", Uuid::new_v4().simple());
+        let key = format!("{}/{}/{}", &sha[..2], &sha[2..4], sha);
+        for (repo, storage) in [(fx.repo_id, &storage_a), (repo_b, &storage_b)] {
+            storage
+                .put(&key, bytes::Bytes::from_static(b"same bytes"))
+                .await
+                .expect("put copy");
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'shared.bin', 'shared.bin', 10, $2, 'application/octet-stream', $3)",
+            )
+            .bind(repo)
+            .bind(&sha)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert artifact row");
+        }
+
+        let collected = collect_repo_artifact_object_keys(&state, fx.repo_id, &loc_a).await;
+        purge_storage_object_keys(&state, fx.repo_id, &loc_a, collected.clone()).await;
+
+        let a_left = storage_a.exists(&key).await.expect("exists A");
+        let b_left = storage_b.get(&key).await.expect("B still served");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("delete repo B");
+        let _ = std::fs::remove_dir_all(&dir_b);
+        fx.teardown().await;
+
+        assert!(
+            collected.contains(&key),
+            "#4833: repo B's copy lives in another tree and must not spare repo A's file"
+        );
+        assert!(!a_left, "#4833: repo A's file must be purged with repo A");
+        assert_eq!(
+            &b_left[..],
+            b"same bytes",
+            "repo B's copy must be untouched"
+        );
+    }
+
+    /// #4833: a key the delete spares because another repository on the same
+    /// storage still holds it is recorded as a GC candidate before the cascade,
+    /// and a key it purges is not.
+    #[tokio::test]
+    async fn delete_repository_records_spared_keys_as_gc_candidates_4833() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+            .bind(&location.path)
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("share the storage root");
+        let shared = format!("generic/{}/shared.bin", Uuid::new_v4());
+        let owned = format!("generic/{}/owned.bin", Uuid::new_v4());
+        for (repo, key) in [
+            (fx.repo_id, &shared),
+            (repo_b, &shared),
+            (fx.repo_id, &owned),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'f.bin', 1, $3, 'application/octet-stream', $2)",
+            )
+            .bind(repo)
+            .bind(key)
+            .bind("0".repeat(64))
+            .execute(&fx.pool)
+            .await
+            .expect("insert artifact row");
+        }
+
+        let collected = collect_repo_artifact_object_keys(&state, fx.repo_id, &location).await;
+        crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
+            &fx.pool, fx.repo_id, &location, &collected,
+        )
+        .await
+        .expect("record spared keys");
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM oci_gc_candidates WHERE storage_key = ANY($1) \
+               AND storage_backend = 'filesystem' AND storage_path = $2",
+        )
+        .bind(&[shared.clone(), owned.clone()][..])
+        .bind(&location.path)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read candidates");
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = ANY($1)")
+            .bind(&[shared.clone(), owned.clone()][..])
+            .execute(&fx.pool)
+            .await
+            .expect("clean candidates");
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("delete repo B");
+        let _ = std::fs::remove_dir_all(&dir_b);
+        fx.teardown().await;
+
+        assert!(collected.contains(&owned) && !collected.contains(&shared));
+        assert_eq!(
+            candidates,
+            vec![shared],
+            "only the spared key is a candidate"
+        );
     }
 
     /// #2776: deleting a LARGE Maven virtual repository must not run its
