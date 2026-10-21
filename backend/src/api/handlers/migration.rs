@@ -1054,53 +1054,69 @@ async fn list_migrations(
     let per_page = query.per_page.unwrap_or(20);
     let offset = (page - 1) * per_page;
 
-    // Non-admins see only jobs they created; admins see all. The
-    // `($1 OR created_by = $2)` predicate keeps both branches single-statement
-    // and the count consistent with the listed rows.
-    let jobs: Vec<MigrationJobRow> = if let Some(status) = &query.status {
-        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-            "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
-             WHERE ($1 OR created_by = $2) AND status = $3 \
-             ORDER BY created_at DESC LIMIT $4 OFFSET $5"
-        )))
-        .bind(auth.is_admin)
-        .bind(auth.user_id)
-        .bind(status)
-        .bind(per_page)
-        .bind(offset)
-        .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-            "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
-             WHERE ($1 OR created_by = $2) \
-             ORDER BY created_at DESC LIMIT $3 OFFSET $4"
-        )))
-        .bind(auth.is_admin)
-        .bind(auth.user_id)
-        .bind(per_page)
-        .bind(offset)
-        .fetch_all(&state.db)
-        .await?
-    };
-
-    // Get total count, scoped to the same ownership filter as the listing.
-    let total: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM migration_jobs WHERE ($1 OR created_by = $2)")
-            .bind(auth.is_admin)
-            .bind(auth.user_id)
-            .fetch_one(&state.db)
-            .await?;
+    let (jobs, total) = fetch_migration_jobs(
+        &state.db,
+        auth.is_admin,
+        auth.user_id,
+        query.status.as_deref(),
+        per_page,
+        offset,
+    )
+    .await?;
 
     Ok(Json(ListResponse {
         items: jobs.into_iter().map(Into::into).collect(),
         pagination: Some(MigrationPaginationInfo {
             page,
             per_page,
-            total: total.0,
-            total_pages: (total.0 + per_page - 1) / per_page,
+            total,
+            total_pages: (total + per_page - 1) / per_page,
         }),
     }))
+}
+
+/// One page of migration jobs plus the total matching row count.
+///
+/// Non-admins see only the jobs they created; admins see all. `status` narrows
+/// both the page and the count (#4800): the listing applied it while
+/// `COUNT(*)` did not, so `?status=failed` paged over the failed jobs while
+/// `pagination.total` — and the `total_pages` derived from it — still reported
+/// every job the caller could see. One `($n IS NULL OR col = $n)` predicate in
+/// both statements keeps them consistent, and the listing and its count share
+/// the single ownership predicate from #4778. Runtime `sqlx::query_as`, so the
+/// `.sqlx/` cache is unchanged.
+async fn fetch_migration_jobs(
+    db: &sqlx::PgPool,
+    is_admin: bool,
+    user_id: Uuid,
+    status: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<MigrationJobRow>, i64)> {
+    let jobs: Vec<MigrationJobRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+        "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
+         WHERE ($1 OR created_by = $2) AND ($3::text IS NULL OR status = $3) \
+         ORDER BY created_at DESC LIMIT $4 OFFSET $5"
+    )))
+    .bind(is_admin)
+    .bind(user_id)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db)
+    .await?;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM migration_jobs \
+         WHERE ($1 OR created_by = $2) AND ($3::text IS NULL OR status = $3)",
+    )
+    .bind(is_admin)
+    .bind(user_id)
+    .bind(status)
+    .fetch_one(db)
+    .await?;
+
+    Ok((jobs, total))
 }
 
 /// PostgreSQL SQLSTATE for a foreign-key violation.
@@ -2810,6 +2826,16 @@ mod tests {
         .expect("seed job")
     }
 
+    /// Move a seeded job to `status` (the `INSERT` above seeds `'pending'`).
+    async fn set_job_status(pool: &sqlx::PgPool, job: Uuid, status: &str) {
+        sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+            .bind(status)
+            .bind(job)
+            .execute(pool)
+            .await
+            .expect("set job status");
+    }
+
     async fn cleanup_user(pool: &sqlx::PgPool, user_id: Uuid) {
         // migration_jobs/source_connections created_by FK + jobs reference
         // connections; delete jobs first, then connections, then the user.
@@ -2997,6 +3023,95 @@ mod tests {
             "marco must see only his own job"
         );
         assert_eq!(v["pagination"]["total"], 1, "count must be owner-scoped");
+
+        cleanup_user(&pool, victor).await;
+        cleanup_user(&pool, marco).await;
+    }
+
+    // Issue #4800: `?status=` narrowed the listed rows but the `COUNT(*)`
+    // behind `pagination.total` ignored it, so the filtered list reported the
+    // unfiltered row count (and `total_pages` derived from it).
+    #[tokio::test]
+    async fn test_list_migrations_status_filter_applies_to_total_4800() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let (victor, _) = tdh::create_user(&pool).await;
+        let marco_conn = seed_connection(&pool, marco).await;
+        let victor_conn = seed_connection(&pool, victor).await;
+
+        for _ in 0..3 {
+            let job = seed_job(&pool, marco_conn, marco).await;
+            set_job_status(&pool, job, "failed").await;
+        }
+        for _ in 0..2 {
+            let job = seed_job(&pool, marco_conn, marco).await;
+            set_job_status(&pool, job, "completed").await;
+        }
+        for _ in 0..2 {
+            seed_job(&pool, marco_conn, marco).await; // stays 'pending'
+        }
+        // Another user's failed job must not leak into marco's filtered count.
+        let victor_job = seed_job(&pool, victor_conn, victor).await;
+        set_job_status(&pool, victor_job, "failed").await;
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // The filtered page and the filtered count must agree.
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            "/?status=failed".to_string(),
+        )
+        .await;
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "page lists the three failed jobs");
+        assert!(
+            items.iter().all(|job| job["status"] == "failed"),
+            "listing itself is filtered"
+        );
+        assert_eq!(
+            v["pagination"]["total"], 3,
+            "total counts only the rows the filter matched"
+        );
+        // One page at the default `per_page = 20`.
+        assert_eq!(
+            v["pagination"]["total_pages"], 1,
+            "total_pages follows the filtered total"
+        );
+
+        // The last filtered row lands on page 2 of the filtered list.
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            "/?status=failed&per_page=2&page=2".to_string(),
+        )
+        .await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["pagination"]["total"], 3);
+        assert_eq!(
+            v["pagination"]["total_pages"], 2,
+            "three filtered rows are two pages of two"
+        );
+
+        // Another status narrows to its own rows.
+        let v = get_json(
+            state.clone(),
+            marco,
+            &marco_name,
+            "/?status=completed".to_string(),
+        )
+        .await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 2);
+        assert_eq!(v["pagination"]["total"], 2);
+
+        // No filter still counts every job the caller owns — not victor's.
+        let v = get_json(state.clone(), marco, &marco_name, "/".to_string()).await;
+        assert_eq!(v["pagination"]["total"], 7, "unfiltered total is unchanged");
 
         cleanup_user(&pool, victor).await;
         cleanup_user(&pool, marco).await;
