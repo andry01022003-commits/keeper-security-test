@@ -452,19 +452,22 @@ fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
 /// be URL-encoded" (S3 API Reference, UploadPartCopy). Each key segment is
 /// percent-encoded; the `/` separators are structural and stay literal.
 ///
-/// The encoding has to be the one the object was stored under, not any valid
-/// URL encoding: a server-side copy names an existing object, and S3 matches
-/// the decoded key against the stored one. `object_store` writes each segment
-/// through [`PathPart`](object_store::path::PathPart), which leaves the space,
-/// `!`, `$`, `&`, `'`, `(`, `)`, `+`, `,`, `:`, `;`, `=`, `@` literal and
-/// encodes `~`; `urlencoding::encode` does the reverse for all fourteen, so a
-/// source whose path held one of them was named `caf%C3%A9%20jar` (or `a~b`
-/// versus `a%7Eb`) and the multipart copy failed with `NoSuchKey` while the
-/// single-request `CopyObject` of a small object — which rides object_store's
-/// own encoding — succeeded (#4838). Reuse [`stored_key_form`] so the copy
-/// source is named exactly as the write named the object.
+/// The key named has to be the one the object was stored under (#4838).
+/// `object_store` writes each segment through
+/// [`PathPart`](object_store::path::PathPart), so the stored S3 key of
+/// `café a&b~c` is literally `caf%C3%A9 a&b%7Ec`; its own `CopyObject` then
+/// URL-encodes that stored form again for the header. S3 decodes the header
+/// once and looks the result up, so the value is the URL encoding of
+/// [`stored_key_form`], not of the caller's key: encoding the caller's key
+/// decodes to `café a&b~c`, which is not the stored object, and the multipart
+/// copy failed with `NoSuchKey` while a small object's single-request
+/// `CopyObject` succeeded.
 fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
-    format!("{}/{}", bucket, stored_key_form(full_key))
+    let encoded: Vec<String> = stored_key_form(full_key)
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect();
+    format!("{}/{}", bucket, encoded.join("/"))
 }
 
 /// Extract the part ETag from an `UploadPartCopy` response body.
@@ -6735,22 +6738,20 @@ mod tests {
         );
     }
 
-    /// The multipart server-side copy must name its source with the encoding
-    /// the object was stored under, not with `urlencoding`'s (#4838).
+    /// The multipart server-side copy must name the object as it is stored
+    /// (#4838).
     ///
     /// object_store writes every key segment through
-    /// [`PathPart`](object_store::path::PathPart), which leaves a space, `&`,
-    /// `!`, `$`, `'`, `(`, `)`, `+`, `,`, `:`, `;`, `=`, `@` literal and
-    /// encodes `~`; `urlencoding::encode` does the opposite for all fourteen.
-    /// The copy source is a reference to an existing object, so naming it with
-    /// the wrong encoding is `NoSuchKey` — for a large object, whose only
-    /// route to S3 is UploadPartCopy, while a small one goes through
-    /// object_store's own CopyObject encoding and works.
+    /// [`PathPart`](object_store::path::PathPart), so the S3 key of
+    /// `café a&b~c` is literally `caf%C3%A9 a&b%7Ec`. S3 URL-decodes
+    /// `x-amz-copy-source` once and looks the result up, so the header must
+    /// be the URL encoding of that stored key. Encoding the caller's key
+    /// instead decodes to `café a&b~c`, which is not the stored object, and the
+    /// part copy is `NoSuchKey`, while a small object's single-request
+    /// CopyObject (object_store's own encoding) works.
     ///
-    /// The fixture keys its decision on that header: the part copy succeeds
-    /// only when `x-amz-copy-source` is exactly the stored form of the source
-    /// key. On the unfixed code the header is the `urlencoding` form, the mock
-    /// answers `NoSuchKey`, and the copy fails.
+    /// The fixture models S3: a part copy succeeds only when its header
+    /// decodes to the stored key; any other spelling answers `NoSuchKey`.
     #[tokio::test]
     async fn test_large_copy_names_source_in_stored_encoding_4838() {
         use wiremock::matchers::{header, method, query_param, query_param_is_missing};
@@ -6759,19 +6760,30 @@ mod tests {
         // 5 GiB + 1 byte -> two parts, so the copier has to take the
         // UploadPartCopy path rather than a single CopyObject.
         let size = 5_u64 * 1024 * 1024 * 1024 + 1;
-        // A path object_store writes percent-encoded and urlencoding would name
-        // differently: the space and `&` stay literal in the stored form (and
-        // become `%20`/`%26` under urlencoding), while `é` encodes and `~`
-        // flips the other way.
+        // Non-ASCII, a space, `&` and `~`: object_store stores `é` and `~`
+        // percent-encoded and the space and `&` literal.
         let source = "maven/r1/com/dtf/uni/1.0/uni-1.0-café a&b~c.jar";
         let dest = "maven/r1/com/dtf/uni/1.0/uni-1.0-promoted.jar";
-        // Derived from object_store itself, not spelled out, so the assertion
+        // The stored key, derived from object_store itself so the assertion
         // can never drift from what a write actually creates.
-        let stored_source = format!("test-bucket/{}", ObjectPath::from(source).as_ref());
-        assert_ne!(
-            stored_source,
-            format!("test-bucket/{}", urlencoding::encode(source)),
-            "precondition: the two encodings must disagree on this fixture"
+        let stored_key = ObjectPath::from(source).as_ref().to_string();
+        assert!(
+            stored_key.contains("caf%C3%A9 a&b%7Ec"),
+            "precondition: object_store stores the segment percent-encoded: {stored_key}"
+        );
+        // What S3 must receive: the stored key, URL-encoded once more.
+        let stored_source = format!(
+            "test-bucket/{}",
+            stored_key
+                .split('/')
+                .map(|seg| urlencoding::encode(seg).into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(
+            urlencoding::decode(stored_source.trim_start_matches("test-bucket/")).unwrap(),
+            stored_key,
+            "precondition: the expected header decodes to the stored key"
         );
 
         let server = MockServer::start().await;
@@ -8593,10 +8605,9 @@ mod integration_tests {
     /// actually has to resolve to an object.
     ///
     /// The wiremock suite asserts the request shape; this asserts the server
-    /// accepts it, which is the whole failure mode — a source named with the
+    /// accepts it, which is the whole failure mode: a source named with the
     /// wrong encoding is `NoSuchKey`. The key mixes a non-ASCII character, a
-    /// space, `&` and `~`, the four places object_store's write encoding and
-    /// `urlencoding` disagree.
+    /// space, `&` and `~`.
     ///
     ///   AK_S3_E2E=1 S3_BUCKET=ak-test S3_REGION=us-east-1 \
     ///   S3_ENDPOINT=http://127.0.0.1:39164 S3_ACCESS_KEY_ID=... \
@@ -8616,8 +8627,7 @@ mod integration_tests {
         let config = S3Config::from_env().expect("S3Config::from_env");
         let backend = S3Backend::new(config).await.expect("S3Backend::new");
 
-        // Non-ASCII, a space, `&` and `~`: each of the four characters the
-        // stored encoding and a plain URL encoding name differently.
+        // Non-ASCII, a space, `&` and `~`.
         let run = uuid::Uuid::new_v4();
         let source_key = format!("large-copy-4838/uni-1.0-café a&b~c-{run}.jar");
         let dest_key = format!("large-copy-4838/uni-1.0-promoted-{run}.jar");
