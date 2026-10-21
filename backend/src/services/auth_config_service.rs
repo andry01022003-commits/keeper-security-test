@@ -990,6 +990,39 @@ impl AuthConfigService {
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
+    /// Disable every still-enabled LDAP provider the `LDAP_*` env bootstrap
+    /// manages (#4857), the LDAP analog of [`Self::disable_env_seeded_oidc`].
+    /// Called on boot when `LDAP_URL`/`LDAP_BASE_DN` are absent, so an
+    /// env-configured provider does not outlive its configuration: the login
+    /// page stops offering only the LDAP form and `local_login_enabled`
+    /// recovers once no enabled provider remains.
+    ///
+    /// "Env-managed" is a non-empty `env_owned_fields` record (migration 255),
+    /// which only the env bootstrap writes. Admin-created rows and rows that
+    /// predate the record (NULL), and rows an administrator re-enabled through
+    /// the admin API (which clears the record), are never touched. Rows are
+    /// disabled, never deleted; re-enabling through the admin API brings the
+    /// provider back (re-adding the env vars alone does not, because the
+    /// reconcile never touches `is_enabled` after the create, #3904).
+    ///
+    /// Returns the names of the providers that were disabled.
+    pub async fn disable_env_managed_ldap(pool: &PgPool) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            UPDATE ldap_configs
+            SET is_enabled = FALSE, updated_at = NOW()
+            WHERE is_enabled = TRUE AND cardinality(env_owned_fields) > 0
+            RETURNING name
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to disable env-managed LDAP configs: {e}"))
+        })?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
     fn oidc_row_to_response(row: OidcConfigRow) -> OidcConfigResponse {
         OidcConfigResponse {
             id: row.id,
@@ -1279,6 +1312,11 @@ impl AuthConfigService {
 
         crate::services::ldap_env_bootstrap::release_env_ownership(pool, id, &admin_changed)
             .await?;
+        // An admin who enables the provider takes ownership of it (#4857), so
+        // a boot without LDAP_* does not disable it again.
+        if req.is_enabled == Some(true) {
+            Self::release_ldap_env_management(pool, id).await?;
+        }
 
         Ok(Self::ldap_row_to_response(row))
     }
@@ -1320,7 +1358,25 @@ impl AuthConfigService {
         .map_err(|e| AppError::Internal(format!("Failed to toggle LDAP config: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
 
+        // An admin who re-enables the provider takes ownership of it (#4857),
+        // so a boot without LDAP_* does not disable it again. A later boot
+        // WITH LDAP_* records env ownership afresh.
+        if toggle.enabled {
+            Self::release_ldap_env_management(pool, id).await?;
+        }
+
         Ok(Self::ldap_row_to_response(row))
+    }
+
+    /// Clear an LDAP provider's env-ownership record (#4857), so
+    /// [`Self::disable_env_managed_ldap`] leaves it alone.
+    async fn release_ldap_env_management(pool: &PgPool, id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE ldap_configs SET env_owned_fields = NULL WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
     }
 
     /// Build an [`LdapService`] from a stored config row and its decrypted bind
