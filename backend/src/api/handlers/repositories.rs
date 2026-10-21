@@ -1783,6 +1783,16 @@ fn enforce_public_upstream_credentials(
 /// The upstream-auth and override halves of the #4662 state, read from
 /// `repository_config` in one query: `(upstream_auth_configured, accepted)`.
 async fn public_credentials_config(db: &sqlx::PgPool, repo_id: Uuid) -> Result<(bool, bool)> {
+    let (auth_type, accepted) = public_credentials_state(db, repo_id).await?;
+    Ok((auth_type.is_some(), accepted))
+}
+
+/// [`public_credentials_config`] keeping the configured upstream auth type:
+/// `(upstream_auth_type, accepted)`.
+async fn public_credentials_state(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+) -> Result<(Option<String>, bool)> {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT key, value FROM repository_config \
          WHERE repository_id = $1 AND key IN ('upstream_auth_type', $2)",
@@ -1795,16 +1805,19 @@ async fn public_credentials_config(db: &sqlx::PgPool, repo_id: Uuid) -> Result<(
     Ok(public_credentials_flags(rows))
 }
 
-/// Fold `repository_config` rows into `(upstream_auth_configured, accepted)`.
+/// Fold `repository_config` rows into `(upstream_auth_type, accepted)`. The
+/// auth type is filtered like the detail handler's (`none` or empty is no
+/// auth), so every response that carries these rows reports the same
+/// `upstream_auth_type` / `upstream_auth_configured` (#4851).
 fn public_credentials_flags(
     rows: impl IntoIterator<Item = (String, Option<String>)>,
-) -> (bool, bool) {
-    let mut flags = (false, false);
+) -> (Option<String>, bool) {
+    let mut flags = (None, false);
     for (key, value) in rows {
         if key == PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY {
             flags.1 = value.as_deref() == Some("true");
         } else {
-            flags.0 = crate::services::upstream_auth::filter_auth_type(value).is_some();
+            flags.0 = crate::services::upstream_auth::filter_auth_type(value);
         }
     }
     flags
@@ -1845,18 +1858,23 @@ async fn with_public_upstream_credentials(
     db: &sqlx::PgPool,
     mut response: RepositoryResponse,
 ) -> Result<RepositoryResponse> {
-    let (auth_configured, accepted) = public_credentials_config(db, response.id).await?;
-    apply_public_credentials_flags(&mut response, auth_configured, accepted);
+    let (auth_type, accepted) = public_credentials_state(db, response.id).await?;
+    apply_public_credentials_flags(&mut response, auth_type, accepted);
     Ok(response)
 }
 
+/// Set the upstream-auth fields and the #4662 fields from the folded
+/// `repository_config` rows. The list, create and update responses are built
+/// here, so they report upstream auth exactly as the detail response (#4851).
 fn apply_public_credentials_flags(
     response: &mut RepositoryResponse,
-    auth_configured: bool,
+    auth_type: Option<String>,
     accepted: bool,
 ) {
-    response.public_with_upstream_credentials =
-        response.is_public && (auth_configured || response.upstream_url_has_credentials);
+    response.upstream_auth_configured = auth_type.is_some();
+    response.upstream_auth_type = auth_type;
+    response.public_with_upstream_credentials = response.is_public
+        && (response.upstream_auth_configured || response.upstream_url_has_credentials);
     response.allow_public_with_upstream_credentials = accepted;
 }
 
@@ -3664,9 +3682,9 @@ pub async fn list_repositories(
             let mut resp = repo_to_display_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
             resp.format_key = custom_format_key(&resp.format, format_key);
-            let (auth_configured, accepted) =
+            let (auth_type, accepted) =
                 public_credentials_flags(credential_rows.remove(&resp.id).unwrap_or_default());
-            apply_public_credentials_flags(&mut resp, auth_configured, accepted);
+            apply_public_credentials_flags(&mut resp, auth_type, accepted);
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
@@ -28889,20 +28907,24 @@ mod tests {
     #[test]
     fn public_credentials_flags_reads_both_keys_4662() {
         let row = |k: &str, v: Option<&str>| (k.to_string(), v.map(str::to_string));
-        assert_eq!(public_credentials_flags(Vec::new()), (false, false));
+        assert_eq!(public_credentials_flags(Vec::new()), (None, false));
         assert_eq!(
             public_credentials_flags(vec![
                 row("upstream_auth_type", Some("bearer")),
                 row(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY, Some("true")),
             ]),
-            (true, true)
+            (Some("bearer".to_string()), true)
         );
         assert_eq!(
             public_credentials_flags(vec![
                 row("upstream_auth_type", Some("none")),
                 row(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY, Some("false")),
             ]),
-            (false, false)
+            (None, false)
+        );
+        assert_eq!(
+            public_credentials_flags(vec![row("upstream_auth_type", Some(""))]),
+            (None, false)
         );
     }
 
@@ -29182,6 +29204,137 @@ mod tests {
                 .await;
             tdh::cleanup(&pool, id, user_id).await;
         }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4851: list and update responses report upstream auth
+    // -----------------------------------------------------------------------
+
+    /// DB-backed (#4851): the list and the update (PATCH) responses report a
+    /// Remote's upstream auth exactly as the detail response does. The list
+    /// read the auth rows for #4662 but never projected them, so a configured
+    /// Remote listed `upstream_auth_type: null, upstream_auth_configured: false`.
+    #[tokio::test]
+    async fn test_list_and_update_report_upstream_auth_like_detail_db_4851() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, Query, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upauth-4851-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let suffix = Uuid::new_v4().simple().to_string();
+        let remote = |key: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            make_create_request(key, key, "generic", body)
+        };
+        let list = |key: String| {
+            let state = state.clone();
+            let username = username.clone();
+            async move {
+                let Json(listed) = list_repositories(
+                    State(state),
+                    Extension(Some(admin_auth(user_id, &username))),
+                    Query(ListRepositoriesQuery {
+                        page: Some(1),
+                        per_page: Some(100),
+                        format: None,
+                        repo_type: None,
+                        q: Some(key.clone()),
+                        project: None,
+                    }),
+                )
+                .await
+                .expect("list");
+                listed
+                    .items
+                    .into_iter()
+                    .find(|r| r.key == key)
+                    .expect("the repository is listed")
+            }
+        };
+        let auth_fields =
+            |r: &RepositoryResponse| (r.upstream_auth_type.clone(), r.upstream_auth_configured);
+
+        let basic_key = format!("upauth-4851-b-{suffix}");
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &basic_key,
+                serde_json::json!({
+                    "upstream_auth_type": "basic",
+                    "upstream_username": "u",
+                    "upstream_password": "p"
+                }),
+            ),
+        )
+        .await
+        .expect("create a basic-auth remote");
+        let none_key = format!("upauth-4851-n-{suffix}");
+        let Json(plain) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(&none_key, serde_json::json!({})),
+        )
+        .await
+        .expect("create a remote without upstream auth");
+
+        let Json(detail) = get_repository(State(state.clone()), auth(), Path(basic_key.clone()))
+            .await
+            .expect("get");
+        let expected = (Some("basic".to_string()), true);
+        assert_eq!(auth_fields(&detail), expected, "detail");
+        assert_eq!(auth_fields(&created), expected, "create");
+        assert_eq!(
+            auth_fields(&list(basic_key.clone()).await),
+            expected,
+            "list"
+        );
+        let Json(updated) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(basic_key.clone()),
+            Json(
+                serde_json::from_value(serde_json::json!({ "description": "edited" }))
+                    .expect("update payload"),
+            ),
+        )
+        .await
+        .expect("update");
+        assert_eq!(auth_fields(&updated), expected, "update");
+
+        // A Remote without upstream auth lists none, as its detail does.
+        let Json(plain_detail) =
+            get_repository(State(state.clone()), auth(), Path(none_key.clone()))
+                .await
+                .expect("get");
+        assert_eq!(auth_fields(&plain_detail), (None, false));
+        assert_eq!(auth_fields(&list(none_key.clone()).await), (None, false));
+
+        for id in [created.id, plain.id] {
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(plain.id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
