@@ -15,12 +15,12 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::rejection::{BytesRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use base64::Engine;
@@ -40,6 +40,7 @@ use crate::api::handlers::oci_digest::{
     compute_sha256, is_digest_reference, verify_digest_or_fall_through,
 };
 use crate::api::handlers::proxy_helpers;
+use crate::api::handlers::queue_push_sync_tasks_for_upload;
 // The bearer challenge is built in the middleware half so this module and
 // `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
 use crate::api::middleware::oci_errors::{www_authenticate_header, OCI_TOKEN_SERVICE};
@@ -11327,6 +11328,10 @@ struct PushedManifest<'a> {
     artifact_path: &'a str,
     total_size: i64,
     uploaded_by: Uuid,
+    /// The request headers, so the post-commit fan-out (#4790) can tell a peer
+    /// replication write from a client push and never replicate a replicated
+    /// write back out to other peers.
+    headers: &'a HeaderMap,
 }
 
 /// Commit a pushed manifest's tag, references and `artifacts` row on ONE
@@ -11394,7 +11399,403 @@ async fn commit_pushed_manifest(
         artifact_id,
     )
     .await;
+
+    // Surface the pushed image in the packages catalog. The web UI's Packages
+    // tab reads `packages`/`package_versions` (via /api/v1/packages), NOT
+    // `artifacts` — every other format handler (composer, debian, incus, maven,
+    // npm, nuget, pypi, generic upload) populates the catalog on upload, but the
+    // OCI path never did, so a pushed image was pullable yet invisible in the
+    // Packages tab. Digest-only pushes are skipped: the child manifests of a
+    // multi-arch index are not user-facing versions (mirrors the tags/list
+    // filter). Best-effort — a catalog failure must not fail the push.
+    if oci_reference_is_tag(m.reference) {
+        let child_size = match m.class {
+            ManifestClass::Index => {
+                index_child_artifact_size_sum(&state.db, m.repo_id, m.digest).await
+            }
+            _ => 0,
+        };
+        let checksum = m.digest.strip_prefix("sha256:").unwrap_or(m.digest);
+        crate::services::package_service::register_published_package_with_metadata(
+            &state.db,
+            &state.event_bus,
+            m.repo_id,
+            m.image,
+            m.reference,
+            m.total_size.saturating_add(child_size),
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "docker" })),
+        )
+        .await;
+    }
+
+    // #4790: fan the committed manifest out to subscribed push/mirror peers.
+    // The push task is the MANIFEST's `artifacts` row; the sync worker's OCI
+    // branch transfers the manifest together with its blob closure (config,
+    // layers, and child manifests for an index) so a peer never serves an image
+    // whose blobs 404. A peer replication write (`x-artifact-keeper-replication`)
+    // is skipped by the helper, so a replicated manifest is never fanned back
+    // out to other peers.
+    queue_push_sync_tasks_for_upload(
+        &state.db,
+        m.headers,
+        m.repo_id,
+        artifact_id,
+        m.artifact_path,
+        m.total_size,
+    )
+    .await;
+
     Ok(artifact_id)
+}
+
+// ---------------------------------------------------------------------------
+// Peer replication receive path (#4790)
+// ---------------------------------------------------------------------------
+
+/// Header naming the tagged image a replicated manifest belongs to (the OCI
+/// `name`), so the receiver can write the same `oci_tags` row a native push
+/// would. Sent by the sync worker's OCI transfer.
+const REPLICATION_IMAGE_HEADER: &str = "x-oci-image";
+/// Header carrying the manifest reference the sender pushed under (a tag, or a
+/// digest for a by-digest child). Only a tag produces an `oci_tags` row.
+const REPLICATION_REFERENCE_HEADER: &str = "x-oci-reference";
+
+/// Require an authenticated caller on a replication route, mapping the
+/// authentication failure to a response. Mirrors `repositories::require_auth`.
+#[allow(clippy::result_large_err)]
+fn require_replication_auth(
+    auth: Option<crate::api::middleware::auth::AuthExtension>,
+) -> Result<crate::api::middleware::auth::AuthExtension, Response> {
+    auth.ok_or_else(|| {
+        AppError::Authentication("Authentication required".to_string()).into_response()
+    })
+}
+
+/// Refuse a replication content write that is not a replication request.
+///
+/// The OCI content surface is otherwise served by the `/v2/*` client routes,
+/// which authenticate a Docker client; these `/api/v1` routes exist only for a
+/// peer's push-replication worker and must never accept a client write. They
+/// also refuse a non-`local` (hosted) repository, matching the generic
+/// replication PUT (`authorize_generic_upload`).
+#[allow(clippy::result_large_err)]
+fn require_oci_replication_route(
+    headers: &HeaderMap,
+    auth: &crate::api::middleware::auth::AuthExtension,
+    repo: &crate::models::repository::Repository,
+) -> Result<(), Response> {
+    if !crate::api::handlers::is_replication_request(headers) {
+        return Err(oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "these routes accept peer replication requests only",
+        ));
+    }
+    if !auth.is_admin && !auth.is_service_account {
+        // A peer authenticates with an API key (a service-account-shaped
+        // credential). A plain user session must not write OCI content here.
+        return Err(oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "peer replication writes require a service credential",
+        ));
+    }
+    if repo.repo_type != RepositoryType::Local {
+        return Err(oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "replication writes are accepted only on hosted repositories",
+        ));
+    }
+    Ok(())
+}
+
+/// Receive one image blob from a replication peer (#4790).
+///
+/// The sender transfers a manifest's blob closure here, digest-addressed, as a
+/// body whose bytes must hash to `digest`. The write is content-addressed and
+/// idempotent: an already-present `oci_blobs` row for the digest is left in
+/// place, so replaying a partially-completed transfer is harmless. Blobs are
+/// always sent BEFORE the manifest so the peer never commits a manifest whose
+/// blobs are missing.
+pub async fn replicate_oci_blob(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<crate::api::middleware::auth::AuthExtension>>,
+    Path((key, digest)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let auth = match require_replication_auth(auth) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let repo_service =
+        crate::services::repository_service::RepositoryService::new(state.db.clone());
+    let repo = match repo_service.get_by_key(&key).await {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(resp) = require_oci_replication_route(&headers, &auth, &repo) {
+        return resp;
+    }
+    if !is_digest_reference(&digest) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "blob replication requires a sha256 digest",
+        );
+    }
+
+    let storage = match state.storage_for_repo_or_500(&repo.storage_location()) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    // Stage the body (bounded by max_upload_size_bytes) while hashing it, then
+    // refuse a body that does not hash to the digest it claims.
+    let (staged, digests) = match proxy_helpers::stage_stream_content_addressed(
+        &state,
+        body.into_data_stream(),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if !digest.eq_ignore_ascii_case(&format!("sha256:{}", digests.sha256)) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "blob bytes do not match the claimed digest",
+        );
+    }
+
+    let bytes = match tokio::fs::read(staged.path()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return oci_error(
+                crate::api::handlers::db_status(&e),
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+    let size_bytes = bytes.len() as i64;
+    let storage_key = blob_storage_key(&digest);
+    if let Err(e) = storage.put(&storage_key, Bytes::from(bytes)).await {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    // Commit the `oci_blobs` row on a transaction whose quota admission is the
+    // same one a native blob push takes (#4422). `pending_deleted_at = NULL`
+    // resurrects a blob the GC had marked, mirroring the native upsert.
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            return oci_error(
+                crate::api::handlers::db_status(&e),
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+    if let Some(refusal) =
+        oci_blob_quota_refusal(&mut tx, &state.db, repo.id, &digest, size_bytes).await
+    {
+        let _ = tx.rollback().await;
+        return refusal;
+    }
+    if let Err(e) = sqlx::query(
+        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (repository_id, digest) DO UPDATE
+           SET size_bytes = EXCLUDED.size_bytes,
+               storage_key = EXCLUDED.storage_key,
+               pending_delete_at = NULL",
+    )
+    .bind(repo.id)
+    .bind(&digest)
+    .bind(size_bytes)
+    .bind(&storage_key)
+    .execute(&mut *tx)
+    .await
+    {
+        let _ = tx.rollback().await;
+        return oci_error(
+            crate::api::handlers::db_status(&e),
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+    if let Err(e) = tx.commit().await {
+        return oci_error(
+            crate::api::handlers::db_status(&e),
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .header(LOCATION, format!("/v2/{}/blobs/{}", key, digest))
+        .header("Docker-Content-Digest", &digest)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Receive a manifest (image or index) from a replication peer (#4790).
+///
+/// The blob closure is transferred first by [`replicate_oci_blob`]; this
+/// endpoint commits the manifest LAST: bytes to `oci-manifests/<digest>`, then
+/// the tag/references/`artifacts` row on ONE transaction via
+/// [`commit_pushed_manifest`] — the same commit a native `docker push` takes,
+/// so a replicated manifest is indistinguishable from a pushed one and is
+/// never visible with missing blobs.
+pub async fn replicate_oci_manifest(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<crate::api::middleware::auth::AuthExtension>>,
+    Path((key, digest)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let auth = match require_replication_auth(auth) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let repo_service =
+        crate::services::repository_service::RepositoryService::new(state.db.clone());
+    let repo = match repo_service.get_by_key(&key).await {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(resp) = require_oci_replication_route(&headers, &auth, &repo) {
+        return resp;
+    }
+    if !is_digest_reference(&digest) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "manifest replication requires a sha256 digest",
+        );
+    }
+    let image = headers
+        .get(REPLICATION_IMAGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let reference = headers
+        .get(REPLICATION_REFERENCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| digest.clone());
+    if image.as_deref().is_none_or(str::is_empty) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "NAME_INVALID",
+            "manifest replication requires the x-oci-image header",
+        );
+    }
+    let image = image.unwrap();
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(OCI_IMAGE_MEDIA_TYPE)
+        .to_string();
+
+    let body = match collect_request_body(body, state.config.max_upload_size_bytes as usize).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
+    // Verify the bytes hash to the claimed digest before anything is stored.
+    let computed = compute_sha256(&body);
+    if !digest.eq_ignore_ascii_case(&computed) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "manifest bytes do not match the claimed digest",
+        );
+    }
+    let class = classify_manifest(&body);
+    if matches!(class, ManifestClass::Malformed) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "manifest body is neither an image nor an index",
+        );
+    }
+    // #4422: descriptor sizes feed the usage ledger, so a negative or absurd
+    // declared size is an invalid manifest, not a number to trust.
+    if let Err(message) = validate_descriptor_sizes(&body) {
+        return oci_error(StatusCode::BAD_REQUEST, "MANIFEST_INVALID", message);
+    }
+    let content_type = stored_media_type_for(&class, &content_type);
+
+    let storage = match state.storage_for_repo_or_500(&repo.storage_location()) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let manifest_key = manifest_storage_key(&digest);
+    if let Err(e) = storage.put(&manifest_key, body.clone()).await {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    // The manifest row records the IMAGE size (config + layers), exactly as a
+    // native push does (#3601): each descriptor counts the size of the blob
+    // the repository actually holds (`oci_blobs.size_bytes`) — the blobs were
+    // transferred first, so the rows exist — and the declared size only for a
+    // blob it does not hold.
+    let artifact_path = format!("v2/{}/manifests/{}", image, reference);
+    let total_size: i64 = match held_descriptor_sizes(&state.db, repo.id, &body).await {
+        Ok(held) => resolved_image_size(&body, &held),
+        Err(e) => {
+            tracing::error!("manifest replication: reading held blob sizes failed: {e}");
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "failed to size the manifest",
+            );
+        }
+    };
+    let committed = commit_pushed_manifest(
+        &state,
+        PushedManifest {
+            repo_id: repo.id,
+            image: &image,
+            reference: &reference,
+            digest: &digest,
+            content_type: &content_type,
+            class: &class,
+            body: &body,
+            manifest_key: &manifest_key,
+            artifact_path: &artifact_path,
+            total_size,
+            uploaded_by: auth.user_id,
+            headers: &headers,
+        },
+    )
+    .await;
+    if let Err(refusal) = committed {
+        return refusal;
+    }
+
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .header(LOCATION, format!("/v2/{}/manifests/{}", image, digest))
+        .header("Docker-Content-Digest", &digest)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Upsert the `artifacts` row that makes a Docker/OCI manifest visible to the
@@ -11658,7 +12059,6 @@ async fn handle_put_manifest(
     // trigger touches the ledger, the sweep's own order. The manifest row is
     // charged 0 by quota admission; see `commit_pushed_manifest`.
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
-    let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
     let committed = commit_pushed_manifest(
         state,
         PushedManifest {
@@ -11673,42 +12073,12 @@ async fn handle_put_manifest(
             artifact_path: &artifact_path,
             total_size,
             uploaded_by: claims.sub,
+            headers,
         },
     )
     .await;
     if let Err(refusal) = committed {
         return refusal;
-    }
-
-    // Surface the pushed image in the packages catalog. The web UI's
-    // Packages tab reads `packages`/`package_versions` (via
-    // /api/v1/packages), NOT `artifacts` — every other format handler
-    // (composer, debian, incus, maven, npm, nuget, pypi, generic upload)
-    // populates the catalog on upload, but the OCI path never did, so a
-    // pushed image was pullable yet invisible in the Packages tab.
-    // Digest-only pushes are skipped: the child manifests of a multi-arch
-    // index are not user-facing versions (mirrors the tags/list filter).
-    // Best-effort — a catalog failure must not fail the push docker just
-    // committed (the fire-and-forget wrapper logs it).
-    if oci_reference_is_tag(reference) {
-        let child_size = match class {
-            ManifestClass::Index => {
-                index_child_artifact_size_sum(&state.db, repo_id, &digest).await
-            }
-            _ => 0,
-        };
-        crate::services::package_service::register_published_package_with_metadata(
-            &state.db,
-            &state.event_bus,
-            repo_id,
-            &image,
-            reference,
-            total_size.saturating_add(child_size),
-            checksum,
-            None,
-            Some(serde_json::json!({ "format": "docker" })),
-        )
-        .await;
     }
 
     info!("Manifest pushed: {}:{} ({})", image_name, reference, digest);
@@ -43813,5 +44183,153 @@ mod scan_config_unreadable_4365_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
         assert_eq!(json["errors"][0]["code"], "UNAVAILABLE");
         assert!(json["errors"][0]["message"].is_string());
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod oci_push_replication_4790_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn auth_header(username: &str, token: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{token}"))
+        )
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    async fn push_blob_v2(state: &SharedState, repo_key: &str, auth: &str, body: &[u8]) -> String {
+        let digest = format!("sha256:{}", sha256_hex(body));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{repo_key}/myimage/blobs/uploads/?digest={digest}"
+            ))
+            .header("Authorization", auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        let resp = router(None)
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "blob push failed");
+        digest
+    }
+
+    async fn push_manifest_v2(
+        state: &SharedState,
+        repo_key: &str,
+        auth: &str,
+        tag: &str,
+        body: String,
+    ) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/{repo_key}/myimage/manifests/{tag}"))
+            .header("Authorization", auth)
+            .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, bytes) = tdh::send(router(None).with_state(state.clone()), req).await;
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn make_image_manifest(
+        config_digest: &str,
+        config_size: i64,
+        layer_digests: &[&str],
+        layer_sizes: &[i64],
+    ) -> String {
+        let layers: Vec<serde_json::Value> = layer_digests
+            .iter()
+            .zip(layer_sizes.iter())
+            .map(|(d, s)| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": *d,
+                    "size": *s,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config_size},
+            "layers": layers
+        })
+        .to_string()
+    }
+
+    /// #4790: pushing an image to a hosted repo with a push peer subscribed must
+    /// queue the manifest AND its blob closure (config + layers) for replication.
+    /// A replicated request (x-artifact-keeper-replication) must not fan back out.
+    #[tokio::test]
+    async fn oci_image_push_queues_manifest_and_blob_closure_for_push_peer() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _) = auth_service
+            .generate_api_token(fx.user_id, "push-tok", vec!["*".to_string()], None)
+            .await
+            .expect("api token");
+        let auth = auth_header(&fx.username, &token);
+
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "oci-repl").await;
+
+        let config_body = b"config-bytes-for-4790";
+        let layer_body = b"layer-bytes-for-4790";
+        let config_digest = push_blob_v2(&fx.state, &fx.repo_key, &auth, config_body).await;
+        let layer_digest = push_blob_v2(&fx.state, &fx.repo_key, &auth, layer_body).await;
+
+        let manifest_body = make_image_manifest(
+            &config_digest,
+            config_body.len() as i64,
+            &[&layer_digest],
+            &[layer_body.len() as i64],
+        );
+        let (status, body) =
+            push_manifest_v2(&fx.state, &fx.repo_key, &auth, "v1", manifest_body).await;
+        assert_eq!(status, StatusCode::CREATED, "manifest push failed: {body}");
+        assert!(body.contains("Docker-Content-Digest") || status == StatusCode::CREATED);
+
+        let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        for table in [
+            "manifest_blob_refs",
+            "oci_manifest_refs",
+            "oci_blobs",
+            "oci_tags",
+            "artifacts",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE repository_id = $1");
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(fx.repo_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            queued,
+            vec!["v2/myimage/manifests/v1".to_string()],
+            "a client push must queue only the manifest task; the sync worker handles the blob closure"
+        );
     }
 }

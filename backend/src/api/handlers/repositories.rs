@@ -930,6 +930,20 @@ pub fn router() -> Router<SharedState> {
         )
         // Immutable revision history for versioned artifacts (#2367).
         .route("/:key/versions/*path", get(list_artifact_versions))
+        // Peer replication receive path for OCI/Docker images (#4790). These
+        // exist only for a peer's push-replication worker (guarded by the
+        // replication header + a service credential); OCI clients use the
+        // `/v2/*` routes. The sync worker sends a manifest's blob closure here
+        // first and the manifest last, so a replicated image is never visible
+        // with missing blobs.
+        .route(
+            "/:key/oci/blobs/:digest",
+            put(super::oci_v2::replicate_oci_blob),
+        )
+        .route(
+            "/:key/oci/manifests/:digest",
+            put(super::oci_v2::replicate_oci_manifest),
+        )
         // Note: `/:key/download/*path` lives in `download_router()` so it
         // can carry a stricter per-IP presign-mint rate limit (#1053) and
         // its own authentication layer (#4654).
