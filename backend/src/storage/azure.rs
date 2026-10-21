@@ -34,6 +34,12 @@
 //! # not reachable by clients (#4417). Backend calls keep the internal endpoint.
 //! AZURE_STORAGE_PUBLIC_ENDPOINT=https://blobs.example.com
 //!
+//! # Minimum deadline, in seconds, for one server-side copy (Put Blob From
+//! # URL). The default deadline is 60 s plus the source size at 8 MiB/s; raise
+//! # this when the account copies slower than that (#4858). Unset or 0 keeps
+//! # the size-derived deadline.
+//! AZURE_COPY_TIMEOUT_SECS=1800
+//!
 //! # For Artifactory migration:
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
 //! ```
@@ -97,6 +103,9 @@ pub struct AzureConfig {
     pub sas_expiry: Duration,
     /// Storage path format (native, artifactory, or migration)
     pub path_format: StoragePathFormat,
+    /// Minimum Put Blob From URL deadline (`AZURE_COPY_TIMEOUT_SECS`, #4858).
+    /// Zero keeps the size-derived deadline of [`put_blob_from_url_timeout`].
+    pub copy_timeout_floor: Duration,
 }
 
 impl AzureConfig {
@@ -129,6 +138,9 @@ impl AzureConfig {
 
         let path_format = StoragePathFormat::from_env();
 
+        let copy_timeout_floor =
+            parse_copy_timeout_floor(std::env::var("AZURE_COPY_TIMEOUT_SECS").ok().as_deref());
+
         Ok(Self {
             account_name,
             container_name,
@@ -138,6 +150,7 @@ impl AzureConfig {
             redirect_downloads,
             sas_expiry,
             path_format,
+            copy_timeout_floor,
         })
     }
 
@@ -201,6 +214,12 @@ const AZURE_BLOCK_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const AZURE_MAX_BLOCKS: usize = 50_000;
 const AZURE_BLOCK_WARNING_THRESHOLD: usize = 40_000;
 const AZURE_PUT_BLOB_FROM_URL_MAX_SIZE: u64 = 5_000 * 1024 * 1024;
+/// Fixed part of a Put Blob From URL request's deadline.
+const AZURE_PUT_BLOB_FROM_URL_BASE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Slowest server-side copy rate a Put Blob From URL deadline allows for.
+/// Azure sends no response byte until the copy is finished, so the deadline
+/// has to cover the whole copy: 5000 MiB at this rate is about 11 minutes.
+const AZURE_PUT_BLOB_FROM_URL_MIN_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 const AZURE_COPY_SOURCE_URL_MAX_LEN: usize = 2 * 1024;
 
 /// How far to backdate a SAS token's signed start (st) to tolerate clock
@@ -427,8 +446,31 @@ pub(crate) fn is_redirect_compatible(
 pub struct AzureBackend {
     config: AzureConfig,
     client: reqwest::Client,
+    /// Client for Put Blob From URL. It has no read timeout, because Azure
+    /// answers only once the copy is done; each request sets its own deadline
+    /// from [`put_blob_from_url_timeout`].
+    copy_client: reqwest::Client,
     auth: AzureAuthMode,
     path_format: StoragePathFormat,
+}
+
+/// Parse `AZURE_COPY_TIMEOUT_SECS`; unset or unparsable means no floor.
+fn parse_copy_timeout_floor(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Deadline for a Put Blob From URL request copying `size` bytes.
+///
+/// Azure performs the copy before it sends the response, so this bounds the
+/// whole copy, not a gap between reads. `floor` (`AZURE_COPY_TIMEOUT_SECS`)
+/// raises it for accounts that copy slower than the assumed rate.
+fn put_blob_from_url_timeout(size: u64, floor: Duration) -> Duration {
+    (AZURE_PUT_BLOB_FROM_URL_BASE_TIMEOUT
+        + Duration::from_secs(size.div_ceil(AZURE_PUT_BLOB_FROM_URL_MIN_BYTES_PER_SEC)))
+    .max(floor)
 }
 
 impl AzureBackend {
@@ -452,6 +494,9 @@ impl AzureBackend {
         let needs_http = allow_http || config.access_key.is_none();
 
         let client = crate::services::http_client::large_object_client_builder(needs_http)
+            .build()
+            .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
+        let copy_client = crate::services::http_client::server_side_copy_client_builder(needs_http)
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
         let token_client = crate::services::http_client::base_client_builder()
@@ -502,6 +547,7 @@ impl AzureBackend {
         Ok(Self {
             config,
             client,
+            copy_client,
             auth,
             path_format,
         })
@@ -821,11 +867,13 @@ impl AzureBackend {
         &self,
         dest_url: &str,
         source_url: &str,
+        timeout: Duration,
     ) -> Result<reqwest::Response> {
         let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         let mut request = self
-            .client
+            .copy_client
             .put(dest_url)
+            .timeout(timeout)
             .header("x-ms-date", &date_str)
             .header("x-ms-version", "2021-06-08")
             .header("x-ms-blob-type", "BlockBlob")
@@ -1579,7 +1627,13 @@ impl StorageBackend for AzureBackend {
             return self.copy_via_stream(source, dest).await;
         }
 
-        let source_url = self.read_url(source, Duration::from_secs(300))?;
+        // Azure reads the source while the request is open, so the source SAS
+        // must outlive the request rather than expire part-way through it.
+        let timeout = put_blob_from_url_timeout(size, self.config.copy_timeout_floor);
+        let source_url = self.read_url(
+            source,
+            Duration::from_secs(300).max(timeout + Duration::from_secs(60)),
+        )?;
         if source_url.len() > AZURE_COPY_SOURCE_URL_MAX_LEN {
             tracing::debug!(
                 source = %source,
@@ -1592,7 +1646,7 @@ impl StorageBackend for AzureBackend {
 
         let dest_url = self.write_url(dest)?;
         let response = self
-            .authorized_put_blob_from_url(&dest_url, &source_url)
+            .authorized_put_blob_from_url(&dest_url, &source_url, timeout)
             .await?;
         if !response.status().is_success() {
             let status = response.status();
@@ -1861,6 +1915,7 @@ mod tests {
             redirect_downloads: true,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            copy_timeout_floor: Duration::ZERO,
         }
     }
 
@@ -1874,6 +1929,7 @@ mod tests {
             redirect_downloads: false,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            copy_timeout_floor: Duration::ZERO,
         }
     }
 
@@ -1910,6 +1966,7 @@ mod tests {
         };
         AzureBackend {
             config: create_rbac_config(),
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -1936,6 +1993,7 @@ mod tests {
         config.path_format = path_format;
         AzureBackend {
             config,
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -2973,6 +3031,153 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_put_blob_from_url_timeout_covers_the_whole_copy() {
+        let none = Duration::ZERO;
+        assert_eq!(put_blob_from_url_timeout(0, none), Duration::from_secs(60));
+        assert_eq!(put_blob_from_url_timeout(1, none), Duration::from_secs(61));
+        // The 1.9 GiB layer from the bug report: about four minutes.
+        assert_eq!(
+            put_blob_from_url_timeout(2_046_467_024, none),
+            Duration::from_secs(60 + 244)
+        );
+        assert_eq!(
+            put_blob_from_url_timeout(AZURE_PUT_BLOB_FROM_URL_MAX_SIZE, none),
+            Duration::from_secs(60 + 625)
+        );
+    }
+
+    #[test]
+    fn test_put_blob_from_url_timeout_honours_the_configured_floor() {
+        let floor = Duration::from_secs(1800);
+        assert_eq!(put_blob_from_url_timeout(1, floor), floor);
+        // A floor below the size-derived deadline does not shorten it.
+        assert_eq!(
+            put_blob_from_url_timeout(AZURE_PUT_BLOB_FROM_URL_MAX_SIZE, Duration::from_secs(5)),
+            Duration::from_secs(60 + 625)
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_timeout_floor() {
+        assert_eq!(
+            parse_copy_timeout_floor(Some(" 1800 ")),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(parse_copy_timeout_floor(None), Duration::ZERO);
+        assert_eq!(parse_copy_timeout_floor(Some("soon")), Duration::ZERO);
+    }
+
+    /// Accept one connection, read one request's headers, and return them
+    /// with the socket. Put Blob From URL and HEAD carry no body.
+    async fn read_one_request(
+        listener: &tokio::net::TcpListener,
+    ) -> (tokio::net::TcpStream, String) {
+        use tokio::io::AsyncReadExt;
+        let (mut socket, _) = listener.accept().await.expect("accept request");
+        let mut received = Vec::new();
+        let mut buf = [0_u8; 1024];
+        while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).await.expect("read request");
+            assert_ne!(n, 0, "client closed before request headers");
+            received.extend_from_slice(&buf[..n]);
+        }
+        (socket, String::from_utf8_lossy(&received).into_owned())
+    }
+
+    /// Azure performs Put Blob From URL before it sends any response byte, so
+    /// copying a large blob leaves the connection silent for as long as the
+    /// copy takes. Through the 30-second read-inactivity timeout of the
+    /// data-plane client, every copy longer than that failed with "Azure Put
+    /// Blob From URL failed: error sending request", although Azure was still
+    /// copying. The copy must wait for the answer.
+    ///
+    /// The clock is paused only once the copy request has reached the server,
+    /// as in `test_large_object_client_builder_does_not_apply_total_timeout`.
+    /// It then moves in two steps: past the 30-second read timeout, where the
+    /// old client failed, and then to the server's answer at 45 seconds.
+    #[tokio::test]
+    async fn test_copy_waits_for_put_blob_from_url_longer_than_read_timeout() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (copy_received_tx, copy_received_rx) = tokio::sync::oneshot::channel::<()>();
+        let (answered_tx, answered_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (mut head_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("HEAD "), "size probe first: {request}");
+            // `Connection: close`, so the copy arrives on a new connection
+            // even when it is sent on the same client as the HEAD.
+            head_conn
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("answer HEAD");
+
+            let (mut copy_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("PUT "), "then the copy: {request}");
+            assert!(
+                request.to_ascii_lowercase().contains("x-ms-copy-source:"),
+                "the copy is Put Blob From URL: {request}"
+            );
+            copy_received_tx.send(()).expect("signal copy received");
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            copy_conn
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("answer copy");
+            answered_tx.send(()).expect("signal copy answered");
+        });
+
+        let mut backend = create_cached_rbac_backend_with_endpoint(endpoint);
+        // The clients `AzureBackend::new` builds, minus any proxy from the
+        // environment so the requests reach this test's listener.
+        backend.client = crate::services::http_client::large_object_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build data-plane client");
+        backend.copy_client = crate::services::http_client::server_side_copy_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build copy client");
+        let copy = tokio::spawn(async move {
+            StorageBackendTrait::copy(&backend, "source/blob.bin", "dest/blob.bin").await
+        });
+
+        // Real time still runs here, so a copy that never reaches the server
+        // fails the test instead of hanging it.
+        tokio::time::timeout(Duration::from_secs(20), copy_received_rx)
+            .await
+            .expect("copy request reached the server in time")
+            .expect("copy request reached the server");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        if copy.is_finished() {
+            panic!(
+                "the copy gave up while Azure was still copying: {:?}",
+                copy.await
+            );
+        }
+        tokio::time::advance(Duration::from_secs(14)).await;
+        answered_rx.await.expect("server answered the copy");
+        // Socket readiness arrives in wall-clock time; see the test named above.
+        tokio::time::resume();
+
+        copy.await
+            .expect("copy task")
+            .expect("copy succeeds once Azure answers");
+        server.await.expect("server task");
+    }
+
     #[tokio::test]
     async fn test_copy_streams_large_source_instead_of_put_blob_from_url() {
         use crate::storage::StorageBackend as StorageBackendTrait;
@@ -3430,6 +3635,7 @@ mod tests {
         config.redirect_downloads = true;
         let backend = AzureBackend {
             config,
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -3567,6 +3773,7 @@ mod tests {
         config.endpoint = Some("https://gov.blob.core.usgovcloudapi.net".to_string());
         let backend = AzureBackend {
             config,
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
@@ -3590,6 +3797,7 @@ mod tests {
         };
         let backend = AzureBackend {
             config: create_rbac_config(),
+            copy_client: client.clone(),
             client,
             auth: AzureAuthMode::TokenCredential {
                 provider: Arc::new(provider),
