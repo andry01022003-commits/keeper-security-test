@@ -1306,7 +1306,7 @@ impl GcsBackend {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "GCS resumable session abort request failed");
+                tracing::warn!(error = %e.without_url(), "GCS resumable session abort request failed");
             }
         }
     }
@@ -1330,7 +1330,12 @@ impl GcsBackend {
             .header("Content-Range", content_range(0, 0, total))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS resumable status query failed: {}", e)))?;
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "GCS resumable status query failed: {}",
+                    e.without_url()
+                ))
+            })?;
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
@@ -1396,7 +1401,8 @@ impl GcsBackend {
             .map_err(|e| {
                 AppError::ServiceUnavailable(format!(
                     "GCS resumable finalize (range {}) network error: {}",
-                    range, e
+                    range,
+                    e.without_url()
                 ))
             })?;
 
@@ -1481,12 +1487,14 @@ impl GcsBackend {
                     if attempt < CHUNK_MAX_ATTEMPTS {
                         last_err = Some(AppError::ServiceUnavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
-                            range, e
+                            range,
+                            e.without_url()
                         )));
                     } else {
                         return Err(AppError::ServiceUnavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
-                            range, e
+                            range,
+                            e.without_url()
                         )));
                     }
                 }
@@ -4373,5 +4381,29 @@ mod tests {
             "expected storage error mentioning 403, got: {:?}",
             err
         );
+    }
+
+    /// A resumable session URI authorizes uploads to the session by itself,
+    /// so a transport error must not repeat it in the returned message.
+    #[tokio::test]
+    async fn test_resumable_session_errors_omit_the_session_url() {
+        let backend = mock_backend("http://127.0.0.1:0").await;
+        // Port 0 cannot be connected to, so each request fails in transport.
+        let session_url = "http://127.0.0.1:0/upload/storage/v1/b/test-bucket/o?uploadType=resumable&upload_id=session-capability";
+
+        let status_err = backend
+            .query_resumable_offset(session_url, Some(10))
+            .await
+            .expect_err("status query fails");
+        let finalize_err = backend
+            .finalize_resumable(session_url, 10)
+            .await
+            .expect_err("finalize fails");
+        for message in [status_err.to_string(), finalize_err.to_string()] {
+            assert!(
+                !message.contains("upload_id"),
+                "error message must not carry the session URL: {message}"
+            );
+        }
     }
 }

@@ -1119,6 +1119,25 @@ async fn execute_transfer(
         return execute_delete(db, client, task, peer_endpoint, peer_api_key, retry_policy).await;
     }
 
+    // #4790: an OCI/Docker manifest task cannot be replicated as a single
+    // artifact PUT — the manifest's config and layer blobs live in `oci_blobs`,
+    // not `artifacts`, so a peer that received only the manifest bytes would
+    // serve an image whose blobs 404. Transfer the manifest together with its
+    // blob closure (config + layers, and child manifests for an index) through
+    // the blob-aware receive path, blobs first and the manifest last.
+    if is_oci_manifest_task(task) {
+        return execute_oci_transfer(
+            db,
+            client,
+            &storage_registry,
+            task,
+            peer_endpoint,
+            peer_api_key,
+            retry_policy,
+        )
+        .await;
+    }
+
     // Push flow: decide between single-request upload and chunked transfer
     // based on the artifact size or the need to preserve metadata.
     let threshold = chunked_threshold_bytes();
@@ -1189,6 +1208,354 @@ async fn execute_transfer(
             Err(msg)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OCI/Docker manifest replication (#4790)
+// ---------------------------------------------------------------------------
+
+/// Prefix of every final, content-addressed OCI blob key (mirrors
+/// `oci_v2::OCI_BLOB_KEY_PREFIX`).
+const OCI_BLOB_KEY_PREFIX: &str = "oci-blobs/";
+/// Prefix of every OCI manifest storage key (mirrors
+/// `oci_v2::manifest_storage_key`).
+const OCI_MANIFEST_KEY_PREFIX: &str = "oci-manifests/";
+
+/// True when a claimed push task is an OCI/Docker manifest rather than a plain
+/// artifact. The OCI push path writes `artifacts.path =
+/// v2/<image>/manifests/<reference>` (see `upsert_manifest_artifact`), which is
+/// the marker the artifact-driven worker keys on.
+fn is_oci_manifest_task(task: &TaskRow) -> bool {
+    task.task_type != "delete" && parse_oci_manifest_path(&task.artifact_path).is_some()
+}
+
+/// Parse `v2/<image>/manifests/<reference>` into `(image, reference)`.
+fn parse_oci_manifest_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("v2/")?;
+    let (image, reference) = rest.split_once("/manifests/")?;
+    if image.is_empty() || reference.is_empty() {
+        return None;
+    }
+    Some((image, reference))
+}
+
+/// One content object to transfer for an OCI manifest task: a blob, or a
+/// manifest (the image's own, a child of an index, or the index itself).
+#[derive(Clone)]
+pub(crate) struct OciTransferItem {
+    /// `true` for a manifest (sent to the manifest route), `false` for a blob.
+    pub(crate) is_manifest: bool,
+    /// Canonical `sha256:<hex>` digest the receiver verifies bytes against.
+    pub(crate) digest: String,
+    /// Local storage key the bytes are read from.
+    pub(crate) storage_key: String,
+    /// Media type; only meaningful for a manifest.
+    pub(crate) content_type: String,
+}
+
+/// Build the ordered transfer plan for a manifest: every blob BEFORE the
+/// manifest that references it, a child manifest before its index, and the
+/// top-level manifest LAST.
+///
+/// The closure is read from the OCI tables (`manifest_blob_refs` for an image's
+/// config/layers, `oci_manifest_refs` for an index's children), so the plan is
+/// exactly what a native push recorded. Bounded by `MAX_DEPTH` against a
+/// pathological self-referential index; a cycle is impossible on the
+/// content-addressed write path but the guard keeps the walk cheap and total.
+pub(crate) async fn build_oci_transfer_plan(
+    db: &PgPool,
+    repo_id: Uuid,
+    top: &OciTransferItem,
+) -> Result<Vec<OciTransferItem>, String> {
+    const MAX_DEPTH: usize = 8;
+    let mut plan: Vec<OciTransferItem> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Walk a manifest: enqueue its blobs, then each index child's closure and
+    // bytes (child manifest committed after its own blobs), then the child.
+    // The top-level manifest is pushed by the caller AFTER the walk.
+    fn walk<'a>(
+        db: &'a PgPool,
+        repo_id: Uuid,
+        item: OciTransferItem,
+        depth: usize,
+        plan: &'a mut Vec<OciTransferItem>,
+        seen: &'a mut std::collections::HashSet<String>,
+    ) -> futures::future::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if depth > MAX_DEPTH || !seen.insert(item.digest.clone()) {
+                return Ok(());
+            }
+            let mut blob_digests: Vec<String> = sqlx::query_scalar(
+                "SELECT blob_digest FROM manifest_blob_refs \
+                 WHERE repository_id = $1 AND manifest_digest = $2",
+            )
+            .bind(repo_id)
+            .bind(&item.digest)
+            .fetch_all(db)
+            .await
+            .map_err(|e| format!("Failed to read manifest blob refs: {e}"))?;
+            blob_digests.sort();
+            blob_digests.dedup();
+            for blob_digest in blob_digests {
+                if seen.insert(blob_digest.clone()) {
+                    plan.push(OciTransferItem {
+                        is_manifest: false,
+                        storage_key: format!("{OCI_BLOB_KEY_PREFIX}{blob_digest}"),
+                        digest: blob_digest,
+                        content_type: "application/octet-stream".to_string(),
+                    });
+                }
+            }
+
+            let mut children: Vec<String> = sqlx::query_scalar(
+                "SELECT child_digest FROM oci_manifest_refs \
+                 WHERE repository_id = $1 AND parent_digest = $2",
+            )
+            .bind(repo_id)
+            .bind(&item.digest)
+            .fetch_all(db)
+            .await
+            .map_err(|e| format!("Failed to read index child refs: {e}"))?;
+            children.sort();
+            children.dedup();
+            for child_digest in children {
+                if seen.contains(&child_digest) {
+                    continue;
+                }
+                let child_item = OciTransferItem {
+                    is_manifest: true,
+                    storage_key: format!("{OCI_MANIFEST_KEY_PREFIX}{child_digest}"),
+                    digest: child_digest.clone(),
+                    content_type: child_manifest_content_type(db, repo_id, &child_digest)
+                        .await
+                        .unwrap_or_else(|| {
+                            "application/vnd.oci.image.manifest.v1+json".to_string()
+                        }),
+                };
+                walk(db, repo_id, child_item.clone(), depth + 1, plan, seen).await?;
+                // The child manifest is committed only after its own blobs.
+                plan.push(child_item);
+            }
+            Ok(())
+        })
+    }
+
+    walk(db, repo_id, top.clone(), 0, &mut plan, &mut seen).await?;
+    // The top-level manifest LAST, so the peer never has a pullable manifest
+    // whose referenced content is absent.
+    plan.push(OciTransferItem {
+        is_manifest: true,
+        digest: top.digest.clone(),
+        storage_key: top.storage_key.clone(),
+        content_type: top.content_type.clone(),
+    });
+    Ok(plan)
+}
+
+/// The content type recorded for a by-digest child manifest, if any.
+async fn child_manifest_content_type(db: &PgPool, repo_id: Uuid, digest: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT manifest_content_type FROM oci_tags \
+         WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(digest)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Execute a blob-aware OCI manifest transfer to a remote peer (#4790).
+///
+/// The manifest's blob closure and any index children go through the peer's
+/// replication content routes first; the top-level manifest is committed LAST
+/// by the peer, so a partially transferred image never becomes pullable.
+async fn execute_oci_transfer(
+    db: &PgPool,
+    client: &reqwest::Client,
+    storage_registry: &StorageRegistry,
+    task: &Claimed<TaskRow>,
+    peer_endpoint: &str,
+    peer_api_key: &str,
+    retry_policy: SyncRetryPolicy,
+) -> Result<(), String> {
+    let (image, reference) = match parse_oci_manifest_path(&task.artifact_path) {
+        Some(parts) => parts,
+        None => {
+            let msg = format!(
+                "OCI manifest task has an unparseable path: {}",
+                task.artifact_path
+            );
+            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            return Err(msg);
+        }
+    };
+    let manifest_digest = format!(
+        "sha256:{}",
+        task.checksum_sha256.trim_start_matches("sha256:")
+    );
+    let storage = match storage_for_task(storage_registry, task) {
+        Ok(s) => s,
+        Err(e) => {
+            handle_transfer_failure(db, task, &e, retry_policy).await;
+            return Err(e);
+        }
+    };
+    let top = OciTransferItem {
+        is_manifest: true,
+        digest: manifest_digest,
+        storage_key: task.storage_key.clone(),
+        content_type: task.content_type.clone(),
+    };
+    let plan = match build_oci_transfer_plan(db, task.repository_id, &top).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            handle_transfer_failure(db, task, &e, retry_policy).await;
+            return Err(e);
+        }
+    };
+
+    let mut total_bytes: i64 = 0;
+    for item in &plan {
+        let bytes = match storage.get(&item.storage_key).await {
+            Ok(b) => b.to_vec(),
+            Err(e) => {
+                let msg = format!(
+                    "Storage read error for {} ({}): {e}",
+                    item.digest, item.storage_key
+                );
+                handle_transfer_failure(db, task, &msg, retry_policy).await;
+                return Err(msg);
+            }
+        };
+        total_bytes = total_bytes.saturating_add(bytes.len() as i64);
+        let (url, headers) = if item.is_manifest {
+            // Only the top-level manifest carries the client's tag; a child
+            // manifest transferred by digest is sent with its digest as the
+            // reference, mirroring a native by-digest push (which records a
+            // digest-shaped tag) and never letting a child claim the top tag.
+            let item_reference = if item.digest == top.digest {
+                reference
+            } else {
+                item.digest.as_str()
+            };
+            (
+                build_oci_manifest_replication_url(
+                    peer_endpoint,
+                    &task.repository_key,
+                    &item.digest,
+                ),
+                oci_manifest_replication_headers(
+                    task,
+                    peer_api_key,
+                    image,
+                    item_reference,
+                    &item.content_type,
+                ),
+            )
+        } else {
+            (
+                build_oci_blob_replication_url(peer_endpoint, &task.repository_key, &item.digest),
+                oci_blob_replication_headers(peer_api_key),
+            )
+        };
+        let request = headers
+            .into_iter()
+            .fold(client.put(&url), |req, (name, value)| {
+                req.header(name, value)
+            });
+        match request.body(bytes).send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| unreadable_response_body());
+                let msg =
+                    format_peer_response_failure("Remote peer returned", status.as_u16(), &body);
+                handle_transfer_failure(db, task, &msg, retry_policy).await;
+                return Err(msg);
+            }
+            Err(e) => {
+                let msg = format!("HTTP request failed: {e}");
+                handle_transfer_failure(db, task, &msg, retry_policy).await;
+                return Err(msg);
+            }
+        }
+    }
+
+    handle_transfer_success(db, task, total_bytes).await;
+    tracing::info!(
+        "Replicated OCI image '{}:{}' ({} objects, {} bytes) to peer (task {})",
+        image,
+        reference,
+        plan.len(),
+        total_bytes,
+        task.id
+    );
+    Ok(())
+}
+
+/// Build the URL to replicate one blob to a peer.
+pub(crate) fn build_oci_blob_replication_url(
+    peer_endpoint: &str,
+    repository_key: &str,
+    digest: &str,
+) -> String {
+    format!(
+        "{}/api/v1/repositories/{}/oci/blobs/{}",
+        peer_endpoint.trim_end_matches('/'),
+        encode_artifact_path(repository_key),
+        encode_artifact_path(digest)
+    )
+}
+
+/// Build the URL to replicate one manifest to a peer.
+pub(crate) fn build_oci_manifest_replication_url(
+    peer_endpoint: &str,
+    repository_key: &str,
+    digest: &str,
+) -> String {
+    format!(
+        "{}/api/v1/repositories/{}/oci/manifests/{}",
+        peer_endpoint.trim_end_matches('/'),
+        encode_artifact_path(repository_key),
+        encode_artifact_path(digest)
+    )
+}
+
+fn oci_blob_replication_headers(peer_api_key: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("Authorization", format!("Bearer {peer_api_key}")),
+        (
+            REPLICATION_REQUEST_HEADER,
+            REPLICATION_REQUEST_VALUE.to_string(),
+        ),
+        ("Content-Type", "application/octet-stream".to_string()),
+    ]
+}
+
+fn oci_manifest_replication_headers(
+    task: &TaskRow,
+    peer_api_key: &str,
+    image: &str,
+    reference: &str,
+    content_type: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("Authorization", format!("Bearer {peer_api_key}")),
+        (
+            REPLICATION_REQUEST_HEADER,
+            REPLICATION_REQUEST_VALUE.to_string(),
+        ),
+        ("Content-Type", content_type.to_string()),
+        ("x-oci-image", image.to_string()),
+        ("x-oci-reference", reference.to_string()),
+        (CHECKSUM_SHA256_HEADER, task.checksum_sha256.clone()),
+    ]
 }
 
 /// Execute a chunked upload for a large replicated artifact.

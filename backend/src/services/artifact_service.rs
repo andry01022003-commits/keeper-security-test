@@ -919,6 +919,16 @@ impl ArtifactService {
         // replaced would still expose the *old* sha1/md5 via the
         // checksum-search endpoint, which would point dedup-by-checksum
         // clients at the wrong artifact.
+        //
+        // #4832: the `WHERE` on the update is the live-overwrite rule of
+        // `enforce_path_immutability` (check 1), applied atomically. That
+        // check runs in the preflight, before the bytes are stored and outside
+        // this transaction, so concurrent uploads to one path all passed it
+        // and every one answered 201 while the last upsert silently replaced
+        // the others. Here the conflicting row is locked: a live row at the
+        // same version is left untouched (no row returned) and the upload is
+        // refused with the preflight's own 409. A tombstone is resurrected
+        // and a versioning-enabled repository appends, as before.
         let artifact = sqlx::query_as!(
             Artifact,
             r#"
@@ -940,6 +950,9 @@ impl ArtifactService {
                 uploaded_by = EXCLUDED.uploaded_by,
                 is_deleted = false,
                 updated_at = NOW()
+            WHERE artifacts.is_deleted
+                OR $12
+                OR artifacts.version IS DISTINCT FROM EXCLUDED.version
             RETURNING
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
@@ -957,11 +970,20 @@ impl ArtifactService {
             checksum_md5,
             content_type,
             storage_key,
-            uploaded_by
+            uploaded_by,
+            versioning_active
         )
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        let Some(artifact) = artifact else {
+            // Drop `tx` (rolls back the quota admission). The content blob is
+            // content-addressed; if this upload orphaned it, storage GC
+            // reclaims it, as on the quota-deny path above.
+            return Err(AppError::Conflict(
+                "Artifact version already exists and is immutable".to_string(),
+            ));
+        };
 
         // Commit the admission + INSERT together, releasing the ledger-row
         // lock. Everything below is a post-commit side effect on the pool.
@@ -3202,6 +3224,116 @@ mod tests {
             std::fs::read(&on_disk).expect("read the CAS object"),
             payload,
             "the deduplicated object must still hold the payload"
+        );
+    }
+
+    /// #4832: concurrent uploads to one free path must agree on a single
+    /// winner. The live-overwrite check ran before the bytes were stored and
+    /// outside the commit transaction, so every racer passed it, every one
+    /// answered 201, and the last upsert silently replaced the content the
+    /// earlier ones had been acknowledged for. Exactly one upload succeeds;
+    /// the others get the documented 409 and the stored row is the winner's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_4832_concurrent_uploads_to_one_path_have_one_winner() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = Arc::new(ArtifactService::new(pool.clone(), storage));
+
+        const RACERS: usize = 8;
+        let start = Arc::new(tokio::sync::Barrier::new(RACERS));
+        let mut racers = tokio::task::JoinSet::new();
+        for i in 0..RACERS {
+            let (svc, start) = (svc.clone(), start.clone());
+            let payload = Bytes::from(format!("racer {i} payload ").repeat(512));
+            racers.spawn(async move {
+                start.wait().await;
+                let result = svc
+                    .upload_with_sync_options(
+                        repo_id,
+                        "race/blob.bin",
+                        "blob.bin",
+                        None,
+                        "application/octet-stream",
+                        payload.clone(),
+                        Some(user_id),
+                        false,
+                    )
+                    .await;
+                (ArtifactService::calculate_sha256(&payload), result)
+            });
+        }
+        let mut winners = Vec::new();
+        let mut conflicts = 0;
+        while let Some(joined) = racers.join_next().await {
+            match joined.expect("racer task") {
+                (sha, Ok(artifact)) => winners.push((sha, artifact.checksum_sha256)),
+                (_, Err(AppError::Conflict(message))) => {
+                    assert_eq!(message, "Artifact version already exists and is immutable");
+                    conflicts += 1;
+                }
+                (_, Err(other)) => panic!("unexpected upload error: {other:?}"),
+            }
+        }
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind("race/blob.bin")
+        .fetch_all(&pool)
+        .await
+        .expect("read the stored row");
+
+        // Control: a versioning-enabled Generic repository appends a revision
+        // for each sequential upload to one path instead of refusing (#2367).
+        let (versioned_id, _key, versioned_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(versioned_id)
+            .execute(&pool)
+            .await
+            .expect("enable versioning");
+        let versioned = ArtifactService::new(
+            pool.clone(),
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                versioned_dir.clone(),
+            )),
+        );
+        for body in ["first revision", "second revision"] {
+            versioned
+                .upload_with_sync_options(
+                    versioned_id,
+                    "tool/tool.bin",
+                    "tool.bin",
+                    None,
+                    "application/octet-stream",
+                    Bytes::from_static(body.as_bytes()),
+                    Some(user_id),
+                    false,
+                )
+                .await
+                .expect("a versioning-enabled repository accepts a second upload");
+        }
+
+        tdh::cleanup(&pool, versioned_id, user_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&versioned_dir);
+
+        assert_eq!(winners.len(), 1, "exactly one upload succeeds");
+        assert_eq!(conflicts, RACERS - 1, "every other upload is refused");
+        let (winner_sha, returned_sha) = &winners[0];
+        assert_eq!(returned_sha, winner_sha);
+        assert_eq!(
+            stored,
+            vec![winner_sha.clone()],
+            "the stored row is the winner's"
         );
     }
 

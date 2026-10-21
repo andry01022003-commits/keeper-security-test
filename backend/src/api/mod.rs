@@ -471,7 +471,8 @@ impl AppState {
     }
 
     /// Convenience for handlers that return `Result<..., Response>`.
-    /// Resolves storage and maps errors to a 500 plain-text response.
+    /// Resolves storage and maps errors to a 500 plain-text response, except a
+    /// backend skipped at startup, which keeps its 503 (#4530).
     #[allow(clippy::result_large_err)]
     pub fn storage_for_repo_or_500(
         &self,
@@ -479,6 +480,11 @@ impl AppState {
     ) -> Result<Arc<dyn StorageBackend>, Response> {
         self.storage_for_repo(location).map_err(|e| {
             tracing::error!("Storage backend resolution failed: {}", e);
+            // A backend skipped at startup is a 503 naming it (#4530), not a
+            // bare 500.
+            if matches!(e, crate::error::AppError::ServiceUnavailable(_)) {
+                return e.into_response();
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage operation failed",
@@ -1206,5 +1212,49 @@ mod tests {
         }
         // Permit returned to the pool after drop, the next acquire must succeed.
         assert!(sem.clone().try_acquire_owned().is_ok());
+    }
+
+    /// #4530: `storage_for_repo_or_500` keeps the 503 of a backend skipped at
+    /// startup (naming it, without the configuration error) and still maps
+    /// every other resolution failure to the historic plain 500.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // STREAMING-EXEMPT: test reads a small, bounded error body
+    async fn storage_for_repo_or_500_keeps_skipped_backend_503_4530() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("skip-4530-{}", Uuid::new_v4()));
+        let mut state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let mut registry =
+            StorageRegistry::new(std::collections::HashMap::new(), "filesystem".to_string());
+        registry.record_skipped_backend("s3", "S3_PUBLIC_ENDPOINT=\"ftp://internal.example\"");
+        Arc::get_mut(&mut state)
+            .expect("fresh state has one owner")
+            .storage_registry = Arc::new(registry);
+
+        let skipped = state
+            .storage_for_repo_or_500(&StorageLocation {
+                backend: "s3".to_string(),
+                path: "repo/x".to_string(),
+            })
+            .err()
+            .expect("a skipped backend must not resolve");
+        assert_eq!(skipped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(skipped.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("'s3'"), "names the backend: {body}");
+        assert!(
+            !body.contains("internal.example"),
+            "does not carry the configuration error: {body}"
+        );
+
+        let unknown = state
+            .storage_for_repo_or_500(&StorageLocation {
+                backend: "azure".to_string(),
+                path: "repo/x".to_string(),
+            })
+            .err()
+            .expect("an unconfigured backend must not resolve");
+        assert_eq!(unknown.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

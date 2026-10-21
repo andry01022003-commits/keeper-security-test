@@ -147,7 +147,9 @@ pub struct MintedApiToken {
 /// [`refresh_tokens`] for the rotation/family-revocation logic). They are
 /// serialized as standard JWT claims when present and omitted otherwise so
 /// existing access-token consumers keep parsing the JWT unchanged. Access
-/// tokens leave both fields `None`.
+/// tokens leave `jti` `None`; an access token minted as half of a token pair
+/// carries its refresh token's `family_id` so logout can revoke the session
+/// from the access token alone (#4831).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     /// Subject (user ID)
@@ -186,7 +188,8 @@ pub struct Claims {
     pub jti: Option<Uuid>,
     /// Refresh-token family identifier. All tokens minted from the same login
     /// share a `family_id`; replay of a consumed token revokes the whole
-    /// family. Set on refresh tokens only.
+    /// family. Set on refresh tokens and on the access token minted with
+    /// them (#4831); `None` on access-only mints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family_id: Option<Uuid>,
     /// Repository routing key this token is authorized to *pull* from, and
@@ -1834,11 +1837,15 @@ impl AuthService {
         // action-scope ceiling as the access token: `refresh_tokens` and
         // `mint_access_from_registry_refresh` re-mint from them, so leaving
         // either off would widen the grant on refresh (#4261, #2430).
+        // The access token carries the session's `family_id` too, so a
+        // logout presenting only the access token can still revoke this
+        // session's refresh-token family (#4831).
         let access = self.mint_access_token(
             user,
             allowed_repo_ids.clone(),
             scopes.clone(),
             credential_exp,
+            Some(family_id),
         )?;
         let refresh_exp = access.now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
@@ -1885,18 +1892,23 @@ impl AuthService {
         credential_exp: Option<DateTime<Utc>>,
     ) -> Result<AccessToken> {
         Ok(self
-            .mint_access_token(user, allowed_repo_ids, scopes, credential_exp)?
+            .mint_access_token(user, allowed_repo_ids, scopes, credential_exp, None)?
             .token)
     }
 
     /// The access half of every token mint: claims, the exchange cap on
     /// `exp`, and the `iat`/`iat_ms` anchor a paired refresh token shares.
+    ///
+    /// `family_id` is the paired refresh token's family (`None` for an
+    /// access-only mint), so logout can revoke the session from the access
+    /// token alone (#4831).
     fn mint_access_token(
         &self,
         user: &User,
         allowed_repo_ids: Option<Vec<Uuid>>,
         scopes: Option<Vec<String>>,
         credential_exp: Option<DateTime<Utc>>,
+        family_id: Option<Uuid>,
     ) -> Result<MintedAccess> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
@@ -1934,7 +1946,7 @@ impl AuthService {
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
             jti: None,
-            family_id: None,
+            family_id,
             scan_pull_repo: None,
             scopes,
         };
@@ -2651,6 +2663,14 @@ impl AuthService {
         let Some(family_id) = token_data.claims.family_id else {
             return Ok(0);
         };
+        self.revoke_refresh_token_family(family_id).await
+    }
+
+    /// Revoke every unrevoked refresh-token jti row in `family_id` (one login
+    /// session). Used by logout when the caller presents only the session's
+    /// access token, which carries the same `family_id` (#4831). Returns the
+    /// number of rows revoked.
+    pub async fn revoke_refresh_token_family(&self, family_id: Uuid) -> Result<u64> {
         let result = sqlx::query(
             r#"
             UPDATE refresh_token_jti
@@ -4822,6 +4842,41 @@ mod tests {
         assert!(
             claims.scan_pull_repo.is_none(),
             "normal tokens carry no scan scope (no-op for enforcement)"
+        );
+    }
+
+    /// The access half of a token pair carries its refresh token's
+    /// `family_id`, so logout can revoke the session from the access token
+    /// alone (#4831). Access-only mints carry none.
+    #[tokio::test]
+    async fn access_token_carries_family_id_matching_its_refresh_token() {
+        let auth = make_lazy_auth_service();
+        let user = make_test_user();
+        let tokens = auth.generate_tokens(&user).expect("tokens");
+        let access = auth
+            .validate_access_token(&tokens.access_token)
+            .expect("access token must validate");
+        let refresh = auth
+            .decode_token(&tokens.refresh_token)
+            .expect("refresh token must decode")
+            .claims;
+        assert!(refresh.family_id.is_some(), "refresh token has a family");
+        assert_eq!(
+            access.family_id, refresh.family_id,
+            "access token must carry its refresh token's family_id"
+        );
+        assert_eq!(access.token_type, "access");
+        assert!(access.jti.is_none(), "access tokens keep no jti");
+
+        let access_only = auth
+            .generate_access_token_capped(&user, None, None, None)
+            .expect("access-only mint");
+        let claims = auth
+            .validate_access_token(&access_only.access_token)
+            .expect("access-only token must validate");
+        assert!(
+            claims.family_id.is_none(),
+            "an access-only mint has no session family"
         );
     }
 

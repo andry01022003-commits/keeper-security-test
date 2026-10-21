@@ -28,6 +28,7 @@ async fn test_azure_shared_key_put_get_exists_delete() {
         redirect_downloads: true,
         sas_expiry: std::time::Duration::from_secs(3600),
         path_format: artifact_keeper_backend::storage::StoragePathFormat::Native,
+        copy_timeout_floor: std::time::Duration::ZERO,
     };
 
     use artifact_keeper_backend::storage::StorageBackend;

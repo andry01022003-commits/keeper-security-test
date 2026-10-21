@@ -754,11 +754,15 @@ async fn authorize_virtual_member_mutation(
 
     // Fine-grained privilege gate on the virtual parent. Admins short-circuit
     // with no DB lookup; non-admins need `repository:admin` on the virtual repo.
+    // The decision goes through `check_repository_action` so the `admin` action
+    // can come from a role assignment (`repository-owner`, which repository
+    // creation grants to the creator) and not only a fine-grained rule — the
+    // same gap `require_repo_admin` had (#4818/#4834).
     let has_repo_admin = if auth.is_admin {
         true
     } else {
         permission_service
-            .check_permission(auth.user_id, "repository", virtual_repo.id, "admin", false)
+            .check_repository_action(auth.user_id, virtual_repo.id, "admin", false)
             .await?
     };
     if !member_mutation_admin_allowed(auth.is_admin, has_repo_admin) {
@@ -926,6 +930,20 @@ pub fn router() -> Router<SharedState> {
         )
         // Immutable revision history for versioned artifacts (#2367).
         .route("/:key/versions/*path", get(list_artifact_versions))
+        // Peer replication receive path for OCI/Docker images (#4790). These
+        // exist only for a peer's push-replication worker (the replication
+        // header, then the generic upload's write gates); OCI clients use the
+        // `/v2/*` routes. The sync worker sends a manifest's blob closure here
+        // first and the manifest last, so a replicated image is never visible
+        // with missing blobs.
+        .route(
+            "/:key/oci/blobs/:digest",
+            put(super::oci_v2::replicate_oci_blob),
+        )
+        .route(
+            "/:key/oci/manifests/:digest",
+            put(super::oci_v2::replicate_oci_manifest),
+        )
         // Note: `/:key/download/*path` lives in `download_router()` so it
         // can carry a stricter per-IP presign-mint rate limit (#1053) and
         // its own authentication layer (#4654).
@@ -1824,6 +1842,16 @@ fn enforce_public_upstream_credentials(
 /// The upstream-auth and override halves of the #4662 state, read from
 /// `repository_config` in one query: `(upstream_auth_configured, accepted)`.
 async fn public_credentials_config(db: &sqlx::PgPool, repo_id: Uuid) -> Result<(bool, bool)> {
+    let (auth_type, accepted) = public_credentials_state(db, repo_id).await?;
+    Ok((auth_type.is_some(), accepted))
+}
+
+/// [`public_credentials_config`] keeping the configured upstream auth type:
+/// `(upstream_auth_type, accepted)`.
+async fn public_credentials_state(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+) -> Result<(Option<String>, bool)> {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT key, value FROM repository_config \
          WHERE repository_id = $1 AND key IN ('upstream_auth_type', $2)",
@@ -1836,16 +1864,19 @@ async fn public_credentials_config(db: &sqlx::PgPool, repo_id: Uuid) -> Result<(
     Ok(public_credentials_flags(rows))
 }
 
-/// Fold `repository_config` rows into `(upstream_auth_configured, accepted)`.
+/// Fold `repository_config` rows into `(upstream_auth_type, accepted)`. The
+/// auth type is filtered like the detail handler's (`none` or empty is no
+/// auth), so every response that carries these rows reports the same
+/// `upstream_auth_type` / `upstream_auth_configured` (#4851).
 fn public_credentials_flags(
     rows: impl IntoIterator<Item = (String, Option<String>)>,
-) -> (bool, bool) {
-    let mut flags = (false, false);
+) -> (Option<String>, bool) {
+    let mut flags = (None, false);
     for (key, value) in rows {
         if key == PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY {
             flags.1 = value.as_deref() == Some("true");
         } else {
-            flags.0 = crate::services::upstream_auth::filter_auth_type(value).is_some();
+            flags.0 = crate::services::upstream_auth::filter_auth_type(value);
         }
     }
     flags
@@ -1886,18 +1917,23 @@ async fn with_public_upstream_credentials(
     db: &sqlx::PgPool,
     mut response: RepositoryResponse,
 ) -> Result<RepositoryResponse> {
-    let (auth_configured, accepted) = public_credentials_config(db, response.id).await?;
-    apply_public_credentials_flags(&mut response, auth_configured, accepted);
+    let (auth_type, accepted) = public_credentials_state(db, response.id).await?;
+    apply_public_credentials_flags(&mut response, auth_type, accepted);
     Ok(response)
 }
 
+/// Set the upstream-auth fields and the #4662 fields from the folded
+/// `repository_config` rows. The list, create and update responses are built
+/// here, so they report upstream auth exactly as the detail response (#4851).
 fn apply_public_credentials_flags(
     response: &mut RepositoryResponse,
-    auth_configured: bool,
+    auth_type: Option<String>,
     accepted: bool,
 ) {
-    response.public_with_upstream_credentials =
-        response.is_public && (auth_configured || response.upstream_url_has_credentials);
+    response.upstream_auth_configured = auth_type.is_some();
+    response.upstream_auth_type = auth_type;
+    response.public_with_upstream_credentials = response.is_public
+        && (response.upstream_auth_configured || response.upstream_url_has_credentials);
     response.allow_public_with_upstream_credentials = accepted;
 }
 
@@ -2567,18 +2603,9 @@ pub async fn set_cache_ttl(
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository. Cache TTL is a pull-through proxy supply-chain control on the
     // same administrative tier as delete/update, so the tenant write gate above
-    // is not sufficient on its own.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the cache TTL of this repository".to_string(),
-            ));
-        }
-    }
+    // is not sufficient on its own. `require_repo_admin` honors an `admin`
+    // action held through a role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (see #917).
@@ -2737,19 +2764,9 @@ pub async fn set_on_upstream_not_found(
     // repository. Like the cache TTL, this is a pull-through proxy
     // supply-chain control on the same administrative tier as delete/update,
     // so the tenant write gate above is not sufficient on its own.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the upstream-not-found policy of this \
-                 repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // `require_repo_admin` honors an `admin` action held through a role
+    // (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (#4640).
@@ -2895,19 +2912,9 @@ pub async fn set_stale_if_error_grace(
 
     // Same administrative tier as `set_cache_ttl`: the grace window is a
     // pull-through supply-chain control, so a tenant write grant is not enough.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the stale-if-error grace window of this \
-                 repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // `require_repo_admin` honors an `admin` action held through a role
+    // (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Only Remote (proxy) repositories consume the value; writing it elsewhere
     // is dead state (mirrors `set_cache_ttl`).
@@ -3408,19 +3415,9 @@ pub async fn set_npm_scope_policy(
 
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository (mirrors `set_cache_ttl`; the global-admin bypass is
-    // preserved).
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the npm scope policy of this repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // preserved). `require_repo_admin` honors an `admin` action held through a
+    // role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
 
@@ -3477,18 +3474,10 @@ pub async fn get_npm_scope_policy(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to read the npm scope policy of this repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // Reading the npm scope policy is admin-tier (it discloses the repository's
+    // supply-chain configuration). `require_repo_admin` honors an `admin` action
+    // held through a role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     let policy = crate::api::handlers::npm::fetch_npm_scope_policy(&state.db, repo.id).await?;
     let active = policy.is_active();
@@ -3558,19 +3547,10 @@ pub async fn invalidate_cache(
     // #2321 G6: evicting proxy-cache entries is a pull-through supply-chain
     // control on the same administrative tier as `set_cache_ttl` (an attacker
     // with plain repo-write could force re-fetches / open a cache-poisoning
-    // window). Require `repository:admin` for non-admins, mirroring
-    // `set_cache_ttl`; the global-admin bypass is preserved.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to invalidate the cache of this repository".to_string(),
-            ));
-        }
-    }
+    // window). `require_repo_admin` requires `repository:admin` for non-admins
+    // (mirroring `set_cache_ttl`) while honoring an `admin` action held through
+    // a role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Cache invalidation is meaningless on Local / Virtual / Staging repos --
     // only Remote (proxy) repos own a cache. Reject up front before touching
@@ -4081,9 +4061,9 @@ pub async fn list_repositories(
             let mut resp = repo_to_display_response(r, storage);
             resp.has_trusted_gpg_key = has_gpg;
             resp.format_key = custom_format_key(&resp.format, format_key);
-            let (auth_configured, accepted) =
+            let (auth_type, accepted) =
                 public_credentials_flags(credential_rows.remove(&resp.id).unwrap_or_default());
-            apply_public_credentials_flags(&mut resp, auth_configured, accepted);
+            apply_public_credentials_flags(&mut resp, auth_type, accepted);
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
@@ -4358,6 +4338,25 @@ pub async fn create_repository(
         payload.upstream_username.as_deref(),
         payload.upstream_password.as_deref(),
     )?;
+    // #4843: the remaining invalid credential shapes — an unknown
+    // `upstream_auth_type`, `basic` without a password, an AWS type without an
+    // `aws` block — used to be caught only while persisting, after the
+    // repository row had been inserted. A refused create left a
+    // half-configured Remote behind and a retry hit 409 on the key. Build (and
+    // so validate) the credentials here, before the insert, and reuse the
+    // result afterwards instead of rebuilding it.
+    let upstream_credentials = match payload.upstream_auth_type.as_deref() {
+        Some(auth_type) => Some((
+            auth_type.to_string(),
+            build_upstream_credentials(
+                auth_type,
+                payload.upstream_username.as_deref(),
+                payload.upstream_password.as_deref(),
+                None,
+            )?,
+        )),
+        None => None,
+    };
     // #4662: a public repository with upstream credentials spends them for
     // anonymous callers. Refused before the row exists unless accepted.
     let public_credentials_override = enforce_public_upstream_credentials(
@@ -4561,19 +4560,14 @@ pub async fn create_repository(
         }
     }
 
-    // Store upstream auth credentials if provided
-    if let Some(ref auth_type) = payload.upstream_auth_type {
-        let credentials_json = build_upstream_credentials(
-            auth_type,
-            payload.upstream_username.as_deref(),
-            payload.upstream_password.as_deref(),
-            None,
-        )?;
+    // Store upstream auth credentials if provided. Already built and validated
+    // before the insert (#4843), so this only writes them.
+    if let Some((ref auth_type, ref credentials_json)) = upstream_credentials {
         crate::services::upstream_auth::save_upstream_auth(
             &state.db,
             repo.id,
             auth_type,
-            &credentials_json,
+            credentials_json,
         )
         .await?;
     }
@@ -5290,18 +5284,10 @@ pub async fn update_repository(
     let existing = service.get_by_key(&key).await?;
     require_repo_access(&auth, existing.id)?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target repository.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", existing.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to update this repository".to_string(),
-            ));
-        }
-    }
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository. `require_repo_admin` honors an `admin` action held through a
+    // role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, existing.id, &state.permission_service).await?;
 
     // Projects (#2473): (re)assigning a repository to a different project
     // needs a global admin, a system repo-admin, or project-admin on the
@@ -6028,6 +6014,13 @@ async fn collect_repo_artifact_object_keys(
     repo_id: Uuid,
     location: &crate::storage::StorageLocation,
 ) -> std::collections::BTreeSet<String> {
+    // A key is spared only when another repository resolves it to the SAME
+    // object: any repository on the same cloud backend (one shared keyspace),
+    // but on `filesystem` only one rooted at the same `storage_path`, because
+    // every other repository keeps its own copy in its own tree (#4833). The
+    // scope is the one `trash_service`'s `KEY_STILL_REFERENCED_SQL` uses, and
+    // a surviving repository's older revision (`artifact_versions`) protects
+    // the key as well as its live rows do.
     let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
@@ -6035,11 +6028,21 @@ async fn collect_repo_artifact_object_keys(
            AND a.storage_key NOT LIKE 'oci-manifests/%' \
            AND a.storage_key NOT LIKE 'oci-blobs/%' \
            AND NOT EXISTS ( \
-               SELECT 1 FROM artifacts b \
+               SELECT 1 FROM artifacts b JOIN repositories rb ON rb.id = b.repository_id \
                WHERE b.storage_key = a.storage_key AND b.repository_id <> $1 \
+                 AND rb.storage_backend = $2 \
+                 AND (rb.storage_backend <> 'filesystem' OR rb.storage_path = $3) \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifact_versions v JOIN repositories rv ON rv.id = v.repository_id \
+               WHERE v.storage_key = a.storage_key AND v.repository_id <> $1 \
+                 AND rv.storage_backend = $2 \
+                 AND (rv.storage_backend <> 'filesystem' OR rv.storage_path = $3) \
            )",
     )
     .bind(repo_id)
+    .bind(&location.backend)
+    .bind(&location.path)
     .fetch_all(&state.db)
     .await
     .unwrap_or_else(|e| {
@@ -6352,18 +6355,10 @@ pub async fn delete_repository(
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target repository.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to delete this repository".to_string(),
-            ));
-        }
-    }
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository. `require_repo_admin` honors an `admin` action held through a
+    // role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Gather this repo's in-flight / abandoned OCI upload temp storage keys
     // BEFORE the repository row is deleted — the journal/session/part rows
@@ -6380,6 +6375,27 @@ pub async fn delete_repository(
     // object deletion is deferred below.
     let location = repo.storage_location();
     let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
+
+    // The keys the purge spares because another repository on the same
+    // storage still holds them lose their last record of THIS repository's
+    // reference with the cascade below. Hand them to GC's candidate set, whose
+    // sweep deletes each object once no surviving repository references it, so
+    // a key spared for a repository that is deleted next (or concurrently)
+    // cannot leak (#4833). Best-effort, like the OCI hand-off below.
+    if let Err(e) = crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
+        &state.db,
+        repo.id,
+        &location,
+        &artifact_object_keys,
+    )
+    .await
+    {
+        tracing::warn!(
+            repo_id = %repo.id,
+            error = %e,
+            "Failed to record spared artifact objects as GC candidates before repository delete"
+        );
+    }
 
     // Committed OCI objects are deliberately NOT in `artifact_object_keys`:
     // they are content-addressed and can be shared cross-repo through
@@ -9825,6 +9841,10 @@ pub async fn list_artifact_versions(
         (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
         (status = 405, description = "Repository is remote (proxy); direct uploads are not accepted", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "An artifact already exists at this path and is immutable. \
+            The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`. \
+            Delete the artifact first, or enable versioning on the repository (Generic and Mlmodel) to append a revision instead. \
+            Of several concurrent uploads to one free path exactly one is answered 201; the others get this 409 (#4832).", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
@@ -10046,7 +10066,7 @@ async fn stage_multipart_field(
 /// Authorize a generic artifact write: resolve the repository and enforce the
 /// write gates shared by the raw-`PUT` and multipart upload entry points, before
 /// any request body is consumed.
-async fn authorize_generic_upload(
+pub(crate) async fn authorize_generic_upload(
     state: &SharedState,
     auth: &AuthExtension,
     key: &str,
@@ -12274,14 +12294,17 @@ pub async fn update_virtual_members(
     // Gate the whole operation on repo-admin of the virtual PARENT up front.
     // Editing the member list is administration of the parent; doing this here
     // (not only inside the per-member loop) means an empty desired set — "remove
-    // all members" — is still authorized rather than silently ungated.
+    // all members" — is still authorized rather than silently ungated. The
+    // decision goes through `check_repository_action` so an `admin` action held
+    // through a role (`repository-owner`) counts, not only a fine-grained rule
+    // (#4818/#4834).
     require_repo_access(&auth, virtual_repo.id)?;
     let has_repo_admin = if auth.is_admin {
         false
     } else {
         state
             .permission_service
-            .check_permission(auth.user_id, "repository", virtual_repo.id, "admin", false)
+            .check_repository_action(auth.user_id, virtual_repo.id, "admin", false)
             .await?
     };
     if !member_mutation_admin_allowed(auth.is_admin, has_repo_admin) {
@@ -19626,8 +19649,10 @@ mod tests {
         .await;
         match denied {
             Err(AppError::Authorization(msg)) => {
+                // #4834: the route now goes through the shared `require_repo_admin`
+                // gate, so the refusal carries its canonical message.
                 assert!(
-                    msg.contains("Insufficient permissions"),
+                    msg.contains("Repository admin permission is required"),
                     "unexpected message: {msg}"
                 );
             }
@@ -22391,6 +22416,210 @@ mod tests {
         tdh::cleanup(&pool, other_id, dev_id).await;
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    /// DB-backed (#4834): every repository-administration handler that still
+    /// carried an inline `check_permission(.., "repository", .., "admin", ..)`
+    /// gate now honours a `repository-owner` role member, the same gap
+    /// `require_repo_admin` had (#4818).
+    ///
+    /// A member of `repository-owner` (`{read,write,delete,admin}`, the role
+    /// repository creation grants to the creator) drives each of these routes
+    /// successfully with NO fine-grained `permissions` row:
+    /// `set_cache_ttl`, `set_on_upstream_not_found`, `set_stale_if_error_grace`,
+    /// `set_npm_scope_policy` / `get_npm_scope_policy`, `update_repository`,
+    /// `invalidate_cache`, `delete_repository`, and the shared virtual-member
+    /// mutation gate (`authorize_virtual_member_mutation`). A `developer`
+    /// member is still refused, so the fix widens the check and does not
+    /// disable it.
+    #[tokio::test]
+    async fn repository_owner_role_passes_inline_repo_admin_gates_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (dev_id, dev_name) = tdh::create_user(&pool).await;
+
+        // Remote repos: the only type these proxy-configuration routes accept.
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (vm_id, vm_key, vm_dir) = tdh::create_repo(&pool, "virtual", "npm").await;
+        let (member_id, member_key, member_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (del_id, del_key, del_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+
+        // repository-owner on every repo under test; a developer on the shared
+        // one to prove the gate still refuses a role without `admin`.
+        for id in [repo_id, vm_id, del_id] {
+            tdh::grant_repo_role(&pool, id, owner_id, "repository-owner").await;
+        }
+        tdh::grant_repo_role(&pool, repo_id, dev_id, "developer").await;
+
+        let state = || tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let owner = || tdh::make_auth(owner_id, &owner_name);
+        let dev = || tdh::make_auth(dev_id, &dev_name);
+
+        // A `repository-owner` member passes each gate...
+        let ok = set_cache_ttl(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetCacheTtlRequest {
+                cache_ttl_seconds: 60,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_cache_ttl must admit a repository-owner: {ok:?}"
+        );
+
+        let ok = set_on_upstream_not_found(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetOnUpstreamNotFoundRequest {
+                on_upstream_not_found:
+                    crate::services::upstream_not_found_policy::OnUpstreamNotFound::Keep,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_on_upstream_not_found must admit a repository-owner: {ok:?}"
+        );
+
+        let ok = set_stale_if_error_grace(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetStaleIfErrorGraceRequest {
+                stale_if_error_grace_seconds: 60,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_stale_if_error_grace must admit a repository-owner: {ok:?}"
+        );
+
+        let ok = set_npm_scope_policy(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetNpmScopePolicyRequest {
+                allowed_scopes: vec!["@acme".to_string()],
+                allow_unscoped: false,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_npm_scope_policy must admit a repository-owner: {ok:?}"
+        );
+        let ok =
+            get_npm_scope_policy(State(state()), Extension(Some(owner())), Path(key.clone())).await;
+        assert!(
+            ok.is_ok(),
+            "get_npm_scope_policy must admit a repository-owner: {ok:?}"
+        );
+
+        let update: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"description":"owner-set description"}"#)
+                .expect("deserialize update payload");
+        let ok = update_repository(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(update),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "update_repository must admit a repository-owner: {ok:?}"
+        );
+
+        // The virtual-member mutation gate. The member repo is public so the
+        // member-visibility gate early-returns and only the parent's
+        // repository:admin gate is measured.
+        let v = make_repo_with_id(vm_id, &vm_key);
+        let m = crate::models::repository::Repository {
+            visibility: crate::models::repository::RepositoryVisibility::Public,
+            is_public: true,
+            ..make_repo_with_id(member_id, &member_key)
+        };
+        let perms = crate::services::permission_service::PermissionService::new(pool.clone());
+        let ok = authorize_virtual_member_mutation(&pool, &owner(), &v, &m, "update", &perms).await;
+        assert!(
+            ok.is_ok(),
+            "virtual-member mutation must admit a repository-owner: {ok:?}"
+        );
+
+        // A `developer` (write-only) member is still refused on a shared route.
+        let denied = set_cache_ttl(
+            State(state()),
+            Extension(Some(dev())),
+            Path(key.clone()),
+            Json(SetCacheTtlRequest {
+                cache_ttl_seconds: 60,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "a developer (no admin) must still be refused: {denied:?}"
+        );
+
+        // A `developer` on the repository is refused the delete and the row
+        // survives; that is the boundary this change keeps.
+        tdh::grant_repo_role(&pool, del_id, dev_id, "developer").await;
+        let denied = delete_repository(
+            State(state()),
+            Extension(Some(dev())),
+            Path(del_key.clone()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "a developer must not delete the repository: {denied:?}"
+        );
+        let row_exists = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = $1)",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert!(row_exists(del_id).await, "refused delete keeps the row");
+
+        // ...and `delete_repository` admits a repository-owner, which removes
+        // the repository (behaviour change of #4834: owners can now delete).
+        let ok = delete_repository(
+            State(state()),
+            Extension(Some(owner())),
+            Path(del_key.clone()),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "delete_repository must admit a repository-owner: {ok:?}"
+        );
+        assert!(!row_exists(del_id).await, "owner delete removes the row");
+
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, member_id, &member_dir).await;
+        tdh::cleanup_member_repo(&pool, vm_id, &vm_dir).await;
+        tdh::cleanup_member_repo(&pool, del_id, &del_dir).await;
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup_user(&pool, dev_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DB-backed: a non-admin member holding only `write` (developer role via
@@ -26635,8 +26864,15 @@ mod tests {
         insert_artifact(fx.repo_id, "a/owned.bin", owned_key.clone()).await;
 
         // Object whose storage_key is also referenced by a SECOND repository
-        // (content-addressed dedup): must NOT be purged.
+        // on the same storage root (content-addressed dedup, the shape of every
+        // cloud backend): must NOT be purged.
         let (other_repo_id, _key, _dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+            .bind(&location.path)
+            .bind(other_repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("share the storage root");
         let shared_key = format!("generic/{}/shared.bin", Uuid::new_v4());
         storage
             .put(&shared_key, bytes::Bytes::from_static(b"shared"))
@@ -26672,6 +26908,151 @@ mod tests {
             .await
             .expect("delete other repo");
         fx.teardown().await;
+    }
+
+    /// #4833: on `filesystem` every repository roots its own tree, so two
+    /// repositories holding the same bytes under one content-addressed key
+    /// hold two files. Deleting one must remove ITS file; the other
+    /// repository's copy (a different file) must not shield it, and must
+    /// itself be left alone and still served.
+    #[tokio::test]
+    async fn delete_repository_purges_own_copy_of_key_another_filesystem_repo_holds_4833() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let loc_a = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let loc_b = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: dir_b.to_string_lossy().into_owned(),
+        };
+        let storage_a = state.storage_for_repo(&loc_a).expect("storage A");
+        let storage_b = state.storage_for_repo(&loc_b).expect("storage B");
+
+        let sha = format!("{:0>64}", Uuid::new_v4().simple());
+        let key = format!("{}/{}/{}", &sha[..2], &sha[2..4], sha);
+        for (repo, storage) in [(fx.repo_id, &storage_a), (repo_b, &storage_b)] {
+            storage
+                .put(&key, bytes::Bytes::from_static(b"same bytes"))
+                .await
+                .expect("put copy");
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'shared.bin', 'shared.bin', 10, $2, 'application/octet-stream', $3)",
+            )
+            .bind(repo)
+            .bind(&sha)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert artifact row");
+        }
+
+        let collected = collect_repo_artifact_object_keys(&state, fx.repo_id, &loc_a).await;
+        purge_storage_object_keys(&state, fx.repo_id, &loc_a, collected.clone()).await;
+
+        let a_left = storage_a.exists(&key).await.expect("exists A");
+        let b_left = storage_b.get(&key).await.expect("B still served");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("delete repo B");
+        let _ = std::fs::remove_dir_all(&dir_b);
+        fx.teardown().await;
+
+        assert!(
+            collected.contains(&key),
+            "#4833: repo B's copy lives in another tree and must not spare repo A's file"
+        );
+        assert!(!a_left, "#4833: repo A's file must be purged with repo A");
+        assert_eq!(
+            &b_left[..],
+            b"same bytes",
+            "repo B's copy must be untouched"
+        );
+    }
+
+    /// #4833: a key the delete spares because another repository on the same
+    /// storage still holds it is recorded as a GC candidate before the cascade,
+    /// and a key it purges is not.
+    #[tokio::test]
+    async fn delete_repository_records_spared_keys_as_gc_candidates_4833() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+            .bind(&location.path)
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("share the storage root");
+        let shared = format!("generic/{}/shared.bin", Uuid::new_v4());
+        let owned = format!("generic/{}/owned.bin", Uuid::new_v4());
+        for (repo, key) in [
+            (fx.repo_id, &shared),
+            (repo_b, &shared),
+            (fx.repo_id, &owned),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'f.bin', 1, $3, 'application/octet-stream', $2)",
+            )
+            .bind(repo)
+            .bind(key)
+            .bind("0".repeat(64))
+            .execute(&fx.pool)
+            .await
+            .expect("insert artifact row");
+        }
+
+        let collected = collect_repo_artifact_object_keys(&state, fx.repo_id, &location).await;
+        crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
+            &fx.pool, fx.repo_id, &location, &collected,
+        )
+        .await
+        .expect("record spared keys");
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM oci_gc_candidates WHERE storage_key = ANY($1) \
+               AND storage_backend = 'filesystem' AND storage_path = $2",
+        )
+        .bind(&[shared.clone(), owned.clone()][..])
+        .bind(&location.path)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read candidates");
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = ANY($1)")
+            .bind(&[shared.clone(), owned.clone()][..])
+            .execute(&fx.pool)
+            .await
+            .expect("clean candidates");
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("delete repo B");
+        let _ = std::fs::remove_dir_all(&dir_b);
+        fx.teardown().await;
+
+        assert!(collected.contains(&owned) && !collected.contains(&shared));
+        assert_eq!(
+            candidates,
+            vec![shared],
+            "only the spared key is a candidate"
+        );
     }
 
     /// #2776: deleting a LARGE Maven virtual repository must not run its
@@ -29640,20 +30021,24 @@ mod tests {
     #[test]
     fn public_credentials_flags_reads_both_keys_4662() {
         let row = |k: &str, v: Option<&str>| (k.to_string(), v.map(str::to_string));
-        assert_eq!(public_credentials_flags(Vec::new()), (false, false));
+        assert_eq!(public_credentials_flags(Vec::new()), (None, false));
         assert_eq!(
             public_credentials_flags(vec![
                 row("upstream_auth_type", Some("bearer")),
                 row(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY, Some("true")),
             ]),
-            (true, true)
+            (Some("bearer".to_string()), true)
         );
         assert_eq!(
             public_credentials_flags(vec![
                 row("upstream_auth_type", Some("none")),
                 row(PUBLIC_UPSTREAM_CREDENTIALS_OVERRIDE_KEY, Some("false")),
             ]),
-            (false, false)
+            (None, false)
+        );
+        assert_eq!(
+            public_credentials_flags(vec![row("upstream_auth_type", Some(""))]),
+            (None, false)
         );
     }
 
@@ -30072,6 +30457,203 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// DB-backed (#4851): the list and the update (PATCH) responses report a
+    /// Remote's upstream auth exactly as the detail response does. The list
+    /// read the auth rows for #4662 but never projected them, so a configured
+    /// Remote listed `upstream_auth_type: null, upstream_auth_configured: false`.
+    #[tokio::test]
+    async fn test_list_and_update_report_upstream_auth_like_detail_db_4851() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, Query, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upauth-4851-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let suffix = Uuid::new_v4().simple().to_string();
+        let remote = |key: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            make_create_request(key, key, "generic", body)
+        };
+        let list = |key: String| {
+            let state = state.clone();
+            let username = username.clone();
+            async move {
+                let Json(listed) = list_repositories(
+                    State(state),
+                    Extension(Some(admin_auth(user_id, &username))),
+                    Query(ListRepositoriesQuery {
+                        page: Some(1),
+                        per_page: Some(100),
+                        format: None,
+                        repo_type: None,
+                        q: Some(key.clone()),
+                        project: None,
+                    }),
+                )
+                .await
+                .expect("list");
+                listed
+                    .items
+                    .into_iter()
+                    .find(|r| r.key == key)
+                    .expect("the repository is listed")
+            }
+        };
+        let auth_fields =
+            |r: &RepositoryResponse| (r.upstream_auth_type.clone(), r.upstream_auth_configured);
+
+        let basic_key = format!("upauth-4851-b-{suffix}");
+        let Json(created) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(
+                &basic_key,
+                serde_json::json!({
+                    "upstream_auth_type": "basic",
+                    "upstream_username": "u",
+                    "upstream_password": "p"
+                }),
+            ),
+        )
+        .await
+        .expect("create a basic-auth remote");
+        let none_key = format!("upauth-4851-n-{suffix}");
+        let Json(plain) = create_repository(
+            State(state.clone()),
+            auth(),
+            remote(&none_key, serde_json::json!({})),
+        )
+        .await
+        .expect("create a remote without upstream auth");
+
+        let Json(detail) = get_repository(State(state.clone()), auth(), Path(basic_key.clone()))
+            .await
+            .expect("get");
+        let expected = (Some("basic".to_string()), true);
+        assert_eq!(auth_fields(&detail), expected, "detail");
+        assert_eq!(auth_fields(&created), expected, "create");
+        assert_eq!(
+            auth_fields(&list(basic_key.clone()).await),
+            expected,
+            "list"
+        );
+        let Json(updated) = update_repository(
+            State(state.clone()),
+            auth(),
+            Path(basic_key.clone()),
+            Json(
+                serde_json::from_value(serde_json::json!({ "description": "edited" }))
+                    .expect("update payload"),
+            ),
+        )
+        .await
+        .expect("update");
+        assert_eq!(auth_fields(&updated), expected, "update");
+
+        // A Remote without upstream auth lists none, as its detail does.
+        let Json(plain_detail) =
+            get_repository(State(state.clone()), auth(), Path(none_key.clone()))
+                .await
+                .expect("get");
+        assert_eq!(auth_fields(&plain_detail), (None, false));
+        assert_eq!(auth_fields(&list(none_key.clone()).await), (None, false));
+
+        for id in [created.id, plain.id] {
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(plain.id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// DB-backed (#4843): the remaining invalid credential shapes — an unknown
+    /// `upstream_auth_type`, `basic` without a password, an AWS type without an
+    /// `aws` block — must be refused *before* the repository row is inserted,
+    /// so a refused create leaves nothing behind (previously the 400 came back
+    /// with the row already committed, and a retry hit 409).
+    #[tokio::test]
+    async fn test_create_remote_invalid_credentials_leave_no_row_db_4843() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("upauth-4843-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = || Extension(Some(admin_auth(user_id, &username)));
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // Each `extra` is a credential shape the handler must reject with 400
+        // VALIDATION_ERROR while building the credentials, before the insert.
+        let invalid_shapes = [
+            // Unknown auth type.
+            serde_json::json!({ "upstream_auth_type": "kerberos" }),
+            // `basic` without a password.
+            serde_json::json!({ "upstream_auth_type": "basic", "upstream_username": "u" }),
+            // An AWS type with no `aws` block (the create payload has none).
+            serde_json::json!({ "upstream_auth_type": "aws_ecr" }),
+        ];
+
+        for (idx, extra) in invalid_shapes.into_iter().enumerate() {
+            let key = format!("upauth-4843-{idx}-{suffix}");
+            let mut body = serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.com/api"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut body, extra)
+            {
+                b.extend(e);
+            }
+            let err = create_repository(
+                State(state.clone()),
+                auth(),
+                make_create_request(&key, &key, "generic", body),
+            )
+            .await
+            .expect_err("an invalid credential shape must be refused");
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "expected a validation error for {key}, got {err:?}"
+            );
+
+            // The point of #4843: the refusal happens before the insert, so the
+            // row must not exist and a retry is not a 409.
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repositories WHERE key = $1)")
+                    .bind(&key)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                !exists,
+                "a refused create ({key}) must not leave a repository row"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 

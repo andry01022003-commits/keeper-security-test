@@ -540,7 +540,8 @@ async fn get_session_status(
         (status = 409, description = "Conflict, for one of two reasons that the status code alone does not distinguish; read the response body to tell them apart. \
             (1) Checksum mismatch: the assembled file's SHA-256 differs from the checksum declared when the session was created. \
             The body is `{\"error\": \"checksum mismatch: expected <sha256>, got <sha256>\"}`; the session is failed, so re-upload in a new session. \
-            (2) Immutable path occupied (#3924): an artifact already exists at this path and may not be overwritten. \
+            (2) Immutable path occupied (#3924): an artifact already exists at this path and may not be overwritten, \
+            including one committed by a concurrent upload to the same path (#4832). \
             The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`; no bytes are written and the session stays open, \
             so this request can be repeated once the occupying artifact is deleted.", body = crate::api::openapi::ErrorResponse),
         (status = 410, description = "Session expired, or created by an earlier server version and not resumable; start a new session", body = crate::api::openapi::ErrorResponse),
@@ -886,6 +887,12 @@ async fn complete_session_commit(
             return Err(map_err(StatusCode::INSUFFICIENT_STORAGE, message));
         }
     }
+    // #4832: the `WHERE` is the live-overwrite rule of the
+    // `enforce_path_immutability` gate above, applied atomically: that gate
+    // runs outside this transaction, so two completions racing to one path
+    // both passed it and the later upsert silently replaced the earlier one.
+    // A live row at the same version is now left untouched (no row returned)
+    // and this completion is refused with the gate's own 409.
     let inserted_artifact_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -895,6 +902,9 @@ async fn complete_session_commit(
             name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
             content_type = $7, storage_key = $8, uploaded_by = $9,
             updated_at = NOW(), is_deleted = false
+        WHERE artifacts.is_deleted
+            OR $10
+            OR artifacts.version IS DISTINCT FROM EXCLUDED.version
         RETURNING id
         "#,
     )
@@ -907,10 +917,25 @@ async fn complete_session_commit(
     .bind(&session.content_type)
     .bind(&storage_key)
     .bind(user_id)
-    .fetch_one(&mut *tx)
+    .bind(crate::services::artifact_service::versioning_applies(
+        &repo.format,
+        repo.versioning_enabled,
+    ))
+    .fetch_optional(&mut *tx)
     .await;
     let artifact_id: Uuid = match inserted_artifact_id {
-        Ok(id) => id,
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // Same response and lease handling as the gate's own 409: the
+            // write becomes legal once the occupying artifact is deleted, so
+            // the session stays retryable.
+            drop(tx);
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(crate::error::AppError::Conflict(
+                "Artifact version already exists and is immutable".to_string(),
+            )
+            .into_response());
+        }
         Err(e) => {
             drop(tx);
             return Err(release_after_precommit_failure(&state.db, &session, e).await);
