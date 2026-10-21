@@ -328,7 +328,7 @@ impl TokenCredentialProvider {
             ])
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to request Azure AD token: {}", e)))?;
+            .map_err(|e| request_error("Failed to request Azure AD token", e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -363,7 +363,7 @@ impl TokenCredentialProvider {
                 AppError::Storage(format!(
                     "Failed to reach Azure IMDS for managed identity token. \
                      Are you running on Azure? Error: {}",
-                    e
+                    e.without_url()
                 ))
             })?;
 
@@ -380,9 +380,10 @@ impl TokenCredentialProvider {
     }
 
     async fn parse_token_response(&self, response: reqwest::Response) -> Result<CachedToken> {
-        let body: serde_json::Value = response.json().await.map_err(|e| {
-            AppError::Storage(format!("Failed to parse Azure token response: {}", e))
-        })?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| request_error("Failed to parse Azure token response", e))?;
 
         let access_token = body["access_token"]
             .as_str()
@@ -436,6 +437,14 @@ pub(crate) fn is_redirect_compatible(
         return false;
     }
     true
+}
+
+/// Storage error for a failed Azure HTTP request.
+///
+/// The request URL is left out: in Shared Key mode its query string is a SAS
+/// token, and this message reaches API clients and the logs.
+fn request_error(operation: &str, e: reqwest::Error) -> AppError {
+    AppError::Storage(format!("{}: {}", operation, e.without_url()))
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +644,7 @@ impl AzureBackend {
             let bytes = response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                .map_err(|e| request_error("Failed to read response", e))?;
             return Ok(Some(bytes));
         }
 
@@ -792,7 +801,7 @@ impl AzureBackend {
                     .body(content.clone())
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))
+                    .map_err(|e| request_error("Azure upload failed", e))
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -808,7 +817,7 @@ impl AzureBackend {
                     .body(content.clone())
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))
+                    .map_err(|e| request_error("Azure upload failed", e))
             }
         }
     }
@@ -833,7 +842,7 @@ impl AzureBackend {
         request
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Azure Put Block failed: {}", e)))
+            .map_err(|e| request_error("Azure Put Block failed", e))
     }
 
     async fn authorized_put_block_list(
@@ -860,7 +869,7 @@ impl AzureBackend {
         request
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Azure Put Block List failed: {}", e)))
+            .map_err(|e| request_error("Azure Put Block List failed", e))
     }
 
     async fn authorized_put_blob_from_url(
@@ -891,7 +900,7 @@ impl AzureBackend {
         request
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Azure Put Blob From URL failed: {}", e)))
+            .map_err(|e| request_error("Azure Put Blob From URL failed", e))
     }
 
     /// Build an authorized GET request.
@@ -903,7 +912,7 @@ impl AzureBackend {
                     .get(url)
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure download failed: {}", e)))
+                    .map_err(|e| request_error("Azure download failed", e))
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -916,7 +925,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure download failed: {}", e)))
+                    .map_err(|e| request_error("Azure download failed", e))
             }
         }
     }
@@ -935,7 +944,7 @@ impl AzureBackend {
                 .header("x-ms-range", range_header)
                 .send()
                 .await
-                .map_err(|e| AppError::Storage(format!("Azure ranged download failed: {}", e))),
+                .map_err(|e| request_error("Azure ranged download failed", e)),
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
                 let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -949,7 +958,7 @@ impl AzureBackend {
                     .header("x-ms-range", range_header)
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure ranged download failed: {}", e)))
+                    .map_err(|e| request_error("Azure ranged download failed", e))
             }
         }
     }
@@ -962,7 +971,7 @@ impl AzureBackend {
                 .head(url)
                 .send()
                 .await
-                .map_err(|e| AppError::Storage(format!("Azure HEAD request failed: {}", e))),
+                .map_err(|e| request_error("Azure HEAD request failed", e)),
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
                 let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -974,7 +983,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure HEAD request failed: {}", e)))
+                    .map_err(|e| request_error("Azure HEAD request failed", e))
             }
         }
     }
@@ -996,7 +1005,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure delete failed: {}", e)))
+                    .map_err(|e| request_error("Azure delete failed", e))
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -1008,7 +1017,7 @@ impl AzureBackend {
                     .header("x-ms-version", "2021-06-08")
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure delete failed: {}", e)))
+                    .map_err(|e| request_error("Azure delete failed", e))
             }
         }
     }
@@ -1408,9 +1417,10 @@ impl StorageBackend for AzureBackend {
                             );
                             #[allow(clippy::disallowed_methods)]
                             // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
-                            let bytes = fallback_response.bytes().await.map_err(|e| {
-                                AppError::Storage(format!("Failed to read response: {}", e))
-                            })?;
+                            let bytes = fallback_response
+                                .bytes()
+                                .await
+                                .map_err(|e| request_error("Failed to read response", e))?;
                             return Ok(bytes);
                         }
                     }
@@ -1429,7 +1439,7 @@ impl StorageBackend for AzureBackend {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| request_error("Failed to read response", e))?;
 
         Ok(bytes)
     }
@@ -1450,7 +1460,7 @@ impl StorageBackend for AzureBackend {
             return response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read range response: {}", e)));
+                .map_err(|e| request_error("Failed to read range response", e));
         }
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1509,7 +1519,7 @@ impl StorageBackend for AzureBackend {
 
         let stream = response
             .bytes_stream()
-            .map(|chunk| chunk.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
+            .map(|chunk| chunk.map_err(|e| request_error("Stream read error", e)));
 
         Ok(Box::pin(stream))
     }
@@ -1834,7 +1844,7 @@ impl StorageBackend for AzureBackend {
                     .body(reqwest::Body::wrap_stream(stream))
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+                    .map_err(|e| request_error("Azure upload failed", e))?
             }
             AzureAuthMode::TokenCredential { provider } => {
                 let token = provider.get_token().await?;
@@ -1849,7 +1859,7 @@ impl StorageBackend for AzureBackend {
                     .body(reqwest::Body::wrap_stream(stream))
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Azure upload failed: {}", e)))?
+                    .map_err(|e| request_error("Azure upload failed", e))?
             }
         };
 
@@ -3176,6 +3186,118 @@ mod tests {
             .expect("copy task")
             .expect("copy succeeds once Azure answers");
         server.await.expect("server task");
+    }
+
+    /// Shared Key backend whose endpoint is `listener`, with the clients
+    /// `AzureBackend::new` builds minus any proxy from the environment.
+    async fn create_shared_key_backend_on(listener: &tokio::net::TcpListener) -> AzureBackend {
+        let endpoint = format!(
+            "http://{}/testaccount",
+            listener.local_addr().expect("local addr")
+        );
+        let mut backend = create_test_backend_with_endpoint(&endpoint).await;
+        backend.client = crate::services::http_client::large_object_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build data-plane client");
+        backend.copy_client = crate::services::http_client::server_side_copy_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build copy client");
+        backend
+    }
+
+    fn assert_no_sas_query(message: &str) {
+        for field in ["sig=", "sp=", "sv=", "se="] {
+            assert!(
+                !message.contains(field),
+                "error message must not carry the request's query string ({field}): {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_error_leaves_out_the_request_url() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        // Port 0 cannot be connected to, so the request fails in transport.
+        let err = client
+            .get("http://127.0.0.1:0/c/k?sv=2021-06-08&sr=b&sp=cw&sig=c2lnbmF0dXJl")
+            .send()
+            .await
+            .expect_err("connecting to port 0 fails");
+        assert!(
+            err.to_string().contains("sig="),
+            "reqwest names the URL: {err}"
+        );
+
+        let message = request_error("Azure upload failed", err).to_string();
+        assert!(message.contains("Azure upload failed: "), "{message}");
+        assert!(!message.contains("127.0.0.1"), "{message}");
+        assert_no_sas_query(&message);
+    }
+
+    /// The text of a transport error names the request URL, and in Shared Key
+    /// mode that URL is signed. The message returned to the caller keeps the
+    /// operation and the transport error only.
+    #[tokio::test]
+    async fn test_copy_transport_error_omits_request_query_string() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let backend = create_shared_key_backend_on(&listener).await;
+
+        let server = tokio::spawn(async move {
+            let (mut head_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("HEAD "), "size probe first: {request}");
+            head_conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("answer HEAD");
+            let (copy_conn, request) = read_one_request(&listener).await;
+            assert!(request.starts_with("PUT "), "then the copy: {request}");
+            assert!(
+                request.contains("sig="),
+                "Shared Key copy URL is signed: {request}"
+            );
+            // Close the connection without answering.
+            drop(copy_conn);
+        });
+
+        let err = StorageBackendTrait::copy(&backend, "source/blob.bin", "dest/blob.bin")
+            .await
+            .expect_err("a dropped copy connection fails the copy");
+        server.await.expect("server task");
+        let message = err.to_string();
+        assert!(
+            message.contains("Azure Put Blob From URL failed"),
+            "the operation is still named: {message}"
+        );
+        assert_no_sas_query(&message);
+    }
+
+    #[tokio::test]
+    async fn test_download_transport_error_omits_request_query_string() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let backend = create_shared_key_backend_on(&listener).await;
+        // Nothing listens any more, so the request fails to connect.
+        drop(listener);
+
+        let err = StorageBackendTrait::get(&backend, "some/blob.bin")
+            .await
+            .expect_err("a refused connection fails the download");
+        let message = err.to_string();
+        assert!(
+            message.contains("Azure download failed"),
+            "the operation is still named: {message}"
+        );
+        assert_no_sas_query(&message);
     }
 
     #[tokio::test]
