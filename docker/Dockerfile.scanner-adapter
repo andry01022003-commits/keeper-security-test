@@ -57,11 +57,21 @@
 # go.sum, and adding x/net would add a dependency nothing imports (`go mod
 # tidy` removes it again). The x/net findings in this image are in the
 # bundled trivy, below.
+#
+# 1.27.2 -> 1.27.3 on 2026-10-21, for CVE-2026-111943 (HIGH) against stdlib
+# v1.27.2. Found not by a red publish but by the pinned-base-image watch
+# (#4852) -- which is the whole point of that workflow, since a stdlib CVE in
+# the ADAPTER binary is ours to fix here while one in the bundled trivy is
+# fixed in artifact-keeper/trivy and reached by moving the digest below. Both
+# halves are in this change. Same rule as #3655: the floor stays on the newest
+# patch of the minor the floating FROM names, never on the minimum go.mod
+# permits. CVE-2026-111943 is also fixed in go1.26.10, which is irrelevant
+# here -- this binary is built on 1.27.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG GO_MIN_PATCH=1.27.2
+ARG GO_MIN_PATCH=1.27.3
 
 RUN set -eu; \
     have="$(go env GOVERSION | sed 's/^go//')"; \
@@ -192,7 +202,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.76.0-r1 (note: no leading
+# This digest is the manifest-list digest of tag 0.76.0-r2 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -202,9 +212,19 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # DID move this time — the bundled binary now reports `Version: 0.76.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
 #
-# This digest is the manifest-list digest of tag 0.76.0-r1 (artifact-keeper/
-# trivy#18, tagged 2026-10-17; verified with `skopeo inspect --raw`).
-FROM ghcr.io/artifact-keeper/trivy@sha256:36e93de3edfa615553692781624be999fb22d113d1ecbe6712a3c90c71d5cc74 AS trivy
+# This digest is the manifest-list digest of tag 0.76.0-r2 (artifact-keeper/
+# trivy#19, tag v0.76.0-r2, published 2026-10-21; verified with `skopeo
+# inspect --raw`). The bundled binary is unchanged upstream v0.76.0
+# (531360e5) rebuilt on go1.27.3; `go version -m` on it reports go1.27.3.
+#
+# 0.76.0-r1 -> 0.76.0-r2 (#4852): the pinned-base-image watch reported HIGH
+# CVE-2026-111943 in the bundled trivy (stdlib v1.27.2, fixed in 1.27.3). A
+# stdlib advisory has no module to override, so the fix in artifact-keeper/
+# trivy is a GO_VERSION bump alone (trivy#19); nothing else moved there. It
+# was merged, tagged v0.76.0-r2, and this FROM repoints to the published
+# digest. docker/scanner-adapter/VERSION moves 1.5.0 -> 1.5.1 with it, because
+# exact versions are never republished (scripts/ci/check-version-pin-bump.sh).
+FROM ghcr.io/artifact-keeper/trivy@sha256:1076c0b7fe3295c7b1ebb6bd360e405ab0e61795881475f8ef5b2fdc4f28adb1 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

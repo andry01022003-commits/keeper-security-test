@@ -364,13 +364,23 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # The FROM stays floating on purpose, as the paragraph above argues: pinning
 # it to `golang:1.27.2-alpine` would make the floor redundant today and stale
 # the day go1.27.3 ships, and a stale pin fails no check.
+#
+# 1.27.2 -> 1.27.3 on 2026-10-21, for CVE-2026-111943 (HIGH) against stdlib
+# v1.27.2. Unlike the bumps above this one was not found by a red publish: it
+# came from the pinned-base-image watch (#4852), which reported it against the
+# scanner-adapter's bundled trivy. The same stdlib is compiled into grype and
+# buildctl here, so every Go stage moves in the same edit rather than waiting
+# for its own gate failure -- the class is a property of the toolchain, not of
+# one image. CVE-2026-111943 is fixed in BOTH go1.26.10 and go1.27.3; 1.27.3
+# is the patch of the minor the floating FROM names, which is the rule this
+# floor has followed since #3655.
 
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
 ARG GRYPE_VERSION=0.120.1
 ARG GRYPE_COMMIT=6f8d854af29d3a3086b11a84afa51554a2a245fe
-ARG GO_MIN_PATCH=1.27.2
+ARG GO_MIN_PATCH=1.27.3
 # The one declared divergence from upstream grype at this tag. See the
 # override block below the clone for its justification and removal condition.
 ARG XNET_FROM=v0.59.0
@@ -673,7 +683,7 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG BUILDKIT_VERSION=0.33.1
 ARG BUILDKIT_COMMIT=8c91502cf280bd70a0c50912ce251c46a8881d9f
-ARG GO_MIN_PATCH=1.27.2
+ARG GO_MIN_PATCH=1.27.3
 # The one declared divergence from upstream buildkit at this tag.
 ARG XNET_FROM=v0.58.0
 ARG XNET_TO=v0.60.0
