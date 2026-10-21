@@ -56,8 +56,14 @@ const ORPHAN_PREDICATE_SQL: &str = r#"
 a.is_deleted = true
 AND NOT EXISTS (
     SELECT 1 FROM artifacts a2
+    JOIN repositories a2r ON a2r.id = a2.repository_id
     WHERE a2.storage_key = a.storage_key
       AND a2.is_deleted = false
+      AND a2r.storage_backend = r.storage_backend
+      AND (
+        r.storage_backend <> 'filesystem'
+        OR a2r.storage_path = r.storage_path
+      )
 )
 AND NOT EXISTS (
     SELECT 1
@@ -483,6 +489,11 @@ static OCI_GC_CANDIDATE_REFERENCED_SQL: Lazy<String> = Lazy::new(|| {
         // owns this key; leave it to the predicate that can see its bytes and
         // its promotion rows.
         candidate_reference_arm("artifacts", "t.storage_key = $1"),
+        // #4833: non-OCI keys a repository delete spared because another
+        // repository shared them. An older revision or a row-less Maven flat
+        // object of a surviving repository keeps the object alive too.
+        candidate_reference_arm("artifact_versions", "t.storage_key = $1"),
+        candidate_reference_arm("maven_flat_object_owner", "t.storage_key = $1"),
         candidate_reference_arm(
             "oci_blobs",
             &format!("{is_blob} AND t.digest = {blob_digest}"),
@@ -3852,6 +3863,57 @@ where
         .map_err(|e| AppError::Database(e.to_string()))
 }
 
+/// Record the non-OCI object keys a repository delete leaves in place into the
+/// durable GC candidate set (#4833).
+///
+/// `purged` is what `collect_repo_artifact_object_keys` (repository
+/// handlers) gathered for the delete to remove directly; every other key this
+/// repository's `artifacts` rows name (outside the OCI and proxy-cache key spaces, which have their own
+/// owners) was spared because another repository on the same storage still
+/// references it. The cascade then drops this repository's rows, and if the
+/// sharing repository goes too (deleted next, or concurrently and racing this
+/// one past the same guard), nothing records the object any more. The
+/// candidate sweep re-tests each key against every surviving repository, so
+/// recording a key that stays shared costs one dropped row.
+///
+/// MUST run BEFORE the repository row is deleted. Idempotent, like
+/// [`record_oci_gc_candidates`]. Returns the number of rows newly recorded.
+pub(crate) async fn record_spared_artifact_gc_candidates(
+    db: &PgPool,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    purged: &std::collections::BTreeSet<String>,
+) -> Result<u64> {
+    let scope = oci_gc_candidate_scope(location);
+    let purged: Vec<&str> = purged.iter().map(String::as_str).collect();
+    let sql = format!(
+        r#"
+        INSERT INTO oci_gc_candidates
+            (storage_key, storage_backend, storage_path, source_repository_id)
+        SELECT DISTINCT a.storage_key, $2, $3, $1
+          FROM artifacts a
+         WHERE a.repository_id = $1
+           AND a.storage_key NOT LIKE 'proxy-cache/%'
+           AND a.storage_key NOT LIKE '{manifest}%'
+           AND a.storage_key NOT LIKE '{blob}%'
+           AND NOT (a.storage_key = ANY($4))
+        ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING
+        "#,
+        manifest = crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX,
+        blob = OCI_BLOB_STORAGE_PREFIX,
+    );
+    let recorded = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .bind(repo_id)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .bind(&purged)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+    Ok(recorded)
+}
+
 /// Record a repository's committed OCI object keys into the durable GC
 /// candidate set (#3733).
 ///
@@ -4770,6 +4832,8 @@ mod tests {
             "oci_tags",
             "oci_manifest_refs",
             "oci_upload_cleanup_keys",
+            "artifact_versions",
+            "maven_flat_object_owner",
         ] {
             assert!(
                 sql.contains(&format!("FROM {table} t ")),
@@ -5080,6 +5144,192 @@ mod tests {
         );
         assert!(!survived, "the orphaned object must be reclaimed");
         assert_eq!(left, 0, "the candidate is consumed");
+    }
+
+    /// Seed an `artifacts` row naming `key` in `repo` (generic, content-addressed
+    /// shape), soft-deleted when `trashed`.
+    async fn seed_generic_artifact_row(pool: &PgPool, repo: Uuid, key: &str, trashed: bool) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+                 content_type, storage_key, is_deleted, deleted_at) \
+             VALUES ($1, $2, 'payload.bin', 7, $3, 'application/octet-stream', $4, $5, \
+                     CASE WHEN $5 THEN NOW() - INTERVAL '48 hours' END)",
+        )
+        .bind(repo)
+        .bind(format!("dir/{}/payload.bin", Uuid::new_v4().simple()))
+        .bind("0".repeat(64))
+        .bind(key)
+        .bind(trashed)
+        .execute(pool)
+        .await
+        .expect("seed generic artifacts row");
+    }
+
+    /// #4833: two repositories delete while sharing content-addressed generic
+    /// keys on one storage root (the shape every cloud backend has). Each
+    /// delete spares a key the other still holds, so when both collect before
+    /// either cascades, the objects outlive both and nothing records them. The
+    /// delete now hands every spared key to the candidate set; the sweep must
+    /// keep an object a surviving repository still references (here by an
+    /// older revision) and reclaim one nothing references.
+    #[tokio::test]
+    async fn spared_generic_keys_are_reclaimed_once_no_repository_references_them_4833() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (repo_b, _kb, repo_b_dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let (repo_c, _kc, repo_c_dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let shared_root = fx.storage_dir.to_string_lossy().into_owned();
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = ANY($2)")
+            .bind(&shared_root)
+            .bind(&[fx.repo_id, repo_b, repo_c][..])
+            .execute(&fx.pool)
+            .await
+            .expect("share one storage root");
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: shared_root,
+        };
+        let storage = fx.state.storage_for_repo(&location).expect("storage");
+        let content_key = || {
+            let sha = format!("{:0>64}", Uuid::new_v4().simple());
+            format!("{}/{}/{}", &sha[..2], &sha[2..4], sha)
+        };
+        let orphaned = content_key();
+        let revision_held = content_key();
+        for key in [&orphaned, &revision_held] {
+            storage
+                .put(key, Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+            seed_generic_artifact_row(&fx.pool, fx.repo_id, key, false).await;
+            seed_generic_artifact_row(&fx.pool, repo_b, key, false).await;
+        }
+        sqlx::query(
+            "INSERT INTO artifact_versions (repository_id, path, revision, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'dir/old.bin', 1, 'old.bin', 7, $2, 'application/octet-stream', $3)",
+        )
+        .bind(repo_c)
+        .bind("0".repeat(64))
+        .bind(&revision_held)
+        .execute(&fx.pool)
+        .await
+        .expect("seed artifact_versions row");
+
+        // Both deletes collect before either cascades: each spares both keys.
+        let none = std::collections::BTreeSet::new();
+        let mut recorded = 0;
+        for repo in [fx.repo_id, repo_b] {
+            recorded += record_spared_artifact_gc_candidates(&fx.pool, repo, &location, &none)
+                .await
+                .expect("record spared keys");
+        }
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&[fx.repo_id, repo_b][..])
+            .execute(&fx.pool)
+            .await
+            .expect("delete A and B");
+        age_oci_gc_candidates(&fx.pool).await;
+        StorageGcService::new(fx.pool.clone(), fx.state.storage_registry.clone())
+            .run_gc(false)
+            .await
+            .expect("gc");
+        let orphaned_survived = storage.exists(&orphaned).await.expect("exists");
+        let revision_held_survived = storage.exists(&revision_held).await.expect("exists");
+        let left =
+            surviving_candidate_count(&fx.pool, &[orphaned.clone(), revision_held.clone()]).await;
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_c)
+            .execute(&fx.pool)
+            .await
+            .expect("delete C");
+        let _ = std::fs::remove_dir_all(&repo_b_dir);
+        let _ = std::fs::remove_dir_all(&repo_c_dir);
+        fx.teardown().await;
+
+        assert_eq!(
+            recorded, 2,
+            "each spared key is recorded once per storage scope"
+        );
+        assert!(
+            !orphaned_survived,
+            "#4833: an object no surviving repository references must be reclaimed"
+        );
+        assert!(
+            revision_held_survived,
+            "an older revision in a surviving repository must keep the object"
+        );
+        assert_eq!(left, 0, "every candidate is consumed by its sweep");
+    }
+
+    /// #4833 (GC side): on `filesystem` every repository keeps its own copy of
+    /// a content-addressed key in its own tree. A trashed copy in one
+    /// repository must be reclaimable while another repository serves ITS copy
+    /// of the same key; the orphan predicate's live-row arm used to look across
+    /// every repository and kept the trashed file forever.
+    #[tokio::test]
+    async fn trashed_filesystem_copy_is_reclaimed_while_another_repo_serves_the_same_key_4833() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (repo_b, _kb, repo_b_dir) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let loc_a = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let loc_b = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: repo_b_dir.to_string_lossy().into_owned(),
+        };
+        let storage_a = fx.state.storage_for_repo(&loc_a).expect("storage A");
+        let storage_b = fx.state.storage_for_repo(&loc_b).expect("storage B");
+        let sha = format!("{:0>64}", Uuid::new_v4().simple());
+        let key = format!("{}/{}/{}", &sha[..2], &sha[2..4], sha);
+        for s in [&storage_a, &storage_b] {
+            s.put(&key, Bytes::from_static(b"payload"))
+                .await
+                .expect("seed copy");
+        }
+        seed_generic_artifact_row(&fx.pool, fx.repo_id, &key, true).await;
+        seed_generic_artifact_row(&fx.pool, repo_b, &key, false).await;
+
+        StorageGcService::new(fx.pool.clone(), fx.state.storage_registry.clone())
+            .run_gc(false)
+            .await
+            .expect("gc");
+        let a_survived = storage_a.exists(&key).await.expect("exists A");
+        let b_survived = storage_b.exists(&key).await.expect("exists B");
+        let b_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND storage_key = $2",
+        )
+        .bind(repo_b)
+        .bind(&key)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count B rows");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("delete B");
+        let _ = std::fs::remove_dir_all(&repo_b_dir);
+        fx.teardown().await;
+
+        assert!(
+            !a_survived,
+            "#4833: the trashed copy in repo A's tree must be reclaimed"
+        );
+        assert!(b_survived, "repo B's own copy must be untouched");
+        assert_eq!(b_rows, 1, "repo B's live row must be untouched");
     }
 
     /// Repository-delete hand-off, as `delete_repository` performs it: record
