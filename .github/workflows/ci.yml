@@ -2081,8 +2081,8 @@ jobs:
   # because a scheduled watch can only ever see the image it scanned.
   #
   # Offline and instant: it reads Dockerfiles, not the Go release index (that
-  # question -- is this the newest patch of its minor -- is the sibling
-  # repository's scripts/check-go-floor.sh, for the pinned tarball). Gated on
+  # question -- is this the newest patch of its minor -- is answered by the
+  # pinned-base-image watch scanning the published images). Gated on
   # `docker/**` so it runs exactly when a floor can move, and -- like Version
   # Pin Bump -- reported through ✅ CI Complete rather than as a new required
   # context, so a failure blocks without a branch-protection change.
