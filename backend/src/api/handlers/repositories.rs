@@ -754,11 +754,15 @@ async fn authorize_virtual_member_mutation(
 
     // Fine-grained privilege gate on the virtual parent. Admins short-circuit
     // with no DB lookup; non-admins need `repository:admin` on the virtual repo.
+    // The decision goes through `check_repository_action` so the `admin` action
+    // can come from a role assignment (`repository-owner`, which repository
+    // creation grants to the creator) and not only a fine-grained rule — the
+    // same gap `require_repo_admin` had (#4818/#4834).
     let has_repo_admin = if auth.is_admin {
         true
     } else {
         permission_service
-            .check_permission(auth.user_id, "repository", virtual_repo.id, "admin", false)
+            .check_repository_action(auth.user_id, virtual_repo.id, "admin", false)
             .await?
     };
     if !member_mutation_admin_allowed(auth.is_admin, has_repo_admin) {
@@ -2567,18 +2571,9 @@ pub async fn set_cache_ttl(
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository. Cache TTL is a pull-through proxy supply-chain control on the
     // same administrative tier as delete/update, so the tenant write gate above
-    // is not sufficient on its own.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the cache TTL of this repository".to_string(),
-            ));
-        }
-    }
+    // is not sufficient on its own. `require_repo_admin` honors an `admin`
+    // action held through a role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (see #917).
@@ -2737,19 +2732,9 @@ pub async fn set_on_upstream_not_found(
     // repository. Like the cache TTL, this is a pull-through proxy
     // supply-chain control on the same administrative tier as delete/update,
     // so the tenant write gate above is not sufficient on its own.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the upstream-not-found policy of this \
-                 repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // `require_repo_admin` honors an `admin` action held through a role
+    // (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (#4640).
@@ -2895,19 +2880,9 @@ pub async fn set_stale_if_error_grace(
 
     // Same administrative tier as `set_cache_ttl`: the grace window is a
     // pull-through supply-chain control, so a tenant write grant is not enough.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the stale-if-error grace window of this \
-                 repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // `require_repo_admin` honors an `admin` action held through a role
+    // (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Only Remote (proxy) repositories consume the value; writing it elsewhere
     // is dead state (mirrors `set_cache_ttl`).
@@ -3408,19 +3383,9 @@ pub async fn set_npm_scope_policy(
 
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository (mirrors `set_cache_ttl`; the global-admin bypass is
-    // preserved).
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to change the npm scope policy of this repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // preserved). `require_repo_admin` honors an `admin` action held through a
+    // role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
 
@@ -3477,18 +3442,10 @@ pub async fn get_npm_scope_policy(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to read the npm scope policy of this repository"
-                    .to_string(),
-            ));
-        }
-    }
+    // Reading the npm scope policy is admin-tier (it discloses the repository's
+    // supply-chain configuration). `require_repo_admin` honors an `admin` action
+    // held through a role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     let policy = crate::api::handlers::npm::fetch_npm_scope_policy(&state.db, repo.id).await?;
     let active = policy.is_active();
@@ -3558,19 +3515,10 @@ pub async fn invalidate_cache(
     // #2321 G6: evicting proxy-cache entries is a pull-through supply-chain
     // control on the same administrative tier as `set_cache_ttl` (an attacker
     // with plain repo-write could force re-fetches / open a cache-poisoning
-    // window). Require `repository:admin` for non-admins, mirroring
-    // `set_cache_ttl`; the global-admin bypass is preserved.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to invalidate the cache of this repository".to_string(),
-            ));
-        }
-    }
+    // window). `require_repo_admin` requires `repository:admin` for non-admins
+    // (mirroring `set_cache_ttl`) while honoring an `admin` action held through
+    // a role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Cache invalidation is meaningless on Local / Virtual / Staging repos --
     // only Remote (proxy) repos own a cache. Reject up front before touching
@@ -5290,18 +5238,10 @@ pub async fn update_repository(
     let existing = service.get_by_key(&key).await?;
     require_repo_access(&auth, existing.id)?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target repository.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", existing.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to update this repository".to_string(),
-            ));
-        }
-    }
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository. `require_repo_admin` honors an `admin` action held through a
+    // role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, existing.id, &state.permission_service).await?;
 
     // Projects (#2473): (re)assigning a repository to a different project
     // needs a global admin, a system repo-admin, or project-admin on the
@@ -6352,18 +6292,10 @@ pub async fn delete_repository(
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
 
-    // Fine-grained permission check: non-admins need "admin" on the target repository.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
-            .await?;
-        if !has_perm {
-            return Err(AppError::Authorization(
-                "Insufficient permissions to delete this repository".to_string(),
-            ));
-        }
-    }
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository. `require_repo_admin` honors an `admin` action held through a
+    // role (`repository-owner`), not only a rule (#4834).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     // Gather this repo's in-flight / abandoned OCI upload temp storage keys
     // BEFORE the repository row is deleted — the journal/session/part rows
@@ -12274,14 +12206,17 @@ pub async fn update_virtual_members(
     // Gate the whole operation on repo-admin of the virtual PARENT up front.
     // Editing the member list is administration of the parent; doing this here
     // (not only inside the per-member loop) means an empty desired set — "remove
-    // all members" — is still authorized rather than silently ungated.
+    // all members" — is still authorized rather than silently ungated. The
+    // decision goes through `check_repository_action` so an `admin` action held
+    // through a role (`repository-owner`) counts, not only a fine-grained rule
+    // (#4818/#4834).
     require_repo_access(&auth, virtual_repo.id)?;
     let has_repo_admin = if auth.is_admin {
         false
     } else {
         state
             .permission_service
-            .check_permission(auth.user_id, "repository", virtual_repo.id, "admin", false)
+            .check_repository_action(auth.user_id, virtual_repo.id, "admin", false)
             .await?
     };
     if !member_mutation_admin_allowed(auth.is_admin, has_repo_admin) {
@@ -19626,8 +19561,10 @@ mod tests {
         .await;
         match denied {
             Err(AppError::Authorization(msg)) => {
+                // #4834: the route now goes through the shared `require_repo_admin`
+                // gate, so the refusal carries its canonical message.
                 assert!(
-                    msg.contains("Insufficient permissions"),
+                    msg.contains("Repository admin permission is required"),
                     "unexpected message: {msg}"
                 );
             }
@@ -22391,6 +22328,181 @@ mod tests {
         tdh::cleanup(&pool, other_id, dev_id).await;
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    /// DB-backed (#4834): every repository-administration handler that still
+    /// carried an inline `check_permission(.., "repository", .., "admin", ..)`
+    /// gate now honours a `repository-owner` role member, the same gap
+    /// `require_repo_admin` had (#4818).
+    ///
+    /// A member of `repository-owner` (`{read,write,delete,admin}`, the role
+    /// repository creation grants to the creator) drives each of these routes
+    /// successfully with NO fine-grained `permissions` row:
+    /// `set_cache_ttl`, `set_on_upstream_not_found`, `set_stale_if_error_grace`,
+    /// `set_npm_scope_policy` / `get_npm_scope_policy`, `update_repository`,
+    /// `invalidate_cache`, `delete_repository`, and the shared virtual-member
+    /// mutation gate (`authorize_virtual_member_mutation`). A `developer`
+    /// member is still refused, so the fix widens the check and does not
+    /// disable it.
+    #[tokio::test]
+    async fn repository_owner_role_passes_inline_repo_admin_gates_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (dev_id, dev_name) = tdh::create_user(&pool).await;
+
+        // Remote repos: the only type these proxy-configuration routes accept.
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (vm_id, vm_key, vm_dir) = tdh::create_repo(&pool, "virtual", "npm").await;
+        let (member_id, member_key, member_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (del_id, del_key, del_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+
+        // repository-owner on every repo under test; a developer on the shared
+        // one to prove the gate still refuses a role without `admin`.
+        for id in [repo_id, vm_id, del_id] {
+            tdh::grant_repo_role(&pool, id, owner_id, "repository-owner").await;
+        }
+        tdh::grant_repo_role(&pool, repo_id, dev_id, "developer").await;
+
+        let state = || tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let owner = || tdh::make_auth(owner_id, &owner_name);
+        let dev = || tdh::make_auth(dev_id, &dev_name);
+
+        // A `repository-owner` member passes each gate...
+        let ok = set_cache_ttl(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetCacheTtlRequest {
+                cache_ttl_seconds: 60,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_cache_ttl must admit a repository-owner: {ok:?}"
+        );
+
+        let ok = set_on_upstream_not_found(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetOnUpstreamNotFoundRequest {
+                on_upstream_not_found:
+                    crate::services::upstream_not_found_policy::OnUpstreamNotFound::Keep,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_on_upstream_not_found must admit a repository-owner: {ok:?}"
+        );
+
+        let ok = set_stale_if_error_grace(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetStaleIfErrorGraceRequest {
+                stale_if_error_grace_seconds: 60,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_stale_if_error_grace must admit a repository-owner: {ok:?}"
+        );
+
+        let ok = set_npm_scope_policy(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(SetNpmScopePolicyRequest {
+                allowed_scopes: vec!["@acme".to_string()],
+                allow_unscoped: false,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "set_npm_scope_policy must admit a repository-owner: {ok:?}"
+        );
+        let ok =
+            get_npm_scope_policy(State(state()), Extension(Some(owner())), Path(key.clone())).await;
+        assert!(
+            ok.is_ok(),
+            "get_npm_scope_policy must admit a repository-owner: {ok:?}"
+        );
+
+        let update: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"description":"owner-set description"}"#)
+                .expect("deserialize update payload");
+        let ok = update_repository(
+            State(state()),
+            Extension(Some(owner())),
+            Path(key.clone()),
+            Json(update),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "update_repository must admit a repository-owner: {ok:?}"
+        );
+
+        // The virtual-member mutation gate. The member repo is public so the
+        // member-visibility gate early-returns and only the parent's
+        // repository:admin gate is measured.
+        let v = make_repo_with_id(vm_id, &vm_key);
+        let m = crate::models::repository::Repository {
+            visibility: crate::models::repository::RepositoryVisibility::Public,
+            is_public: true,
+            ..make_repo_with_id(member_id, &member_key)
+        };
+        let perms = crate::services::permission_service::PermissionService::new(pool.clone());
+        let ok = authorize_virtual_member_mutation(&pool, &owner(), &v, &m, "update", &perms).await;
+        assert!(
+            ok.is_ok(),
+            "virtual-member mutation must admit a repository-owner: {ok:?}"
+        );
+
+        // A `developer` (write-only) member is still refused on a shared route.
+        let denied = set_cache_ttl(
+            State(state()),
+            Extension(Some(dev())),
+            Path(key.clone()),
+            Json(SetCacheTtlRequest {
+                cache_ttl_seconds: 60,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "a developer (no admin) must still be refused: {denied:?}"
+        );
+
+        // ...and `delete_repository` admits a repository-owner too.
+        let ok = delete_repository(
+            State(state()),
+            Extension(Some(owner())),
+            Path(del_key.clone()),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "delete_repository must admit a repository-owner: {ok:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, member_id, &member_dir).await;
+        tdh::cleanup_member_repo(&pool, vm_id, &vm_dir).await;
+        tdh::cleanup_member_repo(&pool, del_id, &del_dir).await;
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup_user(&pool, dev_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DB-backed: a non-admin member holding only `write` (developer role via
