@@ -489,6 +489,33 @@ pub async fn login(
     ))
 }
 
+/// The refresh-token family of the login session whose access token
+/// authenticated this request (#4831): the JWT in `Authorization: Bearer`, or
+/// the web UI's `ak_access_token` cookie. Access tokens minted with a refresh
+/// token carry its `family_id`; API keys, Basic credentials, access-only
+/// mints and tokens minted before #4831 carry none. The token was already
+/// validated by the auth middleware; it is decoded again only to read the
+/// claim, and must belong to the authenticated user.
+fn presenting_session_family(
+    auth_service: &AuthService,
+    headers: &HeaderMap,
+    auth: &AuthExtension,
+) -> Option<Uuid> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        });
+    let token = bearer.or_else(|| extract_cookie(headers, "ak_access_token"))?;
+    let claims = auth_service.validate_access_token(token.trim()).ok()?;
+    if claims.sub != auth.user_id {
+        return None;
+    }
+    claims.family_id
+}
+
 /// Logout current session
 #[utoipa::path(
     post,
@@ -511,19 +538,31 @@ pub async fn logout(
         // (#1807). Scoped to the session's family_id rather than a user-wide
         // watermark, so other concurrent sessions stay alive. Browser clients
         // carry the refresh token in the ak_refresh_token cookie; CLI/mobile
-        // clients pass it in the request body (like /auth/refresh). A missing
-        // or malformed refresh token is ignored: logout still clears cookies
-        // and succeeds.
+        // clients pass it in the request body (like /auth/refresh). The
+        // presenting access token carries the same family_id, so the session
+        // is revoked even when no refresh token is in the request: a bearer
+        // logout with an empty body, or a browser, which only sends the
+        // refresh cookie to /auth/refresh (#4831). A missing or malformed
+        // refresh token is ignored: logout still clears cookies and succeeds.
         let refresh = body
             .and_then(|Json(b)| b.refresh_token)
             .or_else(|| extract_cookie(&headers, "ak_refresh_token").map(String::from));
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
         if let Some(refresh) = refresh {
-            let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
             if let Err(err) = auth_service.revoke_refresh_token_family_for(&refresh).await {
                 tracing::warn!(
                     user_id = %auth.user_id,
                     error = %err,
                     "logout: failed to revoke refresh-token family",
+                );
+            }
+        }
+        if let Some(family_id) = presenting_session_family(&auth_service, &headers, &auth) {
+            if let Err(err) = auth_service.revoke_refresh_token_family(family_id).await {
+                tracing::warn!(
+                    user_id = %auth.user_id,
+                    error = %err,
+                    "logout: failed to revoke the session's refresh-token family",
                 );
             }
         }
@@ -1459,6 +1498,176 @@ mod tests {
                 .await
                 .is_err(),
             "a refresh token presented after logout must be rejected"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mint and persist one login session (token pair) for `user_id`.
+    async fn mint_persisted_session(
+        pool: &sqlx::PgPool,
+        state: &crate::api::SharedState,
+        user_id: Uuid,
+    ) -> crate::services::auth_service::TokenPair {
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .expect("fetch user");
+        let tokens = auth_service.generate_tokens(&user).expect("mint tokens");
+        auth_service
+            .persist_refresh_jti_from_pair(&tokens, user_id)
+            .await
+            .expect("persist refresh jti");
+        tokens
+    }
+
+    /// POST `/logout` through the optional-auth layer, as routes.rs mounts it.
+    async fn send_logout(
+        pool: &sqlx::PgPool,
+        state: &crate::api::SharedState,
+        req: axum::http::Request<axum::body::Body>,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let app =
+            logout_router()
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_service,
+                    crate::api::middleware::auth::optional_auth_middleware,
+                ));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "logout must succeed, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    async fn unrevoked_refresh_jti(pool: &sqlx::PgPool, user_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count unrevoked jti")
+    }
+
+    /// A bearer logout with an empty body (the API/CLI shape) carries no
+    /// refresh token, so it revoked nothing and the session's refresh token
+    /// kept minting access tokens after a 200 logout (#4831). The access
+    /// token carries the session's family, so logout revokes it.
+    #[tokio::test]
+    async fn logout_with_bearer_and_empty_body_revokes_refresh_token_family() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-empty-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let tokens = mint_persisted_session(&pool, &state, user_id).await;
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {}", tokens.access_token))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        send_logout(&pool, &state, req).await;
+
+        assert_eq!(
+            unrevoked_refresh_jti(&pool, user_id).await,
+            0,
+            "a bearer logout without a refresh token must revoke the session's family"
+        );
+        let check = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        assert!(
+            check.refresh_tokens(&tokens.refresh_token).await.is_err(),
+            "the session's refresh token must be rejected after logout"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The browser shape: only the session cookie is sent (the refresh cookie
+    /// is scoped to /auth/refresh) and there is no body (#4831).
+    #[tokio::test]
+    async fn logout_with_session_cookies_only_revokes_refresh_token_family() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-cookie-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let tokens = mint_persisted_session(&pool, &state, user_id).await;
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("cookie", format!("ak_access_token={}", tokens.access_token))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        send_logout(&pool, &state, req).await;
+
+        assert_eq!(
+            unrevoked_refresh_jti(&pool, user_id).await,
+            0,
+            "a cookie-only logout must revoke the session's family"
+        );
+        let check = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        assert!(
+            check.refresh_tokens(&tokens.refresh_token).await.is_err(),
+            "the session's refresh token must be rejected after logout"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Logout ends the presenting session only: another concurrent session of
+    /// the same user keeps refreshing (#1807 scoping, kept by #4831).
+    #[tokio::test]
+    async fn logout_revokes_only_the_presenting_session() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-scope-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let first = mint_persisted_session(&pool, &state, user_id).await;
+        let second = mint_persisted_session(&pool, &state, user_id).await;
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {}", first.access_token))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        send_logout(&pool, &state, req).await;
+
+        let check = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        assert!(
+            check.refresh_tokens(&first.refresh_token).await.is_err(),
+            "the logged-out session's refresh token must be rejected"
+        );
+        assert!(
+            check.refresh_tokens(&second.refresh_token).await.is_ok(),
+            "another session of the same user must keep refreshing"
         );
 
         tdh::cleanup_user(&pool, user_id).await;
