@@ -22481,7 +22481,35 @@ mod tests {
             "a developer (no admin) must still be refused: {denied:?}"
         );
 
-        // ...and `delete_repository` admits a repository-owner too.
+        // A `developer` on the repository is refused the delete and the row
+        // survives; that is the boundary this change keeps.
+        tdh::grant_repo_role(&pool, del_id, dev_id, "developer").await;
+        let denied = delete_repository(
+            State(state()),
+            Extension(Some(dev())),
+            Path(del_key.clone()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "a developer must not delete the repository: {denied:?}"
+        );
+        let row_exists = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = $1)",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert!(row_exists(del_id).await, "refused delete keeps the row");
+
+        // ...and `delete_repository` admits a repository-owner, which removes
+        // the repository (behaviour change of #4834: owners can now delete).
         let ok = delete_repository(
             State(state()),
             Extension(Some(owner())),
@@ -22492,6 +22520,7 @@ mod tests {
             ok.is_ok(),
             "delete_repository must admit a repository-owner: {ok:?}"
         );
+        assert!(!row_exists(del_id).await, "owner delete removes the row");
 
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
             .bind(repo_id)
