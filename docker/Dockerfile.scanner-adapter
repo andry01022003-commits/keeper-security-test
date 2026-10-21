@@ -57,11 +57,21 @@
 # go.sum, and adding x/net would add a dependency nothing imports (`go mod
 # tidy` removes it again). The x/net findings in this image are in the
 # bundled trivy, below.
+#
+# 1.27.2 -> 1.27.3 on 2026-10-21, for CVE-2026-111943 (HIGH) against stdlib
+# v1.27.2. Found not by a red publish but by the pinned-base-image watch
+# (#4852) -- which is the whole point of that workflow, since a stdlib CVE in
+# the ADAPTER binary is ours to fix here while one in the bundled trivy is
+# fixed in artifact-keeper/trivy and reached by moving the digest below. Both
+# halves are in this change. Same rule as #3655: the floor stays on the newest
+# patch of the minor the floating FROM names, never on the minimum go.mod
+# permits. CVE-2026-111943 is also fixed in go1.26.10, which is irrelevant
+# here -- this binary is built on 1.27.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG GO_MIN_PATCH=1.27.2
+ARG GO_MIN_PATCH=1.27.3
 
 RUN set -eu; \
     have="$(go env GOVERSION | sed 's/^go//')"; \
@@ -204,6 +214,44 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 #
 # This digest is the manifest-list digest of tag 0.76.0-r1 (artifact-keeper/
 # trivy#18, tagged 2026-10-17; verified with `skopeo inspect --raw`).
+#
+# MOVING THIS DIGEST (#4852): the remedy is three steps and this commit does
+# the first and the last, but NOT the middle one --
+#
+#   1. the Go-toolchain bump in artifact-keeper/trivy (a stdlib CVE has no
+#      module to override, so overrides.yaml correctly stays empty and
+#      GO_VERSION moves; scripts/check-go-floor.sh there now fails the build
+#      on a stale pin, which is what let 1.27.2 sit here unnoticed).
+#   2. merge, then tag the next -rN -- which needs the image BUILT and
+#      PUBLISHED, not merely tagged, because this pin names a DIGEST.
+#      DONE ONLY WHEN 0.76.0-r2 EXISTS AND ITS DIGEST IS KNOWN.
+#   3. repoint this FROM and move docker/scanner-adapter/VERSION, because the
+#      publish job refuses to republish an exact version ("Scanner adapter
+#      VERSION bump required").
+#
+# THIS COMMIT DID STEP 3'S VERSION HALF: VERSION moves 1.5.0 -> 1.6.0 (1.5.0
+# is published, and exact tags are never republished -- without the bump this
+# file could not be edited at all; scripts/ci/check-version-pin-bump.sh fails
+# the PR otherwise, which is #3754 working). The digest below is deliberately
+# STILL 0.76.0-r1: while r2 does not exist there is nothing newer to name, and
+# the alternative -- leaving VERSION at 1.5.0 -- is not a smaller change, it
+# is one that cannot publish. So 1.6.0 currently builds the same trivy as
+# 1.5.0 plus the go1.27.3 floor from step 1; the digest repoint is the one
+# remaining edit, and it belongs in a follow-up PR the moment r2 is published.
+# This mirrors how 1.5.0 itself shipped: its own commit message records that
+# the FROM digest was an "all-zero placeholder until the fork tags v0.76.0-r1",
+# i.e. the digest and its VERSION have been out of step across a release here
+# before, on purpose, and the tag was fixed up after.
+#
+# The watch's remedy text stops at step 2 deliberately, and `--ignore-unfixed`
+# stops even a red watch from being an emergency: the error is reported for a
+# FIXED finding, which is by construction not exploitable while an
+# `ignore-unfixed` gate is what reads it. That is the window this file is
+# written to be updated in -- not under a failed publish. v0.76.0-r1 remains
+# correct until v0.76.0-r2 exists. The sibling half -- artifact-keeper/trivy,
+# branch fix/4819-go1.27.3-cve-2026-111943, commit "build: Go 1.27.3 for
+# CVE-2026-111943; fail the build on a stale toolchain pin" -- carries step 1;
+# it is not yet opened as a PR there, so there is no number to cite.
 FROM ghcr.io/artifact-keeper/trivy@sha256:36e93de3edfa615553692781624be999fb22d113d1ecbe6712a3c90c71d5cc74 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
