@@ -34,6 +34,12 @@
 //! # not reachable by clients (#4417). Backend calls keep the internal endpoint.
 //! AZURE_STORAGE_PUBLIC_ENDPOINT=https://blobs.example.com
 //!
+//! # Minimum deadline, in seconds, for one server-side copy (Put Blob From
+//! # URL). The default deadline is 60 s plus the source size at 8 MiB/s; raise
+//! # this when the account copies slower than that (#4858). Unset or 0 keeps
+//! # the size-derived deadline.
+//! AZURE_COPY_TIMEOUT_SECS=1800
+//!
 //! # For Artifactory migration:
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
 //! ```
@@ -97,6 +103,9 @@ pub struct AzureConfig {
     pub sas_expiry: Duration,
     /// Storage path format (native, artifactory, or migration)
     pub path_format: StoragePathFormat,
+    /// Minimum Put Blob From URL deadline (`AZURE_COPY_TIMEOUT_SECS`, #4858).
+    /// Zero keeps the size-derived deadline of [`put_blob_from_url_timeout`].
+    pub copy_timeout_floor: Duration,
 }
 
 impl AzureConfig {
@@ -131,6 +140,9 @@ impl AzureConfig {
 
         let path_format = StoragePathFormat::from_env();
 
+        let copy_timeout_floor =
+            parse_copy_timeout_floor(std::env::var("AZURE_COPY_TIMEOUT_SECS").ok().as_deref());
+
         Ok(Self {
             account_name,
             container_name,
@@ -140,6 +152,7 @@ impl AzureConfig {
             redirect_downloads,
             sas_expiry,
             path_format,
+            copy_timeout_floor,
         })
     }
 
@@ -445,13 +458,23 @@ pub struct AzureBackend {
     path_format: StoragePathFormat,
 }
 
+/// Parse `AZURE_COPY_TIMEOUT_SECS`; unset or unparsable means no floor.
+fn parse_copy_timeout_floor(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO)
+}
+
 /// Deadline for a Put Blob From URL request copying `size` bytes.
 ///
 /// Azure performs the copy before it sends the response, so this bounds the
-/// whole copy, not a gap between reads.
-fn put_blob_from_url_timeout(size: u64) -> Duration {
-    AZURE_PUT_BLOB_FROM_URL_BASE_TIMEOUT
-        + Duration::from_secs(size.div_ceil(AZURE_PUT_BLOB_FROM_URL_MIN_BYTES_PER_SEC))
+/// whole copy, not a gap between reads. `floor` (`AZURE_COPY_TIMEOUT_SECS`)
+/// raises it for accounts that copy slower than the assumed rate.
+fn put_blob_from_url_timeout(size: u64, floor: Duration) -> Duration {
+    (AZURE_PUT_BLOB_FROM_URL_BASE_TIMEOUT
+        + Duration::from_secs(size.div_ceil(AZURE_PUT_BLOB_FROM_URL_MIN_BYTES_PER_SEC)))
+    .max(floor)
 }
 
 impl AzureBackend {
@@ -1610,7 +1633,7 @@ impl StorageBackend for AzureBackend {
 
         // Azure reads the source while the request is open, so the source SAS
         // must outlive the request rather than expire part-way through it.
-        let timeout = put_blob_from_url_timeout(size);
+        let timeout = put_blob_from_url_timeout(size, self.config.copy_timeout_floor);
         let source_url = self.read_url(
             source,
             Duration::from_secs(300).max(timeout + Duration::from_secs(60)),
@@ -1896,6 +1919,7 @@ mod tests {
             redirect_downloads: true,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            copy_timeout_floor: Duration::ZERO,
         }
     }
 
@@ -1909,6 +1933,7 @@ mod tests {
             redirect_downloads: false,
             sas_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            copy_timeout_floor: Duration::ZERO,
         }
     }
 
@@ -3012,17 +3037,39 @@ mod tests {
 
     #[test]
     fn test_put_blob_from_url_timeout_covers_the_whole_copy() {
-        assert_eq!(put_blob_from_url_timeout(0), Duration::from_secs(60));
-        assert_eq!(put_blob_from_url_timeout(1), Duration::from_secs(61));
+        let none = Duration::ZERO;
+        assert_eq!(put_blob_from_url_timeout(0, none), Duration::from_secs(60));
+        assert_eq!(put_blob_from_url_timeout(1, none), Duration::from_secs(61));
         // The 1.9 GiB layer from the bug report: about four minutes.
         assert_eq!(
-            put_blob_from_url_timeout(2_046_467_024),
+            put_blob_from_url_timeout(2_046_467_024, none),
             Duration::from_secs(60 + 244)
         );
         assert_eq!(
-            put_blob_from_url_timeout(AZURE_PUT_BLOB_FROM_URL_MAX_SIZE),
+            put_blob_from_url_timeout(AZURE_PUT_BLOB_FROM_URL_MAX_SIZE, none),
             Duration::from_secs(60 + 625)
         );
+    }
+
+    #[test]
+    fn test_put_blob_from_url_timeout_honours_the_configured_floor() {
+        let floor = Duration::from_secs(1800);
+        assert_eq!(put_blob_from_url_timeout(1, floor), floor);
+        // A floor below the size-derived deadline does not shorten it.
+        assert_eq!(
+            put_blob_from_url_timeout(AZURE_PUT_BLOB_FROM_URL_MAX_SIZE, Duration::from_secs(5)),
+            Duration::from_secs(60 + 625)
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_timeout_floor() {
+        assert_eq!(
+            parse_copy_timeout_floor(Some(" 1800 ")),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(parse_copy_timeout_floor(None), Duration::ZERO);
+        assert_eq!(parse_copy_timeout_floor(Some("soon")), Duration::ZERO);
     }
 
     /// Accept one connection, read one request's headers, and return them
