@@ -1583,8 +1583,104 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
     entries
 }
 
-/// Fetch and parse one V2 OData document. `odata` is the verb plus query, e.g.
+/// Extract the V2 OData continuation URL from one Atom feed page.
+///
+/// V2 feeds expose the next page as a feed-level Atom `<link rel="next"
+/// href="..."/>`. Attribute values are normalized so the `&amp;` in an OData
+/// `$skiptoken` becomes a real ampersand before the URL is resolved. A `<link>`
+/// inside an `<entry>` describes that entry, not the feed, and is ignored.
+fn parse_v2_next_link(xml: &str) -> Option<String> {
+    use quick_xml::events::{BytesStart, Event};
+    use quick_xml::{Reader, XmlVersion};
+
+    fn attribute(element: &BytesStart<'_>, name: &[u8]) -> Option<String> {
+        element.attributes().flatten().find_map(|attribute| {
+            (attribute.key.as_ref() == name)
+                .then(|| {
+                    attribute
+                        .normalized_value(XmlVersion::Explicit1_0)
+                        .ok()
+                        .map(|value| value.into_owned())
+                })
+                .flatten()
+        })
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut entry_depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) if element.local_name().as_ref() == b"entry" => {
+                entry_depth += 1;
+            }
+            Ok(Event::End(element)) if element.local_name().as_ref() == b"entry" => {
+                entry_depth = entry_depth.saturating_sub(1);
+            }
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if entry_depth == 0 && element.local_name().as_ref() == b"link" =>
+            {
+                if attribute(&element, b"rel").is_some_and(|rel| rel.eq_ignore_ascii_case("next")) {
+                    return attribute(&element, b"href");
+                }
+            }
+            Err(_) | Ok(Event::Eof) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// Resolve and validate a V2 continuation URL before sending the upstream's
+/// configured credentials to it. Continuations may be relative, but they must
+/// stay on the configured upstream origin (same scheme, host and effective
+/// port); the repository's upstream credentials are only ever sent there.
+/// `Err` carries the reason a continuation is not followed.
+fn resolve_v2_next_url(
+    upstream_url: &str,
+    current_url: &str,
+    href: &str,
+) -> Result<String, &'static str> {
+    let next = reqwest::Url::parse(current_url)
+        .and_then(|current| current.join(href))
+        .map_err(|_| "continuation URL could not be resolved")?;
+    let same_scheme =
+        reqwest::Url::parse(upstream_url).is_ok_and(|upstream| upstream.scheme() == next.scheme());
+    if !matches!(next.scheme(), "http" | "https")
+        || !same_scheme
+        || !same_upstream_origin(upstream_url, next.as_str())
+    {
+        return Err("continuation points off the configured upstream origin");
+    }
+    Ok(next.to_string())
+}
+
+/// Most upstream pages one translated V2 query reads. Each page is a
+/// request on the client's path, so the walk is bounded; real feeds page at
+/// 100 entries or more, so this covers packages with thousands of versions.
+const MAX_V2_UPSTREAM_PAGES: usize = 20;
+
+fn v2_continuation_cache_path(fetch_url: &str) -> String {
+    format!("v2/continuation/{:x}", Sha256::digest(fetch_url.as_bytes()))
+}
+
+fn v2_odata_top_limit(odata: &str) -> Option<usize> {
+    let query = odata.split_once('?')?.1;
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        let key = urlencoding::decode(key).ok()?;
+        if !key.eq_ignore_ascii_case("$top") {
+            return None;
+        }
+        urlencoding::decode(value).ok()?.parse().ok()
+    })
+}
+
+/// Fetch and parse a V2 OData document, following bounded Atom continuation
+/// links. `odata` is the verb plus query, e.g.
 /// `FindPackagesById()?id='newtonsoft.json'`.
+///
+/// The first page keeps the historical cache key so existing entries remain
+/// usable. Continuation pages get distinct keys based on their resolved URL;
+/// otherwise every page would overwrite the first page's cache entry.
 async fn fetch_v2_entries(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -1593,19 +1689,87 @@ async fn fetch_v2_entries(
     base: &str,
     odata: &str,
 ) -> Result<Vec<V2Entry>, Response> {
-    let fetch_url = format!("{}/{}", base.trim_end_matches('/'), odata);
-    let cache_path = format!("v2/{}", bounded_cache_segment(odata));
-    let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        &fetch_url,
-        &cache_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-    )
-    .await?;
-    Ok(parse_v2_feed_entries(&String::from_utf8_lossy(&content)))
+    let first_url = format!("{}/{}", base.trim_end_matches('/'), odata);
+    let mut next_url = Some(first_url);
+    let mut entries = Vec::new();
+    let mut seen_urls = std::collections::HashSet::new();
+    // Paging is not a stable snapshot: an upstream that changes between pages
+    // can repeat a row, so keep the first copy of each (id, version).
+    let mut seen_entries = std::collections::HashSet::new();
+    let entry_limit = v2_odata_top_limit(odata);
+    if entry_limit == Some(0) {
+        return Ok(entries);
+    }
+    let mut page = 0;
+
+    while let Some(fetch_url) = next_url.take() {
+        if page >= MAX_V2_UPSTREAM_PAGES {
+            warn!(
+                repo_key = %repo_key,
+                upstream = %upstream_url,
+                max_pages = MAX_V2_UPSTREAM_PAGES,
+                "NuGet V2 upstream pagination reached its safety limit"
+            );
+            break;
+        }
+        if !seen_urls.insert(fetch_url.clone()) {
+            warn!(
+                repo_key = %repo_key,
+                upstream = %upstream_url,
+                "NuGet V2 upstream returned a repeated continuation URL"
+            );
+            break;
+        }
+
+        let cache_path = if page == 0 {
+            format!("v2/{}", bounded_cache_segment(odata))
+        } else {
+            v2_continuation_cache_path(&fetch_url)
+        };
+        let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &fetch_url,
+            &cache_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await?;
+        let body = String::from_utf8_lossy(&content);
+        entries.extend(parse_v2_feed_entries(&body).into_iter().filter(|entry| {
+            seen_entries.insert((entry.id.to_lowercase(), entry.version.to_lowercase()))
+        }));
+        if let Some(limit) = entry_limit {
+            if entries.len() >= limit {
+                entries.truncate(limit);
+                break;
+            }
+        }
+        // A continuation that cannot be followed safely ends the walk with the
+        // entries already read: the pages fetched so far are still correct,
+        // and failing the whole request would turn a served first page into
+        // a 502. A failed FETCH of a later page still fails the request below,
+        // since silently dropping versions is the bug this loop fixes.
+        next_url = match parse_v2_next_link(&body)
+            .map(|href| resolve_v2_next_url(upstream_url, &fetch_url, &href))
+        {
+            None => None,
+            Some(Ok(next)) => Some(next),
+            Some(Err(reason)) => {
+                warn!(
+                    repo_key = %repo_key,
+                    upstream = %upstream_url,
+                    reason,
+                    "NuGet V2 upstream continuation not followed; serving the pages already read"
+                );
+                None
+            }
+        };
+        page += 1;
+    }
+
+    Ok(entries)
 }
 
 /// The V2 verb for "every version of this id". `semVerLevel` is sent because a
@@ -7301,6 +7465,99 @@ mod read_db_tests {
     }
 
     #[test]
+    fn test_v2_next_link_decodes_xml_entities() {
+        let xml = r#"<feed><link rel="next" href="https://feed.example/api/v2/FindPackagesById()?id='pkg'&amp;$skiptoken=page-2" /></feed>"#;
+        assert_eq!(
+            parse_v2_next_link(xml).as_deref(),
+            Some("https://feed.example/api/v2/FindPackagesById()?id='pkg'&$skiptoken=page-2")
+        );
+    }
+
+    /// Only the feed-level continuation counts; an entry's own `<link>`
+    /// elements (edit links, and so on) never page the feed.
+    #[test]
+    fn test_v2_next_link_ignores_links_inside_entries() {
+        let xml = r#"<feed><entry><link rel="next" href="https://feed.example/wrong" /></entry><link rel="self" href="https://feed.example/self" /><link rel="next" href="https://feed.example/right" /></feed>"#;
+        assert_eq!(
+            parse_v2_next_link(xml).as_deref(),
+            Some("https://feed.example/right")
+        );
+        assert_eq!(parse_v2_next_link("<feed><entry/></feed>"), None);
+    }
+
+    #[test]
+    fn test_resolve_v2_next_url_requires_the_configured_origin_and_scheme() {
+        // `Url::join` percent-encodes the OData quotes; upstreams decode them.
+        let resolved = resolve_v2_next_url(
+            "https://feed.example/api/v2",
+            "https://feed.example/api/v2/FindPackagesById()?id='pkg'",
+            "FindPackagesById()?id='pkg'&$skiptoken=page-2",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            "https://feed.example/api/v2/FindPackagesById()?id=%27pkg%27&$skiptoken=page-2"
+        );
+        let pairs: Vec<(String, String)> = reqwest::Url::parse(&resolved)
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("id".to_string(), "'pkg'".to_string()),
+                ("$skiptoken".to_string(), "page-2".to_string()),
+            ]
+        );
+
+        // Same host and port, other scheme: a downgrade is not followed.
+        assert!(resolve_v2_next_url(
+            "https://feed.example:443/api/v2",
+            "https://feed.example:443/api/v2/FindPackagesById()?id='pkg'",
+            "http://feed.example:443/api/v2/FindPackagesById()?id='pkg'&$skiptoken=page-2",
+        )
+        .is_err());
+        assert!(resolve_v2_next_url(
+            "https://feed.example/api/v2",
+            "https://feed.example/api/v2/FindPackagesById()?id='pkg'",
+            "https://other.example/api/v2/FindPackagesById()?id='pkg'&$skiptoken=page-2",
+        )
+        .is_err());
+        assert!(resolve_v2_next_url(
+            "https://feed.example/api/v2",
+            "https://feed.example/api/v2/FindPackagesById()?id='pkg'",
+            "https://feed.example:8443/api/v2/FindPackagesById()?$skiptoken=page-2",
+        )
+        .is_err());
+        assert!(resolve_v2_next_url(
+            "https://feed.example/api/v2",
+            "https://feed.example/api/v2/FindPackagesById()?id='pkg'",
+            "file:///etc/passwd",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_v2_odata_top_limit_decodes_the_query_key() {
+        assert_eq!(v2_odata_top_limit("Search()?%24top=37"), Some(37));
+        assert_eq!(v2_odata_top_limit("Search()?%24top=37&$skip=4"), Some(37));
+        assert_eq!(v2_odata_top_limit("FindPackagesById()?id='pkg'"), None);
+        assert_eq!(v2_odata_top_limit("Search()?%24top=0"), Some(0));
+    }
+
+    #[test]
+    fn test_v2_continuation_cache_path_hashes_the_full_url() {
+        let first =
+            v2_continuation_cache_path("https://feed.example/api/v2/FindPackagesById()?token=a/b");
+        let second =
+            v2_continuation_cache_path("https://feed.example/api/v2/FindPackagesById()?token=a?b");
+        assert_ne!(first, second);
+        assert!(first.starts_with("v2/continuation/"));
+        assert!(first.len() < 255);
+    }
+
+    #[test]
     fn test_rewrite_v2_odata_rebinds_feed_base_to_proxy() {
         let body = r#"<feed xml:base="https://community.chocolatey.org/api/v2/"><entry><id>https://community.chocolatey.org/api/v2/Packages(Id='git',Version='2.0')</id><content type="application/zip" src="https://community.chocolatey.org/api/v2/package/git/2.0"/></entry></feed>"#;
         let out = rewrite_v2_odata(
@@ -9107,6 +9364,268 @@ mod virtual_federation_tests {
         tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, priority).await;
         tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
         (member_id, dir)
+    }
+
+    /// A V2 upstream that exposes the second page through an Atom continuation
+    /// link. The `&amp;` in the link exercises XML attribute decoding as well as
+    /// the pagination loop.
+    async fn paginated_v2_upstream() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let first_page = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <entry><title type="text">paged</title><m:properties><d:Id>paged</d:Id><d:Version>1.0.0</d:Version></m:properties></entry>
+  <link rel="next" href="{}/api/v2/FindPackagesById()?id='paged'&amp;semVerLevel=2.0.0&amp;$skiptoken=page-2" />
+</feed>"#,
+            upstream.uri()
+        );
+        let second_page = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <entry><title type="text">paged</title><m:properties><d:Id>paged</d:Id><d:Version>2.0.0</d:Version></m:properties></entry>
+</feed>"#;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2/FindPackagesById()"))
+            .and(query_param("$skiptoken", "page-2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/atom+xml")
+                    .set_body_string(second_page),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/FindPackagesById()"))
+            .and(query_param_is_missing("$skiptoken"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/atom+xml")
+                    .set_body_string(first_page),
+            )
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    /// Pagination must survive the virtual-repository federation boundary:
+    /// the V2 member contributes both pages to the V3 registration document,
+    /// rather than only the first upstream page.
+    #[tokio::test]
+    async fn virtual_v3_registration_follows_v2_continuation_pages() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = paginated_v2_upstream().await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v3/registration/paged/index.json", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions: Vec<&str> = document["items"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["catalogEntry"]["version"].as_str())
+            .collect();
+        assert_eq!(versions, ["1.0.0", "2.0.0"]);
+    }
+
+    /// Mount one page of `FindPackagesById()?id='paged'`: `skiptoken` selects
+    /// the page (`None` is the first), `next_href` is written verbatim into
+    /// the feed-level `<link rel="next">` (XML-escaped as a real feed does).
+    async fn mount_v2_page(
+        upstream: &wiremock::MockServer,
+        skiptoken: Option<&str>,
+        versions: &[&str],
+        next_href: Option<String>,
+    ) {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let entries: String = versions
+            .iter()
+            .map(|v| {
+                format!(
+                    r#"<entry><title type="text">paged</title><m:properties><d:Id>paged</d:Id><d:Version>{v}</d:Version></m:properties></entry>"#
+                )
+            })
+            .collect();
+        let next = next_href
+            .map(|href| {
+                format!(
+                    r#"<link rel="next" href="{}" />"#,
+                    href.replace('&', "&amp;")
+                )
+            })
+            .unwrap_or_default();
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">{entries}{next}</feed>"#
+        );
+        let mock = Mock::given(method("GET")).and(path("/api/v2/FindPackagesById()"));
+        let mock = match skiptoken {
+            Some(token) => mock.and(query_param("$skiptoken", token)),
+            None => mock.and(query_param_is_missing("$skiptoken")),
+        };
+        mock.respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/atom+xml")
+                .set_body_string(body),
+        )
+        .mount(upstream)
+        .await;
+    }
+
+    /// A Remote repository over a V2 upstream answers its V3 registration and
+    /// flat-container version list from EVERY page of `FindPackagesById()`
+    /// (#4856): a relative continuation, an absolute one, and a row repeated
+    /// across pages (listed once).
+    #[tokio::test]
+    async fn remote_v3_surface_follows_v2_continuation_pages() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_v2_page(
+            &upstream,
+            None,
+            &["1.0.0"],
+            Some("FindPackagesById()?id='paged'&$skiptoken=page-2".to_string()),
+        )
+        .await;
+        mount_v2_page(
+            &upstream,
+            Some("page-2"),
+            &["1.0.0", "2.0.0", "2.1.0"],
+            Some(format!(
+                "{}/api/v2/FindPackagesById()?id='paged'&$skiptoken=page-3",
+                upstream.uri()
+            )),
+        )
+        .await;
+        mount_v2_page(&upstream, Some("page-3"), &["3.0.0"], None).await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/api/v2", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let app = || tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+        let (reg_status, reg_body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/v3/registration/paged/index.json", fx.repo_key)),
+        )
+        .await;
+        let (flat_status, flat_body) = tdh::send(
+            app(),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/paged/index.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            reg_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&reg_body)
+        );
+        let document: serde_json::Value = serde_json::from_slice(&reg_body).unwrap();
+        let mut versions: Vec<&str> = document["items"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["catalogEntry"]["version"].as_str())
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(versions, ["1.0.0", "2.0.0", "2.1.0", "3.0.0"]);
+
+        assert_eq!(
+            flat_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&flat_body)
+        );
+        let index: serde_json::Value = serde_json::from_slice(&flat_body).unwrap();
+        assert_eq!(
+            index["versions"],
+            serde_json::json!(["1.0.0", "2.0.0", "2.1.0", "3.0.0"])
+        );
+    }
+
+    /// A continuation that leaves the configured upstream origin is not
+    /// followed: the other host receives no request (it would carry the
+    /// repository's upstream credentials) and the pages already read are
+    /// still served rather than failing the request.
+    #[tokio::test]
+    async fn v2_continuation_to_another_origin_is_not_followed() {
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let foreign = wiremock::MockServer::start().await;
+        mount_v2_page(&foreign, Some("page-2"), &["9.9.9"], None).await;
+        let upstream = wiremock::MockServer::start().await;
+        mount_v2_page(
+            &upstream,
+            None,
+            &["1.0.0"],
+            Some(format!(
+                "{}/api/v2/FindPackagesById()?id='paged'&$skiptoken=page-2",
+                foreign.uri()
+            )),
+        )
+        .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/api/v2", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/paged/index.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let foreign_requests = foreign.received_requests().await.unwrap_or_default();
+        fx.teardown().await;
+
+        assert!(
+            foreign_requests.is_empty(),
+            "the off-origin continuation must not be requested"
+        );
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let index: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(index["versions"], serde_json::json!(["1.0.0"]));
     }
 
     /// #4021 — the V2 feed of a virtual repository listed hosted members only:
