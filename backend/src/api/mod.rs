@@ -1218,6 +1218,7 @@ mod tests {
     /// startup (naming it, without the configuration error) and still maps
     /// every other resolution failure to the historic plain 500.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // STREAMING-EXEMPT: test reads a small, bounded error body
     async fn storage_for_repo_or_500_keeps_skipped_backend_503_4530() {
         use crate::api::handlers::test_db_helpers as tdh;
         let dir = std::env::temp_dir().join(format!("skip-4530-{}", Uuid::new_v4()));
@@ -1237,7 +1238,7 @@ mod tests {
             .err()
             .expect("a skipped backend must not resolve");
         assert_eq!(skipped.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(skipped.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(skipped.into_body(), 64 * 1024)
             .await
             .unwrap();
         let body = String::from_utf8_lossy(&body);

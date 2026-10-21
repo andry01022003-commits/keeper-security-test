@@ -505,6 +505,7 @@ mod tests {
     /// Read the HTTP status and JSON `code` from a `backend_for` error without
     /// depending on `AppError`'s private mapping, exactly as a client sees
     /// them. Consumes the error, so it does not need `AppError: Clone`.
+    #[allow(clippy::disallowed_methods)] // STREAMING-EXEMPT: test reads a small, bounded error body
     async fn status_and_code_of(result: Result<Arc<dyn StorageBackend>>) -> (StatusCode, String) {
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
@@ -514,7 +515,7 @@ mod tests {
         };
         let response = err.into_response();
         let status = response.status();
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         (
             status,
