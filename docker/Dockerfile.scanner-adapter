@@ -202,7 +202,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.76.0-r1 (note: no leading
+# This digest is the manifest-list digest of tag 0.76.0-r2 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -212,47 +212,19 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # DID move this time — the bundled binary now reports `Version: 0.76.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
 #
-# This digest is the manifest-list digest of tag 0.76.0-r1 (artifact-keeper/
-# trivy#18, tagged 2026-10-17; verified with `skopeo inspect --raw`).
+# This digest is the manifest-list digest of tag 0.76.0-r2 (artifact-keeper/
+# trivy#19, tag v0.76.0-r2, published 2026-10-21; verified with `skopeo
+# inspect --raw`). The bundled binary is unchanged upstream v0.76.0
+# (531360e5) rebuilt on go1.27.3; `go version -m` on it reports go1.27.3.
 #
-# MOVING THIS DIGEST (#4852): the remedy is three steps and this commit does
-# the first and the last, but NOT the middle one --
-#
-#   1. the Go-toolchain bump in artifact-keeper/trivy (a stdlib CVE has no
-#      module to override, so overrides.yaml correctly stays empty and
-#      GO_VERSION moves; scripts/check-go-floor.sh there now fails the build
-#      on a stale pin, which is what let 1.27.2 sit here unnoticed).
-#   2. merge, then tag the next -rN -- which needs the image BUILT and
-#      PUBLISHED, not merely tagged, because this pin names a DIGEST.
-#      DONE ONLY WHEN 0.76.0-r2 EXISTS AND ITS DIGEST IS KNOWN.
-#   3. repoint this FROM and move docker/scanner-adapter/VERSION, because the
-#      publish job refuses to republish an exact version ("Scanner adapter
-#      VERSION bump required").
-#
-# THIS COMMIT DID STEP 3'S VERSION HALF: VERSION moves 1.5.0 -> 1.6.0 (1.5.0
-# is published, and exact tags are never republished -- without the bump this
-# file could not be edited at all; scripts/ci/check-version-pin-bump.sh fails
-# the PR otherwise, which is #3754 working). The digest below is deliberately
-# STILL 0.76.0-r1: while r2 does not exist there is nothing newer to name, and
-# the alternative -- leaving VERSION at 1.5.0 -- is not a smaller change, it
-# is one that cannot publish. So 1.6.0 currently builds the same trivy as
-# 1.5.0 plus the go1.27.3 floor from step 1; the digest repoint is the one
-# remaining edit, and it belongs in a follow-up PR the moment r2 is published.
-# This mirrors how 1.5.0 itself shipped: its own commit message records that
-# the FROM digest was an "all-zero placeholder until the fork tags v0.76.0-r1",
-# i.e. the digest and its VERSION have been out of step across a release here
-# before, on purpose, and the tag was fixed up after.
-#
-# The watch's remedy text stops at step 2 deliberately, and `--ignore-unfixed`
-# stops even a red watch from being an emergency: the error is reported for a
-# FIXED finding, which is by construction not exploitable while an
-# `ignore-unfixed` gate is what reads it. That is the window this file is
-# written to be updated in -- not under a failed publish. v0.76.0-r1 remains
-# correct until v0.76.0-r2 exists. The sibling half -- artifact-keeper/trivy,
-# branch fix/4819-go1.27.3-cve-2026-111943, commit "build: Go 1.27.3 for
-# CVE-2026-111943; fail the build on a stale toolchain pin" -- carries step 1;
-# it is not yet opened as a PR there, so there is no number to cite.
-FROM ghcr.io/artifact-keeper/trivy@sha256:36e93de3edfa615553692781624be999fb22d113d1ecbe6712a3c90c71d5cc74 AS trivy
+# 0.76.0-r1 -> 0.76.0-r2 (#4852): the pinned-base-image watch reported HIGH
+# CVE-2026-111943 in the bundled trivy (stdlib v1.27.2, fixed in 1.27.3). A
+# stdlib advisory has no module to override, so the fix in artifact-keeper/
+# trivy is a GO_VERSION bump alone (trivy#19); nothing else moved there. It
+# was merged, tagged v0.76.0-r2, and this FROM repoints to the published
+# digest. docker/scanner-adapter/VERSION moves 1.5.0 -> 1.6.0 with it, because
+# exact versions are never republished (scripts/ci/check-version-pin-bump.sh).
+FROM ghcr.io/artifact-keeper/trivy@sha256:1076c0b7fe3295c7b1ebb6bd360e405ab0e61795881475f8ef5b2fdc4f28adb1 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
