@@ -9454,6 +9454,10 @@ pub async fn list_artifact_versions(
         (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
         (status = 405, description = "Repository is remote (proxy); direct uploads are not accepted", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "An artifact already exists at this path and is immutable. \
+            The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`. \
+            Delete the artifact first, or enable versioning on the repository (Generic and Mlmodel) to append a revision instead. \
+            Of several concurrent uploads to one free path exactly one is answered 201; the others get this 409 (#4832).", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
