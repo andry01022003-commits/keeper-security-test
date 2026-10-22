@@ -23,6 +23,14 @@ instead of a hung or failed connection (#4647).
 3. **In process.** Below the limit, every accepted request runs. When the CPU
    limit is the bottleneck, they all slow down together.
 
+Some expensive work sheds on its own limits inside the process. Virtual conda
+channel merges are capped by `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES` and answer
+`503` with `Retry-After` after `CONDA_VIRTUAL_MERGE_QUEUE_SECS`; a merged
+document that is being rebuilt is served stale for up to
+`CONDA_VIRTUAL_MERGE_MAX_STALE_SECS` instead of making clients wait on the
+rebuild ([Sizing memory for virtual conda
+channels](conda-virtual-merge-memory.md)).
+
 ## Measured behaviour
 
 Debug build on one host, the API listener under a systemd `CPUQuota=20%`.

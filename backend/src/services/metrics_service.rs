@@ -303,14 +303,16 @@ pub fn record_proxy_cache_lookup(repo_key: &str, result: &'static str) {
 /// `repodata`, `channeldata` or `shard_index`.
 ///
 /// A cache hit is a request answered without running a merge of its own:
-/// `via="cache"` for a merged document kept from an earlier merge, and
-/// `via="singleflight"` for a request that waited on the merge another
-/// request for the same document was already running.
+/// `via="cache"` for a fresh merged document kept from an earlier merge,
+/// `via="stale"` for a kept document served stale while one background merge
+/// rebuilds it (#4879), and `via="singleflight"` for a request that waited on
+/// the merge another request for the same document was already running.
 pub fn record_conda_virtual_merge_cache_hit(kind: &'static str, via: &'static str) {
     counter!("ak_conda_virtual_merge_cache_hits_total", "kind" => kind, "via" => via).increment(1);
 }
 
-/// A request that ran a merge (no usable cached document, none in flight).
+/// A request that started a merge (no usable cached document, none in
+/// flight), in the foreground or as the background rebuild of a stale one.
 pub fn record_conda_virtual_merge_cache_miss(kind: &'static str) {
     counter!("ak_conda_virtual_merge_cache_misses_total", "kind" => kind).increment(1);
 }

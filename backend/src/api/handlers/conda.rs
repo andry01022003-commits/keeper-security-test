@@ -1883,7 +1883,7 @@ async fn patch_instructions_json(
 // Repodata encoding helpers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepodataEncoding {
     Json,
     Bz2,
@@ -1931,14 +1931,70 @@ impl RepodataEncoding {
                     .finish()
                     .map_err(failed)
             }
-            Self::Zst => {
-                let encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).map_err(failed)?;
-                let mut out = std::io::BufWriter::with_capacity(BUF, encoder);
-                serde_json::to_writer(&mut out, repodata).map_err(failed)?;
-                out.into_inner()
-                    .map_err(|e| failed(e.error()))?
-                    .finish()
-                    .map_err(failed)
+            Self::Zst => Self::encode_zst_counted(repodata).map(|(body, _)| body),
+        }
+    }
+
+    /// Serialize `repodata` as compact JSON straight into zstd, returning the
+    /// compressed document and the length of the JSON it holds. This is how
+    /// a merged virtual `repodata.json` is kept; its other encodings are
+    /// derived from it with [`Self::transcode_zst`] (#4879).
+    #[allow(clippy::result_large_err)]
+    fn encode_zst_counted<T: serde::Serialize + ?Sized>(
+        repodata: &T,
+    ) -> Result<(Vec<u8>, usize), Response> {
+        struct Counting<W> {
+            inner: W,
+            written: usize,
+        }
+        impl<W: std::io::Write> std::io::Write for Counting<W> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = self.inner.write(buf)?;
+                self.written += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+        fn failed(e: impl std::fmt::Display) -> Response {
+            tracing::error!("repodata encoding error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        }
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).map_err(failed)?;
+        let mut out = std::io::BufWriter::with_capacity(
+            256 * 1024,
+            Counting {
+                inner: encoder,
+                written: 0,
+            },
+        );
+        serde_json::to_writer(&mut out, repodata).map_err(failed)?;
+        let counting = out.into_inner().map_err(|e| failed(e.error()))?;
+        let plain_len = counting.written;
+        let body = counting.inner.finish().map_err(failed)?;
+        Ok((body, plain_len))
+    }
+
+    /// Re-encode a zstd-compressed JSON document (a kept virtual merge) in
+    /// this encoding, streaming from the decoder into the encoder so the plain
+    /// document is only held when it is the result. CPU-bound: run it on a
+    /// blocking thread (#4879).
+    #[allow(clippy::result_large_err)]
+    fn transcode_zst(&self, zst: &[u8]) -> Result<Vec<u8>, Response> {
+        fn failed(e: impl std::fmt::Display) -> Response {
+            tracing::error!("repodata re-encoding error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        }
+        match self {
+            Self::Zst => Ok(zst.to_vec()),
+            Self::Json => zstd::stream::decode_all(zst).map_err(failed),
+            Self::Bz2 => {
+                let mut decoder = zstd::stream::read::Decoder::new(zst).map_err(failed)?;
+                let mut encoder =
+                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                std::io::copy(&mut decoder, &mut encoder).map_err(failed)?;
+                encoder.finish().map_err(failed)
             }
         }
     }
@@ -2071,11 +2127,19 @@ async fn serve_repodata(
     // Virtual repos: merge repodata from all members
     if repo.repo_type == RepositoryType::Virtual {
         let merged =
-            build_virtual_repodata(state, auth.as_ref(), repo.id, repo_key, subdir, encoding)
-                .await?;
+            build_virtual_repodata(state, auth.as_ref(), repo.id, repo_key, subdir).await?;
         let document = format!("{subdir}/{}", encoding.upstream_filename());
-        return serve_virtual_merge(&state.db, repo.id, repo_key, &document, merged, ct, headers)
-            .await;
+        return serve_virtual_merge_encoded(
+            &state.db,
+            repo.id,
+            repo_key,
+            &document,
+            merged,
+            Some(encoding),
+            ct,
+            headers,
+        )
+        .await;
     }
 
     // For remote repos, proxy repodata from upstream. Real conda-forge
@@ -2302,15 +2366,8 @@ async fn repodata_json_sig(
             .await;
         }
         Some(RepositoryType::Virtual) => {
-            let merged = build_virtual_repodata(
-                &state,
-                auth.as_ref(),
-                repo.id,
-                &repo_key,
-                &subdir,
-                RepodataEncoding::Json,
-            )
-            .await?;
+            let merged =
+                build_virtual_repodata(&state, auth.as_ref(), repo.id, &repo_key, &subdir).await?;
             partial = virtual_merge_failure_policy(
                 &state.db,
                 repo.id,
@@ -2319,7 +2376,11 @@ async fn repodata_json_sig(
                 &merged,
             )
             .await?;
-            merged.body.clone()
+            // The signature covers the bytes `repodata.json` serves: the
+            // `.json` rendering of the merge (#4879).
+            merge_gate::gate_for(repo.id)
+                .rendering(&merged, RepodataEncoding::Json)
+                .await?
         }
         _ => {
             let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
@@ -4771,9 +4832,12 @@ async fn merge_validators_fresh(
     true
 }
 
-/// Build merged repodata for a virtual repository, encoded as `encoding`, or
-/// reuse the merge already running or kept for the same inputs
-/// ([`merge_gate`], #4608).
+/// Build merged repodata for a virtual repository, or reuse the merge already
+/// running or kept for the same inputs ([`merge_gate`], #4608).
+///
+/// One merge serves every encoding of the subdir: the merged document is
+/// kept in its canonical zstd encoding and `.json` and `.bz2` are derived
+/// from it on demand ([`merge_gate::MergeGate::rendering`], #4879).
 ///
 /// Hosted (local/staging) members are merged first, then remote members, each
 /// group in member priority order, first-writer-wins per filename; a remote
@@ -4787,7 +4851,6 @@ async fn build_virtual_repodata(
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     subdir: &str,
-    encoding: RepodataEncoding,
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
     build_virtual_package_document(
         state,
@@ -4797,22 +4860,12 @@ async fn build_virtual_repodata(
             virtual_repo_key,
             subdir,
             kind: merge_gate::MergeKind::Repodata,
-            filename: encoding.upstream_filename(),
+            filename: RepodataEncoding::Json.upstream_filename(),
             candidates: virtual_merge::repodata_candidates(subdir),
-            plain_json: matches!(encoding, RepodataEncoding::Json),
+            plain_json: false,
         },
         build_artifact_entry,
-        move |virtual_repo_key, subdir, hosted, remote, owned, allowlist| {
-            virtual_merge::merge_repodata(
-                virtual_repo_key,
-                subdir,
-                hosted,
-                remote,
-                owned,
-                allowlist,
-                encoding,
-            )
-        },
+        virtual_merge::merge_repodata,
     )
     .await
 }
@@ -4861,7 +4914,9 @@ struct VirtualPackageDocument<'a> {
     filename: &'static str,
     /// The upstream files a remote member's document is read from.
     candidates: Vec<(String, virtual_merge::FileCodec)>,
-    /// Whether the merged body is plain JSON (gzip-coded on request).
+    /// Whether the merged body is plain JSON (gzip-coded on request). When it
+    /// is not, it is the canonical zstd encoding of a merged
+    /// `repodata.json`, and its other encodings are derived from it (#4879).
     plain_json: bool,
 }
 
@@ -5009,7 +5064,10 @@ where
                     );
                 }
                 failed.extend(parse_failures);
-                let body = body?;
+                let virtual_merge::MergedBody {
+                    bytes: body,
+                    plain_len,
+                } = body?;
                 account.track(
                     body.len()
                         .saturating_sub(merge_gate::merge_output_allowance(
@@ -5023,7 +5081,7 @@ where
                     reserved: account.reserved(),
                     peak_need: account.peak_need(),
                 };
-                Ok(merge_gate::MergedDocument::new(
+                let doc = merge_gate::MergedDocument::new(
                     body,
                     failed,
                     enforced.then_some(dropped.not_allowed),
@@ -5031,7 +5089,12 @@ where
                     all_validated,
                     stats,
                     plain_json,
-                ))
+                );
+                Ok(if plain_json {
+                    doc
+                } else {
+                    doc.with_renderings(plain_len)
+                })
             },
         )
         .await
@@ -5042,10 +5105,12 @@ where
 /// it serves (#4708), or reuse the derivation kept for that merge.
 ///
 /// The derived document inherits the merge's member failures, allowlist
-/// count and member validators, so the failure policy, the
-/// `x-ak-allowlist-dropped` header and cache freshness all follow the merge it
-/// came from; it is keyed by the merged document's ETag, so a new merge is a
-/// new derivation.
+/// count and member validators, so the failure policy and the
+/// `x-ak-allowlist-dropped` header follow the merge it came from. It is keyed
+/// by the merged document's ETag, so a new merge is a new derivation, and it
+/// is valid exactly while that merge is what `repodata.json` serves
+/// (including while that merge is served stale, #4879): its validity is the
+/// merge's, not checked again here.
 async fn build_virtual_current_repodata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -5053,37 +5118,43 @@ async fn build_virtual_current_repodata(
     virtual_repo_key: &str,
     subdir: &str,
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
-    let merged = build_virtual_repodata(
-        state,
-        auth,
-        virtual_repo_id,
-        virtual_repo_key,
-        subdir,
-        RepodataEncoding::Json,
-    )
-    .await?;
+    let merged =
+        build_virtual_repodata(state, auth, virtual_repo_id, virtual_repo_key, subdir).await?;
     let kind = merge_gate::MergeKind::CurrentRepodata;
     let document = format!("{subdir}/current_repodata.json");
     let mut key = merge_gate::MergeKeyBuilder::new(kind);
     key.part(virtual_repo_id.as_bytes())
         .part(document.as_bytes())
         .part(merged.etag.as_bytes());
-    let validate_proxy = state.proxy_service.clone();
     merge_gate::gate_for(virtual_repo_id)
         .get_or_merge(
             kind,
             key.finish(),
             Some(format!("{virtual_repo_id}/{document}")),
-            move |doc| merge_validators_fresh(validate_proxy, doc),
+            |_| async { true },
             move |mut account| async move {
+                // The merged repodata.json is kept zstd-encoded: decode it on
+                // the blocking thread for the derivation only, under this
+                // merge's reservation (never through a rendering, which
+                // would take a second merge slot while this one is held).
+                let plain_len = merged.output_plain_len();
+                account.track(
+                    plain_len.saturating_add(merge_gate::merge_working_set(plain_len, true)),
+                );
                 let input = merged.body.clone();
-                account.track(merge_gate::merge_working_set(input.len(), true));
-                let body = tokio::task::spawn_blocking(move || current_repodata::derive(&input))
-                    .await
-                    .map_err(virtual_merge::internal_error)?
-                    .map_err(virtual_merge::internal_error)?;
+                let zst = merged.has_renderings();
+                let body = tokio::task::spawn_blocking(move || {
+                    if zst {
+                        let json = RepodataEncoding::Json.transcode_zst(&input)?;
+                        current_repodata::derive(&json).map_err(virtual_merge::internal_error)
+                    } else {
+                        current_repodata::derive(&input).map_err(virtual_merge::internal_error)
+                    }
+                })
+                .await
+                .map_err(virtual_merge::internal_error)??;
                 let stats = merge_gate::MergeStats {
-                    decoded_bytes: merged.body.len(),
+                    decoded_bytes: plain_len,
                     output_bytes: body.len(),
                     reserved: account.reserved(),
                     peak_need: account.peak_need(),
@@ -5276,45 +5347,70 @@ async fn serve_virtual_merge(
     content_type: &str,
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
+    serve_virtual_merge_encoded(
+        db,
+        virtual_repo_id,
+        virtual_repo_key,
+        document,
+        merged,
+        None,
+        content_type,
+        headers,
+    )
+    .await
+}
+
+/// [`serve_virtual_merge`] for one encoding of a merged `repodata.json`
+/// (`None`: the kept body as it is). Each encoding has its own ETag and is
+/// derived from the one merge on first demand (#4879), after the failure
+/// policy and the conditional request are answered, so a strict 502 or a
+/// 304 never costs an encoding. A document served stale while it is rebuilt
+/// carries `Warning: 110`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_virtual_merge_encoded(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    document: &str,
+    merged: std::sync::Arc<merge_gate::MergedDocument>,
+    encoding: Option<RepodataEncoding>,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
     use crate::api::handlers::cache_headers;
 
     let partial =
         virtual_merge_failure_policy(db, virtual_repo_id, virtual_repo_key, document, &merged)
             .await?;
 
+    let etag = merged.etag_for(encoding);
     let not_modified = if partial.is_none() {
-        check_conditional_request(headers, &merged.etag)
+        check_conditional_request(headers, &etag)
     } else {
         None
     };
     let mut response = match not_modified {
         Some(not_modified) => not_modified,
         None => {
-            let gzip = if merged.json && accepts_gzip(headers) {
-                let body = merged.body.clone();
-                merged
-                    .gzip
-                    .get_or_try_init(|| async move {
-                        tokio::task::spawn_blocking(move || Bytes::from(gzip_compress(&body))).await
-                    })
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "conda gzip offload failed; serving uncompressed body"
-                        );
-                    })
-                    .ok()
-                    .cloned()
+            let gate = merge_gate::gate_for(virtual_repo_id);
+            let (body, json) = match encoding {
+                Some(encoding) if merged.has_renderings() => (
+                    gate.rendering(&merged, encoding).await?,
+                    encoding == RepodataEncoding::Json,
+                ),
+                _ => (merged.body.clone(), merged.json),
+            };
+            let gzip = if json && accepts_gzip(headers) {
+                gate.gzip_rendering(&merged, body.clone()).await
             } else {
                 None
             };
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, content_type)
-                .header(ETAG, &merged.etag)
+                .header(ETAG, &etag)
                 .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL);
-            if merged.json {
+            if json {
                 builder = builder.header("Vary", "Accept-Encoding");
             }
             let body = match gzip {
@@ -5322,7 +5418,7 @@ async fn serve_virtual_merge(
                     builder = builder.header(CONTENT_ENCODING, "gzip");
                     gzip
                 }
-                None => merged.body.clone(),
+                None => body,
             };
             builder
                 .header(CONTENT_LENGTH, body.len().to_string())
@@ -5330,6 +5426,12 @@ async fn serve_virtual_merge(
                 .unwrap()
         }
     };
+    if merged.is_stale() {
+        response.headers_mut().insert(
+            axum::http::header::WARNING,
+            axum::http::HeaderValue::from_static("110 - \"Response is Stale\""),
+        );
+    }
     if let Some(missing) = partial {
         virtual_merge::mark_partial(&mut response, &missing);
     }
@@ -19571,16 +19673,10 @@ mod virtual_channel_tests {
                 validator: None,
             },
         ];
-        let (body, failures, dropped) = virtual_merge::merge_repodata(
-            "virtual",
-            "noarch",
-            &hosted,
-            &remote,
-            &owned,
-            None,
-            RepodataEncoding::Json,
-        );
-        let doc: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        let (body, failures, dropped) =
+            virtual_merge::merge_repodata("virtual", "noarch", &hosted, &remote, &owned, None);
+        let doc: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&body.unwrap().bytes[..]).unwrap()).unwrap();
         let conda = doc["packages.conda"].as_object().unwrap();
         assert_eq!(conda["shared-1.0-0.conda"]["from"], "hosted");
         assert_eq!(conda["rich-13.0-0.conda"]["from"], "remote-a");
@@ -20176,9 +20272,9 @@ mod virtual_channel_tests {
             &remote,
             &Default::default(),
             Some(&allowlist),
-            RepodataEncoding::Json,
         );
-        let merged: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&body.unwrap().bytes[..]).unwrap()).unwrap();
         assert!(failures.is_empty());
         assert_eq!(
             listed(&merged),
@@ -20226,7 +20322,6 @@ mod virtual_channel_tests {
                 &remote,
                 &Default::default(),
                 Some(&allowlist),
-                RepodataEncoding::Json,
             )
             .2
         });
@@ -20362,6 +20457,7 @@ mod virtual_channel_tests {
                 queue_wait: std::time::Duration::from_secs(queue_secs),
                 cache_ttl: std::time::Duration::from_secs(300),
                 cache_max_bytes: 64 * 1024 * 1024,
+                max_stale: std::time::Duration::from_secs(300),
             },
             proxy_helpers::proxy_metadata_budget(),
         );
@@ -20409,8 +20505,9 @@ mod virtual_channel_tests {
     /// #4608: two concurrent requests for the same merged document run ONE
     /// merge (one upstream fetch) and get the same ETag; a later request is
     /// served from the kept merge without merging again, and revalidating
-    /// with that ETag is a 304. A different encoding is a different document;
-    /// channeldata shares the same way.
+    /// with that ETag is a 304. Another encoding of the same subdir is served
+    /// from the same merge (#4879) under its own ETag; channeldata shares the
+    /// same way.
     #[tokio::test]
     async fn concurrent_identical_requests_share_one_merge_and_etag_4608() {
         let Some(pool) = tdh::try_pool().await else {
@@ -20457,7 +20554,10 @@ mod virtual_channel_tests {
         let app = tdh::router_anon(router(), rig.state.clone());
         let (nm_status, nm_body, nm_headers) = tdh::send_with_headers(app, conditional).await;
 
-        let (json_status, json_body, _) = rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (json_status, json_body, json_headers) =
+            rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (bz2_status, bz2_body, bz2_headers) =
+            rig.get(format!("/{v}/noarch/repodata.json.bz2")).await;
         let merges_after_json = gate.merges_started();
 
         let cd_uri = format!("/{v}/channeldata.json");
@@ -20496,14 +20596,30 @@ mod virtual_channel_tests {
         assert_eq!(etag(&nm_headers), etag(&a.2));
 
         assert_eq!(json_status, StatusCode::OK);
-        assert_eq!(merges_after_json, 2, "another encoding is another document");
+        assert_eq!(bz2_status, StatusCode::OK);
+        assert_eq!(
+            merges_after_json, 1,
+            "#4879: every encoding of a subdir is served from one merge"
+        );
         let json_doc: serde_json::Value = serde_json::from_slice(&json_body).unwrap();
         assert_eq!(json_doc, doc, "every encoding carries the same merge");
+        let mut bz2_json = Vec::new();
+        std::io::Read::read_to_end(
+            &mut bzip2::read::BzDecoder::new(&bz2_body[..]),
+            &mut bz2_json,
+        )
+        .unwrap();
+        assert_eq!(bz2_json, json_body.to_vec(), ".bz2 holds the .json bytes");
+        let tags = [etag(&a.2), etag(&json_headers), etag(&bz2_headers)];
+        assert!(
+            tags[0] != tags[1] && tags[1] != tags[2] && tags[0] != tags[2],
+            "each encoding has its own ETag: {tags:?}"
+        );
 
         assert_eq!(cd_a.0, StatusCode::OK);
         assert_eq!(cd_b.0, StatusCode::OK);
         assert_eq!(
-            merges_after_channeldata, 3,
+            merges_after_channeldata, 2,
             "channeldata: one merge for two requests"
         );
         assert_eq!(channeldata_fetches, 1);
@@ -20610,7 +20726,8 @@ mod virtual_channel_tests {
     }
 
     /// #4608: a merge reserves its decoded member documents and its output
-    /// against the buffered-metadata budget, in every encoding: the first
+    /// against the buffered-metadata budget (one merge for every encoding,
+    /// #4879): the first
     /// merge of a document (size unknown) reserves the whole budget, and the
     /// next merge of it reserves what the first one needed, which still
     /// covers decoded + merged bytes.
@@ -20627,35 +20744,24 @@ mod virtual_channel_tests {
         let _gate = test_gate(&rig, 4, 30);
         let budget = proxy_helpers::proxy_metadata_budget().total_bytes();
 
-        let merge = |encoding: RepodataEncoding| {
+        let merge = || {
             let state = rig.state.clone();
             let (id, key) = (rig.virtual_id, rig.virtual_key.clone());
             async move {
-                build_virtual_repodata(&state, None, id, &key, "noarch", encoding)
+                build_virtual_repodata(&state, None, id, &key, "noarch")
                     .await
-                    .unwrap_or_else(|_| panic!("merge {}", encoding.upstream_filename()))
+                    .unwrap_or_else(|_| panic!("merge repodata.json"))
                     .stats
             }
         };
-        let encodings = [
-            RepodataEncoding::Json,
-            RepodataEncoding::Zst,
-            RepodataEncoding::Bz2,
-        ];
-        let mut first = Vec::new();
-        for encoding in encodings {
-            first.push((encoding.upstream_filename(), merge(encoding).await));
-        }
-        // A new allowlist generation: every document merges again.
+        let first = vec![("repodata.json", merge().await)];
+        // A new allowlist generation: the document merges again.
         set_allowlist(
             &rig,
             serde_json::json!({"enabled": true, "entries": [{"name": "pkg*"}]}),
         )
         .await;
-        let mut second = Vec::new();
-        for encoding in encodings {
-            second.push((encoding.upstream_filename(), merge(encoding).await));
-        }
+        let second = vec![("repodata.json", merge().await)];
         rig.cleanup().await;
 
         for (document, stats) in first {

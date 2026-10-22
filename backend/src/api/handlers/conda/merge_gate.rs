@@ -9,11 +9,12 @@
 //! into the OOM killer. Three things bound it here:
 //!
 //! 1. **Singleflight and a short-lived cache.** Requests for the same merged
-//!    document share one merge, and its result is kept (as served, already
-//!    encoded) for `CONDA_VIRTUAL_MERGE_CACHE_TTL_SECS` and served with one
-//!    ETag, so revalidation answers 304. The key is a digest of every input
+//!    document share one merge, and its result is kept for
+//!    `CONDA_VIRTUAL_MERGE_CACHE_TTL_SECS` and served with one ETag per
+//!    encoding, so revalidation answers 304. The key is a digest of every input
 //!    the merge reads that can change without a member refetch: the virtual,
-//!    the document and encoding, the caller-visible member set, the hosted
+//!    the document (not its encoding: `repodata.json`, `.zst` and `.bz2` of
+//!    one subdir are one merge, see 4), the caller-visible member set, the hosted
 //!    records and the names hosted members own, and the allowlist's stored
 //!    value. Remote members are covered by validators instead: the merge
 //!    records the SHA-256 of each member document it read, and a cached
@@ -36,12 +37,36 @@
 //!    never waits again while it holds budget ([`MergeAccount`]), so what
 //!    the merges hold in flight is bounded by configuration and visible next
 //!    to every other buffered-metadata reader.
+//! 4. **One merge, several renderings (#4879).** A merged `repodata.json` is
+//!    built and kept in one canonical encoding, zstd (the smallest to hold, and
+//!    what current clients fetch). The other encodings a client asks for
+//!    (plain `.json`, `.bz2`, and the gzip transfer coding of `.json`) are
+//!    derived from it on first demand, on a blocking thread, and kept on the
+//!    document for as long as it is kept ([`MergeGate::rendering`]). A
+//!    rendering is accounted like a merge: it takes a merge slot and reserves
+//!    its output plus the encoder's state from the budget before it starts
+//!    (the same queue deadline, the same 503), and it holds nothing else while
+//!    it waits. Once built it is part of the kept document, and the cache entry
+//!    is re-weighed, so `CONDA_VIRTUAL_MERGE_CACHE_MAX_BYTES` bounds every
+//!    rendering held, not only the canonical body.
+//! 5. **Stale while revalidate (#4879).** A kept document that is no longer
+//!    fresh (a member validator changed or expired, or the document outlived
+//!    the cache TTL) is still served, for at most
+//!    `CONDA_VIRTUAL_MERGE_MAX_STALE_SECS` after it was first found stale,
+//!    while ONE background merge (the singleflight entry for its key) rebuilds
+//!    it. The rebuilt document replaces it in the cache once it is complete,
+//!    including the renderings its predecessor had been asked for, so the
+//!    next request gets the new document without waiting on an encoder. Only
+//!    a cacheable document (no member failed) is ever kept, so a degraded
+//!    merge is never served stale; a rebuild that fails leaves the previous
+//!    document in place until its stale bound runs out, and the request after
+//!    that waits on a merge as before. `0` turns stale serving off.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -51,6 +76,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::virtual_merge::{MemberFailure, MemberLimits};
+use super::RepodataEncoding;
 use crate::api::handlers::proxy_helpers::{self, ProxyMetadataBudget};
 use crate::services::metrics_service;
 
@@ -64,6 +90,11 @@ pub(super) const MERGE_QUEUE_SECS_ENV: &str = "CONDA_VIRTUAL_MERGE_QUEUE_SECS";
 pub(super) const MERGE_CACHE_TTL_SECS_ENV: &str = "CONDA_VIRTUAL_MERGE_CACHE_TTL_SECS";
 /// Ceiling on the bytes of merged documents kept by the cache.
 pub(super) const MERGE_CACHE_MAX_BYTES_ENV: &str = "CONDA_VIRTUAL_MERGE_CACHE_MAX_BYTES";
+/// How long after a kept document was first found stale it may still be
+/// served while one background merge rebuilds it (#4879). Defaults to the
+/// cache TTL; `0` turns stale serving off (a stale document is dropped and
+/// the request waits on the rebuild).
+pub(super) const MERGE_MAX_STALE_SECS_ENV: &str = "CONDA_VIRTUAL_MERGE_MAX_STALE_SECS";
 
 const DEFAULT_QUEUE_SECS: u64 = 60;
 /// The proxy cache's default TTL for mutable metadata, which is what a
@@ -76,6 +107,12 @@ const DEFAULT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_DEFAULT_MERGES: usize = 2;
 /// `Retry-After` on a shed merge, capped by the queue deadline.
 const RETRY_AFTER_SECS: u64 = 5;
+/// Budget reserved for an encoder's own state on top of a rendering's output
+/// (bzip2 at the default level holds about 8 MiB, zstd and gzip less).
+const ENCODER_STATE_BYTES: usize = 16 * 1024 * 1024;
+/// Longest the cache keeps a document (fresh plus stale), well inside what
+/// the cache accepts as a time to live.
+const MAX_KEEP: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
 /// What a merge builds; the `kind` label on the merge metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,9 +124,22 @@ pub(super) enum MergeKind {
     RunExports,
     /// `current_repodata.json`, derived from a merged `repodata.json` (#4708).
     CurrentRepodata,
+    /// Another encoding of a kept merge (`.json`, `.bz2`, gzip), derived
+    /// from it on first demand (#4879). Not a merge: only the slot, budget
+    /// and shed metrics carry this label.
+    Rendering,
 }
 
 impl MergeKind {
+    /// Whether a stale kept document of this kind may be served while it is
+    /// rebuilt (#4879). Not `current_repodata`, which is derived from a
+    /// merged `repodata.json` and keyed by its ETag, so it follows whatever
+    /// that merge serves; and not the shard index, whose shard routing must
+    /// not point at shards an upstream may have dropped.
+    fn serves_stale(self) -> bool {
+        matches!(self, Self::Repodata | Self::Channeldata | Self::RunExports)
+    }
+
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Repodata => "repodata",
@@ -97,6 +147,7 @@ impl MergeKind {
             Self::ShardIndex => "shard_index",
             Self::RunExports => "run_exports",
             Self::CurrentRepodata => "current_repodata",
+            Self::Rendering => "rendering",
         }
     }
 }
@@ -108,6 +159,9 @@ pub(super) struct GateConfig {
     pub queue_wait: Duration,
     pub cache_ttl: Duration,
     pub cache_max_bytes: u64,
+    /// How long after it was first found stale a kept document may still be
+    /// served while it is rebuilt; zero disables stale serving (#4879).
+    pub max_stale: Duration,
 }
 
 impl GateConfig {
@@ -128,6 +182,7 @@ impl GateConfig {
         limits: MemberLimits,
     ) -> Self {
         let num = |key: &str| get(key).and_then(|v| v.trim().parse::<u64>().ok());
+        let cache_ttl_secs = num(MERGE_CACHE_TTL_SECS_ENV).unwrap_or(DEFAULT_CACHE_TTL_SECS);
         Self {
             max_merges: num(MAX_CONCURRENT_MERGES_ENV)
                 .filter(|v| *v > 0)
@@ -141,10 +196,9 @@ impl GateConfig {
                     .filter(|v| *v > 0)
                     .unwrap_or(DEFAULT_QUEUE_SECS),
             ),
-            cache_ttl: Duration::from_secs(
-                num(MERGE_CACHE_TTL_SECS_ENV).unwrap_or(DEFAULT_CACHE_TTL_SECS),
-            ),
+            cache_ttl: Duration::from_secs(cache_ttl_secs),
             cache_max_bytes: num(MERGE_CACHE_MAX_BYTES_ENV).unwrap_or(DEFAULT_CACHE_MAX_BYTES),
+            max_stale: Duration::from_secs(num(MERGE_MAX_STALE_SECS_ENV).unwrap_or(cache_ttl_secs)),
         }
     }
 
@@ -189,7 +243,8 @@ pub(super) struct MemberValidator {
 pub(super) struct MergeStats {
     /// Decoded member documents, summed.
     pub decoded_bytes: usize,
-    /// The merged document as served.
+    /// The merged document as kept (for `repodata.json`, its canonical zstd
+    /// encoding).
     pub output_bytes: usize,
     /// Budget bytes the merge held (its reservation, after any top-up).
     pub reserved: usize,
@@ -197,9 +252,35 @@ pub(super) struct MergeStats {
     pub peak_need: usize,
 }
 
+/// The encodings of a merged `repodata.json` other than its canonical zstd
+/// body, each derived from that body on first demand and then kept (#4879).
+pub(super) struct Renderings {
+    /// Length of the plain JSON document the body decodes to.
+    plain_len: usize,
+    json: tokio::sync::OnceCell<Bytes>,
+    bz2: tokio::sync::OnceCell<Bytes>,
+}
+
+impl Renderings {
+    fn cell(&self, encoding: RepodataEncoding) -> Option<&tokio::sync::OnceCell<Bytes>> {
+        match encoding {
+            RepodataEncoding::Json => Some(&self.json),
+            RepodataEncoding::Bz2 => Some(&self.bz2),
+            RepodataEncoding::Zst => None,
+        }
+    }
+}
+
+/// The encoding a merged `repodata.json` is built and kept in.
+pub(super) const CANONICAL_ENCODING: RepodataEncoding = RepodataEncoding::Zst;
+
 /// A finished merge, shared by every request it answers.
 pub(super) struct MergedDocument {
+    /// The document as kept: plain JSON, CEP-16 msgpack, or for a merged
+    /// `repodata.json` its canonical zstd encoding ([`Renderings`]).
     pub body: Bytes,
+    /// The ETag of `body`; another encoding of it has its own
+    /// ([`Self::etag_for`]).
     pub etag: String,
     pub failed: Vec<MemberFailure>,
     /// Remote records the allowlist left out; `None` when none is enforced.
@@ -213,11 +294,22 @@ pub(super) struct MergedDocument {
     pub stats: MergeStats,
     /// Whether the body is plain JSON (served gzip-coded on request).
     pub json: bool,
-    /// The gzip rendering of a JSON body, built once on first demand.
+    /// The gzip rendering of the document's plain JSON (the body, or the
+    /// `.json` rendering of a merged `repodata.json`), built once on first
+    /// demand.
     pub gzip: tokio::sync::OnceCell<Bytes>,
+    /// For a merged `repodata.json`: its other encodings (#4879).
+    renderings: Option<Renderings>,
     /// For a shard index merge: where every listed shard comes from, so a
     /// shard request is routed from the kept merge (#4607).
     pub shard_index: Option<super::VirtualShardIndex>,
+    /// When the merge finished; the document is fresh for the cache TTL
+    /// from here (and while its validators hold).
+    built_at: Instant,
+    /// When the document was first found stale (#4879).
+    stale_since: OnceLock<Instant>,
+    /// The cache key it is kept under, once kept.
+    cache_key: OnceLock<String>,
 }
 
 impl MergedDocument {
@@ -243,8 +335,70 @@ impl MergedDocument {
             stats,
             json,
             gzip: tokio::sync::OnceCell::new(),
+            renderings: None,
             shard_index: None,
+            built_at: Instant::now(),
+            stale_since: OnceLock::new(),
+            cache_key: OnceLock::new(),
         }
+    }
+
+    /// Mark the body as the canonical zstd encoding of a merged
+    /// `repodata.json` whose plain JSON is `plain_len` bytes, so its other
+    /// encodings are derived from it (#4879).
+    pub(super) fn with_renderings(mut self, plain_len: usize) -> Self {
+        self.renderings = Some(Renderings {
+            plain_len,
+            json: tokio::sync::OnceCell::new(),
+            bz2: tokio::sync::OnceCell::new(),
+        });
+        self
+    }
+
+    /// Whether the document has encodings derived from its body.
+    pub(super) fn has_renderings(&self) -> bool {
+        self.renderings.is_some()
+    }
+
+    /// Length of the document as plain JSON: the body's own, or what a kept
+    /// zstd body decodes to.
+    pub(super) fn output_plain_len(&self) -> usize {
+        self.renderings
+            .as_ref()
+            .map_or(self.body.len(), |r| r.plain_len)
+    }
+
+    /// The ETag of the document in `encoding`: the body's own for the
+    /// canonical encoding (or a document without renderings), else the body's
+    /// tagged with the encoding. Every encoding is a deterministic function of
+    /// the body, so the tag identifies its bytes without building them, and a
+    /// revalidation of any encoding can answer 304 without encoding.
+    pub(super) fn etag_for(&self, encoding: Option<RepodataEncoding>) -> String {
+        match (encoding, &self.renderings) {
+            (Some(encoding), Some(_)) if encoding != CANONICAL_ENCODING => {
+                let bare = self.etag.trim_end_matches('"');
+                let suffix = match encoding {
+                    RepodataEncoding::Json => "json",
+                    RepodataEncoding::Bz2 => "bz2",
+                    RepodataEncoding::Zst => "zst",
+                };
+                format!("{bare}-{suffix}\"")
+            }
+            _ => self.etag.clone(),
+        }
+    }
+
+    /// Whether the document was found stale and is being served while it is
+    /// rebuilt (#4879).
+    pub(super) fn is_stale(&self) -> bool {
+        self.stale_since.get().is_some()
+    }
+
+    /// The rendering of a merged `repodata.json` in `encoding`, when it has
+    /// been built already (tests).
+    #[cfg(test)]
+    pub(super) fn rendered(&self, encoding: RepodataEncoding) -> Option<Bytes> {
+        self.renderings.as_ref()?.cell(encoding)?.get().cloned()
     }
 
     /// Attach the shard routing of a shard index merge.
@@ -253,11 +407,18 @@ impl MergedDocument {
         self
     }
 
-    /// Cache weight in bytes: the body, plus room for the gzip rendering a
-    /// JSON body may grow.
+    /// Cache weight in bytes: the body plus every rendering built so far. A
+    /// rendering built after the document was kept re-weighs its cache entry
+    /// ([`MergeGate::reweigh`]), so the weight is what the document holds.
     fn weight(&self) -> u32 {
-        let extra = if self.json { self.body.len() / 4 } else { 0 };
-        u32::try_from(self.body.len().saturating_add(extra)).unwrap_or(u32::MAX)
+        let len = |cell: &tokio::sync::OnceCell<Bytes>| cell.get().map_or(0, Bytes::len);
+        let mut bytes = self.body.len().saturating_add(len(&self.gzip));
+        if let Some(r) = &self.renderings {
+            bytes = bytes
+                .saturating_add(len(&r.json))
+                .saturating_add(len(&r.bz2));
+        }
+        u32::try_from(bytes).unwrap_or(u32::MAX)
     }
 }
 
@@ -495,15 +656,24 @@ pub(super) struct MergeGate {
     learned: Mutex<HashMap<String, usize>>,
     running: AtomicUsize,
     merges_started: AtomicU64,
+    renders_started: AtomicU64,
 }
 
 impl MergeGate {
     pub(super) fn new(config: GateConfig, budget: &'static ProxyMetadataBudget) -> Arc<Self> {
+        // A kept document is fresh for the TTL and may then be served stale
+        // for up to `max_stale` more; [`Self::get_or_merge`] enforces both
+        // from the document's own clock, the cache only evicts after both.
         let cache = (!config.cache_ttl.is_zero() && config.cache_max_bytes > 0).then(|| {
             moka::future::Cache::builder()
                 .max_capacity(config.cache_max_bytes)
                 .weigher(|_key: &String, doc: &Arc<MergedDocument>| doc.weight())
-                .time_to_live(config.cache_ttl)
+                .time_to_live(
+                    config
+                        .cache_ttl
+                        .saturating_add(config.max_stale)
+                        .min(MAX_KEEP),
+                )
                 .build()
         });
         tracing::info!(
@@ -511,6 +681,7 @@ impl MergeGate {
             queue_secs = config.queue_wait.as_secs(),
             cache_ttl_secs = config.cache_ttl.as_secs(),
             cache_max_bytes = config.cache_max_bytes,
+            max_stale_secs = config.max_stale.as_secs(),
             budget_bytes = budget.total_bytes(),
             "conda virtual merge gate configured"
         );
@@ -523,6 +694,7 @@ impl MergeGate {
             learned: Mutex::new(HashMap::new()),
             running: AtomicUsize::new(0),
             merges_started: AtomicU64::new(0),
+            renders_started: AtomicU64::new(0),
         })
     }
 
@@ -547,6 +719,23 @@ impl MergeGate {
         self.merges_started.load(Ordering::Acquire)
     }
 
+    /// Renderings this gate has started (tests).
+    #[cfg(test)]
+    pub(super) fn renders_started(&self) -> u64 {
+        self.renders_started.load(Ordering::Acquire)
+    }
+
+    /// Keep `doc` under `key` as a finished merge would (tests).
+    #[cfg(test)]
+    pub(super) async fn keep_for_test(&self, key: &str, doc: Arc<MergedDocument>) {
+        let _ = doc.cache_key.set(key.to_string());
+        self.cache
+            .as_ref()
+            .expect("the test gate keeps documents")
+            .insert(key.to_string(), doc)
+            .await;
+    }
+
     /// Take every merge slot (tests): further merges queue.
     #[cfg(test)]
     pub(super) async fn hold_all_slots(&self) -> OwnedSemaphorePermit {
@@ -556,17 +745,20 @@ impl MergeGate {
             .unwrap()
     }
 
-    /// Serve the merged document `key` from the cache when `validate` accepts
-    /// it, else join the merge already running for `key`, else run `merge`.
+    /// Serve the merged document `key` from the cache when it is fresh and
+    /// `validate` accepts it, else serve it stale while one background merge
+    /// rebuilds it (within `max_stale`, for a kind that allows it), else join
+    /// the merge already running for `key`, else run `merge`.
     ///
     /// `budget_shape` names the document for budget accounting (the same
-    /// document across generations, e.g. virtual + subdir + encoding): a
+    /// document across generations, e.g. virtual + subdir + document name): a
     /// merge with one reserves from the buffered-metadata budget before it
     /// starts, sized from the previous merge of that shape. `None` for a merge
     /// whose fetches reserve their own budget (the shard index).
     ///
     /// The merge runs as its own task, so a client that disconnects does not
-    /// cancel the work the other requests are waiting on.
+    /// cancel the work the other requests are waiting on, and a stale serve
+    /// does not wait for it at all.
     pub(super) async fn get_or_merge<V, VF, M, MF>(
         self: &Arc<Self>,
         kind: MergeKind,
@@ -583,35 +775,38 @@ impl MergeGate {
     {
         if let Some(cache) = &self.cache {
             if let Some(hit) = cache.get(&key).await {
-                if validate(Arc::clone(&hit)).await {
+                let now = Instant::now();
+                // A TTL past what `Instant` can represent never expires.
+                let expires = hit
+                    .built_at
+                    .checked_add(self.config.cache_ttl)
+                    .unwrap_or(now + Duration::from_secs(1));
+                if now < expires && !hit.is_stale() && validate(Arc::clone(&hit)).await {
                     metrics_service::record_conda_virtual_merge_cache_hit(kind.label(), "cache");
                     return Ok(hit);
                 }
-                cache.invalidate(&key).await;
+                // Stale: since its TTL ran out, or since now if a validator
+                // failed first. Recorded once, so the bound runs from the
+                // first request that found it stale.
+                let since = *hit.stale_since.get_or_init(|| now.min(expires));
+                if kind.serves_stale()
+                    && hit.cacheable
+                    && !self.config.max_stale.is_zero()
+                    && now.saturating_duration_since(since) <= self.config.max_stale
+                {
+                    let (_, leader) =
+                        self.join_or_lead(kind, key, budget_shape, merge, Some(Arc::clone(&hit)));
+                    if leader {
+                        metrics_service::record_conda_virtual_merge_cache_miss(kind.label());
+                    }
+                    metrics_service::record_conda_virtual_merge_cache_hit(kind.label(), "stale");
+                    return Ok(hit);
+                }
+                self.forget(&key, &hit).await;
             }
         }
 
-        let (merge_future, leader) = {
-            let mut inflight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
-            match inflight.get(&key) {
-                Some(running) => (running.clone(), false),
-                None => {
-                    let gate = Arc::clone(self);
-                    let task_key = key.clone();
-                    let task = tokio::spawn(async move {
-                        gate.lead(kind, task_key, budget_shape, merge).await
-                    });
-                    let shared = async move {
-                        task.await
-                            .unwrap_or_else(|e| Err(SharedResponse::internal(e)))
-                    }
-                    .boxed()
-                    .shared();
-                    inflight.insert(key, shared.clone());
-                    (shared, true)
-                }
-            }
-        };
+        let (merge_future, leader) = self.join_or_lead(kind, key, budget_shape, merge, None);
         if leader {
             metrics_service::record_conda_virtual_merge_cache_miss(kind.label());
         } else {
@@ -620,12 +815,87 @@ impl MergeGate {
         merge_future.await
     }
 
+    /// The merge running for `key`, or a new one started from `merge`, and
+    /// whether this call started it. `predecessor` is the stale document a
+    /// background rebuild replaces.
+    fn join_or_lead<M, MF>(
+        self: &Arc<Self>,
+        kind: MergeKind,
+        key: String,
+        budget_shape: Option<String>,
+        merge: M,
+        predecessor: Option<Arc<MergedDocument>>,
+    ) -> (InflightMerge, bool)
+    where
+        M: FnOnce(MergeAccount) -> MF + Send + 'static,
+        MF: Future<Output = Result<MergedDocument, Response>> + Send + 'static,
+    {
+        let mut inflight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(running) = inflight.get(&key) {
+            return (running.clone(), false);
+        }
+        let gate = Arc::clone(self);
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            gate.lead(kind, task_key, budget_shape, merge, predecessor)
+                .await
+        });
+        let shared = async move {
+            task.await
+                .unwrap_or_else(|e| Err(SharedResponse::internal(e)))
+        }
+        .boxed()
+        .shared();
+        inflight.insert(key, shared.clone());
+        (shared, true)
+    }
+
+    /// Drop the kept `doc` from `key`, unless a newer document replaced it
+    /// meanwhile.
+    async fn forget(&self, key: &str, doc: &Arc<MergedDocument>) {
+        use moka::ops::compute::Op;
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let doc = Arc::clone(doc);
+        cache
+            .entry(key.to_string())
+            .and_compute_with(|entry| async move {
+                match entry {
+                    Some(e) if Arc::ptr_eq(e.value(), &doc) => Op::Remove,
+                    _ => Op::Nop,
+                }
+            })
+            .await;
+    }
+
+    /// Re-insert a kept document whose renderings grew, so the cache weighs
+    /// what it now holds. A document no longer kept (replaced, evicted) is
+    /// left alone.
+    async fn reweigh(&self, doc: &Arc<MergedDocument>) {
+        use moka::ops::compute::Op;
+        let (Some(cache), Some(key)) = (&self.cache, doc.cache_key.get()) else {
+            return;
+        };
+        let doc = Arc::clone(doc);
+        cache
+            .entry(key.clone())
+            .and_compute_with(|entry| async move {
+                match entry {
+                    Some(e) if Arc::ptr_eq(e.value(), &doc) => Op::Put(doc),
+                    _ => Op::Nop,
+                }
+            })
+            .await;
+    }
+
     async fn lead<M, MF>(
         self: Arc<Self>,
         kind: MergeKind,
         key: String,
         budget_shape: Option<String>,
         merge: M,
+        predecessor: Option<Arc<MergedDocument>>,
     ) -> MergeOutcome
     where
         M: FnOnce(MergeAccount) -> MF,
@@ -634,6 +904,14 @@ impl MergeGate {
         let outcome = self.run(kind, budget_shape, merge).await;
         if let (Ok(doc), Some(cache)) = (&outcome, &self.cache) {
             if doc.cacheable {
+                // A background rebuild replaces a document that is being
+                // served stale: build the renderings it had been asked for
+                // first, so the switch never makes a client wait on an
+                // encoder (#4879).
+                if let Some(previous) = &predecessor {
+                    self.prerender(kind, previous, doc).await;
+                }
+                let _ = doc.cache_key.set(key.clone());
                 cache.insert(key.clone(), Arc::clone(doc)).await;
             }
         }
@@ -657,32 +935,9 @@ impl MergeGate {
         MF: Future<Output = Result<MergedDocument, Response>>,
     {
         let retry_after = self.config.retry_after_secs();
-        let slot = match tokio::time::timeout(
-            self.config.queue_wait,
-            Arc::clone(&self.slots).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(slot)) => slot,
-            _ => {
-                metrics_service::record_conda_virtual_merge_rejected(kind.label(), "queue");
-                tracing::warn!(
-                    kind = kind.label(),
-                    max_merges = self.config.max_merges,
-                    "conda virtual merge shed: no merge slot within the queue deadline"
-                );
-                return Err(SharedResponse::from_response(shed_response(
-                    retry_after,
-                    format!(
-                        "Too many virtual conda channel merges are running (limit {}, \
-                         {MAX_CONCURRENT_MERGES_ENV}); this one waited {} s \
-                         ({MERGE_QUEUE_SECS_ENV})",
-                        self.config.max_merges,
-                        self.config.queue_wait.as_secs()
-                    ),
-                ))
-                .await);
-            }
+        let slot = match self.slot(kind).await {
+            Ok(slot) => slot,
+            Err(shed) => return Err(SharedResponse::from_response(shed).await),
         };
         let mut account = MergeAccount::new(kind, self.budget, self.config.queue_wait, retry_after);
         if let Some(shape) = &budget_shape {
@@ -727,6 +982,175 @@ impl MergeGate {
                 Ok(Arc::new(doc))
             }
             Err(response) => Err(SharedResponse::from_response(response).await),
+        }
+    }
+
+    /// A merge slot, waiting at most the queue deadline, else the 503.
+    async fn slot(&self, kind: MergeKind) -> Result<OwnedSemaphorePermit, Response> {
+        match tokio::time::timeout(
+            self.config.queue_wait,
+            Arc::clone(&self.slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(slot)) => Ok(slot),
+            _ => {
+                metrics_service::record_conda_virtual_merge_rejected(kind.label(), "queue");
+                tracing::warn!(
+                    kind = kind.label(),
+                    max_merges = self.config.max_merges,
+                    "conda virtual merge shed: no merge slot within the queue deadline"
+                );
+                Err(shed_response(
+                    self.config.retry_after_secs(),
+                    format!(
+                        "Too many virtual conda channel merges are running (limit {}, \
+                         {MAX_CONCURRENT_MERGES_ENV}); this one waited {} s \
+                         ({MERGE_QUEUE_SECS_ENV})",
+                        self.config.max_merges,
+                        self.config.queue_wait.as_secs()
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Run `encode` as a rendering of `doc`: under a merge slot, with
+    /// `estimate` bytes reserved from the budget, on a blocking thread
+    /// (#4879). The reservation covers the rendering's output and the
+    /// encoder's state; the rendering holds no other budget while it waits,
+    /// and tops up without waiting if its output outgrows the estimate.
+    async fn render_with<F>(
+        &self,
+        kind: MergeKind,
+        estimate: usize,
+        encode: F,
+    ) -> Result<Bytes, Response>
+    where
+        F: FnOnce() -> Result<Vec<u8>, Response> + Send + 'static,
+    {
+        let slot = self.slot(kind).await?;
+        let mut account = MergeAccount::new(
+            kind,
+            self.budget,
+            self.config.queue_wait,
+            self.config.retry_after_secs(),
+        );
+        account.reserve(estimate).await?;
+        self.renders_started.fetch_add(1, Ordering::AcqRel);
+        let out = tokio::task::spawn_blocking(encode)
+            .await
+            .map_err(super::virtual_merge::internal_error)??;
+        account.track(out.len().saturating_add(ENCODER_STATE_BYTES));
+        drop(slot);
+        Ok(Bytes::from(out))
+    }
+
+    /// `doc` (a merged `repodata.json`) in `encoding`: the kept body for the
+    /// canonical encoding, else the rendering derived from it, built on first
+    /// demand and kept on the document (#4879). Concurrent requests for one
+    /// rendering share one build.
+    pub(super) async fn rendering(
+        &self,
+        doc: &Arc<MergedDocument>,
+        encoding: RepodataEncoding,
+    ) -> Result<Bytes, Response> {
+        let Some(cell) = doc.renderings.as_ref().and_then(|r| r.cell(encoding)) else {
+            return Ok(doc.body.clone());
+        };
+        let plain_len = doc.renderings.as_ref().map_or(0, |r| r.plain_len);
+        let mut built = false;
+        let bytes = cell
+            .get_or_try_init(|| {
+                built = true;
+                let body = doc.body.clone();
+                // Plain JSON is the document itself; a compressed encoding is
+                // allowed a quarter of it, as a compressed merge output is.
+                let output = match encoding {
+                    RepodataEncoding::Json => plain_len,
+                    _ => merge_output_allowance(plain_len, false),
+                };
+                self.render_with(
+                    MergeKind::Rendering,
+                    output.saturating_add(ENCODER_STATE_BYTES),
+                    move || encoding.transcode_zst(&body),
+                )
+            })
+            .await?
+            .clone();
+        if built {
+            self.reweigh(doc).await;
+        }
+        Ok(bytes)
+    }
+
+    /// The gzip transfer coding of `json` (the plain JSON of `doc`), built
+    /// on first demand and kept on the document; `None` when it cannot be
+    /// built (the caller serves `json` uncoded).
+    pub(super) async fn gzip_rendering(
+        &self,
+        doc: &Arc<MergedDocument>,
+        json: Bytes,
+    ) -> Option<Bytes> {
+        let mut built = false;
+        let gzip = doc
+            .gzip
+            .get_or_try_init(|| {
+                built = true;
+                let estimate = merge_output_allowance(json.len(), false);
+                self.render_with(
+                    MergeKind::Rendering,
+                    estimate.saturating_add(ENCODER_STATE_BYTES),
+                    move || Ok(super::gzip_compress(&json)),
+                )
+            })
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    status = e.status().as_u16(),
+                    "conda gzip rendering failed; serving the body uncoded"
+                );
+            })
+            .ok()
+            .cloned();
+        if built && gzip.is_some() {
+            self.reweigh(doc).await;
+        }
+        gzip
+    }
+
+    /// Build on `doc` the renderings `previous` had been asked for, so `doc`
+    /// replaces it without making the next request wait on an encoder. A
+    /// rendering that cannot be built is left for that request to build.
+    async fn prerender(
+        &self,
+        kind: MergeKind,
+        previous: &Arc<MergedDocument>,
+        doc: &Arc<MergedDocument>,
+    ) {
+        if let (Some(old), Some(_)) = (&previous.renderings, &doc.renderings) {
+            for encoding in [RepodataEncoding::Json, RepodataEncoding::Bz2] {
+                if old.cell(encoding).is_some_and(|c| c.initialized()) {
+                    if let Err(e) = self.rendering(doc, encoding).await {
+                        tracing::warn!(
+                            kind = kind.label(),
+                            encoding = encoding.upstream_filename(),
+                            status = e.status().as_u16(),
+                            "could not pre-build a rendering of a rebuilt conda merge"
+                        );
+                    }
+                }
+            }
+        }
+        if previous.gzip.initialized() {
+            let json = if doc.renderings.is_some() {
+                self.rendering(doc, RepodataEncoding::Json).await.ok()
+            } else {
+                doc.json.then(|| doc.body.clone())
+            };
+            if let Some(json) = json {
+                let _ = self.gzip_rendering(doc, json).await;
+            }
         }
     }
 }
@@ -826,12 +1250,14 @@ mod tests {
         assert_eq!(cfg.queue_wait, Duration::from_secs(60));
         assert_eq!(cfg.cache_ttl, Duration::from_secs(300));
         assert_eq!(cfg.cache_max_bytes, 1 << 30);
+        assert_eq!(cfg.max_stale, cfg.cache_ttl, "stale for one TTL by default");
 
         let set = |k: &str| match k {
             MAX_CONCURRENT_MERGES_ENV => Some("7".to_string()),
             MERGE_QUEUE_SECS_ENV => Some("0".to_string()),
             MERGE_CACHE_TTL_SECS_ENV => Some("0".to_string()),
             MERGE_CACHE_MAX_BYTES_ENV => Some("junk".to_string()),
+            MERGE_MAX_STALE_SECS_ENV => Some("0".to_string()),
             _ => None,
         };
         let cfg = GateConfig::from_lookup(set, budget, l);
@@ -843,6 +1269,11 @@ mod tests {
         );
         assert_eq!(cfg.cache_ttl, Duration::ZERO, "zero TTL disables the cache");
         assert_eq!(cfg.cache_max_bytes, 1 << 30);
+        assert_eq!(
+            cfg.max_stale,
+            Duration::ZERO,
+            "zero turns stale serving off"
+        );
         assert_eq!(cfg.retry_after_secs(), 5);
     }
 
@@ -924,6 +1355,301 @@ mod tests {
     fn learned_estimate_adds_a_margin() {
         assert_eq!(learned_estimate(0), 1024 * 1024);
         assert_eq!(learned_estimate(700_000_000), 770_000_000);
+    }
+
+    // -------------------------------------------------------------------
+    // #4879: one merge per document, renderings, stale while revalidate
+    // -------------------------------------------------------------------
+
+    const KEY: &str = "virtual/linux-64/repodata.json";
+
+    fn new_gate(max_stale_secs: u64) -> Arc<MergeGate> {
+        MergeGate::new(
+            GateConfig {
+                max_merges: 4,
+                queue_wait: Duration::from_secs(5),
+                cache_ttl: Duration::from_secs(300),
+                cache_max_bytes: 64 * 1024 * 1024,
+                max_stale: Duration::from_secs(max_stale_secs),
+            },
+            leaked_budget(256 * 1024 * 1024),
+        )
+    }
+
+    fn plain(generation: u32) -> Vec<u8> {
+        let packages: serde_json::Map<String, serde_json::Value> = (0..200)
+            .map(|i| {
+                (
+                    format!("pkg{i}-{generation}.0-0.conda"),
+                    serde_json::json!({"name": format!("pkg{i}"), "version": format!("{generation}.0")}),
+                )
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "info": {"subdir": "linux-64"},
+            "packages": {},
+            "packages.conda": packages,
+        }))
+        .unwrap()
+    }
+
+    /// A merged `repodata.json` of `generation`, kept zstd-encoded as a
+    /// merge keeps it; `failed` marks a member failure.
+    fn repodata(generation: u32, failed: bool) -> MergedDocument {
+        let json = plain(generation);
+        let failures = if failed {
+            vec![MemberFailure {
+                member: "remote".into(),
+                kind: "fetch",
+                reason: "upstream down".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        MergedDocument::new(
+            zstd::encode_all(&json[..], 3).unwrap(),
+            failures,
+            None,
+            Vec::new(),
+            true,
+            MergeStats::default(),
+            false,
+        )
+        .with_renderings(json.len())
+    }
+
+    /// A merge that waits for `release` and then produces `generation`.
+    fn held_merge(
+        generation: u32,
+        release: Arc<tokio::sync::Notify>,
+    ) -> impl FnOnce(MergeAccount) -> BoxFuture<'static, Result<MergedDocument, Response>> {
+        move |_account| {
+            async move {
+                release.notified().await;
+                Ok(repodata(generation, false))
+            }
+            .boxed()
+        }
+    }
+
+    fn ready_merge(
+        generation: u32,
+        failed: bool,
+    ) -> impl FnOnce(MergeAccount) -> BoxFuture<'static, Result<MergedDocument, Response>> {
+        move |_account| async move { Ok(repodata(generation, failed)) }.boxed()
+    }
+
+    async fn get(
+        gate: &Arc<MergeGate>,
+        fresh: bool,
+        merge: impl FnOnce(MergeAccount) -> BoxFuture<'static, Result<MergedDocument, Response>>
+            + Send
+            + 'static,
+    ) -> Arc<MergedDocument> {
+        gate.get_or_merge(
+            MergeKind::Repodata,
+            KEY.to_string(),
+            Some(KEY.to_string()),
+            move |_| async move { fresh },
+            merge,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("merge failed"))
+    }
+
+    fn decode(doc: &MergedDocument) -> Vec<u8> {
+        zstd::decode_all(&doc.body[..]).unwrap()
+    }
+
+    /// `.json`, `.zst` and `.bz2` of one subdir are one merge: the merged
+    /// document is kept once and every encoding is derived from it, once,
+    /// with its own ETag, and the cache weighs every rendering it holds.
+    #[tokio::test]
+    async fn every_encoding_is_served_from_one_merge_4879() {
+        let gate = new_gate(300);
+        let doc = get(&gate, true, ready_merge(1, false)).await;
+        let weight_bare = doc.weight();
+
+        let zst = gate.rendering(&doc, RepodataEncoding::Zst).await.unwrap();
+        let json = gate.rendering(&doc, RepodataEncoding::Json).await.unwrap();
+        let bz2 = gate.rendering(&doc, RepodataEncoding::Bz2).await.unwrap();
+        // Asked again, from a request that found the kept document.
+        let again = get(&gate, true, ready_merge(99, false)).await;
+        let bz2_again = gate.rendering(&again, RepodataEncoding::Bz2).await.unwrap();
+
+        assert_eq!(gate.merges_started(), 1, "one merge for every encoding");
+        assert_eq!(gate.renders_started(), 2, ".json and .bz2, each once");
+        assert!(Arc::ptr_eq(&doc, &again));
+        assert_eq!(zst, doc.body, ".zst is the kept body");
+        assert_eq!(&json[..], &plain(1)[..], ".json is the merged document");
+        let mut from_bz2 = Vec::new();
+        std::io::Read::read_to_end(&mut bzip2::read::BzDecoder::new(&bz2[..]), &mut from_bz2)
+            .unwrap();
+        assert_eq!(from_bz2, plain(1), ".bz2 holds the same document");
+        assert_eq!(bz2_again, bz2);
+        let tags = [
+            doc.etag_for(Some(RepodataEncoding::Zst)),
+            doc.etag_for(Some(RepodataEncoding::Json)),
+            doc.etag_for(Some(RepodataEncoding::Bz2)),
+        ];
+        assert_eq!(tags[0], doc.etag);
+        assert!(tags[1] != tags[0] && tags[2] != tags[0] && tags[1] != tags[2]);
+        assert!(tags.iter().all(|t| t.starts_with('"') && t.ends_with('"')));
+        assert_eq!(
+            doc.weight() as usize,
+            weight_bare as usize + json.len() + bz2.len(),
+            "the kept document weighs its renderings"
+        );
+    }
+
+    /// A kept document that went stale is served at once while ONE
+    /// background merge rebuilds it; the request after the rebuild lands
+    /// gets the new document, with the renderings the old one had.
+    #[tokio::test]
+    async fn stale_document_is_served_while_one_rebuild_runs_4879() {
+        let gate = new_gate(300);
+        let first = get(&gate, true, ready_merge(1, false)).await;
+        gate.rendering(&first, RepodataEncoding::Bz2).await.unwrap();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut served = Vec::new();
+        for _ in 0..3 {
+            let doc = tokio::time::timeout(
+                Duration::from_secs(2),
+                get(&gate, false, held_merge(2, Arc::clone(&release))),
+            )
+            .await
+            .expect("a stale document is served without waiting on the rebuild");
+            served.push(doc);
+        }
+        // The rebuild starts in its own task.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.merges_started() < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gate.merges_started(), 2, "three stale serves, one rebuild");
+        assert!(served.iter().all(|d| Arc::ptr_eq(d, &first)));
+        assert!(
+            first.is_stale(),
+            "the stale document says so (Warning: 110)"
+        );
+
+        release.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let fresh = loop {
+            let doc = get(&gate, true, ready_merge(99, false)).await;
+            if !Arc::ptr_eq(&doc, &first) {
+                break doc;
+            }
+            assert!(Instant::now() < deadline, "the rebuild never landed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            decode(&fresh),
+            plain(2),
+            "the next request gets the rebuild"
+        );
+        assert!(!fresh.is_stale());
+        assert_eq!(gate.merges_started(), 2, "no merge beyond the one rebuild");
+        assert!(
+            fresh.rendered(RepodataEncoding::Bz2).is_some(),
+            "the rebuild built the .bz2 its predecessor was asked for"
+        );
+    }
+
+    /// With `CONDA_VIRTUAL_MERGE_MAX_STALE_SECS=0` a stale document is not
+    /// served: the request waits on the rebuild, as before #4879.
+    #[tokio::test]
+    async fn max_stale_zero_waits_for_the_rebuild_4879() {
+        let gate = new_gate(0);
+        let first = get(&gate, true, ready_merge(1, false)).await;
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let g = Arc::clone(&gate);
+        let held = held_merge(2, Arc::clone(&release));
+        let request = tokio::spawn(async move { get(&g, false, held).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!request.is_finished(), "the request waits on the rebuild");
+        release.notify_one();
+        let doc = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&doc, &first));
+        assert_eq!(decode(&doc), plain(2));
+    }
+
+    /// A document with a failed member is never kept, so it is never served
+    /// stale: the next request merges again and waits for it. Even one that
+    /// is somehow kept is not served stale.
+    #[tokio::test]
+    async fn uncacheable_document_is_not_served_stale_4879() {
+        let gate = new_gate(300);
+        let degraded = get(&gate, true, ready_merge(1, true)).await;
+        assert!(!degraded.cacheable);
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let g = Arc::clone(&gate);
+        let held = held_merge(2, Arc::clone(&release));
+        let request = tokio::spawn(async move { get(&g, false, held).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !request.is_finished(),
+            "a degraded merge is not served stale"
+        );
+        release.notify_one();
+        let doc = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&doc), plain(2));
+
+        // The guard itself: a kept document marked uncacheable.
+        let other = new_gate(300);
+        let kept = Arc::new(repodata(3, true));
+        other.keep_for_test(KEY, Arc::clone(&kept)).await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let g = Arc::clone(&other);
+        let held = held_merge(4, Arc::clone(&release));
+        let request = tokio::spawn(async move { get(&g, false, held).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !request.is_finished(),
+            "an uncacheable document is never stale-served"
+        );
+        release.notify_one();
+        let doc = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&doc, &kept));
+        assert_eq!(decode(&doc), plain(4));
+    }
+
+    /// The stale bound runs from when the document was first found stale:
+    /// past it, the request waits on the rebuild.
+    #[tokio::test]
+    async fn stale_serving_is_bounded_by_max_stale_4879() {
+        let gate = new_gate(1);
+        let first = get(&gate, true, ready_merge(1, false)).await;
+        // Found stale; served stale, its rebuild held.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let stale = get(&gate, false, held_merge(2, Arc::clone(&release))).await;
+        assert!(Arc::ptr_eq(&stale, &first));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // Past the bound: this request joins the running rebuild.
+        let g = Arc::clone(&gate);
+        let request = tokio::spawn(async move { get(&g, false, ready_merge(99, false)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!request.is_finished(), "past max-stale the request waits");
+        release.notify_one();
+        let doc = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&doc), plain(2));
+        assert_eq!(gate.merges_started(), 2, "it joined the one rebuild");
     }
 
     #[test]
