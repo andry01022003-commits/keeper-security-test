@@ -5055,7 +5055,8 @@ async fn push_package(
             digests,
             size_bytes,
             Some(user_id),
-            true,
+            // #4792: a push replayed by a peer must not fan back out.
+            !super::is_replication_request(&headers),
             Some(&catalog_name),
         )
         .await
@@ -6594,6 +6595,57 @@ mod push_db_tests {
     // a non-empty `<description>` to `Some(...)` (persisted) and an empty
     // one to `None` (NULL column).
     // -----------------------------------------------------------------------
+
+    /// #4792: a NuGet push to a hosted repository queues a push sync task for
+    /// a subscribed push peer, and a push that arrives as peer replication is
+    /// not fanned back out to the other peers. Fails on `main`: the handler
+    /// passed `true` unconditionally, so the replicated push queued too.
+    #[tokio::test]
+    async fn push_package_skips_queue_for_replication_4792() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "nuget").await;
+
+        let req = put_nupkg(
+            format!("/{}/api/v2/package", f.repo_key),
+            build_nupkg("ReplPkg", "1.0.0", "client push"),
+        )
+        .await;
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "client push must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A replicated push (as the sync worker sends it) stores the package
+        // but must not queue another task.
+        let mut req = put_nupkg(
+            format!("/{}/api/v2/package", f.repo_key),
+            build_nupkg("ReplPkg", "2.0.0", "replicated push"),
+        )
+        .await;
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated push must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["replpkg/1.0.0/replpkg.1.0.0.nupkg".to_string()],
+            "only the client push queues a push task; the replicated one must not"
+        );
+    }
 
     #[tokio::test]
     async fn push_package_populates_packages_index_with_description() {

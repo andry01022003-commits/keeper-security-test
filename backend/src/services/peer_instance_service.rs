@@ -61,6 +61,30 @@ const REARM_SUPERSEDED_PUSH_SQL: &str = r#"
                     OR (d.status <> 'cancelled' AND d.completed_at > st.completed_at)
                 )
           )
+          -- #4792: a pacman signature (`pgpsig`) or a conda attestation
+          -- (`attestation`) is attached to its package after the upload, in
+          -- the package's metadata document, and travels with the next push.
+          -- Re-deliver when the document changed since the finished push
+          -- ($3 is what it carried, a pacman file list merged in), or when
+          -- the caller cannot say what it carried ($3 NULL: a re-queue).
+          OR EXISTS (
+              SELECT 1
+              FROM artifact_metadata am
+              WHERE am.artifact_id = a.id
+                AND (
+                    (r.format::text = 'pacman' AND am.metadata ? 'pgpsig')
+                    OR (r.format::text = 'conda' AND am.metadata ? 'attestation')
+                )
+                AND (
+                    $3::jsonb IS NULL
+                    OR am.metadata IS DISTINCT FROM (
+                        CASE WHEN r.format::text = 'pacman' AND jsonb_typeof($3::jsonb) = 'object'
+                             THEN $3::jsonb - 'files'
+                             ELSE $3::jsonb
+                        END
+                    )
+                )
+          )
       )
 "#;
 
@@ -739,7 +763,7 @@ impl PeerInstanceService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        self.rearm_superseded_push(id, None).await?;
+        self.rearm_superseded_push(id, None, None).await?;
 
         Ok(id)
     }
@@ -808,14 +832,21 @@ impl PeerInstanceService {
         queued
     }
 
+    /// Put a finished push task back to `pending` when the artifact it
+    /// delivered has since changed. `sent_checksum` and `sent_metadata`
+    /// describe what the finished push carried (its content checksum and
+    /// metadata document, JSON `null` for none); `None` means unknown, as for
+    /// a re-queue, which then re-arms whenever the artifact could differ.
     pub async fn rearm_superseded_push(
         &self,
         task_id: Uuid,
         sent_checksum: Option<&str>,
+        sent_metadata: Option<&serde_json::Value>,
     ) -> Result<bool> {
         let result = sqlx::query(REARM_SUPERSEDED_PUSH_SQL)
             .bind(task_id)
             .bind(sent_checksum)
+            .bind(sent_metadata)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2271,9 +2302,95 @@ mod tests {
         .await
         .unwrap();
         assert!(!svc
-            .rearm_superseded_push(task_id, Some(&format!("{:064x}", 1)))
+            .rearm_superseded_push(task_id, Some(&format!("{:064x}", 1)), None)
             .await
             .unwrap());
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
+    /// #4792: a pacman signature lives in the package's metadata. A push that
+    /// finished without it is re-armed once the package is signed; a push that
+    /// carried it (with or without the merged file list), or an unsigned
+    /// package, is left alone.
+    #[tokio::test]
+    async fn rearm_redelivers_pacman_package_signed_after_its_push_4792() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let (repo_id, peer_id, artifact_id, task_id) =
+            completed_push_fixture(&pool, &svc, false).await;
+        sqlx::query("UPDATE repositories SET format = 'pacman' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'pacman', '{\"filename\": \"x\"}')",
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let checksum = format!("{:064x}", 1);
+
+        let unsigned = serde_json::json!({ "filename": "x" });
+        let signed = serde_json::json!({ "filename": "x", "pgpsig": "AAE=" });
+        // As the claim sends it: the file list merged into the document.
+        let signed_with_files =
+            serde_json::json!({ "filename": "x", "pgpsig": "AAE=", "files": ["usr/"] });
+
+        // Unsigned: nothing to re-deliver.
+        assert!(!svc
+            .rearm_superseded_push(task_id, Some(&checksum), Some(&unsigned))
+            .await
+            .unwrap());
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        assert_eq!(push_task_state(&pool, task_id).await.0, "completed");
+
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata || '{\"pgpsig\": \"AAE=\"}' \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The delivered copy already carried the signature.
+        for sent in [&signed, &signed_with_files] {
+            assert!(!svc
+                .rearm_superseded_push(task_id, Some(&checksum), Some(sent))
+                .await
+                .unwrap());
+        }
+        // It went out unsigned (signature attached while in flight).
+        assert!(svc
+            .rearm_superseded_push(task_id, Some(&checksum), Some(&unsigned))
+            .await
+            .unwrap());
+        assert_eq!(
+            push_task_state(&pool, task_id).await,
+            ("pending".to_string(), 0, None)
+        );
+
+        // A re-queue after the signature is attached re-arms a finished push.
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        assert_eq!(push_task_state(&pool, task_id).await.0, "pending");
+
+        sqlx::query("DELETE FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         cleanup_assign(&pool, peer_id, repo_id).await;
     }
 

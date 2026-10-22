@@ -2528,7 +2528,7 @@ async fn store_rpm(
             .map_err(IntoResponse::into_response)?;
         state
             .create_artifact_service(storage)
-            .upload(
+            .upload_with_sync_options(
                 repo.id,
                 &artifact_path,
                 &pkg_name,
@@ -2536,6 +2536,8 @@ async fn store_rpm(
                 "application/x-rpm",
                 content.clone(),
                 Some(user_id),
+                // #4792: a peer replication write must not fan back out.
+                !super::is_replication_request(headers),
             )
             .await
             .map_err(IntoResponse::into_response)?
@@ -4360,6 +4362,58 @@ mod tests {
         assert_eq!(
             queued,
             vec!["packages/repl-rpm-1.0-1.noarch.rpm".to_string()],
+            "only the client upload queues a push task; the replicated one must not"
+        );
+    }
+
+    /// #4792: the nested-layout (`repodata_depth > 0`) branch of `store_rpm`
+    /// goes through `ArtifactService`, which queued push sync tasks even for a
+    /// peer replication write. A client upload queues; a replicated one must
+    /// not. Fails on `main` (both uploads queued).
+    #[tokio::test]
+    async fn rpm_nested_upload_skips_queue_for_replication_4792() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let mut conn = f.pool.acquire().await.unwrap();
+        crate::services::rpm_layout::set_depth(&mut conn, f.repo_id, 1)
+            .await
+            .unwrap();
+        drop(conn);
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "rpm-nested").await;
+
+        let req = tdh::put(
+            format!("/{}/build-a/repl-rpm-1.0-1.noarch.rpm", f.repo_key),
+            bytes::Bytes::from_static(b"client rpm"),
+        );
+        let (status, resp) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "nested rpm upload must succeed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let mut req = tdh::put(
+            format!("/{}/build-a/repl-rpm-2.0-1.noarch.rpm", f.repo_key),
+            bytes::Bytes::from_static(b"replicated rpm"),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, resp) = tdh::send(f.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "replicated nested rpm upload must succeed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec!["build-a/repl-rpm-1.0-1.noarch.rpm".to_string()],
             "only the client upload queues a push task; the replicated one must not"
         );
     }

@@ -630,7 +630,7 @@ async fn upload(
         Some(RepoFile::Package {
             filename,
             signature: true,
-        }) => attach_signature(&state, &repo, filename, &body).await,
+        }) => attach_signature(&state, &repo, filename, &body, &headers).await,
         _ => Err(error(
             StatusCode::BAD_REQUEST,
             format!(
@@ -841,12 +841,13 @@ async fn attach_signature(
     repo: &RepoInfo,
     filename: &str,
     body: &[u8],
+    headers: &HeaderMap,
 ) -> Result<Response, Response> {
     let signature = fmt::normalize_signature(body)
         .map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?;
     let arch = filename_arch(filename)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Invalid package filename"))?;
-    let (artifact_id, _, metadata) =
+    let (artifact_id, artifact_path, metadata) =
         find_package(&state.db, repo.id, &[package_artifact_path(arch, filename)])
             .await?
             .ok_or_else(|| {
@@ -887,6 +888,33 @@ async fn attach_signature(
     .map_err(super::db_err)?;
     if updated.rows_affected() == 0 {
         return Err(already_signed());
+    }
+
+    // #4792: the signature travels inside the package's metadata, so a push
+    // peer that already received the package needs it delivered again. The
+    // queue re-arms a finished push of a now-signed package; a push still in
+    // flight is re-armed when it finishes (see `rearm_superseded_push`).
+    match sqlx::query_scalar::<_, i64>("SELECT size_bytes FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(size_bytes) => {
+            super::queue_push_sync_tasks_for_upload(
+                &state.db,
+                headers,
+                repo.id,
+                artifact_id,
+                &artifact_path,
+                size_bytes,
+            )
+            .await
+        }
+        Err(e) => tracing::warn!(
+            artifact_id = %artifact_id,
+            error = %e,
+            "pacman signature attached but its push sync could not be queued"
+        ),
     }
 
     info!(
@@ -1398,6 +1426,78 @@ mod db_tests {
             queued,
             vec![queued_path],
             "only the client upload queues a push task; the replicated one must not"
+        );
+    }
+
+    /// Status of the push task queued for `path` to `peer_id`.
+    async fn push_task_status(fx: &tdh::Fixture, peer_id: uuid::Uuid, path: &str) -> String {
+        sqlx::query_scalar(
+            "SELECT st.status::TEXT FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id \
+             WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
+               AND a.repository_id = $2 AND a.path = $3",
+        )
+        .bind(peer_id)
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("push task for path")
+    }
+
+    /// #4792: a `.sig` attached after its package was already pushed to a
+    /// peer must deliver the package again (the signature travels in the
+    /// package's metadata), so the finished push task goes back to pending.
+    /// A signature arriving as peer replication must not re-queue. Fails on
+    /// `main`: attaching a signature queued nothing.
+    #[tokio::test]
+    async fn pacman_signature_requeues_delivered_push_4792() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "pacman-sig").await;
+
+        assert_eq!(put(&fx, MARKER_FILE, MARKER_PKG).await, StatusCode::CREATED);
+        let (other, other_pkg) = build_package("replsig", "1.0-1", "any");
+        assert_eq!(put(&fx, &other, other_pkg).await, StatusCode::CREATED);
+        let marker_path = format!("any/{MARKER_FILE}");
+        let other_path = format!("any/{other}");
+
+        // Both packages have reached the peer.
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() \
+             WHERE peer_instance_id = $1",
+        )
+        .bind(peer_id)
+        .execute(&fx.pool)
+        .await
+        .expect("mark pushes delivered");
+
+        assert_eq!(
+            put(&fx, &format!("{MARKER_FILE}.sig"), MARKER_SIG).await,
+            StatusCode::CREATED
+        );
+        let mut req = tdh::put(
+            format!("/{}/{other}.sig", fx.repo_key),
+            Bytes::from_static(MARKER_SIG),
+        );
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        assert_eq!(send(&fx, req).await.0, StatusCode::CREATED);
+
+        let marker = push_task_status(&fx, peer_id, &marker_path).await;
+        let replicated = push_task_status(&fx, peer_id, &other_path).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(
+            marker, "pending",
+            "a client signature must re-deliver the package to the peer"
+        );
+        assert_eq!(
+            replicated, "completed",
+            "a replicated signature must not be fanned back out"
         );
     }
 

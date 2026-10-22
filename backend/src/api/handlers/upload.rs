@@ -704,18 +704,33 @@ async fn complete_session_commit(
         Some((_, version)) => Some(version.clone()),
         None => completed_format_artifact_version(&session, &repo.format),
     };
-    if let Err(e) = crate::services::artifact_service::enforce_path_immutability(
-        &state.db,
-        session.repository_id,
-        Some(&repo),
-        &session.artifact_path,
-        derived_version.as_deref(),
-        &session.checksum_sha256,
-    )
-    .await
-    {
-        UploadService::release_commit_lease(&state.db, &session).await;
-        return Err(e.into_response());
+    // #4792: a trusted peer pushing the very bytes already live at this path
+    // is a replay, not an overwrite: the source re-sends an artifact whose
+    // metadata changed after its first push (a pacman signature attached to
+    // the package later). It refreshes the row's metadata below instead of
+    // being refused as an immutable republish.
+    let identical_replay = replication_trusted
+        && is_identical_live_artifact(
+            &state.db,
+            session.repository_id,
+            &session.artifact_path,
+            &session.checksum_sha256,
+        )
+        .await;
+    if !identical_replay {
+        if let Err(e) = crate::services::artifact_service::enforce_path_immutability(
+            &state.db,
+            session.repository_id,
+            Some(&repo),
+            &session.artifact_path,
+            derived_version.as_deref(),
+            &session.checksum_sha256,
+        )
+        .await
+        {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(e.into_response());
+        }
     }
 
     // #3918: reassemble the staged chunks from the repository's backend into a
@@ -905,6 +920,7 @@ async fn complete_session_commit(
         WHERE artifacts.is_deleted
             OR $10
             OR artifacts.version IS DISTINCT FROM EXCLUDED.version
+            OR ($11 AND LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256))
         RETURNING id
         "#,
     )
@@ -921,6 +937,7 @@ async fn complete_session_commit(
         &repo.format,
         repo.versioning_enabled,
     ))
+    .bind(identical_replay)
     .fetch_optional(&mut *tx)
     .await;
     let artifact_id: Uuid = match inserted_artifact_id {
@@ -1172,6 +1189,28 @@ async fn complete_session_commit(
         checksum_sha256: session.checksum_sha256,
     })
     .into_response())
+}
+
+/// Whether a live artifact at `(repository_id, path)` already holds exactly
+/// the bytes `checksum_sha256` names (#4792). A lookup error reads as `false`,
+/// which keeps the full immutability gate in force.
+async fn is_identical_live_artifact(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    path: &str,
+    checksum_sha256: &str,
+) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+           AND LOWER(checksum_sha256) = LOWER($3))",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(checksum_sha256)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -3810,7 +3849,24 @@ mod tests {
         create_body: serde_json::Value,
         payload: &[u8],
     ) -> Uuid {
-        let auth = tdh::make_auth(f.user_id, &f.username);
+        complete_replication_upload_as(
+            f,
+            || tdh::make_auth(f.user_id, &f.username),
+            create_body,
+            payload,
+        )
+        .await
+    }
+
+    /// [`complete_replication_upload`] under the identity `auth` returns.
+    async fn complete_replication_upload_as(
+        f: &tdh::Fixture,
+        auth: impl Fn() -> AuthExtension,
+        create_body: serde_json::Value,
+        payload: &[u8],
+    ) -> Uuid {
+        let auth_for = &auth;
+        let auth = auth_for();
         let app = upload_router_with_auth(f.state.clone(), auth);
         let create_req = create_replication_session_req(&create_body);
         let (status, body) = tdh::send(app, create_req).await;
@@ -3824,7 +3880,7 @@ mod tests {
         let session_id: Uuid =
             serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
 
-        let auth = tdh::make_auth(f.user_id, &f.username);
+        let auth = auth_for();
         let app = upload_router_with_auth(f.state.clone(), auth);
         let req = axum::http::Request::builder()
             .method("PATCH")
@@ -3844,7 +3900,7 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
 
-        let auth = tdh::make_auth(f.user_id, &f.username);
+        let auth = auth_for();
         let app = upload_router_with_auth(f.state.clone(), auth);
         let req = axum::http::Request::builder()
             .method("PUT")
@@ -5630,6 +5686,79 @@ mod tests {
             .execute(&f.pool)
             .await;
         f.teardown().await;
+    }
+
+    /// #4792: a trusted peer re-pushing the exact bytes already live at a
+    /// path (the source re-sends a package whose metadata changed after the
+    /// first push, such as a pacman signature) refreshes the metadata instead
+    /// of being refused as an immutable republish. Fails on `main` with 409.
+    #[tokio::test]
+    async fn complete_replays_identical_trusted_replication_with_new_metadata_4792() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"replicated-package-signed-later";
+        let artifact_path = "x86_64/replay-1.0-1-x86_64.pkg.tar.zst";
+        let body = |metadata: serde_json::Value| {
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "replay",
+                "artifact_version": "1.0-1",
+                "artifact_metadata_format": "pacman",
+                "artifact_metadata": metadata,
+                "total_size": payload.len() as i64,
+                "checksum_sha256": sha256_hex(payload),
+                "chunk_size": 1024 * 1024_i64,
+            })
+        };
+        // A peer's sync worker authenticates with an admin key: trusted.
+        let admin = || tdh::admin_auth(f.user_id, &f.username);
+        let first = complete_replication_upload_as(
+            &f,
+            admin,
+            body(serde_json::json!({ "filename": "replay-1.0-1-x86_64.pkg.tar.zst" })),
+            payload,
+        )
+        .await;
+        let second = complete_replication_upload_as(
+            &f,
+            admin,
+            body(serde_json::json!({
+                "filename": "replay-1.0-1-x86_64.pkg.tar.zst",
+                "pgpsig": "AAE="
+            })),
+            payload,
+        )
+        .await;
+
+        let rows: Vec<(Uuid, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT a.id, am.metadata FROM artifacts a \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(artifact_path)
+        .fetch_all(&f.pool)
+        .await
+        .expect("query replayed artifact");
+        for session_id in [first, second] {
+            let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+        }
+        f.teardown().await;
+        assert_eq!(rows.len(), 1, "a replay must not add a second row");
+        assert_eq!(
+            rows[0].1.as_ref().expect("metadata")["pgpsig"],
+            "AAE=",
+            "the replay must refresh the replicated metadata"
+        );
     }
 
     #[tokio::test]
