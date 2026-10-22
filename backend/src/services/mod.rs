@@ -118,6 +118,7 @@ pub mod smtp_service;
 pub mod source_registry;
 pub mod spdx_licenses;
 pub mod ssrf_dns;
+pub mod ssrf_refusal;
 pub mod storage_gc_service;
 pub mod storage_reindex_service;
 pub mod storage_scrub_service;
