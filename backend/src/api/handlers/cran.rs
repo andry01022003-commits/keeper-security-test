@@ -31,7 +31,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::cran::CranHandler;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -122,34 +122,76 @@ async fn build_virtual_combined_index(
 // GET /cran/{repo_key}/src/contrib/PACKAGES — Package index (text format)
 // ---------------------------------------------------------------------------
 
+/// Build the `src/contrib/PACKAGES` DCF document a request should be answered
+/// with, by repository type.
+///
+/// * **Virtual** — the caller-authorized merge of every member's index.
+/// * **Remote** — the upstream's own `PACKAGES` (the discovery document an R
+///   client needs before it can install anything), merged over whatever is
+///   held locally. See [`build_remote_source_index`].
+/// * **Hosted / everything else** — the locally-catalogued rows.
+///
+/// Shared by [`package_index`] and [`package_index_gz`] so the plain and
+/// gzipped routes can never disagree about which records the repository
+/// advertises (the bug in #4877 was that the gzipped route shared the plain
+/// route's local-only index, so BOTH were empty against a Remote upstream).
+async fn build_source_index_document(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+) -> Result<(String, proxy_helpers::PartialMerge), Response> {
+    if repo.repo_type == RepositoryType::Virtual {
+        let (combined, partial) = build_virtual_combined_index(state, auth, repo.id).await?;
+        return Ok((combined, partial));
+    }
+
+    let local = build_source_index(&state.db, repo.id).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        match build_remote_source_index(state, repo).await {
+            Ok(upstream) => {
+                return Ok((
+                    merge_upstream_source_index(&local, &upstream),
+                    proxy_helpers::PartialMerge::default(),
+                ))
+            }
+            // Upstream is unreachable or unparseable. With nothing held
+            // locally there is no honest index to serve: an empty document is
+            // indistinguishable from "upstream publishes no packages", which
+            // is precisely the silent failure #4877 is about, so the
+            // upstream's own error is surfaced. With packages held locally the
+            // local set is still served, so an upstream outage cannot break
+            // resolution of a package this repository already has.
+            Err(err) if local.is_empty() => return Err(err),
+            Err(err) => {
+                tracing::warn!(
+                    repository = %repo.key,
+                    status = %err.status(),
+                    "upstream CRAN PACKAGES unavailable; serving locally-held packages only"
+                );
+            }
+        }
+    }
+
+    Ok((local, proxy_helpers::PartialMerge::default()))
+}
+
 async fn package_index(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
+    let (index, partial) = build_source_index_document(&state, auth.as_ref(), &repo).await?;
 
-    if repo.repo_type == RepositoryType::Virtual {
-        let (combined, partial) =
-            build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-            .header(CONTENT_LENGTH, combined.len().to_string())
-            .body(Body::from(combined))
-            .unwrap();
-        partial.mark(&mut response);
-        return Ok(response);
-    }
-
-    let index = build_source_index(&state.db, repo.id).await?;
-
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(CONTENT_LENGTH, index.len().to_string())
         .body(Body::from(index))
-        .unwrap())
+        .unwrap();
+    partial.mark(&mut response);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -162,29 +204,7 @@ async fn package_index_gz(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
-
-    if repo.repo_type == RepositoryType::Virtual {
-        let (combined, partial) =
-            build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
-        let compressed = gzip_compress(combined.as_bytes()).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Compression error: {}", e),
-            )
-                .into_response()
-        })?;
-
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/gzip")
-            .header(CONTENT_LENGTH, compressed.len().to_string())
-            .body(Body::from(compressed))
-            .unwrap();
-        partial.mark(&mut response);
-        return Ok(response);
-    }
-
-    let index = build_source_index(&state.db, repo.id).await?;
+    let (index, partial) = build_source_index_document(&state, auth.as_ref(), &repo).await?;
 
     let compressed = gzip_compress(index.as_bytes()).map_err(|e| {
         (
@@ -194,12 +214,14 @@ async fn package_index_gz(
             .into_response()
     })?;
 
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/gzip")
         .header(CONTENT_LENGTH, compressed.len().to_string())
         .body(Body::from(compressed))
-        .unwrap())
+        .unwrap();
+    partial.mark(&mut response);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +541,247 @@ async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, 
     }
 
     Ok(index)
+}
+
+// ---------------------------------------------------------------------------
+// Remote (proxy) upstream index
+// ---------------------------------------------------------------------------
+
+/// One parsed DCF record from a `PACKAGES` document: the exact text of the
+/// record (with its terminator normalised to a single trailing newline) and the
+/// `(Package, Version)` identity an R client reconstructs the download filename
+/// from.
+#[derive(Debug)]
+struct UpstreamDcfRecord {
+    package: String,
+    version: String,
+    text: String,
+}
+
+/// Parse a CRAN `PACKAGES` DCF document into records, keeping each record's
+/// text verbatim.
+///
+/// The upstream document carries far more than `Package`/`Version` — `Depends`,
+/// `Imports`, `LinkingTo`, `License`, `MD5sum` and more — and R resolves a
+/// package's dependency graph out of those fields. Re-rendering through
+/// [`write_dcf_record`], which emits only the three fields the *local* index
+/// builder stores, would silently strip them and break dependency resolution
+/// for every package proxied from upstream. So the record text is preserved
+/// byte-for-byte and only the `(Package, Version)` identity is extracted.
+///
+/// DCF records are separated by one or more blank lines; a continuation line
+/// (leading whitespace) belongs to the field above it and is preserved as-is.
+fn parse_upstream_dcf(document: &str) -> Vec<UpstreamDcfRecord> {
+    let normalised = document.replace("\r\n", "\n").replace('\r', "\n");
+    let mut records = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+
+    let flush = |lines: &mut Vec<&str>, out: &mut Vec<UpstreamDcfRecord>| {
+        if lines.is_empty() {
+            return;
+        }
+        let text = lines.join("\n");
+        // Identity: the FIRST `Package:` and `Version:` value, ignoring the
+        // leading whitespace DCF continuation lines carry.
+        let field = |name: &str| {
+            lines
+                .iter()
+                .find_map(|line| line.strip_prefix(name).map(|v| v.trim().to_string()))
+                .filter(|v| !v.is_empty())
+        };
+        if let (Some(package), Some(version)) = (field("Package:"), field("Version:")) {
+            out.push(UpstreamDcfRecord {
+                package,
+                version,
+                text,
+            });
+        }
+        lines.clear();
+    };
+
+    for line in normalised.split('\n') {
+        if line.trim().is_empty() {
+            flush(&mut current, &mut records);
+        } else {
+            current.push(line);
+        }
+    }
+    flush(&mut current, &mut records);
+
+    records
+}
+
+/// Fetch and parse a Remote repository's upstream `src/contrib/PACKAGES`,
+/// returning the DCF document an index response should merge over the local
+/// rows.
+///
+/// The document is the discovery half of a CRAN install — `install.packages()`
+/// reads it to learn which `(Package, Version)` pairs exist before requesting
+/// any tarball — so building the index from locally-catalogued rows alone
+/// answered an empty `200` and made a Remote repository unusable (#4877). The
+/// fetch is byte-capped and reserved against the shared buffered-metadata
+/// budget, and goes through the proxy cache so the upstream round-trip is paid
+/// once per cache TTL.
+///
+/// A `404` from upstream is **not** an error: it means the upstream publishes
+/// no `PACKAGES` at that path, so there is honestly nothing to merge and the
+/// locally-held rows stand alone.
+///
+/// A non-`404` failure is surfaced to the caller, which decides whether to fall
+/// back to the local set (a Remote with locally-cached packages) or fail loudly
+/// (nothing held locally — an empty index is indistinguishable from "upstream
+/// publishes no packages", the silent failure this issue is about).
+///
+/// Upstreams that publish only the gzipped index are handled: the plain
+/// `PACKAGES` is tried first (what CRAN and its mirrors serve unsigned and
+/// unsurprising), and a `404` there falls back to `PACKAGES.gz`, which is
+/// gunzipped in-process. Both are the same document in two codings.
+async fn build_remote_source_index(
+    state: &SharedState,
+    repo: &RepoInfo,
+) -> Result<String, Response> {
+    let Some(upstream_url) = repo.upstream_url.as_deref() else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Remote CRAN repository has no upstream URL configured",
+        )
+            .into_response());
+    };
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Proxy service is not available",
+        )
+            .into_response());
+    };
+
+    // CRAN indexes are whole-repository listings: real upstreams (CRAN itself
+    // and its mirrors) ship a `PACKAGES` well past the 8 MiB default, so the
+    // larger ceiling applies, exactly as it does for the helm index and the
+    // PyPI simple index.
+    let cap = proxy_helpers::LARGE_METADATA_MAX_BYTES;
+    let plain = proxy_helpers::proxy_fetch_capped_budgeted(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        "src/contrib/PACKAGES",
+        cap,
+        RepositoryFormat::Cran,
+    )
+    .await;
+
+    let document = match plain {
+        Ok((bytes, _content_type, _budget_permit)) => {
+            String::from_utf8(bytes.to_vec()).map_err(|_| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Invalid UTF-8 in upstream PACKAGES",
+                )
+                    .into_response()
+            })?
+        }
+        // A `404` on the plain document may mean this upstream ships only the
+        // gzipped index; anything else is a real failure the caller handles.
+        Err(response) if response.status() == StatusCode::NOT_FOUND => {
+            match fetch_upstream_gzip_index(proxy, repo, upstream_url, cap).await {
+                Ok(Some(document)) => document,
+                // No gzipped index either: the upstream publishes no PACKAGES.
+                Ok(None) => return Ok(String::new()),
+                Err(response) => return Err(response),
+            }
+        }
+        Err(response) => return Err(response),
+    };
+
+    // Re-render each record as PACKAGES text: records are already
+    // blank-line separated, so a record's own trailing `\n\n` is the separator.
+    let mut index = String::new();
+    for record in parse_upstream_dcf(&document) {
+        index.push_str(&record.text);
+        index.push_str("\n\n");
+    }
+
+    Ok(index)
+}
+
+/// Fetch and gunzip `src/contrib/PACKAGES.gz`. `Ok(None)` means the upstream
+/// answered `404` for it too, i.e. it publishes no CRAN index at all.
+async fn fetch_upstream_gzip_index(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    cap: usize,
+) -> Result<Option<String>, Response> {
+    let (bytes, _content_type, _budget_permit) = match proxy_helpers::proxy_fetch_capped_budgeted(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        "src/contrib/PACKAGES.gz",
+        cap,
+        RepositoryFormat::Cran,
+    )
+    .await
+    {
+        Ok(triple) => triple,
+        Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
+        Err(response) => return Err(response),
+    };
+
+    let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut document = String::new();
+    use std::io::Read as _;
+    decoder.read_to_string(&mut document).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Invalid gzip in upstream PACKAGES.gz",
+        )
+            .into_response()
+    })?;
+    Ok(Some(document))
+}
+
+/// Merge an upstream `PACKAGES` document over the locally-built index.
+///
+/// Locally-held records win: a locally-catalogued package is served from
+/// storage by the download route before upstream is ever consulted, and its row
+/// carries the artifact's real stored coordinates, so replacing it with the
+/// upstream record could advertise a filename the local path resolves
+/// differently. An upstream record for a `(Package, Version)` that is not held
+/// locally is appended; a different version of the same package is a different
+/// record and is always appended, which is what lets an R client resolve a
+/// version that only upstream carries.
+fn merge_upstream_source_index(local: &str, upstream_index: &str) -> String {
+    if upstream_index.is_empty() {
+        return local.to_string();
+    }
+
+    let held: std::collections::HashSet<(String, String)> = parse_upstream_dcf(local)
+        .into_iter()
+        .map(|r| (r.package, r.version))
+        .collect();
+
+    let mut merged = local.to_string();
+    for record in parse_upstream_dcf(upstream_index) {
+        if held.contains(&(record.package, record.version)) {
+            continue;
+        }
+        // DCF needs a blank line between records. `build_source_index` always
+        // terminates a record with one, but a caller handing over a truncated
+        // document must not have two records silently fused into one, so top
+        // the terminator up rather than assuming it.
+        if !merged.is_empty() && !merged.ends_with("\n\n") {
+            if merged.ends_with('\n') {
+                merged.push('\n');
+            } else {
+                merged.push_str("\n\n");
+            }
+        }
+        merged.push_str(&record.text);
+        merged.push_str("\n\n");
+    }
+    merged
 }
 
 fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
@@ -1220,5 +1483,334 @@ mod tests {
             "index still advertises the unresolvable sha256 fallback: {text}"
         );
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4877: a Remote CRAN repository must proxy the upstream PACKAGES index.
+    //
+    // Every test below mounts a wiremock upstream and drives the real router
+    // through `rewire_remote_proxy`, so it exercises the whole
+    // resolve -> fetch -> merge -> respond path and fails on `main` (where a
+    // Remote repo answered an empty 200 because the index was built from
+    // local rows alone).
+    // -----------------------------------------------------------------------
+
+    /// Two realistic CRAN DCF records, with fields beyond Package/Version that
+    /// dependency resolution needs and must survive the merge.
+    const UPSTREAM_PACKAGES: &str = "\
+Package: ggplot2
+Version: 3.4.4
+Depends: R (>= 3.3.0)
+Imports: cli, glue, rlang
+License: MIT + file LICENSE
+
+Package: dplyr
+Version: 1.1.4
+Depends: R (>= 3.5.0)
+License: MIT + file LICENSE
+";
+
+    async fn mount_packages(server: &wiremock::MockServer, body: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/src/contrib/PACKAGES"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    /// The bug: `GET /cran/{key}/src/contrib/PACKAGES` against a Remote repo
+    /// returned an empty 200, so R clients pointed at a remote repo could not
+    /// discover anything. It must now serve what the upstream advertises.
+    #[tokio::test]
+    async fn test_cran_remote_package_index_proxies_upstream_4877() {
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        mount_packages(&server, UPSTREAM_PACKAGES).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body.to_vec()).expect("utf-8 index");
+        assert!(
+            text.contains("Package: ggplot2") && text.contains("Version: 3.4.4"),
+            "a Remote CRAN index must advertise the upstream's packages (#4877): {text}"
+        );
+        assert!(text.contains("Package: dplyr"), "index was: {text}");
+        // Fields beyond Package/Version are what R resolves dependencies from;
+        // a re-render that emitted only our three local columns would drop
+        // them and break `install.packages()` dependency resolution.
+        assert!(
+            text.contains("Imports: cli, glue, rlang"),
+            "upstream-only DCF fields must be preserved verbatim: {text}"
+        );
+    }
+
+    /// `PACKAGES.gz` must carry the SAME records as `PACKAGES`: the two routes
+    /// share one index builder, so they cannot disagree (both were empty
+    /// against a Remote before #4877).
+    #[tokio::test]
+    async fn test_cran_remote_package_index_gz_matches_plain_4877() {
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        mount_packages(&server, UPSTREAM_PACKAGES).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES.gz", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let mut decoder = GzDecoder::new(&body[..]);
+        let mut text = String::new();
+        decoder.read_to_string(&mut text).expect("gunzip index");
+        assert!(
+            text.contains("Package: ggplot2") && text.contains("Package: dplyr"),
+            "PACKAGES.gz must proxy the upstream index too (#4877): {text}"
+        );
+    }
+
+    /// An upstream that ships only the gzipped index (some mirrors do) still
+    /// gets proxied: the plain fetch 404s and the gzip fallback serves it.
+    #[tokio::test]
+    async fn test_cran_remote_index_falls_back_to_gz_only_upstream_4877() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        // No `/src/contrib/PACKAGES` mock at all: wiremock answers 404 for it.
+        let gz = gzip_compress(UPSTREAM_PACKAGES.as_bytes()).expect("gzip fixture");
+        Mock::given(method("GET"))
+            .and(path("/src/contrib/PACKAGES.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(gz))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body.to_vec()).expect("utf-8 index");
+        assert!(
+            text.contains("Package: ggplot2"),
+            "a gzip-only upstream must still be proxied (#4877): {text}"
+        );
+    }
+
+    /// A locally-held package is served from storage before upstream is
+    /// consulted, and its real stored coordinates must not be replaced by the
+    /// upstream record. An upstream-only package is still appended.
+    #[tokio::test]
+    async fn test_cran_remote_index_local_wins_and_upstream_added_4877() {
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let repo = f.repo_info("remote", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/localpkg/9.9.9/localpkg_9.9.9.tar.gz",
+            "localpkg/9.9.9/localpkg_9.9.9.tar.gz",
+            "localpkg",
+            "9.9.9",
+            "application/x-gzip",
+            Bytes::from_static(b"local-pkg"),
+            f.user_id,
+        )
+        .await;
+
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        mount_packages(&server, UPSTREAM_PACKAGES).await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body.to_vec()).expect("utf-8 index");
+        assert!(
+            text.contains("Package: localpkg") && text.contains("Version: 9.9.9"),
+            "a locally-held package stays advertised: {text}"
+        );
+        assert!(
+            text.contains("Package: ggplot2"),
+            "the upstream's packages are merged in alongside the local rows: {text}"
+        );
+    }
+
+    /// An upstream that publishes no `PACKAGES` (both paths 404) is not an
+    /// error: the repository honestly serves its local set — here, empty.
+    #[tokio::test]
+    async fn test_cran_remote_index_upstream_404_is_empty_not_error_4877() {
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        // No mocks mounted: every path is 404.
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty(), "nothing to serve: {body:?}");
+    }
+
+    /// With nothing held locally, an upstream failure must be LOUD: an empty
+    /// 200 is indistinguishable from "upstream publishes no packages", which is
+    /// the silent failure #4877 is about.
+    #[tokio::test]
+    async fn test_cran_remote_index_upstream_failure_without_local_is_server_error_4877() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/src/contrib/PACKAGES"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+
+        assert!(
+            status.is_server_error(),
+            "an upstream failure with no local fallback must not be a silent \
+             empty 200 (#4877): got {status}"
+        );
+    }
+
+    /// The DCF parser is the heart of the merge; pin its behaviour directly so
+    /// a refactor cannot silently change what is preserved or how identity is
+    /// extracted.
+    #[test]
+    fn test_parse_upstream_dcf_preserves_fields_and_extracts_identity() {
+        let records = parse_upstream_dcf(UPSTREAM_PACKAGES);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].package, "ggplot2");
+        assert_eq!(records[0].version, "3.4.4");
+        assert_eq!(records[1].package, "dplyr");
+        assert_eq!(records[1].version, "1.1.4");
+        assert!(
+            records[0].text.contains("Imports: cli, glue, rlang"),
+            "record text keeps every field: {}",
+            records[0].text
+        );
+    }
+
+    /// CRLF and a missing trailing blank line still parse (real upstreams vary).
+    #[test]
+    fn test_parse_upstream_dcf_handles_crlf_and_no_trailing_blank() {
+        let doc = "Package: a\r\nVersion: 1.0\r\n\r\nPackage: b\r\nVersion: 2.0";
+        let records = parse_upstream_dcf(doc);
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            (records[0].package.as_str(), records[0].version.as_str()),
+            ("a", "1.0")
+        );
+        assert_eq!(
+            (records[1].package.as_str(), records[1].version.as_str()),
+            ("b", "2.0")
+        );
+    }
+
+    /// A record without both identity fields contributes nothing (it could
+    /// never be converted into a download request).
+    #[test]
+    fn test_parse_upstream_dcf_skips_records_without_identity() {
+        let doc = "Package: nover\nVersion:\n\nDescription: unnamed\n";
+        let records = parse_upstream_dcf(doc);
+        // `Version:` is empty → not a usable identity.
+        assert!(records.is_empty(), "got {records:?}");
+    }
+
+    /// A local record and an upstream record for the same coordinate must not
+    /// be duplicated: local wins, upstream's extra fields do not shadow it.
+    #[test]
+    fn test_merge_upstream_source_index_dedupes_by_identity() {
+        let local = "Package: ggplot2\nVersion: 3.4.4\n\n";
+        let merged = merge_upstream_source_index(local, UPSTREAM_PACKAGES);
+        assert_eq!(
+            merged.matches("Package: ggplot2").count(),
+            1,
+            "the local row must not be duplicated by the upstream one: {merged}"
+        );
+        assert!(
+            merged.contains("Package: dplyr"),
+            "upstream-only added: {merged}"
+        );
+        // The surviving ggplot2 record is the LOCAL one (no upstream-only fields).
+        assert!(
+            !merged.contains("Imports: cli, glue, rlang"),
+            "the local ggplot2 record must win over upstream's: {merged}"
+        );
+    }
+
+    /// An empty upstream index leaves the local document untouched.
+    #[test]
+    fn test_merge_upstream_source_index_empty_upstream_is_identity() {
+        let local = "Package: only\nVersion: 1.0\n\n";
+        assert_eq!(merge_upstream_source_index(local, ""), local);
+    }
+
+    /// Upstream records that are not held locally are appended with their DCF
+    /// fields intact, and a local record without a trailing blank line still
+    /// yields valid, separated records.
+    #[test]
+    fn test_merge_upstream_source_index_preserves_fields_and_separators() {
+        let local = "Package: only\nVersion: 1.0"; // no trailing blank line
+        let merged = merge_upstream_source_index(local, UPSTREAM_PACKAGES);
+        assert!(merged.contains("Imports: cli, glue, rlang"), "{merged}");
+        // Records must be blank-line separated for a DCF parser.
+        assert!(
+            merged.contains("Version: 1.0\n\nPackage: ggplot2\n"),
+            "local and upstream records must be separated: {merged}"
+        );
     }
 }
