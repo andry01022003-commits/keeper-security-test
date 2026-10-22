@@ -190,6 +190,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         "Starting Artifact Keeper"
     );
 
+    // Install the Prometheus recorder before anything records a metric.
+    // `db::create_pool` counts failed initial connect attempts in
+    // `ak_db_pool_connection_failures_total{stage="startup"}`; with the
+    // recorder installed later those increments went to the `metrics`
+    // crate's no-op default and were never exported (#4828). The recorder
+    // needs nothing from the database or the rest of startup.
+    let metrics_handle = metrics_service::init_metrics();
+    tracing::info!("Prometheus metrics recorder initialized");
+
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
@@ -399,10 +408,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             None
         }
     };
-
-    // Initialize Prometheus metrics recorder
-    let metrics_handle = metrics_service::init_metrics();
-    tracing::info!("Prometheus metrics recorder initialized");
 
     // Issues #976, #1224: surface the upstream private-IP allowlist at
     // boot so the posture is obvious in startup logs. Metadata IPs
