@@ -1093,6 +1093,27 @@ async fn complete_session_commit(
             .await;
     }
 
+    // #4791: this path writes its own `artifacts` row instead of going through
+    // `ArtifactService::finalize_upload`, so the peer fan-out that path performs
+    // for every other generic upload never runs here. Queue it explicitly, like
+    // the native-format handlers do, and only once the row, its metadata and the
+    // catalog entry above are committed so a peer cannot fetch a half-registered
+    // artifact. `queue_push_sync_tasks_for_upload` applies the #4725 guard (a
+    // request carrying the replication marker is never fanned back out); the
+    // stored session flag covers a replication session that completes without
+    // repeating the header.
+    if !session.is_replication {
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            headers,
+            session.repository_id,
+            artifact_id,
+            &session.artifact_path,
+            session.total_size,
+        )
+        .await;
+    }
+
     // #4166: this path inserts its own row, so it mirrors finalize_upload's
     // scan-on-upload gate itself (metadata is written above).
     crate::services::scanner_service::trigger_scan_on_upload(
@@ -5468,6 +5489,62 @@ mod tests {
         assert_eq!(
             artifacts, 0,
             "a refused completion must not write an artifact"
+        );
+    }
+
+    /// #4791: a non-replication upload completed through `/api/v1/uploads`
+    /// must queue a push sync task for a subscribed push peer. This path writes
+    /// its own `artifacts` row instead of calling
+    /// `ArtifactService::finalize_upload`, so it inherited none of that path's
+    /// peer fan-out. Fails on `main` (nothing queued). A replication session
+    /// completing through the same route must not enqueue one, or a peer write
+    /// would be fanned back out to the other peers (#4725).
+    #[tokio::test]
+    async fn complete_queues_push_sync_task_4791() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&f.pool, f.repo_id, "generic-upload").await;
+
+        let client_path = "push/client-4791.bin";
+        let (status, body) = f
+            .chunked_upload(
+                client_path,
+                b"client-upload-bytes-4791",
+                serde_json::json!({}),
+                false,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the client chunked upload must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let replicated_path = "push/replicated-4791.bin";
+        let (status, body) = f
+            .chunked_upload(
+                replicated_path,
+                b"replicated-upload-bytes-4791",
+                serde_json::json!({}),
+                true,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the replicated chunked upload must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        tdh::delete_push_peer(&f.pool, peer_id).await;
+        f.teardown().await;
+        assert_eq!(
+            queued,
+            vec![client_path.to_string()],
+            "only the client upload queues a push task; the replicated one must not"
         );
     }
 
