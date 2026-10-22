@@ -449,7 +449,10 @@ fn ssrf_redirect_policy_with(
                 context_label,
             );
             crate::services::metrics_service::record_ssrf_block(surface);
-            return attempt.error("redirect target rejected by SSRF policy");
+            return attempt.error(format!(
+                "redirect target {}",
+                crate::services::ssrf_refusal::REDIRECT_REFUSAL_PHRASE
+            ));
         }
         if attempt.previous().len() >= MAX_REDIRECTS {
             return attempt.error("too many redirects");

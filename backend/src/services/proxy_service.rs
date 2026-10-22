@@ -794,32 +794,31 @@ pub(crate) fn strip_url_userinfo_textual(url: &str) -> (String, bool) {
     }
 }
 
-/// True when the SSRF DNS guard's "all resolved addresses blocked" marker
-/// appears anywhere in a transport error's `source()` chain. The marker
-/// string is emitted only by [`crate::services::ssrf_dns::SsrfGuardResolver`],
-/// so a match unambiguously identifies an SSRF-guard block (as opposed to a
-/// plain connection-refused / timeout).
+/// True when an SSRF refusal appears anywhere in a transport error's
+/// `source()` chain. The refusals are the connect-time DNS guard's
+/// ("all resolved addresses blocked by SSRF policy") and the per-hop
+/// redirect policy's ("redirect target rejected by SSRF policy"); both are
+/// emitted by this repository's own outbound-policy code, so a match
+/// unambiguously identifies an SSRF refusal (as opposed to a plain
+/// connection-refused / timeout). Classified through the shared vocabulary
+/// in [`crate::services::ssrf_refusal`] so a redirect refusal is not
+/// mistaken for a generic transport failure (#4869).
 fn is_ssrf_block_error(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(e) = cur {
-        if e.to_string().contains("blocked by SSRF policy") {
-            return true;
-        }
-        cur = e.source();
-    }
-    false
+    crate::services::ssrf_refusal::is_ssrf_refusal_error(err)
 }
 
 /// Pure transport-error mapping (unit-testable without a real
-/// `reqwest::Error`). When the failure is the SSRF DNS guard refusing to
-/// resolve a host, surface a meaningful 503 instead of an opaque `Storage` 500
-/// or a blanket 502 (issue #2570). The wording is proxy-specific ONLY when an
-/// egress proxy is actually configured (`proxy_configured`), so a direct /
-/// `NO_PROXY` upstream that is SSRF-blocked is not mislabeled as a proxy
-/// failure — that just confuses triage since no proxy was involved. Either way
-/// it is a 503 and the redacted-URL `context` (never proxy creds/IP) is
-/// preserved. Every other (non-SSRF) transport failure keeps the pre-existing
-/// `Storage` mapping unchanged.
+/// `reqwest::Error`). When the failure is the SSRF policy refusing the
+/// request — the connect-time DNS guard refusing to resolve a host, or a
+/// redirect hop refusing its target — surface a meaningful 503 instead of an
+/// opaque `Storage` 500 or a blanket 502 (issue #2570, #4869). The wording is
+/// proxy-specific ONLY when an egress proxy is actually configured
+/// (`proxy_configured`), so a direct / `NO_PROXY` upstream that is
+/// SSRF-blocked is not mislabeled as a proxy failure — that just confuses
+/// triage since no proxy was involved. Either way it is a 503 and the
+/// redacted-URL `context` (never proxy creds/IP) is preserved. Every other
+/// (non-SSRF) transport failure keeps the pre-existing `Storage` mapping
+/// unchanged.
 fn map_transport_error(
     proxy_configured: bool,
     is_ssrf_block: bool,
@@ -829,11 +828,11 @@ fn map_transport_error(
     if is_ssrf_block {
         if proxy_configured {
             AppError::ServiceUnavailable(format!(
-                "egress proxy connection refused by SSRF egress policy while {context}: {detail}"
+                "egress proxy request refused by SSRF egress policy while {context}: {detail}"
             ))
         } else {
             AppError::ServiceUnavailable(format!(
-                "connection to upstream refused by SSRF egress policy while {context}: {detail}"
+                "upstream request refused by SSRF egress policy while {context}: {detail}"
             ))
         }
     } else {
@@ -9265,6 +9264,20 @@ mod tests {
         let plain =
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
         assert!(!is_ssrf_block_error(&plain));
+    }
+
+    /// A redirect hop the SSRF policy refuses is a refusal like the
+    /// connect-time one (#4869). Matching only the DNS guard's phrase
+    /// mapped it to the generic `Storage` path, so an upstream that
+    /// redirected onto a blocked address surfaced as a 500 instead of the
+    /// 503 the policy refusal deserves.
+    #[test]
+    fn is_ssrf_block_error_matches_the_redirect_refusal_too() {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "redirect target rejected by SSRF policy",
+        );
+        assert!(is_ssrf_block_error(&err));
     }
 
     // -----------------------------------------------------------------------
