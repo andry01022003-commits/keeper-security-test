@@ -3051,9 +3051,52 @@ fn resolve_shards_base(
     Ok(base)
 }
 
+/// An upstream shard as the proxy holds it, with any transfer coding undone:
+/// the proxy's HTTP client does not decode, so a shard that arrived coded has
+/// to be decoded before it can be verified or served.
+async fn decode_upstream_shard(content: Bytes, coding: Option<String>) -> Result<Bytes, String> {
+    let Some(coding) = coding
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("identity"))
+    else {
+        return Ok(content);
+    };
+    tokio::task::spawn_blocking(move || {
+        virtual_merge::decode_member_document(
+            &content,
+            Some(&coding),
+            virtual_merge::FileCodec::Plain,
+            CEP16_UPSTREAM_SHARD_MAX_BYTES,
+        )
+    })
+    .await
+    .map_err(|e| format!("decoder task failed: {e}"))?
+    .map(Bytes::from)
+}
+
+/// The proxy-cache identity check for the shard at `hash_hex` (#4829): the
+/// body, decoded, hashes to the address. A body that fails is never committed
+/// to the proxy cache, and a cached one that fails is evicted, so one wrong
+/// upstream answer is not pinned under a path the cache treats as immutable.
+fn shard_cache_check(
+    hash_hex: &str,
+) -> impl Fn(Bytes, Option<String>) -> futures::future::BoxFuture<'static, bool> + Send + Sync {
+    let hash_hex = hash_hex.to_string();
+    move |content, coding| {
+        let hash_hex = hash_hex.clone();
+        Box::pin(async move {
+            decode_upstream_shard(content, coding)
+                .await
+                .is_ok_and(|shard| hex::encode(shard_address(&shard)) == hash_hex)
+        })
+    }
+}
+
 /// Fetch one shard of a remote repository's upstream by address through the
 /// proxy cache (immutable: the address is the hash of the bytes) and verify
-/// it. `Ok(None)`: the upstream has no such shard.
+/// it. `Ok(None)`: the upstream has no such shard. Only a shard that hashes
+/// to its address is committed to the proxy cache, and a cached entry that
+/// does not is evicted and fetched again (#4829).
 async fn fetch_upstream_shard(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -3084,6 +3127,7 @@ async fn fetch_upstream_shard(
     let _budget_permit = proxy_helpers::proxy_metadata_budget()
         .reserve(CEP16_UPSTREAM_SHARD_MAX_BYTES)
         .await;
+    let check = shard_cache_check(hash_hex);
     let fetched = proxy_helpers::proxy_fetch_capped_with_cache_key_encoded_format(
         proxy,
         repo_id,
@@ -3093,6 +3137,7 @@ async fn fetch_upstream_shard(
         &cache_path,
         CEP16_UPSTREAM_SHARD_MAX_BYTES,
         RepositoryFormat::Conda,
+        &check,
     )
     .await;
     let (content, _content_type, content_encoding) = match fetched {
@@ -3100,24 +3145,8 @@ async fn fetch_upstream_shard(
         Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
         Err(response) => return Err(response),
     };
-    // The proxy's HTTP client does not undo an upstream transfer coding; a
-    // shard that arrived coded has to be decoded before it can be verified.
-    let shard = match content_encoding
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("identity"))
-    {
-        None => content,
-        Some(coding) => tokio::task::spawn_blocking(move || {
-            virtual_merge::decode_member_document(
-                &content,
-                Some(&coding),
-                virtual_merge::FileCodec::Plain,
-                CEP16_UPSTREAM_SHARD_MAX_BYTES,
-            )
-        })
+    let shard = decode_upstream_shard(content, content_encoding)
         .await
-        .map_err(virtual_merge::internal_error)?
-        .map(Bytes::from)
         .map_err(|e| {
             tracing::warn!(repo = %repo_key, hash = hash_hex, error = %e, "upstream conda shard could not be decoded");
             (
@@ -3125,8 +3154,7 @@ async fn fetch_upstream_shard(
                 "Upstream shard could not be decoded",
             )
                 .into_response()
-        })?,
-    };
+        })?;
     if hex::encode(shard_address(&shard)) != hash_hex {
         tracing::warn!(
             repo = %repo_key,
@@ -22412,6 +22440,194 @@ mod cep16_proxy_tests {
         );
         assert!(String::from_utf8_lossy(&body).contains(&repo_key));
         assert_eq!(shard_status, StatusCode::BAD_GATEWAY);
+    }
+
+    // ---------------------------------------------------------------------
+    // #4829: a shard refused for failing its address check is never left in
+    // the proxy cache, where the immutable classification would pin it.
+    // ---------------------------------------------------------------------
+
+    /// Mount `wrong` for `path` for the first `wrong_times` requests and
+    /// `right` after that (wiremock tries mocks in mount order).
+    async fn mount_wrong_then_right(
+        server: &MockServer,
+        path: &str,
+        wrong: Vec<u8>,
+        wrong_times: u64,
+        right: Vec<u8>,
+    ) {
+        Mock::given(method("GET"))
+            .and(wm_path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(wrong),
+            )
+            .up_to_n_times(wrong_times)
+            .mount(server)
+            .await;
+        mount_bytes(server, path, right).await;
+    }
+
+    /// What the proxy cache holds for `cache_path`: the body, and the SHA-256
+    /// the proxy-cache catalogue recorded for it.
+    async fn cached_shard(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        repo_key: &str,
+        cache_path: &str,
+    ) -> (Option<Bytes>, Option<String>) {
+        let body = state
+            .proxy_service
+            .as_deref()
+            .expect("proxy service")
+            .get_cached_artifact_by_path(repo_key, cache_path)
+            .await
+            .expect("proxy cache read")
+            .map(|(content, _, _)| content);
+        let checksum: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM proxy_cache_artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(cache_path)
+        .fetch_optional(pool)
+        .await
+        .expect("proxy cache catalogue read");
+        (body, checksum.flatten())
+    }
+
+    /// The upstream answers a shard address with the wrong bytes once and the
+    /// right bytes after. The first request is refused (502) and nothing is
+    /// cached for that address; the next asks the upstream again, serves the
+    /// verified shard and caches it, and the one after is a cache hit.
+    #[tokio::test]
+    async fn remote_shard_refused_for_its_address_is_not_cached_4829() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (shard, hash) = upstream_shard("noarch", &["tzdata-2025b-h78e105d_0.conda"]);
+        let (wrong, _) = upstream_shard("noarch", &["tzdata-2025a-h78e105d_0.conda"]);
+        let server = MockServer::start().await;
+        mount_bytes(
+            &server,
+            INDEX,
+            upstream_index("noarch", "./shards/", &[("tzdata", &hash)]),
+        )
+        .await;
+        let shard_path = format!("/noarch/shards/{hash}.msgpack.zst");
+        mount_wrong_then_right(&server, &shard_path, wrong, 1, shard.clone()).await;
+
+        let (state, _cache_dir) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let get = |uri: String| {
+            let app = tdh::router_anon(router(), state.clone());
+            async move { tdh::send(app, tdh::get(uri)).await }
+        };
+        let cache_path = format!("noarch/shards/{hash}.msgpack.zst");
+
+        let (refused_status, refused_body) = get(shard_uri(&repo_key, &hash)).await;
+        let after_refusal = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+        let (healed_status, healed_body) = get(shard_uri(&repo_key, &hash)).await;
+        let (hit_status, hit_body) = get(shard_uri(&repo_key, &hash)).await;
+        let hits = upstream_hits(&server, &format!("{hash}.msgpack.zst")).await;
+        let after_heal = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            refused_status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            String::from_utf8_lossy(&refused_body)
+        );
+        assert_eq!(
+            after_refusal,
+            (None, None),
+            "a refused shard must not be committed to the proxy cache"
+        );
+        assert_eq!(
+            healed_status,
+            StatusCode::OK,
+            "once the upstream serves the right bytes the shard is served: {}",
+            String::from_utf8_lossy(&healed_body)
+        );
+        assert_eq!(&healed_body[..], &shard[..]);
+        assert_eq!(hit_status, StatusCode::OK);
+        assert_eq!(&hit_body[..], &shard[..]);
+        assert_eq!(
+            hits, 2,
+            "the refused shard is fetched again, the verified one is then a cache hit"
+        );
+        assert_eq!(after_heal.0.as_deref(), Some(&shard[..]));
+        assert_eq!(after_heal.1.as_deref(), Some(hash.as_str()));
+    }
+
+    /// A shard whose wrong bytes are already in the proxy cache (committed by
+    /// a release without the identity check) is evicted on the next request
+    /// and fetched again, so an existing poisoned cache heals by itself.
+    #[tokio::test]
+    async fn remote_shard_poisoned_cache_entry_is_evicted_and_refetched_4829() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (shard, hash) = upstream_shard("noarch", &["rich-13.0-pyh_0.conda"]);
+        let (wrong, wrong_hash) = upstream_shard("noarch", &["rich-12.0-pyh_0.conda"]);
+        let server = MockServer::start().await;
+        mount_bytes(
+            &server,
+            INDEX,
+            upstream_index("noarch", "./shards/", &[("rich", &hash)]),
+        )
+        .await;
+        let shard_path = format!("/noarch/shards/{hash}.msgpack.zst");
+        mount_wrong_then_right(&server, &shard_path, wrong.clone(), 1, shard.clone()).await;
+
+        let (state, _cache_dir) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let cache_path = format!("noarch/shards/{hash}.msgpack.zst");
+        // Poison the cache the way the pre-#4829 fetch did: commit whatever
+        // the upstream answered under the shard's path.
+        let accept_anything =
+            |_: Bytes, _: Option<String>| -> futures::future::BoxFuture<'static, bool> {
+                Box::pin(async { true })
+            };
+        proxy_helpers::proxy_fetch_capped_with_cache_key_encoded_format(
+            state.proxy_service.as_deref().expect("proxy service"),
+            repo_id,
+            &repo_key,
+            &server.uri(),
+            &shard_path[1..],
+            &cache_path,
+            CEP16_UPSTREAM_SHARD_MAX_BYTES,
+            RepositoryFormat::Conda,
+            &accept_anything,
+        )
+        .await
+        .expect("seed the poisoned entry");
+        let poisoned = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(shard_uri(&repo_key, &hash)),
+        )
+        .await;
+        let hits = upstream_hits(&server, &format!("{hash}.msgpack.zst")).await;
+        let healed = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(poisoned.0.as_deref(), Some(&wrong[..]), "fixture: poisoned");
+        assert_eq!(poisoned.1.as_deref(), Some(wrong_hash.as_str()));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a poisoned entry must not keep the shard at 502: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], &shard[..]);
+        assert_eq!(hits, 2, "the poisoned entry is evicted and fetched again");
+        assert_eq!(healed.0.as_deref(), Some(&shard[..]));
+        assert_eq!(healed.1.as_deref(), Some(hash.as_str()));
     }
     /// #4608: the merged shard index is shared like the other merged
     /// documents: two concurrent requests run one merge and get one ETag, a

@@ -2053,6 +2053,21 @@ impl CacheKeys {
 /// replayed to the client — see [`UpstreamResponse::content_encoding`].
 pub(crate) type CachedBody = (Bytes, Option<String>, Option<String>);
 
+/// A caller's identity check on a buffered proxy body (#4829): `true` when
+/// the bytes are the resource the cache path names. It receives the body as
+/// the proxy cache stores it and that body's `Content-Encoding`, so a check
+/// that hashes the decoded document can undo the coding first.
+///
+/// [`ProxyService::fetch_artifact_with_cache_path_capped_checked`] runs it on
+/// a freshly fetched body before committing it (a body that fails is served
+/// to the caller but never cached) and on a cache hit before serving it (an
+/// entry that fails is evicted and fetched again). Used where the address of
+/// a resource is not a plain SHA-256 of the stored bytes that
+/// [`cache_classifier::expected_sha256_from_path`] could read off the path,
+/// e.g. a conda CEP-16 shard, whose address is the hash of the decoded file.
+pub type CachedBodyCheck =
+    dyn Fn(Bytes, Option<String>) -> futures::future::BoxFuture<'static, bool> + Send + Sync;
+
 /// An uncached, straight-from-upstream buffered read — the result of
 /// [`ProxyService::fetch_upstream_direct_with_link`].
 ///
@@ -5249,19 +5264,65 @@ impl ProxyService {
     /// result because reqwest no longer decodes upstream bodies, so a buffered
     /// metadata document may itself be content coded and the handler has to
     /// declare that when it serves the bytes on.
+    ///
+    /// A plain `fn` returning the inner future rather than an `async fn`
+    /// awaiting it: a wrapper state machine would add a level to the layout
+    /// of every handler future that reaches here, and the deepest of those
+    /// (the NuGet member walk) sits at the compiler's query-depth limit.
+    pub fn fetch_artifact_with_cache_path_and_accept_capped<'a>(
+        &'a self,
+        repo: &'a Repository,
+        fetch_path: &'a str,
+        cache_path: &'a str,
+        accept: Option<&'a str>,
+        max: usize,
+    ) -> impl std::future::Future<Output = Result<CachedBody>> + Send + 'a {
+        self.fetch_buffered_with_cache_path(repo, fetch_path, cache_path, accept, max, None)
+    }
+
+    /// [`Self::fetch_artifact_with_cache_path_capped`] for a resource whose
+    /// identity the caller can check (#4829). `check` gates the cache both
+    /// ways round:
+    ///
+    /// * a freshly fetched body that fails it is NOT committed to the proxy
+    ///   cache. It is still returned, so the caller decides what to answer
+    ///   (the conda shard proxy answers 502), and the next request asks the
+    ///   upstream again instead of being pinned to the wrong bytes;
+    /// * a cached body that fails it (an entry committed before the check
+    ///   existed) is evicted and the request is treated as a miss, so a cache
+    ///   poisoned by an earlier release heals on the next request.
+    ///
+    /// The check matters most for a path the classifier caches as immutable,
+    /// which is never revalidated: without it one wrong upstream answer would
+    /// stay in the cache until evicted by hand.
+    pub fn fetch_artifact_with_cache_path_capped_checked<'a>(
+        &'a self,
+        repo: &'a Repository,
+        fetch_path: &'a str,
+        cache_path: &'a str,
+        max: usize,
+        check: &'a CachedBodyCheck,
+    ) -> impl std::future::Future<Output = Result<CachedBody>> + Send + 'a {
+        self.fetch_buffered_with_cache_path(repo, fetch_path, cache_path, None, max, Some(check))
+    }
+
+    /// The buffered fetch behind
+    /// [`Self::fetch_artifact_with_cache_path_and_accept_capped`] and
+    /// [`Self::fetch_artifact_with_cache_path_capped_checked`].
     #[tracing::instrument(
         name = "proxy_fetch",
         level = "info",
         skip_all,
         fields(artifact_keeper.repository.key = %repo.key, artifact_keeper.proxy.mode = "buffered")
     )]
-    pub async fn fetch_artifact_with_cache_path_and_accept_capped(
+    async fn fetch_buffered_with_cache_path(
         &self,
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
         accept: Option<&str>,
         max: usize,
+        check: Option<&CachedBodyCheck>,
     ) -> Result<CachedBody> {
         // Type check only (keeps the non-remote error ahead of any other
         // work); the URL itself is built by `gated_upstream_url`.
@@ -5291,7 +5352,31 @@ impl ProxyService {
             .await?
         {
             CacheReadOutcome::Hit(content, content_type, content_encoding) => {
-                return Ok((content, content_type, content_encoding))
+                let verified = match check {
+                    Some(check) => check(content.clone(), content_encoding.clone()).await,
+                    None => true,
+                };
+                if verified {
+                    return Ok((content, content_type, content_encoding));
+                }
+                // #4829: an entry that is not the resource its path names
+                // (committed before the caller's check existed) is evicted
+                // and fetched again, never served.
+                tracing::warn!(
+                    repository = %repo.key,
+                    path = %cache_path,
+                    "cached proxy body fails the caller's identity check; evicting it and \
+                     fetching from upstream"
+                );
+                crate::services::metrics_service::record_proxy_cache_checksum_mismatch(&repo.key);
+                if let Err(e) = self.invalidate_cache_keys(&repo.key, cache_path).await {
+                    tracing::warn!(
+                        repository = %repo.key,
+                        path = %cache_path,
+                        error = %e,
+                        "evicting a cached proxy body that fails its identity check failed"
+                    );
+                }
             }
             CacheReadOutcome::NegativeHit => {
                 return Err(AppError::NotFound(format!(
@@ -5428,6 +5513,32 @@ impl ProxyService {
                             }
                             None => true,
                         };
+                        // #4829: the caller's own identity check, for an
+                        // address the path check above cannot read. Same
+                        // stance: serve the body, refuse to cache it.
+                        let checksum_ok = checksum_ok
+                            && match check {
+                                Some(check) => {
+                                    let ok = check(
+                                        resp.content.clone(),
+                                        upstream_encoding.clone(),
+                                    )
+                                    .await;
+                                    if !ok {
+                                        tracing::warn!(
+                                            repository = %repo.key,
+                                            cache_key = %cache_key,
+                                            path = %cache_path,
+                                            "proxy body fails the caller's identity check; \
+                                             refusing to cache it"
+                                        );
+                                        crate::services::metrics_service::
+                                            record_proxy_cache_checksum_mismatch(&repo.key);
+                                    }
+                                    ok
+                                }
+                                None => true,
+                            };
 
                         // Phase-1 interim over-quota guard (bug
                         // artifact-keeper-x70): full per-repo proxy-cache usage
