@@ -13,13 +13,28 @@ to alert on (#4608).
 ## How a merge is bounded
 
 **One merge per document, shared.** Requests for the same merged document
-share one merge, and the result is kept, already encoded, for a short time. A
-burst of 40 solves asking for `linux-64/repodata.json.zst` runs one merge, not
-40, and every request gets the same bytes and the same `ETag`, so a client that
-revalidates gets a 304. The kept document is reused only while all of these are
-unchanged:
+share one merge, and the result is kept for a short time. A burst of 40 solves
+asking for `linux-64/repodata.json.zst` runs one merge, not 40, and every
+request gets the same bytes and the same `ETag`, so a client that revalidates
+gets a 304.
 
-- the virtual, the document and its encoding;
+**One merge for every encoding (#4879).** `repodata.json`,
+`repodata.json.zst` and `repodata.json.bz2` of one subdir are one merge. The
+merged document is kept zstd-encoded (compact JSON); the plain `.json` and the
+`.bz2` are derived from it the first time a client asks for them, on a
+blocking thread, and kept with it, so each is built at most once per merge.
+Each encoding has its own `ETag`. Deriving an encoding takes a merge slot and
+reserves its output (plus about 16 MiB for the encoder) from the budget like a
+merge does, and sheds with the same 503 when neither is free in time. The
+gzip transfer coding of a plain JSON document is built and kept the same way,
+except that when it cannot get a slot or budget in time the response goes out
+uncoded instead of 503.
+The served `.json` of a virtual is compact JSON; earlier releases
+pretty-printed it.
+
+The kept document is reused only while all of these are unchanged:
+
+- the virtual and the document (not its encoding);
 - the members the caller can read, in order (a token that sees fewer members
   gets its own merge);
 - the hosted records the merge lists and the package names hosted members own
@@ -27,13 +42,30 @@ unchanged:
 - the stored package allowlist of the virtual;
 - each remote member's document: the merge records the checksum of the bytes it
   read out of the member's proxy cache, and the kept document is served only
-  while that cache entry is still fresh and still holds those bytes. When the
-  member's cache entry expires, the next request merges again from the
-  revalidated member document.
+  while that cache entry is still fresh and still holds those bytes.
 
-A merge in which a member failed is never kept. The member-failure policy
-(strict 502, or a partial document marked `no-store`) is applied to every
-response exactly as before.
+**Stale while revalidate (#4879).** When a kept document stops being fresh
+(a remote member's cache entry expired or changed, or the document is older
+than `CONDA_VIRTUAL_MERGE_CACHE_TTL_SECS`), the request that notices is still
+answered at once with the kept document, and exactly one background merge
+starts to rebuild it. Every request until the rebuild lands gets the kept
+document too, with a `Warning: 110 - "Response is Stale"` header, and counts as
+`ak_conda_virtual_merge_cache_hits_total{via="stale"}`. The rebuilt document
+replaces the kept one only once it is complete, including the encodings the
+kept one had been asked for (so a client that wants `.bz2` never waits on the
+bzip2 encoder after a rebuild); the next request gets it. A document is served
+stale for at most `CONDA_VIRTUAL_MERGE_MAX_STALE_SECS` after it was first found
+stale; after that a request waits on the rebuild as it did before. Set it to
+`0` to turn stale serving off. A rebuild that fails (a member is down) leaves
+the kept document in place, still bounded by the same setting, and the next
+request starts another rebuild.
+
+`current_repodata.json` follows the merged `repodata.json` it is derived from,
+stale or not. The CEP-16 shard index is never served stale.
+
+A merge in which a member failed is never kept, so it is never served stale.
+The member-failure policy (strict 502, or a partial document marked
+`no-store`) is applied to every response exactly as before.
 
 **A cap on concurrent merges.** At most `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES`
 merges run at once across all virtual channels. A merge that cannot start within
@@ -55,8 +87,11 @@ document grew) tops up from whatever budget is free without waiting, and goes
 on over its reservation by that growth if none is; it never waits for budget
 while holding some, so two merges cannot wait on each other.
 
-The compressed encodings are written straight into the compressor, so the
-plain document is not held next to its compressed form.
+The merged document is written straight into the zstd compressor, so the
+plain document is not held next to its compressed form during the merge. The
+`.bz2` is derived by streaming the kept document through a zstd decoder into
+the bzip2 encoder, so it does not hold the plain document either; only the
+`.json` itself, when a client asks for it, is held plain.
 
 ## Settings
 
@@ -64,8 +99,9 @@ plain document is not held next to its compressed form.
 |---|---|---|
 | `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES` | budget ÷ (member fetch ceiling + member decoded ceiling), at least 2 (2 with the defaults) | Merges that may run at once. |
 | `CONDA_VIRTUAL_MERGE_QUEUE_SECS` | 60 | Longest a merge waits for a slot or for budget before the request gets 503. `Retry-After` is this value capped at 5 s. |
-| `CONDA_VIRTUAL_MERGE_CACHE_TTL_SECS` | 300 (the proxy cache's default for mutable metadata) | How long a merged document is kept. `0` turns the cache off; concurrent requests still share one merge. |
-| `CONDA_VIRTUAL_MERGE_CACHE_MAX_BYTES` | 1 GiB | Ceiling on kept merged documents, by body size (plain JSON bodies count a quarter extra for their gzip rendering). |
+| `CONDA_VIRTUAL_MERGE_CACHE_TTL_SECS` | 300 (the proxy cache's default for mutable metadata) | How long a merged document is fresh. `0` turns the cache off; concurrent requests still share one merge. |
+| `CONDA_VIRTUAL_MERGE_MAX_STALE_SECS` | the cache TTL | How long after it was first found stale a kept document may still be served while one background merge rebuilds it. `0` turns stale serving off: the request waits on the rebuild. |
+| `CONDA_VIRTUAL_MERGE_CACHE_MAX_BYTES` | 1 GiB | Ceiling on kept merged documents, counting the kept body and every encoding derived from it so far. |
 | `AK_PROXY_METADATA_BUDGET_BYTES` | 1 GiB | The shared buffered-metadata budget merges reserve from. Accounted in 4 KiB units; values above 4 GiB are honoured (before 1.11.5 they were clamped to 4 GiB, #4881). |
 | `CONDA_VIRTUAL_MEMBER_MAX_BYTES` | 128 MiB | Ceiling on one member document as fetched (compressed). |
 | `CONDA_VIRTUAL_MEMBER_MAX_DECODED_BYTES` | 1 GiB | Ceiling on one member document after decoding. |
@@ -82,15 +118,20 @@ Size the container from three parts:
    With conda-forge as the remote member, a `linux-64` `repodata.json.zst`
    merge holds about 0.7 GB (455 MB decoded plus the parsed records and the
    output) and a `noarch` one about 0.3 GB, so the default 1 GiB budget lets a
-   platform subdir and `noarch` merge side by side. A plain `repodata.json`
-   merge holds more (its output is larger than its input), and a 1 GiB budget
-   runs it alone. Two virtual channels over conda-forge, or more platforms,
+   platform subdir and `noarch` merge side by side. Every encoding of a subdir
+   is served from that one merge; deriving the plain `repodata.json` from it
+   reserves the plain document's size again while it is built. Two virtual
+   channels over conda-forge, or more platforms,
    want a larger budget: about 0.7 GB per compressed platform document you
    expect to be merged at the same time.
-3. **Kept documents**: up to `CONDA_VIRTUAL_MERGE_CACHE_MAX_BYTES`. A
-   conda-forge `linux-64` `.zst` is about 60 MB; a plain `repodata.json` is
-   about 600 MB (pretty-printed), so clients that cannot read `.zst` cost ten
-   times more cache.
+3. **Kept documents**: up to `CONDA_VIRTUAL_MERGE_CACHE_MAX_BYTES`. A merged
+   conda-forge `linux-64` is kept as its `.zst`, about 60 MB; a client that
+   asks for `.bz2` adds about as much again, and one that asks for plain
+   `repodata.json` adds the plain document, about 455 MB, so clients that
+   cannot read `.zst` or `.bz2` cost several times more cache. A kept
+   document stays in the cache for its TTL plus
+   `CONDA_VIRTUAL_MERGE_MAX_STALE_SECS`, and during a rebuild the kept and the
+   rebuilt document are held side by side.
 
 Then leave headroom for the allocator: freed merge memory is not always returned
 to the operating system at once, so the resident set after a burst sits above
@@ -133,16 +174,19 @@ which share one merge.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `ak_conda_virtual_merge_inflight` | gauge | | Merges running now. At the merge cap for long, merges are queueing. |
-| `ak_conda_virtual_merge_cache_hits_total` | counter | `kind`, `via` | Requests answered without a merge of their own: `via="cache"` from a kept document, `via="singleflight"` by waiting on a merge already running. |
-| `ak_conda_virtual_merge_cache_misses_total` | counter | `kind` | Requests that started a merge. |
-| `ak_conda_virtual_merge_rejected_total` | counter | `kind`, `reason` | Merges shed with 503: `reason="queue"` (no slot in time) or `reason="budget"` (no budget in time). |
+| `ak_conda_virtual_merge_cache_hits_total` | counter | `kind`, `via` | Requests answered without a merge of their own: `via="cache"` from a fresh kept document, `via="stale"` from a stale kept document while it is rebuilt, `via="singleflight"` by waiting on a merge already running. |
+| `ak_conda_virtual_merge_cache_misses_total` | counter | `kind` | Requests that started a merge (in the foreground, or the background rebuild of a stale document). |
+| `ak_conda_virtual_merge_rejected_total` | counter | `kind`, `reason` | Merges and encodings shed with 503: `reason="queue"` (no slot in time) or `reason="budget"` (no budget in time). |
 | `ak_conda_virtual_merge_bytes_reserved` | gauge | | Buffered-metadata budget bytes held by running merges. |
 
 `kind` is `repodata`, `current_repodata`, `run_exports`, `channeldata` or
-`shard_index`. A healthy channel under
-load shows misses at roughly one per document per cache TTL and hits for the
-rest. A rising `rejected_total` means the cap or the budget is too small for the
-number of distinct documents being merged at once.
+`shard_index`, and `rendering` on `rejected_total` for an encoding derived
+from a kept merge. A healthy channel under load shows misses at roughly one
+per document (not per encoding) per cache TTL and hits for the rest. A
+rising `rejected_total` means the cap or the budget is too small for the
+number of distinct documents being merged at once. A steady
+`via="stale"` share is expected right after each member refresh; stale serves
+that go on for long mean rebuilds are failing or being shed.
 
 The counters for the conda security controls (attestation outcomes,
 install-script findings, allowlist drops) are in

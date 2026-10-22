@@ -635,12 +635,31 @@ fn parse_member_package_maps<'a>(
     (parsed, failures)
 }
 
-/// The result of a per-package merge: the encoded document, member parse
-/// failures, and the remote records it dropped.
-pub(super) type PackageMerge = (Result<Vec<u8>, Response>, Vec<MemberFailure>, MergeDrops);
+/// A merged per-package document as it is kept.
+pub(super) struct MergedBody {
+    pub bytes: Vec<u8>,
+    /// Length of the plain JSON document `bytes` holds (`bytes.len()` when it
+    /// is plain JSON).
+    pub plain_len: usize,
+}
 
-/// Merge hosted records and remote member documents into one encoded
-/// `repodata.json`. CPU-bound over upstream-sized input: run it on a blocking
+impl MergedBody {
+    fn plain(bytes: Vec<u8>) -> Self {
+        Self {
+            plain_len: bytes.len(),
+            bytes,
+        }
+    }
+}
+
+/// The result of a per-package merge: the document, member parse
+/// failures, and the remote records it dropped.
+pub(super) type PackageMerge = (Result<MergedBody, Response>, Vec<MemberFailure>, MergeDrops);
+
+/// Merge hosted records and remote member documents into one
+/// `repodata.json`, kept in its canonical zstd encoding (compact JSON); the
+/// `.json` and `.bz2` a client asks for are derived from it, so one merge
+/// serves every encoding (#4879). CPU-bound over upstream-sized input: run it on a blocking
 /// thread. A member document that does not parse is reported as that member's
 /// failure; the others still merge. Allowlist drops are counted per member in
 /// `ak_conda_allowlist_dropped_total` under `virtual_repo_key` (#4711).
@@ -651,7 +670,6 @@ pub(super) fn merge_repodata(
     remote: &[MemberDocument],
     owned: &HashSet<String>,
     allowlist: Option<&CompiledAllowlist>,
-    encoding: super::RepodataEncoding,
 ) -> PackageMerge {
     let mut dropped = MergeDrops::default();
     let (parsed, failures) = parse_member_package_maps(remote, "repodata");
@@ -671,7 +689,9 @@ pub(super) fn merge_repodata(
         removed: [],
         repodata_version: 1,
     };
-    (encoding.encode(&merged), failures, dropped)
+    let body = super::RepodataEncoding::encode_zst_counted(&merged)
+        .map(|(bytes, plain_len)| MergedBody { bytes, plain_len });
+    (body, failures, dropped)
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +743,9 @@ pub(super) fn merge_run_exports(
         packages_conda,
     };
     (
-        serde_json::to_vec_pretty(&merged).map_err(internal_error),
+        serde_json::to_vec_pretty(&merged)
+            .map(MergedBody::plain)
+            .map_err(internal_error),
         failures,
         dropped,
     )
