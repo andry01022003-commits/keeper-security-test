@@ -125,6 +125,12 @@ failures:
 | `startup` | An initial connect attempt failed at boot. Startup retries up to five times with a jittered 1 to 8 s backoff, so a refusal storm shows several increments before the process exits or recovers. |
 | `request` | A pool acquire timed out while serving a request and the client was answered `503 POOL_EXHAUSTED`. |
 
+The `startup` series is exported once the replica has started serving, so it
+shows how many connect attempts a replica that did come up needed; a replica
+that gave up exits before it can be scraped, and its attempts are in its log.
+Before 1.11.5 the `startup` series was never exported, because the attempts
+were counted before the Prometheus recorder was installed (#4828).
+
 A sustained non-zero `rate(ak_db_pool_connection_failures_total{stage="request"}[5m])`
 means the pool is too small for the load, or the server is refusing new
 sessions; the server's `FATAL: sorry, too many clients already` lines appear
