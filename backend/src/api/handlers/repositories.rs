@@ -5937,14 +5937,18 @@ async fn purge_oci_upload_temp_objects(
 
 /// Best-effort deletion of a repository's committed artifact objects from the
 /// storage backend, called BEFORE the repository row (and its cascading
-/// `artifacts` rows) are deleted. Without this, deleting a repository left
-/// every stored object orphaned on the backend, most visibly on S3 where the
-/// bytes simply stayed in the bucket with nothing referencing them (#1551).
+/// `artifacts` / `artifact_versions` rows) are deleted. Without this, deleting
+/// a repository left every stored object orphaned on the backend, most visibly
+/// on S3 where the bytes simply stayed in the bucket with nothing referencing
+/// them (#1551), and the history objects of a versioned repository leaked the
+/// same way (#4865).
 ///
 /// Only objects owned *exclusively* by this repository are removed: a
 /// `storage_key` still referenced by another repository's artifact row
 /// (content-addressed dedup can share a key across repos on a shared backend)
 /// is left in place, so deleting one repository never destroys another's data.
+/// The same guard covers the repository's own older revisions: a key another
+/// repository still names — as a live artifact or as a revision — is spared.
 ///
 /// OCI objects (`oci-manifests/<digest>` and `oci-blobs/<digest>`) are
 /// intentionally OUT of scope here and are excluded from the purge SELECT.
@@ -5983,15 +5987,23 @@ async fn purge_repo_artifact_objects(
 /// *exclusively* by this repository, to be purged from the storage backend.
 ///
 /// Must run BEFORE the repository row (and its cascading `artifacts` /
-/// `maven_flat_object_owner` rows) are deleted: once those rows CASCADE away
-/// the owning keys are no longer derivable. The actual object deletion is
-/// performed separately by [`purge_storage_object_keys`], which the delete
-/// path defers to a background task so that deleting a LARGE repository does
-/// not run O(objects) synchronous storage round-trips inside the request and
-/// trip the global request-timeout backstop (#2776).
+/// `artifact_versions` / `maven_flat_object_owner` rows) are deleted: once
+/// those rows CASCADE away the owning keys are no longer derivable. The actual
+/// object deletion is performed separately by [`purge_storage_object_keys`],
+/// which the delete path defers to a background task so that deleting a LARGE
+/// repository does not run O(objects) synchronous storage round-trips inside
+/// the request and trip the global request-timeout backstop (#2776).
 ///
 /// The exclusivity and OCI-exclusion rules are documented on
 /// [`purge_repo_artifact_objects`].
+///
+/// The key set spans the repository's LIVE artifacts AND its own revision
+/// history (`artifact_versions`, #4865). A versioned repository keeps every
+/// older revision in `artifact_versions`, and those rows CASCADE away with
+/// the repository row — so their objects must be collected here, or they leak
+/// with no row left to derive them from. The storage GC cannot pick them up
+/// either: its orphan scan starts from `artifacts` rows, which never name an
+/// older revision's key.
 ///
 /// `proxy-cache/%` is excluded for the same reason the storage GC excludes it
 /// (#3368), and the reason is worth restating because the exclusivity guard
@@ -6021,21 +6033,30 @@ async fn collect_repo_artifact_object_keys(
     // scope is the one `trash_service`'s `KEY_STILL_REFERENCED_SQL` uses, and
     // a surviving repository's older revision (`artifact_versions`) protects
     // the key as well as its live rows do.
+    //
+    // The candidate set is the union of the repository's live `artifacts` rows
+    // and its own `artifact_versions` revisions (#4865): the history objects
+    // of a versioned repository are owned by it just as much as its HEAD
+    // artifact is, and the cascade takes their rows away at the same moment.
+    // The repository's OWN rows never spare a key — it is being deleted.
     let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
-        "SELECT DISTINCT a.storage_key FROM artifacts a \
-         WHERE a.repository_id = $1 \
-           AND a.storage_key NOT LIKE 'proxy-cache/%' \
-           AND a.storage_key NOT LIKE 'oci-manifests/%' \
-           AND a.storage_key NOT LIKE 'oci-blobs/%' \
+        "SELECT DISTINCT k.storage_key FROM ( \
+            SELECT a.storage_key FROM artifacts a WHERE a.repository_id = $1 \
+            UNION \
+            SELECT v.storage_key FROM artifact_versions v WHERE v.repository_id = $1 \
+         ) k \
+         WHERE k.storage_key NOT LIKE 'proxy-cache/%' \
+           AND k.storage_key NOT LIKE 'oci-manifests/%' \
+           AND k.storage_key NOT LIKE 'oci-blobs/%' \
            AND NOT EXISTS ( \
                SELECT 1 FROM artifacts b JOIN repositories rb ON rb.id = b.repository_id \
-               WHERE b.storage_key = a.storage_key AND b.repository_id <> $1 \
+               WHERE b.storage_key = k.storage_key AND b.repository_id <> $1 \
                  AND rb.storage_backend = $2 \
                  AND (rb.storage_backend <> 'filesystem' OR rb.storage_path = $3) \
            ) \
            AND NOT EXISTS ( \
                SELECT 1 FROM artifact_versions v JOIN repositories rv ON rv.id = v.repository_id \
-               WHERE v.storage_key = a.storage_key AND v.repository_id <> $1 \
+               WHERE v.storage_key = k.storage_key AND v.repository_id <> $1 \
                  AND rv.storage_backend = $2 \
                  AND (rv.storage_backend <> 'filesystem' OR rv.storage_path = $3) \
            )",
@@ -6369,10 +6390,10 @@ pub async fn delete_repository(
     let oci_upload_temp_keys = collect_repo_oci_upload_temp_keys(&state, repo.id).await;
 
     // Collect the storage keys of this repo's committed artifact objects BEFORE
-    // the repository row is deleted (the `artifacts` / `maven_flat_object_owner`
-    // rows CASCADE away with it, after which the owning keys are no longer
-    // derivable — #1551/#2668). Collection is a handful of SELECTs; the actual
-    // object deletion is deferred below.
+    // the repository row is deleted (the `artifacts` / `artifact_versions` /
+    // `maven_flat_object_owner` rows CASCADE away with it, after which the
+    // owning keys are no longer derivable — #1551/#2668/#4865). Collection is a
+    // handful of SELECTs; the actual object deletion is deferred below.
     let location = repo.storage_location();
     let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
 
@@ -6381,7 +6402,9 @@ pub async fn delete_repository(
     // reference with the cascade below. Hand them to GC's candidate set, whose
     // sweep deletes each object once no surviving repository references it, so
     // a key spared for a repository that is deleted next (or concurrently)
-    // cannot leak (#4833). Best-effort, like the OCI hand-off below.
+    // cannot leak (#4833). The same hand-off covers this repository's own
+    // revision history (`artifact_versions`), whose rows cascade away just as
+    // the live ones do (#4865). Best-effort, like the OCI hand-off below.
     if let Err(e) = crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
         &state.db,
         repo.id,
@@ -27052,6 +27075,278 @@ mod tests {
             candidates,
             vec![shared],
             "only the spared key is a candidate"
+        );
+    }
+
+    /// #4865: a versioned repository keeps every older revision in
+    /// `artifact_versions`, and those rows CASCADE away with the repository
+    /// row — so the delete has to collect their storage keys BEFORE the
+    /// cascade. Without it the history objects of a deleted repository leak:
+    /// the storage GC's orphan scan starts from `artifacts`, which never names
+    /// an older revision's key, so nothing reclaims them afterwards either.
+    ///
+    /// The shape is the one the issue suggests: two revisions of one path in a
+    /// versioned generic repository, then a delete.
+    #[tokio::test]
+    async fn delete_repository_purges_older_revision_objects_4865() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // Versioning (#2367): the second upload appends a revision instead of
+        // overwriting the HEAD.
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("enable versioning");
+
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+        let artifacts = fx.state.create_artifact_service(storage.clone());
+
+        let path = "pkg/model.bin";
+        let first = artifacts
+            .upload(
+                fx.repo_id,
+                path,
+                "model.bin",
+                Some("1"),
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"revision one"),
+                Some(fx.user_id),
+            )
+            .await
+            .expect("first revision upload");
+        let second = artifacts
+            .upload(
+                fx.repo_id,
+                path,
+                "model.bin",
+                Some("2"),
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"revision two"),
+                Some(fx.user_id),
+            )
+            .await
+            .expect("second revision upload");
+
+        // The HEAD artifact names the newest revision's key; the older
+        // revision's key survives ONLY in `artifact_versions`.
+        let older_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM artifact_versions \
+             WHERE repository_id = $1 AND path = $2 AND revision = 1",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read revision 1");
+        assert_ne!(
+            older_key, second.storage_key,
+            "#4865: the two revisions must hold different content"
+        );
+        assert_eq!(older_key, first.storage_key);
+
+        // Collect BEFORE the delete: the version rows CASCADE away with the
+        // repository row, after which the history keys are underivable.
+        let collected = collect_repo_artifact_object_keys(&fx.state, fx.repo_id, &location).await;
+        assert!(
+            collected.contains(&older_key),
+            "#4865: the older revision's key must be collected before the cascade"
+        );
+        assert!(
+            collected.contains(&second.storage_key),
+            "#4865: the HEAD artifact's key must be collected before the cascade"
+        );
+
+        // The delete itself: the repository row and its `artifact_versions`
+        // rows go away together.
+        fx.state
+            .create_repository_service()
+            .delete(fx.repo_id)
+            .await
+            .expect("repository delete");
+        let versions_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifact_versions WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count remaining versions");
+        assert_eq!(
+            versions_left, 0,
+            "#4865: the version rows cascade with the repository row"
+        );
+
+        // Only the collected key set can still name the history objects now.
+        purge_storage_object_keys(&fx.state, fx.repo_id, &location, collected).await;
+        assert!(
+            !storage
+                .exists(&older_key)
+                .await
+                .expect("check older revision"),
+            "#4865: the older revision's object must be purged with the repository"
+        );
+        assert!(
+            !storage
+                .exists(&second.storage_key)
+                .await
+                .expect("check head revision"),
+            "#4865: the HEAD revision's object must be purged with the repository"
+        );
+        fx.teardown().await;
+    }
+
+    /// #4865: the sharing guard the repository delete applies to a revision
+    /// key is the same location-scoped one #4864 introduced for live
+    /// artifacts — another repository's `artifacts` row OR another
+    /// repository's `artifact_versions` row, in the same storage scope,
+    /// protects the key. On `filesystem` every repository roots its own tree,
+    /// so a copy in another tree is a different file and must not shield this
+    /// repository's.
+    #[tokio::test]
+    async fn delete_repository_spares_revision_key_another_repository_holds_4865() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("enable versioning");
+
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+        let artifacts = fx.state.create_artifact_service(storage.clone());
+
+        let path = "pkg/model.bin";
+        let first = artifacts
+            .upload(
+                fx.repo_id,
+                path,
+                "model.bin",
+                Some("1"),
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"revision one"),
+                Some(fx.user_id),
+            )
+            .await
+            .expect("first revision upload");
+        let second = artifacts
+            .upload(
+                fx.repo_id,
+                path,
+                "model.bin",
+                Some("2"),
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"revision two"),
+                Some(fx.user_id),
+            )
+            .await
+            .expect("second revision upload");
+
+        // The older revision's key — the one this repository's history owns
+        // and the other repository below also holds.
+        let shared_key = first.storage_key.clone();
+
+        // A SECOND repository on the SAME storage root that also holds the
+        // older revision's key: the key resolves to one shared object, so
+        // deleting this repository must not destroy it.
+        let (repo_b, _key_b, _dir_b) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+            .bind(&location.path)
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("share the storage root");
+        sqlx::query(
+            "INSERT INTO artifact_versions \
+             (repository_id, path, revision, name, size_bytes, checksum_sha256, \
+              content_type, storage_key) \
+             VALUES ($1, $2, 1, 'model.bin', 12, $3, 'application/octet-stream', $4)",
+        )
+        .bind(repo_b)
+        .bind(path)
+        .bind(&first.checksum_sha256)
+        .bind(&shared_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the other repository's revision");
+
+        let collected = collect_repo_artifact_object_keys(&fx.state, fx.repo_id, &location).await;
+        assert!(
+            !collected.contains(&shared_key),
+            "#4865: a revision key another repository still holds must be spared"
+        );
+        assert!(
+            collected.contains(&second.storage_key),
+            "#4865: the HEAD revision's key is exclusively owned and must be collected"
+        );
+
+        // ...and the spared revision key is handed to GC, so it is reclaimed
+        // once no surviving repository references it.
+        crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
+            &fx.pool, fx.repo_id, &location, &collected,
+        )
+        .await
+        .expect("record the spared revision key");
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM oci_gc_candidates WHERE storage_key = $1 \
+               AND storage_backend = 'filesystem' AND storage_path = $2",
+        )
+        .bind(&shared_key)
+        .bind(&location.path)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read candidates");
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&shared_key)
+            .execute(&fx.pool)
+            .await
+            .expect("clean candidates");
+
+        // The purge removes the exclusively-owned HEAD revision and leaves the
+        // shared one in place.
+        purge_storage_object_keys(&fx.state, fx.repo_id, &location, collected).await;
+        let shared_left = storage
+            .exists(&shared_key)
+            .await
+            .expect("the shared object must survive this repository's delete");
+        let head_left = storage
+            .exists(&second.storage_key)
+            .await
+            .expect("check the head revision object");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&fx.pool)
+            .await
+            .expect("delete repo B");
+        fx.teardown().await;
+
+        assert_eq!(
+            candidates,
+            vec![shared_key.clone()],
+            "#4865: the spared revision key must become a GC candidate"
+        );
+        assert!(
+            shared_left,
+            "#4865: a key another repository still holds must not be purged"
+        );
+        assert!(
+            !head_left,
+            "#4865: the exclusively-owned HEAD revision must be purged"
         );
     }
 
