@@ -3272,7 +3272,20 @@ async fn serve_artifact(
             // under the scoped scheme (checksums, verbatim metadata) live at
             // `maven/{repo.id}/{path}`. The key embeds this repository's id,
             // so it needs no attribution gate.
-            if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
+            //
+            // #4837: scoped keys exist only for uploads this server performed
+            // under the scoped scheme, and every non-row-less one of those also
+            // inserts its `artifacts` row in the same request. A REAL artifact
+            // coordinate reaching this point with no live row therefore has no
+            // publish behind it — it is the object of an upload whose ledger
+            // transaction failed (see `discard_failed_maven_publish`), and the
+            // scoped prefix must not turn that rejected deploy into a 200. Only
+            // the two path classes the scoped read exists for are served here;
+            // published artifacts resolve through their row above.
+            let rowless = is_rowless_maven_path(path);
+            if rowless
+                && (repo.repo_type == RepositoryType::Local
+                    || repo.repo_type == RepositoryType::Staging)
             {
                 if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env()
                     .scoped_read_key(&repo.storage_backend, "maven", repo.id, path)
@@ -3514,6 +3527,86 @@ fn build_maven_package_catalog_metadata(
 
 fn should_enqueue_maven_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
+}
+
+/// Discard the object a hosted Maven upload wrote when the publish it was
+/// written for never commits (#4837).
+///
+/// `upload` stores the bytes BEFORE the transaction that inserts the
+/// `artifacts` and `artifact_metadata` rows (#3814). If that transaction — or
+/// the POM read in front of it — fails, the client gets an error while the
+/// object stays at `storage_key`. Because the download path falls back to the
+/// repository's storage prefix when no row matches, those bytes then stay
+/// consumable: a deploy the server explicitly rejected is downloadable, and it
+/// bypasses the catalog's quarantine, scan, lifecycle, download accounting and
+/// search bookkeeping.
+///
+/// Best-effort by design: the caller is already returning the failure that
+/// triggered this, and a cleanup error must never replace that response. Two
+/// guards keep it from deleting live data:
+///
+/// * A live `artifacts` row that still names `storage_key` wins. A republishable
+///   `-SNAPSHOT` overwrite writes its new bytes to an already-published
+///   artifact's key, so a failed republish must leave them in place: the
+///   artifact is published, only this revision attempt failed.
+/// * The flat-key attribution claim is released only AFTER the object is gone.
+///   Releasing it on a failed delete would let another repository claim — and
+///   then be served — bytes this repository could not reclaim (#2584).
+///
+/// A delete that fails anyway leaves an object with no catalog row, which the
+/// row-driven orphan sweep cannot see; the warning is the operator's only
+/// signal, so it names the key.
+async fn discard_failed_maven_publish(
+    db: &PgPool,
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+    claim: crate::services::maven_flat_attribution::FlatKeyWriteClaim,
+) {
+    let still_published = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM artifacts \
+         WHERE storage_key = $1 AND is_deleted = false)",
+    )
+    .bind(storage_key)
+    .fetch_one(db)
+    .await;
+    match still_published {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            // Fail closed: without proof that no row references the key, leave
+            // the object alone rather than delete bytes a live artifact may be
+            // serving.
+            warn!(
+                error = %e,
+                storage_key = %storage_key,
+                "could not check whether a failed Maven publish left a live row at its \
+                 storage key; keeping the object"
+            );
+            return;
+        }
+    }
+    match storage.delete(storage_key).await {
+        Ok(()) => {
+            release_flat_key_claim_best_effort(
+                db,
+                claim,
+                repository_id,
+                storage_backend,
+                storage_key,
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                storage_key = %storage_key,
+                "failed to remove the object of an uncommitted Maven publish; it stays \
+                 unreferenced in storage and needs manual cleanup"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3764,11 +3857,23 @@ async fn upload(
     // large artifact is never materialised in memory.
     let handler = MavenHandler::new();
     let pom_bytes = if MavenHandler::is_pom(&path) {
-        Bytes::from(
-            tokio::fs::read(staged.path())
-                .await
-                .map_err(|e| proxy_helpers::internal_error("Reading staged POM", e))?,
-        )
+        // #4837: the object is already stored, so a failure to read the staged
+        // POM must not leave it behind — nothing is published.
+        match tokio::fs::read(staged.path()).await {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(e) => {
+                discard_failed_maven_publish(
+                    &state.db,
+                    &storage,
+                    repo.id,
+                    &repo.storage_backend,
+                    &storage_key,
+                    flat_key_claim,
+                )
+                .await;
+                return Err(proxy_helpers::internal_error("Reading staged POM", e));
+            }
+        }
     } else {
         Bytes::new()
     };
@@ -3813,76 +3918,103 @@ async fn upload(
     // path (#3587 review): a metadata write that fails after the row landed
     // would otherwise leave a live artifact with no Maven metadata, and a
     // concurrent republish must never observe the row without it.
-    let mut tx = state.db.begin().await.map_err(map_db_err)?;
-    super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
-        .await?;
-    let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as(
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_sha1, checksum_md5,
-                content_type, storage_key, uploaded_by
+    //
+    // #4837: the bytes are already in storage at this point, so every failure
+    // in this ledger rollback must also take the object with it. A rolled-back
+    // insert leaves nothing for the download path to match, and its row-less
+    // fallbacks would serve the rejected upload from storage otherwise.
+    let published: Result<(uuid::Uuid, chrono::DateTime<chrono::Utc>), Response> = async {
+        let mut tx = state.db.begin().await.map_err(map_db_err)?;
+        super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
+            .await?;
+        let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as(
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, checksum_sha1, checksum_md5,
+                    content_type, storage_key, uploaded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (repository_id, path) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    version = EXCLUDED.version,
+                    size_bytes = EXCLUDED.size_bytes,
+                    checksum_sha256 = EXCLUDED.checksum_sha256,
+                    checksum_sha1 = EXCLUDED.checksum_sha1,
+                    checksum_md5 = EXCLUDED.checksum_md5,
+                    content_type = EXCLUDED.content_type,
+                    storage_key = EXCLUDED.storage_key,
+                    uploaded_by = EXCLUDED.uploaded_by,
+                    is_deleted = false,
+                    updated_at = NOW()
+                WHERE $12::boolean
+                RETURNING id, created_at
+                "#,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (repository_id, path) DO UPDATE SET
-                name = EXCLUDED.name,
-                version = EXCLUDED.version,
-                size_bytes = EXCLUDED.size_bytes,
-                checksum_sha256 = EXCLUDED.checksum_sha256,
-                checksum_sha1 = EXCLUDED.checksum_sha1,
-                checksum_md5 = EXCLUDED.checksum_md5,
-                content_type = EXCLUDED.content_type,
-                storage_key = EXCLUDED.storage_key,
-                uploaded_by = EXCLUDED.uploaded_by,
-                is_deleted = false,
-                updated_at = NOW()
-            WHERE $12::boolean
-            RETURNING id, created_at
+            .bind(repo.id)
+            .bind(&path)
+            .bind(&name)
+            .bind(&coords.version)
+            .bind(size_bytes)
+            .bind(&checksum_sha256)
+            .bind(&checksum_sha1)
+            .bind(&checksum_md5)
+            .bind(ct)
+            .bind(&storage_key)
+            .bind(user_id)
+            .bind(republishable)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
+            // row: a concurrent PUT won the race between the duplicate check above
+            // and this statement. Answer it the same 409 the check itself would
+            // have, rather than the 500 the bare INSERT raised (#3587).
+            .ok_or_else(|| {
+                AppError::Conflict("Artifact already exists".to_string()).into_response()
+            })?;
+
+        // The durable attribution claim for this key was already committed by the
+        // atomic `claim_flat_key_for_write` gate above (before the put), so it is
+        // not re-inserted here. The live `artifacts` row also attributes the key
+        // (resolution layer (a)); the durable claim additionally keeps ownership
+        // after a later soft-delete of the row, matching the #2504 write guard's
+        // soft-delete awareness.
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_metadata (artifact_id, format, metadata)
+            VALUES ($1, 'maven', $2)
+            ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
             "#,
         )
-        .bind(repo.id)
-        .bind(&path)
-        .bind(&name)
-        .bind(&coords.version)
-        .bind(size_bytes)
-        .bind(&checksum_sha256)
-        .bind(&checksum_sha1)
-        .bind(&checksum_md5)
-        .bind(ct)
-        .bind(&storage_key)
-        .bind(user_id)
-        .bind(republishable)
-        .fetch_optional(&mut *tx)
+        .bind(artifact_id)
+        .bind(&file_metadata)
+        .execute(&mut *tx)
         .await
-        .map_err(map_db_err)?
-        // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
-        // row: a concurrent PUT won the race between the duplicate check above
-        // and this statement. Answer it the same 409 the check itself would
-        // have, rather than the 500 the bare INSERT raised (#3587).
-        .ok_or_else(|| AppError::Conflict("Artifact already exists".to_string()).into_response())?;
+        .map_err(map_db_err)?;
 
-    // The durable attribution claim for this key was already committed by the
-    // atomic `claim_flat_key_for_write` gate above (before the put), so it is
-    // not re-inserted here. The live `artifacts` row also attributes the key
-    // (resolution layer (a)); the durable claim additionally keeps ownership
-    // after a later soft-delete of the row, matching the #2504 write guard's
-    // soft-delete awareness.
+        tx.commit().await.map_err(map_db_err)?;
+        Ok((artifact_id, artifact_created))
+    }
+    .await;
 
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'maven', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(&file_metadata)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_db_err)?;
-
-    tx.commit().await.map_err(map_db_err)?;
+    let (artifact_id, artifact_created) = match published {
+        Ok(published) => published,
+        Err(response) => {
+            discard_failed_maven_publish(
+                &state.db,
+                &storage,
+                repo.id,
+                &repo.storage_backend,
+                &storage_key,
+                flat_key_claim,
+            )
+            .await;
+            return Err(response);
+        }
+    };
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
