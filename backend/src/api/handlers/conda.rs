@@ -7427,6 +7427,7 @@ fn attestation_outcome(verified: bool, require_verified: bool) -> &'static str {
 /// stored. With the flag explicitly off the attestation is stored with the
 /// failed record attached, so a trusted/dev deployment opts into a logged,
 /// auditable gap rather than a silent one.
+#[allow(clippy::too_many_arguments)]
 async fn store_attestation(
     state: &SharedState,
     repo: &RepoInfo,
@@ -7435,6 +7436,7 @@ async fn store_attestation(
     filename: &str,
     body: &Bytes,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<Response, Response> {
     // Enforce attestation-specific body size limit (H3)
     if body.len() > ATTESTATION_MAX_BODY_SIZE {
@@ -7447,8 +7449,8 @@ async fn store_attestation(
 
     // Look up the target package
     let artifact_path = build_conda_artifact_path(subdir, filename);
-    let artifact: (uuid::Uuid, String) = sqlx::query_as(
-        "SELECT id, storage_key FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
+    let artifact: (uuid::Uuid, String, i64) = sqlx::query_as(
+        "SELECT id, storage_key, size_bytes FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
     )
     .bind(repo.id)
     .bind(&artifact_path)
@@ -7460,7 +7462,7 @@ async fn store_attestation(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
 
-    let (artifact_id, storage_key) = artifact;
+    let (artifact_id, storage_key, size_bytes) = artifact;
 
     // Parse the attestation (a Sigstore bundle per CEP-27; a bare Statement
     // parses too and is rejected by the verifier with the reason that says
@@ -7607,6 +7609,21 @@ async fn store_attestation(
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
             }
         })?;
+
+    // #4792: the attestation lives in the package's metadata, so a push peer
+    // that already received the package needs it delivered again (the queue
+    // re-arms a finished push of an attested package).
+    if appended.appended {
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await;
+    }
 
     crate::services::metrics_service::record_conda_attestation(repo_key, outcome);
     info!(
@@ -8186,12 +8203,16 @@ async fn put_attestation(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
+    store_attestation(
+        &state, &repo, &repo_key, &subdir, &filename, &body, user_id, &headers,
+    )
+    .await
 }
 
 /// GET /conda/{repo_key}/{subdir}/{filename}/attestation
@@ -8216,6 +8237,7 @@ async fn put_attestation_with_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -8225,7 +8247,10 @@ async fn put_attestation_with_token(
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
+    store_attestation(
+        &state, &repo, &repo_key, &subdir, &filename, &body, user_id, &headers,
+    )
+    .await
 }
 
 /// GET /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
@@ -18442,6 +18467,85 @@ mod attestation_verification_tests {
             })
         );
         fx.teardown().await;
+    }
+
+    /// #4792: a CEP-27 attestation is stored in its package's metadata, so a
+    /// push peer that already received the package must get it delivered
+    /// again: the finished push task goes back to pending. An attestation that
+    /// arrives as peer replication must not re-queue. Fails on `main`:
+    /// storing an attestation queued nothing.
+    #[tokio::test]
+    async fn attestation_requeues_delivered_push_4792() {
+        let Some(fx) = key_fixture(vec![format!("acme-ci={COSIGN_PUB}")]).await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "conda-att").await;
+        let artifact_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(fx.repo_id)
+                .bind(format!("noarch/{COSIGN_PKG_NAME}"))
+                .fetch_one(&fx.pool)
+                .await
+                .expect("seeded package");
+        let push_status = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status::TEXT FROM sync_tasks \
+                 WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'push'",
+            )
+            .bind(peer_id)
+            .bind(artifact_id)
+            .fetch_optional(&fx.pool)
+            .await
+            .expect("push task")
+        };
+        // The package already reached the peer.
+        sqlx::query(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, status, completed_at) \
+             VALUES ($1, $2, 'completed', NOW())",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("delivered push");
+
+        // A replicated attestation stores but must not re-queue.
+        let mut req = put_key_attestation(&fx);
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, _) = tdh::send(write_router(&fx), req).await;
+        let after_replicated = push_status().await;
+
+        // Reset the stored attestation so the client upload appends again.
+        sqlx::query("DELETE FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("reset metadata");
+        let (client_status, body) = tdh::send(write_router(&fx), put_key_attestation(&fx)).await;
+        let after_client = push_status().await;
+
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            client_status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            after_replicated.as_deref(),
+            Some("completed"),
+            "a replicated attestation must not be fanned back out"
+        );
+        assert_eq!(
+            after_client.as_deref(),
+            Some("pending"),
+            "a client attestation must re-deliver the package to the peer"
+        );
     }
 
     #[tokio::test]

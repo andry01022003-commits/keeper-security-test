@@ -1592,7 +1592,17 @@ async fn rearm_if_superseded(db: &PgPool, task: &Claimed<TaskRow>) {
         return;
     }
     let rearmed = crate::services::peer_instance_service::PeerInstanceService::new(db.clone())
-        .rearm_superseded_push(task.id, Some(&task.checksum_sha256))
+        .rearm_superseded_push(
+            task.id,
+            Some(&task.checksum_sha256),
+            // #4792: what the push carried, so a signature or attestation
+            // attached while it was in flight is delivered again.
+            Some(
+                task.artifact_metadata
+                    .as_ref()
+                    .unwrap_or(&serde_json::Value::Null),
+            ),
+        )
         .await;
     if matches!(rearmed, Ok(true)) {
         tracing::info!(
