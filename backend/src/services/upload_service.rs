@@ -24,10 +24,12 @@
 //! crashed, or its purge failed), so nothing depends on the request that
 //! created the bytes surviving.
 
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -170,6 +172,14 @@ pub fn staging_prefix(session_id: Uuid) -> String {
 /// assembly order.
 pub fn staged_chunk_key(session_id: Uuid, chunk_index: i32) -> String {
     format!("{}/{chunk_index:08}", staging_prefix(session_id))
+}
+
+/// Storage key of the single object a streamed completion assembles the staged
+/// chunks into (#3916). It lives in the session's staging namespace, distinct
+/// from every [`staged_chunk_key`], so the normal purge (and its reaper
+/// backstop) reclaims it along with the chunks.
+pub fn staged_assembly_key(session_id: Uuid) -> String {
+    format!("{}/assembled", staging_prefix(session_id))
 }
 
 fn storage_err(e: impl std::fmt::Display) -> UploadError {
@@ -844,6 +854,66 @@ impl UploadService {
         }
     }
 
+    /// Reassemble a committing session's staged chunks **on the repository's
+    /// backend** instead of a local scratch file (#3916) and verify the result.
+    ///
+    /// The chunks are streamed, in order, into
+    /// [`staged_assembly_key`] through the backend's native `put_stream`
+    /// (S3 multipart / GCS resumable / Azure block blob), so no replica needs
+    /// local disk proportional to the artifact. The assembled object's byte
+    /// count and SHA-256 are checked against the session just as the local
+    /// [`Self::assemble_for_commit`] path checks its file; a mismatch deletes
+    /// the staging object and settles the lease exactly like the local path
+    /// (checksum mismatch is terminal, anything else retryable).
+    ///
+    /// The returned key is a staging object the caller promotes with
+    /// `StorageBackend::copy` and then deletes. Leaving it behind is safe: the
+    /// session purge (and the hourly reaper) removes it with the chunks.
+    pub async fn assemble_for_commit_on_backend(
+        db: &PgPool,
+        storage: &Arc<dyn StorageBackend>,
+        session: &UploadSession,
+    ) -> Result<String, UploadError> {
+        match assemble_staged_chunks_on_backend(storage, session).await {
+            Ok(key) => Ok(key),
+            Err(e) => Err(Self::settle_assembly_failure(db, session, e).await),
+        }
+    }
+
+    /// Verify a committing session's staged chunks without writing anything,
+    /// for a completion whose content-addressed object already exists.
+    ///
+    /// Streams the chunks once and checks the total size and SHA-256, so a
+    /// deduplicated completion still refuses corrupt staged bytes (the local
+    /// path verifies while assembling even when it will skip the write).
+    pub async fn verify_for_commit(
+        db: &PgPool,
+        storage: &Arc<dyn StorageBackend>,
+        session: &UploadSession,
+    ) -> Result<(), UploadError> {
+        match verify_staged_chunks(storage, session).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Self::settle_assembly_failure(db, session, e).await),
+        }
+    }
+
+    /// Settle a completion lease after an assembly/verification failure: a
+    /// checksum mismatch means the staged bytes are wrong and the session is
+    /// terminal; a size mismatch or transient storage failure is retryable, so
+    /// the lease is released and the client can re-issue the completion.
+    async fn settle_assembly_failure(
+        db: &PgPool,
+        session: &UploadSession,
+        e: UploadError,
+    ) -> UploadError {
+        if matches!(e, UploadError::ChecksumMismatch { .. }) {
+            Self::fail_committing(db, session, &e.to_string()).await;
+        } else {
+            Self::release_commit_lease(db, session).await;
+        }
+        e
+    }
+
     /// Delete a session's staged chunk objects and record the purge (#3922).
     ///
     /// Idempotent: a chunk that is already gone counts as deleted, so two
@@ -1346,7 +1416,106 @@ async fn assemble_staged_chunks(
     Ok(assembled)
 }
 
-/// Delete a session's staged chunk objects; an already-missing one is fine.
+/// Stream every staged chunk, in order, from the repository's backend: the
+/// bytes [`assemble_staged_chunks`] would have written to a local scratch file,
+/// without the file (#3916).
+pub fn staged_chunk_stream(
+    storage: Arc<dyn StorageBackend>,
+    session_id: Uuid,
+    total_chunks: i32,
+) -> BoxStream<'static, crate::error::Result<bytes::Bytes>> {
+    use futures::TryStreamExt;
+
+    futures::stream::iter(0..total_chunks)
+        .then(move |index| {
+            let storage = storage.clone();
+            async move {
+                storage
+                    .get_stream(&staged_chunk_key(session_id, index))
+                    .await
+            }
+        })
+        .try_flatten()
+        .boxed()
+}
+
+/// Reassemble the staged chunks into one object on the backend through its
+/// native `put_stream`, then verify the byte count and SHA-256 against the
+/// session. On any verification failure the staging object is deleted so the
+/// bad bytes never survive; the caller settles the lease.
+async fn assemble_staged_chunks_on_backend(
+    storage: &Arc<dyn StorageBackend>,
+    session: &UploadSession,
+) -> Result<String, UploadError> {
+    let key = staged_assembly_key(session.id);
+    let stream = staged_chunk_stream(storage.clone(), session.id, session.total_chunks);
+
+    let put = match storage.put_stream(&key, stream).await {
+        Ok(put) => put,
+        Err(e) => {
+            // A backend that aborts its own multipart/block upload leaves
+            // nothing behind; deleting is a belt-and-braces no-op otherwise.
+            let _ = storage.delete(&key).await;
+            return Err(storage_err(e));
+        }
+    };
+
+    if put.bytes_written != session.total_size as u64 {
+        let _ = storage.delete(&key).await;
+        return Err(UploadError::SizeMismatch {
+            expected: session.total_size,
+            actual: i64::try_from(put.bytes_written).unwrap_or(i64::MAX),
+        });
+    }
+    if !put
+        .checksum_sha256
+        .eq_ignore_ascii_case(&session.checksum_sha256)
+    {
+        let _ = storage.delete(&key).await;
+        return Err(UploadError::ChecksumMismatch {
+            expected: session.checksum_sha256.clone(),
+            actual: put.checksum_sha256,
+        });
+    }
+
+    Ok(key)
+}
+
+/// Verify a session's staged chunks by streaming them once, without writing
+/// them anywhere: the read-only counterpart of
+/// [`assemble_staged_chunks_on_backend`] for a deduplicated completion.
+async fn verify_staged_chunks(
+    storage: &Arc<dyn StorageBackend>,
+    session: &UploadSession,
+) -> Result<(), UploadError> {
+    let mut stream = staged_chunk_stream(storage.clone(), session.id, session.total_chunks);
+    let mut hasher = Sha256::new();
+    let mut size: i64 = 0;
+
+    while let Some(block) = stream.next().await {
+        let block = block.map_err(storage_err)?;
+        hasher.update(&block);
+        size = size.saturating_add(block.len() as i64);
+    }
+
+    if size != session.total_size {
+        return Err(UploadError::SizeMismatch {
+            expected: session.total_size,
+            actual: size,
+        });
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != session.checksum_sha256 {
+        return Err(UploadError::ChecksumMismatch {
+            expected: session.checksum_sha256.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Delete a session's staged chunk objects and any streamed assembly object; an
+/// already-missing key is fine.
 async fn delete_staged_chunk_objects(
     storage: &dyn StorageBackend,
     session_id: Uuid,
@@ -1361,7 +1530,13 @@ async fn delete_staged_chunk_objects(
             Err(e) => return Err(storage_err(e)),
         }
     }
-    Ok(())
+    // A streamed completion may have left its single assembled object behind
+    // (a crash between staging and promotion, or a failed copy). It shares the
+    // session's staging namespace, so the same purge reclaims it (#3916).
+    match storage.delete(&staged_assembly_key(session_id)).await {
+        Ok(()) | Err(crate::error::AppError::NotFound(_)) => Ok(()),
+        Err(e) => Err(storage_err(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------

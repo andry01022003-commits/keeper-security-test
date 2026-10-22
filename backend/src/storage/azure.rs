@@ -1774,6 +1774,13 @@ impl StorageBackend for AzureBackend {
         self.config.redirect_downloads && !self.is_rbac()
     }
 
+    /// Azure block-blob uploads stream from the request body to the container
+    /// without a local file, so a chunked completion can assemble straight
+    /// into a staging object (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,

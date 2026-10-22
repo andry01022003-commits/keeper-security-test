@@ -13,13 +13,15 @@ finishes. This page lists which paths spool, where, and how to size the volume
 | Location | Used by |
 |---|---|
 | `$AK_UPLOAD_STAGING_DIR` if set, else `$STORAGE_PATH/.incoming` | single-request uploads that spool (see below) and Incus image uploads |
-| `$STORAGE_PATH/.uploads` | completion of a chunked upload session (`/api/v1/uploads`) |
+| `$STORAGE_PATH/.uploads` | completion of a chunked upload session (`/api/v1/uploads`) that has to assemble locally (see below) |
 
 `AK_UPLOAD_STAGING_DIR` lets you put upload staging on a separate volume (for
 example a dedicated `emptyDir` or ephemeral PVC) from `STORAGE_PATH`. It does
-**not** move `.uploads`: chunked-upload completion always reassembles under
-`$STORAGE_PATH/.uploads`, so `STORAGE_PATH` must still be sized for concurrent
-chunked completions even when staging lives elsewhere.
+**not** move `.uploads`: a chunked completion that must assemble locally always
+does so under `$STORAGE_PATH/.uploads`, so `STORAGE_PATH` must still be sized for
+those. A completion on an S3-, GCS- or Azure-backed repository whose format does
+not need the body as a file assembles on the repository's backend instead and
+needs no local space at all.
 
 Every file is removed when its upload succeeds or fails. Files left behind by a
 replica that crashed mid-upload are removed by a cleanup pass that runs hourly
@@ -31,7 +33,10 @@ within the hour:
 - chunked-completion scratch (`$STORAGE_PATH/.uploads`): older than 7 hours
   (the 6-hour completion lease plus one hour);
 - objects staged on the repository's backend (`generic-upload-staging/`):
-  older than 24 hours.
+  older than 24 hours;
+- a chunked session's backend staging (`upload-staging/<session-id>/`, chunks
+  and any `assembled` object): reclaimed with the session by the upload reaper,
+  on the same schedule as an abandoned session.
 
 ## Which uploads use local scratch
 
@@ -45,6 +50,11 @@ with bounded memory):
   copied to its content-addressed key.
 - The chunks of a chunked upload session, which are staged as objects on the
   repository's backend as they arrive.
+- Completion of a chunked upload session into an S3-, GCS- or Azure-backed
+  repository, unless the format needs the body as a local file (see the next
+  list). The staged chunks stream, in order, into one
+  `upload-staging/<session-id>/assembled` object on the repository's backend,
+  which is verified and then copied server-side to the content-addressed key.
 - OCI/Docker blob uploads, which are staged under `oci-uploads/` on the
   repository's backend.
 
@@ -59,10 +69,15 @@ with bounded memory):
   field) spools every file, whatever its name, because the form can name the
   path after the file field. `POST .../artifacts/{path}` and `PUT` know the
   path up front and spool only `.rpm` packages.
-- **Chunked upload completion.** The staged chunks are reassembled into one
-  file on the replica handling `PUT /api/v1/uploads/{id}/complete`, verified,
-  and then written to the backend, so each concurrent completion needs the full
-  artifact size.
+- **Chunked upload completion that must assemble locally.** This is the case
+  for a filesystem-backed repository, for every backend that has no native
+  streaming upload, and for formats that need the body as a file (`.rpm` in an
+  RPM repository and Incus/Debian native finalize). The staged chunks are
+  reassembled into one file on the replica handling
+  `PUT /api/v1/uploads/{id}/complete`, verified, and then written to the
+  backend, so each concurrent completion needs the full artifact size. On
+  S3/GCS/Azure without such a format, completion instead assembles on the
+  backend and uses no local scratch.
 - Incus/LXC image uploads (monolithic and chunked).
 - Git LFS object uploads (`PUT /lfs/{key}/objects/{oid}`), up to `MAX_UPLOAD_SIZE` each.
 - Format-native publish routes that stream to staging: Ansible, Chef, Helm,
@@ -146,14 +161,15 @@ reports itself alive.
 Practical guidance:
 
 - With every repository on object storage and uploads going through the
-  generic API, scratch only has to cover chunked completions, RPM packages,
-  Incus images and the spooling format routes above. Size for the largest of
-  those you expect and the number you expect at once.
+  generic API, scratch only has to cover RPM packages, Incus/Debian finalizes,
+  chunked completions whose format needs a local file, and the spooling format
+  routes above. Size for the largest of those you expect and the number you
+  expect at once.
 - When `STORAGE_PATH` is an `emptyDir` with a `sizeLimit`, exceeding the limit
   evicts the pod mid-upload. Leave headroom over the estimate. Pointing
   `AK_UPLOAD_STAGING_DIR` at a separate volume moves single-request staging
-  off `STORAGE_PATH`, but chunked completions still land on `STORAGE_PATH`, so
-  size it for those either way.
+  off `STORAGE_PATH`; a chunked completion that must assemble locally still
+  lands on `STORAGE_PATH`, so size it for those either way.
 - Watch free space on the scratch volume under load; it should return to its
   baseline once uploads finish. Space that does not return points to files left
   by a crashed replica, which the cleanup reclaims once they pass the age

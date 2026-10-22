@@ -357,6 +357,23 @@ pub trait StorageBackend: Send + Sync {
         stream: BoxStream<'static, Result<Bytes>>,
     ) -> Result<PutStreamResult>;
 
+    /// Whether [`Self::put_stream`] uploads through the backend's native
+    /// streaming protocol (S3 multipart, GCS resumable, Azure block blob) and
+    /// therefore needs no local scratch file at any point.
+    ///
+    /// A chunked-upload completion uses this to decide whether it can
+    /// reassemble a session's staged chunks **on the backend** — streaming
+    /// them into one staging object, then `copy`ing it to the content-addressed
+    /// key — instead of writing one full-size local file first (#3916).
+    ///
+    /// Filesystem is deliberately `false`: its `put_stream` stages a temp file
+    /// on the same disk before renaming, so routing through it would not
+    /// remove the scratch requirement. Test doubles and backends that buffer
+    /// in memory also stay `false` unless they explicitly opt in.
+    fn supports_streamed_assembly(&self) -> bool {
+        false
+    }
+
     /// Enumerate the keys stored under `prefix` (a key prefix such as
     /// `maven/`), for the admin storage reindex (#1570).
     ///
