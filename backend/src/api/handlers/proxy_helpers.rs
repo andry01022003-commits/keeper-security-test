@@ -2410,6 +2410,13 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded(
 /// [`proxy_fetch_streaming_with_format`] for the reading a new call site owes
 /// before it passes a format. The conda CEP-16 shard proxy passes `Conda` for
 /// `{subdir}/shards/<sha256>.msgpack.zst`.
+///
+/// `check` is the caller's identity check on the body (#4829): a fetched body
+/// that fails it is returned but never committed to the proxy cache, and a
+/// cached one that fails it is evicted and fetched again. See
+/// [`ProxyService::fetch_artifact_with_cache_path_capped_checked`]. An
+/// immutable classification without such a check pins whatever the upstream
+/// answered first.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_capped_with_cache_key_encoded_format(
     proxy_service: &ProxyService,
@@ -2420,10 +2427,11 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded_format(
     cache_path: &str,
     max: usize,
     format: RepositoryFormat,
+    check: &crate::services::proxy_service::CachedBodyCheck,
 ) -> Result<crate::services::proxy_service::CachedBody, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     proxy_service
-        .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
+        .fetch_artifact_with_cache_path_capped_checked(&repo, fetch_path, cache_path, max, check)
         .await
         .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
 }
