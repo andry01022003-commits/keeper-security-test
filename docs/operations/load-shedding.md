@@ -75,6 +75,28 @@ health check briefly removed the endpoint.
   backend's `503` and `Retry-After` through rather than turning upstream
   overload into a connection error.
 
+## Buffered metadata memory budget
+
+Proxied metadata that has to be held in memory before it is answered (npm
+packuments, the PyPI simple index, Debian `dists`, Helm indexes, VS Code
+gallery queries, conda virtual merges) reserves bytes from one process-wide
+budget, `AK_PROXY_METADATA_BUDGET_BYTES` (default 1 GiB). When the budget is
+held by in-flight requests, a new request waits for room; the callers that
+bound their wait (conda virtual merges, VS Code gallery queries) answer `503`
+with `Retry-After` instead.
+
+The budget is accounted in 4 KiB units: a reservation is rounded up to a
+whole unit, and a single request larger than the whole budget holds all of it
+rather than waiting forever. Any value the platform can address is honoured.
+Before 1.11.5, a value above 4 GiB was silently clamped to 4294967295 bytes
+(#4881), which also capped the default `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES`
+at 3. A blank, non-numeric or zero value falls back to the default; that, or
+a value too large to represent, logs a warning at startup naming the
+configured and effective values. The effective value is in the
+`conda virtual merge gate configured` log line (`budget_bytes`), printed when
+the first virtual conda merge runs. Sizing against the container memory limit
+is in [conda virtual merge memory](conda-virtual-merge-memory.md).
+
 ## Database connection budget
 
 Every replica opens its own pool, so size the fleet against the server

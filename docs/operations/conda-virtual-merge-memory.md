@@ -66,7 +66,7 @@ plain document is not held next to its compressed form.
 | `CONDA_VIRTUAL_MERGE_QUEUE_SECS` | 60 | Longest a merge waits for a slot or for budget before the request gets 503. `Retry-After` is this value capped at 5 s. |
 | `CONDA_VIRTUAL_MERGE_CACHE_TTL_SECS` | 300 (the proxy cache's default for mutable metadata) | How long a merged document is kept. `0` turns the cache off; concurrent requests still share one merge. |
 | `CONDA_VIRTUAL_MERGE_CACHE_MAX_BYTES` | 1 GiB | Ceiling on kept merged documents, by body size (plain JSON bodies count a quarter extra for their gzip rendering). |
-| `AK_PROXY_METADATA_BUDGET_BYTES` | 1 GiB | The shared buffered-metadata budget merges reserve from. |
+| `AK_PROXY_METADATA_BUDGET_BYTES` | 1 GiB | The shared buffered-metadata budget merges reserve from. Accounted in 4 KiB units; values above 4 GiB are honoured (before 1.11.5 they were clamped to 4 GiB, #4881). |
 | `CONDA_VIRTUAL_MEMBER_MAX_BYTES` | 128 MiB | Ceiling on one member document as fetched (compressed). |
 | `CONDA_VIRTUAL_MEMBER_MAX_DECODED_BYTES` | 1 GiB | Ceiling on one member document after decoding. |
 
@@ -123,7 +123,8 @@ limit by the same amount, or set the upload budget explicitly.
 
 When you raise the budget, raise `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES` with it
 if you want more merges to run at once; the default is derived from the budget
-at startup. Lowering the budget or the merge cap trades memory for 503s under a
+at startup (for example 28 merges for a 32 GiB budget at the default member
+ceilings). Lowering the budget or the merge cap trades memory for 503s under a
 burst of distinct documents; it does not affect a burst of identical requests,
 which share one merge.
 

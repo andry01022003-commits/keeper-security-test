@@ -3295,9 +3295,10 @@ entries:
     /// queued for the socket.
     #[tokio::test]
     async fn test_index_response_holds_the_budget_until_the_body_is_dropped_3448() {
-        let budget = proxy_helpers::ProxyMetadataBudget::new(4096);
-        let permit = budget.reserve(1000).await;
-        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+        const U: usize = proxy_helpers::PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let budget = proxy_helpers::ProxyMetadataBudget::new(4 * U);
+        let permit = budget.reserve(U).await;
+        assert_eq!(budget.available_bytes(), 3 * U, "reservation debited");
 
         let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
         let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
@@ -3306,20 +3307,20 @@ entries:
         // The merge and the render both happen while the permit is held.
         assert_eq!(
             budget.available_bytes(),
-            3096,
+            3 * U,
             "budget must stay debited across the merge"
         );
         let resp = build_index_response(charts, Some(permit)).expect("index response");
         assert_eq!(
             budget.available_bytes(),
-            3096,
+            3 * U,
             "budget must stay debited while the rendered response body is alive"
         );
 
         drop(resp);
         assert_eq!(
             budget.available_bytes(),
-            4096,
+            4 * U,
             "budget is released once the response body is dropped"
         );
     }
