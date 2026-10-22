@@ -805,6 +805,18 @@ mod tests {
         );
     }
 
+    /// #4881: the merge cap follows a budget past 4 GiB. The budget used to be
+    /// clamped to `u32::MAX` bytes, so 32 GiB configured gave 3 merges.
+    #[test]
+    fn default_merge_cap_grows_with_a_budget_past_four_gib_4881() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let budget = ProxyMetadataBudget::new(32 * GIB);
+        assert_eq!(budget.total_bytes(), 34_359_738_368);
+        let cfg = GateConfig::from_lookup(|_| None, budget.total_bytes(), limits(128 << 20, GIB));
+        // 32 GiB / (128 MiB + 1 GiB) = 28.
+        assert_eq!(cfg.max_merges, 28);
+    }
+
     #[test]
     fn settings_parse_and_fall_back() {
         let budget = 1024 * 1024 * 1024;
@@ -853,29 +865,31 @@ mod tests {
 
     #[tokio::test]
     async fn account_reserves_once_tops_up_without_waiting_and_releases() {
-        let budget = leaked_budget(1000);
+        // Whole budget units, so the byte arithmetic below is exact (#4881).
+        const U: usize = proxy_helpers::PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let budget = leaked_budget(1000 * U);
         let mut account =
             MergeAccount::new(MergeKind::Repodata, budget, Duration::from_millis(200), 1);
-        account.reserve(600).await.unwrap();
-        assert_eq!(budget.available_bytes(), 400);
+        account.reserve(600 * U).await.unwrap();
+        assert_eq!(budget.available_bytes(), 400 * U);
         // A fetch buffer, decoded into a document: within the reservation.
-        account.track(100);
-        account.release(100);
-        account.track(500);
-        assert_eq!(account.reserved(), 600);
+        account.track(100 * U);
+        account.release(100 * U);
+        account.track(500 * U);
+        assert_eq!(account.reserved(), 600 * U);
         // Outgrowing it tops up from the free budget at once.
-        account.track(250);
-        assert_eq!(account.reserved(), 750);
-        assert_eq!(budget.available_bytes(), 250);
+        account.track(250 * U);
+        assert_eq!(account.reserved(), 750 * U);
+        assert_eq!(budget.available_bytes(), 250 * U);
         // With no room left it goes on over its reservation instead of waiting
         // (never hold-and-wait).
-        let other = budget.try_reserve(250).unwrap();
-        account.track(100);
-        assert_eq!(account.reserved(), 750);
-        assert_eq!(account.peak_need(), 850);
+        let other = budget.try_reserve(250 * U).unwrap();
+        account.track(100 * U);
+        assert_eq!(account.reserved(), 750 * U);
+        assert_eq!(account.peak_need(), 850 * U);
         drop(other);
         drop(account);
-        assert_eq!(budget.available_bytes(), 1000);
+        assert_eq!(budget.available_bytes(), 1000 * U);
     }
 
     #[tokio::test]

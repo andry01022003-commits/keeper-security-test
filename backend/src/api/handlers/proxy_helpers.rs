@@ -41,8 +41,29 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub const DEFAULT_PROXY_METADATA_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Env override for [`DEFAULT_PROXY_METADATA_BUDGET_BYTES`]. A blank,
-/// non-numeric, or zero value falls back to the default.
+/// non-numeric, or zero value falls back to the default; a value above
+/// [`MAX_PROXY_METADATA_BUDGET_BYTES`] is clamped to it. Either case logs a
+/// warning at startup naming the configured and effective values (#4881).
 pub const PROXY_METADATA_BUDGET_BYTES_ENV: &str = "AK_PROXY_METADATA_BUDGET_BYTES";
+
+/// Accounting granularity of every [`ProxyMetadataBudget`]: the semaphore
+/// counts one permit per 4 KiB, and a reservation is rounded UP to whole
+/// units (#4881). Counting bytes made the permit count bounded by the `u32`
+/// that `acquire_many` takes, which silently clamped any budget above
+/// 4 GiB. In 4 KiB units the semaphore can hold a budget as large as `usize`
+/// can express, and one reservation can hold up to 16 TiB.
+pub const PROXY_METADATA_BUDGET_UNIT_BYTES: usize = 4 * 1024;
+
+/// Largest budget [`ProxyMetadataBudget`] can represent: tokio's permit
+/// ceiling in [`PROXY_METADATA_BUDGET_UNIT_BYTES`] units, which on a 64-bit
+/// target saturates at `usize::MAX`.
+pub const MAX_PROXY_METADATA_BUDGET_BYTES: usize =
+    Semaphore::MAX_PERMITS.saturating_mul(PROXY_METADATA_BUDGET_UNIT_BYTES);
+
+/// Whole budget units covering `bytes`, rounded up.
+fn budget_units(bytes: usize) -> usize {
+    bytes.div_ceil(PROXY_METADATA_BUDGET_UNIT_BYTES)
+}
 
 /// A process-wide byte budget bounding the TOTAL memory the *buffered*
 /// proxy-metadata path may hold resident at once, independent of request
@@ -58,7 +79,7 @@ pub const PROXY_METADATA_BUDGET_BYTES_ENV: &str = "AK_PROXY_METADATA_BUDGET_BYTE
 /// responses each buffered independently.
 ///
 /// This budget caps that sum: each buffered fetch reserves permits (one per
-/// byte, up to the cap) BEFORE it buffers and releases them once the buffered
+/// [`PROXY_METADATA_BUDGET_UNIT_BYTES`], up to the cap) BEFORE it buffers and releases them once the buffered
 /// body has been handed to the response writer, so total concurrent buffering
 /// can never exceed `total_bytes`. Once the budget is exhausted, further
 /// requests await a reservation (bounded queueing) instead of admitting
@@ -71,15 +92,15 @@ pub struct ProxyMetadataBudget {
 }
 
 impl ProxyMetadataBudget {
-    /// Build a budget of `total_bytes`, clamped to `[1, u32::MAX]` (and to
-    /// [`Semaphore::MAX_PERMITS`]). A single reservation is always `<=` the
-    /// per-request cap, far below `u32::MAX`, so it stays inside the acquirable
-    /// range.
+    /// Build a budget of `total_bytes`, clamped to
+    /// `[1, MAX_PROXY_METADATA_BUDGET_BYTES]`. The semaphore holds the total
+    /// in [`PROXY_METADATA_BUDGET_UNIT_BYTES`] units, rounded up, so the
+    /// byte-facing methods keep byte semantics while the permit count stays
+    /// inside tokio's limits for any budget (#4881).
     pub fn new(total_bytes: usize) -> Self {
-        let ceiling = (u32::MAX as usize).min(Semaphore::MAX_PERMITS);
-        let total = total_bytes.clamp(1, ceiling);
+        let total = total_bytes.clamp(1, MAX_PROXY_METADATA_BUDGET_BYTES);
         Self {
-            sem: Arc::new(Semaphore::new(total)),
+            sem: Arc::new(Semaphore::new(budget_units(total))),
             total,
         }
     }
@@ -89,16 +110,23 @@ impl ProxyMetadataBudget {
         self.total
     }
 
-    /// Currently unreserved bytes (observability / test helper).
+    /// Currently unreserved bytes (observability / test helper). Counted in
+    /// whole units, so never more than [`Self::total_bytes`].
     pub fn available_bytes(&self) -> usize {
-        self.sem.available_permits()
+        self.sem
+            .available_permits()
+            .saturating_mul(PROXY_METADATA_BUDGET_UNIT_BYTES)
+            .min(self.total)
     }
 
     fn permits_for(&self, bytes: usize) -> u32 {
         // A single request can reserve at most the whole budget, so an oversized
         // request degrades to "hold the whole budget" rather than deadlocking on
-        // a permit count the semaphore can never satisfy.
-        bytes.clamp(1, self.total) as u32
+        // a permit count the semaphore can never satisfy. One `acquire_many`
+        // takes at most `u32::MAX` units (16 TiB); a budget larger than that
+        // still satisfies such a request, it just leaves the rest free.
+        let ceiling = budget_units(self.total).min(u32::MAX as usize);
+        budget_units(bytes).clamp(1, ceiling) as u32
     }
 
     /// Reserve `bytes` of the budget, awaiting when it is exhausted. The
@@ -128,13 +156,53 @@ impl ProxyMetadataBudget {
 pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
     static BUDGET: OnceLock<ProxyMetadataBudget> = OnceLock::new();
     BUDGET.get_or_init(|| {
-        let total = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PROXY_METADATA_BUDGET_BYTES);
+        let configured = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV).ok();
+        let (total, adjustment) = resolve_proxy_metadata_budget_bytes(configured.as_deref());
+        if let Some(reason) = adjustment {
+            tracing::warn!(
+                env = PROXY_METADATA_BUDGET_BYTES_ENV,
+                configured = configured.as_deref().unwrap_or_default(),
+                effective_bytes = total,
+                max_bytes = MAX_PROXY_METADATA_BUDGET_BYTES,
+                "{PROXY_METADATA_BUDGET_BYTES_ENV} {reason}; using {total} bytes"
+            );
+        }
         ProxyMetadataBudget::new(total)
     })
+}
+
+/// Resolve [`PROXY_METADATA_BUDGET_BYTES_ENV`] to the effective budget in
+/// bytes, plus why the configured value was not taken as is (#4881): `None`
+/// when it was unset or used verbatim, otherwise a reason fit for a warning.
+pub fn resolve_proxy_metadata_budget_bytes(
+    configured: Option<&str>,
+) -> (usize, Option<&'static str>) {
+    let Some(raw) = configured else {
+        return (DEFAULT_PROXY_METADATA_BUDGET_BYTES, None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+            Some("is blank, falling back to the default"),
+        );
+    }
+    // Parse wide so a value past `usize` is reported as clamped, not as junk.
+    match raw.parse::<u128>() {
+        Err(_) => (
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+            Some("is not a byte count, falling back to the default"),
+        ),
+        Ok(0) => (
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+            Some("is zero, falling back to the default"),
+        ),
+        Ok(v) if v > MAX_PROXY_METADATA_BUDGET_BYTES as u128 => (
+            MAX_PROXY_METADATA_BUDGET_BYTES,
+            Some("exceeds the largest representable budget, clamping"),
+        ),
+        Ok(v) => (v as usize, None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11882,6 +11950,102 @@ mod tests {
         );
     }
 
+    // ── Budget accounting in fixed units (#4881) ─────────────────────
+    //
+    // Permits used to be one per byte, so the semaphore (and the `u32` that
+    // `acquire_many` takes) silently clamped any configured budget to
+    // 4 GiB, and the conda merge gate sized its slots from the clamped
+    // total. These pin the unit-based accounting and the startup parse.
+
+    #[test]
+    fn proxy_metadata_budget_represents_more_than_four_gib_4881() {
+        let configured: usize = 32 * 1024 * 1024 * 1024;
+        let budget = ProxyMetadataBudget::new(configured);
+        assert_eq!(budget.total_bytes(), 34_359_738_368);
+        assert_eq!(budget.available_bytes(), 34_359_738_368);
+        // Five 4 GiB reservations fit at once: more than the old ceiling.
+        let held: Vec<_> = (0..5)
+            .map(|_| {
+                budget
+                    .try_reserve(4 * 1024 * 1024 * 1024)
+                    .expect("a 32 GiB budget admits five 4 GiB reservations")
+            })
+            .collect();
+        assert_eq!(budget.available_bytes(), 12 * 1024 * 1024 * 1024);
+        drop(held);
+        assert_eq!(budget.available_bytes(), configured);
+    }
+
+    #[test]
+    fn proxy_metadata_budget_rounds_reservations_up_to_whole_units_4881() {
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        assert_eq!(U, 4096);
+        let budget = ProxyMetadataBudget::new(10 * U);
+
+        let one_byte = budget.try_reserve(1).expect("fits");
+        assert_eq!(budget.available_bytes(), 9 * U, "1 byte holds one unit");
+        let exact = budget.try_reserve(2 * U).expect("fits");
+        assert_eq!(
+            budget.available_bytes(),
+            7 * U,
+            "an exact multiple is not padded"
+        );
+        let over = budget.try_reserve(2 * U + 1).expect("fits");
+        assert_eq!(budget.available_bytes(), 4 * U, "one byte over rounds up");
+        let zero = budget.try_reserve(0).expect("fits");
+        assert_eq!(
+            budget.available_bytes(),
+            3 * U,
+            "an empty reservation holds one unit"
+        );
+        drop((one_byte, exact, over, zero));
+        assert_eq!(budget.available_bytes(), 10 * U);
+
+        // A total that is not a unit multiple keeps its byte value and never
+        // reports more available than it holds.
+        let odd = ProxyMetadataBudget::new(U + 1);
+        assert_eq!(odd.total_bytes(), U + 1);
+        assert_eq!(odd.available_bytes(), U + 1);
+        let p = odd.try_reserve(1).expect("fits");
+        assert_eq!(odd.available_bytes(), U);
+        drop(p);
+        assert_eq!(odd.available_bytes(), U + 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_metadata_budget_oversized_reservation_holds_whole_large_budget_4881() {
+        // The "hold the whole budget, never deadlock" invariant must survive
+        // budgets past the old 4 GiB ceiling.
+        let budget = Arc::new(ProxyMetadataBudget::new(32 * 1024 * 1024 * 1024));
+        let all = tokio::time::timeout(Duration::from_secs(5), budget.reserve(usize::MAX))
+            .await
+            .expect("an oversized reservation is satisfiable, not a deadlock");
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(1).is_none());
+        drop(all);
+        assert_eq!(budget.available_bytes(), 32 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn proxy_metadata_budget_env_resolution_reports_adjustments_4881() {
+        let default = DEFAULT_PROXY_METADATA_BUDGET_BYTES;
+        assert_eq!(resolve_proxy_metadata_budget_bytes(None), (default, None));
+        assert_eq!(
+            resolve_proxy_metadata_budget_bytes(Some(" 34359738368 ")),
+            (34_359_738_368, None),
+            "32 GiB is taken verbatim"
+        );
+        for fallback in ["", "  ", "lots", "-5", "1.5", "0"] {
+            let (bytes, reason) = resolve_proxy_metadata_budget_bytes(Some(fallback));
+            assert_eq!(bytes, default, "{fallback:?} falls back to the default");
+            assert!(reason.is_some(), "{fallback:?} must be reported");
+        }
+        let (bytes, reason) =
+            resolve_proxy_metadata_budget_bytes(Some("340282366920938463463374607431768211455"));
+        assert_eq!(bytes, MAX_PROXY_METADATA_BUDGET_BYTES);
+        assert!(reason.unwrap().contains("clamping"));
+    }
+
     // ── Per-family metadata sub-budgets (#3914) ─────────────────────
 
     fn leaked_sub_budget(bytes: usize) -> &'static MetadataSubBudget {
@@ -11959,21 +12123,22 @@ mod tests {
     /// so, and leaves the rest of the shared budget to other formats.
     #[tokio::test]
     async fn saturated_sub_budget_sheds_family_but_admits_other_formats() {
-        let shared = ProxyMetadataBudget::new(1000);
-        let sub = leaked_sub_budget(250);
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let shared = ProxyMetadataBudget::new(1000 * U);
+        let sub = leaked_sub_budget(250 * U);
 
-        let first = reserve_metadata_budget_in(&shared, Some(sub), 250, None)
+        let first = reserve_metadata_budget_in(&shared, Some(sub), 250 * U, None)
             .await
             .unwrap_or_else(|_| panic!("the family's first reservation fits its share"));
         assert_eq!(sub.saturation(), 1.0);
         assert_eq!(
             shared.available_bytes(),
-            750,
+            750 * U,
             "family bytes count against the shared total"
         );
 
         let shed =
-            reserve_metadata_budget_in(&shared, Some(sub), 10, Some(Duration::from_millis(20)))
+            reserve_metadata_budget_in(&shared, Some(sub), 10 * U, Some(Duration::from_millis(20)))
                 .await;
         let Err(response) = shed else {
             panic!("a saturated family sub-budget must shed")
@@ -11981,13 +12146,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             shared.available_bytes(),
-            750,
+            750 * U,
             "the shed reservation held nothing"
         );
 
-        let npm = reserve_metadata_budget_in(&shared, None, 750, Some(Duration::from_millis(20)))
-            .await
-            .unwrap_or_else(|_| panic!("other formats keep the rest of the shared budget"));
+        let npm =
+            reserve_metadata_budget_in(&shared, None, 750 * U, Some(Duration::from_millis(20)))
+                .await
+                .unwrap_or_else(|_| panic!("other formats keep the rest of the shared budget"));
         assert_eq!(shared.available_bytes(), 0);
 
         drop(first);
@@ -11996,9 +12162,9 @@ mod tests {
             0.0,
             "dropping the permit releases the family share"
         );
-        assert_eq!(shared.available_bytes(), 250);
+        assert_eq!(shared.available_bytes(), 250 * U);
         drop(npm);
-        assert_eq!(shared.available_bytes(), 1000);
+        assert_eq!(shared.available_bytes(), 1000 * U);
     }
 
     /// The family share is queued on first, so when the SHARED budget is
@@ -12006,26 +12172,27 @@ mod tests {
     /// family slice back rather than leaking it.
     #[tokio::test]
     async fn family_reservation_releases_its_share_when_the_shared_budget_sheds() {
-        let shared = ProxyMetadataBudget::new(100);
-        let sub = leaked_sub_budget(100);
-        let hog = shared.try_reserve(100).expect("fresh budget");
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let shared = ProxyMetadataBudget::new(100 * U);
+        let sub = leaked_sub_budget(100 * U);
+        let hog = shared.try_reserve(100 * U).expect("fresh budget");
 
         let shed =
-            reserve_metadata_budget_in(&shared, Some(sub), 40, Some(Duration::from_millis(20)))
+            reserve_metadata_budget_in(&shared, Some(sub), 40 * U, Some(Duration::from_millis(20)))
                 .await;
         assert!(
             shed.is_err(),
             "a saturated shared budget still sheds a family read"
         );
-        assert_eq!(sub.budget().available_bytes(), 100);
+        assert_eq!(sub.budget().available_bytes(), 100 * U);
         assert_eq!(sub.saturation(), 0.0);
         drop(hog);
 
-        let permit = reserve_metadata_budget_in(&shared, Some(sub), 40, None)
+        let permit = reserve_metadata_budget_in(&shared, Some(sub), 40 * U, None)
             .await
             .unwrap_or_else(|_| panic!("unbounded reservation succeeds once free"));
-        assert_eq!(sub.budget().available_bytes(), 60);
-        assert_eq!(shared.available_bytes(), 60);
+        assert_eq!(sub.budget().available_bytes(), 60 * U);
+        assert_eq!(shared.available_bytes(), 60 * U);
         drop(permit);
     }
 
@@ -12058,14 +12225,15 @@ mod tests {
                 })
         };
         metrics::with_local_recorder(&recorder, || {
-            let sub = leaked_sub_budget(100);
+            const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+            let sub = leaked_sub_budget(100 * U);
             sub.record_saturation();
             assert_eq!(gauge(), Some(0.0));
-            let shared = ProxyMetadataBudget::new(1000);
+            let shared = ProxyMetadataBudget::new(1000 * U);
             let permit = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap()
-                .block_on(reserve_metadata_budget_in(&shared, Some(sub), 25, None))
+                .block_on(reserve_metadata_budget_in(&shared, Some(sub), 25 * U, None))
                 .unwrap_or_else(|_| panic!("fits"));
             assert_eq!(gauge(), Some(0.25));
             drop(permit);
@@ -12094,21 +12262,22 @@ mod tests {
     /// index still relies on this.
     #[tokio::test]
     async fn budgeted_body_holds_budget_until_body_dropped() {
-        let budget = ProxyMetadataBudget::new(4096);
-        let permit = budget.reserve(1000).await;
-        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let budget = ProxyMetadataBudget::new(4 * U);
+        let permit = budget.reserve(U).await;
+        assert_eq!(budget.available_bytes(), 3 * U, "reservation debited");
 
         let body = budgeted_body(Bytes::from_static(b"metadata-bytes"), permit);
         assert_eq!(
             budget.available_bytes(),
-            3096,
+            3 * U,
             "budget stays debited while the body is alive"
         );
 
         drop(body);
         assert_eq!(
             budget.available_bytes(),
-            4096,
+            4 * U,
             "budget is released once the body is dropped"
         );
     }
