@@ -26,7 +26,7 @@
 //!   GET  /t/{token}/conda/{repo_key}/...                     - rattler/pixi `--conda-token` layout
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -2000,6 +2000,253 @@ impl RepodataEncoding {
     }
 }
 
+/// The upstream documents a plain `repodata.json` read is built from, most
+/// compact first (#4180).
+///
+/// The plain document is never fetched from upstream: conda-forge's `.json` is
+/// 160-200 MiB for every major subdir, while the same document as `.zst` is
+/// 20-60 MiB. Fetching the compressed representation keeps the buffered
+/// ceiling (`LARGE_METADATA_MAX_BYTES`) on the bytes actually read, and the
+/// plain response is decoded from it as a stream. `.json` stays as the last
+/// resort for an upstream that publishes no compressed encoding.
+const PLAIN_REPODATA_SOURCES: [RepodataEncoding; 3] = [
+    RepodataEncoding::Zst,
+    RepodataEncoding::Bz2,
+    RepodataEncoding::Json,
+];
+
+/// Undo the HTTP transfer coding and the file compression of one upstream
+/// repodata document, returning a reader over the plain JSON.
+///
+/// The decoders stream: neither this function nor its caller ever holds the
+/// uncompressed document, which is several hundred MiB for a conda-forge
+/// subdir (#4180). The returned reader is `Send` because it is driven on the
+/// blocking pool.
+fn decoded_repodata_reader(
+    compressed: Bytes,
+    transfer_encoding: Option<&str>,
+    encoding: RepodataEncoding,
+) -> Result<Box<dyn Read + Send>, String> {
+    let transfer: Box<dyn Read + Send> = match transfer_encoding.map(str::trim) {
+        None | Some("") | Some("identity") => Box::new(std::io::Cursor::new(compressed)),
+        Some(c) if c.eq_ignore_ascii_case("gzip") || c.eq_ignore_ascii_case("x-gzip") => Box::new(
+            flate2::read::MultiGzDecoder::new(std::io::Cursor::new(compressed)),
+        ),
+        Some(c) if c.eq_ignore_ascii_case("deflate") => Box::new(flate2::read::ZlibDecoder::new(
+            std::io::Cursor::new(compressed),
+        )),
+        Some(c) if c.eq_ignore_ascii_case("zstd") => Box::new(
+            zstd::stream::read::Decoder::new(std::io::Cursor::new(compressed))
+                .map_err(|e| format!("zstd transfer coding: {e}"))?,
+        ),
+        Some(other) => return Err(format!("unsupported Content-Encoding {other:?}")),
+    };
+    let reader: Box<dyn Read + Send> = match encoding {
+        RepodataEncoding::Json => transfer,
+        RepodataEncoding::Zst => {
+            Box::new(zstd::stream::read::Decoder::new(transfer).map_err(|e| format!("zstd: {e}"))?)
+        }
+        RepodataEncoding::Bz2 => Box::new(bzip2::read::MultiBzDecoder::new(transfer)),
+    };
+    Ok(reader)
+}
+
+/// Serve a plain `repodata.json` decoded from an upstream compressed document
+/// (#4180).
+///
+/// The body is produced by a blocking task that streams the decoder into the
+/// response channel; the compressed bytes (and their buffered-metadata
+/// reservation) live only until the body has been read. `Content-Encoding`
+/// and `Content-Length` are the only headers that differ from
+/// [`cacheable_response_coded`]: the body is not in memory, so its length is
+/// unknown and the optional gzip pass is streaming too.
+fn streamed_repodata_response(
+    compressed: Bytes,
+    transfer_encoding: Option<&str>,
+    encoding: RepodataEncoding,
+    headers: &HeaderMap,
+    budget_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Response {
+    let etag = compute_etag(&compressed);
+    if let Some(not_modified) = check_conditional_request(headers, &etag) {
+        return not_modified;
+    }
+
+    let gzip = accepts_gzip(headers);
+    let mut reader = match decoded_repodata_reader(compressed, transfer_encoding, encoding) {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::error!("repodata transcode error: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
+        }
+    };
+    if gzip {
+        reader = Box::new(flate2::read::GzEncoder::new(
+            reader,
+            flate2::Compression::default(),
+        ));
+    }
+
+    // Read the first chunk before committing to a 200: a body that is not a
+    // valid zstd/bzip2 document fails here, where the client can still get an
+    // error status, rather than halfway through a successful response.
+    let mut first = vec![0u8; 64 * 1024];
+    let first_len = match reader.read(&mut first) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("repodata transcode error: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
+        }
+    };
+    let first_chunk = (first_len > 0).then(|| Bytes::copy_from_slice(&first[..first_len]));
+    drop(first);
+
+    // A bounded channel gives the blocking decoder backpressure: it reads
+    // ahead by at most a few chunks while the client consumes the body.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        // The reservation covers the compressed buffer until the last chunk
+        // has been decoded and handed to the response.
+        let _budget_permit = budget_permit;
+        if let Some(chunk) = first_chunk {
+            if tx.blocking_send(Ok(chunk)).is_err() {
+                return;
+            }
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, RepodataEncoding::Json.content_type())
+        .header(ETAG, &etag)
+        .header(
+            CACHE_CONTROL,
+            crate::api::handlers::cache_headers::DEFAULT_CACHE_CONTROL,
+        );
+    if gzip {
+        builder = builder
+            .header(CONTENT_ENCODING, "gzip")
+            .header("Vary", "Accept-Encoding");
+    }
+    builder
+        .body(Body::from_stream(futures::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|item| (item, rx)) },
+        )))
+        .unwrap()
+}
+
+/// Proxy a Remote repository's plain `repodata.json` (#4180).
+///
+/// Tries the compressed upstream documents in [`PLAIN_REPODATA_SOURCES`]
+/// through the same capped, budgeted proxy-cache path the compressed endpoints
+/// use, then decodes the winner as a stream. The compressed representation is
+/// what the proxy cache keeps, so a later `.zst`/`.bz2` request and a warm
+/// plain request are both served from it without another upstream read. A
+/// compressed candidate that exceeds the buffered ceiling is a hard failure
+/// (the ceiling is the point of fetching it); only an upstream that publishes
+/// no compressed document at all falls through to the plain streaming path.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_plain_repodata(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    subdir: &str,
+    headers: &HeaderMap,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let mut over_cap = None;
+    for source in PLAIN_REPODATA_SOURCES
+        .into_iter()
+        .filter(|source| *source != RepodataEncoding::Json)
+    {
+        let upstream_path = format!("{}/{}", subdir, source.upstream_filename());
+        match proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
+        {
+            Ok(proxy_helpers::CappedMetadataGet::Buffered {
+                content,
+                content_encoding,
+                budget_permit,
+                ..
+            }) => {
+                return Ok(streamed_repodata_response(
+                    content,
+                    content_encoding.as_deref(),
+                    source,
+                    headers,
+                    Some(budget_permit),
+                ));
+            }
+            Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
+                tracing::warn!(
+                    repo = %repo.key,
+                    path = %upstream_path,
+                    "compressed conda repodata exceeds the buffered-metadata ceiling (#4180)"
+                );
+                over_cap = Some(upstream_path);
+            }
+            Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            Err(response) => return Err(response),
+        }
+    }
+
+    if let Some(path) = over_cap {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Upstream conda repodata {path} exceeds the {}-byte compressed metadata ceiling",
+                proxy_helpers::LARGE_METADATA_MAX_BYTES
+            ),
+        )
+            .into_response());
+    }
+
+    // No compressed encoding upstream: stream the plain document instead of
+    // buffering it, so a channel that predates `.zst`/`.bz2` still works
+    // without materialising its index (#4149).
+    let upstream_path = format!("{}/{}", subdir, RepodataEncoding::Json.upstream_filename());
+    let response = proxy_helpers::proxy_fetch_streaming(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        RepodataEncoding::Json.content_type(),
+    )
+    .await?;
+    // #3649: count the proxied serve once the streaming helper resolves, on
+    // the same cache path this fetch commits under.
+    proxy_helpers::record_proxy_download(state, repo.id, &repo.key, &upstream_path, ctx).await;
+    Ok(response)
+}
+
 // ---------------------------------------------------------------------------
 // #4051: upstream repodata patch generation attribution
 // ---------------------------------------------------------------------------
@@ -2165,31 +2412,13 @@ async fn serve_repodata(
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
                 // #4051: attribute the served index to the upstream patch
-                // generation in effect at serve time, and record it so an
-                // upstream repodata patch revision is visible as a change.
-                //
-                // This MUST run BEFORE the repodata reservation below, never
-                // underneath it. `record_upstream_patch_generation` buffers
-                // through the same budgeted helper, so it reserves a SECOND
-                // slice (8 MiB) of the SAME process-wide buffered-metadata
-                // budget. Taking it while the 128 MiB repodata permit is held
-                // is hold-and-wait: the default budget is 1 GiB, i.e. exactly
-                // eight `LARGE_METADATA_MAX_BYTES` buffers, so eight
-                // concurrent (anonymous, un-rate-limited) repodata requests
-                // reserve the whole budget and then each await bytes only the
-                // others could release — a permanent deadlock of the shared
-                // buffered-metadata path for EVERY format, not just conda
-                // (#4129). Sequencing the two fetches keeps a request to one
-                // reservation at a time: the attribution permit is released
-                // when this call returns, before the repodata permit exists,
-                // and the peak reservation stays 128 MiB rather than 136 MiB.
-                //
-                // The cost of the order is one extra (cached, 8 MiB-capped)
-                // attribution lookup when the repodata fetch then fails, which
-                // is strictly preferable to a liveness hazard on a budget every
-                // format shares.
+                // generation in effect at serve time. This MUST run before the
+                // repodata reservation below: both fetch through the shared
+                // buffered-metadata budget, and taking the attribution's
+                // 8 MiB permit while holding a 128 MiB repodata permit is the
+                // hold-and-wait deadlock of #4129. Sequencing them keeps one
+                // reservation per request.
                 let patch_generation = record_upstream_patch_generation(
                     state,
                     proxy,
@@ -2199,73 +2428,78 @@ async fn serve_repodata(
                     subdir,
                 )
                 .await;
-                // #4149: the buffered read is the COMMON path, but conda-forge's
-                // uncompressed `repodata.json` for every major subdir runs
-                // 160-200 MiB — past the 128 MiB ceiling — and used to die here
-                // with a 502 while the compressed encodings (which fit under
-                // the cap) proxied fine. The ceiling abort is therefore not an
-                // error for this endpoint: fall through to the streaming path,
-                // which tees upstream -> client -> proxy cache without ever
-                // buffering the document, exactly as oversized .deb/.npm
-                // tarballs are served (#3596/#2181). Once the stream commits
-                // the cache entry, subsequent requests take the buffered arm
-                // above again — the ceiling bounds the UPSTREAM read only;
-                // serving a warmed copy from cache was never the problem.
-                let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
-                    proxy,
-                    repo.id,
-                    repo_key,
-                    upstream_url,
-                    &upstream_path,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                )
-                .await?;
-                let mut response = match fetched {
-                    proxy_helpers::CappedMetadataGet::Buffered {
-                        content,
-                        content_encoding,
-                        budget_permit: _budget_permit,
-                        ..
-                    } => {
-                        // `_budget_permit` is held until this function returns,
-                        // i.e. across response construction (including the gzip
-                        // pass) — the window where the buffer is both resident
-                        // and being read. Matches the debian dists path (#2684).
-                        cacheable_response_coded(content, ct, content_encoding.as_deref(), headers)
+                // #4180: a plain `repodata.json` read is built from the
+                // upstream compressed document (`.zst`, then `.bz2`) and
+                // streamed through a decoder, so the buffered ceiling applies
+                // to the 20-60 MiB compressed body instead of the 160-200 MiB
+                // plain one. The compressed `.zst`/`.bz2` endpoints keep
+                // proxying their own upstream document.
+                let mut response = if encoding == RepodataEncoding::Json {
+                    proxy_plain_repodata(state, proxy, &repo, upstream_url, subdir, headers, ctx)
+                        .await?
+                } else {
+                    let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
+                    let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
+                    match fetched {
+                        proxy_helpers::CappedMetadataGet::Buffered {
+                            content,
+                            content_encoding,
+                            budget_permit: _budget_permit,
+                            ..
+                        } => {
+                            // `_budget_permit` is held until this function returns,
+                            // i.e. across response construction (including the gzip
+                            // pass) — the window where the buffer is both resident
+                            // and being read. Matches the debian dists path (#2684).
+                            cacheable_response_coded(
+                                content,
+                                ct,
+                                content_encoding.as_deref(),
+                                headers,
+                            )
                             .await
-                    }
-                    proxy_helpers::CappedMetadataGet::OverCap => {
-                        tracing::info!(
-                            repo = %repo_key,
-                            path = %upstream_path,
-                            "repodata document exceeds the buffered-metadata ceiling; \
-                             serving it via the streaming path (#4149)"
-                        );
-                        let response = proxy_helpers::proxy_fetch_streaming(
-                            proxy,
-                            repo.id,
-                            repo_key,
-                            upstream_url,
-                            &upstream_path,
-                            ct,
-                        )
-                        .await?;
-                        // #3649: count the proxied serve. The streaming helper
-                        // answers a warm cache HIT from storage and a cold MISS
-                        // from upstream through the same call, so recording once
-                        // it resolves counts both — while a 404/502 still counts
-                        // nothing. Keyed on the proxy-cache path this fetch
-                        // commits under, so the count lines up with the catalog
-                        // row the artifact listing renders.
-                        proxy_helpers::record_proxy_download(
-                            state,
-                            repo.id,
-                            repo_key,
-                            &upstream_path,
-                            ctx,
-                        )
-                        .await;
-                        response
+                        }
+                        proxy_helpers::CappedMetadataGet::OverCap => {
+                            tracing::info!(
+                                repo = %repo_key,
+                                path = %upstream_path,
+                                "repodata document exceeds the buffered-metadata ceiling; \
+                                 serving it via the streaming path (#4149)"
+                            );
+                            let response = proxy_helpers::proxy_fetch_streaming(
+                                proxy,
+                                repo.id,
+                                repo_key,
+                                upstream_url,
+                                &upstream_path,
+                                ct,
+                            )
+                            .await?;
+                            // #3649: count the proxied serve. The streaming helper
+                            // answers a warm cache HIT from storage and a cold MISS
+                            // from upstream through the same call, so recording once
+                            // it resolves counts both — while a 404/502 still counts
+                            // nothing. Keyed on the proxy-cache path this fetch
+                            // commits under, so the count lines up with the catalog
+                            // row the artifact listing renders.
+                            proxy_helpers::record_proxy_download(
+                                state,
+                                repo.id,
+                                repo_key,
+                                &upstream_path,
+                                ctx,
+                            )
+                            .await;
+                            response
+                        }
                     }
                 };
                 if let Some(generation) = patch_generation {
@@ -14231,9 +14465,9 @@ mod tests {
                     let mut at = 0usize;
                     while at < total {
                         let n = REPO_BLOCK.min(total - at);
-                        // The aborted first (buffered) attempt closes the
-                        // socket mid-body; stop writing rather than panic on
-                        // the broken pipe.
+                        // A client that disconnects mid-body (or the test's
+                        // cancelled request) closes the socket; stop writing
+                        // rather than panic on the broken pipe.
                         if sock.write_all(&oversized_repoblock(at, n)).await.is_err() {
                             return;
                         }
@@ -14261,6 +14495,124 @@ mod tests {
             }
         }
         (total, hex::encode(hasher.finalize()))
+    }
+
+    // -----------------------------------------------------------------------
+    // #4180: a plain repodata.json request is decoded from the compressed
+    // upstream document as a stream. These pin the decoder itself; the
+    // route-level tests below pin which upstream document is chosen.
+    // -----------------------------------------------------------------------
+
+    const REPODATA_4180: &[u8] = br#"{"info":{"subdir":"noarch"},"packages":{"demo-1.0-0.tar.bz2":{"name":"demo","version":"1.0","build":"0","build_number":0,"depends":[],"subdir":"noarch"}},"packages.conda":{},"repodata_version":1}"#;
+
+    fn zstd_repodata_4180(json: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(json, 3).expect("zstd fixture")
+    }
+
+    fn bzip2_repodata_4180(json: &[u8]) -> Vec<u8> {
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(json).expect("bzip2 fixture");
+        encoder.finish().expect("bzip2 fixture")
+    }
+
+    async fn drain_repodata_body(body: Body) -> Bytes {
+        use http_body_util::BodyExt;
+        body.collect()
+            .await
+            .expect("collect repodata body")
+            .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_decodes_zstd_exactly_4180() {
+        let compressed = Bytes::from(zstd_repodata_4180(REPODATA_4180));
+        let response = super::streamed_repodata_response(
+            compressed,
+            None,
+            RepodataEncoding::Zst,
+            &HeaderMap::new(),
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            drain_repodata_body(response.into_body()).await.as_ref(),
+            REPODATA_4180,
+            "a plain request must serve the decoded upstream document byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_decodes_bzip2_and_gzips_on_request_4180() {
+        let compressed = Bytes::from(bzip2_repodata_4180(REPODATA_4180));
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = super::streamed_repodata_response(
+            compressed,
+            None,
+            RepodataEncoding::Bz2,
+            &headers,
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        let body = drain_repodata_body(response.into_body()).await;
+        let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).expect("gunzip");
+        assert_eq!(decoded, REPODATA_4180);
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_honours_if_none_match_4180() {
+        let compressed = Bytes::from(zstd_repodata_4180(REPODATA_4180));
+        let etag = compute_etag(&compressed);
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
+
+        let response = super::streamed_repodata_response(
+            compressed,
+            None,
+            RepodataEncoding::Zst,
+            &headers,
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+            Some(etag.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_rejects_an_invalid_compressed_body_4180() {
+        let response = super::streamed_repodata_response(
+            Bytes::from_static(b"not a zstd frame"),
+            None,
+            RepodataEncoding::Zst,
+            &HeaderMap::new(),
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            super::decoded_repodata_reader(Bytes::new(), Some("br"), RepodataEncoding::Json)
+                .is_err()
+        );
     }
 
     /// #4149: conda-forge's uncompressed `repodata.json` for every major
@@ -14335,13 +14687,135 @@ mod tests {
             assert_eq!(len, total, "{label} serve must deliver every byte");
             assert_eq!(digest, want_digest, "{label} serve must be byte-identical");
         }
-        // Cold: one aborted buffered attempt plus one full streaming fetch.
-        // Warm: the teed cache entry answers, so the upstream sees NOTHING.
+        // Cold: `.zst` and `.bz2` are not published (404), then one streaming
+        // plain fetch. Warm: the teed plain cache entry answers, so the
+        // upstream sees NOTHING.
         assert_eq!(
-            doc_hits, 2,
-            "expected the cold request's aborted buffered attempt + one \
-             streaming fetch, and NO refetch on the warm request"
+            doc_hits, 1,
+            "expected one cold streaming plain fetch after the compressed \
+             candidates 404, and NO refetch on the warm request"
         );
+    }
+
+    /// #4180: a plain `repodata.json` request must fetch the compressed
+    /// upstream document, decode it byte-for-byte, and keep the compressed
+    /// bytes in the proxy cache so the second request (and a later `.zst`
+    /// request) does not go upstream again.
+    #[tokio::test]
+    async fn plain_repodata_transcodes_upstream_zst_and_is_cached_4180() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(zstd_repodata_4180(REPODATA_4180)),
+            )
+            .mount(&server)
+            .await;
+        // A plain fetch would be the #4149 2xx-if-lucky / 502-if-large path.
+        // Fail it so the transcode path is the only way this test can pass.
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        for label in ["cold", "warm"] {
+            let app = tdh::router_anon(router(), state.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+            assert_eq!(status, StatusCode::OK, "{label} plain repodata serve");
+            assert_eq!(
+                body.as_ref(),
+                REPODATA_4180,
+                "{label} plain repodata must be the decoded upstream .zst"
+            );
+        }
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let hits = |path: &str| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        };
+        let zst_hits = hits("/noarch/repodata.json.zst");
+        let plain_hits = hits("/noarch/repodata.json");
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(zst_hits, 1, "the warm request must be a cache read");
+        assert_eq!(plain_hits, 0, "plain upstream repodata must not be fetched");
+    }
+
+    /// #4180: `.zst` is preferred, but a channel that publishes only `.bz2`
+    /// still serves a plain request by decoding it on the fly.
+    #[tokio::test]
+    async fn plain_repodata_falls_back_to_upstream_bz2_4180() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.bz2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(bzip2_repodata_4180(REPODATA_4180)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let hits = |path: &str| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        };
+        let zst_hits = hits("/noarch/repodata.json.zst");
+        let bz2_hits = hits("/noarch/repodata.json.bz2");
+        let plain_hits = hits("/noarch/repodata.json");
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), REPODATA_4180);
+        assert_eq!(
+            zst_hits, 1,
+            "the missing .zst candidate must be tried first"
+        );
+        assert_eq!(bz2_hits, 1);
+        assert_eq!(plain_hits, 0, "plain upstream repodata must not be fetched");
     }
 
     // #4577: a Remote repo proxies its upstream's CEP-16 index. When the
