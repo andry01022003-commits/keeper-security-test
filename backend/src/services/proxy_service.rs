@@ -20149,6 +20149,23 @@ mod tests {
         repo
     }
 
+    /// Per-test PyPI streaming coordinate (#4814). `load_cache_metadata`
+    /// memoises sidecars -- including misses (`None`) -- in the process-global
+    /// `PROXY_METADATA_LRU`, keyed only by the storage key. Two tests that
+    /// share a fixed `(repo_key, cache_path)` therefore race under the
+    /// in-process parallel runner: the miss test stores `None` for the key and
+    /// the hit test reads it, falls through to the never-connecting test pool,
+    /// and fails with a database error. A UUID in both the repo key and the
+    /// cache path gives every run its own LRU slot; this mirrors the
+    /// unique-coordinate pattern the quarantine and #3951 tests use.
+    fn unique_pypi_streaming_paths() -> (String, String, String) {
+        let unique = Uuid::new_v4();
+        let repo_key = format!("pypi-remote-4814-{unique}");
+        let cache_path = format!("simple/pkg4814-{unique}/pkg4814-{unique}-1.0.0-py3-none-any.whl");
+        let fetch_path = format!("packages/ab/cd/pkg4814-{unique}-1.0.0-py3-none-any.whl");
+        (repo_key, cache_path, fetch_path)
+    }
+
     async fn collect_streaming_body(
         mut body: futures::stream::BoxStream<'static, Result<Bytes>>,
     ) -> Bytes {
@@ -20166,12 +20183,10 @@ mod tests {
         // A cache hit must be found under `cache_path` even though
         // `fetch_path` points somewhere else entirely — and the fetch path
         // must never be used to derive a storage key.
-        let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
-        let fetch_path = "packages/ab/cd/numpy-2.0.0-py3-none-any.whl";
+        let (repo_key, cache_path, fetch_path) = unique_pypi_streaming_paths();
         let wheel_body = Bytes::from_static(b"fake wheel bytes");
 
-        let keys =
-            CacheKeys::derive(&ProxyCacheScope::unscoped(), "pypi-remote", cache_path).unwrap();
+        let keys = CacheKeys::derive(&ProxyCacheScope::unscoped(), &repo_key, &cache_path).unwrap();
         // The sidecar vouches for the body actually stored: the hit path
         // checks an unpinned entry's size against it (#4758).
         let mut sidecar: CacheMetadata = serde_json::from_slice(&fresh_metadata_bytes()).unwrap();
@@ -20188,10 +20203,10 @@ mod tests {
             requested: std::sync::Mutex::new(Vec::new()),
         });
         let svc = build_proxy_service_with_storage(storage.clone()).without_origin_policy_gate();
-        let repo = pypi_remote_repo("pypi-remote");
+        let repo = pypi_remote_repo(&repo_key);
 
         let result = svc
-            .fetch_artifact_streaming_with_cache_path(&repo, fetch_path, cache_path)
+            .fetch_artifact_streaming_with_cache_path(&repo, &fetch_path, &cache_path)
             .await
             .expect("cached entry under cache_path must stream as a hit");
 
@@ -20215,10 +20230,11 @@ mod tests {
             requested: std::sync::Mutex::new(Vec::new()),
         });
         let svc = build_proxy_service_with_storage(storage).without_origin_policy_gate();
-        let repo = pypi_remote_repo("pypi-remote");
+        let (repo_key, cache_path, _fetch_path) = unique_pypi_streaming_paths();
+        let repo = pypi_remote_repo(&repo_key);
 
         let probe = svc
-            .streaming_cached_artifact_by_path(&repo, "simple/numpy/numpy-2.0.0-py3-none-any.whl")
+            .streaming_cached_artifact_by_path(&repo, &cache_path)
             .await
             .expect("a cache miss must not be an error");
         assert!(probe.is_none(), "missing sidecar must probe as a miss");

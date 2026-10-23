@@ -14848,6 +14848,10 @@ mod tests {
         let server = MockServer::start().await;
         let wheel_body = b"fake-wheel-bytes";
 
+        // Per-test repo key: `load_cache_metadata` memoises sidecars (including
+        // misses) in a process-global LRU keyed by the storage key (#4814).
+        let repo_key = format!("pypi-remote-4814-{}", uuid::Uuid::new_v4());
+
         // Empty simple-index page → find_upstream_url_for_file returns None →
         // resolve_pypi_remote_fetch_target falls back to simple/{project}/{filename}.
         Mock::given(method("GET"))
@@ -14879,7 +14883,7 @@ mod tests {
         let result = fetch_from_pypi_remote_streaming(
             &proxy,
             repo_id,
-            "pypi-remote",
+            &repo_key,
             &server.uri(),
             &proj("numpy"),
             "numpy-2.0.0-py3-none-any.whl",
@@ -14900,7 +14904,7 @@ mod tests {
         let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
         let metadata_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
             &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
-            "pypi-remote",
+            &repo_key,
             cache_path,
         )
         .expect("metadata key");
@@ -17069,11 +17073,13 @@ mod tests {
         // Empty MissingStorage → streaming probe returns None without errors.
         let proxy = build_proxy_service_no_db();
         let repo_id = uuid::Uuid::new_v4();
+        // Per-test repo key: the sidecar LRU is process-global (#4814).
+        let repo_key = format!("pypi-remote-4814-{}", uuid::Uuid::new_v4());
 
         let result = super::proxy_helpers::proxy_check_cache_streaming(
             &proxy,
             repo_id,
-            "pypi-remote",
+            &repo_key,
             "https://pypi.org/simple",
             "simple/numpy/numpy-2.0.0-py3-none-any.whl",
             RepositoryFormat::Pypi,
