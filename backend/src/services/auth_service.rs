@@ -1050,6 +1050,13 @@ fn try_acquire_permit_from(
 /// **Replica scope:** this function is per-process. See the docstring on
 /// [`API_TOKEN_USER_INVALIDATIONS`] for the multi-replica caveat.
 pub fn invalidate_user_token_cache_entries(user_id: Uuid) {
+    // 0) Drop LDAP Basic-auth passthrough cache entries for this user. Both
+    //    the positive bind cache and the negative/per-username failure cache
+    //    must stop answering before the SQL that flips `is_active` commits,
+    //    because a positive entry otherwise carries the directory password
+    //    past a deactivation (#3830).
+    crate::services::ldap_basic_auth::invalidate_user(user_id);
+
     // 1) Record the invalidation timestamp BEFORE any SQL has committed.
     if let Ok(mut map) = api_token_user_invalidation_map().write() {
         map.insert(user_id, Instant::now());
@@ -2575,7 +2582,7 @@ impl AuthService {
     /// Fetch a user row by id, rejecting deactivated accounts. Shared by the
     /// refresh flow and any other path that needs the "currently-active"
     /// view of a user.
-    async fn load_active_user(&self, user_id: Uuid) -> Result<User> {
+    pub(crate) async fn load_active_user(&self, user_id: Uuid) -> Result<User> {
         sqlx::query_as!(
             User,
             r#"
@@ -3136,142 +3143,6 @@ impl AuthService {
         } else {
             0
         }
-    }
-
-    // =========================================================================
-    // T055: Federated Authentication Routing
-    // =========================================================================
-
-    /// Authenticate user by routing to the appropriate provider based on auth_provider type.
-    ///
-    /// This method looks up the user's auth_provider and delegates to the appropriate
-    /// authentication service (LDAP, OIDC, SAML) or performs local authentication.
-    ///
-    /// # Arguments
-    /// * `username` - The username to authenticate
-    /// * `password` - The password (for local/LDAP) or empty for token-based flows
-    /// * `provider_override` - Optional provider to force (useful for SSO initiation)
-    ///
-    /// # Returns
-    /// * `Ok((User, TokenPair))` - Authenticated user and JWT tokens
-    /// * `Err(AppError)` - Authentication failure
-    pub async fn authenticate_by_provider(
-        &self,
-        username: &str,
-        password: &str,
-        provider_override: Option<AuthProvider>,
-    ) -> Result<(User, TokenPair)> {
-        // First, look up the user to determine their auth provider
-        let user_lookup = sqlx::query!(
-            r#"
-            SELECT auth_provider as "auth_provider: AuthProvider"
-            FROM users
-            WHERE username = $1 AND is_active = true
-            "#,
-            username
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // Determine which provider to use
-        let provider = provider_override.or_else(|| user_lookup.map(|u| u.auth_provider));
-
-        match provider {
-            Some(AuthProvider::Local) | None => {
-                // Use local authentication
-                self.authenticate(username, password).await
-            }
-            Some(AuthProvider::Ldap) => {
-                // Delegate to LDAP service
-                // Note: ldap_service would be injected or created here in a full implementation
-                self.authenticate_ldap(username, password).await
-            }
-            Some(AuthProvider::Oidc) => {
-                // OIDC authentication is typically handled via callback, not direct auth
-                // This path would be used for token exchange after OIDC redirect
-                Err(AppError::Authentication(
-                    "OIDC authentication requires redirect flow. Use /auth/oidc/login endpoint."
-                        .to_string(),
-                ))
-            }
-            Some(AuthProvider::Saml) => {
-                // SAML authentication is handled via SSO assertion
-                // This path would be used for SAML response processing
-                Err(AppError::Authentication(
-                    "SAML authentication requires SSO flow. Use /auth/saml/login endpoint."
-                        .to_string(),
-                ))
-            }
-            Some(AuthProvider::Ci) => {
-                // CI authentication is handled via the CI OIDC token exchange endpoint.
-                Err(AppError::Authentication(
-                    "CI authentication requires a CI-issued OIDC JWT. Use /api/v1/auth/ci/token."
-                        .to_string(),
-                ))
-            }
-        }
-    }
-
-    /// Authenticate via LDAP provider.
-    ///
-    /// This is a placeholder that would delegate to LdapService in a full implementation.
-    async fn authenticate_ldap(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
-        // In a full implementation, this would:
-        // 1. Bind to LDAP server with user credentials
-        // 2. Fetch user attributes and groups
-        // 3. Call sync_federated_user to create/update user
-        // 4. Generate JWT tokens
-
-        // For now, check if user exists with LDAP provider
-        let user = sqlx::query_as!(
-            User,
-            r#"
-            SELECT
-                id, username, email, password_hash, display_name,
-                auth_provider as "auth_provider: AuthProvider",
-                external_id, is_admin, is_active, is_service_account, must_change_password,
-                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                failed_login_attempts, locked_until, last_failed_login_at,
-                password_changed_at, last_login_at, created_at, updated_at
-            FROM users
-            WHERE username = $1 AND auth_provider = 'ldap' AND is_active = true
-            "#,
-            username
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::Authentication("LDAP user not found".to_string()))?;
-
-        // In production, LDAP bind verification would happen here
-        // For development/testing, we check password if stored (hybrid mode)
-        if let Some(ref hash) = user.password_hash {
-            if !Self::verify_password(password, hash).await? {
-                return Err(AppError::Authentication("Invalid credentials".to_string()));
-            }
-        } else {
-            // Pure LDAP mode - would verify against LDAP server
-            return Err(AppError::Authentication(
-                "LDAP server verification not configured".to_string(),
-            ));
-        }
-
-        // Update last login. Throttled to at most once per 5 minutes per user
-        // (display-only field, #2107) to avoid needless WAL churn on re-auth.
-        sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() \
-             WHERE id = $1 \
-               AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
-            user.id
-        )
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let tokens = self.generate_tokens(&user)?;
-        self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
-        Ok((user, tokens))
     }
 
     /// Authenticate a federated user after successful SSO (OIDC/SAML).
@@ -4067,60 +3938,6 @@ mod tests {
         assert_eq!(
             row.last_login_at, t1,
             "last_login_at still throttled inside the window"
-        );
-
-        sqlx::query!("DELETE FROM users WHERE id = $1", id)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_standalone_login_throttles_last_login_at() {
-        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
-            return;
-        };
-        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
-
-        // LDAP hybrid mode: password_hash stored, auth_provider = 'ldap'.
-        let id = Uuid::new_v4();
-        let username = format!("throttle_ldap_{id}");
-        let password = "Correct!Horse9Battery";
-        let hash = AuthService::hash_password(password).await.unwrap();
-        sqlx::query!(
-            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
-             VALUES ($1, $2, $3, $4, 'ldap', true, false)",
-            id,
-            username,
-            format!("{username}@example.com"),
-            hash
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // (1) First login sets last_login_at on the standalone path.
-        svc.authenticate_ldap(&username, password).await.unwrap();
-        let t1: Option<DateTime<Utc>> =
-            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            t1.is_some(),
-            "first standalone login must set last_login_at"
-        );
-
-        // (2) A repeat login within 5 minutes does NOT advance it.
-        svc.authenticate_ldap(&username, password).await.unwrap();
-        let t2: Option<DateTime<Utc>> =
-            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            t1, t2,
-            "standalone last_login_at must not advance within 5 minutes"
         );
 
         sqlx::query!("DELETE FROM users WHERE id = $1", id)

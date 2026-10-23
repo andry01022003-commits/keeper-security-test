@@ -1245,6 +1245,9 @@ pub(crate) enum AuthOutcome {
     /// it did not coincide with a saturated cap); twine does not retry on
     /// 401 but does on 503.
     Overloaded,
+    /// The shared login limiter refused an LDAP Basic-auth passthrough bind
+    /// (#3830). Carries the `Retry-After` seconds.
+    RateLimited(u64),
 }
 
 /// Resolve a possibly-missing credential into an [`AuthOutcome`].
@@ -1295,6 +1298,73 @@ pub(crate) async fn try_resolve_auth_outcome(
     let mut failure = None;
     let outcome =
         resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+    if matches!(outcome, AuthOutcome::InvalidCredential) {
+        let (surface, reason) =
+            failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
+        record_auth_failure(surface, reason);
+    }
+    outcome
+}
+
+/// Resolve a credential with the opt-in LDAP Basic-auth passthrough (#3830).
+///
+/// Identical to [`try_resolve_auth_outcome`] for every credential form that
+/// already worked, with one addition: on the format/registry surfaces
+/// (`allow_basic_api_token = true`) a Basic `username:password` — or the
+/// base64 `username:password` that some clients put in a `Bearer` header —
+/// that failed bcrypt, JWT-as-password, and API-token-as-password is finally
+/// tried against the configured LDAP/AD provider.
+///
+/// The ordering is load-bearing: a directory bind is the most expensive and
+/// the only path that spends an AD account's failed-password budget, so it
+/// must run last. The passthrough itself is disabled unless
+/// `LDAP_BASIC_AUTH_PASSTHROUGH=true`, rate-limited through the shared
+/// `/v2/token` limiter, and cached per credential (see
+/// `services::ldap_basic_auth`).
+#[tracing::instrument(name = "authenticate", level = "info", skip_all)]
+pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
+    path: &str,
+    method: &str,
+) -> AuthOutcome {
+    let mut failure = None;
+    let outcome =
+        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+
+    if matches!(outcome, AuthOutcome::InvalidCredential) && allow_basic_api_token {
+        let basic = match extracted {
+            ExtractedToken::Basic(encoded) => decode_basic_credentials(encoded),
+            // npm/cargo/goproxy sometimes send base64 `user:pass` under
+            // `Bearer`; `resolve_auth_outcome` already tried it as bcrypt.
+            ExtractedToken::Bearer(token) => decode_basic_credentials(token),
+            ExtractedToken::ApiKey(_) | ExtractedToken::None | ExtractedToken::Invalid => None,
+        };
+        if let Some((username, password)) = basic {
+            match crate::services::ldap_basic_auth::try_authenticate(
+                auth_service,
+                &username,
+                &password,
+                path,
+                method,
+            )
+            .await
+            {
+                crate::services::ldap_basic_auth::Outcome::Resolved(user) => {
+                    return AuthOutcome::Resolved(AuthExtension::from(*user));
+                }
+                crate::services::ldap_basic_auth::Outcome::RateLimited(retry_after) => {
+                    return AuthOutcome::RateLimited(retry_after);
+                }
+                crate::services::ldap_basic_auth::Outcome::Unavailable => {
+                    return AuthOutcome::Overloaded;
+                }
+                crate::services::ldap_basic_auth::Outcome::Invalid => {}
+            }
+        }
+    }
+
     if matches!(outcome, AuthOutcome::InvalidCredential) {
         let (surface, reason) =
             failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
@@ -1704,6 +1774,8 @@ pub async fn optional_auth_middleware(
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
         // Handled above with an early 503 return.
         AuthOutcome::Overloaded => None,
+        // `try_resolve_auth_outcome` cannot produce this.
+        AuthOutcome::RateLimited(_) => None,
     };
 
     // If header-based auth produced no identity, fall back to a `?ticket=`
@@ -1796,11 +1868,27 @@ pub async fn repository_download_auth_middleware(
     // Download route: an API token IS accepted as the Basic password
     // (`allow_basic_api_token=true`), the format-route contract (#2786,
     // #4654). The management API keeps `false` (#2809).
-    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
+    let path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let method = request.method().as_str().to_string();
+    let outcome = try_resolve_auth_outcome_with_passthrough(
+        &vis_state.auth_service,
+        extracted,
+        true,
+        &path,
+        &method,
+    )
+    .await;
     // Transient bcrypt-capacity shed -> retryable 503 (see
     // `AuthOutcome::Overloaded`), never a 401.
     if matches!(outcome, AuthOutcome::Overloaded) {
         return service_unavailable_response();
+    }
+    if let AuthOutcome::RateLimited(retry_after) = outcome {
+        return rate_limited_response(retry_after);
     }
     let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
     let no_credential = matches!(outcome, AuthOutcome::NoCredential);
@@ -1809,6 +1897,8 @@ pub async fn repository_download_auth_middleware(
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
         // Handled above with an early 503 return.
         AuthOutcome::Overloaded => None,
+        // Handled above with an early 429 return.
+        AuthOutcome::RateLimited(_) => None,
     };
 
     // A `?ticket=` stands in for headers on this read-only route, exactly as
@@ -1899,6 +1989,10 @@ pub async fn admin_middleware(
     let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false).await {
         AuthOutcome::Resolved(ext) => ext,
         AuthOutcome::Overloaded => return service_unavailable_response(),
+        // `try_resolve_auth_outcome` cannot produce this.
+        AuthOutcome::RateLimited(retry_after) => {
+            return rate_limited_response(retry_after);
+        }
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
             let msg = match extracted {
                 ExtractedToken::Bearer(_) => "Invalid or expired token",
@@ -2516,6 +2610,21 @@ pub(super) fn service_unavailable_response() -> Response {
         .unwrap()
 }
 
+/// Build a 429 for a passthrough bind refused by the shared login limiter
+/// (`AuthOutcome::RateLimited`, #3830). The hint is the limiter's remaining
+/// window, so a package client can back off instead of hammering the
+/// directory.
+pub(super) fn rate_limited_response(retry_after: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(axum::http::header::RETRY_AFTER, retry_after.to_string())
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from(
+            "Too many authentication attempts, retry later",
+        ))
+        .unwrap()
+}
+
 /// Build a 403 response for API tokens that lack access to the requested
 /// repository.
 fn forbidden_repo_response() -> Response {
@@ -2846,6 +2955,9 @@ pub async fn repo_visibility_middleware(
             AuthOutcome::Resolved(ext) => Some(ext),
             AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
             AuthOutcome::Overloaded => None,
+            // `try_resolve_auth_outcome` cannot produce this, but the enum is
+            // shared with the passthrough-aware call above.
+            AuthOutcome::RateLimited(_) => None,
         };
         if credential_invalid && auth_ext.is_none() {
             return unauthorized_response();
@@ -2888,17 +3000,30 @@ pub async fn repo_visibility_middleware(
     let extracted = extract_visibility_token(&request);
     // Format/registry endpoint: preserve pip-netrc / Artifactory-style
     // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
-    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
+    let method = request.method().as_str().to_string();
+    let outcome = try_resolve_auth_outcome_with_passthrough(
+        &vis_state.auth_service,
+        extracted,
+        true,
+        &path,
+        &method,
+    )
+    .await;
     // Transient bcrypt-capacity shed -> retryable 503 (see
     // `AuthOutcome::Overloaded`), never a 401.
     if matches!(outcome, AuthOutcome::Overloaded) {
         return service_unavailable_response();
+    }
+    if let AuthOutcome::RateLimited(retry_after) = outcome {
+        return rate_limited_response(retry_after);
     }
     let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
     let mut auth_ext: Option<AuthExtension> = match outcome {
         AuthOutcome::Resolved(ext) => Some(ext),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
         AuthOutcome::Overloaded => None,
+        // Handled above with an early 429 return.
+        AuthOutcome::RateLimited(_) => None,
     };
     // `credential_invalid` was captured before the match consumed `outcome`.
 
@@ -8086,7 +8211,8 @@ mod tests {
                 AuthOutcome::Resolved(ext) => Some(ext),
                 AuthOutcome::NoCredential
                 | AuthOutcome::InvalidCredential
-                | AuthOutcome::Overloaded => None,
+                | AuthOutcome::Overloaded
+                | AuthOutcome::RateLimited(_) => None,
             }
         };
         assert!(flatten(AuthOutcome::NoCredential).is_none());

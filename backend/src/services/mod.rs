@@ -52,6 +52,7 @@ pub mod http_client;
 pub mod image_build_service;
 pub mod image_scanner;
 pub mod incus_scanner;
+pub mod ldap_basic_auth;
 pub mod ldap_env_bootstrap;
 pub mod ldap_service;
 pub mod ldap_sync_service;

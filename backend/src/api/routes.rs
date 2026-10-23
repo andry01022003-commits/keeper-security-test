@@ -212,6 +212,15 @@ pub fn create_router(state: SharedState) -> Router {
     // per source IP per window) instead of no trace at all.
     login_rate_limit_state.audit = Some(Arc::new(LoginRateLimitAudit::new(state.db.clone())));
 
+    // The `/v2/token` state has the larger per-(username, IP) bucket package
+    // clients need, and shares the login limiter's global backstop. LDAP
+    // Basic-auth passthrough (#3830) draws from THIS state: a directory bind
+    // must spend the same budget as the OCI credential exchange, and the
+    // format routes had no login budget before the passthrough.
+    let token_exchange_rate_limit_state =
+        build_token_exchange_rate_limit_state(&login_rate_limit_state, &state.config);
+    crate::services::ldap_basic_auth::install_rate_limit(token_exchange_rate_limit_state.clone());
+
     let mut router = router
         // API v1 routes
         .nest(
@@ -241,10 +250,7 @@ pub fn create_router(state: SharedState) -> Router {
         // interactive logins the login bucket allows.
         .nest(
             "/v2",
-            handlers::oci_v2::router(Some(build_token_exchange_rate_limit_state(
-                &login_rate_limit_state,
-                &state.config,
-            ))),
+            handlers::oci_v2::router(Some(token_exchange_rate_limit_state)),
         )
         // All native-protocol format handler routes (repo visibility enforced)
         .merge(format_routes);
