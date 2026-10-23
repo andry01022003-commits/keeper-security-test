@@ -15,6 +15,8 @@ New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR;
 
 - **The PyPI age gate no longer blocks old releases whose filename spells the version differently from the Warehouse release** (#4907). The gate looked up a distribution's publish time by the exact version string in its filename, but Warehouse keys `releases` by the release's own spelling, so `cuda_toolkit-13.0.3.0-py2.py3-none-any.whl` (release `13.0.3`, uploaded months earlier) found no publish time and was withheld with a 451 indefinitely, which broke `pip install torch==2.14.1` on Linux. The lookup now falls back to PEP 440 equality on the download path and in both simple-index listing filters; a version that is not PEP 440-equal to a release still has no publish time and stays gated.
 
+- **Two replication tests no longer race the background push queue** (#4911). The NuGet and nested RPM echo tests added for #4792 read `sync_tasks` before the spawned task that queues the client upload's push had written its row, so they failed intermittently in CI. They now wait for that task to settle before asserting. Test-only change; no production code changed.
+
 ### Security
 
 - **`ctutils` bumped 0.4.0 -> 0.4.5 for RUSTSEC-2026-0385** (#4910). `ctutils` 0.4.0 generated masks and compared `u128` values in non-constant time. It reaches the backend through `crypto-bigint` under the `bergshamra` XML signature crates. Lockfile-only; no behaviour change.
