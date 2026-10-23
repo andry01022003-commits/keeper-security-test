@@ -6637,7 +6637,13 @@ mod push_db_tests {
             String::from_utf8_lossy(&body)
         );
 
-        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        let queued = tdh::queued_push_paths_settled(
+            &f.pool,
+            peer_id,
+            f.repo_id,
+            "replpkg/1.0.0/replpkg.1.0.0.nupkg",
+        )
+        .await;
         tdh::delete_push_peer(&f.pool, peer_id).await;
         f.teardown().await;
         assert_eq!(
