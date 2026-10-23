@@ -3529,33 +3529,83 @@ fn should_enqueue_maven_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
 }
 
+/// Take the transaction-scoped lock that serialises every decision about the
+/// object at one hosted Maven storage key (#4837).
+///
+/// Two holders exist: the publishing transaction of `upload` and the cleanup
+/// in [`discard_failed_maven_publish`]. The lock name is the physical object:
+/// backend plus key, plus the repository id on repo-isolated backends
+/// (filesystem), where the same key string in two repositories names two
+/// different objects. A hash collision between two names only serialises two
+/// unrelated publishes; it never lets two holders of one name overlap.
+async fn lock_maven_publish_key(
+    conn: &mut sqlx::PgConnection,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<(), sqlx::Error> {
+    let scope = if crate::storage::registry::backend_is_repo_isolated(storage_backend) {
+        repository_id.to_string()
+    } else {
+        String::new()
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "maven-publish\u{1f}{storage_backend}\u{1f}{scope}\u{1f}{storage_key}"
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Discard the object a hosted Maven upload wrote when the publish it was
 /// written for never commits (#4837).
 ///
 /// `upload` stores the bytes BEFORE the transaction that inserts the
-/// `artifacts` and `artifact_metadata` rows (#3814). If that transaction — or
-/// the POM read in front of it — fails, the client gets an error while the
-/// object stays at `storage_key`. Because the download path falls back to the
-/// repository's storage prefix when no row matches, those bytes then stay
-/// consumable: a deploy the server explicitly rejected is downloadable, and it
-/// bypasses the catalog's quarantine, scan, lifecycle, download accounting and
-/// search bookkeeping.
+/// `artifacts` and `artifact_metadata` rows (#3814). If that transaction, or
+/// the POM read in front of it, fails, the client gets an error while the
+/// object stays at `storage_key`, and the download path's row-less storage
+/// fallbacks would keep serving the rejected deploy, outside the catalog's
+/// quarantine, scan, lifecycle and download accounting.
+///
+/// # Concurrent publishes of the same key
+///
+/// Every upload of one coordinate writes the same key, and an upload stores
+/// its bytes before it opens its transaction. So a failing upload A can run
+/// this cleanup after an overlapping upload B of the same coordinate has
+/// stored its bytes but before B has committed its row; deleting then would
+/// destroy the bytes B is about to publish. Two rules close that window:
+///
+/// * This cleanup and B's publishing transaction both hold
+///   [`lock_maven_publish_key`] for the key. The cleanup decides under the
+///   lock: a live `artifacts` row naming the key means a publish has
+///   committed, and the object is left alone. While B's transaction holds the
+///   lock the cleanup waits, and it then sees B's committed row (or B's
+///   rollback, in which case B runs its own cleanup).
+/// * B's transaction, right after taking the lock, checks that the object is
+///   still at the key and, if a cleanup removed it in the meantime, writes it
+///   again from B's staged copy, and re-asserts B's flat-key claim inside the
+///   transaction. A cleanup can only run strictly before that check or
+///   strictly after B commits, so B never commits a row whose object a
+///   cleanup deleted.
+///
+/// The guarantee: an `artifacts` row that commits always names an object
+/// that was present when it committed, and an object left with no row is
+/// one no publish is still going to claim.
+///
+/// The lock is held across the storage delete, which only happens on this
+/// failure path. A republishable `-SNAPSHOT` overwrite writes its new bytes
+/// to an already-published artifact's key, so the live-row rule also keeps a
+/// failed republish from deleting a published artifact's object.
 ///
 /// Best-effort by design: the caller is already returning the failure that
-/// triggered this, and a cleanup error must never replace that response. Two
-/// guards keep it from deleting live data:
-///
-/// * A live `artifacts` row that still names `storage_key` wins. A republishable
-///   `-SNAPSHOT` overwrite writes its new bytes to an already-published
-///   artifact's key, so a failed republish must leave them in place: the
-///   artifact is published, only this revision attempt failed.
-/// * The flat-key attribution claim is released only AFTER the object is gone.
-///   Releasing it on a failed delete would let another repository claim — and
-///   then be served — bytes this repository could not reclaim (#2584).
-///
-/// A delete that fails anyway leaves an object with no catalog row, which the
-/// row-driven orphan sweep cannot see; the warning is the operator's only
-/// signal, so it names the key.
+/// triggered this, and a cleanup error must never replace that response. Any
+/// error before the delete keeps the object (fail closed). The flat-key claim
+/// is released only after the object is gone, in the same locked
+/// transaction: releasing it on a failed delete would let another repository
+/// claim, and then be served, bytes this repository could not reclaim
+/// (#2584). A delete that fails leaves an object with no catalog row, which
+/// the row-driven orphan sweep cannot see, so the warning names the key.
 async fn discard_failed_maven_publish(
     db: &PgPool,
     storage: &Arc<dyn crate::storage::StorageBackend>,
@@ -3564,48 +3614,65 @@ async fn discard_failed_maven_publish(
     storage_key: &str,
     claim: crate::services::maven_flat_attribution::FlatKeyWriteClaim,
 ) {
-    let still_published = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM artifacts \
-         WHERE storage_key = $1 AND is_deleted = false)",
-    )
-    .bind(storage_key)
-    .fetch_one(db)
-    .await;
-    match still_published {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(e) => {
-            // Fail closed: without proof that no row references the key, leave
-            // the object alone rather than delete bytes a live artifact may be
-            // serving.
-            warn!(
-                error = %e,
-                storage_key = %storage_key,
-                "could not check whether a failed Maven publish left a live row at its \
-                 storage key; keeping the object"
-            );
-            return;
+    let result: Result<(), String> = async {
+        let mut tx = db.begin().await.map_err(|e| e.to_string())?;
+        lock_maven_publish_key(&mut tx, repository_id, storage_backend, storage_key)
+            .await
+            .map_err(|e| e.to_string())?;
+        // On a repo-isolated backend the same key string in another
+        // repository is a different object, so only this repository's rows
+        // count there. On a shared namespace any live row naming the key
+        // shares the object.
+        let still_published = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM artifacts \
+             WHERE storage_key = $1 AND is_deleted = false \
+               AND (repository_id = $2 OR NOT $3))",
+        )
+        .bind(storage_key)
+        .bind(repository_id)
+        .bind(crate::storage::registry::backend_is_repo_isolated(
+            storage_backend,
+        ))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if still_published {
+            return Ok(());
         }
-    }
-    match storage.delete(storage_key).await {
-        Ok(()) => {
-            release_flat_key_claim_best_effort(
-                db,
-                claim,
-                repository_id,
-                storage_backend,
-                storage_key,
-            )
-            .await;
-        }
-        Err(e) => {
+        if let Err(e) = storage.delete(storage_key).await {
             warn!(
                 error = %e,
                 storage_key = %storage_key,
                 "failed to remove the object of an uncommitted Maven publish; it stays \
                  unreferenced in storage and needs manual cleanup"
             );
+            return Ok(());
         }
+        if let Err(e) = crate::services::maven_flat_attribution::release_flat_key_claim(
+            &mut *tx,
+            claim,
+            repository_id,
+            storage_backend,
+            storage_key,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                storage_key = %storage_key,
+                "failed to release flat-key write claim after a failed Maven publish; \
+                 a later write or the migration-163 backfill will reconcile it"
+            );
+        }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+    .await;
+    if let Err(e) = result {
+        warn!(
+            error = %e,
+            storage_key = %storage_key,
+            "could not settle the object of a failed Maven publish; keeping it"
+        );
     }
 }
 
@@ -3877,8 +3944,6 @@ async fn upload(
     } else {
         Bytes::new()
     };
-    // Scratch file no longer needed once the object is stored and any POM read.
-    drop(staged);
     let mut file_metadata =
         crate::formats::FormatHandler::parse_metadata(&handler, &path, &pom_bytes)
             .await
@@ -3925,6 +3990,29 @@ async fn upload(
     // fallbacks would serve the rejected upload from storage otherwise.
     let published: Result<(uuid::Uuid, chrono::DateTime<chrono::Utc>), Response> = async {
         let mut tx = state.db.begin().await.map_err(map_db_err)?;
+        // #4837: serialise against `discard_failed_maven_publish` for this key
+        // (see its doc comment). A failed overlapping upload of the same
+        // coordinate may already have removed the object this request stored,
+        // and released the claim it relied on; restore both under the lock so
+        // the row below never commits without its bytes.
+        lock_maven_publish_key(&mut tx, repo.id, &repo.storage_backend, &storage_key)
+            .await
+            .map_err(map_db_err)?;
+        if !matches!(storage.content_already_stored(&storage_key).await, Ok(true)) {
+            let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+            storage
+                .put_stream(&storage_key, stream)
+                .await
+                .map_err(map_storage_err)?;
+        }
+        crate::services::maven_flat_attribution::claim_flat_key_for_write_on(
+            &mut tx,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
         super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
             .await?;
         let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
@@ -3999,6 +4087,9 @@ async fn upload(
         Ok((artifact_id, artifact_created))
     }
     .await;
+    // Scratch file no longer needed once the publish has settled: the locked
+    // transaction above may have had to write the object again from it.
+    drop(staged);
 
     let (artifact_id, artifact_created) = match published {
         Ok(published) => published,
@@ -6635,6 +6726,103 @@ mod tests {
         );
         assert_eq!(get_status, StatusCode::OK, "the published jar is served");
         assert_eq!(get_body, second);
+    }
+
+    /// #4837 review, the other interleaving: a failed publisher's cleanup that
+    /// runs after an overlapping upload stored its bytes but before that
+    /// upload's transaction took the publish lock. The test holds the lock
+    /// itself, waits until the upload has stored its object, then plays the
+    /// cleanup (deletes the object and the claim) and lets go. The upload
+    /// must notice under the lock that its object is gone, write it again
+    /// from its staged copy and re-assert its claim, so the row it commits
+    /// names bytes that exist.
+    #[tokio::test]
+    async fn test_publish_restores_object_removed_by_concurrent_cleanup_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let Some(pool) = crate::testing::try_pool_with(6).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let path = "com/example/restore4837/demo/1.0.0/demo-1.0.0.jar";
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let jar = bytes::Bytes::from_static(b"restored-jar-bytes-4837");
+
+        let mut holder = pool.begin().await.expect("lock holder tx");
+        super::lock_maven_publish_key(&mut holder, repo_id, "s3", &scoped_key)
+            .await
+            .expect("take publish lock");
+        let put = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), jar.clone())),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !mem.objects.lock().unwrap().contains_key(&scoped_key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload never stored its object"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Play the cleanup of a failed overlapping publish.
+        mem.objects.lock().unwrap().remove(&scoped_key);
+        sqlx::query(
+            "DELETE FROM maven_flat_object_owner \
+             WHERE storage_backend = 's3' AND storage_key = $1",
+        )
+        .bind(&scoped_key)
+        .execute(&mut *holder)
+        .await
+        .expect("drop claim");
+        holder.commit().await.expect("release publish lock");
+
+        let status = put.await.expect("join put").expect("put").status();
+        let stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let claim_owner: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT repository_id FROM maven_flat_object_owner \
+             WHERE storage_backend = 's3' AND storage_key = $1",
+        )
+        .bind(&scoped_key)
+        .fetch_optional(&pool)
+        .await
+        .expect("read claim");
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            stored,
+            Some(jar.clone()),
+            "the publish must restore the object a concurrent cleanup removed"
+        );
+        assert_eq!(
+            claim_owner,
+            Some(repo_id),
+            "the publish must re-assert the flat-key claim the cleanup released"
+        );
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_body, jar);
     }
 
     /// #3181: `HEAD` on a Maven artifact served from a presigned-redirect
