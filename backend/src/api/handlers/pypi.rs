@@ -2549,7 +2549,9 @@ async fn apply_pypi_download_age_gate(
             .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
             .await
             .ok()
-            .and_then(|times| times.get(&version).copied())
+            .and_then(|times| {
+                crate::services::age_gate_service::pypi_publish_time(&times, &version)
+            })
     } else {
         None
     };

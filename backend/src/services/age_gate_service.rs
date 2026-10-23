@@ -2154,13 +2154,39 @@ pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexPars
     (spans, versions)
 }
 
+/// Look up a PyPI version's publish time, matching PEP 440-equal spellings.
+///
+/// Warehouse keys `releases` by the release's own spelling (`13.0.3`), but a
+/// distribution filename may spell the same version differently
+/// (`cuda_toolkit-13.0.3.0-...whl`, `setuptools-69.3.tar.gz` under `69.3.0`).
+/// An exact-string miss reads as "no publish time", which the gate treats as
+/// young and blocks (#2066), so an old release would be withheld forever.
+/// Falls back to comparing PEP 440 sort keys; on more than one match the
+/// youngest wins, so the fallback is never more permissive than an exact hit.
+pub(crate) fn pypi_publish_time(
+    publish_times: &std::collections::HashMap<String, DateTime<Utc>>,
+    version: &str,
+) -> Option<DateTime<Utc>> {
+    if let Some(ts) = publish_times.get(version) {
+        return Some(*ts);
+    }
+    let wanted = crate::formats::pypi::PypiHandler::pep440_sort_key(version)?;
+    publish_times
+        .iter()
+        .filter(|(key, _)| {
+            crate::formats::pypi::PypiHandler::pep440_sort_key(key).as_ref() == Some(&wanted)
+        })
+        .map(|(_, ts)| *ts)
+        .max()
+}
+
 /// Attach publish times to parsed simple-index versions.
 pub(crate) fn attach_pypi_publish_times(
     versions: &mut [(String, Option<DateTime<Utc>>)],
     publish_times: &std::collections::HashMap<String, DateTime<Utc>>,
 ) {
     for (ver, ts) in versions {
-        *ts = publish_times.get(ver).copied();
+        *ts = pypi_publish_time(publish_times, ver);
     }
 }
 
@@ -2298,7 +2324,7 @@ pub(crate) fn fill_missing_publish_times(
 ) {
     for (version, ts) in versions {
         if ts.is_none() {
-            *ts = fallback.get(version).copied();
+            *ts = pypi_publish_time(fallback, version);
         }
     }
 }
@@ -3683,6 +3709,62 @@ mod tests {
         assert_eq!(versions[0].1, Some(doc_time), "document time kept");
         assert_eq!(versions[1].1, Some(fallback_time), "gap filled");
         assert_eq!(versions[2].1, None, "absent from fallback stays None");
+    }
+
+    #[test]
+    fn pypi_publish_time_matches_pep440_equal_spellings() {
+        // Real Warehouse shapes: `cuda-toolkit` release `13.0.3` ships
+        // `cuda_toolkit-13.0.3.0-py2.py3-none-any.whl`, and `setuptools`
+        // release `69.3.0` ships `setuptools-69.3.tar.gz`. Exact-string
+        // lookup missed both, so an old release was gated as young forever.
+        let published = Utc.with_ymd_and_hms(2026, 4, 14, 0, 50, 8).unwrap();
+        let times = std::collections::HashMap::from([
+            ("13.0.3".to_string(), published),
+            ("69.3.0".to_string(), published),
+            ("4.21.0rc1".to_string(), published),
+        ]);
+
+        assert_eq!(pypi_publish_time(&times, "13.0.3"), Some(published));
+        assert_eq!(pypi_publish_time(&times, "13.0.3.0"), Some(published));
+        assert_eq!(pypi_publish_time(&times, "69.3"), Some(published));
+        assert_eq!(pypi_publish_time(&times, "4.21.0_rc_1"), Some(published));
+
+        // Not the same version under PEP 440: still a miss, still gated.
+        assert_eq!(pypi_publish_time(&times, "13.0.3.1"), None);
+        assert_eq!(pypi_publish_time(&times, "13.0.3.post0"), None);
+        assert_eq!(pypi_publish_time(&times, "not-a-version"), None);
+    }
+
+    #[test]
+    fn pypi_publish_time_prefers_youngest_of_equal_spellings() {
+        let old = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let young = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let times = std::collections::HashMap::from([
+            ("1.0".to_string(), old),
+            ("1.0.0".to_string(), young),
+        ]);
+        assert_eq!(pypi_publish_time(&times, "1.0.0.0"), Some(young));
+        assert_eq!(
+            pypi_publish_time(&times, "1.0"),
+            Some(old),
+            "exact hit wins"
+        );
+    }
+
+    #[test]
+    fn listing_helpers_attach_times_for_pep440_equal_filename_versions() {
+        let published = Utc.with_ymd_and_hms(2026, 4, 14, 0, 50, 8).unwrap();
+        let warehouse = std::collections::HashMap::from([("13.0.3".to_string(), published)]);
+
+        let html = r#"<a href="/pkg/cuda_toolkit-13.0.3.0-py2.py3-none-any.whl">wheel</a>"#;
+        let (_, mut versions) = parse_pypi_simple_index_anchors(html);
+        assert_eq!(versions, vec![("13.0.3.0".to_string(), None)]);
+        attach_pypi_publish_times(&mut versions, &warehouse);
+        assert_eq!(versions[0].1, Some(published), "HTML listing path");
+
+        let mut versions = vec![("13.0.3.0".to_string(), None)];
+        fill_missing_publish_times(&mut versions, &warehouse);
+        assert_eq!(versions[0].1, Some(published), "JSON fallback path");
     }
 
     #[test]
