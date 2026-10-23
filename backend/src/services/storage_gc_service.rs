@@ -3875,6 +3875,12 @@ where
 /// candidate sweep re-tests each key against every surviving repository, so
 /// recording a key that stays shared costs one dropped row.
 ///
+/// The repository's own revision history (`artifact_versions`, #4865) is
+/// covered too: those rows cascade away with the live ones, so a revision key
+/// the purge spares for a surviving repository needs the same hand-off — and a
+/// revision key the purge removes directly is already in `purged` and stays
+/// out of the candidate set.
+///
 /// MUST run BEFORE the repository row is deleted. Idempotent, like
 /// [`record_oci_gc_candidates`]. Returns the number of rows newly recorded.
 pub(crate) async fn record_spared_artifact_gc_candidates(
@@ -3889,13 +3895,16 @@ pub(crate) async fn record_spared_artifact_gc_candidates(
         r#"
         INSERT INTO oci_gc_candidates
             (storage_key, storage_backend, storage_path, source_repository_id)
-        SELECT DISTINCT a.storage_key, $2, $3, $1
-          FROM artifacts a
-         WHERE a.repository_id = $1
-           AND a.storage_key NOT LIKE 'proxy-cache/%'
-           AND a.storage_key NOT LIKE '{manifest}%'
-           AND a.storage_key NOT LIKE '{blob}%'
-           AND NOT (a.storage_key = ANY($4))
+        SELECT DISTINCT k.storage_key, $2, $3, $1
+          FROM (
+            SELECT a.storage_key FROM artifacts a WHERE a.repository_id = $1
+            UNION
+            SELECT v.storage_key FROM artifact_versions v WHERE v.repository_id = $1
+          ) k
+         WHERE k.storage_key NOT LIKE 'proxy-cache/%'
+           AND k.storage_key NOT LIKE '{manifest}%'
+           AND k.storage_key NOT LIKE '{blob}%'
+           AND NOT (k.storage_key = ANY($4))
         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING
         "#,
         manifest = crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX,
