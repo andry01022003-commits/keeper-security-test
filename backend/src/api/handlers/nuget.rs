@@ -6635,19 +6635,13 @@ mod push_db_tests {
             String::from_utf8_lossy(&body)
         );
 
-        // The artifact service queues push tasks from a spawned task, so wait
-        // for the client push's task to land, then give a wrongly queued
-        // replicated task the same chance before reading the final list.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while tdh::queued_push_paths(&f.pool, peer_id, f.repo_id)
-            .await
-            .is_empty()
-            && std::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        let queued = tdh::queued_push_paths_settled(
+            &f.pool,
+            peer_id,
+            f.repo_id,
+            "replpkg/1.0.0/replpkg.1.0.0.nupkg",
+        )
+        .await;
         tdh::delete_push_peer(&f.pool, peer_id).await;
         f.teardown().await;
         assert_eq!(

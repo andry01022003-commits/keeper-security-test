@@ -4408,7 +4408,13 @@ mod tests {
             String::from_utf8_lossy(&resp)
         );
 
-        let queued = tdh::queued_push_paths(&f.pool, peer_id, f.repo_id).await;
+        let queued = tdh::queued_push_paths_settled(
+            &f.pool,
+            peer_id,
+            f.repo_id,
+            "build-a/repl-rpm-1.0-1.noarch.rpm",
+        )
+        .await;
         tdh::delete_push_peer(&f.pool, peer_id).await;
         f.teardown().await;
         assert_eq!(
