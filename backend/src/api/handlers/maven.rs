@@ -3252,7 +3252,20 @@ async fn serve_artifact(
             // under the scoped scheme (checksums, verbatim metadata) live at
             // `maven/{repo.id}/{path}`. The key embeds this repository's id,
             // so it needs no attribution gate.
-            if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
+            //
+            // #4837: scoped keys exist only for uploads this server performed
+            // under the scoped scheme, and every non-row-less one of those also
+            // inserts its `artifacts` row in the same request. A REAL artifact
+            // coordinate reaching this point with no live row therefore has no
+            // publish behind it — it is the object of an upload whose ledger
+            // transaction failed (see `discard_failed_maven_publish`), and the
+            // scoped prefix must not turn that rejected deploy into a 200. Only
+            // the two path classes the scoped read exists for are served here;
+            // published artifacts resolve through their row above.
+            let rowless = is_rowless_maven_path(path);
+            if rowless
+                && (repo.repo_type == RepositoryType::Local
+                    || repo.repo_type == RepositoryType::Staging)
             {
                 if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env()
                     .scoped_read_key(&repo.storage_backend, "maven", repo.id, path)
@@ -3494,6 +3507,153 @@ fn build_maven_package_catalog_metadata(
 
 fn should_enqueue_maven_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
+}
+
+/// Take the transaction-scoped lock that serialises every decision about the
+/// object at one hosted Maven storage key (#4837).
+///
+/// Two holders exist: the publishing transaction of `upload` and the cleanup
+/// in [`discard_failed_maven_publish`]. The lock name is the physical object:
+/// backend plus key, plus the repository id on repo-isolated backends
+/// (filesystem), where the same key string in two repositories names two
+/// different objects. A hash collision between two names only serialises two
+/// unrelated publishes; it never lets two holders of one name overlap.
+async fn lock_maven_publish_key(
+    conn: &mut sqlx::PgConnection,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<(), sqlx::Error> {
+    let scope = if crate::storage::registry::backend_is_repo_isolated(storage_backend) {
+        repository_id.to_string()
+    } else {
+        String::new()
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "maven-publish\u{1f}{storage_backend}\u{1f}{scope}\u{1f}{storage_key}"
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Discard the object a hosted Maven upload wrote when the publish it was
+/// written for never commits (#4837).
+///
+/// `upload` stores the bytes BEFORE the transaction that inserts the
+/// `artifacts` and `artifact_metadata` rows (#3814). If that transaction, or
+/// the POM read in front of it, fails, the client gets an error while the
+/// object stays at `storage_key`, and the download path's row-less storage
+/// fallbacks would keep serving the rejected deploy, outside the catalog's
+/// quarantine, scan, lifecycle and download accounting.
+///
+/// # Concurrent publishes of the same key
+///
+/// Every upload of one coordinate writes the same key, and an upload stores
+/// its bytes before it opens its transaction. So a failing upload A can run
+/// this cleanup after an overlapping upload B of the same coordinate has
+/// stored its bytes but before B has committed its row; deleting then would
+/// destroy the bytes B is about to publish. Two rules close that window:
+///
+/// * This cleanup and B's publishing transaction both hold
+///   [`lock_maven_publish_key`] for the key. The cleanup decides under the
+///   lock: a live `artifacts` row naming the key means a publish has
+///   committed, and the object is left alone. While B's transaction holds the
+///   lock the cleanup waits, and it then sees B's committed row (or B's
+///   rollback, in which case B runs its own cleanup).
+/// * B's transaction, right after taking the lock, checks that the object is
+///   still at the key and, if a cleanup removed it in the meantime, writes it
+///   again from B's staged copy, and re-asserts B's flat-key claim inside the
+///   transaction. A cleanup can only run strictly before that check or
+///   strictly after B commits, so B never commits a row whose object a
+///   cleanup deleted.
+///
+/// The guarantee: an `artifacts` row that commits always names an object
+/// that was present when it committed, and an object left with no row is
+/// one no publish is still going to claim.
+///
+/// The lock is held across the storage delete, which only happens on this
+/// failure path. A republishable `-SNAPSHOT` overwrite writes its new bytes
+/// to an already-published artifact's key, so the live-row rule also keeps a
+/// failed republish from deleting a published artifact's object.
+///
+/// Best-effort by design: the caller is already returning the failure that
+/// triggered this, and a cleanup error must never replace that response. Any
+/// error before the delete keeps the object (fail closed). The flat-key claim
+/// is released only after the object is gone, in the same locked
+/// transaction: releasing it on a failed delete would let another repository
+/// claim, and then be served, bytes this repository could not reclaim
+/// (#2584). A delete that fails leaves an object with no catalog row, which
+/// the row-driven orphan sweep cannot see, so the warning names the key.
+async fn discard_failed_maven_publish(
+    db: &PgPool,
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+    claim: crate::services::maven_flat_attribution::FlatKeyWriteClaim,
+) {
+    let result: Result<(), String> = async {
+        let mut tx = db.begin().await.map_err(|e| e.to_string())?;
+        lock_maven_publish_key(&mut tx, repository_id, storage_backend, storage_key)
+            .await
+            .map_err(|e| e.to_string())?;
+        // On a repo-isolated backend the same key string in another
+        // repository is a different object, so only this repository's rows
+        // count there. On a shared namespace any live row naming the key
+        // shares the object.
+        let still_published = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM artifacts \
+             WHERE storage_key = $1 AND is_deleted = false \
+               AND (repository_id = $2 OR NOT $3))",
+        )
+        .bind(storage_key)
+        .bind(repository_id)
+        .bind(crate::storage::registry::backend_is_repo_isolated(
+            storage_backend,
+        ))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if still_published {
+            return Ok(());
+        }
+        if let Err(e) = storage.delete(storage_key).await {
+            warn!(
+                error = %e,
+                storage_key = %storage_key,
+                "failed to remove the object of an uncommitted Maven publish; it stays \
+                 unreferenced in storage and needs manual cleanup"
+            );
+            return Ok(());
+        }
+        if let Err(e) = crate::services::maven_flat_attribution::release_flat_key_claim(
+            &mut *tx,
+            claim,
+            repository_id,
+            storage_backend,
+            storage_key,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                storage_key = %storage_key,
+                "failed to release flat-key write claim after a failed Maven publish; \
+                 a later write or the migration-163 backfill will reconcile it"
+            );
+        }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+    .await;
+    if let Err(e) = result {
+        warn!(
+            error = %e,
+            storage_key = %storage_key,
+            "could not settle the object of a failed Maven publish; keeping it"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3744,16 +3904,26 @@ async fn upload(
     // large artifact is never materialised in memory.
     let handler = MavenHandler::new();
     let pom_bytes = if MavenHandler::is_pom(&path) {
-        Bytes::from(
-            tokio::fs::read(staged.path())
-                .await
-                .map_err(|e| proxy_helpers::internal_error("Reading staged POM", e))?,
-        )
+        // #4837: the object is already stored, so a failure to read the staged
+        // POM must not leave it behind — nothing is published.
+        match tokio::fs::read(staged.path()).await {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(e) => {
+                discard_failed_maven_publish(
+                    &state.db,
+                    &storage,
+                    repo.id,
+                    &repo.storage_backend,
+                    &storage_key,
+                    flat_key_claim,
+                )
+                .await;
+                return Err(proxy_helpers::internal_error("Reading staged POM", e));
+            }
+        }
     } else {
         Bytes::new()
     };
-    // Scratch file no longer needed once the object is stored and any POM read.
-    drop(staged);
     let mut file_metadata =
         crate::formats::FormatHandler::parse_metadata(&handler, &path, &pom_bytes)
             .await
@@ -3793,76 +3963,129 @@ async fn upload(
     // path (#3587 review): a metadata write that fails after the row landed
     // would otherwise leave a live artifact with no Maven metadata, and a
     // concurrent republish must never observe the row without it.
-    let mut tx = state.db.begin().await.map_err(map_db_err)?;
-    super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
-        .await?;
-    let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as(
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_sha1, checksum_md5,
-                content_type, storage_key, uploaded_by
+    //
+    // #4837: the bytes are already in storage at this point, so every failure
+    // in this ledger rollback must also take the object with it. A rolled-back
+    // insert leaves nothing for the download path to match, and its row-less
+    // fallbacks would serve the rejected upload from storage otherwise.
+    let published: Result<(uuid::Uuid, chrono::DateTime<chrono::Utc>), Response> = async {
+        let mut tx = state.db.begin().await.map_err(map_db_err)?;
+        // #4837: serialise against `discard_failed_maven_publish` for this key
+        // (see its doc comment). A failed overlapping upload of the same
+        // coordinate may already have removed the object this request stored,
+        // and released the claim it relied on; restore both under the lock so
+        // the row below never commits without its bytes.
+        lock_maven_publish_key(&mut tx, repo.id, &repo.storage_backend, &storage_key)
+            .await
+            .map_err(map_db_err)?;
+        if !matches!(storage.content_already_stored(&storage_key).await, Ok(true)) {
+            let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+            storage
+                .put_stream(&storage_key, stream)
+                .await
+                .map_err(map_storage_err)?;
+        }
+        crate::services::maven_flat_attribution::claim_flat_key_for_write_on(
+            &mut tx,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+        super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
+            .await?;
+        let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as(
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, checksum_sha1, checksum_md5,
+                    content_type, storage_key, uploaded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (repository_id, path) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    version = EXCLUDED.version,
+                    size_bytes = EXCLUDED.size_bytes,
+                    checksum_sha256 = EXCLUDED.checksum_sha256,
+                    checksum_sha1 = EXCLUDED.checksum_sha1,
+                    checksum_md5 = EXCLUDED.checksum_md5,
+                    content_type = EXCLUDED.content_type,
+                    storage_key = EXCLUDED.storage_key,
+                    uploaded_by = EXCLUDED.uploaded_by,
+                    is_deleted = false,
+                    updated_at = NOW()
+                WHERE $12::boolean
+                RETURNING id, created_at
+                "#,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (repository_id, path) DO UPDATE SET
-                name = EXCLUDED.name,
-                version = EXCLUDED.version,
-                size_bytes = EXCLUDED.size_bytes,
-                checksum_sha256 = EXCLUDED.checksum_sha256,
-                checksum_sha1 = EXCLUDED.checksum_sha1,
-                checksum_md5 = EXCLUDED.checksum_md5,
-                content_type = EXCLUDED.content_type,
-                storage_key = EXCLUDED.storage_key,
-                uploaded_by = EXCLUDED.uploaded_by,
-                is_deleted = false,
-                updated_at = NOW()
-            WHERE $12::boolean
-            RETURNING id, created_at
+            .bind(repo.id)
+            .bind(&path)
+            .bind(&name)
+            .bind(&coords.version)
+            .bind(size_bytes)
+            .bind(&checksum_sha256)
+            .bind(&checksum_sha1)
+            .bind(&checksum_md5)
+            .bind(ct)
+            .bind(&storage_key)
+            .bind(user_id)
+            .bind(republishable)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
+            // row: a concurrent PUT won the race between the duplicate check above
+            // and this statement. Answer it the same 409 the check itself would
+            // have, rather than the 500 the bare INSERT raised (#3587).
+            .ok_or_else(|| {
+                AppError::Conflict("Artifact already exists".to_string()).into_response()
+            })?;
+
+        // The durable attribution claim for this key was already committed by the
+        // atomic `claim_flat_key_for_write` gate above (before the put), so it is
+        // not re-inserted here. The live `artifacts` row also attributes the key
+        // (resolution layer (a)); the durable claim additionally keeps ownership
+        // after a later soft-delete of the row, matching the #2504 write guard's
+        // soft-delete awareness.
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_metadata (artifact_id, format, metadata)
+            VALUES ($1, 'maven', $2)
+            ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
             "#,
         )
-        .bind(repo.id)
-        .bind(&path)
-        .bind(&name)
-        .bind(&coords.version)
-        .bind(size_bytes)
-        .bind(&checksum_sha256)
-        .bind(&checksum_sha1)
-        .bind(&checksum_md5)
-        .bind(ct)
-        .bind(&storage_key)
-        .bind(user_id)
-        .bind(republishable)
-        .fetch_optional(&mut *tx)
+        .bind(artifact_id)
+        .bind(&file_metadata)
+        .execute(&mut *tx)
         .await
-        .map_err(map_db_err)?
-        // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
-        // row: a concurrent PUT won the race between the duplicate check above
-        // and this statement. Answer it the same 409 the check itself would
-        // have, rather than the 500 the bare INSERT raised (#3587).
-        .ok_or_else(|| AppError::Conflict("Artifact already exists".to_string()).into_response())?;
+        .map_err(map_db_err)?;
 
-    // The durable attribution claim for this key was already committed by the
-    // atomic `claim_flat_key_for_write` gate above (before the put), so it is
-    // not re-inserted here. The live `artifacts` row also attributes the key
-    // (resolution layer (a)); the durable claim additionally keeps ownership
-    // after a later soft-delete of the row, matching the #2504 write guard's
-    // soft-delete awareness.
+        tx.commit().await.map_err(map_db_err)?;
+        Ok((artifact_id, artifact_created))
+    }
+    .await;
+    // Scratch file no longer needed once the publish has settled: the locked
+    // transaction above may have had to write the object again from it.
+    drop(staged);
 
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'maven', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(&file_metadata)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_db_err)?;
-
-    tx.commit().await.map_err(map_db_err)?;
+    let (artifact_id, artifact_created) = match published {
+        Ok(published) => published,
+        Err(response) => {
+            discard_failed_maven_publish(
+                &state.db,
+                &storage,
+                repo.id,
+                &repo.storage_backend,
+                &storage_key,
+                flat_key_claim,
+            )
+            .await;
+            return Err(response);
+        }
+    };
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -6134,6 +6357,452 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// Install a BEFORE INSERT OR UPDATE trigger on `artifact_metadata` that
+    /// runs `body` (PL/pgSQL statements) for rows whose metadata mentions
+    /// `artifact_id`, so a test can fail or delay the ledger write of exactly
+    /// one coordinate without touching any other test sharing the database
+    /// (#4837). Returns the SQL that removes it again.
+    async fn install_maven_metadata_fault_4837(
+        pool: &sqlx::PgPool,
+        suffix: &str,
+        artifact_id: &str,
+        declare: &str,
+        body: &str,
+    ) -> String {
+        let func = format!("ak_test_meta_fault_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+             {declare} BEGIN \
+               IF NEW.metadata::text LIKE '%{artifact_id}%' THEN {body} END IF; \
+               RETURN NEW; \
+             END $f$"
+        )))
+        .execute(pool)
+        .await
+        .expect("create fault function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON artifact_metadata \
+             FOR EACH ROW EXECUTE FUNCTION {func}()"
+        )))
+        .execute(pool)
+        .await
+        .expect("create fault trigger");
+        format!(
+            "DROP TRIGGER IF EXISTS {func} ON artifact_metadata; DROP FUNCTION IF EXISTS {func}()"
+        )
+    }
+
+    /// #4837 (a): a hosted upload on the repo-scoped key scheme whose ledger
+    /// transaction fails must not leave its bytes downloadable. The object is
+    /// stored before the transaction opens, so without the cleanup the jar
+    /// stayed at `maven/{repo_id}/{path}` and the scoped storage fallback
+    /// served it with a 200 although the client was told the deploy failed.
+    /// The retry with the fault removed is the positive control: it proves
+    /// the key layout the absence check looks at.
+    #[tokio::test]
+    async fn test_failed_hosted_upload_leaves_no_downloadable_object_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let aid = format!("orphan4837x{}", &suffix[..12]);
+        let drop_sql = install_maven_metadata_fault_4837(
+            &pool,
+            &suffix,
+            &aid,
+            "",
+            "RAISE EXCEPTION 'injected artifact_metadata failure (#4837)';",
+        )
+        .await;
+
+        let path = format!("com/example/orphan4837/{aid}/1.0.0/{aid}-1.0.0.jar");
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let jar = bytes::Bytes::from_static(b"rejected-jar-bytes-4837");
+        let (put_status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{path}"), jar.clone()),
+        )
+        .await;
+        for stmt in drop_sql.split("; ") {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
+                .execute(&pool)
+                .await
+                .expect("drop fault");
+        }
+        let object_left = mem.objects.lock().unwrap().contains_key(&scoped_key);
+        let live_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        let (get_status, _) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        // Positive control: with the fault gone the same PUT publishes at the
+        // very key the absence check above looked at.
+        let retry = bytes::Bytes::from_static(b"accepted-jar-bytes-4837");
+        let (retry_status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{path}"), retry.clone()),
+        )
+        .await;
+        let retry_stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let (retry_get, retry_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            put_status.is_server_error(),
+            "the upload whose metadata write failed must fail, got {put_status}"
+        );
+        assert_eq!(live_rows, 0, "the failed upload must leave no live row");
+        assert!(
+            !object_left,
+            "#4837: the failed upload's object must be removed from {scoped_key}"
+        );
+        assert_eq!(
+            get_status,
+            StatusCode::NOT_FOUND,
+            "#4837: the rejected deploy must not be downloadable"
+        );
+        assert_eq!(retry_status, StatusCode::CREATED, "retry must publish");
+        assert_eq!(
+            retry_stored,
+            Some(retry.clone()),
+            "retry lands at the scoped key"
+        );
+        assert_eq!(retry_get, StatusCode::OK);
+        assert_eq!(retry_body, retry);
+    }
+
+    /// #4837 (b): the repo-scoped storage fallback in `serve_artifact` exists
+    /// for the row-less puts only. An object at the scoped key of a real
+    /// artifact coordinate with no `artifacts` row was never published and
+    /// must 404, while a checksum sidecar and a verbatim `maven-metadata.xml`
+    /// at their scoped keys are still served (the controls).
+    #[tokio::test]
+    async fn test_scoped_object_without_row_is_not_served_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let jar_path = "com/example/rowless4837/demo/1.0.0/demo-1.0.0.jar";
+        let pom_path = "com/example/rowless4837/demo/1.0.0/demo-1.0.0.pom";
+        let sha1_path = format!("{jar_path}.sha1");
+        let meta_path = "com/example/rowless4837/demo/maven-metadata.xml";
+        let sha1 = bytes::Bytes::from_static(b"0123456789abcdef0123456789abcdef01234567");
+        let meta = bytes::Bytes::from_static(
+            b"<metadata><groupId>com.example.rowless4837</groupId>\
+              <artifactId>demo</artifactId><versioning><versions>\
+              <version>1.0.0</version></versions></versioning></metadata>",
+        );
+        {
+            let mut objects = mem.objects.lock().unwrap();
+            objects.insert(
+                format!("maven/{repo_id}/{jar_path}"),
+                bytes::Bytes::from_static(b"never-published-jar"),
+            );
+            objects.insert(
+                format!("maven/{repo_id}/{pom_path}"),
+                bytes::Bytes::from_static(b"<project/>"),
+            );
+            objects.insert(format!("maven/{repo_id}/{sha1_path}"), sha1.clone());
+            objects.insert(format!("maven/{repo_id}/{meta_path}"), meta.clone());
+        }
+
+        let (jar_status, _) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{jar_path}"))).await;
+        let (pom_status, _) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{pom_path}"))).await;
+        let (sha1_status, sha1_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{sha1_path}"))).await;
+        let (meta_status, meta_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{meta_path}"))).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            jar_status,
+            StatusCode::NOT_FOUND,
+            "#4837: a scoped jar with no artifacts row was never published"
+        );
+        assert_eq!(
+            pom_status,
+            StatusCode::NOT_FOUND,
+            "#4837: a scoped pom with no artifacts row was never published"
+        );
+        assert_eq!(
+            sha1_status,
+            StatusCode::OK,
+            "scoped checksum sidecar served"
+        );
+        assert_eq!(sha1_body, sha1);
+        assert_eq!(
+            meta_status,
+            StatusCode::OK,
+            "scoped maven-metadata.xml served"
+        );
+        assert_eq!(meta_body, meta);
+    }
+
+    /// #4837 review: the failed-publish cleanup must not destroy the bytes of
+    /// an overlapping first publish of the same coordinate. Both PUTs share
+    /// one storage key. The trigger numbers the metadata writes for this
+    /// artifactId: write 1 sleeps and raises, write 2 sleeps and succeeds.
+    /// PUT 2 starts while PUT 1 is inside its transaction, so it stores its
+    /// bytes before PUT 1 fails, and it commits only after PUT 1 has rolled
+    /// back and run its cleanup. Unserialised, the cleanup saw no committed
+    /// row, deleted the object and PUT 2 then published a row whose bytes
+    /// were gone (201, then GET 500).
+    #[tokio::test]
+    async fn test_failed_publish_cleanup_spares_overlapping_publish_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        // Two uploads in flight plus the cleanup: more than the default
+        // three-connection test pool.
+        let Some(pool) = crate::testing::try_pool_with(8).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let aid = format!("race4837x{}", &suffix[..12]);
+        let seq = format!("ak_test_race_seq_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SEQUENCE {seq}")))
+            .execute(&pool)
+            .await
+            .expect("create sequence");
+        let drop_sql = install_maven_metadata_fault_4837(
+            &pool,
+            &suffix,
+            &aid,
+            "DECLARE n bigint;",
+            &format!(
+                "n := nextval('{seq}'); \
+                 IF n = 1 THEN PERFORM pg_sleep(2); \
+                   RAISE EXCEPTION 'injected artifact_metadata failure (first publisher)'; \
+                 ELSIF n = 2 THEN PERFORM pg_sleep(2); END IF;"
+            ),
+        )
+        .await;
+
+        let path = format!("com/example/race4837/{aid}/1.0.0/{aid}-1.0.0.jar");
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let first = bytes::Bytes::from_static(b"first-publisher-bytes-4837");
+        let second = bytes::Bytes::from_static(b"second-publisher-bytes-4837");
+        let put1 = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), first.clone())),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let put2 = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), second.clone())),
+        );
+        let status1 = put1.await.expect("join put 1").expect("put 1").status();
+        let status2 = put2.await.expect("join put 2").expect("put 2").status();
+
+        for stmt in drop_sql.split("; ") {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
+                .execute(&pool)
+                .await
+                .expect("drop fault");
+        }
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SEQUENCE IF EXISTS {seq}"
+        )))
+        .execute(&pool)
+        .await;
+        let stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let live_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            status1.is_server_error(),
+            "the first publisher's metadata write failed, got {status1}"
+        );
+        assert_eq!(
+            status2,
+            StatusCode::CREATED,
+            "the second publisher must win"
+        );
+        assert_eq!(live_rows, 1, "exactly the winner's row is live");
+        assert_eq!(
+            stored,
+            Some(second.clone()),
+            "the failed publisher's cleanup must not delete the winner's object"
+        );
+        assert_eq!(get_status, StatusCode::OK, "the published jar is served");
+        assert_eq!(get_body, second);
+    }
+
+    /// #4837 review, the other interleaving: a failed publisher's cleanup that
+    /// runs after an overlapping upload stored its bytes but before that
+    /// upload's transaction took the publish lock. The test holds the lock
+    /// itself, waits until the upload has stored its object, then plays the
+    /// cleanup (deletes the object and the claim) and lets go. The upload
+    /// must notice under the lock that its object is gone, write it again
+    /// from its staged copy and re-assert its claim, so the row it commits
+    /// names bytes that exist.
+    #[tokio::test]
+    async fn test_publish_restores_object_removed_by_concurrent_cleanup_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let Some(pool) = crate::testing::try_pool_with(6).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let path = "com/example/restore4837/demo/1.0.0/demo-1.0.0.jar";
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let jar = bytes::Bytes::from_static(b"restored-jar-bytes-4837");
+
+        let mut holder = pool.begin().await.expect("lock holder tx");
+        super::lock_maven_publish_key(&mut holder, repo_id, "s3", &scoped_key)
+            .await
+            .expect("take publish lock");
+        let put = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), jar.clone())),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !mem.objects.lock().unwrap().contains_key(&scoped_key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload never stored its object"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Play the cleanup of a failed overlapping publish.
+        mem.objects.lock().unwrap().remove(&scoped_key);
+        sqlx::query(
+            "DELETE FROM maven_flat_object_owner \
+             WHERE storage_backend = 's3' AND storage_key = $1",
+        )
+        .bind(&scoped_key)
+        .execute(&mut *holder)
+        .await
+        .expect("drop claim");
+        holder.commit().await.expect("release publish lock");
+
+        let status = put.await.expect("join put").expect("put").status();
+        let stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let claim_owner: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT repository_id FROM maven_flat_object_owner \
+             WHERE storage_backend = 's3' AND storage_key = $1",
+        )
+        .bind(&scoped_key)
+        .fetch_optional(&pool)
+        .await
+        .expect("read claim");
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            stored,
+            Some(jar.clone()),
+            "the publish must restore the object a concurrent cleanup removed"
+        );
+        assert_eq!(
+            claim_owner,
+            Some(repo_id),
+            "the publish must re-assert the flat-key claim the cleanup released"
+        );
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_body, jar);
     }
 
     /// #3181: `HEAD` on a Maven artifact served from a presigned-redirect
