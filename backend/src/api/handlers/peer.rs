@@ -461,16 +461,24 @@ async fn get_scored_peers(
     request_body = NetworkProfileBody,
     responses(
         (status = 200, description = "Network profile updated"),
+        (status = 400, description = "Invalid peer ID or network profile"),
+        (status = 404, description = "Peer instance not found"),
     ),
     security(("bearer_auth" = []))
 )]
 async fn update_network_profile(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Path(peer_id): Path<Uuid>,
+    Path(peer_id): Path<String>,
     Json(body): Json<NetworkProfileBody>,
 ) -> Result<()> {
     auth.require_admin()?;
+    // Parse the path parameter here instead of relying on `Path<Uuid>`: its
+    // rejection body echoes axum's raw extractor error, which leaked internal
+    // details through the previously miswired route (#4884). A plain 400 from
+    // `AppError` keeps the contract consistent with every other handler error.
+    let peer_id = Uuid::parse_str(&peer_id)
+        .map_err(|_| crate::error::AppError::Validation("Invalid peer id".to_string()))?;
     // Parse time strings if provided
     let window_start = body
         .sync_window_start
@@ -490,7 +498,7 @@ async fn update_network_profile(
             crate::error::AppError::Validation(format!("Invalid sync_window_end: {}", e))
         })?;
 
-    sqlx::query!(
+    let result = sqlx::query!(
         r#"
         UPDATE peer_instances SET
             max_bandwidth_bps = COALESCE($2, max_bandwidth_bps),
@@ -511,6 +519,12 @@ async fn update_network_profile(
     .execute(&state.db)
     .await
     .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Err(crate::error::AppError::NotFound(
+            "Peer instance not found".to_string(),
+        ));
+    }
 
     Ok(())
 }
@@ -1136,8 +1150,8 @@ mod tests {
         }
 
         fn profile_app(state: crate::api::SharedState, auth: AuthExtension) -> Router {
-            // network_profile_router()'s handler extracts Path<Uuid>, so mount it
-            // behind a `/:id` prefix to supply the peer id.
+            // network_profile_router()'s handler reads the peer id from the
+            // `/:id` segment, so mount it behind that prefix.
             let router = Router::new().nest("/:id", super::super::network_profile_router());
             tdh::router_with_auth_ext(router, state, auth)
         }
