@@ -2536,8 +2536,9 @@ async fn store_rpm(
                 "application/x-rpm",
                 content.clone(),
                 Some(user_id),
-                // #4792: a peer replication write must not fan back out.
-                !super::is_replication_request(headers),
+                // #4889: queue after the RPM metadata write below, not before
+                // it.
+                false,
             )
             .await
             .map_err(IntoResponse::into_response)?
@@ -2631,6 +2632,19 @@ async fn store_rpm(
                 Some(serde_json::json!({"format":"rpm"})),
             )
             .await;
+
+        // #4889: the nested-layout branch used to queue inside
+        // `upload_with_sync_options`, before `record_rpm_metadata` ran below.
+        // Queue here instead so the task can carry the RPM document.
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await;
     } else {
         crate::services::package_service::register_published_package(
             &state.db,

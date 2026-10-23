@@ -6434,7 +6434,8 @@ async fn upload(
             digests,
             size_bytes,
             Some(user_id),
-            should_enqueue_pypi_sync_tasks(&headers),
+            // #4889: queue after the metadata write below, not before it.
+            false,
             None,
         )
         .await
@@ -6446,6 +6447,17 @@ async fn upload(
         .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
         .await
         .map_err(|e| e.into_response())?;
+
+    if should_enqueue_pypi_sync_tasks(&headers) {
+        super::queue_push_sync_tasks_now(
+            &state.db,
+            repo.id,
+            artifact.id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await;
+    }
 
     record_pypi_package_analysis(&state, artifact.id, content_analysis).await;
 

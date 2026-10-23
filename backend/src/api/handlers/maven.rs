@@ -3788,6 +3788,13 @@ async fn upload(
 
     // If this is a maven-metadata.xml upload, just store it. Row-less put: same
     // claim-on-write-success rule as the checksum branch (#2574, V3b).
+    //
+    // #4889 decision: this document deliberately stays row-less and is not
+    // pushed to peers. It is a mutable aggregate of the versions the peer
+    // receives, not a publishable coordinate; giving it an artifact row would
+    // make a generated index look like a release and let one deploy's snapshot
+    // overwrite the peer's own generated view. Peer metadata is regenerated
+    // from the replicated versioned artifacts and converges on its own.
     if MavenHandler::is_metadata(&path) {
         // Row-less metadata put: atomic claim-gate before the write, same as the
         // checksum branch (#2586); release on put failure (V3b). Staged stream

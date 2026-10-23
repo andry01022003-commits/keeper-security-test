@@ -717,7 +717,17 @@ async fn complete_session_commit(
             &session.checksum_sha256,
         )
         .await;
-    if !identical_replay {
+    // #4889: a trusted peer may legitimately rewrite one of its format's
+    // explicitly mutable index files (protobuf's `_labels` maps a label to a
+    // new commit). Those paths are not release coordinates, so the live-row
+    // gate and the atomic upsert must both allow the in-place refresh; every
+    // other replicated path keeps the full immutability guard.
+    let mutable_replication = replication_trusted
+        && crate::services::cache_classifier::is_explicitly_mutable_index(
+            &repo.format,
+            &session.artifact_path,
+        );
+    if !identical_replay && !mutable_replication {
         if let Err(e) = crate::services::artifact_service::enforce_path_immutability(
             &state.db,
             session.repository_id,
@@ -921,6 +931,7 @@ async fn complete_session_commit(
             OR $10
             OR artifacts.version IS DISTINCT FROM EXCLUDED.version
             OR ($11 AND LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256))
+            OR $12
         RETURNING id
         "#,
     )
@@ -938,6 +949,7 @@ async fn complete_session_commit(
         repo.versioning_enabled,
     ))
     .bind(identical_replay)
+    .bind(mutable_replication)
     .fetch_optional(&mut *tx)
     .await;
     let artifact_id: Uuid = match inserted_artifact_id {
@@ -1728,6 +1740,12 @@ fn completed_package_catalog_entry(
     format: &crate::models::repository::RepositoryFormat,
 ) -> Option<(String, String)> {
     use crate::models::repository::RepositoryFormat;
+    // #4889: the protobuf `_labels` index is a generated pointer, not a
+    // publishable version. The source never registers it in `packages`; do not
+    // create a bogus `_labels` package row when a peer replicates it.
+    if matches!(format, RepositoryFormat::Protobuf) && session.artifact_path.ends_with("/_labels") {
+        return None;
+    }
     // #2723: Maven/Gradle grouped listings key the catalog `packages` row on
     // `groupId:artifactId`. Prefer the replicated POM metadata's coordinates;
     // otherwise, for a Maven/Gradle repo, derive the grouped name from the
@@ -5758,6 +5776,98 @@ mod tests {
             rows[0].1.as_ref().expect("metadata")["pgpsig"],
             "AAE=",
             "the replay must refresh the replicated metadata"
+        );
+    }
+
+    /// #4889: a protobuf `_labels` index is a mutable pointer, so a trusted
+    /// peer must be able to replace it in place when a label moves to a new
+    /// commit. On `main` the live-row immutability guard refuses the second
+    /// completion with 409 and the peer keeps the stale label map.
+    #[tokio::test]
+    async fn complete_overwrites_mutable_protobuf_labels_index_4889() {
+        let Some(f) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let artifact_path = "modules/acme/widgets/_labels";
+        let first_bytes = br#"{"labels":{"main":"commit-a"}}"#;
+        let second_bytes = br#"{"labels":{"main":"commit-b"}}"#;
+        let body = |metadata: serde_json::Value, payload: &[u8]| {
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "acme/widgets",
+                "artifact_version": "_labels",
+                "artifact_metadata_format": "protobuf",
+                "artifact_metadata": metadata,
+                "total_size": payload.len() as i64,
+                "checksum_sha256": sha256_hex(payload),
+                "chunk_size": 1024 * 1024_i64,
+            })
+        };
+        let admin = || tdh::admin_auth(f.user_id, &f.username);
+        let first = complete_replication_upload_as(
+            &f,
+            admin,
+            body(
+                serde_json::json!({"labels": {"main": "commit-a"}}),
+                first_bytes,
+            ),
+            first_bytes,
+        )
+        .await;
+        let second = complete_replication_upload_as(
+            &f,
+            admin,
+            body(
+                serde_json::json!({"labels": {"main": "commit-b"}}),
+                second_bytes,
+            ),
+            second_bytes,
+        )
+        .await;
+
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT a.checksum_sha256, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(artifact_path)
+        .fetch_all(&f.pool)
+        .await
+        .expect("query label index");
+        let label_packages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM packages \
+             WHERE repository_id = $1 AND version = '_labels'",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count label packages");
+        for session_id in [first, second] {
+            let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+        }
+        f.teardown().await;
+        assert_eq!(rows.len(), 1, "a label move must update the one index row");
+        assert_eq!(
+            rows[0].0,
+            sha256_hex(second_bytes),
+            "the row must point at the new label document"
+        );
+        assert_eq!(
+            rows[0].1["labels"]["main"], "commit-b",
+            "the peer must receive the moved label, not the first push's map"
+        );
+        assert_eq!(
+            label_packages, 0,
+            "the generated label index must not become a package version"
         );
     }
 
