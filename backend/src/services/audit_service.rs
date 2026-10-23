@@ -252,6 +252,9 @@ pub enum AuditAction {
     DeviceTokenRejected,
     /// An approved device authorization expired without being redeemed.
     DeviceAuthorizationExpired,
+    /// An admin ran the source-free Debian package backfill (#4740),
+    /// re-registering imported `.deb` rows from their stored control members.
+    DebianBackfillRun,
 }
 
 impl AuditAction {
@@ -358,6 +361,7 @@ impl AuditAction {
             AuditAction::DeviceAuthorizationFailed => "DEVICE_AUTHORIZATION_FAILED",
             AuditAction::DeviceTokenRejected => "DEVICE_TOKEN_REJECTED",
             AuditAction::DeviceAuthorizationExpired => "DEVICE_AUTHORIZATION_EXPIRED",
+            AuditAction::DebianBackfillRun => "DEBIAN_BACKFILL_RUN",
         }
     }
 }

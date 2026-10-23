@@ -1,5 +1,6 @@
-//! Admin storage-integrity endpoints: the storage scrub (#3910) and the
-//! per-repository storage reindex that registers ghost objects (#1570).
+//! Admin storage-integrity endpoints: the storage scrub (#3910), the
+//! per-repository storage reindex that registers ghost objects (#1570), and
+//! the source-free Debian package backfill (#4740).
 //!
 //! Mounted inside the `/api/v1/admin` block (routes.rs), so `admin_middleware`
 //! gates every route; each handler re-checks `is_admin` as defense in depth,
@@ -20,6 +21,7 @@ use crate::services::audit_export::Outcome;
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
+use crate::services::debian_backfill_service::{DebianBackfillResult, DebianBackfillService};
 use crate::services::repository_service::RepositoryService;
 use crate::services::storage_reindex_service::{StorageReindexResult, StorageReindexService};
 use crate::services::storage_scrub_service::{
@@ -31,7 +33,8 @@ use crate::services::storage_scrub_service::{
     paths(
         run_storage_scrub,
         list_storage_scrub_findings,
-        reindex_repository_storage
+        reindex_repository_storage,
+        backfill_debian_packages
     ),
     components(schemas(
         StorageScrubRequest,
@@ -40,6 +43,8 @@ use crate::services::storage_scrub_service::{
         ScrubObjectKind,
         StorageReindexRequest,
         StorageReindexResult,
+        DebianBackfillRequest,
+        DebianBackfillResult,
     ))
 )]
 pub struct StorageIntegrityApiDoc;
@@ -51,6 +56,10 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/repositories/:key/reindex-storage",
             post(reindex_repository_storage),
+        )
+        .route(
+            "/repositories/:key/backfill-debian",
+            post(backfill_debian_packages),
         )
 }
 
@@ -399,6 +408,101 @@ pub async fn reindex_repository_storage(
     outcome.map(Json)
 }
 
+/// Default and ceiling for packages examined per Debian backfill call.
+const DEFAULT_DEBIAN_BACKFILL_LIMIT: u64 = 1_000;
+const MAX_DEBIAN_BACKFILL_LIMIT: u64 = 10_000;
+
+/// Request body for the source-free Debian backfill. `dry_run` is required
+/// and unknown fields are rejected (the #3501 contract for write-capable
+/// admin calls).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DebianBackfillRequest {
+    /// Report what would be registered and removed without writing anything.
+    pub dry_run: bool,
+    /// Examine at most this many candidate packages in this call (default
+    /// 1000, max 10000). `truncated` says when more remain.
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+/// POST /api/v1/admin/repositories/{key}/backfill-debian
+///
+/// Repairs a hosted Debian repository migrated before #4657 without the
+/// source system: walks live `pool/**/*.deb` rows that have no `debian`
+/// control document, reads the `control.tar` member from the repository's own
+/// storage, and records the same control document, catalog row, and
+/// maintainer-script analysis a native upload writes. Migration-origin
+/// `dists/` index copies are removed from the artifact list. Idempotent and
+/// safe on a live repository.
+#[utoipa::path(
+    post,
+    path = "/repositories/{key}/backfill-debian",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    operation_id = "backfill_debian_packages",
+    params(("key" = String, Path, description = "Repository key")),
+    request_body = DebianBackfillRequest,
+    responses(
+        (status = 200, description = "Backfill summary", body = DebianBackfillResult),
+        (status = 404, description = "Repository not found"),
+        (status = 409, description = "A backfill of this repository is already running"),
+        (status = 422, description = "Repository is not a hosted Debian repository"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn backfill_debian_packages(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(key): Path<String>,
+    Json(payload): Json<DebianBackfillRequest>,
+) -> Result<Json<DebianBackfillResult>> {
+    require_admin(auth.is_admin)?;
+    let repo = RepositoryService::new(state.db.clone())
+        .get_by_key(&key)
+        .await?;
+    let limit = scrub_budget(
+        payload.limit,
+        DEFAULT_DEBIAN_BACKFILL_LIMIT,
+        MAX_DEBIAN_BACKFILL_LIMIT,
+    );
+    let outcome = DebianBackfillService::new(state.db.clone(), state.storage_registry.clone())
+        .backfill(&repo, payload.dry_run, limit)
+        .await;
+
+    // Audited on success and on refusal/failure (409 lock held, 422 the wrong
+    // repository kind, storage/DB errors).
+    let details = match &outcome {
+        Ok(result) => serde_json::json!({
+            "repository": key,
+            "dry_run": payload.dry_run,
+            "artifacts_scanned": result.artifacts_scanned,
+            "packages_registered": result.packages_registered,
+            "artifacts_skipped": result.artifacts_skipped,
+            "artifacts_failed": result.artifacts_failed,
+            "dists_removed": result.dists_removed,
+            "truncated": result.truncated,
+            "errors": result.errors.len(),
+        }),
+        Err(e) => serde_json::json!({
+            "repository": key,
+            "dry_run": payload.dry_run,
+            "error": e.to_string(),
+        }),
+    };
+    let mut entry = AuditEntry::new(AuditAction::DebianBackfillRun, ResourceType::Repository)
+        .user(auth.user_id)
+        .resource(repo.id)
+        .actor_name(&auth.username)
+        .details(details);
+    if outcome.is_err() {
+        entry = entry.outcome(Outcome::Failure);
+    }
+    audit_fire_and_forget(state.db.clone(), entry).await;
+
+    outcome.map(Json)
+}
+
 fn require_admin(is_admin: bool) -> Result<()> {
     if is_admin {
         Ok(())
@@ -414,7 +518,11 @@ fn require_admin(is_admin: bool) -> Result<()> {
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
+    use crate::api::handlers::debian::minimal_deb;
+    use crate::api::handlers::test_db_helpers as tdh;
 
     #[test]
     fn scrub_request_requires_repair_and_rejects_unknown_fields() {
@@ -570,6 +678,143 @@ mod tests {
             .paths
             .paths
             .contains_key("/api/v1/admin/repositories/{key}/reindex-storage"));
+    }
+
+    #[test]
+    fn debian_backfill_request_requires_dry_run() {
+        assert!(serde_json::from_str::<DebianBackfillRequest>("{}").is_err());
+        assert!(serde_json::from_str::<DebianBackfillRequest>(r#"{"dryRun":true}"#).is_err());
+        let r: DebianBackfillRequest =
+            serde_json::from_str(r#"{"dry_run":true,"limit":3}"#).unwrap();
+        assert!(r.dry_run);
+        assert_eq!(r.limit, Some(3));
+    }
+
+    #[test]
+    fn openapi_doc_registers_debian_backfill_path() {
+        let doc = StorageIntegrityApiDoc::openapi();
+        assert!(doc
+            .paths
+            .paths
+            .contains_key("/api/v1/admin/repositories/{key}/backfill-debian"));
+    }
+
+    /// Poll for the backfill's audit row: `audit_fire_and_forget` runs in a
+    /// detached task, so the handler can return first.
+    async fn debian_backfill_audit(
+        pool: &sqlx::PgPool,
+        repo_key: &str,
+    ) -> Option<serde_json::Value> {
+        for _ in 0..50 {
+            let details: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT details FROM audit_log \
+                 WHERE action = 'DEBIAN_BACKFILL_RUN' AND details->>'repository' = $1 \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(repo_key)
+            .fetch_optional(pool)
+            .await
+            .expect("query audit_log");
+            if details.is_some() {
+                return details;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    /// The admin route wires the service, clamps the limit, records the audit
+    /// row, and still refuses non-admins.
+    #[tokio::test]
+    async fn debian_backfill_endpoint_registers_and_audits() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let auth = admin_auth(&f.pool).await;
+        let path = "pool/main/h/hello/hello_9.0_amd64.deb";
+        let storage_key = format!("backfill-endpoint-{}", uuid::Uuid::new_v4());
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &f.repo_info("local", None),
+            &storage_key,
+            path,
+            "hello",
+            "9.0",
+            "application/vnd.debian.binary-package",
+            Bytes::from(minimal_deb("hello", "9.0", "amd64", "endpoint")),
+            f.user_id,
+        )
+        .await;
+
+        let result = backfill_debian_packages(
+            State(f.state.clone()),
+            Extension(auth.clone()),
+            Path(f.repo_key.clone()),
+            Json(DebianBackfillRequest {
+                dry_run: false,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect("backfill handler succeeds");
+        assert_eq!(result.0.packages_registered, 1);
+
+        let details = debian_backfill_audit(&f.pool, &f.repo_key)
+            .await
+            .expect("backfill audit row");
+        assert_eq!(details["repository"], f.repo_key);
+        assert_eq!(details["packages_registered"], 1);
+        assert_eq!(details["dry_run"], false);
+
+        let mut non_admin = auth;
+        non_admin.is_admin = false;
+        let err = backfill_debian_packages(
+            State(f.state.clone()),
+            Extension(non_admin),
+            Path(f.repo_key.clone()),
+            Json(DebianBackfillRequest {
+                dry_run: true,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect_err("a non-admin is refused");
+        assert!(matches!(err, AppError::Authorization(_)));
+
+        f.teardown().await;
+    }
+
+    /// A validation failure is audited with the error and reaches the caller.
+    #[tokio::test]
+    async fn debian_backfill_endpoint_audits_validation_failure() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let auth = admin_auth(&f.pool).await;
+        let err = backfill_debian_packages(
+            State(f.state.clone()),
+            Extension(auth),
+            Path(f.repo_key.clone()),
+            Json(DebianBackfillRequest {
+                dry_run: true,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect_err("a generic repository is refused");
+        assert!(matches!(err, AppError::UnprocessableEntity(_)));
+
+        let details = debian_backfill_audit(&f.pool, &f.repo_key)
+            .await
+            .expect("failed backfill audit row");
+        assert_eq!(details["repository"], f.repo_key);
+        assert!(details["error"]
+            .as_str()
+            .expect("error detail")
+            .contains("Debian repositories"));
+
+        f.teardown().await;
     }
 
     #[test]

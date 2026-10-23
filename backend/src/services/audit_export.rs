@@ -156,6 +156,7 @@ impl AuditAction {
             | AuditAction::CiOidcGroupBindingReconciled
             | AuditAction::StorageScrubRun
             | AuditAction::StorageReindexRun
+            | AuditAction::DebianBackfillRun
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
             | AuditAction::QuarantineRejected

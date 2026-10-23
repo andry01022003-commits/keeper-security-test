@@ -60,6 +60,7 @@ use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS}
 use crate::services::signing_service::{
     signed_cache_entry_is_fresh, signed_cache_max_age, signer_set_fingerprint, SigningService,
 };
+use crate::storage::StorageBackend;
 
 const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
@@ -4167,6 +4168,89 @@ async fn read_deb_head(file: &std::path::Path) -> io::Result<Vec<u8>> {
     Err(invalid("control.tar not found in .deb file"))
 }
 
+/// Read a stored `.deb`'s head through the end of its `control.tar` member
+/// with ranged storage reads, so the source-free backfill (#4740) validates a
+/// package without downloading the whole file. The result is the same ar
+/// prefix [`read_deb_head`] produces.
+async fn read_deb_head_from_storage(
+    storage: &dyn StorageBackend,
+    storage_key: &str,
+) -> Result<Vec<u8>, String> {
+    let invalid = |msg: &str| format!("Invalid Debian package metadata: {msg}");
+    let read = |offset: u64, length: usize| storage.get_range(storage_key, offset, length);
+
+    let magic = read(0, 8)
+        .await
+        .map_err(|e| format!("could not read stored .deb: {e}"))?;
+    if magic.as_ref() != b"!<arch>\n" {
+        return Err(invalid("not an ar archive"));
+    }
+    let mut head = magic.to_vec();
+    let mut offset = 8u64;
+    for _ in 0..STAGED_DEB_MAX_MEMBERS {
+        let header = match read(offset, 60).await {
+            Ok(header) if header.len() == 60 => header,
+            Ok(_) => break,
+            Err(e) => return Err(format!("could not read stored .deb: {e}")),
+        };
+        let name = std::str::from_utf8(&header[..16])
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/');
+        let size: u64 = std::str::from_utf8(&header[48..58])
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if name.starts_with("control.tar") {
+            if size > STAGED_DEB_CONTROL_MAX {
+                return Err(invalid("control.tar member is too large"));
+            }
+            let body_offset = offset
+                .checked_add(60)
+                .ok_or_else(|| invalid("ar member offset overflow"))?;
+            let body_len =
+                usize::try_from(size).map_err(|_| invalid("control.tar member is too large"))?;
+            let body = read(body_offset, body_len)
+                .await
+                .map_err(|e| format!("could not read stored .deb: {e}"))?;
+            if body.len() != body_len {
+                return Err(invalid("truncated ar member"));
+            }
+            head.extend_from_slice(&header);
+            head.extend_from_slice(&body);
+            return Ok(head);
+        }
+        let member_len = 60u64
+            .checked_add(size)
+            .and_then(|len| len.checked_add(size % 2))
+            .ok_or_else(|| invalid("ar member offset overflow"))?;
+        offset = offset
+            .checked_add(member_len)
+            .ok_or_else(|| invalid("ar member offset overflow"))?;
+    }
+    Err(invalid("control.tar not found in stored .deb"))
+}
+
+/// Parse and validate a `.deb` head for `artifact_path`. Shared by the chunked
+/// completion's staged file, the migration importer, and the source-free
+/// backfill's stored object.
+async fn finalize_from_head(
+    artifact_path: &str,
+    deb_head: Vec<u8>,
+) -> Result<Option<StagedDebianPackage>, String> {
+    let Some((component, path)) = staged_package_target(artifact_path) else {
+        return Ok(None);
+    };
+    let (component, path) = (component.to_string(), path.to_string());
+    tokio::task::spawn_blocking(move || {
+        parse_debian_upload(&component, &path, &deb_head)
+            .map(|upload| Some(StagedDebianPackage { upload, deb_head }))
+    })
+    .await
+    .map_err(|e| format!("Debian package parse failed: {e}"))?
+}
+
 /// Format-native finalize for a `.deb` completed through the generic chunked
 /// flow (#1846): parse and validate the control file of the staged package at
 /// `file` exactly as `PUT /debian/{repo}/pool/...` does. `Ok(None)` when
@@ -4177,19 +4261,28 @@ pub(crate) async fn finalize_from_staged(
     artifact_path: &str,
     file: &std::path::Path,
 ) -> Result<Option<StagedDebianPackage>, String> {
-    let Some((component, path)) = staged_package_target(artifact_path) else {
+    if staged_package_target(artifact_path).is_none() {
         return Ok(None);
-    };
+    }
     let deb_head = read_deb_head(file)
         .await
         .map_err(|e| format!("Invalid Debian package metadata: {e}"))?;
-    let (component, path) = (component.to_string(), path.to_string());
-    tokio::task::spawn_blocking(move || {
-        parse_debian_upload(&component, &path, &deb_head)
-            .map(|upload| Some(StagedDebianPackage { upload, deb_head }))
-    })
-    .await
-    .map_err(|e| format!("Debian package parse failed: {e}"))?
+    finalize_from_head(artifact_path, deb_head).await
+}
+
+/// Validate a `.deb` already stored under `storage_key` without reading its
+/// payload bytes (#4740). Returns `Ok(None)` when `artifact_path` is not a
+/// canonical `pool/<component>/.../<file>.deb` package path.
+pub(crate) async fn finalize_from_storage(
+    artifact_path: &str,
+    storage: &dyn StorageBackend,
+    storage_key: &str,
+) -> Result<Option<StagedDebianPackage>, String> {
+    if staged_package_target(artifact_path).is_none() {
+        return Ok(None);
+    }
+    let deb_head = read_deb_head_from_storage(storage, storage_key).await?;
+    finalize_from_head(artifact_path, deb_head).await
 }
 
 // ---------------------------------------------------------------------------
@@ -6132,74 +6225,83 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn append_ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
+    let header = format!(
+        "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        name,
+        0,
+        0,
+        0,
+        "100644",
+        content.len()
+    );
+    assert_eq!(header.len(), 60, "ar header must be exactly 60 bytes");
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(content);
+    if content.len() % 2 == 1 {
+        out.push(b'\n');
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn control_tar_gz(control: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(control.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "./control", control.as_bytes())
+        .expect("append control file");
+    builder.finish().expect("finish control.tar");
+    let tar_bytes = builder.into_inner().expect("control.tar bytes");
+    gzip_compress(&tar_bytes).expect("gzip control.tar")
+}
+
+#[cfg(test)]
+fn empty_data_tar_gz() -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.finish().expect("finish data.tar");
+    let tar_bytes = builder.into_inner().expect("data.tar bytes");
+    gzip_compress(&tar_bytes).expect("gzip data.tar")
+}
+
+#[cfg(test)]
+pub(crate) fn minimal_deb(
+    package: &str,
+    version: &str,
+    architecture: &str,
+    description: &str,
+) -> Vec<u8> {
+    let control = format!(
+        "Package: {package}\n\
+         Version: {version}\n\
+         Architecture: {architecture}\n\
+         Maintainer: Test Maintainer <test@example.local>\n\
+         Installed-Size: 7\n\
+         Depends: libc6 (>= 2.36)\n\
+         Section: utils\n\
+         Priority: optional\n\
+         Homepage: https://example.local/{package}\n\
+         Description: {description}\n\
+         {description_continuation}",
+        description_continuation = " extended description line\n",
+    );
+
+    let mut deb = Vec::new();
+    deb.extend_from_slice(b"!<arch>\n");
+    append_ar_member(&mut deb, "debian-binary", b"2.0\n");
+    append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(&control));
+    append_ar_member(&mut deb, "data.tar.gz", &empty_data_tar_gz());
+    deb
+}
+
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod upload_db_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-
-    fn append_ar_member(out: &mut Vec<u8>, name: &str, content: &[u8]) {
-        let header = format!(
-            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-            name,
-            0,
-            0,
-            0,
-            "100644",
-            content.len()
-        );
-        assert_eq!(header.len(), 60, "ar header must be exactly 60 bytes");
-        out.extend_from_slice(header.as_bytes());
-        out.extend_from_slice(content);
-        if content.len() % 2 == 1 {
-            out.push(b'\n');
-        }
-    }
-
-    fn control_tar_gz(control: &str) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_size(control.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "./control", control.as_bytes())
-            .expect("append control file");
-        builder.finish().expect("finish control.tar");
-        let tar_bytes = builder.into_inner().expect("control.tar bytes");
-        gzip_compress(&tar_bytes).expect("gzip control.tar")
-    }
-
-    fn empty_data_tar_gz() -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        builder.finish().expect("finish data.tar");
-        let tar_bytes = builder.into_inner().expect("data.tar bytes");
-        gzip_compress(&tar_bytes).expect("gzip data.tar")
-    }
-
-    fn minimal_deb(package: &str, version: &str, architecture: &str, description: &str) -> Vec<u8> {
-        let control = format!(
-            "Package: {package}\n\
-             Version: {version}\n\
-             Architecture: {architecture}\n\
-             Maintainer: Test Maintainer <test@example.local>\n\
-             Installed-Size: 7\n\
-             Depends: libc6 (>= 2.36)\n\
-             Section: utils\n\
-             Priority: optional\n\
-             Homepage: https://example.local/{package}\n\
-             Description: {description}\n\
-             {description_continuation}",
-            description_continuation = " extended description line\n",
-        );
-
-        let mut deb = Vec::new();
-        deb.extend_from_slice(b"!<arch>\n");
-        append_ar_member(&mut deb, "debian-binary", b"2.0\n");
-        append_ar_member(&mut deb, "control.tar.gz", &control_tar_gz(&control));
-        append_ar_member(&mut deb, "data.tar.gz", &empty_data_tar_gz());
-        deb
-    }
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
