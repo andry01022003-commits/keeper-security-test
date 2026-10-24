@@ -18,7 +18,7 @@
 //!   last-tag delete that leaves it unaddressable ([`delete_removes_record`]).
 //! * [`run_backfill`] — a one-shot, idempotent, best-effort startup pass that
 //!   records manifests committed before migration 268.
-//! * [`run_reconcile`] — the repair pass (#1683): the backfill's additions plus
+//! * [`run_reconcile`]: the repair pass (#1683): the backfill's additions plus
 //!   removal of rows whose manifest is no longer addressable (no tag, no live
 //!   index edge, no live `artifacts` row). Rows go stale in ways the dual-write
 //!   cannot see: a pre-268 replica's delete during a rolling upgrade, a
