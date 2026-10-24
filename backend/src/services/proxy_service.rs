@@ -1653,9 +1653,19 @@ struct PrefetchedBody {
 /// started before `cached_at` may have opened the previous object and is
 /// redone; one that started after it saw the published object. Almost every
 /// hit is on an entry cached long before the request.
+///
+/// `cached_at` is stamped by the clock of the replica that published, which
+/// on a shared filesystem need not be this one, so the read must have started
+/// [`PREFETCH_PUBLISH_SKEW_SECS`] after it to be trusted. An entry younger
+/// than that is read again after its sidecar, as before #4331.
 fn prefetch_is_current(read_started: DateTime<Utc>, metadata: Option<&CacheMetadata>) -> bool {
-    metadata.is_some_and(|m| read_started > m.cached_at)
+    metadata.is_some_and(|m| {
+        read_started > m.cached_at + chrono::Duration::seconds(PREFETCH_PUBLISH_SKEW_SECS)
+    })
 }
+
+/// Clock skew between replicas tolerated by [`prefetch_is_current`] (#4331).
+const PREFETCH_PUBLISH_SKEW_SECS: i64 = 5;
 
 /// Matches the shape of an S3 *multipart* upload ETag: 32 hex digits (the MD5
 /// of the concatenated part digests) followed by `-<partcount>`, e.g.
@@ -27368,8 +27378,12 @@ mod cache_read_overlap_tests {
         };
         let old = meta(now - chrono::Duration::hours(1));
         let new = meta(now + chrono::Duration::seconds(1));
+        // Published "just before" the read by another replica's clock: inside
+        // the skew allowance, so not trusted either.
+        let just_before = meta(now - chrono::Duration::seconds(1));
         assert!(prefetch_is_current(now, Some(&old)));
         assert!(!prefetch_is_current(now, Some(&new)));
+        assert!(!prefetch_is_current(now, Some(&just_before)));
         assert!(!prefetch_is_current(now, None));
     }
 

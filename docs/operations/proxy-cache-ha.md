@@ -33,15 +33,21 @@ A proxied GET that hits the cache reads two objects: the metadata sidecar
   opened at the same time as the sidecar is read, not after it. A first-touch
   hit on NFS costs one storage round trip of latency instead of three (sidecar
   read, size check, open). The buffered path (small metadata documents) reads
-  the body alongside the sidecar the same way.
+  the body alongside the sidecar the same way. The one-instead-of-three figure
+  is reasoned from the sequence of storage calls (a test pins that the body is
+  opened while the sidecar read is still in flight); it has not been measured
+  on NFS. An entry published in the last few seconds is still read
+  sequentially, so a replica with a skewed clock never trusts a body opened
+  before the publish.
 - On S3, GCS and Azure the two reads stay sequential: opening the body there is
   a GET that starts transferring it, which a miss or a stale entry would throw
   away. A presigned redirect (`*_REDIRECT_DOWNLOADS`) moves the body transfer
   off the backend entirely.
 
-What remains is the storage's own per-operation latency. The #4331
-measurements put local disk at about 7 ms and NFS at about 40 to 66 ms for the
-same request; no change in the backend removes NFS's own round trip. If
+What remains is the storage's own per-operation latency. The measurements
+reported on #4331 (by the reporter, before this change) put local disk at about
+7 ms and NFS at about 40 to 66 ms for the same request; no change in the
+backend removes NFS's own round trip. If
 latency matters more than a shared cache, two other shapes work:
 
 - object storage with presigned redirects, so replicas share one cache and
