@@ -4,22 +4,20 @@
 //! This module provides helpers for recording domain-specific metrics such as
 //! artifact uploads/downloads, security scans, backups, and storage gauges.
 //!
-//! The `metrics` facade fans out to more than one recorder: `/metrics` is
-//! always served from the Prometheus recorder, and when OpenTelemetry export is
-//! configured an OTel recorder is added alongside it by
-//! [`install_otel_recorder`] (#4337). The handle returned by [`init_metrics`]
-//! keeps rendering the Prometheus half.
+//! The `metrics` facade can fan out to more than one recorder: `/metrics` is
+//! always served from the Prometheus recorder, and when OTLP metrics export is
+//! configured an OTel recorder is installed alongside it (#4337, see
+//! [`install_otel_recorder`]). The handle returned by [`init_metrics`] keeps
+//! rendering the Prometheus half.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-/// The process-global Prometheus recorder, so an OpenTelemetry recorder can be
-/// fanned out with it. `None` until [`init_metrics`] has run. Wrapped in an
-/// `Arc` because the recorder itself is not `Clone`, and both the fan-out and
-/// the `metrics` facade need to own it.
-static PROMETHEUS_RECORDER: Mutex<Option<Arc<metrics_exporter_prometheus::PrometheusRecorder>>> =
+/// The OpenTelemetry recorder handed over by `telemetry::init_tracing`, waiting
+/// for [`init_metrics`] to install it beside the Prometheus recorder.
+static PENDING_OTEL_RECORDER: Mutex<Option<Box<dyn metrics::Recorder + Send + Sync>>> =
     Mutex::new(None);
 
 /// Name of the HTTP request latency histogram recorded by
@@ -55,44 +53,53 @@ pub fn prometheus_builder() -> PrometheusBuilder {
 }
 
 /// Initialize the Prometheus metrics recorder and return the handle for rendering.
+///
+/// When OTLP metrics export is configured, `telemetry::init_tracing` (which
+/// `main` runs first) has handed an OpenTelemetry recorder to
+/// [`install_otel_recorder`]; the global recorder is then a fan-out of the
+/// Prometheus recorder and that one, so `/metrics` reports exactly what it
+/// does without OTLP. The `metrics` facade accepts one global recorder per
+/// process, which is why both halves are installed here, once, rather than the
+/// OTel half being added later.
 pub fn init_metrics() -> PrometheusHandle {
-    let recorder = Arc::new(prometheus_builder().build_recorder());
-    let handle = recorder.handle();
-    *PROMETHEUS_RECORDER.lock().expect("metrics recorder lock") = Some(Arc::clone(&recorder));
+    let otel = PENDING_OTEL_RECORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (recorder, handle) = build_global_recorder(otel);
     metrics::set_global_recorder(recorder).expect("failed to install Prometheus recorder");
     handle
 }
 
-/// Install `recorder` as the OpenTelemetry half of a fan-out, with the
-/// Prometheus recorder installed by [`init_metrics`] as the other half (#4337).
-///
-/// Called by `telemetry::init_with_otel` when OTLP metrics export is enabled,
-/// *after* `main` has installed the Prometheus recorder. Until then the OTel
-/// pipeline is built but not attached, so a deployment that never calls this
-/// keeps the plain Prometheus-only recorder.
-///
-/// The already-installed recorder cannot be read back out of the `metrics`
-/// facade, which is why the Prometheus recorder is kept beside it: the
-/// replacement is a fan-out of the same two recorders, so `/metrics` keeps
-/// reporting exactly what it did before.
-pub fn install_otel_recorder(otel: impl metrics::Recorder + Sync + 'static) {
-    let prometheus = PROMETHEUS_RECORDER
-        .lock()
-        .expect("metrics recorder lock")
-        .take();
-    let Some(prometheus) = prometheus else {
-        // No Prometheus recorder yet: `metrics` has not been initialized, and
-        // there is nothing to fan out with. The OTel pipeline still exists;
-        // this only happens in tests that call `init_tracing` directly.
-        return;
+/// The recorder [`init_metrics`] installs: the Prometheus recorder alone, or a
+/// fan-out of it and `otel`.
+pub(crate) fn build_global_recorder(
+    otel: Option<Box<dyn metrics::Recorder + Send + Sync>>,
+) -> (Box<dyn metrics::Recorder + Sync>, PrometheusHandle) {
+    let prometheus = prometheus_builder().build_recorder();
+    let handle = prometheus.handle();
+    let recorder: Box<dyn metrics::Recorder + Sync> = match otel {
+        Some(otel) => Box::new(
+            metrics_util::layers::FanoutBuilder::default()
+                .add_recorder(prometheus)
+                .add_recorder(otel)
+                .build(),
+        ),
+        None => Box::new(prometheus),
     };
-    let fanout: metrics_util::layers::Fanout = metrics_util::layers::FanoutBuilder::default()
-        .add_recorder(prometheus)
-        .add_recorder(otel)
-        .build();
-    if let Err(e) = metrics::set_global_recorder(fanout) {
-        eprintln!("Failed to install OTel metrics fan-out recorder: {e}");
-    }
+    (recorder, handle)
+}
+
+/// Hand the OpenTelemetry `metrics` recorder to [`init_metrics`] (#4337).
+///
+/// Called by `telemetry::init_tracing` when OTLP metrics export is enabled,
+/// which `main` does before it calls [`init_metrics`] (the recorder must be in
+/// place before the startup pool connect records anything, #4828). Nothing is
+/// recorded to OTLP until [`init_metrics`] has installed the fan-out.
+pub fn install_otel_recorder(otel: impl metrics::Recorder + Send + Sync + 'static) {
+    *PENDING_OTEL_RECORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(otel));
 }
 
 /// Count one HTTP connection closed because the client did not deliver a

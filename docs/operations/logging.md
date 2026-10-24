@@ -15,24 +15,62 @@ stream (`AUDIT_STREAM`) is separate; see [audit-events.md](../audit-events.md).
 
 ## OpenTelemetry export (`OTEL_EXPORTER_OTLP_ENDPOINT`)
 
-When the backend is pointed at an OTLP endpoint, the same diagnostics events
-are *also* exported as OpenTelemetry log records, alongside spans and metrics
-(#4337). Stdout output is unchanged — OTLP is a second destination, not a
-replacement, and the events exported are exactly those `RUST_LOG` lets through.
+Setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports spans over OTLP. Since 1.12.0
+the backend can also export its diagnostics log as OpenTelemetry log records
+and its metrics as OTLP metrics, to the same collector and over the same
+protocol (#4337). Both are opt-in: an endpoint that only accepts traces (Tempo
+or Jaeger used directly) keeps working after an upgrade.
 
 | Variable | Values | Default | Effect |
 |---|---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | a URL | unset (export off) | Enables OTLP export of all three signals. |
-| `OTEL_LOGS_EXPORTER` | `otlp`, `none` | `otlp` | `none` disables log-record export. |
-| `OTEL_TRACES_EXPORTER` | `otlp`, `none` | `otlp` | `none` disables span export. |
-| `OTEL_METRICS_EXPORTER` | `otlp`, `none` | `otlp` | `none` disables metric export. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | a URL | unset (export off) | Turns OTLP export on. With `http/protobuf` this is the full traces URL, ending in `/v1/traces`. |
+| `OTEL_TRACES_EXPORTER` | `otlp`, `none` | `otlp` | `none` stops span export. |
+| `OTEL_LOGS_EXPORTER` | `otlp`, `none` | `none` | `otlp` exports log records. |
+| `OTEL_METRICS_EXPORTER` | `otlp`, `none` | `none` | `otlp` pushes metrics. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | a URL | derived | Log endpoint, used verbatim. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | a URL | derived | Metric endpoint, used verbatim. |
+| `OTEL_METRIC_EXPORT_INTERVAL` | milliseconds | `60000` | How often metrics are pushed. |
+| `OTEL_RESOURCE_ATTRIBUTES` | `k=v,...` | unset | Extra resource attributes, including `service.instance.id`. |
 
-Exported log records carry the `trace_id` / `span_id` of the span the event was
-emitted under, so a log line correlates with its trace in a backend such as
-Grafana Tempo. Events emitted outside any span are exported without one. SQL
-text (`sqlx::query` events) stays stdout-only (#4455); slow statements still
-appear as `CLIENT` spans. Metrics are fanned out beside Prometheus, so
-`/metrics` keeps reporting exactly what it did before.
+Any other value of an `OTEL_*_EXPORTER` variable keeps that signal's default
+and is reported by a startup warning. The derived endpoints are the shared one
+for gRPC, and for `http/protobuf` the traces URL with `/v1/traces` replaced by
+`/v1/logs` or `/v1/metrics`. The startup line `OpenTelemetry tracing enabled`
+lists the exported signals in its `signals` field.
+
+**Log records.** Every event that `RUST_LOG` lets through to stdout is also
+exported, so stdout output is unchanged and is not replaced: turn
+`OTEL_LOGS_EXPORTER` on only where the collector, not stdout collection, is
+the log pipeline, or the same lines are stored twice. `LOG_FORMAT` and
+`LOG_ANSI` affect stdout only; a log record always carries the message as its
+body, the event's fields as typed attributes, its level as the severity, and
+the `trace_id` / `span_id` of the span it was emitted under, so a line
+correlates with its trace in a backend such as Grafana Tempo. Events emitted
+outside any span carry no trace context. Only the event's own fields are
+exported, not those of the enclosing spans, and they carry the same redacted
+values stdout prints (upstream URLs without credentials, tokens removed from
+request URIs). Not exported: SQL text (`sqlx::query` events stay stdout-only,
+#4455; slow statements still appear as `CLIENT` spans) and events of the
+export's own transport (`opentelemetry*`, `tonic`, `h2`, `hyper`,
+`hyper_util`, `tower`, `reqwest`), which would otherwise feed back into the
+export.
+
+**Metrics.** The instruments behind `/metrics` are pushed with the same names
+and labels (`ak_http_requests_total`, `ak_http_request_duration_seconds` with
+the same buckets, and so on), cumulatively. `/metrics` is served exactly as
+before, so Prometheus scraping and dashboards built on it are unaffected.
+Counters export as sums, gauges that are set as gauges, gauges that move up and
+down (`ak_http_connections_open`) as non-monotonic sums. Every signal carries
+`service.name`, `service.version` and `service.instance.id` (from
+`OTEL_RESOURCE_ATTRIBUTES`, else `HOSTNAME`, else a random id per process), so
+pushed series of different replicas stay apart.
+
+**An unreachable collector** never blocks startup or requests: log records
+queue in a bounded buffer (`OTEL_BLRP_MAX_QUEUE_SIZE`, 2048) and are dropped
+when it is full, metrics are pushed from a background thread, and an exporter
+that cannot be built (an unparseable endpoint) turns its signal off with a
+message on stderr. On shutdown each pipeline flushes what it holds, waiting at
+most a few seconds per signal for the collector.
 
 ## ANSI colour (`LOG_ANSI`)
 

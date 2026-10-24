@@ -6,11 +6,11 @@
 //! destination: a `metrics` [`Recorder`] that aggregates what it is given with
 //! the OpenTelemetry SDK and pushes it to the OTLP endpoint.
 //!
-//! Installation ([`install_otel_metrics_recorder`]) fans the process-global
+//! Installation (`metrics_service::init_metrics`) fans the process-global
 //! recorder out to the Prometheus recorder and this one, so enabling
 //! OpenTelemetry adds a destination rather than replacing the scrape endpoint.
-//! The layer is installed only on the OTLP path and only when
-//! `OTEL_METRICS_EXPORTER` is not `none` (see [`super::SignalExporter`]).
+//! The recorder is built only on the OTLP path and only when
+//! `OTEL_METRICS_EXPORTER=otlp` (see [`super::SignalExporter`]).
 //!
 //! ## Instrument shapes
 //!
@@ -23,14 +23,14 @@
 //! | `metrics` handle | `Key` call | OTel instrument |
 //! |---|---|---|
 //! | counter | `register_counter` / `absolute` / `increment` | `u64` **counter** (`add`) |
-//! | gauge | `register_gauge` / `set` | `f64` **gauge** (`record`) |
+//! | gauge | `set` | `f64` **gauge** (`record`) |
 //! | gauge | `increment` / `decrement` | `f64` **up-down counter** (`add`, negative for `decrement`) |
 //! | histogram | `register_histogram` / `record` | `f64` **histogram** (`record(value)`) |
 //!
-//! A counter's `absolute` is `add`, not `set`: the OTel `Counter` has no
-//! set-once operation, and the SDK deltas an instrument's measurements into
-//! monotonic cumulative sums. The two are equivalent for the only pattern in
-//! this tree, `increment(1)`, where the running total is the number of calls.
+//! A counter's `absolute(total)` sets the running total. The OTel `Counter`
+//! only adds, so the recorder remembers the largest total seen per key and
+//! adds the difference; a total lower than that is ignored, as a monotonic
+//! counter cannot go down.
 //!
 //! A gauge's `increment`/`decrement` go to an *up-down counter* because an OTel
 //! gauge's `record` replaces the last value rather than accumulating it: an
@@ -38,6 +38,10 @@
 //! (`metrics_service::OpenConnectionGuard`) must add one, and the guard's
 //! `decrement(1)` must subtract one, or the gauge would only ever report `1`.
 //! `set` still replaces, which is the same split the Prometheus exporter makes.
+//! The two OTel instruments share the gauge's name, so each is created only
+//! when the gauge first uses it: a gauge that is only ever `set` (most of
+//! them) or only ever incremented exports one instrument, and the SDK's
+//! duplicate-name conflict warning is not triggered.
 //!
 //! ## Attributes and names
 //!
@@ -61,7 +65,8 @@
 //! scrape interval and no data is lost between the two.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use opentelemetry::metrics::{Meter, MeterProvider as _};
@@ -73,6 +78,12 @@ const SCOPE_NAME: &str = "artifact-keeper";
 
 /// The OTel-based `metrics` recorder. See the module docs for the mapping.
 pub(crate) struct MetricsRecorder {
+    inner: Arc<RecorderInner>,
+}
+
+/// State shared by the recorder and the handles it returns, so a gauge handle
+/// can create its instruments lazily.
+struct RecorderInner {
     meter: Meter,
     /// Instrument handles created so far, keyed by the `metrics` key (name and
     /// label names). Each instrument is registered with the SDK exactly once
@@ -85,7 +96,8 @@ pub(crate) struct MetricsRecorder {
 /// registered with the SDK exactly once.
 #[derive(Default)]
 struct MetricsInstruments {
-    counters: HashMap<Key, opentelemetry::metrics::Counter<u64>>,
+    /// With the largest `absolute` total seen for the key, see the module docs.
+    counters: HashMap<Key, (opentelemetry::metrics::Counter<u64>, Arc<AtomicU64>)>,
     gauges: HashMap<Key, opentelemetry::metrics::Gauge<f64>>,
     /// `increment`/`decrement` on a `metrics` gauge are additive, so they go to
     /// an up-down counter; `set` replaces and goes to the gauge above.
@@ -96,8 +108,10 @@ struct MetricsInstruments {
 impl MetricsRecorder {
     fn new(provider: &SdkMeterProvider) -> Self {
         Self {
-            meter: provider.meter(SCOPE_NAME),
-            instruments: Mutex::new(MetricsInstruments::default()),
+            inner: Arc::new(RecorderInner {
+                meter: provider.meter(SCOPE_NAME),
+                instruments: Mutex::new(MetricsInstruments::default()),
+            }),
         }
     }
 
@@ -108,18 +122,34 @@ impl MetricsRecorder {
             .collect()
     }
 
-    fn counter_for(&self, key: &Key) -> opentelemetry::metrics::Counter<u64> {
-        let mut instruments = self.instruments.lock().expect("metrics instruments lock");
-        instruments
+    #[cfg(test)]
+    fn instruments(&self) -> std::sync::MutexGuard<'_, MetricsInstruments> {
+        self.inner.lock()
+    }
+}
+
+impl RecorderInner {
+    fn lock(&self) -> std::sync::MutexGuard<'_, MetricsInstruments> {
+        self.instruments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn counter_for(&self, key: &Key) -> (opentelemetry::metrics::Counter<u64>, Arc<AtomicU64>) {
+        self.lock()
             .counters
             .entry(key.clone())
-            .or_insert_with(|| self.meter.u64_counter(key.name().to_string()).build())
+            .or_insert_with(|| {
+                (
+                    self.meter.u64_counter(key.name().to_string()).build(),
+                    Arc::new(AtomicU64::new(0)),
+                )
+            })
             .clone()
     }
 
     fn gauge_for(&self, key: &Key) -> opentelemetry::metrics::Gauge<f64> {
-        let mut instruments = self.instruments.lock().expect("metrics instruments lock");
-        instruments
+        self.lock()
             .gauges
             .entry(key.clone())
             .or_insert_with(|| self.meter.f64_gauge(key.name().to_string()).build())
@@ -127,8 +157,7 @@ impl MetricsRecorder {
     }
 
     fn up_down_counter_for(&self, key: &Key) -> opentelemetry::metrics::UpDownCounter<f64> {
-        let mut instruments = self.instruments.lock().expect("metrics instruments lock");
-        instruments
+        self.lock()
             .up_down_counters
             .entry(key.clone())
             .or_insert_with(|| {
@@ -140,8 +169,7 @@ impl MetricsRecorder {
     }
 
     fn histogram_for(&self, key: &Key) -> opentelemetry::metrics::Histogram<f64> {
-        let mut instruments = self.instruments.lock().expect("metrics instruments lock");
-        instruments
+        self.lock()
             .histograms
             .entry(key.clone())
             .or_insert_with(|| self.meter.f64_histogram(key.name().to_string()).build())
@@ -177,27 +205,28 @@ impl Recorder for MetricsRecorder {
     }
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        let counter = self.counter_for(key);
+        let (counter, absolute_total) = self.inner.counter_for(key);
         let attributes = Self::attributes(key);
         Counter::from_arc(Arc::new(OtelCounter {
             counter,
+            absolute_total,
             attributes,
         }))
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        let gauge = self.gauge_for(key);
-        let up_down = self.up_down_counter_for(key);
         let attributes = Self::attributes(key);
         Gauge::from_arc(Arc::new(OtelGauge {
-            gauge,
-            up_down,
+            inner: Arc::clone(&self.inner),
+            key: key.clone(),
+            gauge: OnceLock::new(),
+            up_down: OnceLock::new(),
             attributes,
         }))
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-        let histogram = self.histogram_for(key);
+        let histogram = self.inner.histogram_for(key);
         let attributes = Self::attributes(key);
         Histogram::from_arc(Arc::new(OtelHistogram {
             histogram,
@@ -209,6 +238,9 @@ impl Recorder for MetricsRecorder {
 /// `metrics` counter handle backed by an OTel `u64` counter.
 struct OtelCounter {
     counter: opentelemetry::metrics::Counter<u64>,
+    /// The largest `absolute` total reported for this key, shared by every
+    /// handle of the key.
+    absolute_total: Arc<AtomicU64>,
     attributes: Vec<KeyValue>,
 }
 
@@ -218,32 +250,45 @@ impl metrics::CounterFn for OtelCounter {
     }
 
     fn absolute(&self, value: u64) {
-        // See the module docs: OTel has no set-once counter, and the SDK turns
-        // repeated measurements into a monotonic cumulative total, which is
-        // the sum of the values reported here.
-        self.counter.add(value, &self.attributes);
+        // See the module docs: OTel has no set-once counter, so add the
+        // difference to the largest total seen so far.
+        let previous = self.absolute_total.fetch_max(value, Ordering::Relaxed);
+        if value > previous {
+            self.counter.add(value - previous, &self.attributes);
+        }
     }
 }
 
 /// `metrics` gauge handle backed by an OTel `f64` gauge (`set`) and `f64`
-/// up-down counter (`increment` / `decrement`).
+/// up-down counter (`increment` / `decrement`), each created on first use.
 struct OtelGauge {
-    gauge: opentelemetry::metrics::Gauge<f64>,
-    up_down: opentelemetry::metrics::UpDownCounter<f64>,
+    inner: Arc<RecorderInner>,
+    key: Key,
+    gauge: OnceLock<opentelemetry::metrics::Gauge<f64>>,
+    up_down: OnceLock<opentelemetry::metrics::UpDownCounter<f64>>,
     attributes: Vec<KeyValue>,
+}
+
+impl OtelGauge {
+    fn up_down(&self) -> &opentelemetry::metrics::UpDownCounter<f64> {
+        self.up_down
+            .get_or_init(|| self.inner.up_down_counter_for(&self.key))
+    }
 }
 
 impl metrics::GaugeFn for OtelGauge {
     fn increment(&self, value: f64) {
-        self.up_down.add(value, &self.attributes);
+        self.up_down().add(value, &self.attributes);
     }
 
     fn decrement(&self, value: f64) {
-        self.up_down.add(-value, &self.attributes);
+        self.up_down().add(-value, &self.attributes);
     }
 
     fn set(&self, value: f64) {
-        self.gauge.record(value, &self.attributes);
+        self.gauge
+            .get_or_init(|| self.inner.gauge_for(&self.key))
+            .record(value, &self.attributes);
     }
 }
 
@@ -325,7 +370,7 @@ impl Drop for MetricsGuard {
     }
 }
 
-#[cfg(ak_test_shard = "services-1")]
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,14 +494,35 @@ mod tests {
         let counter =
             recorder.register_counter(&key, &Metadata::new("", metrics::Level::INFO, None));
         counter.increment(1);
-        counter.increment(1);
-        counter.absolute(5);
+        counter.increment(2);
 
         let data = collect(&reader);
         let sum = expect_u64_sum(named_metric(&data, "ak_uploads_total"));
         let points: Vec<_> = sum.data_points().collect();
         assert_eq!(points.len(), 1);
-        assert_eq!(points[0].value(), 7);
+        assert_eq!(points[0].value(), 3);
+    }
+
+    /// `absolute` sets the running total: the exported sum is the largest
+    /// total reported, not the sum of every report.
+    #[test]
+    fn counter_absolute_sets_the_total() {
+        let TestMetrics {
+            recorder,
+            provider: _provider,
+            reader,
+        } = recording_recorder();
+        let key = Key::from_name("ak_backups_total");
+        let metadata = Metadata::new("", metrics::Level::INFO, None);
+        recorder.register_counter(&key, &metadata).absolute(5);
+        // A second handle for the same key shares the total.
+        let counter = recorder.register_counter(&key, &metadata);
+        counter.absolute(3);
+        counter.absolute(8);
+
+        let data = collect(&reader);
+        let sum = expect_u64_sum(named_metric(&data, "ak_backups_total"));
+        assert_eq!(sum.data_points().next().unwrap().value(), 8);
     }
 
     #[test]
@@ -485,21 +551,56 @@ mod tests {
     }
 
     #[test]
-    fn gauges_support_set_increment_and_decrement() {
+    fn gauge_set_replaces_the_value() {
         let TestMetrics {
             recorder,
             provider: _provider,
             reader,
         } = recording_recorder();
-        let key = Key::from_name("ak_http_connections_open");
+        let key = Key::from_name("ak_storage_used_bytes");
         let gauge = recorder.register_gauge(&key, &Metadata::new("", metrics::Level::INFO, None));
-        gauge.increment(2.0);
-        gauge.decrement(0.5);
+        gauge.set(4.0);
         gauge.set(9.0);
 
         let data = collect(&reader);
-        let gauge = expect_f64_gauge(named_metric(&data, "ak_http_connections_open"));
+        let gauge = expect_f64_gauge(named_metric(&data, "ak_storage_used_bytes"));
         assert_eq!(gauge.data_points().next().unwrap().value(), 9.0);
+    }
+
+    /// A gauge that is only `set` creates only the OTel gauge, and one that is
+    /// only incremented only the up-down counter: creating both eagerly would
+    /// register two instruments under one name for every gauge.
+    #[test]
+    fn a_gauge_creates_only_the_instrument_it_uses() {
+        let TestMetrics {
+            recorder,
+            provider: _provider,
+            reader,
+        } = recording_recorder();
+        let metadata = Metadata::new("", metrics::Level::INFO, None);
+        recorder
+            .register_gauge(&Key::from_name("ak_set_only"), &metadata)
+            .set(1.0);
+        recorder
+            .register_gauge(&Key::from_name("ak_incremented_only"), &metadata)
+            .increment(1.0);
+
+        {
+            let instruments = recorder.instruments();
+            assert_eq!(instruments.gauges.len(), 1);
+            assert_eq!(instruments.up_down_counters.len(), 1);
+        }
+        let data = collect(&reader);
+        let names: Vec<_> = data
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .map(|m| m.name().to_owned())
+            .collect();
+        assert_eq!(names.iter().filter(|n| *n == "ak_set_only").count(), 1);
+        assert_eq!(
+            names.iter().filter(|n| *n == "ak_incremented_only").count(),
+            1
+        );
     }
 
     /// `increment`/`decrement` are additive, so they need an up-down counter:
@@ -590,8 +691,71 @@ mod tests {
         let metadata = Metadata::new("", metrics::Level::INFO, None);
         recorder.register_counter(&key, &metadata).increment(1);
         recorder.register_counter(&key, &metadata).increment(1);
-        let instruments = recorder.instruments.lock().unwrap();
+        let instruments = recorder.instruments();
         assert_eq!(instruments.counters.len(), 1);
+    }
+
+    /// `main` runs `telemetry::init_tracing` (which hands the OTel recorder
+    /// over) before `metrics_service::init_metrics` (which installs the
+    /// Prometheus recorder ahead of the startup pool connect, #4828). In that
+    /// order a metric must reach both `/metrics` and the OTel pipeline. This
+    /// is the only test in the crate that installs the process-global
+    /// recorder.
+    #[test]
+    fn main_startup_order_exports_metrics_to_prometheus_and_otel() {
+        let TestMetrics {
+            recorder,
+            provider: _provider,
+            reader,
+        } = recording_recorder();
+        // telemetry::init_tracing
+        crate::services::metrics_service::install_otel_recorder(recorder);
+        // main, before db::create_pool
+        let handle = crate::services::metrics_service::init_metrics();
+
+        metrics::counter!("ak_startup_order_probe_total").increment(1);
+
+        let data = collect(&reader);
+        let sum = expect_u64_sum(named_metric(&data, "ak_startup_order_probe_total"));
+        assert_eq!(sum.data_points().next().unwrap().value(), 1);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("ak_startup_order_probe_total 1"),
+            "/metrics must still report the counter once: {rendered}"
+        );
+    }
+
+    /// The fan-out leaves the Prometheus side as it is without OTLP: the same
+    /// series names, values counted once, histogram buckets unchanged.
+    #[test]
+    fn fanout_keeps_the_prometheus_rendering_unchanged() {
+        fn record() {
+            metrics::counter!("ak_uploads_total", "format" => "npm").increment(2);
+            metrics::gauge!("ak_http_connections_open").increment(1.0);
+            metrics::histogram!(
+                crate::services::metrics_service::HTTP_REQUEST_DURATION_METRIC,
+                "method" => "GET"
+            )
+            .record(0.03);
+        }
+
+        let (prometheus_only, plain) =
+            crate::services::metrics_service::build_global_recorder(None);
+        metrics::with_local_recorder(&prometheus_only, record);
+
+        let TestMetrics {
+            recorder,
+            provider: _provider,
+            reader,
+        } = recording_recorder();
+        let (fanout, fanned) =
+            crate::services::metrics_service::build_global_recorder(Some(Box::new(recorder)));
+        metrics::with_local_recorder(&fanout, record);
+
+        assert_eq!(plain.render(), fanned.render());
+        let data = collect(&reader);
+        let sum = expect_u64_sum(named_metric(&data, "ak_uploads_total"));
+        assert_eq!(sum.data_points().next().unwrap().value(), 2);
     }
 
     #[test]
