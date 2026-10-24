@@ -160,6 +160,11 @@ its source package too (`libssl3` is graded as `openssl`).
   RHEL 9 (RHEL rebuilds such as Rocky, AlmaLinux and Oracle Linux are graded
   against the RHEL feed, as the scanner itself grades them), `fc40` Fedora 40,
   `amzn2023` Amazon Linux 2023.
+- A release is used only when the bundled vulnerability database has an
+  advisory feed for it (Debian 7 to 14, the Ubuntu releases from 12.04,
+  RHEL 5 to 10, Fedora, Amazon Linux 2 and 2023, Alpine 3.2 to 3.24 and
+  edge): the scanner matches nothing on a release it has no feed for, which
+  would read as clean.
 - A package for which no release the scanner has a feed for can be
   determined is inconclusive and not scanned: `423` under `fail_closed`,
   served `pending` under `fail_open` and `record_only`. See
@@ -383,7 +388,7 @@ have no core proxy path to gate.
 | `oci` | `docker`, `podman`, `buildx`, `oras`, `wasm_oci`, `helm_oci` | enforced | Image manifests: the whole image (config and layers) is scanned, and blob pulls re-check the verdict of the image they belong to. Remote and Virtual. |
 | `helm` | `helm` | accepted | |
 | `rpm` | `rpm` | enforced | Every file on the `/packages/` route and the catch-all, Remote and Virtual, except repository metadata and signing material (anything under `repodata/`, `repomd.xml` and its signature and key, `.treeinfo`, `media.repo`, `RPM-GPG-KEY*`, `.asc`/`.sig`/`.gpg`/`.key` files). An `.rpm` is graded as itself on the release its dist tag names (see [Operating-system packages](#what-the-gate-does)); any other file (a `.drpm`, an installer image) is inconclusive. A package of a published `@N` snapshot is served checksum-verified against the snapshot and is not gated. |
-| `debian` | `debian` | enforced | Every `pool/` file except `.dsc`, `.buildinfo` and `.changes`, and the `.deb`/`.udeb`/`.ddeb` packages of a `dists/` or flat layout, Remote and Virtual. A binary package is graded as itself on the release the remote's `Release` names (see [Operating-system packages](#what-the-gate-does)); a source tarball or diff is inconclusive. `Release`, `InRelease`, `Packages`, `Sources` and every other index are not gated. |
+| `debian` | `debian` | enforced | Every `pool/` file except `.dsc`, `.buildinfo` and `.changes`, and the `.deb`/`.udeb`/`.ddeb` packages of a `dists/` or flat layout, Remote and Virtual. A binary package is graded as itself on the release the remote's `Release` names (see [Operating-system packages](#what-the-gate-does)); a source tarball or diff is inconclusive. `Release`, `InRelease`, `Packages`, `Sources`, every other index and the installer files under `dists/` (`installer-<arch>/`) are not gated. |
 | `conan` | `conan` | enforced | Every recipe and package file except `conanfile.py`, `conanmanifest.txt` and `conaninfo.txt`, Remote and Virtual: the `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`) and any other file name, graded as the requested `name/version` and on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). A file that is not a gzipped tar (a zstd `.tzst`, a Conan 2 metadata file) is inconclusive: `423` under `fail_closed`. The three metadata files, revision lists and search are not gated. |
 | `cargo` | `cargo` | enforced | `.crate` downloads, Remote and Virtual. |
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
@@ -486,6 +491,18 @@ have no core proxy path to gate.
   from `pool/` (`apt-get source` fails), and a scanning RPM Remote withholds
   every file that is not an `.rpm` and not repository metadata (`.drpm`
   deltas, installer trees under `images/` or `LiveOS/`).
+- **OS package paths and releases come from the upstream's metadata.** A
+  Remote does not verify the upstream's signature on `Release` /
+  `InRelease` or `repomd.xml`; it re-signs what it serves. The release a
+  Debian package is graded against is the one that `Release` names, and the
+  paths a client fetches packages from are the ones the upstream's
+  `Packages` (`Filename`) and `primary.xml` (`location`) name. Both are
+  trusted as the package bytes themselves are: an upstream that names an
+  older release than the package's own grades it against that release's
+  feed, and a package file the upstream's index places under a metadata name
+  (a `.dsc`, a `repodata/` path, a `.asc` file) streams unscanned. Alpine
+  file names and branches come from the client's request, and an RPM's
+  release from its own header.
 - **Debian and RPM rows in a Remote repository.** As for NuGet, an
   `artifacts` row a Remote repository holds for a package path (from
   replication or a publish into the remote) is served from storage without
