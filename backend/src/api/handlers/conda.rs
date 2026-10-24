@@ -5941,9 +5941,12 @@ fn http_date(at: chrono::DateTime<chrono::Utc>) -> String {
 /// catalogued proxy-cache copy the route resolved), the response's own
 /// `X-Checksum-SHA256` (the scan-on-proxy gate's digest of the bytes it
 /// serves), and otherwise the response's existing `ETag`. A 304 is only
-/// answered when `allow_not_modified` is set: the caller clears it for a
-/// proxied serve that may be a cold fetch, so dropping the body never cancels
-/// a cache fill. Every gate (access, quarantine, scan policy, holds) has
+/// answered on a sha256 validator (one of the first two) and when
+/// `allow_not_modified` is set: the caller clears it for a proxied serve that
+/// may be a cold fetch, so dropping the body never cancels a cache fill. A
+/// response that only carries the upstream's `ETag` (the streaming arms of
+/// the scan-on-proxy walk, which may be a cold fetch) is always served in
+/// full. Every gate (access, quarantine, scan policy, holds) has
 /// already run by the time a `200` reaches this point, so a blocked package
 /// is never answered 304.
 fn finish_package_response(
@@ -6015,7 +6018,7 @@ fn finish_package_response(
             _ => false,
         },
     };
-    if !not_modified || !allow_not_modified {
+    if !not_modified || !allow_not_modified || !sha_based {
         return response;
     }
     let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
@@ -25486,6 +25489,71 @@ mod package_conditional_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers[CONTENT_LENGTH], bytes.len().to_string().as_str());
         assert_eq!(statements, 1, "one statement per hosted package request");
+    }
+
+    /// A rejected hosted package is refused before any validator is
+    /// consulted: a conditional request is 403, never a 304.
+    #[tokio::test]
+    async fn a_rejected_package_is_never_answered_304_4579() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let state = fx.state.clone();
+        let bytes = b"rejected package".to_vec();
+        let sha = seed_hosted_package(&state, fx.repo_id, &bytes).await;
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let etag = format!("\"{sha}\"");
+        let (status, _, _) = get(
+            &state,
+            &format!("/conda/{}/noarch/{FILE}", fx.repo_key),
+            &[("if-none-match", etag.as_str())],
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A streamed proxy serve that only carries the upstream's `ETag` (the
+    /// scan-on-proxy walk's streaming arms, which may be the cold fetch that
+    /// fills the cache) is never answered 304, even when the caller allows a
+    /// 304 and the request names that `ETag`: dropping the body would cancel
+    /// the cache fill, and the upstream's tag is not the sha256 validator.
+    #[test]
+    fn an_upstream_etag_alone_never_yields_304_4579() {
+        let response = || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(ETAG, "\"upstream-etag\"")
+                .header(CONTENT_LENGTH, "5")
+                .body(Body::from("bytes"))
+                .unwrap()
+        };
+        let mut request = HeaderMap::new();
+        request.insert(
+            axum::http::header::IF_NONE_MATCH,
+            "\"upstream-etag\"".parse().unwrap(),
+        );
+        let served = finish_package_response(&request, response(), None, true);
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers()[ETAG], "\"upstream-etag\"");
+
+        // The scan gate's digest header is a sha256 validator and does 304.
+        let mut digested = response();
+        digested
+            .headers_mut()
+            .insert("X-Checksum-SHA256", "abc".parse().unwrap());
+        request.insert(
+            axum::http::header::IF_NONE_MATCH,
+            "\"abc\"".parse().unwrap(),
+        );
+        let served = finish_package_response(&request, digested, None, true);
+        assert_eq!(served.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(served.headers()[ETAG], "\"abc\"");
     }
 
     #[test]
