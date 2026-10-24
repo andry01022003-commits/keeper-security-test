@@ -45,7 +45,14 @@ from the reference tables, as before.
 
 The pass runs at startup (it includes the backfill that used to run alone)
 and then every `OCI_MANIFESTS_RECONCILE_INTERVAL_SECS` seconds, default 21600
-(6 hours). `0` keeps only the startup pass.
+(6 hours). `0` keeps only the startup pass. The value is read once at
+startup, so changing it takes a restart. Every replica runs its own timer; a
+pass that finds another replica holding the lock is skipped, not queued.
+
+The removal scan walks `oci_manifests` in primary-key order and answers each
+row with index lookups on `oci_tags`, `oci_manifest_refs` and `artifacts`, so
+its cost grows with the table, not with `artifacts`: about two seconds for
+300,000 rows when none is stale.
 
 ## Metrics
 

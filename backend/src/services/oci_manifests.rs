@@ -660,10 +660,14 @@ const ROW_IS_STALE_SQL: &str = r#"
     AND NOT (
         om.digest LIKE 'sha256:%'
         AND EXISTS (
+            -- `checksum_sha256` is CHAR(64). Comparing it with the TEXT that
+            -- SUBSTRING returns casts the column instead, which rules out
+            -- idx_artifacts_checksum and turns this arm into a scan of every
+            -- artifacts row per oci_manifests row. Cast the digest instead.
             SELECT 1 FROM artifacts a
             WHERE a.repository_id = om.repository_id
               AND a.is_deleted = false
-              AND a.checksum_sha256 = SUBSTRING(om.digest FROM 8)
+              AND a.checksum_sha256 = SUBSTRING(om.digest FROM 8)::bpchar
         )
     )
 "#;
@@ -1869,6 +1873,16 @@ mod tests {
         );
         assert!(!removed);
         assert!(row.is_some(), "the re-tagged manifest keeps its row");
+    }
+
+    /// #1683 review: the checksum arm must compare as `bpchar` so it can use
+    /// `idx_artifacts_checksum`; the TEXT comparison cast the column and
+    /// planned a scan of `artifacts` per `oci_manifests` row.
+    #[test]
+    fn stale_predicate_checksum_arm_is_index_friendly_1683() {
+        assert!(
+            ROW_IS_STALE_SQL.contains("a.checksum_sha256 = SUBSTRING(om.digest FROM 8)::bpchar")
+        );
     }
 
     #[test]
