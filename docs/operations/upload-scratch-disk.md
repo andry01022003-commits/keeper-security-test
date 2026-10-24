@@ -81,8 +81,11 @@ capability the chunked completion uses, not by the backend's name.
   path up front and spool only `.rpm` packages.
 - **Chunked upload completion that must assemble locally.** This is the case
   for a filesystem-backed repository, for every backend that has no native
-  streaming upload, and for formats that need the body as a file (`.rpm` in an
-  RPM repository and Incus/Debian native finalize). The staged chunks are
+  streaming upload, and for formats whose finalize reads the body as a file
+  (`.rpm` in an RPM repository, a wheel or sdist in a PyPI repository, and
+  Incus/Debian packages; see `docs/chunked-uploads.md`). A Maven POM and an npm
+  tarball are read from the staged chunks instead and need no local file. The
+  staged chunks are
   reassembled into one file on the replica handling
   `PUT /api/v1/uploads/{id}/complete`, verified, and then written to the
   backend, so each concurrent completion needs the full artifact size. On

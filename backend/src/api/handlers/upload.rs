@@ -28,6 +28,9 @@ use crate::services::package_service::PackageService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::upload_service::{self, UploadError, UploadService};
 
+mod format_finalize;
+use format_finalize::{FinalizeInput, FinalizeSource};
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -121,6 +124,12 @@ pub struct SessionStatusResponse {
     pub artifact_path: String,
     pub created_at: String,
     pub expires_at: String,
+    /// The committed artifact, once `status` is `completed` (#1846).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<Uuid>,
+    /// Why the completion failed, once `status` is `failed` (#1846).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -506,19 +515,49 @@ async fn get_session_status(
         return Err(map_upload_err(UploadError::LegacySession));
     }
 
-    Ok(Json(SessionStatusResponse {
+    let status = session.status.clone();
+    Ok(Json(session_status_response(&state.db, &session, &status).await).into_response())
+}
+
+/// The status document of `session`, reporting `status`. A completed
+/// session names the artifact it committed (the live row at its path) and a
+/// failed one its error, so a client that completed with
+/// `Prefer: respond-async` learns the outcome by polling (#1846).
+async fn session_status_response(
+    db: &sqlx::PgPool,
+    session: &upload_service::UploadSession,
+    status: &str,
+) -> SessionStatusResponse {
+    let artifact_id = if status == "completed" {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(session.repository_id)
+        .bind(&session.artifact_path)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    SessionStatusResponse {
         session_id: session.id,
-        status: session.status,
+        status: status.to_string(),
         total_size: session.total_size,
         bytes_received: session.bytes_received,
         chunks_completed: session.completed_chunks,
         chunks_total: session.total_chunks,
-        repository_key: session.repository_key,
-        artifact_path: session.artifact_path,
+        repository_key: session.repository_key.clone(),
+        artifact_path: session.artifact_path.clone(),
         created_at: session.created_at.to_rfc3339(),
         expires_at: session.expires_at.to_rfc3339(),
-    })
-    .into_response())
+        artifact_id,
+        error: (status == "failed")
+            .then(|| session.error_message.clone())
+            .flatten(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,10 +570,12 @@ async fn get_session_status(
     tag = "uploads",
     params(
         ("session_id" = Uuid, Path, description = "Upload session ID"),
+        ("Prefer" = Option<String>, Header, description = "`respond-async` (RFC 7240): answer 202 once the completion lease is held and commit in the background; poll `GET /api/v1/uploads/{session_id}` until `status` is `completed` (with `artifact_id`), `failed` (with `error`), or back to `in_progress` (a retryable failure: repeat this request)"),
     ),
     responses(
-        (status = 200, description = "Upload finalized, artifact created", body = CompleteResponse),
-        (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed)", body = crate::api::openapi::ErrorResponse),
+        (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
+        (status = 202, description = "`Prefer: respond-async` was sent: the completion lease is held and the commit runs in the background. `Location` is the session status to poll", body = SessionStatusResponse),
+        (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed), or the format's own upload route would refuse the package: a `package.json`, wheel `METADATA` or Debian control file that names another package or version than the path (the session is failed, nothing is stored)", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
         (status = 405, description = "The session's repository is remote (proxy); direct uploads are not accepted and the session is failed", body = crate::api::openapi::ErrorResponse),
         (status = 409, description = "Conflict, for one of two reasons that the status code alone does not distinguish; read the response body to tell them apart. \
@@ -561,7 +602,53 @@ async fn complete(
     auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
-    let outcome = complete_session_commit(&state, &auth, &headers, session_id).await;
+    // C3: Verify user owns this session.
+    //
+    // complete_session takes the completion lease (pending/in_progress ->
+    // 'committing' with a state token) before verifying chunks/size/checksum,
+    // so a duplicate complete request — even one routed to another replica —
+    // gets a conflict here instead of a second storage copy + artifact
+    // upsert. Everything after runs under that lease and the terminal
+    // transition is token-guarded.
+    let session = UploadService::complete_session(&state.db, session_id, auth.user_id)
+        .await
+        .map_err(map_upload_err)?;
+
+    // #1846: a client that sends `Prefer: respond-async` (RFC 7240) gets 202
+    // as soon as the lease is held, and polls the session (`GET
+    // /api/v1/uploads/{id}`) for the outcome. A format finalize can read a
+    // multi-GiB package (an Incus image, a wheel's content analysis), longer
+    // than a proxy in front of the server waits for a response. The commit
+    // runs exactly as it would in the request; the session's `status` is the
+    // poll state.
+    if prefers_respond_async(&headers) {
+        let status = session_status_response(&state.db, &session, "committing").await;
+        let location = format!("/api/v1/uploads/{session_id}");
+        tokio::spawn(async move {
+            let outcome = complete_session_commit(&state, &auth, &headers, session).await;
+            if let Err(response) = &outcome {
+                tracing::warn!(
+                    session = %session_id,
+                    status = %response.status(),
+                    "asynchronous chunked completion failed"
+                );
+                reclaim_failed_session_staging(&state, session_id).await;
+            }
+        });
+        let mut response = (StatusCode::ACCEPTED, Json(status)).into_response();
+        if let Ok(value) = axum::http::HeaderValue::from_str(&location) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LOCATION, value);
+        }
+        response.headers_mut().insert(
+            "preference-applied",
+            axum::http::HeaderValue::from_static("respond-async"),
+        );
+        return Ok(response);
+    }
+
+    let outcome = complete_session_commit(&state, &auth, &headers, session).await;
     if outcome.is_err() {
         // #3922: a completion that failed terminally (checksum mismatch,
         // quota, a post-copy database failure) can never be retried, so its
@@ -573,28 +660,36 @@ async fn complete(
     outcome
 }
 
+/// Whether the request asks for an asynchronous answer
+/// (`Prefer: respond-async`, RFC 7240 section 4.1).
+fn prefers_respond_async(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|preference| {
+            preference
+                .split(';')
+                .next()
+                .is_some_and(|token| token.trim().eq_ignore_ascii_case("respond-async"))
+        })
+}
+
+/// Commit a session whose completion lease `complete` took: reassemble and
+/// verify the chunks, run the format finalize, write the artifact row and
+/// settle the session.
 async fn complete_session_commit(
     state: &SharedState,
     auth: &AuthExtension,
     headers: &HeaderMap,
-    session_id: Uuid,
+    session: upload_service::UploadSession,
 ) -> Result<Response, Response> {
     // The `write:artifacts` scope ceiling is enforced by `complete` before
     // this runs.
     let user_id = auth.user_id;
+    let session_id = session.id;
     let is_replication_request = super::is_replication_request(headers);
-
-    // C3: Verify user owns this session.
-    //
-    // complete_session takes the completion lease (pending/in_progress ->
-    // 'committing' with a state token) before verifying chunks/size/checksum,
-    // so a duplicate complete request — even one routed to another replica —
-    // gets a conflict here instead of a second storage copy + artifact
-    // upsert. Everything below runs under that lease and the terminal
-    // transition is token-guarded.
-    let session = UploadService::complete_session(&state.db, session_id, user_id)
-        .await
-        .map_err(map_upload_err)?;
     let commit_renewal = UploadService::spawn_commit_lease_renewal(state.db.clone(), &session);
 
     // #2603 G1: re-check repository write authorization before committing the
@@ -691,17 +786,18 @@ async fn complete_session_commit(
         auth.is_service_account,
     );
     let replicated_metadata = replication_trusted && session.artifact_metadata_format.is_some();
-    // #1846: a format with a native finalize (incus image, debian package)
-    // gets the coordinates its native upload route writes, derived from the
+    // #1846: a format with a native upload route (Maven, npm, PyPI, RPM,
+    // Incus, Debian) gets the coordinates that route writes, derived from the
     // path before the bytes are read so the immutability gate below checks
-    // the very `version` the row is written with.
-    let native_coordinates = if replicated_metadata {
+    // the very `version` the row is written with. A trusted replication
+    // session brings the source row's own metadata instead.
+    let native_target = if replicated_metadata {
         None
     } else {
-        native_finalize_coordinates(&repo.format, &session.artifact_path)
+        format_finalize::native_target(&repo.format, &session.artifact_path)
     };
-    let derived_version = match &native_coordinates {
-        Some((_, version)) => Some(version.clone()),
+    let derived_version = match &native_target {
+        Some(target) => Some(target.version.clone()),
         None => completed_format_artifact_version(&session, &repo.format),
     };
     // #4792: a trusted peer pushing the very bytes already live at this path
@@ -747,9 +843,13 @@ async fn complete_session_commit(
     // multipart / GCS resumable / Azure block blob) can reassemble the staged
     // chunks *on the backend* instead of writing one full-size local file.
     // Formats whose finalize reads the body as a file (the RPM header parse,
-    // the Incus/Debian package parse) still need local assembly, as does a
-    // filesystem repository and any backend that has no native streaming.
-    let needs_local_file = native_coordinates.is_some()
+    // a PyPI wheel, the Incus/Debian package parse) still need local assembly,
+    // as does a filesystem repository and any backend that has no native
+    // streaming. A finalize that reads a forward-only stream (a Maven POM, an
+    // npm tarball's `package.json`) is fed the staged chunks instead (#1846).
+    let needs_local_file = native_target
+        .as_ref()
+        .is_some_and(|target| target.input == FinalizeInput::LocalFile)
         || (!replicated_metadata
             && rpm_header_metadata_eligible(&repo.format, &session.artifact_path));
     let stream_assembly = !needs_local_file
@@ -832,40 +932,73 @@ async fn complete_session_commit(
         None
     };
 
-    // #1846: the format-native finalize for an incus image or a debian
-    // package, run over the reassembled file before any byte is stored, so a
-    // package its native route would refuse (a control file that disagrees
-    // with the file name) is refused here too, with nothing left behind.
-    let staged_native = match native_coordinates {
-        Some(_) => {
-            let temp_path = temp_path.expect("a native finalize assembles locally");
-            match stage_native_finalize(&repo.format, &session.artifact_path, temp_path).await {
-                Ok(staged) => staged,
+    // #1846: the format-native finalize, run over the verified bytes before
+    // any byte is stored under the content-addressed key, so a package its
+    // native route would refuse (a control file, `package.json` or wheel
+    // `METADATA` that disagrees with the file name) is refused here too, with
+    // nothing left behind. A local assembly is read from its file here; a
+    // backend assembly is read from the staged chunks once they are verified,
+    // below.
+    let mut staged_native = None;
+    if let (Some(target), Some(temp_path)) = (&native_target, temp_path) {
+        let source = match target.input {
+            FinalizeInput::PathOnly => FinalizeSource::None,
+            FinalizeInput::Stream | FinalizeInput::LocalFile => FinalizeSource::File(temp_path),
+        };
+        match format_finalize::stage(&repo.format, &session.artifact_path, target, source).await {
+            Ok(staged) => staged_native = Some(staged),
+            Err(reason) => {
+                UploadService::fail_committing(&state.db, &session, &reason).await;
+                return Err(map_err(StatusCode::BAD_REQUEST, reason));
+            }
+        }
+    }
+
+    if stream_assembly {
+        // Deduplicated completion: still verify the staged bytes, exactly as
+        // the local assembly path does, but do not write anything. Otherwise
+        // stream the chunks into the session's staging object and verify the
+        // result, to be promoted server-side to the content-addressed key.
+        let staged_key = if content_exists {
+            UploadService::verify_for_commit(&state.db, &storage, &session)
+                .await
+                .map_err(map_upload_err)?;
+            None
+        } else {
+            Some(
+                UploadService::assemble_for_commit_on_backend(&state.db, &storage, &session)
+                    .await
+                    .map_err(map_upload_err)?,
+            )
+        };
+        if let Some(target) = &native_target {
+            let source = match target.input {
+                FinalizeInput::Stream => {
+                    FinalizeSource::Stream(upload_service::staged_chunk_stream(
+                        storage.clone(),
+                        session.id,
+                        session.total_chunks,
+                    ))
+                }
+                // `needs_local_file` keeps a file-reading finalize off this
+                // path.
+                FinalizeInput::PathOnly | FinalizeInput::LocalFile => FinalizeSource::None,
+            };
+            match format_finalize::stage(&repo.format, &session.artifact_path, target, source).await
+            {
+                Ok(staged) => staged_native = Some(staged),
                 Err(reason) => {
+                    if let Some(staged_key) = &staged_key {
+                        let _ = storage.delete(staged_key).await;
+                    }
                     UploadService::fail_committing(&state.db, &session, &reason).await;
                     return Err(map_err(StatusCode::BAD_REQUEST, reason));
                 }
             }
         }
-        None => None,
-    };
-
-    if stream_assembly {
-        if content_exists {
-            // Deduplicated completion: still verify the staged bytes, exactly
-            // as the local assembly path does, but do not write anything.
-            UploadService::verify_for_commit(&state.db, &storage, &session)
-                .await
-                .map_err(map_upload_err)?;
-        } else {
-            // Stream the chunks into the session's staging object and verify
-            // the result, then promote it server-side to the content-addressed
-            // key. `copy` is the same promotion the generic upload path uses
+        if let Some(staged_key) = staged_key {
+            // `copy` is the same promotion the generic upload path uses
             // (#3916) and needs no local file on S3, GCS or Azure.
-            let staged_key =
-                UploadService::assemble_for_commit_on_backend(&state.db, &storage, &session)
-                    .await
-                    .map_err(map_upload_err)?;
             if let Err(e) = storage.copy(&staged_key, &storage_key).await {
                 // A retry re-creates the staging object from the chunks; the
                 // reaper reclaims this one if it is not deleted now.
@@ -891,11 +1024,20 @@ async fn complete_session_commit(
     drop(assembled);
 
     // Create artifact record. A natively finalized format is named the way
-    // its native route names it (incus product, debian package), which is
-    // what its index generator keys on.
-    let artifact_name = match &native_coordinates {
-        Some((name, _)) => name.as_str(),
+    // its native route names it (Maven artifactId, npm package, normalized
+    // PyPI project, RPM name, incus product, debian package), which is what
+    // its index generator keys on, and carries the content type that route
+    // stores unless the client named one.
+    let artifact_name = match &native_target {
+        Some(target) => target.name.as_str(),
         None => completed_artifact_name(&session),
+    };
+    let content_type = match &native_target {
+        Some(_) if session.content_type == upload_service::DEFAULT_CONTENT_TYPE => {
+            format_finalize::native_content_type(&repo.format, &session.artifact_path)
+                .unwrap_or(&session.content_type)
+        }
+        _ => &session.content_type,
     };
     // #1975 (stopgap for #1846): chunked uploads to FORMAT repositories must
     // carry a non-empty `version`, otherwise format index generators that key on
@@ -1016,7 +1158,7 @@ async fn complete_session_commit(
     .bind(artifact_version)
     .bind(session.total_size)
     .bind(&session.checksum_sha256)
-    .bind(&session.content_type)
+    .bind(content_type)
     .bind(&storage_key)
     .bind(user_id)
     .bind(crate::services::artifact_service::versioning_applies(
@@ -1155,15 +1297,16 @@ async fn complete_session_commit(
         .await;
     }
 
-    if let (Some(staged), Some((name, version))) = (&staged_native, &native_coordinates) {
+    if let (Some(staged), Some(target)) = (staged_native, &native_target) {
         let artifact_service = state.create_artifact_service(storage.clone());
-        let recorded = record_native_finalize(
+        let recorded = format_finalize::record(
             state,
             &artifact_service,
             &session,
             artifact_id,
-            (name, version),
+            target,
             staged,
+            rpm_upload_metadata.as_ref(),
         )
         .await;
         if let Err(e) = recorded {
@@ -1572,112 +1715,6 @@ async fn read_file_prefix(path: &std::path::Path, limit: u64) -> std::io::Result
     let mut buf = Vec::new();
     file.take(limit).read_to_end(&mut buf).await?;
     Ok(buf)
-}
-
-/// Format-native finalize state for a chunked completion (#1846): what the
-/// format's native upload route derives from the bytes, recorded against the
-/// artifact row once it exists.
-enum StagedNativeFinalize {
-    /// An Incus image's `artifact_metadata` document (arch/os/release), which
-    /// `streams_images` reads.
-    Incus(serde_json::Value),
-    /// A parsed and validated Debian package (control metadata, maintainer
-    /// scripts), which `Packages` renders.
-    Debian(Box<super::debian::StagedDebianPackage>),
-}
-
-/// The `(name, version)` a format's native upload route writes for
-/// `artifact_path`, when the repository format has a native finalize the
-/// chunked completion dispatches to (#1846). `None` keeps the generic
-/// behaviour: other formats, and paths their native route would not index
-/// (an incus sidecar, a debian file outside `pool/`).
-fn native_finalize_coordinates(
-    format: &crate::models::repository::RepositoryFormat,
-    artifact_path: &str,
-) -> Option<(String, String)> {
-    use crate::models::repository::RepositoryFormat;
-    match format {
-        RepositoryFormat::Incus | RepositoryFormat::Lxc => {
-            super::incus::image_coordinates_from_path(artifact_path)
-        }
-        RepositoryFormat::Debian => super::debian::package_coordinates_from_path(artifact_path),
-        _ => None,
-    }
-}
-
-/// Run the native finalize's read of the reassembled file at `file`. Called
-/// only for a path [`native_finalize_coordinates`] accepted, so every arm
-/// returns `Some`: debian's `Ok(None)` (not a pool package) is unreachable
-/// here, because the coordinates came from the same `staged_package_target`
-/// check. `Err` is a client-facing reason the upload is refused.
-async fn stage_native_finalize(
-    format: &crate::models::repository::RepositoryFormat,
-    artifact_path: &str,
-    file: &std::path::Path,
-) -> Result<Option<StagedNativeFinalize>, String> {
-    use crate::models::repository::RepositoryFormat;
-    match format {
-        RepositoryFormat::Incus | RepositoryFormat::Lxc => {
-            let (path, file) = (artifact_path.to_string(), file.to_path_buf());
-            let metadata = tokio::task::spawn_blocking(move || {
-                super::incus::extract_image_metadata(&path, &file)
-            })
-            .await
-            .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
-            Ok(Some(StagedNativeFinalize::Incus(metadata)))
-        }
-        RepositoryFormat::Debian => Ok(super::debian::finalize_from_staged(artifact_path, file)
-            .await?
-            .map(|staged| StagedNativeFinalize::Debian(Box::new(staged)))),
-        _ => Ok(None),
-    }
-}
-
-/// Record a natively finalized chunked upload's format records against its
-/// committed artifact row: the `artifact_metadata` document and catalog row
-/// (plus, for debian, the maintainer-script analysis) that its native upload
-/// route writes (#1846). The catalog row is written silently: the completion
-/// emits its own `artifact.uploaded`.
-async fn record_native_finalize(
-    state: &SharedState,
-    artifact_service: &crate::services::artifact_service::ArtifactService,
-    session: &upload_service::UploadSession,
-    artifact_id: Uuid,
-    (name, version): (&str, &str),
-    staged: &StagedNativeFinalize,
-) -> Result<(), String> {
-    match staged {
-        StagedNativeFinalize::Incus(metadata) => {
-            super::incus::store_image_metadata(&state.db, artifact_id, metadata).await?;
-            PackageService::new(state.db.clone())
-                .try_create_or_update_from_artifact(
-                    session.repository_id,
-                    name,
-                    version,
-                    session.total_size,
-                    &session.checksum_sha256,
-                    None,
-                    Some(serde_json::json!({ "format": "incus" })),
-                )
-                .await;
-            Ok(())
-        }
-        StagedNativeFinalize::Debian(package) => {
-            let (upload, deb_head) = package.parts();
-            super::debian::record_debian_package(
-                state,
-                artifact_service,
-                session.repository_id,
-                artifact_id,
-                session.total_size,
-                &session.checksum_sha256,
-                upload,
-                deb_head,
-            )
-            .await
-            .map_err(|e| e.to_string())
-        }
-    }
 }
 
 fn artifact_name_from_path(path: &str) -> &str {
@@ -3155,6 +3192,8 @@ mod tests {
             artifact_path: "images/app.tar.gz".into(),
             created_at: "2026-03-25T10:00:00Z".into(),
             expires_at: "2026-03-26T10:00:00Z".into(),
+            artifact_id: None,
+            error: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["session_id"], "550e8400-e29b-41d4-a716-446655440000");
@@ -3180,6 +3219,8 @@ mod tests {
             artifact_path: String::new(),
             created_at: String::new(),
             expires_at: String::new(),
+            artifact_id: None,
+            error: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         // Verify snake_case field names (API contract)
@@ -3208,6 +3249,8 @@ mod tests {
             artifact_path: "f.bin".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             expires_at: "2026-01-02T00:00:00Z".into(),
+            artifact_id: None,
+            error: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "pending");
@@ -3466,6 +3509,8 @@ mod tests {
             artifact_path: String::new(),
             created_at: String::new(),
             expires_at: String::new(),
+            artifact_id: None,
+            error: None,
         };
         let debug = format!("{:?}", resp);
         assert!(debug.contains("SessionStatusResponse"));
