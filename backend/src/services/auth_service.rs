@@ -317,6 +317,230 @@ pub(crate) fn is_api_token_revoked_in_cache(token_id: Uuid) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Session-family revocation (#4883)
+//
+// An access JWT minted as half of a token pair carries its refresh token's
+// `family_id` (#4831). Logout and refresh-token replay detection record that
+// family in `session_family_revocations` (migration 294), and every
+// access-token validation refuses a token whose family is recorded there.
+// This is the access-token side of a sign-out: before it, only the refresh
+// family was revoked and the access token kept working until it expired.
+//
+// Same shape as the API-token revocation cache above (`REVOKED_API_TOKENS`,
+// `API_TOKEN_CACHE_TTL_SECS`): a bounded in-process map keyed by family with a
+// DB-backed miss path.
+//   * A revoked verdict is sticky (a revocation is never undone), and a
+//     revocation handled by this replica is written to the map before the DB
+//     write, so a replayed token is refused here immediately.
+//   * A not-revoked verdict is cached for `SESSION_REVOCATION_CACHE_TTL_SECS`
+//     (default 5 s). That TTL is the cross-replica bound: a sign-out handled
+//     by replica A is seen by replica B at the latest when B's cached verdict
+//     for that family expires. 0 disables the negative cache (one indexed
+//     lookup per access-token validation).
+//   * The map is bounded; under pressure stale entries go first, then the
+//     not-revoked verdicts, and as a last resort everything. Dropping an
+//     entry only costs a DB lookup, the table is the source of truth.
+// ---------------------------------------------------------------------------
+
+/// 401 message for an access token whose session was signed out. Must not
+/// contain "expired": `AuthFailureReason::for_token_error` would then count
+/// it as an expired token.
+pub(crate) const SESSION_SIGNED_OUT_MESSAGE: &str = "Session has been signed out";
+
+/// Environment variable naming how long a "session not revoked" verdict is
+/// cached per refresh-token family, in seconds.
+pub const SESSION_REVOCATION_CACHE_TTL_ENV: &str = "SESSION_REVOCATION_CACHE_TTL_SECS";
+
+/// Default for [`SESSION_REVOCATION_CACHE_TTL_ENV`]: matches the credential
+/// watermark cache ([`CREDENTIAL_DB_CACHE_TTL_SECS`]), so a sign-out, a
+/// password change and a deactivation all reach every replica within the
+/// same 5 s.
+const DEFAULT_SESSION_REVOCATION_CACHE_TTL_SECS: u64 = 5;
+
+/// Upper bound accepted for [`SESSION_REVOCATION_CACHE_TTL_ENV`]: the
+/// API-token cache TTL. A longer window would leave a signed-out session
+/// usable on other replicas for longer than a revoked API token.
+const MAX_SESSION_REVOCATION_CACHE_TTL_SECS: u64 = API_TOKEN_CACHE_TTL_SECS;
+
+/// Entry bound of the session-family verdict cache. One entry per active
+/// session family seen by this replica; about 40 bytes each.
+const SESSION_FAMILY_CACHE_MAX_ENTRIES: usize = 65_536;
+
+/// How long a revoked verdict is kept in the map when the map is under
+/// pressure. Beyond it the DB lookup answers again.
+const SESSION_FAMILY_REVOKED_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
+
+/// Extra lifetime of a `session_family_revocations` row past the longest
+/// token of its family, for clock skew between replicas.
+const SESSION_FAMILY_REVOCATION_MARGIN_MINUTES: i64 = 60;
+
+/// Parse [`SESSION_REVOCATION_CACHE_TTL_ENV`]. Unset or unparsable values
+/// fall back to the default; values above the maximum are clamped.
+fn parse_session_revocation_cache_ttl(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_REVOCATION_CACHE_TTL_SECS)
+        .min(MAX_SESSION_REVOCATION_CACHE_TTL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The configured negative-cache TTL, read from the environment once.
+fn session_revocation_cache_ttl() -> std::time::Duration {
+    static TTL: OnceLock<std::time::Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        parse_session_revocation_cache_ttl(
+            std::env::var(SESSION_REVOCATION_CACHE_TTL_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Why a session family was revoked. Stored in
+/// `session_family_revocations.reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionRevocationReason {
+    /// `POST /api/v1/auth/logout`.
+    Logout,
+    /// A consumed refresh token of the family was presented again.
+    RefreshReplay,
+}
+
+impl SessionRevocationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Logout => "logout",
+            Self::RefreshReplay => "refresh_replay",
+        }
+    }
+}
+
+/// Bounded verdict cache for session families: `true` = revoked (sticky),
+/// `false` = not revoked as of the recorded instant.
+#[derive(Debug)]
+struct SessionFamilyCache {
+    entries: HashMap<Uuid, (bool, Instant)>,
+    max_entries: usize,
+}
+
+impl SessionFamilyCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// The cached verdict, or `None` when the DB must be asked: no entry, or
+    /// a not-revoked verdict older than `ttl`.
+    fn get(&self, family_id: Uuid, now: Instant, ttl: std::time::Duration) -> Option<bool> {
+        match self.entries.get(&family_id) {
+            Some(&(true, _)) => Some(true),
+            Some(&(false, at)) if now.saturating_duration_since(at) < ttl => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Record a verdict. A not-revoked verdict never overwrites a revoked one,
+    /// so a DB read that raced a local sign-out cannot resurrect the session.
+    fn record(&mut self, family_id: Uuid, revoked: bool, now: Instant, ttl: std::time::Duration) {
+        if !revoked && ttl.is_zero() {
+            return;
+        }
+        if !self.entries.contains_key(&family_id) && self.entries.len() >= self.max_entries {
+            self.make_room(now, ttl);
+        }
+        match self.entries.get_mut(&family_id) {
+            Some(entry) if entry.0 && !revoked => {}
+            Some(entry) => *entry = (revoked, now),
+            None => {
+                self.entries.insert(family_id, (revoked, now));
+            }
+        }
+    }
+
+    fn make_room(&mut self, now: Instant, ttl: std::time::Duration) {
+        self.entries.retain(|_, &mut (revoked, at)| {
+            let age = now.saturating_duration_since(at);
+            if revoked {
+                age < SESSION_FAMILY_REVOKED_RETENTION
+            } else {
+                age < ttl
+            }
+        });
+        if self.entries.len() >= self.max_entries {
+            self.entries.retain(|_, &mut (revoked, _)| revoked);
+        }
+        if self.entries.len() >= self.max_entries {
+            self.entries.clear();
+        }
+    }
+}
+
+static SESSION_FAMILY_VERDICTS: OnceLock<RwLock<SessionFamilyCache>> = OnceLock::new();
+
+fn session_family_cache() -> &'static RwLock<SessionFamilyCache> {
+    SESSION_FAMILY_VERDICTS
+        .get_or_init(|| RwLock::new(SessionFamilyCache::new(SESSION_FAMILY_CACHE_MAX_ENTRIES)))
+}
+
+/// Record on this replica that `family_id` is revoked, so its access tokens
+/// are refused here without waiting for a DB lookup.
+pub(crate) fn mark_session_family_revoked(family_id: Uuid) {
+    if let Ok(mut cache) = session_family_cache().write() {
+        cache.record(
+            family_id,
+            true,
+            Instant::now(),
+            session_revocation_cache_ttl(),
+        );
+    }
+}
+
+/// In-memory half of the session-family check: `true` only when this replica
+/// already knows the family is revoked. Used by the sync
+/// [`AuthService::validate_access_token`], which has no DB access.
+pub(crate) fn is_session_family_revoked_in_cache(family_id: Uuid) -> bool {
+    session_family_cache()
+        .read()
+        .map(|cache| cache.entries.get(&family_id).is_some_and(|e| e.0))
+        .unwrap_or(false)
+}
+
+/// Replica-safe session-family check: the cached verdict when fresh,
+/// otherwise one primary-key lookup in `session_family_revocations`.
+pub(crate) async fn is_session_family_revoked(db: &PgPool, family_id: Uuid) -> Result<bool> {
+    is_session_family_revoked_with_ttl(db, family_id, session_revocation_cache_ttl()).await
+}
+
+async fn is_session_family_revoked_with_ttl(
+    db: &PgPool,
+    family_id: Uuid,
+    ttl: std::time::Duration,
+) -> Result<bool> {
+    if let Ok(cache) = session_family_cache().read() {
+        if let Some(revoked) = cache.get(family_id, Instant::now(), ttl) {
+            return Ok(revoked);
+        }
+    }
+    // Stamp the verdict with the instant BEFORE the read, so its TTL never
+    // extends past what the read could have observed.
+    let asked_at = Instant::now();
+    let revoked = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM session_family_revocations WHERE family_id = $1)",
+    )
+    .bind(family_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if let Ok(mut cache) = session_family_cache().write() {
+        cache.record(family_id, revoked, asked_at, ttl);
+    }
+    Ok(revoked)
+}
+
 /// Cached API token validation entry. Extends `ApiTokenValidation` with
 /// the token's database ID and expiry so that revocation and expiration
 /// can be checked on cache hit without a DB round-trip.
@@ -2105,7 +2329,83 @@ impl AuthService {
             ));
         }
 
+        // Sessions signed out on this replica (#4883). The DB-backed half of
+        // the check lives in `validate_access_token_async`.
+        if token_data
+            .claims
+            .family_id
+            .is_some_and(is_session_family_revoked_in_cache)
+        {
+            return Err(AppError::Authentication(
+                SESSION_SIGNED_OUT_MESSAGE.to_string(),
+            ));
+        }
+
         Ok(token_data.claims)
+    }
+
+    /// Refuse a token whose refresh-token family was revoked by a sign-out or
+    /// by refresh-token replay detection (#4883). Tokens without a
+    /// `family_id` (API-token exchanges, access-only mints, scanner tokens,
+    /// tokens minted before #4831) are not session-bound and pass.
+    ///
+    /// Composes with [`reject_if_invalidated_replica_safe`](Self::reject_if_invalidated_replica_safe):
+    /// that one covers user-wide events (password change or reset, TOTP
+    /// toggle, privilege change, deactivation), this one covers a single
+    /// session. Costs at most one primary-key lookup per cache miss
+    /// ([`is_session_family_revoked`]).
+    async fn reject_if_session_family_revoked(&self, claims: &Claims) -> Result<()> {
+        let Some(family_id) = claims.family_id else {
+            return Ok(());
+        };
+        if is_session_family_revoked(&self.db, family_id).await? {
+            return Err(AppError::Authentication(
+                SESSION_SIGNED_OUT_MESSAGE.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record that the session `family_id` is revoked so its access tokens
+    /// are refused on every replica (#4883). Marks this replica's cache
+    /// first (fail-secure: if the insert fails, this replica still refuses),
+    /// then upserts the `session_family_revocations` row. The row outlives
+    /// the longest token the family can hold (refresh lifetime, which bounds
+    /// the access lifetime too, plus a margin) and is then pruned by
+    /// [`cleanup_expired_refresh_token_jti`](Self::cleanup_expired_refresh_token_jti).
+    async fn record_session_family_revocation(
+        &self,
+        family_id: Uuid,
+        reason: SessionRevocationReason,
+    ) -> Result<()> {
+        mark_session_family_revoked(family_id);
+        const MAX_MINUTES: i64 = 10 * 366 * 24 * 60;
+        let token_minutes = self
+            .config
+            .jwt_access_token_expiry_minutes
+            .max(
+                self.config
+                    .jwt_refresh_token_expiry_days
+                    .saturating_mul(24 * 60),
+            )
+            .clamp(0, MAX_MINUTES);
+        let expires_at = Utc::now()
+            + Duration::minutes(token_minutes + SESSION_FAMILY_REVOCATION_MARGIN_MINUTES);
+        sqlx::query(
+            r#"
+            INSERT INTO session_family_revocations (family_id, reason, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (family_id) DO UPDATE
+                SET expires_at = GREATEST(session_family_revocations.expires_at, EXCLUDED.expires_at)
+            "#,
+        )
+        .bind(family_id)
+        .bind(reason.as_str())
+        .bind(expires_at)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
     }
 
     /// Shared replica-safe credential-change gate for the three DB-backed
@@ -2148,6 +2448,11 @@ impl AuthService {
         }
 
         self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
+
+        // A signed-out session's access token is refused even though its
+        // signature and expiry are still good (#4883).
+        self.reject_if_session_family_revoked(&token_data.claims)
             .await?;
 
         // Re-derive `is_admin` from the live server-side role. The JWT claim is
@@ -2334,7 +2639,10 @@ impl AuthService {
                 // #1174) or its family row was pruned. Rotate normally in the
                 // presented family and record a fresh row so any future replay
                 // of the NEW token IS detected. Behaviour unchanged from the
-                // pre-fix legacy branch.
+                // pre-fix legacy branch, except that a family signed out
+                // without any jti row (#4883) does not rotate.
+                self.reject_if_session_family_revoked(&token_data.claims)
+                    .await?;
                 let user = self.load_active_user(token_data.claims.sub).await?;
                 let tokens = self.generate_tokens_with_family_and_scope(
                     &user,
@@ -2394,6 +2702,24 @@ impl AuthService {
                     .execute(&self.db)
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
+
+                    // The family's access tokens go with it (#4883). Best
+                    // effort: the caller gets the replay 401 either way, and
+                    // this replica's cache is marked before the insert.
+                    if let Err(e) = self
+                        .record_session_family_revocation(
+                            row.family_id,
+                            SessionRevocationReason::RefreshReplay,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            user_id = %token_data.claims.sub,
+                            family_id = %row.family_id,
+                            error = %e,
+                            "Failed to record the replayed session family as revoked",
+                        );
+                    }
 
                     tracing::warn!(
                         user_id = %token_data.claims.sub,
@@ -2673,11 +2999,18 @@ impl AuthService {
         self.revoke_refresh_token_family(family_id).await
     }
 
-    /// Revoke every unrevoked refresh-token jti row in `family_id` (one login
-    /// session). Used by logout when the caller presents only the session's
-    /// access token, which carries the same `family_id` (#4831). Returns the
-    /// number of rows revoked.
+    /// Sign out one login session: revoke every unrevoked refresh-token jti
+    /// row in `family_id` and record the family in
+    /// `session_family_revocations`, so the session's access tokens, which
+    /// carry the same `family_id` (#4831), are refused too (#4883). Used by
+    /// logout, from the presented refresh token or from the access token
+    /// alone. Returns the number of jti rows revoked; the family is recorded
+    /// even when that is 0 (no jti row, or rows already revoked by a
+    /// user-wide sweep).
     pub async fn revoke_refresh_token_family(&self, family_id: Uuid) -> Result<u64> {
+        let recorded = self
+            .record_session_family_revocation(family_id, SessionRevocationReason::Logout)
+            .await;
         let result = sqlx::query(
             r#"
             UPDATE refresh_token_jti
@@ -2689,12 +3022,17 @@ impl AuthService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        recorded?;
         Ok(result.rows_affected())
     }
 
     /// Delete refresh-token jti rows whose underlying JWT expired more than
     /// `grace` ago. Called by the scheduler janitor (#1174 cleanup).
-    /// Returns the number of rows removed.
+    /// Returns the number of jti rows removed.
+    ///
+    /// Also prunes `session_family_revocations` rows past their `expires_at`
+    /// by the same grace (#4883): no token of those families can still be
+    /// valid. That count is logged, not returned.
     pub async fn cleanup_expired_refresh_token_jti(db: &PgPool, grace: Duration) -> Result<u64> {
         let cutoff = Utc::now() - grace;
         let result = sqlx::query!(
@@ -2704,6 +3042,17 @@ impl AuthService {
         .execute(db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        let families = sqlx::query("DELETE FROM session_family_revocations WHERE expires_at < $1")
+            .bind(cutoff)
+            .execute(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if families.rows_affected() > 0 {
+            tracing::debug!(
+                "Pruned {} expired session_family_revocations rows",
+                families.rows_affected()
+            );
+        }
         Ok(result.rows_affected())
     }
 
@@ -9925,5 +10274,487 @@ mod tests {
             .generate_access_token_capped(&user, None, None, Some(Utc::now() + Duration::days(30)))
             .expect("mint far");
         assert_eq!(far.expires_in as i64, base_secs);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4883: a signed-out session's access token is refused.
+    //
+    // DB-backed; each test no-ops when DATABASE_URL is unset. They use only
+    // the public token API, so they run unchanged against a build without the
+    // session-family check (where the replay assertions fail).
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A real user row (watermark backdated by `insert_test_user`) and the
+    /// service that mints and validates its tokens.
+    async fn session_4883_fixture(pool: &sqlx::PgPool, tag: &str) -> (AuthService, User) {
+        let service = AuthService::new(pool.clone(), make_test_config());
+        let username = format!("s4883_{tag}_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+        (service, user)
+    }
+
+    /// One login session: a token pair whose refresh jti row is persisted, as
+    /// the login handler does.
+    async fn session_4883_login(service: &AuthService, user: &User) -> TokenPair {
+        let pair = service.generate_tokens(user).expect("mint pair");
+        service
+            .persist_refresh_jti_from_pair(&pair, user.id)
+            .await
+            .expect("persist refresh jti");
+        pair
+    }
+
+    fn session_4883_family(service: &AuthService, pair: &TokenPair) -> Uuid {
+        service
+            .validate_access_token(&pair.access_token)
+            .expect("fresh access token decodes")
+            .family_id
+            .expect("a pair's access token carries its family")
+    }
+
+    async fn session_4883_cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    fn assert_refused(result: Result<Claims>, what: &str) {
+        match result {
+            Err(AppError::Authentication(_)) => {}
+            other => panic!("{what}: expected a 401 (Authentication), got {other:?}"),
+        }
+    }
+
+    /// Logout presenting only the access token (the API/CLI shape, #4831)
+    /// and logout presenting the refresh token both end the session's access
+    /// token on the async (request-path) and the sync validator.
+    #[tokio::test]
+    async fn test_4883_access_token_refused_after_logout() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "logout").await;
+
+        // Logout from the access token's family.
+        let by_access = session_4883_login(&service, &user).await;
+        service
+            .validate_access_token_async(&by_access.access_token)
+            .await
+            .expect("valid before logout");
+        let family = session_4883_family(&service, &by_access);
+        service
+            .revoke_refresh_token_family(family)
+            .await
+            .expect("logout");
+        assert_refused(
+            service
+                .validate_access_token_async(&by_access.access_token)
+                .await,
+            "Bearer replay after an access-token logout",
+        );
+        assert_refused(
+            service.validate_access_token(&by_access.access_token),
+            "sync validator after an access-token logout",
+        );
+
+        // Logout from the refresh token (the browser / body shape).
+        let by_refresh = session_4883_login(&service, &user).await;
+        service
+            .validate_access_token_async(&by_refresh.access_token)
+            .await
+            .expect("valid before logout");
+        service
+            .revoke_refresh_token_family_for(&by_refresh.refresh_token)
+            .await
+            .expect("logout");
+        assert_refused(
+            service
+                .validate_access_token_async(&by_refresh.access_token)
+                .await,
+            "Bearer replay after a refresh-token logout",
+        );
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// Refresh-token replay detection revokes the family; every access token
+    /// minted in it (the original and the rotated ones) is refused.
+    #[tokio::test]
+    async fn test_4883_access_tokens_refused_after_refresh_replay() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "replay").await;
+        let first = session_4883_login(&service, &user).await;
+        let (_, second) = service
+            .refresh_tokens(&first.refresh_token)
+            .await
+            .expect("first rotation");
+        let (_, third) = service
+            .refresh_tokens(&second.refresh_token)
+            .await
+            .expect("second rotation");
+        service
+            .validate_access_token_async(&third.access_token)
+            .await
+            .expect("current access token valid before the replay");
+
+        // `first` was consumed and its successor `second` is spent too, so this
+        // is a genuine replay, not a benign double-submit.
+        let replay = service.refresh_tokens(&first.refresh_token).await;
+        assert!(replay.is_err(), "the replayed refresh token is refused");
+
+        for (label, pair) in [("first", &first), ("second", &second), ("third", &third)] {
+            assert_refused(
+                service
+                    .validate_access_token_async(&pair.access_token)
+                    .await,
+                &format!("{label} access token after refresh replay"),
+            );
+        }
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// A password change (the change-password handler's sequence: new
+    /// `password_changed_at`, local watermark, user-wide refresh revocation)
+    /// refuses the old access token. Covered by the credential watermark; this
+    /// pins that it composes with the family check.
+    #[tokio::test]
+    async fn test_4883_access_token_refused_after_password_change() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "pwchange").await;
+        let pair = session_4883_login(&service, &user).await;
+        service
+            .validate_access_token_async(&pair.access_token)
+            .await
+            .expect("valid before the password change");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        sqlx::query("UPDATE users SET password_changed_at = NOW() WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .expect("change password");
+        invalidate_user_tokens(user.id);
+        service
+            .revoke_all_refresh_token_families(user.id)
+            .await
+            .expect("revoke refresh families");
+
+        assert_refused(
+            service
+                .validate_access_token_async(&pair.access_token)
+                .await,
+            "Bearer replay after a password change",
+        );
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// Signing out one session leaves the user's other sessions alone.
+    #[tokio::test]
+    async fn test_4883_logout_leaves_other_sessions_valid() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "scope").await;
+        let signed_out = session_4883_login(&service, &user).await;
+        let other = session_4883_login(&service, &user).await;
+        assert_ne!(
+            session_4883_family(&service, &signed_out),
+            session_4883_family(&service, &other),
+            "two logins are two families"
+        );
+
+        service
+            .revoke_refresh_token_family(session_4883_family(&service, &signed_out))
+            .await
+            .expect("logout");
+
+        assert_refused(
+            service
+                .validate_access_token_async(&signed_out.access_token)
+                .await,
+            "the signed-out session",
+        );
+        service
+            .validate_access_token_async(&other.access_token)
+            .await
+            .expect("another session's access token stays valid");
+        service
+            .validate_access_token(&other.access_token)
+            .expect("and passes the sync validator");
+        service
+            .refresh_tokens(&other.refresh_token)
+            .await
+            .expect("and keeps refreshing");
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// The user-wide refresh revocation alone (what the TOTP toggle runs after
+    /// exempting the caller, #1370) does not end the caller's access token:
+    /// only a sign-out or a replay records the family. A later logout of that
+    /// session still does, although its jti rows are already revoked.
+    #[tokio::test]
+    async fn test_4883_user_wide_revocation_keeps_access_token_until_logout() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, user) = session_4883_fixture(&pool, "userwide").await;
+        let pair = session_4883_login(&service, &user).await;
+
+        service
+            .revoke_all_refresh_token_families(user.id)
+            .await
+            .expect("user-wide revocation");
+        service
+            .validate_access_token_async(&pair.access_token)
+            .await
+            .expect("the access token is not ended by the user-wide sweep alone");
+
+        let revoked_rows = service
+            .revoke_refresh_token_family(session_4883_family(&service, &pair))
+            .await
+            .expect("logout");
+        assert_eq!(revoked_rows, 0, "the jti rows were already revoked");
+        assert_refused(
+            service
+                .validate_access_token_async(&pair.access_token)
+                .await,
+            "Bearer replay after logout of an already-swept family",
+        );
+
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// Cross-replica bound: a sign-out recorded by another replica (a row this
+    /// process did not write) is seen on a cache miss at once, and through a
+    /// cached "not revoked" verdict once that verdict's TTL lapses.
+    #[tokio::test]
+    async fn test_4883_remote_revocation_seen_within_cache_ttl() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let insert_remote = |family: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO session_family_revocations (family_id, reason, expires_at) \
+                     VALUES ($1, 'logout', NOW() + INTERVAL '1 hour')",
+                )
+                .bind(family)
+                .execute(&pool)
+                .await
+                .expect("remote revocation row");
+            }
+        };
+
+        // Miss path: never seen here, revoked elsewhere, refused on first use.
+        let (service, user) = session_4883_fixture(&pool, "remote").await;
+        let pair = session_4883_login(&service, &user).await;
+        let family = session_4883_family(&service, &pair);
+        insert_remote(family).await;
+        assert_refused(
+            service
+                .validate_access_token_async(&pair.access_token)
+                .await,
+            "a family revoked by another replica, first lookup",
+        );
+
+        // Cached verdict: valid until the TTL lapses, refused after.
+        let ttl = std::time::Duration::from_millis(400);
+        let cached = Uuid::new_v4();
+        assert!(!is_session_family_revoked_with_ttl(&pool, cached, ttl)
+            .await
+            .unwrap());
+        insert_remote(cached).await;
+        assert!(
+            !is_session_family_revoked_with_ttl(&pool, cached, ttl)
+                .await
+                .unwrap(),
+            "inside the TTL the cached verdict answers"
+        );
+        tokio::time::sleep(ttl + std::time::Duration::from_millis(100)).await;
+        assert!(
+            is_session_family_revoked_with_ttl(&pool, cached, ttl)
+                .await
+                .unwrap(),
+            "after the TTL the DB is asked again and the revocation is seen"
+        );
+
+        // TTL 0: no negative caching, every lookup asks the DB.
+        let uncached = Uuid::new_v4();
+        let zero = std::time::Duration::ZERO;
+        assert!(!is_session_family_revoked_with_ttl(&pool, uncached, zero)
+            .await
+            .unwrap());
+        insert_remote(uncached).await;
+        assert!(is_session_family_revoked_with_ttl(&pool, uncached, zero)
+            .await
+            .unwrap());
+
+        for f in [family, cached, uncached] {
+            let _ = sqlx::query("DELETE FROM session_family_revocations WHERE family_id = $1")
+                .bind(f)
+                .execute(&pool)
+                .await;
+        }
+        session_4883_cleanup(&pool, user.id).await;
+    }
+
+    /// The revocation row outlives every token of the family and is pruned by
+    /// the refresh-token janitor once past `expires_at` plus the grace.
+    #[tokio::test]
+    async fn test_4883_revocation_row_lifetime_and_pruning() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+        let family = Uuid::new_v4();
+        service
+            .revoke_refresh_token_family(family)
+            .await
+            .expect("logout of a family with no jti rows");
+        let (reason, lifetime_secs): (String, f64) = sqlx::query_as(
+            "SELECT reason, EXTRACT(EPOCH FROM expires_at - revoked_at)::float8 \
+             FROM session_family_revocations WHERE family_id = $1",
+        )
+        .bind(family)
+        .fetch_one(&pool)
+        .await
+        .expect("the family is recorded even without jti rows");
+        assert_eq!(reason, "logout");
+        let refresh_secs = (make_test_config().jwt_refresh_token_expiry_days * 86_400) as f64;
+        assert!(
+            lifetime_secs > refresh_secs,
+            "row lifetime {lifetime_secs}s must cover the refresh lifetime {refresh_secs}s"
+        );
+
+        let stale = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO session_family_revocations (family_id, reason, revoked_at, expires_at) \
+             VALUES ($1, 'refresh_replay', NOW() - INTERVAL '10 days', NOW() - INTERVAL '2 days')",
+        )
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("stale row");
+        AuthService::cleanup_expired_refresh_token_jti(&pool, Duration::hours(1))
+            .await
+            .expect("janitor");
+        let left: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT family_id FROM session_family_revocations WHERE family_id = ANY($1)",
+        )
+        .bind(vec![family, stale])
+        .fetch_all(&pool)
+        .await
+        .expect("query");
+        assert_eq!(left, vec![family], "only the expired row is pruned");
+
+        let _ = sqlx::query("DELETE FROM session_family_revocations WHERE family_id = $1")
+            .bind(family)
+            .execute(&pool)
+            .await;
+    }
+
+    #[test]
+    fn test_4883_session_family_cache_semantics() {
+        let ttl = std::time::Duration::from_secs(5);
+        let t0 = Instant::now();
+        let later = |secs| t0 + std::time::Duration::from_secs(secs);
+        let mut cache = SessionFamilyCache::new(16);
+        let (live, revoked) = (Uuid::new_v4(), Uuid::new_v4());
+
+        assert_eq!(cache.get(live, t0, ttl), None, "unknown family: ask the DB");
+        cache.record(live, false, t0, ttl);
+        assert_eq!(cache.get(live, later(4), ttl), Some(false));
+        assert_eq!(
+            cache.get(live, later(5), ttl),
+            None,
+            "negative verdict expires"
+        );
+
+        cache.record(revoked, true, t0, ttl);
+        assert_eq!(
+            cache.get(revoked, later(3600), ttl),
+            Some(true),
+            "a revocation is sticky"
+        );
+        cache.record(revoked, false, later(1), ttl);
+        assert_eq!(
+            cache.get(revoked, later(2), ttl),
+            Some(true),
+            "a racing not-revoked read never resurrects a revoked family"
+        );
+        cache.record(live, true, later(1), ttl);
+        assert_eq!(
+            cache.get(live, later(2), ttl),
+            Some(true),
+            "live -> revoked"
+        );
+
+        let mut uncached = SessionFamilyCache::new(16);
+        uncached.record(live, false, t0, std::time::Duration::ZERO);
+        assert!(uncached.entries.is_empty(), "TTL 0 caches no negatives");
+    }
+
+    #[test]
+    fn test_4883_session_family_cache_is_bounded() {
+        let ttl = std::time::Duration::from_secs(5);
+        let t0 = Instant::now();
+        let mut cache = SessionFamilyCache::new(4);
+        let revoked = Uuid::new_v4();
+        cache.record(revoked, true, t0, ttl);
+        for _ in 0..3 {
+            cache.record(Uuid::new_v4(), false, t0, ttl);
+        }
+        assert_eq!(cache.entries.len(), 4);
+
+        // Full of fresh entries: the negatives go, the revocation stays.
+        let newcomer = Uuid::new_v4();
+        cache.record(newcomer, false, t0, ttl);
+        assert!(cache.entries.len() <= 4);
+        assert_eq!(cache.get(revoked, t0, ttl), Some(true));
+        assert_eq!(cache.get(newcomer, t0, ttl), Some(false));
+
+        // Full of revocations: everything is dropped rather than growing.
+        let mut full = SessionFamilyCache::new(2);
+        full.record(Uuid::new_v4(), true, t0, ttl);
+        full.record(Uuid::new_v4(), true, t0, ttl);
+        full.record(Uuid::new_v4(), true, t0, ttl);
+        assert!(full.entries.len() <= 2);
+    }
+
+    #[test]
+    fn test_4883_session_revocation_cache_ttl_parsing() {
+        let secs = |raw| parse_session_revocation_cache_ttl(raw).as_secs();
+        assert_eq!(secs(None), 5, "default");
+        assert_eq!(secs(Some("")), 5);
+        assert_eq!(secs(Some("abc")), 5);
+        assert_eq!(secs(Some("-1")), 5);
+        assert_eq!(secs(Some("0")), 0, "0 disables the negative cache");
+        assert_eq!(secs(Some(" 2 ")), 2);
+        assert_eq!(
+            secs(Some("86400")),
+            300,
+            "clamped to the API-token cache TTL"
+        );
+        assert!(!SESSION_SIGNED_OUT_MESSAGE
+            .to_ascii_lowercase()
+            .contains("expired"));
     }
 }

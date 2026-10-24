@@ -11938,4 +11938,99 @@ mod tests {
             "{outcome:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #4883: the issue's replay end to end through the real routes. Login
+    // pair, GET /me 200, POST /logout with only the Bearer access token, then
+    // the same Bearer on GET /me is 401 and another session of the user is
+    // still 200. The logout route is mounted behind `optional_auth_middleware`
+    // and /me behind `auth_middleware`, as routes.rs mounts them.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_4883_bearer_replay_after_logout_is_401() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request as HttpRequest, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("mw-4883-{}", uuid::Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch user");
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let pair = auth_service.generate_tokens(&user).expect("mint pair");
+            auth_service
+                .persist_refresh_jti_from_pair(&pair, user_id)
+                .await
+                .expect("persist jti");
+            sessions.push(pair);
+        }
+        let (signed_out, other) = (&sessions[0], &sessions[1]);
+
+        let app = axum::Router::new()
+            .merge(crate::api::handlers::auth::protected_router().layer(
+                axum::middleware::from_fn_with_state(auth_service.clone(), auth_middleware),
+            ))
+            .merge(crate::api::handlers::auth::logout_router().layer(
+                axum::middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                ),
+            ))
+            .with_state(state);
+        let me = |token: &str| {
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/me")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let (status, _) = tdh::send(app.clone(), me(&signed_out.access_token)).await;
+        assert_eq!(status, StatusCode::OK, "before logout");
+
+        let logout = HttpRequest::builder()
+            .method("POST")
+            .uri("/logout")
+            .header(
+                "authorization",
+                format!("Bearer {}", signed_out.access_token),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, body) = tdh::send(app.clone(), logout).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "logout: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let (status, _) = tdh::send(app.clone(), me(&signed_out.access_token)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a Bearer replay of the signed-out access token must be refused"
+        );
+        let (status, _) = tdh::send(app.clone(), me(&other.access_token)).await;
+        assert_eq!(status, StatusCode::OK, "another session is unaffected");
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

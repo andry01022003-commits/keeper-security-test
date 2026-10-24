@@ -150,6 +150,26 @@ impl AuthInterceptor {
             return Err(Status::unauthenticated("Token has been revoked"));
         }
 
+        // A signed-out session's access token is refused here as on the HTTP
+        // path (#4883): the DB-backed family check when a pool is wired, the
+        // in-memory one otherwise.
+        if let Some(family_id) = token_data.claims.family_id {
+            let revoked = match &self.db {
+                Some(db) => tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::services::auth_service::is_session_family_revoked(db, family_id),
+                    )
+                })
+                .map_err(|e| Status::unavailable(format!("Session lookup failed: {}", e)))?,
+                None => {
+                    crate::services::auth_service::is_session_family_revoked_in_cache(family_id)
+                }
+            };
+            if revoked {
+                return Err(Status::unauthenticated("Token has been revoked"));
+            }
+        }
+
         // Re-derive `is_admin` from the live server-side role. The JWT claim is
         // client-supplied and must not be the authorization source of truth: a
         // validly-signed token forged for a real low-priv subject with
@@ -559,5 +579,32 @@ mod tests {
             .bind(admin_id)
             .execute(&pool)
             .await;
+    }
+
+    /// A signed-out session's access token is refused on gRPC too (#4883);
+    /// another session's token is not.
+    #[test]
+    fn test_4883_signed_out_session_rejected() {
+        let interceptor = AuthInterceptor::new("secret", None);
+        let token_for = |family_id: Uuid| {
+            let mut claims = test_claims(Uuid::new_v4(), true, "access", None);
+            claims.family_id = Some(family_id);
+            encode(
+                &Header::default(),
+                &claims,
+                &EncodingKey::from_secret("secret".as_bytes()),
+            )
+            .unwrap()
+        };
+        let (signed_out, other) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::services::auth_service::mark_session_family_revoked(signed_out);
+
+        let err = interceptor
+            .intercept(request_with_token(&token_for(signed_out)))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(interceptor
+            .intercept(request_with_token(&token_for(other)))
+            .is_ok());
     }
 }
