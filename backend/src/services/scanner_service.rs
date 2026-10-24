@@ -4631,8 +4631,40 @@ impl OsRelease {
     pub const KNOWN_IDS: &'static [&'static str] =
         &["debian", "ubuntu", "rhel", "fedora", "amzn", "alpine"];
 
-    /// `None` for a family outside [`Self::KNOWN_IDS`] or a version that is
-    /// not dotted digits (`12`, `22.04`, `3.19`); Alpine also accepts `edge`.
+    /// The Ubuntu releases the bundled engine has an advisory feed for.
+    const UBUNTU_RELEASES: &'static [&'static str] = &[
+        "12.04", "12.10", "13.04", "14.04", "14.10", "15.04", "15.10", "16.04", "16.10", "17.04",
+        "17.10", "18.04", "18.10", "19.04", "19.10", "20.04", "20.10", "21.04", "21.10", "22.04",
+        "22.10", "23.04", "23.10", "24.04", "24.10", "25.04", "25.10", "26.04", "26.10",
+    ];
+
+    /// Whether the bundled engine has an advisory feed for release
+    /// `version_id` of family `id`. The engine matches nothing for a release
+    /// it has no feed for (`debian:15`, `ubuntu:99.04`), which would read as
+    /// clean, so such a release is not representable: the package is then
+    /// inconclusive. Mirrors the bundled vulnerability database's
+    /// distribution releases; a release added there is added here.
+    fn bundled_feed_has(id: &str, version_id: &str) -> bool {
+        let one_of = |range: std::ops::RangeInclusive<u32>, prefix: &str| {
+            range
+                .into_iter()
+                .any(|n| version_id == format!("{prefix}{n}"))
+        };
+        match id {
+            "debian" => one_of(7..=14, ""),
+            "ubuntu" => Self::UBUNTU_RELEASES.contains(&version_id),
+            "rhel" => one_of(5..=10, ""),
+            "fedora" => one_of(5..=9, "") || one_of(21..=46, ""),
+            "amzn" => matches!(version_id, "2" | "2022" | "2023"),
+            "alpine" => version_id == "edge" || one_of(2..=24, "3."),
+            _ => false,
+        }
+    }
+
+    /// `None` for a family outside [`Self::KNOWN_IDS`], a version that is
+    /// not dotted digits (`12`, `22.04`, `3.19`; Alpine also accepts `edge`),
+    /// or a release the bundled engine has no feed for
+    /// ([`Self::bundled_feed_has`]).
     pub fn new(id: &str, version_id: &str) -> Option<Self> {
         let id = *Self::KNOWN_IDS.iter().find(|k| **k == id)?;
         let version_id = version_id.trim();
@@ -4642,6 +4674,9 @@ impl OsRelease {
                 .split('.')
                 .all(|p| !p.is_empty() && p.len() <= 6 && p.chars().all(|c| c.is_ascii_digit()));
         if !(dotted || (id == "alpine" && version_id == "edge")) {
+            return None;
+        }
+        if !Self::bundled_feed_has(id, version_id) {
             return None;
         }
         Some(Self {
@@ -16075,8 +16110,29 @@ mod tests {
             ("rhel", "9\nID=x"),
             ("gentoo", "1"),
             ("alpine", "3..19"),
+            // A release the bundled engine has no feed for would grade
+            // nothing and read as clean.
+            ("debian", "15"),
+            ("debian", "99"),
+            ("ubuntu", "99.04"),
+            ("ubuntu", "22.4"),
+            ("rhel", "11"),
+            ("fedora", "99"),
+            ("amzn", "2024"),
+            ("alpine", "3.99"),
+            ("alpine", "4.0"),
         ] {
             assert!(OsRelease::new(id, version).is_none(), "{id:?} {version:?}");
+        }
+        for (id, version) in [
+            ("debian", "14"),
+            ("ubuntu", "26.04"),
+            ("rhel", "10"),
+            ("fedora", "40"),
+            ("amzn", "2"),
+            ("alpine", "3.24"),
+        ] {
+            assert!(OsRelease::new(id, version).is_some(), "{id:?} {version:?}");
         }
         // Every field of an OS pin is checked, not only name and version.
         let ctx = |arch: &str, source: Option<&str>| OsPackageContext {
