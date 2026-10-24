@@ -135,8 +135,11 @@ pub async fn run_storage_scrub(
                     serde_json::json!({ "repair": payload.repair, "repository": key }),
                 )
                 .await;
-                audit.finish(&Err(AppError::NotFound(e.to_string())));
-                return Err(e);
+                // Audit the lookup's own error (a 404, or a database
+                // failure), then answer it.
+                let refused: Result<ScrubResult> = Err(e);
+                audit.finish(&refused);
+                return refused.map(Json);
             }
         },
         None => None,
