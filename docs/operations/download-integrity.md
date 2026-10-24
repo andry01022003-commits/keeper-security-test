@@ -35,6 +35,17 @@ the stored bundle.
 - A range request for part of an object is not checked (a window cannot be
   checked against a whole-object digest); a range covering the whole object
   is.
+- A `HEAD` on the generic route, or one the shared hosted fetch answers from
+  the artifact row, reads no body and is not checked.
+
+## Cost
+
+Every checked serve hashes the bytes it sends (SHA-256, one pass, no second
+read of the object). An object of at most 4 MiB is held in memory until it has
+been checked, so its first byte leaves only after its last byte was read, and
+each such serve in flight holds up to 4 MiB. A larger object streams with one
+chunk held back. Virtual-repository `HEAD` requests that resolve through a
+member walk still read a small object to check it.
 
 Each failure logs `stored object failed integrity verification on serve`
 at error level with the object, the expected and actual digest and length.

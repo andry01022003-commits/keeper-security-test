@@ -37748,6 +37748,58 @@ mod conditional_put_and_serve_verification_tests {
         assert_eq!(code_of(&err_body), "STORED_OBJECT_INTEGRITY");
     }
 
+    /// #4323: a HEAD answered from the artifact row by the shared hosted fetch
+    /// never reads the body, so it is not verified (it would read up to 4 MiB
+    /// of the object for nothing); the GET of the same corrupted object is the
+    /// 502.
+    #[tokio::test]
+    async fn head_from_the_row_does_not_read_or_verify_the_body_4323_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+        let (status, _, _) = fx.put(&key, "h/x.bin", b"head body", &[]).await;
+        assert_eq!(status, StatusCode::CREATED);
+        fx.corrupt(repo_id, "h/x.bin", b"head bodY").await;
+        let location = crate::storage::StorageLocation {
+            backend: "s3".into(),
+            path: key.clone(),
+        };
+        let ctx = |is_head| crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head,
+        };
+        let status_of =
+            |r: &std::result::Result<axum::response::Response, axum::response::Response>| match r {
+                Ok(resp) | Err(resp) => resp.status(),
+            };
+        let head = crate::api::handlers::proxy_helpers::local_fetch_or_redirect(
+            &fx.pool,
+            &fx.state,
+            repo_id,
+            &location,
+            "h/x.bin",
+            &ctx(true),
+        )
+        .await;
+        let get = crate::api::handlers::proxy_helpers::local_fetch_or_redirect(
+            &fx.pool,
+            &fx.state,
+            repo_id,
+            &location,
+            "h/x.bin",
+            &ctx(false),
+        )
+        .await;
+        let (head_status, get_status) = (status_of(&head), status_of(&get));
+        drop((head, get));
+        fx.teardown().await;
+        assert_eq!(head_status, StatusCode::OK, "HEAD is answered from the row");
+        assert_eq!(get_status, StatusCode::BAD_GATEWAY, "GET verifies");
+    }
+
     /// #4323: `ranged_stream_response_advertised` (Incus images) verifies a
     /// whole-object serve against the digest its own headers advertise, and
     /// leaves a content-coded body alone.

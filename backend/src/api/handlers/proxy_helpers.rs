@@ -5765,6 +5765,18 @@ async fn read_local_stream(
     artifact: &LocalArtifactRow,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<StreamingFetchResult, Response> {
+    open_local_stream(db, artifact, storage, true).await
+}
+
+/// [`read_local_stream`] with serve-time verification optional. A HEAD
+/// answered from the row passes `verify = false`: it never polls the body, and
+/// verifying would read up to `VERIFY_BEFORE_HEADERS_MAX_BYTES` of it (#4323).
+async fn open_local_stream(
+    db: &PgPool,
+    artifact: &LocalArtifactRow,
+    storage: &dyn crate::storage::StorageBackend,
+    verify: bool,
+) -> Result<StreamingFetchResult, Response> {
     let body = match storage.get_stream(&artifact.storage_key).await {
         Ok(stream) => stream,
         Err(crate::error::AppError::NotFound(_)) => {
@@ -5778,14 +5790,18 @@ async fn read_local_stream(
     // #4323: verify against the record (a 502 for a small object, see
     // `verify_stored_body`); terminal for virtual resolution via
     // `is_member_policy_block_response`.
-    let body = crate::storage::verify::verify_stored_body(
-        body,
-        &artifact.checksum_sha256,
-        &artifact.path,
-        artifact.size_bytes,
-        || artifact.path.clone(),
-    )
-    .await?;
+    let body = if verify {
+        crate::storage::verify::verify_stored_body(
+            body,
+            &artifact.checksum_sha256,
+            &artifact.path,
+            artifact.size_bytes,
+            || artifact.path.clone(),
+        )
+        .await?
+    } else {
+        body
+    };
     Ok(StreamingFetchResult {
         commit_sha: None,
         content_encoding: None,
@@ -6074,7 +6090,7 @@ pub async fn local_fetch_or_redirect(
     // artifact into memory just to answer a probe. Status parity with GET is
     // preserved: a storage miss still errors here exactly as it would for a GET.
     if ctx.is_head {
-        let result = read_local_stream(db, &artifact, &*storage).await?;
+        let result = open_local_stream(db, &artifact, &*storage, false).await?;
         return stream_fetch_result(result, &artifact.content_type, None);
     }
 
