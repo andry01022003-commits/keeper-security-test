@@ -20,10 +20,11 @@ propagation format (B3, Jaeger `uber-trace-id`, X-Ray) is read.
 **What a valid header does.** The request's `http_request` span (kind `SERVER`)
 becomes a child of the span the header names: it carries the header's trace id,
 and its parent span id is the header's parent id. The request's spans and the
-caller's are then one trace. The header is valid when it has four fields,
-version `00`, a 32-hex-character trace id and a 16-hex-character parent id, and
-neither id is all zeros. A header that is not valid is ignored, and the request
-starts a new root trace. A `tracestate` over the W3C limits (32 members or 512
+caller's are then one trace. The header is valid when it has at least four
+fields (exactly four for version `00`), a version other than `ff`, a trace id of
+exactly 32 and a parent id of exactly 16 lowercase hex characters, and neither
+id is all zeros. A header that is not valid is ignored, and the request starts a
+new root trace. A `tracestate` over the W3C limits (32 members or 512
 characters) is dropped and `traceparent` is still used.
 
 **Sampling.** The default sampler, `parentbased_always_on`, follows the
@@ -99,9 +100,10 @@ values are validated, so this is not a header-injection path.
 
 All spans carry the resource attributes `service.name` (`OTEL_SERVICE_NAME`,
 default `artifact-keeper`), `service.version` and `service.instance.id`.
-Every span also carries the code location and thread attributes the
-tracing bridge adds (`code.file.path`, `code.module.name`, `code.line.number`,
-`thread.id`, `thread.name`). The tables below list the rest.
+Every span except the database statement spans (which are built directly,
+not from a `tracing` span) also carries the code location and thread attributes
+the tracing bridge adds (`code.file.path`, `code.module.name`,
+`code.line.number`, `thread.id`, `thread.name`). The tables below list the rest.
 
 A span is marked as an error (status `ERROR`) only where its section says so,
 and then `error.type` names the cause.
@@ -213,6 +215,16 @@ after the operation's function (`put`, `get`, `exists`, `delete`, ...).
 | `key` (and the call's other arguments) | string | The storage key the call addressed. |
 
 A failed call records its error message as an `INFO` event on the span.
+
+### Background work (kind `INTERNAL`)
+
+A few background workers open spans of their own, outside any request:
+
+| Span | When | Attributes |
+|---|---|---|
+| `dispatch_event` | The email notification dispatcher handles one domain event. | `event_type`, `entity_id`, `repository_id`, and `event` (the whole event, debug-formatted) |
+| `update_job_status`, `claim_job_running`, `finalize_job_status` | A migration job changes state. | `job_id`, `status` where the call has one |
+| `complete_item`, `fail_item`, `skip_item` | A migration item finishes. | `item_id` and the call's other arguments (`target_path`, `checksum_target`, `error_message`, `reason`) |
 
 ## Building on the spans
 
