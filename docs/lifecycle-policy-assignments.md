@@ -28,6 +28,14 @@ Every policy type accepts these optional `config` keys:
   unanchored unless you use `^` / `$`, so `sha-` also matches `release-sha-1`.
   Use `\y`, not `\b`, for a word boundary. A version-less artifact is in scope
   only if the pattern matches the empty string.
+- `match.format` limits the policy to repositories of one format
+  (`"format": "docker"`) or of several (`"format": ["npm", "yarn"]`). Use the
+  format name the repository API reports (`docker`, `helm_oci`,
+  `conda_native`, ...); an unknown name is rejected with 400. The policy does
+  not run at all in a repository of another format, even when it is assigned
+  to it or is global, so neither its artifact sweep nor its proxy-cache
+  eviction touches that repository. Formats are matched exactly: `docker`
+  does not include `podman` or `oras` repositories.
 
 Every lifecycle regex -- `match.version_pattern`, each
 `exclude.version_patterns` entry, and the `pattern` of `tag_pattern_keep` /

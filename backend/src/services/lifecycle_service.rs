@@ -40,7 +40,9 @@
 //! starts with the given string, and `version_pattern` to artifacts whose
 //! version (the tag, for OCI formats) matches a regex. The pattern is a
 //! PostgreSQL regex (validated by PostgreSQL at create/update time) and is
-//! unanchored unless it uses `^` / `$`. `max_age_days`
+//! unanchored unless it uses `^` / `$`. `format` limits the policy to
+//! repositories of the given format (or formats): it runs in no other
+//! repository at all. `max_age_days`
 //! additionally accepts `min_keep`: the newest N artifacts of each package
 //! (grouped and ordered exactly as `max_versions` groups them) survive even
 //! when they are past the age window (#2024):
@@ -999,9 +1001,13 @@ pub(crate) fn parse_exclusions(config: &serde_json::Value) -> Result<PolicyExclu
 pub(crate) const MATCH_CONFIG_KEY: &str = "match";
 
 /// The only keys accepted inside `config.match`. Further selectors from #2024
-/// (format, repository) are deliberately rejected until they are implemented,
-/// so a config written for them fails instead of silently matching more.
-const MATCH_ALLOWED_KEYS: [&str; 2] = ["path_prefix", "version_pattern"];
+/// (repository, tag pattern) are deliberately rejected until they are
+/// implemented, so a config written for them fails instead of silently
+/// matching more.
+const MATCH_ALLOWED_KEYS: [&str; 3] = ["path_prefix", "version_pattern", MATCH_FORMAT_KEY];
+
+/// `config.match.format`: the repository formats a policy runs in (#2024).
+pub(crate) const MATCH_FORMAT_KEY: &str = "format";
 
 /// `max_age_days` / `composite` key: keep the newest N artifacts of each
 /// retention group even when they meet the deletion condition (#2024).
@@ -1054,7 +1060,7 @@ pub(crate) fn parse_match(config: &serde_json::Value) -> Result<(Option<String>,
     };
     let map = matcher.as_object().ok_or_else(|| {
         AppError::Validation(
-            "config 'match' must be an object with 'path_prefix' and/or 'version_pattern'"
+            "config 'match' must be an object with 'path_prefix', 'version_pattern' and/or 'format'"
                 .to_string(),
         )
     })?;
@@ -1077,6 +1083,52 @@ pub(crate) fn parse_match(config: &serde_json::Value) -> Result<(Option<String>,
         reject_backspace_escape("match.version_pattern", pattern)?;
     }
     Ok((path_prefix, version_pattern))
+}
+
+/// Parse `config.match.format` into the repository format keys a policy is
+/// limited to (#2024). Absent is an empty list (every format). Present, it is
+/// one format key (`"docker"`) or a non-empty array of them
+/// (`["npm", "yarn"]`), each a `repository_format` label exactly as the
+/// repository API reports it ([`RepositoryFormat::as_key`]); an unknown or
+/// misspelt format is a validation error rather than a scope that matches
+/// nothing. Duplicates are dropped.
+///
+/// Unlike `path_prefix` and `version_pattern` this is a repository-level
+/// scope: the policy simply does not run in a repository of another format,
+/// so neither its artifact sweep nor its proxy-cache arm touches it.
+///
+/// [`RepositoryFormat::as_key`]: crate::models::repository::RepositoryFormat::as_key
+pub(crate) fn parse_match_formats(config: &serde_json::Value) -> Result<Vec<String>> {
+    use crate::models::repository::RepositoryFormat;
+    let Some(value) = config
+        .get(MATCH_CONFIG_KEY)
+        .and_then(|m| m.get(MATCH_FORMAT_KEY))
+    else {
+        return Ok(Vec::new());
+    };
+    let invalid = || {
+        AppError::Validation(
+            "match.format must be a format name or a non-empty array of format names".to_string(),
+        )
+    };
+    let names: Vec<&serde_json::Value> = match value {
+        serde_json::Value::String(_) => vec![value],
+        serde_json::Value::Array(items) if !items.is_empty() => items.iter().collect(),
+        _ => return Err(invalid()),
+    };
+    let mut formats: Vec<String> = Vec::with_capacity(names.len());
+    for name in names {
+        let name = name.as_str().ok_or_else(invalid)?;
+        if !RepositoryFormat::ALL.iter().any(|f| f.as_key() == name) {
+            return Err(AppError::Validation(format!(
+                "match.format: unknown repository format '{name}'"
+            )));
+        }
+        if !formats.iter().any(|f| f == name) {
+            formats.push(name.to_string());
+        }
+    }
+    Ok(formats)
 }
 
 /// Parse a policy's [`PolicyFilters`] from its `config`.
@@ -1359,7 +1411,12 @@ impl LifecycleService {
             }
         }
 
-        let repositories = self.resolve_repositories(&policy).await?;
+        let repositories = self
+            .retain_matching_formats(
+                self.resolve_repositories(&policy).await?,
+                &parse_match_formats(&policy.config)?,
+            )
+            .await?;
         let mut result = Self::build_execution_result(&policy, dry_run, 0, 0, 0);
         if dry_run {
             // Report every stored-regex problem in the preview, and stop when
@@ -1407,6 +1464,31 @@ impl LifecycleService {
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
         Ok(result)
+    }
+
+    /// Narrow a policy's resolved repositories to its `match.format` scope
+    /// (#2024), keeping their order. An empty `formats` list (no
+    /// `match.format`) keeps every repository without a query.
+    async fn retain_matching_formats(
+        &self,
+        mut repositories: Vec<Uuid>,
+        formats: &[String],
+    ) -> Result<Vec<Uuid>> {
+        if formats.is_empty() || repositories.is_empty() {
+            return Ok(repositories);
+        }
+        let in_scope: std::collections::HashSet<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM repositories WHERE id = ANY($1) AND format::TEXT = ANY($2)",
+        )
+        .bind(&repositories)
+        .bind(formats)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .into_iter()
+        .collect();
+        repositories.retain(|id| in_scope.contains(id));
+        Ok(repositories)
     }
 
     /// The stored-regex problems of `policy` (#4461), checked on one pooled
@@ -2111,6 +2193,7 @@ impl LifecycleService {
         // bad `exclude`/`match` block is a 422 at create/update time rather
         // than a surprise at sweep time.
         parse_policy_filters(config)?;
+        parse_match_formats(config)?;
         let version_patterns = parse_exclusions(config)?.version_patterns.len();
         if version_patterns > MAX_VERSION_PATTERNS {
             return Err(AppError::Validation(format!(
