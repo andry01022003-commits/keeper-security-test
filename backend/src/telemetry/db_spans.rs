@@ -29,12 +29,18 @@
 //!
 //! This costs no call-site changes and no new dependency, and it is bounded:
 //!
-//! * The layer is installed only on the OTLP path (`init_with_otel`).
-//! * It sees only the events the global `EnvFilter` lets through. The default
-//!   filter keeps `sqlx::query=info`, so out of the box only statements sqlx
-//!   reports as SLOW (WARN, over its 1 s default threshold) become spans. A
-//!   span for every statement needs `sqlx::query=debug` in `RUST_LOG`, which
-//!   also logs every statement on stdout.
+//! * The layer is installed only on the OTLP path (`init_with_otel`), and not
+//!   at all with `DB_QUERY_SPANS=off`.
+//! * By default (`DB_QUERY_SPANS` unset or `log`) it sees only the events the
+//!   global `EnvFilter` lets through. The default filter keeps
+//!   `sqlx::query=info`, so out of the box only statements sqlx reports as
+//!   SLOW (WARN, over its 1 s default threshold) become spans, and a span for
+//!   every statement needs `sqlx::query=debug` in `RUST_LOG`, which also logs
+//!   every statement on stdout. `DB_QUERY_SPANS=all` decouples the two
+//!   (#3954): the global filter lets every `sqlx::query` event through, and
+//!   the stdout and OTel log layers get `RUST_LOG` as a per-layer filter of
+//!   their own, so every statement becomes a span while stdout shows exactly
+//!   what `RUST_LOG` asks for (see [`DbQuerySpans`]).
 //! * A query with no OTel-backed parent span (startup, a background job outside
 //!   any span) produces nothing, so background work does not open one root
 //!   trace per statement.
@@ -87,6 +93,69 @@ where
     tracing_opentelemetry::layer()
         .with_tracer(tracer)
         .with_filter(filter_fn(keep))
+}
+
+/// The variable that selects which statements become DB spans.
+pub(crate) const DB_QUERY_SPANS_VAR: &str = "DB_QUERY_SPANS";
+
+/// The directive the global filter gains under [`DbQuerySpans::All`]: every
+/// level of the sqlx statement target, whatever `RUST_LOG` says about it.
+pub(crate) const ALL_QUERIES_DIRECTIVE: &str = "sqlx::query=trace";
+
+/// Which sqlx statements become DB `CLIENT` spans (`DB_QUERY_SPANS`, #3954).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbQuerySpans {
+    /// `log` (the default): the statements `RUST_LOG` lets through, which
+    /// under the default filter are the slow ones. Unchanged from 1.11.
+    Log,
+    /// `all`: every statement, independent of `RUST_LOG`; stdout and exported
+    /// log records still follow `RUST_LOG`.
+    All,
+    /// `off`: no DB spans.
+    Off,
+}
+
+impl DbQuerySpans {
+    /// Parse a raw value: case-insensitive, surrounding whitespace ignored,
+    /// empty or unset is the default. `None` for an unsupported value.
+    pub(crate) fn parse(raw: Option<&str>) -> Option<Self> {
+        match raw.map(str::trim) {
+            None | Some("") => Some(Self::Log),
+            Some(v) if v.eq_ignore_ascii_case("log") => Some(Self::Log),
+            Some(v) if v.eq_ignore_ascii_case("all") => Some(Self::All),
+            Some(v) if v.eq_ignore_ascii_case("off") => Some(Self::Off),
+            Some(_) => None,
+        }
+    }
+
+    /// The mode from [`DB_QUERY_SPANS_VAR`], plus the raw value when it was
+    /// not recognised (the default is used then, and startup warns).
+    pub(crate) fn from_env() -> (Self, Option<String>) {
+        let raw = std::env::var(DB_QUERY_SPANS_VAR).ok();
+        match Self::parse(raw.as_deref()) {
+            Some(mode) => (mode, None),
+            None => (Self::Log, raw),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::All => "all",
+            Self::Off => "off",
+        }
+    }
+
+    /// Whether [`DbQuerySpanLayer`] is installed at all.
+    pub(crate) fn enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Whether the global filter must let every statement through, with
+    /// `RUST_LOG` moved onto the log layers as per-layer filters.
+    pub(crate) fn needs_per_layer_log_filters(self) -> bool {
+        self == Self::All
+    }
 }
 
 /// Converts `sqlx::query` events into backdated OTel `CLIENT` spans.

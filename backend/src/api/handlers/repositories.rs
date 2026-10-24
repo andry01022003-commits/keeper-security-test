@@ -12897,8 +12897,9 @@ pub async fn test_upstream(
         request = crate::services::upstream_auth::apply_upstream_auth(request, &upstream_auth);
     }
 
-    let response = request
-        .send()
+    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
+    // attributes, parented to this request's span, and `traceparent` sent on.
+    let response = crate::services::upstream_tracing::send_upstream(request)
         .await
         .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {e}")))?;
 
@@ -35382,6 +35383,54 @@ mod content_encoding_forwarding_tests {
         assert_eq!(json["upstream_url"], plain.as_str(), "{json}");
         assert_eq!(json["upstream_url_has_credentials"], true, "{json}");
         assert!(!json.to_string().contains("s3cret"), "leaked: {json}");
+    }
+
+    /// #3954: the `test-upstream` probe goes through `send_upstream`, so its
+    /// HEAD exports a `CLIENT` span with an integer status. Before, it used a
+    /// bare `.send()` and exported no span at all.
+    #[tokio::test]
+    async fn test_test_upstream_exports_a_client_span_3954() {
+        use crate::services::upstream_tracing::exported_upstream_client_spans;
+        use crate::testing::otel::{otel_subscriber, ExportedSpans};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/probe"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let upstream = format!("{}/probe", server.uri());
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+
+        let exported = ExportedSpans::default();
+        let result = {
+            let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+            super::test_upstream(
+                axum::extract::State(fx.state.clone()),
+                Extension(Some(tdh::admin_auth(fx.user_id, &fx.username))),
+                axum::extract::Path(fx.repo_key.clone()),
+            )
+            .await
+        };
+        fx.teardown().await;
+
+        let json = result
+            .unwrap_or_else(|e| panic!("test-upstream must reach the mock: {e:?}"))
+            .0;
+        assert_eq!(json["upstream_status"], 204, "{json}");
+        assert_eq!(
+            exported_upstream_client_spans(&exported, "HEAD"),
+            vec![("HEAD".to_string(), upstream, 204)],
+            "one CLIENT span for the probe, with an integer status"
+        );
     }
 }
 

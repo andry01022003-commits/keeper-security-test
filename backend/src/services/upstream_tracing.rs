@@ -8,16 +8,23 @@
 //! (`services::upstream_feed`), the npm audit and `/-/` meta passthroughs, the
 //! Go sumdb proxy, and the AWS token exchange in
 //! `services::aws_upstream_auth` (its SigV4 signature does not cover the
-//! injected headers, which are added after signing). Three upstream callers
-//! off the request proxy path still use a bare `.send()` and are follow-ups on
-//! #3954: the repository "test upstream" check (`api::handlers::repositories`),
-//! the curation sync cycle (`services::scheduler_service`) and the popularity
-//! source (`services::curation::popularity_source`). It wraps the send in an
+//! injected headers, which are added after signing). Since 1.12.0 the three
+//! callers off the request proxy path use it too (#3954): the repository
+//! "test upstream" check (`api::handlers::repositories`), the curation sync
+//! cycle's index fetches (`services::scheduler_service`) and the popularity
+//! source (`services::curation::popularity_source`). The curation fetches run
+//! outside any request, so each of their spans is the root of its own trace.
+//! [`send_upstream`] wraps the send in an
 //! `otel.kind = "client"` span carrying the stable HTTP client semantic
 //! conventions (`http.request.method`, `url.full`, `server.address`,
 //! `server.port`, `http.response.status_code`, `error.type`) and injects the
 //! W3C `traceparent` (plus `tracestate`) of that span into the request, so the
 //! upstream's own spans, if it emits any, join the caller's trace.
+//!
+//! The two integer attributes, `server.port` and `http.response.status_code`,
+//! are recorded as `i64`. `tracing-opentelemetry` has no `u64` path for span
+//! fields and exports a `u64` (and so a `u16`) as its decimal STRING, which a
+//! backend then cannot compare numerically (`status_code >= 500`).
 //!
 //! The span covers the whole `send`: DNS, connect, TLS, any redirects reqwest
 //! follows, and the wait for response headers. Body streaming happens after
@@ -82,7 +89,7 @@ fn upstream_client_span(method: &Method, url: &Url) -> Span {
         http.request.method = %method,
         url.full = %redact_url_for_diagnostics(url.as_str()),
         server.address = url.host_str().unwrap_or_default(),
-        server.port = url.port_or_known_default(),
+        server.port = url.port_or_known_default().map(i64::from),
         http.response.status_code = Empty,
         error.type = Empty,
         otel.status_code = Empty,
@@ -136,7 +143,7 @@ fn transport_error_type(err: &reqwest::Error) -> &'static str {
 }
 
 fn record_response_status(span: &Span, status: StatusCode, had_auth: bool) {
-    span.record("http.response.status_code", status.as_u16());
+    span.record("http.response.status_code", i64::from(status.as_u16()));
     if status_is_error(status, had_auth) {
         span.record("error.type", status.as_str());
         span.record("otel.status_code", "error");
@@ -162,6 +169,39 @@ impl Injector for HeaderInjector<'_> {
             self.0.insert(name, value);
         }
     }
+}
+
+/// The exported upstream `CLIENT` spans in `exported` (named after their HTTP
+/// method), checked to carry an INTEGER `http.response.status_code`, as
+/// `(method, url.full, status)`. For the callers' own tests (#3954): a caller
+/// that bypasses [`send_upstream`] exports no such span, and one that records
+/// the status as `u64` exports it as a string.
+#[cfg(test)]
+pub(crate) fn exported_upstream_client_spans(
+    exported: &crate::testing::otel::ExportedSpans,
+    method: &str,
+) -> Vec<(String, String, i64)> {
+    use crate::testing::otel::attr;
+    exported
+        .named(method)
+        .into_iter()
+        .map(|span| {
+            assert_eq!(
+                span.span_kind,
+                opentelemetry::trace::SpanKind::Client,
+                "an upstream request is a CLIENT span"
+            );
+            let url = match attr(&span, "url.full") {
+                Some(opentelemetry::Value::String(url)) => url.to_string(),
+                other => panic!("url.full must be a string, got {other:?}"),
+            };
+            let status = match attr(&span, "http.response.status_code") {
+                Some(opentelemetry::Value::I64(status)) => status,
+                other => panic!("http.response.status_code must be an integer, got {other:?}"),
+            };
+            (method.to_string(), url, status)
+        })
+        .collect()
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -427,5 +467,42 @@ mod tests {
         );
         assert_eq!(fields.get("otel.status_code"), None);
         assert_eq!(fields.get("error.type"), None);
+    }
+
+    /// #3954: both integer attributes are EXPORTED as integers. Recorded as
+    /// `u16`, `tracing-opentelemetry` exported them as the strings "404" and
+    /// the port, which a trace backend cannot compare numerically.
+    #[tokio::test]
+    async fn status_code_and_port_are_exported_as_integers() {
+        use crate::testing::otel::attr;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let port = i64::from(server.address().port());
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(subscriber_exporting(&fields(), &exported));
+        send_upstream(reqwest::Client::new().get(format!("{}/x", server.uri())))
+            .await
+            .expect("the mock answers");
+
+        let span = exported.one("GET");
+        assert_eq!(
+            attr(&span, "http.response.status_code"),
+            Some(opentelemetry::Value::I64(404))
+        );
+        assert_eq!(
+            attr(&span, "server.port"),
+            Some(opentelemetry::Value::I64(port))
+        );
+        assert_eq!(
+            exported_upstream_client_spans(&exported, "GET"),
+            vec![("GET".to_string(), format!("{}/x", server.uri()), 404)]
+        );
     }
 }
