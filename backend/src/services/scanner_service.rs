@@ -1216,8 +1216,9 @@ pub(crate) struct WorkspaceExtraction<'a> {
 #[async_trait]
 pub(crate) trait WorkspaceExtractor: Send + Sync {
     /// Stage and extract the artifact under `job.workspace`, returning the
-    /// directory to scan. A relative path is taken relative to the
-    /// workspace. Anything that resolves outside the workspace is refused.
+    /// directory to scan: a path joined onto `job.workspace`, or one
+    /// relative to it. Anything that resolves outside the workspace is
+    /// refused.
     async fn extract(&self, job: WorkspaceExtraction<'_>) -> Result<PathBuf>;
 }
 
@@ -1390,20 +1391,31 @@ impl ScanWorkspace {
     }
 
     /// Resolve an extractor's scan root against `workspace` and refuse one
-    /// that is not inside it. Lexical: a `..` component is refused outright
-    /// rather than resolved, so neither a crafted layout nor an extractor bug
-    /// can point the engine (or the adapter upload, which tars the scan root)
-    /// at a directory this job does not own.
+    /// that is not inside it. Lexical: a `..` component below the workspace
+    /// is refused outright rather than resolved, so neither a crafted layout
+    /// nor an extractor bug can point the engine (or the adapter upload,
+    /// which tars the scan root) at a directory this job does not own.
+    ///
+    /// A root the extractor built by joining onto `workspace` is taken as is,
+    /// so a relative `SCAN_WORKSPACE_PATH` (allowed for object-store
+    /// backends) is not joined onto itself a second time, and only the part
+    /// below the workspace is checked, so a base path that itself spells a
+    /// `..` keeps working.
     fn confine_scan_root(workspace: &Path, root: PathBuf) -> Result<PathBuf> {
-        let root = if root.is_absolute() {
+        let root = if root.is_absolute() || root.starts_with(workspace) {
             root
         } else {
             workspace.join(root)
         };
-        let climbs = root
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir));
-        if climbs || !root.starts_with(workspace) {
+        let inside = root.strip_prefix(workspace).is_ok_and(|below| {
+            below.components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        });
+        if !inside {
             return Err(AppError::Internal(format!(
                 "Scan root {} is outside the scan workspace {}",
                 root.display(),
@@ -11166,6 +11178,47 @@ mod tests {
                 "{label}: got {err}"
             );
             assert!(!path.exists(), "{label}: the workspace must be removed");
+        }
+    }
+
+    /// #1429: the scan-root check works on the path the extractor builds
+    /// from the workspace it was handed, whatever form the base takes. A
+    /// relative `SCAN_WORKSPACE_PATH` (accepted for object-store backends)
+    /// must not be joined onto itself, and a base that itself contains `..`
+    /// must not fail every scan; only a climb below the workspace is refused.
+    #[test]
+    fn confine_scan_root_accepts_roots_built_from_any_workspace_form() {
+        for workspace in [
+            Path::new("scan-workspace/incus-a-job"),
+            Path::new("/data/../scan-workspace/incus-a-job"),
+            Path::new("/scan-workspace/incus-a-job"),
+        ] {
+            let built = workspace.join("rootfs");
+            assert_eq!(
+                ScanWorkspace::confine_scan_root(workspace, built.clone()).unwrap(),
+                built,
+                "{}: a joined root is taken as is",
+                workspace.display()
+            );
+            assert_eq!(
+                ScanWorkspace::confine_scan_root(workspace, workspace.to_path_buf()).unwrap(),
+                workspace,
+                "{}: the workspace itself is a valid scan root",
+                workspace.display()
+            );
+            assert_eq!(
+                ScanWorkspace::confine_scan_root(workspace, PathBuf::from("backup/rootfs"))
+                    .unwrap(),
+                workspace.join("backup/rootfs"),
+                "{}: a relative root resolves under the workspace",
+                workspace.display()
+            );
+            assert!(
+                ScanWorkspace::confine_scan_root(workspace, workspace.join("rootfs/../../x"))
+                    .is_err(),
+                "{}: a climb below the workspace is refused",
+                workspace.display()
+            );
         }
     }
 
