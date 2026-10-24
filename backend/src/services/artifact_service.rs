@@ -1069,7 +1069,7 @@ impl ArtifactService {
         // (#3924), because this function — the documented chokepoint — was
         // simply never on it.
         let repo = self.repo_service.get_by_id(repository_id).await;
-        enforce_path_immutability_with(
+        let immutability = enforce_path_immutability_with(
             &self.db,
             repository_id,
             repo.as_ref().ok(),
@@ -1078,7 +1078,17 @@ impl ArtifactService {
             checksum_sha256,
             precondition.is_some_and(WritePrecondition::replaces_current),
         )
-        .await?;
+        .await;
+        // #4186: a concurrent writer can commit between the precondition
+        // check above and this one. If the precondition no longer holds, that
+        // is what refused the write: answer 412, not the immutability 409.
+        if let (Err(AppError::Conflict(_)), Some(precondition)) = (&immutability, precondition) {
+            let current = current_live_checksum(&self.db, repository_id, path).await?;
+            if !precondition.holds(current.as_deref()) {
+                return Err(WritePrecondition::failed(path));
+            }
+        }
+        immutability?;
 
         Ok(())
     }

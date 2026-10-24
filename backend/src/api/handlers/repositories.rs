@@ -37525,8 +37525,11 @@ mod conditional_put_and_serve_verification_tests {
     /// rest 412 (unconditional racers get 409, #4832).
     #[tokio::test]
     async fn racing_if_none_match_creates_have_one_winner_4186_db() {
-        const RACERS: usize = 8;
-        static BODIES: [&[u8]; RACERS] = [b"c0", b"c1", b"c2", b"c3", b"c4", b"c5", b"c6", b"c7"];
+        const RACERS: usize = 16;
+        static BODIES: [&[u8]; RACERS] = [
+            b"c0", b"c1", b"c2", b"c3", b"c4", b"c5", b"c6", b"c7", b"c8", b"c9", b"ca", b"cb",
+            b"cc", b"cd", b"ce", b"cf",
+        ];
         let Some(mut fx) = Fx::setup().await else {
             return;
         };
