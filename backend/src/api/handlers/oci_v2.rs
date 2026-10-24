@@ -8087,7 +8087,7 @@ async fn run_claimed_oci_upload_completion(job: OciUploadCompletionJob) -> Respo
             }
         };
         let (parts, body) = response.into_parts();
-        let body = to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+        let body = collect_completion_response_body(body).await;
         let _ = outcome_tx.send(Some(OciUploadCompletionOutcome {
             status: parts.status,
             headers: parts.headers.clone(),
@@ -8100,6 +8100,14 @@ async fn run_claimed_oci_upload_completion(job: OciUploadCompletionJob) -> Respo
         Ok(response) => response,
         Err(e) => oci_internal_error(&format!("upload completion task failed: {e}")),
     }
+}
+
+/// Read a completion's response body so it can be replayed to waiting retries.
+/// Completion responses are an empty 201 or a small OCI error document.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
+async fn collect_completion_response_body(body: Body) -> Bytes {
+    // STREAMING-EXEMPT: our own completion response (empty or a small error document), bounded at 64 KiB; #1608
+    to_bytes(body, 64 * 1024).await.unwrap_or_default()
 }
 
 /// The completion proper, from the claimed lease to the published blob.
