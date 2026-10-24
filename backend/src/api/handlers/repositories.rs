@@ -28046,10 +28046,13 @@ mod tests {
             HelmOci,
             Conda,
             CondaNative,
+            Go,
+            Rubygems,
+            Composer,
         ] {
             assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
-        for format in [Generic, Github, Helm, Go, Rubygems, Debian] {
+        for format in [Generic, Github, Helm, Hex, Debian] {
             assert!(!generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
     }

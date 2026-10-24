@@ -23294,6 +23294,12 @@ mod proxy_download_recording_tests {
         ("pub_registry.rs", include_str!("pub_registry.rs")),
         ("puppet.rs", include_str!("puppet.rs")),
         ("pypi.rs", include_str!("pypi.rs")),
+        // #4097: the archive formats' shared scan-on-proxy half (its over-cap
+        // stream).
+        (
+            "proxy_scan_archive.rs",
+            include_str!("proxy_scan_archive.rs"),
+        ),
         ("rpm.rs", include_str!("rpm.rs")),
         ("rubygems.rs", include_str!("rubygems.rs")),
         ("sbt.rs", include_str!("sbt.rs")),
@@ -23883,6 +23889,72 @@ mod proxy_download_recording_tests {
             (
                 "nuget.rs",
                 "serve_scanned_nupkg",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4103: Go module zips, the Remote arm and the Virtual walk.
+            ("goproxy.rs", "download_zip", "serve_scanned_go_zip(", 1),
+            (
+                "goproxy.rs",
+                "download_zip",
+                "serve_scanned_virtual_go_zip(",
+                1,
+            ),
+            (
+                "goproxy.rs",
+                "serve_scanned_virtual_go_zip",
+                "serve_scanned_go_zip(",
+                1,
+            ),
+            (
+                "goproxy.rs",
+                "serve_scanned_go_zip",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4104: RubyGems `.gem` downloads, Remote and Virtual (both arms
+            // of `proxy_scan_archive::serve_scanned_package_download` call the
+            // one `serve_scanned_gem` closure).
+            (
+                "rubygems.rs",
+                "download_gem",
+                "serve_scanned_gem_download(",
+                1,
+            ),
+            (
+                "rubygems.rs",
+                "serve_scanned_gem_download",
+                "serve_scanned_gem(",
+                1,
+            ),
+            (
+                "rubygems.rs",
+                "serve_scanned_gem",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4105: Composer dist archives, Remote and Virtual.
+            (
+                "composer.rs",
+                "download_archive",
+                "serve_scanned_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "download_archive",
+                "serve_scanned_virtual_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "serve_scanned_virtual_composer_dist",
+                "serve_scanned_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "serve_scanned_composer_dist",
                 "serve_scanned_proxy_file(",
                 1,
             ),

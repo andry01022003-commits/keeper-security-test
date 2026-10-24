@@ -66,6 +66,28 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
+**Archive formats graded on their contents (Go, Composer).** The gate
+takes the coordinate from the request and checks it against the archive
+first, as for every format: a Go module zip must hold only
+`{module}@{version}/` entries and its `go.mod` (when it has one) must declare
+that module; a Composer dist's own `composer.json` (at the archive root, or
+under the one top-level directory a VCS zipball wraps it in) must name the
+requested package, and a `version` it declares must be the requested one.
+Bytes that fail that check, or are not a readable archive of that kind, are
+inconclusive and are not scanned, so no verdict is recorded for them:
+`423` under `fail_closed`, served `pending` under `fail_open` and
+`record_only`.
+
+What happens next differs from npm or Cargo. The scanner has no pin for
+these ecosystems, and the bundled engine does not catalog a module zip or a
+dist archive as itself, so it cannot look up the requested module's or
+package's own advisories. It grades what the archive contains instead: the
+requirements in a module's `go.mod`, a `composer.lock` or `installed.json`
+shipped in a dist, a vendored package of any ecosystem it recognises. A
+finding is `vulnerable` as usual. A scan that ran to completion and found
+nothing is `clean`, recorded with how many components were cataloged (often
+`0`) and reused like any other verdict. See [Known gaps](#known-gaps).
+
 **Packages the scanner does not catalog as themselves (conda).** For npm,
 PyPI, RubyGems, Cargo, NuGet and Maven the scanner catalogs the package itself
 (through the pin the gate writes, or the archive's own metadata), so a scan
@@ -229,8 +251,8 @@ have no core proxy path to gate.
 | `npm` | `npm`, `yarn`, `bower`, `pnpm` | enforced | Package tarballs, Remote and Virtual. |
 | `pypi` | `pypi`, `poetry`, `jupyter` | enforced | Package files (wheels and sdists), Remote and Virtual. |
 | `nuget` | `nuget`, `chocolatey`, `powershell` | enforced | `.nupkg` downloads on the V3 flat container and the V2 `package/{id}/{version}` route, Remote and Virtual. The `.nuspec` manifest passes unscanned; against a V2 upstream, which has no separate manifest, the flat container answers only the `.nupkg` itself. |
-| `go` | `go` | accepted | |
-| `rubygems` | `rubygems` | accepted | |
+| `go` | `go` | enforced | Module `.zip` downloads, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). `.mod`, `.info`, `@v/list` and `@latest` are not gated. |
+| `rubygems` | `rubygems` | enforced | `.gem` downloads, Remote and Virtual. The gem is graded as the `{name}-{version}` its file name names, which its gemspec must declare. Spec indexes and the JSON API are not gated. |
 | `oci` | `docker`, `podman`, `buildx`, `oras`, `wasm_oci`, `helm_oci` | enforced | Image manifests: the whole image (config and layers) is scanned, and blob pulls re-check the verdict of the image they belong to. Remote and Virtual. |
 | `helm` | `helm` | accepted | |
 | `rpm` | `rpm` | accepted | |
@@ -242,7 +264,7 @@ have no core proxy path to gate.
 | `terraform` | `terraform`, `opentofu` | accepted | |
 | `alpine` | `alpine` | accepted | |
 | `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
-| `composer` | `composer` | accepted | |
+| `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
 | `hex` | `hex` | accepted | |
 | `cocoapods` | `cocoapods` | accepted | |
 | `swift` | `swift` | accepted | |
@@ -300,6 +322,13 @@ have no core proxy path to gate.
   file name (a binary it recognises under its upstream name or version), the
   scan is still inconclusive: `423` under `fail_closed`, served `pending`
   (and not recorded) under `fail_open`.
+- **Go modules and Composer packages are not graded as themselves.** A
+  module zip or a dist archive is graded on what it contains (see
+  [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)).
+  An advisory against the requested module or package itself (for example
+  `golang.org/x/text v0.3.0`, pulled as its own module zip) is not found, and
+  the pull is `clean` unless something inside the archive is vulnerable.
+  Grading the coordinate itself needs a scanner pin for these ecosystems.
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.

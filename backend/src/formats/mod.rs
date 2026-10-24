@@ -307,13 +307,20 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// channel indexes (repodata in every encoding, channeldata, shards) are not
 /// gated, and a `.sigs` sidecar follows its package's stored verdict (#4585).
 /// `conda` and `conda_native` are two handler keys served by the one conda
-/// route, so both are listed.
+/// route, so both are listed. Go (module `.zip`), RubyGems (`.gem`) and
+/// Composer (dist archives) scan every file on their package download route
+/// (#4103, #4104, #4105); RubyGems is graded as the gem the request names
+/// (its pin), Go and Composer on the archive's contents, since the scanner
+/// has no pin for them (see `api::handlers::proxy_scan_archive`).
 pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
     "cargo",        // #4101
+    "composer",     // #4105
     "conda",        // #4585
     "conda_native", // #4585 (the same conda route)
+    "go",           // #4103
     "maven",        // #4100 (also serves gradle)
     "nuget",        // #4102 (also serves chocolatey and powershell)
+    "rubygems",     // #4104
     "sbt",          // #4100
     "npm",
     "oci",
