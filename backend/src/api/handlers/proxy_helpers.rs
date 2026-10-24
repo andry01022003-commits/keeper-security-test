@@ -8511,8 +8511,9 @@ pub(crate) fn age_gate_repo_type_from_str(
 
 /// Map a `repositories.format` string onto the age-gate format alias space:
 /// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
-/// Go gates as Go, VS Code gates as VS Code, Cargo gates as Cargo, and
-/// everything else as `Generic` (not in the enforceable matrix).
+/// Go gates as Go, VS Code gates as VS Code, Cargo gates as Cargo, Maven and
+/// Gradle gate as Maven, and everything else as `Generic` (not in the
+/// enforceable matrix).
 ///
 /// Every format carrying an entry in the age-gate capability registry
 /// (`crate::formats::age_gate_spec`) must have an arm here. A format that
@@ -8532,6 +8533,8 @@ pub(crate) fn age_gate_format_from_str(
         "go" => RepositoryFormat::Go,
         "vscode" => RepositoryFormat::Vscode,
         "cargo" => RepositoryFormat::Cargo,
+        // #4702: Gradle repositories gate as Maven (same layout and handler).
+        "maven" | "gradle" => RepositoryFormat::Maven,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -21892,6 +21895,7 @@ mod tests {
             RepositoryFormat::Go,
             RepositoryFormat::Vscode,
             RepositoryFormat::Cargo,
+            RepositoryFormat::Maven,
         ] {
             let spec = crate::formats::age_gate_spec(&canonical)
                 .expect("format must carry an age-gate capability spec");
@@ -21903,6 +21907,9 @@ mod tests {
                 "capability-registry format {canonical:?} must map back from its wire label"
             );
         }
+        // #4702: a Gradle repository is served by the Maven handler and must
+        // not fall through to the ungated `Generic`.
+        assert_eq!(age_gate_format_from_str("gradle"), RepositoryFormat::Maven);
     }
 
     #[test]

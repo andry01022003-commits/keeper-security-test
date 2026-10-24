@@ -7436,6 +7436,23 @@ impl ProxyService {
         Ok((resp.content, resp.content_type, resp.effective_url))
     }
 
+    /// Fetch from upstream without reading or writing the proxy cache, and
+    /// return the body with the upstream `Last-Modified` header (#4702: the
+    /// Maven age gate dates a version by its POM's `Last-Modified`). Same
+    /// origin policy, URL gate and upstream authentication as every other
+    /// upstream read; `max` bounds the buffered body.
+    pub async fn fetch_upstream_direct_dated(
+        &self,
+        repo: &Repository,
+        path: &str,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        self.ensure_origin_policy_allows(repo).await?;
+        let full_url = self.gated_upstream_url(repo, path).await?;
+        let resp = self.fetch_from_upstream(&full_url, repo.id, max).await?;
+        Ok((resp.content, resp.last_modified))
+    }
+
     /// Fetch from upstream directly, preserving the upstream `Link` header.
     ///
     /// OCI tag pagination relies on the upstream continuation cursor when the

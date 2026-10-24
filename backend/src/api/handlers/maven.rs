@@ -1226,6 +1226,400 @@ fn maven_curation_target(path: &str) -> Option<(String, Option<String>)> {
     Some((pkg, version))
 }
 
+// ---------------------------------------------------------------------------
+// Publish-age gate (#4702)
+// ---------------------------------------------------------------------------
+//
+// A Remote's age gate (`PUT /api/v1/repositories/{key}/age-gate`) applies to
+// every file of a version (and its checksum and signature sidecars) and to
+// the GA-level `maven-metadata.xml` version list; a Virtual applies the gate
+// of the Remote member a file or listing comes from. The format-specific
+// pieces (which path names which version, the POM `Last-Modified` publish
+// time, the metadata rewrite) live in `services::age_gate_maven`; the policy,
+// the review queue and the 451 refusal are the shared seam every gated format
+// uses (`proxy_helpers::enforce_age_gate`). Hosted members are never gated.
+
+/// Largest POM the gate reads to date a version. A POM is a few KiB; the cap
+/// only bounds the shared metadata budget a listing's probes reserve.
+const MAVEN_AGE_GATE_POM_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// The cheap, struct-derived age-gate inputs of a virtual member. The
+/// `Repository` model carries no mode; Maven supports both, so the mode does
+/// not change applicability, and the authoritative policy is re-read by id
+/// ([`maven_gate_policy`]) before anything is decided.
+fn maven_member_gate_inputs(
+    member: &crate::models::repository::Repository,
+) -> crate::services::age_gate_service::AgeGateRepoParams {
+    crate::services::age_gate_service::AgeGateRepoParams::from_parts(
+        member.id,
+        member.key.clone(),
+        member.repo_type.clone(),
+        member.format.clone(),
+        member.age_gate_enabled,
+        member.age_gate_min_age_days,
+        crate::services::age_gate_service::AgeGateMode::default(),
+        member.upstream_url.clone(),
+    )
+}
+
+/// The authoritative age-gate policy of a repository whose cached inputs say
+/// the gate applies; `None` when it does not. Policy is enforcement input, so
+/// it is read from the database by id rather than trusted from a cached or
+/// defaulted struct (#2264); a failed read fails the request.
+async fn maven_gate_policy(
+    state: &SharedState,
+    inputs: crate::services::age_gate_service::AgeGateRepoParams,
+) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
+    use crate::services::age_gate_service::AgeGateService;
+    if !AgeGateService::is_applicable(&inputs) {
+        return Ok(None);
+    }
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, inputs.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(AgeGateService::gating_requested(&params).then_some(params))
+}
+
+/// Where a gated Remote's bytes come from.
+struct MavenGateUpstream<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+}
+
+/// A version's upstream publish time and whether the upstream has it: the
+/// upstream `Last-Modified` of the version's POM (`services::age_gate_maven`).
+/// Read, in order, from the in-process memo, from the proxy cache entry when
+/// the POM is already cached (no upstream contact), else from a direct
+/// upstream read of the POM that is not cached (the gate must not commit a
+/// withheld version's files). A failed read is "no evidence" (`false`), never
+/// an error: the gate then withholds the version.
+async fn maven_pom_publish_time(
+    upstream: &MavenGateUpstream<'_>,
+    repo_id: Uuid,
+    target: &crate::services::age_gate_maven::MavenGateTarget,
+) -> (Option<chrono::DateTime<chrono::Utc>>, bool) {
+    use crate::services::age_gate_maven as gate;
+    if let Some(known) = gate::memo_publish_time(repo_id, &target.package, &target.version).await {
+        return (Some(known), true);
+    }
+    let pom = target.pom_path();
+    let cached = upstream
+        .proxy
+        .get_cache_metadata(upstream.repo_key, &pom)
+        .await
+        .ok()
+        .flatten()
+        .filter(|meta| meta.negative_cached_until.is_none())
+        .and_then(|meta| meta.last_modified)
+        .and_then(|lm| gate::parse_last_modified(&lm));
+    let (published, exists) = match cached {
+        Some(published) => (Some(published), true),
+        None => {
+            let remote = proxy_helpers::build_remote_repo_with_format(
+                repo_id,
+                upstream.repo_key,
+                upstream.upstream_url,
+                RepositoryFormat::Maven,
+            );
+            match upstream
+                .proxy
+                .fetch_upstream_direct_dated(&remote, &pom, MAVEN_AGE_GATE_POM_MAX_BYTES)
+                .await
+            {
+                Ok((_, last_modified)) => (
+                    last_modified.and_then(|lm| gate::parse_last_modified(&lm)),
+                    true,
+                ),
+                Err(_) => (None, false),
+            }
+        }
+    };
+    if let Some(published) = published {
+        gate::remember_publish_time(repo_id, &target.package, &target.version, published).await;
+    }
+    (published, exists)
+}
+
+/// Apply a gated Remote's age gate to one version: `Ok(())` serves, `Err`
+/// is the shared seam's answer (451 `age_gate_blocked`, or a fail-closed
+/// 5xx). Maven has no last-known-good substitution: a client asked for one
+/// version's file, and another version's bytes under that name would be a
+/// different artifact, so a block is always the 451 (as Go does).
+async fn enforce_maven_age_gate(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    upstream: &MavenGateUpstream<'_>,
+    target: &crate::services::age_gate_maven::MavenGateTarget,
+) -> Result<(), Response> {
+    let svc = state.age_gate_service.as_deref();
+    let (published, exists) = maven_pom_publish_time(upstream, params.id, target).await;
+    let basis = match svc {
+        Some(svc) => svc
+            .download_basis(params, &target.package, &target.version, published, exists)
+            .await
+            .map_err(|e| e.into_response())?,
+        None => published,
+    };
+    let blocked =
+        proxy_helpers::enforce_age_gate(svc, params, &target.package, &target.version, basis)
+            .await?;
+    match blocked {
+        None => Ok(()),
+        Some(blocked) => Err(proxy_helpers::age_gate_blocked_response(
+            blocked.review_id,
+            &target.package,
+            &target.version,
+            params.age_gate_min_age_days,
+            basis.map(|b| {
+                crate::services::age_gate_service::AgeGateService::package_age_days(
+                    b,
+                    chrono::Utc::now(),
+                )
+            }),
+        )),
+    }
+}
+
+/// The age gate of a Remote repository for a request `path` (#4702): a no-op
+/// for hosted and virtual repositories, paths that name no gated version, and
+/// repositories without the gate.
+async fn maven_remote_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    path: &str,
+) -> Result<(), Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return Ok(());
+    }
+    let Some(target) = crate::services::age_gate_maven::gate_target(path) else {
+        return Ok(());
+    };
+    let Some(params) = maven_gate_policy(state, proxy_helpers::age_gate_params(repo)).await? else {
+        return Ok(());
+    };
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+    else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            repo_key,
+            &target.package,
+        ));
+    };
+    let upstream = MavenGateUpstream {
+        proxy,
+        repo_key,
+        upstream_url,
+    };
+    enforce_maven_age_gate(state, &params, &upstream, &target).await
+}
+
+/// The age gate of one Virtual member for `path`. `Ok(None)` when the member
+/// may serve it (hosted, no gate, or the version is old enough),
+/// `Ok(Some(451))` when its gate withholds the version, `Err` when the gate
+/// could not be evaluated (fail closed).
+async fn maven_member_age_gate(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<Option<Response>, Response> {
+    if member.repo_type != RepositoryType::Remote {
+        return Ok(None);
+    }
+    let Some(target) = crate::services::age_gate_maven::gate_target(path) else {
+        return Ok(None);
+    };
+    let Some(params) = maven_gate_policy(state, maven_member_gate_inputs(member)).await? else {
+        return Ok(None);
+    };
+    let (Some(upstream_url), Some(proxy)) = (
+        member.upstream_url.as_deref(),
+        state.proxy_service.as_deref(),
+    ) else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &member.key,
+            &target.package,
+        ));
+    };
+    let upstream = MavenGateUpstream {
+        proxy,
+        repo_key: &member.key,
+        upstream_url,
+    };
+    match enforce_maven_age_gate(state, &params, &upstream, &target).await {
+        Ok(()) => Ok(None),
+        Err(resp) if resp.status() == StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => Ok(Some(resp)),
+        Err(resp) => Err(resp),
+    }
+}
+
+/// Drop the Remote members whose age gate withholds `path`'s version, so the
+/// virtual walk never serves it from them (#4702). Returns the members that
+/// may serve it and the first refusal, which the caller answers with when no
+/// remaining member has the file: the client sees the same 451 a direct pull
+/// from that Remote gets, not a 404.
+async fn maven_virtual_age_gate_members(
+    state: &SharedState,
+    members: Vec<crate::models::repository::Repository>,
+    path: &str,
+) -> Result<(Vec<crate::models::repository::Repository>, Option<Response>), Response> {
+    if crate::services::age_gate_maven::gate_target(path).is_none() {
+        return Ok((members, None));
+    }
+    let mut kept = Vec::with_capacity(members.len());
+    let mut refusal = None;
+    for member in members {
+        match maven_member_age_gate(state, &member, path).await? {
+            None => kept.push(member),
+            Some(resp) => {
+                if refusal.is_none() {
+                    refusal = Some(resp);
+                }
+            }
+        }
+    }
+    Ok((kept, refusal))
+}
+
+/// A virtual walk's answer once age-gated members were dropped: a miss
+/// becomes the gate's 451.
+fn maven_virtual_age_gate_answer(
+    result: Result<Response, Response>,
+    refusal: Option<Response>,
+) -> Result<Response, Response> {
+    match (result, refusal) {
+        (Err(resp), Some(refusal)) if resp.status() == StatusCode::NOT_FOUND => Err(refusal),
+        (result, _) => result,
+    }
+}
+
+/// Withhold versions younger than a gated Remote's minimum age from a GA-level
+/// `maven-metadata.xml` (#4702), so `LATEST`, `RELEASE` and version ranges
+/// never resolve to a version whose download would be refused. Returns the
+/// bytes unchanged when nothing is withheld (the checksum then still matches
+/// the upstream's); the `.sha1` of the metadata is computed from what this
+/// returns, so it always matches the served body.
+///
+/// Dating: `first_seen` uses this server's observations (the listing is the
+/// existence evidence, as for npm and PyPI). `upstream_publish_time` reads
+/// each version's POM `Last-Modified`, except when the document's
+/// `lastUpdated` (the last deploy of any version) is itself older than the
+/// minimum age, which dates every listed version at once. Undated versions
+/// past [`crate::services::age_gate_maven::LISTING_MAX_POM_PROBES`] are
+/// withheld from this listing; downloads decide each version on its own POM.
+async fn maven_filter_listing(
+    state: &SharedState,
+    inputs: crate::services::age_gate_service::AgeGateRepoParams,
+    upstream: &MavenGateUpstream<'_>,
+    path: &str,
+    content: Bytes,
+) -> Result<Bytes, Response> {
+    use crate::services::age_gate_maven as gate;
+    use crate::services::age_gate_service::{AgeGateMode, AgeGateService};
+
+    let Some((group_id, artifact_id)) = parse_metadata_path(path) else {
+        return Ok(content);
+    };
+    let Some(params) = maven_gate_policy(state, inputs).await? else {
+        return Ok(content);
+    };
+    let Some(svc) = state.age_gate_service.as_deref() else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            upstream.repo_key,
+            &format!("{group_id}:{artifact_id}"),
+        ));
+    };
+    let Ok(xml) = std::str::from_utf8(&content) else {
+        return Ok(content);
+    };
+    let Some(doc) = gate::metadata_versions(xml) else {
+        return Ok(content);
+    };
+    if doc.gated_newest_first.is_empty() {
+        return Ok(content);
+    }
+    // The identity is the request path's, never the document's own ids.
+    let package = format!("{group_id}:{artifact_id}");
+
+    let versions: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = match params.age_gate_mode
+    {
+        // `evaluate_versions_batch` substitutes this server's observations.
+        AgeGateMode::FirstSeen => doc
+            .gated_newest_first
+            .iter()
+            .map(|v| (v.clone(), None))
+            .collect(),
+        AgeGateMode::UpstreamPublishTime => {
+            let bound = doc
+                .last_updated
+                .as_deref()
+                .and_then(gate::parse_last_updated);
+            if AgeGateService::meets_age_threshold(
+                bound,
+                params.age_gate_min_age_days,
+                chrono::Utc::now(),
+            ) {
+                doc.gated_newest_first
+                    .iter()
+                    .map(|v| (v.clone(), bound))
+                    .collect()
+            } else {
+                // Plain loops (no iterator-adapter closures): a closure
+                // returning a future that borrows the proxy is not
+                // provably `Send` for the handler's future.
+                let mut probed: Vec<Option<chrono::DateTime<chrono::Utc>>> = Vec::new();
+                let candidates: Vec<&String> = doc
+                    .gated_newest_first
+                    .iter()
+                    .take(gate::LISTING_MAX_POM_PROBES)
+                    .collect();
+                for chunk in candidates.chunks(gate::LISTING_POM_CONCURRENCY) {
+                    let mut batch = Vec::with_capacity(chunk.len());
+                    for version in chunk {
+                        let target = gate::MavenGateTarget {
+                            package: package.clone(),
+                            group_id: group_id.clone(),
+                            artifact_id: artifact_id.clone(),
+                            version: (*version).clone(),
+                        };
+                        let repo_id = params.id;
+                        batch.push(async move {
+                            maven_pom_publish_time(upstream, repo_id, &target).await.0
+                        });
+                    }
+                    probed.extend(futures::future::join_all(batch).await);
+                }
+                let mut out = Vec::with_capacity(doc.gated_newest_first.len());
+                for (i, version) in doc.gated_newest_first.iter().enumerate() {
+                    let known = match probed.get(i) {
+                        Some(t) => *t,
+                        None => gate::memo_publish_time(params.id, &package, version).await,
+                    };
+                    out.push((version.clone(), known));
+                }
+                out
+            }
+        }
+    };
+
+    let blocked = svc
+        .evaluate_versions_batch(&params, &package, &versions)
+        .await
+        .map_err(|e| e.into_response())?;
+    if blocked.is_empty() {
+        return Ok(content);
+    }
+    crate::services::metrics_service::record_age_gate_filtered_metadata(
+        &params.key,
+        crate::services::age_gate_service::format_label(&params.format),
+    );
+    Ok(match gate::filter_metadata_versions(xml, &blocked) {
+        Some(filtered) => Bytes::from(filtered),
+        None => content,
+    })
+}
+
 /// Refuse a Maven/sbt proxy path that the upstream request could read
 /// differently from the classified and cached path (#4100): a decoded `?`
 /// or `#` becomes a query or fragment when joined into the upstream URL,
@@ -2039,6 +2433,8 @@ async fn download(
 
         // Fallback: proxy the checksum file from upstream for remote repos
         if repo.repo_type == RepositoryType::Remote {
+            // #4702: a withheld version's checksum answers as its file does.
+            maven_remote_age_gate(&state, &repo, &repo_key, &path).await?;
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
@@ -2082,9 +2478,16 @@ async fn download(
             let members =
                 proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
                     .await?;
+            // #4702: a Remote member whose age gate withholds the version is
+            // skipped; if no other member answers, its 451 is the answer.
+            let mut age_refusal: Option<Response> = None;
 
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
+                    if let Some(refusal) = maven_member_age_gate(&state, member, &path).await? {
+                        age_refusal.get_or_insert(refusal);
+                        continue;
+                    }
                     // Remote member: proxy checksum from upstream directly.
                     // serve_computed_checksum always fails — proxy-cached
                     // artifacts are NOT in the `artifacts` table (#1280).
@@ -2136,6 +2539,9 @@ async fn download(
                         return Ok(response);
                     }
                 }
+            }
+            if let Some(refusal) = age_refusal {
+                return Err(refusal);
             }
         }
 
@@ -2191,6 +2597,39 @@ async fn fetch_remote_member_metadata(
         return Ok(None);
     };
     Ok(std::str::from_utf8(&content).ok().map(|s| s.to_string()))
+}
+
+/// [`fetch_remote_member_metadata`] for a GA-level document, with the
+/// member's own age gate applied (#4702): a Virtual lists a young version
+/// only from members that would serve it.
+async fn fetch_remote_member_metadata_gated(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<Option<String>, Response> {
+    let Some(xml) = fetch_remote_member_metadata(state, member, path).await? else {
+        return Ok(None);
+    };
+    let (Some(upstream_url), Some(proxy)) = (
+        member.upstream_url.as_deref(),
+        state.proxy_service.as_deref(),
+    ) else {
+        return Ok(Some(xml));
+    };
+    let upstream = MavenGateUpstream {
+        proxy,
+        repo_key: &member.key,
+        upstream_url,
+    };
+    let filtered = maven_filter_listing(
+        state,
+        maven_member_gate_inputs(member),
+        &upstream,
+        path,
+        Bytes::from(xml),
+    )
+    .await?;
+    Ok(std::str::from_utf8(&filtered).ok().map(|s| s.to_string()))
 }
 
 /// Read a Local/Staging virtual member's stored metadata document at `path`.
@@ -2258,7 +2697,20 @@ async fn fetch_maven_metadata_bytes(
                 RepositoryFormat::Maven,
             )
             .await?;
-            return Ok(content);
+            // #4702: withhold versions the age gate refuses.
+            let upstream = MavenGateUpstream {
+                proxy,
+                repo_key,
+                upstream_url,
+            };
+            return maven_filter_listing(
+                state,
+                proxy_helpers::age_gate_params(repo),
+                &upstream,
+                path,
+                content,
+            )
+            .await;
         }
         return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
     }
@@ -2306,7 +2758,8 @@ async fn fetch_maven_metadata_bytes(
                         let member_docs =
                             futures::future::join_all(chunk.iter().map(|member| async {
                                 if member.repo_type == RepositoryType::Remote {
-                                    fetch_remote_member_metadata(state, member, path).await
+                                    // #4702: each Remote member's own age gate.
+                                    fetch_remote_member_metadata_gated(state, member, path).await
                                 } else {
                                     Ok(generate_metadata_for_artifact(
                                         &state.db,
@@ -3118,6 +3571,9 @@ async fn serve_artifact(
         Some(a) => a,
         None => {
             if repo.repo_type == RepositoryType::Remote {
+                // #4702: the age gate decides before any byte is fetched,
+                // scanned or served.
+                maven_remote_age_gate(state, repo, repo_key, path).await?;
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
@@ -3227,6 +3683,15 @@ async fn serve_artifact(
                 // a retryable server error, not a definitive 404 (#3321).
                 let members =
                     proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+                // #4702: Remote members whose age gate withholds this version
+                // never serve it; when no other member has it, the client gets
+                // that gate's 451. A locally owned GAV disables every Remote
+                // member already, so there is nothing to gate.
+                let (members, age_refusal) = if proxy_for_virtual.is_some() {
+                    maven_virtual_age_gate_members(state, members, path).await?
+                } else {
+                    (members, None)
+                };
 
                 let local_fetch = |member_id: Uuid, location: crate::storage::StorageLocation| {
                     let db = db.clone();
@@ -3366,18 +3831,24 @@ async fn serve_artifact(
                     )
                     .await
                     {
-                        return served;
+                        return maven_virtual_age_gate_answer(served, age_refusal);
                     }
                 }
 
-                let result = proxy_helpers::resolve_virtual_download_from_members(
+                let result = match proxy_helpers::resolve_virtual_download_from_members(
                     members,
                     proxy_for_virtual,
                     path,
                     Some(ctx),
                     local_fetch,
                 )
-                .await?;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(resp) => {
+                        return maven_virtual_age_gate_answer(Err(resp), age_refusal);
+                    }
+                };
 
                 // Only the winning member's result reaches here, so this counts once;
                 // proxy-member and row-less legacy serves carry `None` (#1278).
@@ -13333,5 +13804,391 @@ mod unreadable_config_route_4365_tests {
         );
         assert_eq!(remote_hits, 0, "refused before any upstream request");
         assert_eq!(virtual_hits, 0, "refused before any upstream request");
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod age_gate_4702_tests {
+    //! #4702: the publish-age gate on Maven Remote and Virtual repositories.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::extract::{Path, State};
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const G: &str = "com/example/agegate";
+    const OLD: &str = "1.0.0";
+    const YOUNG: &str = "2.0.0";
+
+    fn http_date(t: chrono::DateTime<chrono::Utc>) -> String {
+        t.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    }
+
+    fn file(version: &str, ext: &str) -> String {
+        format!("{G}/widget/{version}/widget-{version}.{ext}")
+    }
+
+    /// An upstream with one old (2024) and one young (a day old) version:
+    /// POMs carrying `Last-Modified`, jars, jar `.sha1`s and a GA-level
+    /// `maven-metadata.xml` listing both, whose `lastUpdated` is the young
+    /// deploy (or `last_updated` when given).
+    async fn upstream(last_updated: Option<&str>) -> MockServer {
+        let mock = MockServer::start().await;
+        let young_at = chrono::Utc::now() - chrono::Duration::days(1);
+        for (version, at) in [
+            (
+                OLD,
+                chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            (YOUNG, young_at),
+        ] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{}", file(version, "pom"))))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/xml")
+                        .insert_header("last-modified", http_date(at).as_str())
+                        .set_body_string(format!(
+                            "<project><version>{version}</version></project>"
+                        )),
+                )
+                .mount(&mock)
+                .await;
+            let jar = format!("jar-{version}");
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{}", file(version, "jar"))))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/java-archive")
+                        .insert_header("last-modified", http_date(at).as_str())
+                        .set_body_bytes(jar.clone().into_bytes()),
+                )
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{}.sha1", file(version, "jar"))))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(hex::encode(sha1::Sha1::digest(jar.as_bytes()))),
+                )
+                .mount(&mock)
+                .await;
+        }
+        let lu = last_updated
+            .map(str::to_string)
+            .unwrap_or_else(|| young_at.format("%Y%m%d%H%M%S").to_string());
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{G}/widget/maven-metadata.xml")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  \
+                 <groupId>com.example.agegate</groupId>\n  <artifactId>widget</artifactId>\n  \
+                 <versioning>\n    <latest>{YOUNG}</latest>\n    <release>{YOUNG}</release>\n    \
+                 <versions>\n      <version>{OLD}</version>\n      <version>{YOUNG}</version>\n    \
+                 </versions>\n    <lastUpdated>{lu}</lastUpdated>\n  </versioning>\n</metadata>\n"
+            )))
+            .mount(&mock)
+            .await;
+        mock
+    }
+
+    async fn gated_remote(
+        pool: &PgPool,
+        mock: &MockServer,
+        mode: &str,
+    ) -> (Uuid, String, std::path::PathBuf) {
+        let (id, key, dir) = tdh::create_repo(pool, "remote", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 7, age_gate_mode = $2 WHERE id = $3",
+        )
+        .bind(mock.uri())
+        .bind(mode)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("gate the remote");
+        tdh::publish_repo(pool, id).await;
+        (id, key, dir)
+    }
+
+    async fn get(state: &SharedState, key: &str, path: &str) -> (StatusCode, Bytes) {
+        let resp = match download(
+            State(state.clone()),
+            Extension(None),
+            Path((key.to_string(), path.to_string())),
+            axum::http::HeaderMap::new(),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(r) => r,
+        };
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (status, body)
+    }
+
+    async fn requested(mock: &MockServer, path: &str) -> bool {
+        mock.received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.url.path() == format!("/{path}"))
+    }
+
+    async fn drop_repo(pool: &PgPool, id: Uuid) {
+        let _ = sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+
+    /// A version younger than the gate is refused with the shared 451 on
+    /// its jar, its POM and its `.sha1`, without fetching the jar; the old
+    /// version downloads; the GA metadata lists only the old version, and
+    /// its `.sha1` describes the filtered body.
+    #[tokio::test]
+    async fn remote_gate_refuses_young_files_and_filters_metadata_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let jar = get(&state, &key, &file(YOUNG, "jar")).await;
+        let pom = get(&state, &key, &file(YOUNG, "pom")).await;
+        let sha1 = get(&state, &key, &format!("{}.sha1", file(YOUNG, "jar"))).await;
+        let old = get(&state, &key, &file(OLD, "jar")).await;
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        let meta_sha1 = get(&state, &key, &format!("{G}/widget/maven-metadata.xml.sha1")).await;
+        let young_jar_fetched = requested(&mock, &file(YOUNG, "jar")).await;
+        let young_sha1_fetched = requested(&mock, &format!("{}.sha1", file(YOUNG, "jar"))).await;
+        let reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1 \
+             AND package_name = 'com.example.agegate:widget' AND package_version = $2",
+        )
+        .bind(id)
+        .bind(YOUNG)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, id).await;
+
+        for (what, (status, body)) in [("jar", &jar), ("pom", &pom), ("jar.sha1", &sha1)] {
+            assert_eq!(
+                *status,
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                "young {what}: {}",
+                String::from_utf8_lossy(body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(body).expect("451 body is JSON");
+            assert_eq!(json["error"], "age_gate_blocked", "{what}");
+            assert_eq!(json["package"], "com.example.agegate:widget", "{what}");
+            assert_eq!(json["version"], YOUNG, "{what}");
+            assert_eq!(json["min_age_days"], 7, "{what}");
+        }
+        assert!(
+            !young_jar_fetched,
+            "a refused jar must not be fetched upstream"
+        );
+        assert!(
+            !young_sha1_fetched,
+            "a refused checksum must not be fetched upstream"
+        );
+        assert_eq!(reviews, 1, "the refusal records one pending review");
+
+        assert_eq!(old.0, StatusCode::OK);
+        assert_eq!(&old.1[..], format!("jar-{OLD}").as_bytes());
+
+        assert_eq!(meta.0, StatusCode::OK);
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        let (_, _, versions) = crate::formats::maven::parse_metadata_versions(&xml).unwrap();
+        assert_eq!(versions, vec![OLD.to_string()], "{xml}");
+        assert!(xml.contains(&format!("<latest>{OLD}</latest>")), "{xml}");
+        assert!(xml.contains(&format!("<release>{OLD}</release>")), "{xml}");
+        assert_eq!(meta_sha1.0, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&meta_sha1.1),
+            hex::encode(sha1::Sha1::digest(&meta.1)),
+            "the metadata checksum describes the filtered body"
+        );
+    }
+
+    /// When the GA's `lastUpdated` is older than the gate, every listed
+    /// version is old enough: the listing is served unchanged with no POM
+    /// fetched.
+    #[tokio::test]
+    async fn old_last_updated_lists_everything_without_pom_probes_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(Some("20240102030405")).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        let probed = requested(&mock, &file(OLD, "pom")).await
+            || requested(&mock, &file(YOUNG, "pom")).await;
+        drop_repo(&pool, id).await;
+        assert_eq!(meta.0, StatusCode::OK);
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        assert!(
+            xml.contains(&format!("<version>{YOUNG}</version>")),
+            "{xml}"
+        );
+        assert!(
+            !probed,
+            "no POM fetch when lastUpdated already dates every version"
+        );
+    }
+
+    /// `first_seen`: a version seen for the first time just now is young,
+    /// whatever the upstream claims; the listing records the observation.
+    #[tokio::test]
+    async fn first_seen_mode_withholds_a_newly_seen_version_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "first_seen").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        let old = get(&state, &key, &file(OLD, "jar")).await;
+        let observed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM age_gate_version_observations WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, id).await;
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        let (_, _, versions) = crate::formats::maven::parse_metadata_versions(&xml).unwrap();
+        assert!(
+            versions.is_empty(),
+            "both versions are first seen now: {xml}"
+        );
+        assert_eq!(old.0, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(observed, 2, "the listing observes both versions");
+    }
+
+    /// A Virtual applies its Remote member's gate: the young jar and its
+    /// `.sha1` answer the member's 451, the merged metadata lists only the
+    /// old version, and the old version downloads.
+    #[tokio::test]
+    async fn virtual_applies_the_remote_members_gate_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (remote_id, _remote_key, dir) =
+            gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("member");
+        tdh::publish_repo(&pool, virtual_id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let jar = get(&state, &virtual_key, &file(YOUNG, "jar")).await;
+        let sha1 = get(
+            &state,
+            &virtual_key,
+            &format!("{}.sha1", file(YOUNG, "jar")),
+        )
+        .await;
+        let old = get(&state, &virtual_key, &file(OLD, "jar")).await;
+        let meta = get(
+            &state,
+            &virtual_key,
+            &format!("{G}/widget/maven-metadata.xml"),
+        )
+        .await;
+        let young_jar_fetched = requested(&mock, &file(YOUNG, "jar")).await;
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, virtual_id).await;
+        drop_repo(&pool, remote_id).await;
+
+        assert_eq!(
+            jar.0,
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "{}",
+            String::from_utf8_lossy(&jar.1)
+        );
+        assert_eq!(sha1.0, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert!(!young_jar_fetched);
+        assert_eq!(old.0, StatusCode::OK);
+        assert_eq!(&old.1[..], format!("jar-{OLD}").as_bytes());
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        let (_, _, versions) = crate::formats::maven::parse_metadata_versions(&xml).unwrap();
+        assert_eq!(versions, vec![OLD.to_string()], "{xml}");
+    }
+
+    /// Without the gate nothing changes: the young version downloads and is
+    /// listed (the control for the tests above).
+    #[tokio::test]
+    async fn ungated_remote_serves_everything_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (id, key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("upstream");
+        tdh::publish_repo(&pool, id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let jar = get(&state, &key, &file(YOUNG, "jar")).await;
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        drop_repo(&pool, id).await;
+        assert_eq!(jar.0, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&meta.1).contains(&format!("<version>{YOUNG}</version>")));
     }
 }

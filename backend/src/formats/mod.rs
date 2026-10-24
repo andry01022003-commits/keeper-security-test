@@ -538,6 +538,19 @@ static CARGO_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
     publish_time_resolver: true,
 };
 
+static MAVEN_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Maven,
+    label: "maven",
+    // A released Maven coordinate is immutable: Maven Central refuses a
+    // redeploy of a release, resolvers cache releases forever, and checksum
+    // sidecars pin the bytes. `-SNAPSHOT` versions are rebuilt by design and
+    // are not age-gated at all (`services::age_gate_maven`).
+    immutable_coordinates: true,
+    // The upstream `Last-Modified` of each version's POM, stamped by the
+    // repository manager at deploy time (#4702; `services::age_gate_maven`).
+    publish_time_resolver: true,
+};
+
 /// Look up the age-gate capability spec for a repository format, collapsing
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
@@ -553,6 +566,10 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
         RepositoryFormat::Vscode => Some(&VSCODE_AGE_GATE_SPEC),
         RepositoryFormat::Cargo => Some(&CARGO_AGE_GATE_SPEC),
+        // Gradle repositories speak the Maven layout through the same
+        // handler. sbt has its own handler with no age-gate seam, so it stays
+        // out (an entry without enforcement would accept a gate it ignores).
+        RepositoryFormat::Maven | RepositoryFormat::Gradle => Some(&MAVEN_AGE_GATE_SPEC),
         _ => None,
     }
 }
