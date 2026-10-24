@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#4108, #4097]
+---
+- **Scan-on-proxy now gates Conan recipe and package archives from Conan Remote and Virtual repositories** (#4108, part of #4097). With `scan_on_proxy` on, a proxied `conan_export.tgz`, `conan_sources.tgz` or `conan_package.tgz` goes through the shared inline scan-and-block gate instead of streaming unscanned: a vulnerable archive is refused with 403 `scan_blocked`, a clean one is served with `X-AK-Scan: clean`, the verdict is reused for the same digest, and `fail_open`, `fail_closed` and `record_only` behave as they do for the other enforced formats. A Conan archive carries no identity of its own and the scanner has no Conan pin, so an archive is graded on its contents (a bundled `conanfile.txt` or `conan.lock`, binaries the engine recognises), not as the requested reference; bytes that are not a readable gzipped tar are withheld under `fail_closed` (423) without being scanned. `conanfile.py`, manifests, `conaninfo.txt`, revision lists and search are unchanged, and `GET /api/v1/formats` now reports Conan as `scan_on_proxy: "enforced"`.

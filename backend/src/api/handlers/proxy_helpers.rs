@@ -23958,6 +23958,50 @@ mod proxy_download_recording_tests {
                 "serve_scanned_proxy_file(",
                 1,
             ),
+            // #4107: Pub package archives, Remote and Virtual.
+            (
+                "pub_registry.rs",
+                "download_archive",
+                "serve_scanned_pub_download(",
+                1,
+            ),
+            (
+                "pub_registry.rs",
+                "serve_scanned_pub_download",
+                "serve_scanned_pub_archive(",
+                1,
+            ),
+            (
+                "pub_registry.rs",
+                "serve_scanned_pub_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4108: Conan recipe and package archives, Remote and Virtual.
+            (
+                "conan.rs",
+                "recipe_file_download",
+                "serve_scanned_conan_file_download(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "package_file_download",
+                "serve_scanned_conan_file_download(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "serve_scanned_conan_file_download",
+                "serve_scanned_conan_archive(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "serve_scanned_conan_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
         ];
         // Body of the top-level `fn name(` or generic `fn name<` (brace-matched
         // from its first `{`).

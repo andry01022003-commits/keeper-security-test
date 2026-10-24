@@ -287,6 +287,10 @@ pub(crate) type ScannedRemote = (uuid::Uuid, String, String);
 pub(crate) enum LocalLookup<'a> {
     /// By trailing file name (RubyGems).
     PathSuffix(&'a str),
+    /// By exact artifact path (Conan).
+    ExactPath(&'a str),
+    /// By `(name, version)` (Pub).
+    NameVersion { name: &'a str, version: &'a str },
 }
 
 /// The package file one scan-aware download route serves.
@@ -344,9 +348,24 @@ where
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
     let lookup = route.lookup;
     let local_fetch = |member_id: uuid::Uuid, location: StorageLocation| async move {
-        let LocalLookup::PathSuffix(suffix) = lookup;
-        proxy_helpers::local_fetch_by_path_suffix(&state.db, state, member_id, &location, suffix)
-            .await
+        match lookup {
+            LocalLookup::PathSuffix(suffix) => {
+                proxy_helpers::local_fetch_by_path_suffix(
+                    &state.db, state, member_id, &location, suffix,
+                )
+                .await
+            }
+            LocalLookup::ExactPath(path) => {
+                proxy_helpers::local_fetch_by_path(&state.db, state, member_id, &location, path)
+                    .await
+            }
+            LocalLookup::NameVersion { name, version } => {
+                proxy_helpers::local_fetch_by_name_version(
+                    &state.db, state, member_id, &location, name, version,
+                )
+                .await
+            }
+        }
     };
     let runs = UnscannedArchiveRuns {
         proxy,
@@ -408,6 +427,24 @@ pub(crate) fn read_zip_entry(bytes: &Bytes, entry: &str) -> Result<Option<Vec<u8
 /// inconclusive (fail-closed 423, fail-open served `pending`); clean and
 /// vulnerable outcomes come from verdicts seeded for the content digest, the
 /// same way the Cargo, npm and PyPI suites drive the gate.
+/// The first entry of a gzipped tar whose path `matches`, read under the
+/// identity caps: `Ok(None)` when none matches (every header was walked, so
+/// the bytes are a readable gzipped tar), `Err` when they are not one or a cap
+/// is breached.
+pub(crate) fn read_tar_gz_entry(
+    bytes: &Bytes,
+    matches: impl Fn(&std::path::Path) -> bool,
+) -> Result<Option<Vec<u8>>, String> {
+    crate::util::bounded_archive::read_metadata_from_tar_gz_limited(
+        &bytes[..],
+        matches,
+        crate::services::scanner_service::PROXY_SCAN_MAX_BYTES as u64 * 8,
+        ARCHIVE_IDENTITY_MAX_ENTRIES,
+        ARCHIVE_IDENTITY_MAX_ENTRY_BYTES,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 pub(crate) mod test_support {

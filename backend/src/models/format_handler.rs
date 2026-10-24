@@ -248,6 +248,8 @@ mod tests {
             "go",
             "rubygems",
             "composer",
+            "pub",
+            "conan",
         ] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),

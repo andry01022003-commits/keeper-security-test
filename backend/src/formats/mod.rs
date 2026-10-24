@@ -311,15 +311,20 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// Composer (dist archives) scan every file on their package download route
 /// (#4103, #4104, #4105); RubyGems is graded as the gem the request names
 /// (its pin), Go and Composer on the archive's contents, since the scanner
-/// has no pin for them (see `api::handlers::proxy_scan_archive`).
+/// has no pin for them (see `api::handlers::proxy_scan_archive`). Pub scans
+/// package archives (#4107), graded as the package their `pubspec.yaml`
+/// declares; Conan scans the `.tgz` recipe and package archives (#4108),
+/// graded on their contents, and streams the text files.
 pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
     "cargo",        // #4101
     "composer",     // #4105
+    "conan",        // #4108
     "conda",        // #4585
     "conda_native", // #4585 (the same conda route)
     "go",           // #4103
     "maven",        // #4100 (also serves gradle)
     "nuget",        // #4102 (also serves chocolatey and powershell)
+    "pub",          // #4107
     "rubygems",     // #4104
     "sbt",          // #4100
     "npm",

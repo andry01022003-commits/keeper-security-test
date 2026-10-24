@@ -28049,6 +28049,8 @@ mod tests {
             Go,
             Rubygems,
             Composer,
+            Pub,
+            Conan,
         ] {
             assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
