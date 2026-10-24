@@ -43,6 +43,31 @@ A key that gained a reference between the two steps (for example a re-upload
 of the same content into another repository) is kept, and its record is
 dropped. That is counted in `ak_storage_gc_deletes_skipped_live_total`.
 
+Uploads honour the same record (#4980). An upload whose content is already
+stored skips the write, and one that writes does so before its row commits, so
+a GC delete could otherwise land between the upload's write (or its check that
+the object exists) and its commit, leaving a live row without its object. The
+transaction that commits an upload's row (generic, native and chunked uploads
+that go through the shared upload service or the chunked completion) therefore
+first takes the key's `oci_gc_candidates` slot and checks that the object is
+stored:
+
+- While a fresh record exists (younger than `BLOB_GC_MIN_AGE_SECS`), a delete
+  may still land, so the upload waits for it for up to 5 seconds. GC normally
+  deletes right after its claim, so the wait ends quickly.
+- If the object is gone, the upload writes it again and re-checks. A chunked
+  completion releases its lease instead and answers `503`; retrying the
+  completion writes the object again from the staged chunks.
+- If the record outlives the wait, which happens when a GC delete failed and
+  its record has not aged past `BLOB_GC_MIN_AGE_SECS` yet, the upload is
+  answered `503 SERVICE_UNAVAILABLE` ("retry the upload") and commits nothing.
+  The candidate sweep retries the delete once the record is older than that
+  window; a retried upload then succeeds.
+
+The slot is held only for the commit and a HEAD of the object, never across a
+write. Format handlers that write their own content-addressed rows outside the
+shared upload service are not covered yet.
+
 That re-check consults every reference table, which is wider than the
 soft-deleted-key scan alone. In particular an object that an `artifact_versions`
 row still names is kept: when the newest revision of an artifact in a

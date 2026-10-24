@@ -210,6 +210,24 @@ pub trait StorageBackend: Send + Sync {
         self.exists(key).await
     }
 
+    /// Whether an object is stored under exactly `key`, never resolving a
+    /// fallback key.
+    ///
+    /// [`Self::content_already_stored`] answers `false` whenever `exists`
+    /// could match the legacy fallback key, which is the safe answer for a
+    /// write-deduplication hint but not for a presence check that has to be
+    /// exact: the upload commit guard asks this to learn whether a storage GC
+    /// delete removed the canonical object after the upload wrote or
+    /// deduplicated it, and treating "unknown" as "absent" there would rewrite
+    /// every object twice in Artifactory `Migration` path mode (the cost #4893
+    /// removed from the Maven path). Backends whose `exists` never consults
+    /// another key answer exactly as `exists`; the cloud backends override it
+    /// with a HEAD of the canonical key only. Errors carry `exists`'s
+    /// contract: a failure is "unknown", not "absent".
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        self.exists(key).await
+    }
+
     /// Return the storage backend's opaque ETag for `key` if the backend
     /// supports per-object ETags (S3, GCS, Azure). Returns `Ok(None)` when
     /// the backend has no concept of an ETag (filesystem) or when the

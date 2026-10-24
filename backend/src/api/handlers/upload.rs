@@ -930,8 +930,35 @@ async fn complete_session_commit(
     // decision, not a fault, and stays terminal, as does anything after the
     // commit (or an ambiguous commit error): a retry would then hit the
     // immutability gate on the path this session already wrote.
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
+    //
+    // #4980: the transaction opens behind the storage GC commit guard, so the
+    // object written or deduplicated above cannot be collected before this
+    // row commits. Both refusals are retryable and release the lease: while a
+    // GC delete of the key may still land (the guard waits for it first), and
+    // when one already removed the object, which a retried completion writes
+    // again from the staged chunks.
+    let guarded = crate::services::artifact_service::begin_guarded_cas_commit(
+        &state.db,
+        storage.as_ref(),
+        &repo.storage_location(),
+        &storage_key,
+    )
+    .await;
+    let mut tx = match guarded {
+        Ok(crate::services::artifact_service::GuardedCasCommit::Ready(tx)) => tx,
+        Ok(crate::services::artifact_service::GuardedCasCommit::Missing) => {
+            tracing::warn!(
+                session = %session.id,
+                storage_key = %storage_key,
+                "chunked completion's object was removed by storage GC before commit; lease released for retry"
+            );
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(crate::services::artifact_service::cas_key_busy_error().into_response());
+        }
+        Err(e @ crate::error::AppError::ServiceUnavailable(_)) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(e.into_response());
+        }
         Err(e) => return Err(release_after_precommit_failure(&state.db, &session, e).await),
     };
     if !is_replication_request {
@@ -5021,6 +5048,97 @@ mod tests {
         cleanup_staged_session(&f, first_session, &first_temp_path).await;
         cleanup_staged_session(&f, second_session, &second_temp_path).await;
         f.teardown().await;
+    }
+
+    /// #4980: a completion whose content-addressed key a storage GC pass holds
+    /// a fresh delete lease on must not commit (the delete may land after the
+    /// row): it answers a retryable 503, commits no row and releases the
+    /// lease, and the same session completes once the lease is gone.
+    #[tokio::test]
+    async fn complete_waits_out_a_gc_delete_lease_then_refuses_retryably_4980() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+        let payload = b"chunked completion behind a gc delete lease";
+        let (first_session, first_temp_path) =
+            stage_completable_session_in(&f, storage.clone(), payload, "gc/first.bin").await;
+        let app = upload_router_with_auth(state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let (status, body) = tdh::send(app, complete_req(first_session)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &sha256_hex(payload),
+        );
+        let (backend, path): (String, String) =
+            sqlx::query_as("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("repo");
+        let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(
+            &crate::storage::StorageLocation { backend, path },
+        );
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(&key)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .execute(&f.pool)
+        .await
+        .expect("fresh gc lease");
+
+        let (second_session, second_temp_path) =
+            stage_completable_session_in(&f, storage.clone(), payload, "gc/second.bin").await;
+        let app = upload_router_with_auth(state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let (status, body) = tdh::send(app, complete_req(second_session)).await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = 'gc/second.bin' \
+             AND NOT is_deleted",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("rows");
+        let session_status: String =
+            sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+                .bind(second_session)
+                .fetch_one(&f.pool)
+                .await
+                .expect("session");
+
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&f.pool)
+            .await
+            .expect("lapse the lease");
+        let app = upload_router_with_auth(state, tdh::make_auth(f.user_id, &f.username));
+        let (retry_status, retry_body) = tdh::send(app, complete_req(second_session)).await;
+
+        cleanup_staged_session(&f, first_session, &first_temp_path).await;
+        cleanup_staged_session(&f, second_session, &second_temp_path).await;
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rows, 0, "a refused completion commits no row");
+        assert_ne!(
+            session_status, "committing",
+            "the commit lease is released for the retry"
+        );
+        assert_eq!(
+            retry_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&retry_body)
+        );
     }
 
     /// #3916: a chunked completion into an object-storage repository must

@@ -2302,6 +2302,19 @@ impl super::StorageBackend for S3Backend {
         }
     }
 
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let path: ObjectPath = self.full_key(key).into();
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to check existence of '{}'", key),
+                &e,
+            )),
+        }
+    }
+
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
@@ -5863,6 +5876,44 @@ mod tests {
             copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete,
         }
+    }
+
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/repos/generic/.*"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/ab/abcdef.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("last-modified", "Mon, 06 Jul 2026 22:37:12 GMT")
+                    .insert_header("etag", "\"e\""),
+            )
+            .mount(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.path_format = StoragePathFormat::Migration;
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
+        );
     }
 
     #[tokio::test]
