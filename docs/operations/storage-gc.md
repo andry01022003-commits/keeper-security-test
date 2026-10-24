@@ -43,6 +43,14 @@ A key that gained a reference between the two steps (for example a re-upload
 of the same content into another repository) is kept, and its record is
 dropped. That is counted in `ak_storage_gc_deletes_skipped_live_total`.
 
+That re-check consults every reference table, which is wider than the
+soft-deleted-key scan alone. In particular an object that an `artifact_versions`
+row still names is kept: when the newest revision of an artifact in a
+versioning-enabled repository is trashed and its retention passes, the
+`artifacts` row is removed but the revision's bytes stay, as older revisions'
+bytes always have, until the repository itself is deleted. Before 1.12.0 GC
+deleted that object and left the revision pointing at nothing.
+
 ## Per-run budgets
 
 A large deletion wave (a lifecycle policy that expires millions of artifacts, a
@@ -66,6 +74,10 @@ so its numbers predict what one live pass would reclaim.
 
 Blob GC's mark phase is never budgeted: it performs no storage I/O and must
 keep up with the orphan set.
+
+The two OCI upload cleanup-key sweeps (unreferenced and pending journal rows)
+are not charged to the budget either. They already delete outside a
+transaction and keep their own cap of 1,000 rows each per pass.
 
 ## Metrics
 

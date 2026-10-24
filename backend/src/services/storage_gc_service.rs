@@ -2913,6 +2913,8 @@ impl StorageGcService {
         let mut upload_keys_deleted = 0_i64;
 
         let mut claimed = Vec::new();
+        // Deletes landed by the mid-loop flushes, for the summary log line.
+        let mut landed = 0_i64;
         for session_id in session_ids {
             if meter.exhausted(result) {
                 break;
@@ -3040,13 +3042,15 @@ impl StorageGcService {
                 });
             }
             if claimed.len() >= GC_DELETE_CHUNK {
+                let before = result.storage_keys_deleted;
                 self.finish_claimed_deletes(std::mem::take(&mut claimed), result)
                     .await;
+                landed += result.storage_keys_deleted - before;
             }
         }
         let before = result.storage_keys_deleted;
         self.finish_claimed_deletes(claimed, result).await;
-        upload_keys_deleted += result.storage_keys_deleted - before;
+        upload_keys_deleted += landed + result.storage_keys_deleted - before;
 
         if sessions_removed > 0 {
             tracing::info!(
@@ -3808,6 +3812,8 @@ impl StorageGcService {
         }
 
         let mut claimed = Vec::new();
+        // Deletes landed by the mid-loop flushes, for the summary log line.
+        let mut landed = 0_i64;
         for row in candidates {
             if meter.exhausted(result) {
                 break;
@@ -3905,13 +3911,15 @@ impl StorageGcService {
                 }
             }
             if claimed.len() >= GC_DELETE_CHUNK {
+                let before = result.storage_keys_deleted;
                 self.finish_claimed_deletes(std::mem::take(&mut claimed), result)
                     .await;
+                landed += result.storage_keys_deleted - before;
             }
         }
         let before = result.storage_keys_deleted;
         self.finish_claimed_deletes(claimed, result).await;
-        let objects_removed = result.storage_keys_deleted - before;
+        let objects_removed = landed + result.storage_keys_deleted - before;
 
         if objects_removed > 0 {
             tracing::info!(
@@ -3996,6 +4004,8 @@ impl StorageGcService {
         let candidates = self.select_oci_gc_candidates().await?;
         let mut candidates_dropped = 0_i64;
         let mut claimed = Vec::new();
+        // Deletes landed by the mid-loop flushes, for the summary log line.
+        let mut landed = 0_i64;
 
         for candidate in candidates {
             if meter.exhausted(result) {
@@ -4080,13 +4090,15 @@ impl StorageGcService {
                 }
             }
             if claimed.len() >= GC_DELETE_CHUNK {
+                let before = result.storage_keys_deleted;
                 self.finish_claimed_deletes(std::mem::take(&mut claimed), result)
                     .await;
+                landed += result.storage_keys_deleted - before;
             }
         }
         let before = result.storage_keys_deleted;
         self.finish_claimed_deletes(claimed, result).await;
-        let objects_removed = result.storage_keys_deleted - before;
+        let objects_removed = landed + result.storage_keys_deleted - before;
 
         if objects_removed > 0 || candidates_dropped > 0 {
             tracing::info!(

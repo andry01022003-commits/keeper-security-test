@@ -27077,8 +27077,10 @@ mod oci_blob_upload_streaming_tests {
     /// flight) is refused retryably instead of committing a row for bytes the
     /// sweep is deleting; a retry after the sweep publishes the blob intact.
     ///
-    /// FAILS ON MAIN: the push committed its `oci_blobs` row (201) while the
-    /// sweep's delete was in flight, and the delete then removed its object.
+    /// FAILS ON MAIN: the sweep held the marked `oci_blobs` row lock across
+    /// its storage delete, so the push's commit blocked behind it and never
+    /// answered while the delete was in flight; once the lock was released it
+    /// would have committed a row for the bytes the sweep had just deleted.
     #[tokio::test]
     async fn push_during_a_claimed_blob_delete_is_refused_then_retry_succeeds_2524() {
         let _gc_guard = crate::services::storage_gc_service::storage_gc_test_guard().await;
@@ -27112,10 +27114,6 @@ mod oci_blob_upload_streaming_tests {
         storage.release_delete.notify_one();
         sweep.await.expect("sweep task").expect("sweep");
 
-        let racing_ok = match &racing {
-            Ok((status, _, _)) => *status == StatusCode::CREATED,
-            Err(_) => false,
-        };
         let object_after_race = storage.get(&blob_storage_key(&digest)).await.ok();
         let rows_after_race = oci_blob_count(&f, &digest).await;
 
@@ -27125,17 +27123,15 @@ mod oci_blob_upload_streaming_tests {
         let object_after_retry = storage.get(&blob_storage_key(&digest)).await.ok();
         f.teardown().await;
 
-        if racing_ok {
-            assert_eq!(
-                object_after_race,
-                Some(content.clone()),
-                "a push answered 201 during the sweep must keep its object"
-            );
-        } else {
-            let (status, _, body) = racing.expect("the racing push must answer, not hang");
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", body);
-            assert_eq!(rows_after_race, 0, "a refused push commits no row");
-        }
+        // The same-repository push registers onto the sweep's live tombstone,
+        // so its commit-time journal claim reports it doomed: always a 503.
+        let (status, _, body) = racing.expect("the racing push must answer, not hang");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", body);
+        assert_eq!(rows_after_race, 0, "a refused push commits no row");
+        assert_eq!(
+            object_after_race, None,
+            "the claimed delete went through; the refused push left nothing live"
+        );
         assert_eq!(retry_status, StatusCode::CREATED, "{:?}", retry_body);
         assert_eq!(object_after_retry, Some(content));
     }
