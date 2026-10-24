@@ -100,11 +100,16 @@ use std::path::{Path, PathBuf};
 /// 503 or 404 line of text, read under a 1 MiB bound) to each of them. That
 /// replay reads the error body once; it never touches an artifact or a
 /// metadata document. New file conda/merge_gate.rs: 1, total 30 -> 31.
+///
+/// #4902: an OCI blob completion runs on its own task and a retry of the same
+/// PUT waits for it and is answered with the completion's own response, read
+/// once under a 64 KiB bound (an empty 201 or a small OCI error document,
+/// never blob bytes). oci_v2.rs 1 -> 2, total 31 -> 32.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/conda/merge_gate.rs", 1),
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/npm.rs", 6),
-    ("src/api/handlers/oci_v2.rs", 1),
+    ("src/api/handlers/oci_v2.rs", 2),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
     ("src/api/middleware/rate_limit.rs", 2),
@@ -465,14 +470,15 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 31,
-        "expected 31 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 32,
+        "expected 32 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
          + RPM curation-sync reconciliation (scheduler_service.rs +1) \
          + packument HTTP caching (#3052, npm.rs +1) \
          + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494) \
          + the /v2/token form peek (#4020, rate_limit.rs +1) \
-         + the virtual conda merge error replay (#4608, merge_gate.rs +1); \
+         + the virtual conda merge error replay (#4608, merge_gate.rs +1) \
+         + the OCI completion retry replay (#4902, oci_v2.rs +1); \
          got {total}"
     );
 }

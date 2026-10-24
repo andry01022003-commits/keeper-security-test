@@ -22977,10 +22977,11 @@ mod scan_on_upload_coverage_tests {
     ];
 
     /// The `oci_blobs` writers of a `docker push`: monolithic upload, chunked
-    /// completion and cross-repository mount.
+    /// completion (run on its own task by `handle_complete_upload` since #4902)
+    /// and cross-repository mount.
     const ISSUE_4422_OCI_BLOB_HANDLERS: &[&str] = &[
         "handle_start_upload",
-        "handle_complete_upload",
+        "complete_claimed_oci_upload",
         "try_mount_blob",
     ];
 
