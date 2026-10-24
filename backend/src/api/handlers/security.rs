@@ -108,8 +108,54 @@ pub struct DashboardResponse {
     /// keeps its meaning (hosted rejections plus these). The rows behind it
     /// are `GET /api/v1/security/proxy-blocked`.
     pub proxy_blocked: i64,
+    /// Repositories whose grade letter, over what was assessed, is A (#4336:
+    /// an `unrated` repository has no letter and is not counted).
     pub repos_grade_a: i64,
+    /// Repositories whose grade letter, over what was assessed, is F. Since
+    /// #4336 a failed scan or an uncataloged archive no longer floors a
+    /// letter to F; those repositories are counted in `repos_incomplete` or
+    /// `repos_unrated` instead.
     pub repos_grade_f: i64,
+    /// Repositories by grade status (#4336); see [`ScoreResponse::grade_status`].
+    pub repos_rated: i64,
+    pub repos_incomplete: i64,
+    pub repos_unrated: i64,
+}
+
+/// What a repository's scans assessed (#4336), counted per live artifact by
+/// the latest scan of each scanner.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScoreCoverageResponse {
+    /// Live (not deleted) artifacts in the repository.
+    pub artifacts: i64,
+    /// Artifacts with at least one finished scan:
+    /// `cataloged + failed + uncataloged`.
+    pub scanned: i64,
+    /// Scanned artifacts that were assessed (`complete` or `partial`).
+    pub cataloged: i64,
+    /// The part of `cataloged` assessed only in part (`partial`).
+    pub partial: i64,
+    /// Scanned artifacts whose latest scan failed.
+    pub failed: i64,
+    /// Scanned artifacts no scanner could catalog (`not_cataloged`).
+    pub uncataloged: i64,
+    /// `(cataloged - partial) / scanned` in whole percent, rounded down;
+    /// `null` when nothing was scanned.
+    pub coverage_pct: Option<i32>,
+}
+
+impl From<crate::models::security::ScoreCoverage> for ScoreCoverageResponse {
+    fn from(c: crate::models::security::ScoreCoverage) -> Self {
+        Self {
+            artifacts: c.artifacts,
+            scanned: c.scanned,
+            cataloged: c.cataloged,
+            partial: c.partial,
+            failed: c.failed,
+            uncataloged: c.uncataloged,
+            coverage_pct: c.coverage_pct(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -117,7 +163,21 @@ pub struct ScoreResponse {
     pub id: Uuid,
     pub repository_id: Uuid,
     pub score: i32,
-    pub grade: String,
+    /// Grade letter over the assessed artifacts (#4336), `null` when the
+    /// repository is `unrated`. Never floored: before 1.12 a failed scan or an
+    /// uncataloged archive forced this to `F`; `grade_status` and `coverage`
+    /// now say what was not assessed.
+    #[schema(example = "B")]
+    pub grade: Option<String>,
+    /// `rated` (everything scanned was fully assessed), `incomplete` (some
+    /// artifacts failed to scan, could not be cataloged, or were assessed only
+    /// in part) or `unrated` (nothing was assessed, including no scans at
+    /// all) (#4336).
+    #[schema(example = "incomplete")]
+    pub grade_status: String,
+    /// The counts behind `grade_status` (#4336). `null` until a 1.12 replica
+    /// has recalculated the score (a row last written by an older replica).
+    pub coverage: Option<ScoreCoverageResponse>,
     pub total_findings: i32,
     pub critical_count: i32,
     pub high_count: i32,
@@ -127,22 +187,18 @@ pub struct ScoreResponse {
     pub last_scan_at: Option<chrono::DateTime<chrono::Utc>>,
     pub calculated_at: chrono::DateTime<chrono::Utc>,
     /// True when the latest applicable scan for this repo errored (#2167).
-    /// The `grade` letter is floored to `F` while this holds. The floor is
-    /// display-only: `score` is unchanged, and quality gates, promotion rules
-    /// and download policies read the numeric score, so clients that must not
-    /// treat the repo as clean should check this flag. Cleared automatically
-    /// once a `completed` rescan supersedes the failed scan.
+    /// Since #4336 the `grade` letter is not floored; `coverage.failed` counts
+    /// the artifacts and `grade_status` is `incomplete` or `unrated`. Cleared
+    /// automatically once a `completed` rescan supersedes the failed scan.
     pub has_failed_scan: bool,
     /// True when the latest completed scan of some artifact in this repo
     /// cataloged NO components although its format expects a catalog
     /// (#4036, #4154): its zero findings mean "nothing was assessed", not
-    /// "clean". The scan row's `scan_completeness_reason` says why. The
-    /// `grade` letter is floored to `F` only for package artifacts (typed
-    /// repositories, and package-shaped archives such as `.whl`/`.jar` in a
-    /// generic one); a plain generic `.zip`/`.tar.gz` sets this flag without
-    /// changing the grade. As with `has_failed_scan`, the floor is display-
-    /// only. Cleared automatically once a `completed` rescan supersedes the
-    /// not-cataloged scan.
+    /// "clean". The scan row's `scan_completeness_reason` says why. Since
+    /// #4336 the `grade` letter is not floored; `coverage.uncataloged` counts
+    /// the artifacts and `grade_status` is `incomplete` or `unrated`. Cleared
+    /// automatically once a `completed` rescan supersedes the not-cataloged
+    /// scan.
     pub has_uncataloged_scan: bool,
 }
 
@@ -342,6 +398,15 @@ pub struct ScanResponse {
     /// Why the scan is not `complete`, when known (e.g. which scanner
     /// cataloged nothing). `None` for complete scans.
     pub scan_completeness_reason: Option<String>,
+    /// What this scan assessed (#4336): `rated` (a completed `complete`
+    /// scan), `incomplete` (completed `partial`: graded on part of the
+    /// artifact) or `unrated` (completed `not_cataloged`, failed, not
+    /// applicable, or not finished). Same vocabulary as the repository's
+    /// `grade_status`.
+    #[schema(example = "rated")]
+    pub grade_status: String,
+    /// Why `grade_status` is not `rated`; `null` when it is.
+    pub grade_status_reason: Option<String>,
     /// Vulnerability database the scan ran against (#3014), distinct from
     /// `scanner_version` (the binary): e.g. `trivy-db-v2`, `grype-db-v6.1.10`,
     /// or `live:osv` / `live:osv+ghsa` for the dependency scanner, which
@@ -393,7 +458,14 @@ impl ScanResponse {
             (true, Some(source_id)) => source_id,
             _ => s.id,
         };
+        let (grade_status, grade_status_reason) = crate::models::security::scan_grade_status(
+            &s.status,
+            &s.scan_completeness,
+            s.scan_completeness_reason.as_deref(),
+        );
         Self {
+            grade_status: grade_status.as_str().to_string(),
+            grade_status_reason,
             id: reported_id,
             artifact_id: s.artifact_id,
             artifact_name,
@@ -549,7 +621,9 @@ impl From<crate::models::security::RepoSecurityScore> for ScoreResponse {
             id: s.id,
             repository_id: s.repository_id,
             score: s.score,
-            grade: s.grade,
+            grade: s.display_grade(),
+            grade_status: s.status().as_str().to_string(),
+            coverage: s.coverage().map(ScoreCoverageResponse::from),
             total_findings: s.total_findings,
             critical_count: s.critical_count,
             high_count: s.high_count,
@@ -886,6 +960,9 @@ async fn get_dashboard(
         proxy_blocked: summary.proxy_blocked,
         repos_grade_a: summary.repos_grade_a,
         repos_grade_f: summary.repos_grade_f,
+        repos_rated: summary.repos_rated,
+        repos_incomplete: summary.repos_incomplete,
+        repos_unrated: summary.repos_unrated,
     }))
 }
 
@@ -1511,7 +1588,11 @@ pub struct IngestExternalFindingsResponse {
     pub findings_ingested: i32,
     /// Repository security score after `recalculate_score`.
     pub score: i32,
-    pub grade: String,
+    /// Repository grade letter after `recalculate_score`, as
+    /// [`ScoreResponse::grade`]: `null` when the repository is `unrated`.
+    pub grade: Option<String>,
+    /// Repository grade status after `recalculate_score` (#4336).
+    pub grade_status: String,
 }
 
 /// Per-severity counts for the `scan_results` projection, in the order
@@ -1765,7 +1846,8 @@ async fn ingest_external_findings(
             "malicious_ids": summary.malicious_ids,
             "malicious_ids_truncated": summary.malicious_ids_truncated,
             "score": score.score,
-            "grade": score.grade,
+            "grade": score.display_grade(),
+            "grade_status": score.status().as_str(),
         })),
     )
     .await;
@@ -1776,7 +1858,8 @@ async fn ingest_external_findings(
         repository_id,
         findings_ingested: findings.len() as i32,
         score: score.score,
-        grade: score.grade,
+        grade: score.display_grade(),
+        grade_status: score.status().as_str().to_string(),
     }))
 }
 
@@ -3363,6 +3446,7 @@ async fn rescan_proxy_cached_path(
         ProxyBlockedItem,
         ProxyBlockedResponse,
         ScoreResponse,
+        ScoreCoverageResponse,
         TriggerScanRequest,
         TriggerScanResponse,
         ScanListResponse,
@@ -6491,6 +6575,36 @@ mod tests {
             json["scan_completeness_reason"],
             "grype cataloged no components"
         );
+        // #4336: the per-scan grade status, with the reason.
+        assert_eq!(json["grade_status"], "unrated");
+        assert_eq!(json["grade_status_reason"], "grype cataloged no components");
+    }
+
+    /// #4336: a `partial` scan (part of the artifact assessed, as an image
+    /// whose filesystem could only be partly extracted) is `incomplete` with
+    /// its reason; a complete one is `rated` with none; a failed one is
+    /// `unrated`.
+    #[test]
+    fn scan_response_grade_status_4336() {
+        let mut scan = make_scan_result();
+        scan.status = "completed".to_string();
+        scan.scan_completeness = "partial".to_string();
+        scan.scan_completeness_reason = Some("rootfs partly extracted".to_string());
+        let json = serde_json::to_value(scan_result_to_response(scan, None, None)).unwrap();
+        assert_eq!(json["grade_status"], "incomplete");
+        assert_eq!(json["grade_status_reason"], "rootfs partly extracted");
+
+        let mut scan = make_scan_result();
+        scan.status = "completed".to_string();
+        scan.scan_completeness = "complete".to_string();
+        let json = serde_json::to_value(scan_result_to_response(scan, None, None)).unwrap();
+        assert_eq!(json["grade_status"], "rated");
+        assert!(json["grade_status_reason"].is_null());
+
+        let mut scan = make_scan_result();
+        scan.status = "failed".to_string();
+        let json = serde_json::to_value(scan_result_to_response(scan, None, None)).unwrap();
+        assert_eq!(json["grade_status"], "unrated");
     }
 
     fn make_scan_response(artifact_id: Uuid, scan_type: &str, status: &str) -> ScanResponse {
@@ -6647,6 +6761,9 @@ mod tests {
             proxy_blocked: 0,
             repos_grade_a: 6,
             repos_grade_f: 1,
+            repos_rated: 0,
+            repos_incomplete: 0,
+            repos_unrated: 0,
         };
         assert_eq!(resp.repos_with_scanning, 10);
         assert_eq!(resp.total_scans, 100);
@@ -6670,6 +6787,9 @@ mod tests {
             proxy_blocked: 0,
             repos_grade_a: 0,
             repos_grade_f: 0,
+            repos_rated: 0,
+            repos_incomplete: 0,
+            repos_unrated: 0,
         };
         assert_eq!(resp.repos_with_scanning, 0);
         assert_eq!(resp.total_findings, 0);
@@ -7296,7 +7416,9 @@ mod tests {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
             score: 85,
-            grade: "A".to_string(),
+            grade: Some("A".to_string()),
+            grade_status: "rated".to_string(),
+            coverage: None,
             total_findings: 5,
             critical_count: 0,
             high_count: 1,
@@ -7309,7 +7431,7 @@ mod tests {
             has_uncataloged_scan: false,
         };
         assert_eq!(resp.score, 85);
-        assert_eq!(resp.grade, "A");
+        assert_eq!(resp.grade.as_deref(), Some("A"));
         assert_eq!(resp.total_findings, 5);
         assert_eq!(resp.acknowledged_count, 1);
     }
@@ -7320,7 +7442,9 @@ mod tests {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
             score: 0,
-            grade: "F".to_string(),
+            grade: Some("F".to_string()),
+            grade_status: "rated".to_string(),
+            coverage: None,
             total_findings: 0,
             critical_count: 0,
             high_count: 0,
@@ -7333,7 +7457,7 @@ mod tests {
             has_uncataloged_scan: false,
         };
         assert_eq!(resp.score, 0);
-        assert_eq!(resp.grade, "F");
+        assert_eq!(resp.grade.as_deref(), Some("F"));
         assert!(resp.last_scan_at.is_none());
     }
 
@@ -7372,7 +7496,9 @@ mod tests {
                 id: Uuid::new_v4(),
                 repository_id: Uuid::new_v4(),
                 score: 92,
-                grade: "A".to_string(),
+                grade: Some("A".to_string()),
+                grade_status: "rated".to_string(),
+                coverage: None,
                 total_findings: 2,
                 critical_count: 0,
                 high_count: 0,
@@ -7432,6 +7558,9 @@ mod tests {
             proxy_blocked: 0,
             repos_grade_a: 4,
             repos_grade_f: 0,
+            repos_rated: 0,
+            repos_incomplete: 0,
+            repos_unrated: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"repos_with_scanning\":5"));
@@ -7477,7 +7606,9 @@ mod tests {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
             score: 75,
-            grade: "B".to_string(),
+            grade: Some("B".to_string()),
+            grade_status: "rated".to_string(),
+            coverage: None,
             total_findings: 10,
             critical_count: 0,
             high_count: 2,
@@ -7493,6 +7624,52 @@ mod tests {
         assert_eq!(json["score"], 75);
         assert_eq!(json["grade"], "B");
         assert_eq!(json["total_findings"], 10);
+    }
+
+    /// #4336: the score response carries the grade status and coverage, the
+    /// shown letter is never the 1.11 floor, and `unrated` has no letter.
+    #[test]
+    fn score_response_exposes_status_and_coverage_4336() {
+        let now = chrono::Utc::now();
+        let mut row = crate::models::security::RepoSecurityScore {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            score: 80,
+            grade: "F".to_string(),
+            total_findings: 2,
+            critical_count: 0,
+            high_count: 1,
+            medium_count: 1,
+            low_count: 0,
+            acknowledged_count: 0,
+            last_scan_at: Some(now),
+            calculated_at: now,
+            has_failed_scan: false,
+            has_uncataloged_scan: true,
+            grade_status: Some("incomplete".to_string()),
+            rated_grade: Some("B".to_string()),
+            artifact_count: Some(2),
+            scanned_count: Some(2),
+            cataloged_count: Some(1),
+            partial_count: Some(0),
+            failed_count: Some(0),
+            uncataloged_count: Some(1),
+            status_calculated_at: Some(now),
+        };
+        let json = serde_json::to_value(ScoreResponse::from(row.clone())).unwrap();
+        assert_eq!(json["grade"], "B");
+        assert_eq!(json["grade_status"], "incomplete");
+        assert_eq!(json["coverage"]["scanned"], 2);
+        assert_eq!(json["coverage"]["cataloged"], 1);
+        assert_eq!(json["coverage"]["uncataloged"], 1);
+        assert_eq!(json["coverage"]["coverage_pct"], 50);
+
+        row.grade = "A".to_string();
+        row.grade_status = Some("unrated".to_string());
+        row.rated_grade = None;
+        let json = serde_json::to_value(ScoreResponse::from(row)).unwrap();
+        assert_eq!(json["grade_status"], "unrated");
+        assert!(json["grade"].is_null(), "unrated has no letter");
     }
 
     #[test]
