@@ -9769,6 +9769,20 @@ mod scan_on_proxy_4111 {
     use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
     use crate::api::handlers::test_db_helpers as tdh;
 
+    /// The pin the gate grades `deb()` as: its `+deb12u1` names Debian 12.
+    fn pin() -> Option<crate::services::scanner_service::ExpectedComponent> {
+        crate::services::scanner_service::ExpectedComponent::os_package(
+            crate::services::scanner_service::ComponentEcosystem::Debian,
+            "libdtf",
+            "1.0-1+deb12u1",
+            crate::services::scanner_service::OsPackageContext {
+                release: crate::services::scanner_service::OsRelease::new("debian", "12")?,
+                arch: "amd64".to_string(),
+                source: Some("dtf".to_string()),
+            },
+        )
+    }
+
     const FILE: &str = "libdtf_1.0-1+deb12u1_amd64.deb";
     const POOL: &str = "pool/main/d/dtf";
 
@@ -9793,6 +9807,7 @@ mod scan_on_proxy_4111 {
             body: deb(),
             recorded_path: path,
             file: FILE.to_string(),
+            pin: pin(),
         }
     }
 
@@ -9810,6 +9825,7 @@ mod scan_on_proxy_4111 {
             body: deb(),
             recorded_path: path,
             file: FILE.to_string(),
+            pin: pin(),
         }
     }
 
@@ -9824,6 +9840,7 @@ mod scan_on_proxy_4111 {
             body: deb(),
             recorded_path: FILE.to_string(),
             file: FILE.to_string(),
+            pin: pin(),
         }
     }
 
@@ -9869,6 +9886,101 @@ mod scan_on_proxy_4111 {
             rig.package_fetches().await,
             0,
             "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    /// A pool package whose version names no release (`1.0-1`).
+    fn unmarked_case(_mock: &str) -> ArchiveCase {
+        const UNMARKED: &str = "libdtf_1.0-1_amd64.deb";
+        let path = format!("{POOL}/{UNMARKED}");
+        ArchiveCase {
+            format: "debian",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{POOL}/{UNMARKED}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: deb_with_control(&format!(
+                "Package: libdtf\nVersion: 1.0-1\nArchitecture: amd64\nDescription: {}\n",
+                uuid::Uuid::new_v4()
+            )),
+            recorded_path: path,
+            file: UNMARKED.to_string(),
+            pin: None,
+        }
+    }
+
+    /// #4952 on Debian: the release is part of what a verdict was graded
+    /// as. With no release determinable the pull is inconclusive, and it
+    /// does not inherit a clean verdict the same bytes were graded on Debian
+    /// 12 (fail-open serves it pending); once the remote's `Release` names
+    /// Debian 12, that verdict is this pull's and is reused.
+    #[tokio::test]
+    async fn without_a_release_a_pull_never_inherits_a_clean_verdict() {
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let graded_on_12 = ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "libdtf",
+            "1.0-1",
+            OsPackageContext {
+                release: OsRelease::new("debian", "12").expect("release"),
+                arch: "amd64".to_string(),
+                source: None,
+            },
+        )
+        .expect("pinnable");
+        crate::services::proxy_scan_service::ProxyScanService::new(rig.fx.pool.clone())
+            .record_verdict_with_catalog(
+                &rig.digest(),
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-4952-test"),
+                Some(rig.fx.repo_id),
+                Some(1),
+                Some(&graded_on_12.pin_identity()),
+            )
+            .await
+            .expect("seed verdict");
+
+        let (status, served, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("pending"),
+            "no release: inconclusive, never the Debian 12 verdict"
+        );
+        assert_eq!(&served[..], &rig.case.body[..]);
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/dists/bookworm/Release"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+                "Origin: Debian\nLabel: Debian\nSuite: stable\nVersion: 12.7\n\
+                 Codename: bookworm\nComponents: main\nArchitectures: amd64\n",
+            ))
+            .mount(&rig.server)
+            .await;
+        let _ = tdh::send_with_headers(
+            tdh::router_anon(super::router(), rig.state.clone()),
+            tdh::get(format!("/{}/dists/bookworm/Release", rig.fx.repo_key)),
+        )
+        .await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ts::scan_header(&headers).as_deref(),
+            Some("clean"),
+            "the remote names Debian 12: the verdict graded on Debian 12 is reused"
         );
         rig.teardown().await;
     }

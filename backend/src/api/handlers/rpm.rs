@@ -8219,6 +8219,20 @@ mod scan_on_proxy_4112 {
     use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
     use crate::api::handlers::test_db_helpers as tdh;
 
+    /// The pin the gate grades `rpm()` as: its `el9_2` names RHEL 9.
+    fn pin() -> Option<crate::services::scanner_service::ExpectedComponent> {
+        crate::services::scanner_service::ExpectedComponent::os_package(
+            crate::services::scanner_service::ComponentEcosystem::Rpm,
+            "dtf-libs",
+            "1:1.0-1.el9_2",
+            crate::services::scanner_service::OsPackageContext {
+                release: crate::services::scanner_service::OsRelease::new("rhel", "9")?,
+                arch: "x86_64".to_string(),
+                source: None,
+            },
+        )
+    }
+
     const FILE: &str = "dtf-libs-1.0-1.el9_2.x86_64.rpm";
 
     /// A minimal `.rpm` for `FILE`; the random payload byte keeps every
@@ -8240,6 +8254,7 @@ mod scan_on_proxy_4112 {
             body: rpm(),
             recorded_path: path,
             file: FILE.to_string(),
+            pin: pin(),
         }
     }
 
@@ -8257,6 +8272,7 @@ mod scan_on_proxy_4112 {
             body: rpm(),
             recorded_path: path,
             file: FILE.to_string(),
+            pin: pin(),
         }
     }
 
