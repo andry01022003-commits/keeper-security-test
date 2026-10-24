@@ -743,17 +743,59 @@ async fn complete_session_commit(
         }
     }
 
-    // #3918: reassemble the staged chunks from the repository's backend into a
-    // scratch file on *this* replica and verify size + SHA256. The chunks may
-    // have been PATCHed to any replica. The scratch file is removed when
-    // `assembled` drops, on every path below (#3922); `assemble_for_commit`
-    // settles the lease itself when it fails.
-    let scratch_dir = std::path::PathBuf::from(&state.config.storage_path).join(".uploads");
-    let assembled =
-        UploadService::assemble_for_commit(&state.db, storage.as_ref(), &session, &scratch_dir)
-            .await
-            .map_err(map_upload_err)?;
-    let temp_path = assembled.path();
+    // #3916: a completion into a backend whose `put_stream` is native (S3
+    // multipart / GCS resumable / Azure block blob) can reassemble the staged
+    // chunks *on the backend* instead of writing one full-size local file.
+    // Formats whose finalize reads the body as a file (the RPM header parse,
+    // the Incus/Debian package parse) still need local assembly, as does a
+    // filesystem repository and any backend that has no native streaming.
+    let needs_local_file = native_coordinates.is_some()
+        || (!replicated_metadata
+            && rpm_header_metadata_eligible(&repo.format, &session.artifact_path));
+    let stream_assembly = !needs_local_file
+        && repo.storage_backend != "filesystem"
+        && storage.supports_streamed_assembly();
+
+    // The key is content-addressed and every backend writes it atomically, so
+    // an object already present under it is the object we would write and can
+    // be reused instead of rewritten -- the same dedup the two direct upload
+    // paths perform (`artifact_service::upload_with_sync_options`,
+    // `::upload_stream_with_sync_options`).
+    //
+    // `content_already_stored` rather than `exists` is what makes that safe on
+    // a migration-mode cloud backend, where an `exists` hit can be the legacy
+    // fallback key rather than the canonical one (#3530/#3837). Every upload
+    // path takes its dedup decision from that one helper.
+    //
+    // The probe is a retryable failure: the staged chunks remain in the
+    // backend, so release the commit lease before returning and let the client
+    // re-issue the complete request.
+    let content_exists = match storage.content_already_stored(&storage_key).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+
+    // #3918: reassemble the staged chunks from the repository's backend and
+    // verify size + SHA256. The chunks may have been PATCHed to any replica.
+    // A local scratch file is removed when `assembled` drops, on every path
+    // below (#3922); the assembly helpers settle the lease themselves when
+    // they fail. On a native-streaming backend with no consumer that needs a
+    // file, nothing is written locally: the chunks stream into one staging
+    // object on the backend and are promoted from there.
+    let assembled = if stream_assembly {
+        None
+    } else {
+        let scratch_dir = std::path::PathBuf::from(&state.config.storage_path).join(".uploads");
+        Some(
+            UploadService::assemble_for_commit(&state.db, storage.as_ref(), &session, &scratch_dir)
+                .await
+                .map_err(map_upload_err)?,
+        )
+    };
+    let temp_path = assembled.as_ref().map(|assembled| assembled.path());
 
     // #2588: packages pushed through the generic chunked flow must still
     // surface format metadata (the native format routes parse it at upload
@@ -767,6 +809,7 @@ async fn complete_session_commit(
     let rpm_upload_metadata = if !replicated_metadata
         && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
     {
+        let temp_path = temp_path.expect("an RPM header parse assembles locally");
         match read_rpm_header_prefix(temp_path).await {
             Ok(prefix) => {
                 let filename = artifact_name_from_path(&session.artifact_path).to_string();
@@ -795,6 +838,7 @@ async fn complete_session_commit(
     // with the file name) is refused here too, with nothing left behind.
     let staged_native = match native_coordinates {
         Some(_) => {
+            let temp_path = temp_path.expect("a native finalize assembles locally");
             match stage_native_finalize(&repo.format, &session.artifact_path, temp_path).await {
                 Ok(staged) => staged,
                 Err(reason) => {
@@ -806,40 +850,44 @@ async fn complete_session_commit(
         None => None,
     };
 
-    // The key is content-addressed and every backend writes it atomically, so
-    // an object already present under it is the object we would write and can
-    // be reused instead of rewritten -- the same dedup the two direct upload
-    // paths perform (`artifact_service::upload_with_sync_options`,
-    // `::upload_stream_with_sync_options`).
-    //
-    // `content_already_stored` rather than `exists` is what makes that safe on
-    // a migration-mode cloud backend, where an `exists` hit can be the legacy
-    // fallback key rather than the canonical one (#3530/#3837). Every upload
-    // path takes its dedup decision from that one helper.
-    //
-    // Both the probe and the write are retryable failures: the temp file is
-    // still on disk, so release the commit lease before returning and let the
-    // client re-issue the complete request.
-    let content_exists = match storage.content_already_stored(&storage_key).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            UploadService::release_commit_lease(&state.db, &session).await;
-            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    if stream_assembly {
+        if content_exists {
+            // Deduplicated completion: still verify the staged bytes, exactly
+            // as the local assembly path does, but do not write anything.
+            UploadService::verify_for_commit(&state.db, &storage, &session)
+                .await
+                .map_err(map_upload_err)?;
+        } else {
+            // Stream the chunks into the session's staging object and verify
+            // the result, then promote it server-side to the content-addressed
+            // key. `copy` is the same promotion the generic upload path uses
+            // (#3916) and needs no local file on S3, GCS or Azure.
+            let staged_key =
+                UploadService::assemble_for_commit_on_backend(&state.db, &storage, &session)
+                    .await
+                    .map_err(map_upload_err)?;
+            if let Err(e) = storage.copy(&staged_key, &storage_key).await {
+                // A retry re-creates the staging object from the chunks; the
+                // reaper reclaims this one if it is not deleted now.
+                let _ = storage.delete(&staged_key).await;
+                UploadService::release_commit_lease(&state.db, &session).await;
+                return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            }
+            let _ = storage.delete(&staged_key).await;
         }
-    };
-
-    if !content_exists {
+    } else if !content_exists {
         // C1: Use put_file to stream from disk instead of reading the entire
-        // file into memory. The default implementation still reads into
-        // memory, but backends can override for true streaming (S3 multipart,
-        // etc.).
+        // file into memory. Local assembly is the fallback for a filesystem
+        // backend, a backend without native streaming, and formats that need
+        // the body as a file.
+        let temp_path = temp_path.expect("a local write assembles on disk");
         if let Err(e) = storage.put_file(&storage_key, temp_path).await {
             UploadService::release_commit_lease(&state.db, &session).await;
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     }
 
-    // Clean up the scratch copy now that the bytes are in final storage.
+    // Clean up the local scratch copy now that the bytes are in final storage.
     drop(assembled);
 
     // Create artifact record. A natively finalized format is named the way
@@ -1183,6 +1231,7 @@ async fn complete_session_commit(
     }
 
     tracing::info!(
+        assembly = if stream_assembly { "backend" } else { "local" },
         "Finalized chunked upload {} -> artifact {} ({}B, sha256:{})",
         session_id,
         artifact_id,
@@ -2023,9 +2072,13 @@ mod tests {
     struct CompleteRecordingStorage {
         objects: Mutex<HashMap<String, Bytes>>,
         put_file_calls: AtomicUsize,
+        put_stream_calls: AtomicUsize,
+        copy_calls: AtomicUsize,
         fail_exists: AtomicBool,
         fail_put_file: AtomicBool,
         exists_may_match_fallback_key: AtomicBool,
+        streamed_assembly: AtomicBool,
+        fail_copy: AtomicBool,
     }
 
     impl CompleteRecordingStorage {
@@ -2033,8 +2086,20 @@ mod tests {
             self.put_file_calls.load(Ordering::SeqCst)
         }
 
+        fn put_stream_calls(&self) -> usize {
+            self.put_stream_calls.load(Ordering::SeqCst)
+        }
+
+        fn copy_calls(&self) -> usize {
+            self.copy_calls.load(Ordering::SeqCst)
+        }
+
         fn content(&self, key: &str) -> Option<Bytes> {
             self.objects.lock().unwrap().get(key).cloned()
+        }
+
+        fn contains(&self, key: &str) -> bool {
+            self.objects.lock().unwrap().contains_key(key)
         }
 
         fn set_fail_exists(&self, fail: bool) {
@@ -2048,6 +2113,17 @@ mod tests {
         fn set_exists_may_match_fallback_key(&self, fallback: bool) {
             self.exists_may_match_fallback_key
                 .store(fallback, Ordering::SeqCst);
+        }
+
+        /// Advertise native streaming assembly, as S3/GCS/Azure do. Off by
+        /// default so the filesystem-shaped completion tests keep exercising
+        /// the local assembly path.
+        fn set_streamed_assembly(&self, streamed: bool) {
+            self.streamed_assembly.store(streamed, Ordering::SeqCst);
+        }
+
+        fn set_fail_copy(&self, fail: bool) {
+            self.fail_copy.store(fail, Ordering::SeqCst);
         }
     }
 
@@ -2100,7 +2176,23 @@ mod tests {
             key: &str,
             stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
         ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            self.put_stream_calls.fetch_add(1, Ordering::SeqCst);
             crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            self.copy_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_copy.load(Ordering::SeqCst) {
+                return Err(crate::error::AppError::Storage(
+                    "injected copy failure".to_string(),
+                ));
+            }
+            let content = self.get(source).await?;
+            self.put(dest, content).await
+        }
+
+        fn supports_streamed_assembly(&self) -> bool {
+            self.streamed_assembly.load(Ordering::SeqCst)
         }
 
         fn exists_may_match_fallback_key(&self) -> bool {
@@ -4928,6 +5020,440 @@ mod tests {
 
         cleanup_staged_session(&f, first_session, &first_temp_path).await;
         cleanup_staged_session(&f, second_session, &second_temp_path).await;
+        f.teardown().await;
+    }
+
+    /// #3916: a chunked completion into an object-storage repository must
+    /// reassemble the staged chunks **on the backend**, not in one full-size
+    /// local scratch file. Local scratch is made unusable (STORAGE_PATH sits
+    /// under a regular file), so before this change the completion failed with
+    /// a 500 on the scratch spool. The second, deduplicated completion proves
+    /// the read-only verification path writes nothing at all.
+    #[tokio::test]
+    async fn complete_streams_chunks_to_object_storage_without_local_scratch() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let mut state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let blocker = std::env::temp_dir().join(format!("ak3916-complete-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("write scratch blocker");
+        Arc::get_mut(&mut state)
+            .expect("freshly built state")
+            .config
+            .storage_path = blocker.join("storage").to_string_lossy().into_owned();
+
+        let payload = b"chunked completion streams staged chunks to object storage";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/streamed.bin").await;
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "completion must not need local scratch: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            storage.put_stream_calls(),
+            1,
+            "the chunks are assembled into the staging object with one native stream"
+        );
+        assert_eq!(
+            storage.copy_calls(),
+            1,
+            "the staging object is promoted to the content-addressed key by copy"
+        );
+        assert_eq!(
+            storage.put_file_calls(),
+            0,
+            "no local file write may happen on the streaming path"
+        );
+        assert_eq!(
+            storage.content(&expected_key),
+            Some(Bytes::copy_from_slice(payload)),
+            "the payload must land at its content-addressed key"
+        );
+        assert!(
+            !storage.contains(&upload_service::staged_assembly_key(session_id)),
+            "the staging object must be deleted after promotion"
+        );
+        assert!(
+            !staged.exists().await,
+            "completed session must purge its staged chunks"
+        );
+
+        // Same bytes, second coordinate: the CAS object already exists, so
+        // completion verifies the staged chunks read-only and performs no
+        // second write or copy.
+        let (second_session, second_staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/streamed-second.bin")
+                .await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(second_session)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "deduplicated completion must still finalize: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            storage.put_stream_calls(),
+            1,
+            "existing content must not be assembled or written again"
+        );
+        assert_eq!(
+            storage.copy_calls(),
+            1,
+            "existing content must not be copied again"
+        );
+        assert!(
+            !second_staged.exists().await,
+            "deduplicated completion still purges its staged chunks"
+        );
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        cleanup_staged_session(&f, second_session, &second_staged).await;
+        std::fs::remove_file(&blocker).ok();
+        f.teardown().await;
+    }
+
+    /// #3916: a corrupt staged chunk on the streaming path is caught after the
+    /// backend assembly, the staging object is deleted, and the session fails
+    /// terminally with no content-addressed object left behind — the same
+    /// guarantee the local assembly path gives before it writes.
+    #[tokio::test]
+    async fn complete_streaming_checksum_mismatch_leaves_no_object() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let payload = b"chunked completion streaming checksum mismatch";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/corrupt.bin").await;
+
+        // Same length, different bytes: the size check passes, the digest does
+        // not. This models a chunk that was staged corrupted.
+        crate::storage::StorageBackend::put(
+            storage.as_ref(),
+            &staged.key,
+            Bytes::from(vec![b'x'; payload.len()]),
+        )
+        .await
+        .expect("corrupt the staged chunk");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        let (session_status, message): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_message FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session");
+        let staged_exists = staged.exists().await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(session_status, "failed");
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("checksum mismatch")),
+            "the session must explain the checksum failure: {message:?}"
+        );
+        assert!(
+            storage.content(&expected_key).is_none(),
+            "a checksum mismatch must not leave bytes at the content-addressed key"
+        );
+        assert!(
+            !storage.contains(&upload_service::staged_assembly_key(session_id)),
+            "the failed assembly must delete its staging object"
+        );
+        assert!(!staged_exists, "the terminal session purges its chunks");
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// #3916: the deduplicated streaming path verifies the staged bytes too.
+    /// A corrupt chunk must fail the session even though the existing
+    /// content-addressed object is correct, and must leave that object alone.
+    #[tokio::test]
+    async fn complete_streaming_dedup_checksum_mismatch_keeps_existing_object() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let payload = b"chunked completion dedup checksum mismatch";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        // The correct object is already present, so completion takes the
+        // read-only verification path.
+        crate::storage::StorageBackend::put(
+            storage.as_ref(),
+            &expected_key,
+            Bytes::copy_from_slice(payload),
+        )
+        .await
+        .expect("seed the existing object");
+
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/dedup-corrupt.bin")
+                .await;
+        crate::storage::StorageBackend::put(
+            storage.as_ref(),
+            &staged.key,
+            Bytes::from(vec![b'x'; payload.len()]),
+        )
+        .await
+        .expect("corrupt the staged chunk");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        let (session_status, message): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_message FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session");
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(session_status, "failed");
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("checksum mismatch")),
+            "the session must explain the checksum failure: {message:?}"
+        );
+        assert_eq!(
+            storage.content(&expected_key),
+            Some(Bytes::copy_from_slice(payload)),
+            "verification must not touch the existing content-addressed object"
+        );
+        assert_eq!(
+            storage.put_stream_calls(),
+            0,
+            "the deduplicated path must not assemble anything"
+        );
+        assert_eq!(
+            storage.copy_calls(),
+            0,
+            "the deduplicated path must not copy"
+        );
+        assert!(
+            !staged.exists().await,
+            "the terminal session purges its chunks"
+        );
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// #3916: a byte-count mismatch on the streaming path is retryable, like
+    /// the local path: the lease is released, the chunks stay staged, and no
+    /// content-addressed object or staging object is left behind.
+    #[tokio::test]
+    async fn complete_streaming_size_mismatch_releases_lease() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let payload = b"chunked completion streaming size mismatch";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/short.bin").await;
+        sqlx::query("UPDATE upload_sessions SET total_size = total_size + 1 WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("inflate the declared size");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            storage.content(&expected_key).is_none(),
+            "a size mismatch must not write the content-addressed key"
+        );
+        assert!(
+            !storage.contains(&upload_service::staged_assembly_key(session_id)),
+            "the failed assembly must delete its staging object"
+        );
+        assert_completion_is_retryable(&f, session_id, &staged).await;
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// #3916: a failed promotion (`copy` from the staging object to the
+    /// content-addressed key) is retryable like a failed local `put_file`:
+    /// 500, the lease is released, the chunks stay staged, and neither the
+    /// staging object nor a final object nor an artifact row is left behind.
+    /// The retry then completes from the same chunks.
+    #[tokio::test]
+    async fn complete_streaming_copy_failure_is_retryable() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let payload = b"chunked completion streaming copy failure";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/copy-fail.bin").await;
+
+        storage.set_fail_copy(true);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state.clone(), auth);
+        let (status, _body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            storage.content(&expected_key).is_none(),
+            "a failed promotion must not leave a final object"
+        );
+        assert!(
+            !storage.contains(&upload_service::staged_assembly_key(session_id)),
+            "a failed promotion must delete its staging object"
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind("authz/copy-fail.bin")
+        .fetch_one(&f.pool)
+        .await
+        .expect("count rows");
+        assert_eq!(rows, 0, "a failed promotion must not publish a row");
+        assert_completion_is_retryable(&f, session_id, &staged).await;
+
+        storage.set_fail_copy(false);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the same session completes once the copy succeeds: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            storage.content(&expected_key),
+            Some(Bytes::copy_from_slice(payload))
+        );
+        assert!(!storage.contains(&upload_service::staged_assembly_key(session_id)));
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// #3916 with #2516: on the streaming path the locked quota admission
+    /// still runs in the transaction that inserts the row, so a completion
+    /// over the repository quota answers 507, publishes no row, fails the
+    /// session and leaves no staging object behind.
+    #[tokio::test]
+    async fn complete_streaming_quota_denial_publishes_no_row() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let payload = b"chunked completion streaming over quota";
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/over-quota.bin")
+                .await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("set a quota the payload exceeds");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind("authz/over-quota.bin")
+        .fetch_one(&f.pool)
+        .await
+        .expect("count rows");
+        assert_eq!(rows, 0, "a quota denial must not publish a row");
+        let session_status: String =
+            sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session");
+        assert_eq!(session_status, "failed");
+        assert!(
+            !storage.contains(&upload_service::staged_assembly_key(session_id)),
+            "the denied completion must not leave its staging object"
+        );
+        assert!(
+            !staged.exists().await,
+            "the terminal session purges its chunks"
+        );
+
+        cleanup_staged_session(&f, session_id, &staged).await;
         f.teardown().await;
     }
 

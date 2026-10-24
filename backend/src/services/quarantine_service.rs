@@ -105,6 +105,78 @@ impl QuarantineState {
     }
 }
 
+/// Where a hold came from (`artifacts.quarantine_source`, migration 299,
+/// #4510). Recorded next to `quarantine_status = 'quarantined'`, which stays
+/// the one status every filter and guard reads, so the download gate can
+/// answer a scan-policy hold with the policy 403 instead of the quarantine
+/// 409 without matching on the free-text reason (an administrator can type
+/// `Policy '...'` too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldSource {
+    /// The upload-time quarantine period ([`apply_upload_hold`]); always timed.
+    Upload,
+    /// An administrator's quarantine-now ([`quarantine_now`]).
+    Admin,
+    /// A scan policy refused the artifact after a scan.
+    ScanPolicy,
+}
+
+impl HoldSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Admin => "admin",
+            Self::ScanPolicy => "scan_policy",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "upload" => Some(Self::Upload),
+            "admin" => Some(Self::Admin),
+            "scan_policy" => Some(Self::ScanPolicy),
+            _ => None,
+        }
+    }
+}
+
+/// How the download gate answers an ACTIVE `quarantined` hold (#4510).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldAnswer {
+    /// 409: held pending review (upload period, administrator).
+    Quarantine,
+    /// 403: the repository's scan policy refuses the artifact.
+    ScanPolicy,
+    /// The recorded source does not settle it (no source: a hold written by
+    /// the scanner, by a 1.11 replica during a rolling upgrade, or before
+    /// migration 299; or a source that contradicts the row): ask the scan
+    /// policy, the same evaluation the gate's policy half runs.
+    AskPolicy,
+}
+
+/// Pure classification of an active hold by its recorded source (#4510).
+///
+/// An `upload` source is only trusted on a timed hold: upload holds always
+/// carry `quarantine_until`, and a scanner write that turns a released upload
+/// hold into a permanent policy hold does not rewrite the source, so
+/// `upload` with no expiry is a stale label, not an upload hold.
+pub fn classify_hold_source(source: Option<&str>, until: Option<DateTime<Utc>>) -> HoldAnswer {
+    match source.and_then(HoldSource::parse) {
+        Some(HoldSource::ScanPolicy) => HoldAnswer::ScanPolicy,
+        Some(HoldSource::Admin) => HoldAnswer::Quarantine,
+        Some(HoldSource::Upload) if until.is_some() => HoldAnswer::Quarantine,
+        _ => HoldAnswer::AskPolicy,
+    }
+}
+
+/// The 403 a scan-policy refusal answers, shared by the policy half of the
+/// gate and a scan-policy hold (#4510) so a client sees one body for both.
+pub(crate) fn scan_policy_refusal() -> AppError {
+    AppError::Authorization(
+        "Artifact download is blocked by the repository's scan policy".to_string(),
+    )
+}
+
 /// Resolved quarantine configuration for a single repository.
 #[derive(Debug, Clone)]
 pub struct QuarantineConfig {
@@ -313,14 +385,18 @@ pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfi
 ///
 /// Returns `true` when the row was updated and `false` when the guard held, so
 /// callers do not log a hold they did not actually apply.
+///
+/// `source` is recorded in `quarantine_source` (#4510) in the same statement.
 pub async fn set_quarantine(
     db: &PgPool,
     artifact_id: Uuid,
     status: &str,
     until: Option<DateTime<Utc>>,
+    source: HoldSource,
 ) -> Result<bool> {
     let result = sqlx::query(
-        "UPDATE artifacts SET quarantine_status = $2, quarantine_until = $3 \
+        "UPDATE artifacts SET quarantine_status = $2, quarantine_until = $3, \
+                              quarantine_source = $4 \
          WHERE id = $1 AND is_deleted = false \
            AND (quarantine_status IS NULL \
                 OR quarantine_status IN ('clean', 'flagged', 'unscanned', 'released'))",
@@ -328,6 +404,7 @@ pub async fn set_quarantine(
     .bind(artifact_id)
     .bind(status)
     .bind(until)
+    .bind(source.as_str())
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -358,6 +435,7 @@ pub async fn apply_upload_hold(db: &PgPool, repository_id: Uuid, artifact_id: Uu
         artifact_id,
         QuarantineState::Quarantined.as_str(),
         Some(until),
+        HoldSource::Upload,
     )
     .await
     {
@@ -484,7 +562,7 @@ pub async fn transition(
     let result = if matches!(new_status, QuarantineState::Released) {
         sqlx::query(
             "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
-             quarantine_reason = NULL \
+             quarantine_reason = NULL, quarantine_source = NULL \
              WHERE id = $1 AND quarantine_status = 'quarantined'",
         )
         .bind(artifact_id)
@@ -551,7 +629,7 @@ pub async fn quarantine_now(
     // are not atomic, so a concurrent admin reject must not be downgraded.
     let result = sqlx::query(
         "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
-         quarantine_reason = $2 \
+         quarantine_reason = $2, quarantine_source = 'admin' \
          WHERE id = $1 AND is_deleted = false \
            AND quarantine_status IS DISTINCT FROM 'rejected'",
     )
@@ -711,8 +789,10 @@ pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<(
 /// tracked in #3246 (#3144).
 ///
 /// Ordering is deliberate: the quarantine state is checked FIRST (a quarantined
-/// artifact is a 409 before any policy consideration), then the scan policy. A
-/// disallowed policy result maps to 403.
+/// artifact is refused before any policy consideration), then the scan policy.
+/// A disallowed policy result maps to 403. Since #4510 a hold that IS a
+/// scan-policy hold answers that same 403 rather than the quarantine 409
+/// ([`refine_hold_refusal`]); an upload-period or administrator hold stays 409.
 ///
 /// Guardrail: when the artifact row is absent (deleted / never existed) this is
 /// a no-op `Ok(())`, exactly as the pre-#2954 quarantine-only check was, and
@@ -726,11 +806,65 @@ pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()>
         return Ok(());
     };
 
-    // Quarantine gate first (409 quarantined / 403 rejected).
-    check_download_allowed(status.as_deref(), until, Utc::now())?;
+    // Quarantine gate first (409 quarantined / 403 rejected; 403 for a
+    // scan-policy hold, #4510).
+    if let Err(e) = check_download_allowed(status.as_deref(), until, Utc::now()) {
+        return Err(refine_hold_refusal(db, artifact_id, repository_id, e).await);
+    }
 
     // Scan-policy gate. No-op (allowed) when no enabled policy matches the repo.
     enforce_scan_policy_gate(db, artifact_id, repository_id).await
+}
+
+/// Turn the quarantine 409 of an active hold into the scan-policy 403 when
+/// the hold is a scan-policy hold (#4510). Any other refusal is returned
+/// unchanged. Runs only for a refused (held) artifact, so the common
+/// download pays nothing: one read of the hold's source and, when the source
+/// does not settle it, the same policy evaluation the gate's policy half
+/// runs. A failed read or evaluation keeps the 409: the artifact is refused
+/// either way, only the label would differ.
+pub async fn refine_hold_refusal(
+    db: &PgPool,
+    artifact_id: Uuid,
+    repository_id: Uuid,
+    refusal: AppError,
+) -> AppError {
+    if !matches!(refusal, AppError::Conflict(_)) {
+        return refusal;
+    }
+    let row: Option<(Option<String>, Option<DateTime<Utc>>)> = match sqlx::query_as(
+        "SELECT quarantine_source, quarantine_until FROM artifacts WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(artifact_id = %artifact_id, error = %e, "hold source read failed; answering the quarantine 409");
+            return refusal;
+        }
+    };
+    let Some((source, until)) = row else {
+        return refusal;
+    };
+    match classify_hold_source(source.as_deref(), until) {
+        HoldAnswer::Quarantine => refusal,
+        HoldAnswer::ScanPolicy => scan_policy_refusal(),
+        HoldAnswer::AskPolicy => {
+            match crate::services::policy_service::PolicyService::new(db.clone())
+                .evaluate_artifact(artifact_id, repository_id)
+                .await
+            {
+                Ok(result) if !result.allowed => scan_policy_refusal(),
+                Ok(_) => refusal,
+                Err(e) => {
+                    tracing::warn!(artifact_id = %artifact_id, error = %e, "scan policy evaluation failed for a held artifact; answering the quarantine 409");
+                    refusal
+                }
+            }
+        }
+    }
 }
 
 /// The fields [`enforce_download_gate_for_row`] needs, read by the caller in
@@ -759,7 +893,10 @@ pub struct DownloadGateRow<'a> {
 /// applies is exactly what `evaluate_artifact` does itself (it answers
 /// `allowed` for an empty policy set), only without the round trip.
 pub async fn enforce_download_gate_for_row(db: &PgPool, row: &DownloadGateRow<'_>) -> Result<()> {
-    check_download_allowed(row.quarantine_status, row.quarantine_until, Utc::now())?;
+    if let Err(e) = check_download_allowed(row.quarantine_status, row.quarantine_until, Utc::now())
+    {
+        return Err(refine_hold_refusal(db, row.artifact_id, row.repository_id, e).await);
+    }
     if !row.scan_policy_applies {
         return Ok(());
     }
@@ -806,9 +943,7 @@ fn policy_gate_result(allowed: bool) -> Result<()> {
     if allowed {
         Ok(())
     } else {
-        Err(AppError::Authorization(
-            "Artifact download is blocked by the repository's scan policy".to_string(),
-        ))
+        Err(scan_policy_refusal())
     }
 }
 
@@ -1750,5 +1885,200 @@ mod tests {
                  expected 403, got {other:?}"
             ),
         }
+    }
+}
+
+/// #4510: where a hold came from, and the 403 a scan-policy hold answers.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod hold_source_4510_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers::{seed_artifact, Fixture};
+
+    #[test]
+    fn classify_hold_source_settles_only_consistent_sources() {
+        let until = Some(Utc::now() + Duration::hours(1));
+        assert_eq!(
+            classify_hold_source(Some("scan_policy"), None),
+            HoldAnswer::ScanPolicy
+        );
+        assert_eq!(
+            classify_hold_source(Some("admin"), None),
+            HoldAnswer::Quarantine
+        );
+        assert_eq!(
+            classify_hold_source(Some("upload"), until),
+            HoldAnswer::Quarantine
+        );
+        // An upload hold is always timed: a permanent hold labelled `upload`
+        // is a stale label (a scanner write that kept the old source).
+        assert_eq!(
+            classify_hold_source(Some("upload"), None),
+            HoldAnswer::AskPolicy
+        );
+        assert_eq!(classify_hold_source(None, None), HoldAnswer::AskPolicy);
+        assert_eq!(
+            classify_hold_source(Some("bogus"), until),
+            HoldAnswer::AskPolicy
+        );
+        for s in [
+            HoldSource::Upload,
+            HoldSource::Admin,
+            HoldSource::ScanPolicy,
+        ] {
+            assert_eq!(HoldSource::parse(s.as_str()), Some(s));
+        }
+    }
+
+    async fn seed(fx: &Fixture, path: &str) -> Uuid {
+        seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            path,
+            path,
+            "pkg",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await
+    }
+
+    async fn source_of(pool: &PgPool, id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT quarantine_source FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read quarantine_source")
+    }
+
+    async fn hold(pool: &PgPool, id: Uuid, source: Option<&str>) {
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+             quarantine_reason = 'held', quarantine_source = $2 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(source)
+        .execute(pool)
+        .await
+        .expect("hold the artifact");
+    }
+
+    async fn block_unscanned_policy(pool: &PgPool, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("hold-source-4510-{repo_id}"))
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("insert block_unscanned policy");
+    }
+
+    fn status_of(r: &Result<()>) -> &'static str {
+        match r {
+            Ok(()) => "allowed",
+            Err(AppError::Conflict(_)) => "409",
+            Err(AppError::Authorization(_)) => "403",
+            Err(_) => "other",
+        }
+    }
+
+    /// The upload hold, the admin path and a release each write the source.
+    #[tokio::test]
+    async fn upload_hold_admin_quarantine_and_release_record_the_source() {
+        let Some(fx) = Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let upload = seed(&fx, "s/upload-1.0.bin").await;
+        let admin = seed(&fx, "s/admin-1.0.bin").await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'quarantine_enabled', 'true'), ($1, 'quarantine_duration_minutes', '60')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable quarantine");
+        invalidate_config_cache(fx.repo_id);
+        apply_upload_hold(&fx.pool, fx.repo_id, upload).await;
+        quarantine_now(&fx.pool, admin, Some("incident".into()))
+            .await
+            .expect("quarantine now");
+        let upload_source = source_of(&fx.pool, upload).await;
+        let admin_source = source_of(&fx.pool, admin).await;
+        transition(&fx.pool, admin, QuarantineState::Released, None)
+            .await
+            .expect("release");
+        let released_source = source_of(&fx.pool, admin).await;
+        fx.teardown().await;
+
+        assert_eq!(upload_source.as_deref(), Some("upload"));
+        assert_eq!(admin_source.as_deref(), Some("admin"));
+        assert_eq!(released_source, None, "a release clears the source");
+    }
+
+    /// The gate answers a scan-policy hold with the policy 403, and an
+    /// upload or administrator hold with the quarantine 409. A hold with no
+    /// recorded source answers 403 exactly when a scan policy refuses the
+    /// artifact.
+    #[tokio::test]
+    async fn scan_policy_holds_answer_403_other_holds_409() {
+        let Some(fx) = Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let policy_hold = seed(&fx, "g/policy-1.0.bin").await;
+        let admin_hold = seed(&fx, "g/admin-1.0.bin").await;
+        let unknown_hold = seed(&fx, "g/unknown-1.0.bin").await;
+        let upload_hold = seed(&fx, "g/upload-1.0.bin").await;
+        hold(&fx.pool, policy_hold, Some("scan_policy")).await;
+        hold(&fx.pool, admin_hold, Some("admin")).await;
+        hold(&fx.pool, unknown_hold, None).await;
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NOW() + INTERVAL '1 hour', quarantine_source = 'upload' \
+             WHERE id = $1",
+        )
+        .bind(upload_hold)
+        .execute(&fx.pool)
+        .await
+        .expect("upload hold");
+
+        // No scan policy: a NULL-source hold is a plain hold.
+        let unknown_without_policy = enforce_download_gate(&fx.pool, unknown_hold).await;
+        block_unscanned_policy(&fx.pool, fx.repo_id).await;
+        let mut seen = Vec::new();
+        for id in [policy_hold, admin_hold, unknown_hold, upload_hold] {
+            seen.push(status_of(&enforce_download_gate(&fx.pool, id).await));
+        }
+        // The by-row form (conda) agrees.
+        let by_row = enforce_download_gate_for_row(
+            &fx.pool,
+            &DownloadGateRow {
+                artifact_id: policy_hold,
+                repository_id: fx.repo_id,
+                quarantine_status: Some("quarantined"),
+                quarantine_until: None,
+                scan_policy_applies: true,
+            },
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(status_of(&unknown_without_policy), "409");
+        assert_eq!(
+            seen,
+            vec!["403", "409", "403", "409"],
+            "scan_policy, admin, unrecorded-but-policy-refused, upload"
+        );
+        assert_eq!(status_of(&by_row), "403");
     }
 }

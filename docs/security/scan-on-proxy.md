@@ -28,6 +28,31 @@ The settings live in the repository's scan configuration
 A Virtual repository has its own scan configuration too. See
 [Virtual repositories](#virtual-repositories).
 
+### Instance lock
+
+An instance administrator can hold a repository's proxy scan policy
+centrally (#4363, migration 300). Any `PUT .../security` by an instance
+administrator locks the policy unless the body says `"instance_locked": false`,
+which hands it back to the repository's administrators. The lock is shown as
+`instance_locked` on `GET .../security` and on `GET /api/v1/security/configs`.
+
+While the lock is on, a repository administrator can still tighten the proxy
+scan policy but gets `403` (and nothing is written) for any change that
+weakens it:
+
+- turning `scan_on_proxy` off;
+- moving `proxy_scan_action` towards `record_only` (`fail_closed` to
+  `fail_open`, or either to `record_only`);
+- loosening the severity gate: turning `block_on_policy_violation` on (from
+  "any finding blocks") or raising `severity_threshold` (for example `high`
+  to `critical`).
+
+A repository administrator who sends `instance_locked` at all gets `403`.
+`scan_enabled` and `scan_on_upload` are not governed by the lock. Existing
+configurations start unlocked. During a rolling upgrade a replica still on
+1.11 does not know the lock and accepts any write a repository administrator
+makes; finish the upgrade before relying on it.
+
 ## What the gate does
 
 For each proxied package file of an enforced format:

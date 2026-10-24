@@ -18,11 +18,17 @@
 //!   last-tag delete that leaves it unaddressable ([`delete_removes_record`]).
 //! * [`run_backfill`] — a one-shot, idempotent, best-effort startup pass that
 //!   records manifests committed before migration 268.
+//! * [`run_reconcile`]: the repair pass (#1683): the backfill's additions plus
+//!   removal of rows whose manifest is no longer addressable (no tag, no live
+//!   index edge, no live `artifacts` row). Rows go stale in ways the dual-write
+//!   cannot see: a pre-268 replica's delete during a rolling upgrade, a
+//!   lifecycle tag prune, the startup orphan-tag reconciliation. [`run_maintenance`]
+//!   runs it at startup and every `OCI_MANIFESTS_RECONCILE_INTERVAL_SECS`.
 //!
-//! The slice is write-only: nothing reads `oci_manifests` yet. Moving manifest
-//! GET/HEAD/DELETE, the referrers API and the storage-GC orphan predicate onto
-//! it is a later slice of #1683, which must first reconcile the table (rows
-//! missed or left behind by pre-268 replicas during a rolling upgrade).
+//! Nothing reads `oci_manifests` yet. Moving manifest GET/HEAD/DELETE, the
+//! referrers API and the storage-GC orphan predicate onto it is the next slice
+//! of #1683, which waits until the reconcile has run clean on populated
+//! instances.
 
 use std::sync::Arc;
 
@@ -583,6 +589,327 @@ async fn insert_if_still_known(
     .await?;
     tx.commit().await?;
     Ok(res.rows_affected() > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile (#1683): repair rows the dual-write cannot keep exact
+// ---------------------------------------------------------------------------
+
+/// Advisory-lock object id of the maintenance pass (backfill plus
+/// reconcile), in [`BACKFILL_LOCK_CLASS`]. The standalone startup backfill
+/// keeps object `0`; a maintenance pass holds both so the two never overlap.
+const RECONCILE_LOCK_OBJ: i32 = 1;
+
+/// Rows younger than this are never removed by the reconcile (#1683). Every
+/// writer records a row in the same transaction as the reference that keeps
+/// it (`oci_tags`, an index edge, the `artifacts` row), so a just-written row
+/// with no reference is not expected; the window is margin against a
+/// reference written by a later statement of a push that is still running.
+const RECONCILE_MIN_ROW_AGE_SECS: i64 = 600;
+
+/// Default seconds between scheduled reconcile passes
+/// (`OCI_MANIFESTS_RECONCILE_INTERVAL_SECS`; `0` disables the schedule but
+/// keeps the startup pass).
+pub const RECONCILE_INTERVAL_SECS_DEFAULT: u64 = 6 * 60 * 60;
+
+/// SQL boolean over an `oci_manifests` row aliased `om`: the row no longer
+/// records a manifest the registry can serve (#1683, #4449), because
+///
+/// 1. no tag in its repository points at it;
+/// 2. no live index edge names it as a child: an `oci_manifest_refs` edge
+///    counts only while its parent is itself tagged or has a live `artifacts`
+///    row (an edge whose parent is gone is the stale edge GC prunes, not a
+///    reason for the child to exist); and
+/// 3. no live `artifacts` row of its repository stores it, by the canonical
+///    `oci-manifests/<digest>` key or, for a pre-#2457 migrated manifest kept
+///    under a generic CAS key, by its sha256 checksum.
+///
+/// These are the three ways the registry addresses a manifest today (the
+/// same three `delete_in_tx` and `live_manifest_row_remains_in_tx` consult on
+/// the write side). Anything that keeps a manifest pullable keeps its row.
+const ROW_IS_STALE_SQL: &str = r#"
+    NOT EXISTS (
+        SELECT 1 FROM oci_tags ot
+        WHERE ot.repository_id = om.repository_id
+          AND ot.manifest_digest = om.digest
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM oci_manifest_refs omr
+        WHERE omr.repository_id = om.repository_id
+          AND omr.child_digest = om.digest
+          AND (
+                EXISTS (
+                    SELECT 1 FROM oci_tags pt
+                    WHERE pt.repository_id = omr.repository_id
+                      AND pt.manifest_digest = omr.parent_digest
+                )
+             OR EXISTS (
+                    SELECT 1 FROM artifacts pa
+                    WHERE pa.repository_id = omr.repository_id
+                      AND pa.is_deleted = false
+                      AND pa.storage_key = 'oci-manifests/' || omr.parent_digest
+                )
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM artifacts a
+        WHERE a.repository_id = om.repository_id
+          AND a.is_deleted = false
+          AND a.storage_key = 'oci-manifests/' || om.digest
+    )
+    AND NOT (
+        om.digest LIKE 'sha256:%'
+        AND EXISTS (
+            -- `checksum_sha256` is CHAR(64). Comparing it with the TEXT that
+            -- SUBSTRING returns casts the column instead, which rules out
+            -- idx_artifacts_checksum and turns this arm into a scan of every
+            -- artifacts row per oci_manifests row. Cast the digest instead.
+            SELECT 1 FROM artifacts a
+            WHERE a.repository_id = om.repository_id
+              AND a.is_deleted = false
+              AND a.checksum_sha256 = SUBSTRING(om.digest FROM 8)::bpchar
+        )
+    )
+"#;
+
+/// Result of a reconcile pass, for tracing, metrics and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileStats {
+    /// The add half: the backfill's candidate scan (manifests the registry
+    /// knows but has no row for, such as pushes served by a pre-268 replica).
+    pub added: BackfillStats,
+    /// Stale rows found by the scan.
+    pub stale_found: usize,
+    /// Stale rows removed (after the locked re-check).
+    pub rows_removed: usize,
+    /// Removals that failed (logged at WARN, retried next pass).
+    pub remove_failed: usize,
+}
+
+/// One keyset page (`(repository_id, digest) > ($1, $2)`, `LIMIT $3`) of stale
+/// rows older than `$4` seconds, optionally in repository `$5` only (tests).
+fn stale_page_sql() -> String {
+    format!(
+        r#"
+        SELECT om.repository_id, om.digest
+        FROM oci_manifests om
+        WHERE (om.repository_id, om.digest) > ($1, $2)
+          AND ($5::uuid IS NULL OR om.repository_id = $5)
+          AND om.last_referenced_at < NOW() - make_interval(secs => $4::BIGINT)
+          AND {ROW_IS_STALE_SQL}
+        ORDER BY om.repository_id, om.digest
+        LIMIT $3
+        "#
+    )
+}
+
+/// Remove one stale row if it is still stale, under its row lock. The lock
+/// serializes with a push re-tagging the digest (its `upsert_in_tx` takes the
+/// same row), and the re-check runs as a new statement after the lock is
+/// held, so it sees a reference that push committed. `Ok(true)` when removed.
+async fn remove_if_still_stale(db: &PgPool, repo_id: Uuid, digest: &str) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let locked = sqlx::query(
+        "SELECT 1 AS present FROM oci_manifests \
+         WHERE repository_id = $1 AND digest = $2 FOR UPDATE",
+    )
+    .bind(repo_id)
+    .bind(digest)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if locked.is_none() {
+        return Ok(false);
+    }
+    let sql = format!(
+        "DELETE FROM oci_manifests om \
+         WHERE om.repository_id = $1 AND om.digest = $2 \
+           AND om.last_referenced_at < NOW() - make_interval(secs => $3::BIGINT) \
+           AND {ROW_IS_STALE_SQL}"
+    );
+    let removed = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .bind(repo_id)
+        .bind(digest)
+        .bind(RECONCILE_MIN_ROW_AGE_SECS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(removed > 0)
+}
+
+/// The remove half of the reconcile, walking every stale row page by page.
+async fn remove_stale_rows(
+    db: &PgPool,
+    repository_id: Option<Uuid>,
+    page_size: i64,
+    stats: &mut ReconcileStats,
+) {
+    let sql = stale_page_sql();
+    let mut cursor = (Uuid::nil(), String::new());
+    loop {
+        let page = match sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(cursor.0)
+            .bind(&cursor.1)
+            .bind(page_size)
+            .bind(RECONCILE_MIN_ROW_AGE_SECS)
+            .bind(repository_id)
+            .fetch_all(db)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "oci_manifests reconcile: stale-row scan failed");
+                return;
+            }
+        };
+        let rows: Vec<(Uuid, String)> = page
+            .iter()
+            .filter_map(|r| Some((r.try_get("repository_id").ok()?, r.try_get("digest").ok()?)))
+            .collect();
+        let Some(last) = rows.last().cloned() else {
+            return;
+        };
+        stats.stale_found += rows.len();
+        for (repo_id, digest) in &rows {
+            match remove_if_still_stale(db, *repo_id, digest).await {
+                Ok(true) => {
+                    stats.rows_removed += 1;
+                    tracing::debug!(
+                        repository_id = %repo_id,
+                        digest = digest.as_str(),
+                        "oci_manifests reconcile: removed row of an unaddressable manifest"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    stats.remove_failed += 1;
+                    tracing::warn!(
+                        repository_id = %repo_id,
+                        digest = digest.as_str(),
+                        error = %e,
+                        "oci_manifests reconcile: failed to remove stale row"
+                    );
+                }
+            }
+        }
+        if (rows.len() as i64) < page_size {
+            return;
+        }
+        cursor = last;
+    }
+}
+
+/// One reconcile pass, without the cluster lock (tests, and the locked
+/// wrapper below): add missing rows, then remove stale ones. `repository_id`
+/// scopes the pass to one repository (tests); production passes `None`.
+async fn reconcile_unlocked(
+    db: &PgPool,
+    registry: &StorageRegistry,
+    repository_id: Option<Uuid>,
+    page_size: i64,
+) -> ReconcileStats {
+    let mut stats = ReconcileStats {
+        added: run_backfill_scoped(db, registry, repository_id, page_size).await,
+        ..ReconcileStats::default()
+    };
+    remove_stale_rows(db, repository_id, page_size, &mut stats).await;
+    metrics::counter!("ak_oci_manifests_reconcile_rows_added_total")
+        .increment(stats.added.rows_inserted as u64);
+    metrics::counter!("ak_oci_manifests_reconcile_rows_removed_total")
+        .increment(stats.rows_removed as u64);
+    metrics::counter!("ak_oci_manifests_reconcile_failures_total")
+        .increment((stats.added.candidates_failed + stats.remove_failed) as u64);
+    if stats.added.rows_inserted > 0 || stats.rows_removed > 0 || stats.remove_failed > 0 {
+        tracing::info!(
+            rows_added = stats.added.rows_inserted,
+            rows_removed = stats.rows_removed,
+            stale_found = stats.stale_found,
+            failures = stats.added.candidates_failed + stats.remove_failed,
+            "oci_manifests reconcile: complete"
+        );
+    }
+    stats
+}
+
+/// Reconcile `oci_manifests` with what the registry can actually serve
+/// (#1683): record manifests that have no row (the backfill's candidates, so
+/// pushes a pre-268 replica served during a rolling upgrade get theirs), and
+/// remove rows for manifests that are no longer addressable
+/// ([`ROW_IS_STALE_SQL`]), such as rows a pre-268 replica's delete or a
+/// lifecycle tag prune left behind.
+///
+/// Must have run clean before any reader (GET/HEAD/DELETE by digest, the
+/// referrers API, the GC orphan predicate) trusts the table. Idempotent,
+/// best-effort, and skipped when another replica holds the lock.
+pub async fn run_reconcile(db: &PgPool, registry: Arc<StorageRegistry>) -> Option<ReconcileStats> {
+    run_reconcile_scoped(db, &registry, None).await
+}
+
+/// [`run_reconcile`] optionally scoped to one repository (tests).
+async fn run_reconcile_scoped(
+    db: &PgPool,
+    registry: &StorageRegistry,
+    repository_id: Option<Uuid>,
+) -> Option<ReconcileStats> {
+    let locks = PgAdvisoryLock::new(db.clone());
+    let backfill_lease = match locks.try_acquire(BACKFILL_LOCK_CLASS, 0).await {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::info!("oci_manifests reconcile: another replica holds the lock; skipping");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "oci_manifests reconcile: lock unavailable; skipping");
+            return None;
+        }
+    };
+    let lease = match locks
+        .try_acquire(BACKFILL_LOCK_CLASS, RECONCILE_LOCK_OBJ)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        _ => {
+            backfill_lease.release().await;
+            return None;
+        }
+    };
+    let stats = reconcile_unlocked(db, registry, repository_id, BACKFILL_PAGE_SIZE).await;
+    lease.release().await;
+    backfill_lease.release().await;
+    Some(stats)
+}
+
+/// Parse `OCI_MANIFESTS_RECONCILE_INTERVAL_SECS`: seconds between scheduled
+/// passes; unset or unparsable means the default, `0` disables the schedule.
+pub(crate) fn parse_reconcile_interval(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(RECONCILE_INTERVAL_SECS_DEFAULT)
+}
+
+/// Startup and scheduled maintenance of `oci_manifests` (#1683): one
+/// reconcile at startup (which includes the backfill), then one every
+/// `OCI_MANIFESTS_RECONCILE_INTERVAL_SECS`. Never returns while the schedule
+/// is enabled; spawn it.
+pub async fn run_maintenance(db: PgPool, registry: Arc<StorageRegistry>) {
+    let interval = parse_reconcile_interval(
+        std::env::var("OCI_MANIFESTS_RECONCILE_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    );
+    run_maintenance_every(db, registry, interval).await;
+}
+
+/// [`run_maintenance`] with the interval given: one pass now, then one every
+/// `interval_secs` seconds; returns after the first pass when it is `0`.
+async fn run_maintenance_every(db: PgPool, registry: Arc<StorageRegistry>, interval: u64) {
+    run_reconcile(&db, registry.clone()).await;
+    if interval == 0 {
+        return;
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        run_reconcile(&db, registry.clone()).await;
+    }
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -1285,6 +1612,8 @@ mod tests {
     /// `run_backfill` returns immediately without scanning.
     #[tokio::test]
     async fn run_backfill_skips_when_another_replica_holds_the_lock() {
+        // The backfill lock is shared with the reconcile tests below.
+        let _serial = tdh::oci_reindex_serial_lock().await;
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -1296,5 +1625,381 @@ mod tests {
         let stats = run_backfill(&pool, Arc::new(fs_registry())).await;
         lease.release().await;
         assert_eq!(stats, BackfillStats::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1683 reconcile
+    // -----------------------------------------------------------------------
+
+    /// Backdate a row past the reconcile's minimum row age.
+    async fn age_row(pool: &PgPool, repo_id: Uuid, digest: &str) {
+        sqlx::query(
+            "UPDATE oci_manifests SET created_at = NOW() - INTERVAL '1 day', \
+             last_referenced_at = NOW() - INTERVAL '1 day' \
+             WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .execute(pool)
+        .await
+        .expect("age row");
+    }
+
+    async fn reconcile(fx: &tdh::Fixture) -> ReconcileStats {
+        reconcile_unlocked(&fx.pool, &fs_registry(), Some(fx.repo_id), 2).await
+    }
+
+    /// #1683: a tag removed outside the manifest-delete handler (the lifecycle
+    /// tag prune, the startup orphan-tag reconciliation, a pre-268 replica's
+    /// delete) leaves a row for a manifest that 404s by digest. The reconcile
+    /// removes it.
+    ///
+    /// FAILS ON MAIN: there is no reconcile and the row stays.
+    #[tokio::test]
+    async fn reconcile_removes_the_row_of_a_manifest_whose_tag_was_pruned_1683() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let body = image_body("pruned-1683");
+        let digest = compute_sha256(&body);
+        persist_image(&fx.pool, fx.repo_id, "v1", &digest, &body).await;
+        // What `CASCADE_OCI_TAGS_SQL` and the startup reconciliation do: drop
+        // the tag row directly, without the delete unwind.
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2")
+            .bind(fx.repo_id)
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        age_row(&fx.pool, fx.repo_id, &digest).await;
+
+        let stats = reconcile(&fx).await;
+        let row = manifest_row(&fx.pool, fx.repo_id, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            row, None,
+            "the unaddressable manifest's row must go: {stats:?}"
+        );
+        assert_eq!(stats.rows_removed, 1);
+    }
+
+    /// #1683: everything that still addresses a manifest keeps its row, and a
+    /// young row is left alone even when nothing references it yet.
+    #[tokio::test]
+    async fn reconcile_keeps_every_addressable_manifest_1683() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        // Tagged.
+        let tagged = image_body("tagged-1683");
+        let tagged_digest = compute_sha256(&tagged);
+        persist_image(&fx.pool, fx.repo_id, "t1", &tagged_digest, &tagged).await;
+        // Pushed by tag and by digest, then the tag removed: the live
+        // `artifacts` row still serves it by digest.
+        let by_digest = image_body("by-digest-1683");
+        let by_digest_digest = compute_sha256(&by_digest);
+        push_image(
+            &fx.pool,
+            fx.repo_id,
+            &by_digest_digest,
+            &by_digest_digest,
+            &by_digest,
+        )
+        .await;
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2")
+            .bind(fx.repo_id)
+            .bind(&by_digest_digest)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        // The untagged child of a tagged index.
+        let child = image_body("child-1683");
+        let child_digest = compute_sha256(&child);
+        persist_image(&fx.pool, fx.repo_id, "c1", &child_digest, &child).await;
+        let index = index_body(&[&child_digest]);
+        let index_digest = compute_sha256(&index);
+        persist_tag_and_refs(
+            &fx.pool,
+            fx.repo_id,
+            "app",
+            "idx",
+            &index_digest,
+            INDEX,
+            &ManifestClass::Index,
+            &index,
+        )
+        .await
+        .expect("persist index");
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND tag = 'c1'")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        for d in [
+            &tagged_digest,
+            &by_digest_digest,
+            &child_digest,
+            &index_digest,
+        ] {
+            age_row(&fx.pool, fx.repo_id, d).await;
+        }
+        // Young and unreferenced: inside the minimum row age.
+        let young = image_body("young-1683");
+        let young_digest = compute_sha256(&young);
+        persist_image(&fx.pool, fx.repo_id, "y1", &young_digest, &young).await;
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND tag = 'y1'")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let stats = reconcile(&fx).await;
+        let mut kept = Vec::new();
+        for d in [
+            &tagged_digest,
+            &by_digest_digest,
+            &child_digest,
+            &index_digest,
+            &young_digest,
+        ] {
+            kept.push(manifest_row(&fx.pool, fx.repo_id, d).await.is_some());
+        }
+        fx.teardown().await;
+
+        assert_eq!(kept, vec![true; 5], "{stats:?}");
+        assert_eq!(stats.rows_removed, 0);
+    }
+
+    /// #1683: the child of an index that is itself no longer addressable has
+    /// no live edge, so both rows go once both are stale.
+    #[tokio::test]
+    async fn reconcile_removes_children_of_a_dead_index_1683() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let child = image_body("orphan-child-1683");
+        let child_digest = compute_sha256(&child);
+        persist_image(&fx.pool, fx.repo_id, "c1", &child_digest, &child).await;
+        let index = index_body(&[&child_digest]);
+        let index_digest = compute_sha256(&index);
+        persist_tag_and_refs(
+            &fx.pool,
+            fx.repo_id,
+            "app",
+            "idx",
+            &index_digest,
+            INDEX,
+            &ManifestClass::Index,
+            &index,
+        )
+        .await
+        .expect("persist index");
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        age_row(&fx.pool, fx.repo_id, &child_digest).await;
+        age_row(&fx.pool, fx.repo_id, &index_digest).await;
+
+        let stats = reconcile(&fx).await;
+        let child_row = manifest_row(&fx.pool, fx.repo_id, &child_digest).await;
+        let index_row = manifest_row(&fx.pool, fx.repo_id, &index_digest).await;
+        fx.teardown().await;
+
+        assert_eq!(child_row, None, "{stats:?}");
+        assert_eq!(index_row, None);
+    }
+
+    /// #1683: the add half records a manifest the registry knows but has no
+    /// row for (a push a pre-268 replica served during a rolling upgrade).
+    #[tokio::test]
+    async fn reconcile_adds_the_row_of_a_manifest_pushed_without_one_1683() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let body = image_body("pre-268-push-1683");
+        let digest = compute_sha256(&body);
+        seed_tag(&fx.pool, fx.repo_id, "v1", &digest, IMAGE).await;
+        seed_body(&fx, &digest, &body).await;
+
+        let stats = reconcile(&fx).await;
+        let row = manifest_row(&fx.pool, fx.repo_id, &digest).await;
+        fx.teardown().await;
+
+        assert!(row.is_some(), "{stats:?}");
+        assert_eq!(stats.added.rows_inserted, 1);
+    }
+
+    /// #1683: a row found stale by the scan but re-tagged before its removal
+    /// (a push of the same digest in between) is kept: the removal re-checks
+    /// under the row lock.
+    #[tokio::test]
+    async fn reconcile_keeps_a_row_retagged_after_the_scan_1683() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let body = image_body("retagged-1683");
+        let digest = compute_sha256(&body);
+        persist_image(&fx.pool, fx.repo_id, "v1", &digest, &body).await;
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        age_row(&fx.pool, fx.repo_id, &digest).await;
+        let stale: Vec<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(&*stale_page_sql()))
+            .bind(Uuid::nil())
+            .bind("")
+            .bind(10_i64)
+            .bind(RECONCILE_MIN_ROW_AGE_SECS)
+            .bind(Some(fx.repo_id))
+            .fetch_all(&fx.pool)
+            .await
+            .unwrap();
+        // The push lands between the scan and the removal.
+        seed_tag(&fx.pool, fx.repo_id, "v2", &digest, IMAGE).await;
+        let removed = remove_if_still_stale(&fx.pool, fx.repo_id, &digest)
+            .await
+            .unwrap();
+        let row = manifest_row(&fx.pool, fx.repo_id, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            stale,
+            vec![(fx.repo_id, digest.clone())],
+            "the scan saw it stale"
+        );
+        assert!(!removed);
+        assert!(row.is_some(), "the re-tagged manifest keeps its row");
+    }
+
+    /// #1683 review: the checksum arm must compare as `bpchar` so it can use
+    /// `idx_artifacts_checksum`; the TEXT comparison cast the column and
+    /// planned a scan of `artifacts` per `oci_manifests` row.
+    #[test]
+    fn stale_predicate_checksum_arm_is_index_friendly_1683() {
+        assert!(
+            ROW_IS_STALE_SQL.contains("a.checksum_sha256 = SUBSTRING(om.digest FROM 8)::bpchar")
+        );
+    }
+
+    #[test]
+    fn reconcile_interval_parses_1683() {
+        assert_eq!(
+            parse_reconcile_interval(None),
+            RECONCILE_INTERVAL_SECS_DEFAULT
+        );
+        assert_eq!(parse_reconcile_interval(Some("0")), 0);
+        assert_eq!(parse_reconcile_interval(Some(" 3600 ")), 3600);
+        assert_eq!(
+            parse_reconcile_interval(Some("soon")),
+            RECONCILE_INTERVAL_SECS_DEFAULT
+        );
+    }
+
+    /// #1683: the locked entry point runs the pass when it gets both locks,
+    /// and releases them afterwards.
+    #[tokio::test]
+    async fn run_reconcile_takes_and_releases_both_locks_1683() {
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let body = image_body("locked-pass-1683");
+        let digest = compute_sha256(&body);
+        persist_image(&fx.pool, fx.repo_id, "v1", &digest, &body).await;
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        age_row(&fx.pool, fx.repo_id, &digest).await;
+
+        let stats = run_reconcile_scoped(&fx.pool, &fs_registry(), Some(fx.repo_id)).await;
+        let locks = PgAdvisoryLock::new(fx.pool.clone());
+        let mut free = true;
+        for obj in [0, RECONCILE_LOCK_OBJ] {
+            match locks.try_acquire(BACKFILL_LOCK_CLASS, obj).await {
+                Ok(Some(lease)) => lease.release().await,
+                _ => free = false,
+            }
+        }
+        let row = manifest_row(&fx.pool, fx.repo_id, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(stats.map(|s| s.rows_removed), Some(1));
+        assert_eq!(row, None);
+        assert!(free, "both locks are released after the pass");
+    }
+
+    /// #1683: another replica holding either lock makes the pass a no-op, and
+    /// a pass that got the first lock but not the second gives the first back.
+    #[tokio::test]
+    async fn run_reconcile_skips_while_another_replica_holds_a_lock_1683() {
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let locks = PgAdvisoryLock::new(pool.clone());
+        let registry = Arc::new(fs_registry());
+
+        let backfill = locks
+            .try_acquire(BACKFILL_LOCK_CLASS, 0)
+            .await
+            .expect("lock query")
+            .expect("lock free in this test");
+        let while_backfill_held = run_reconcile(&pool, registry.clone()).await;
+        backfill.release().await;
+
+        let reconcile = locks
+            .try_acquire(BACKFILL_LOCK_CLASS, RECONCILE_LOCK_OBJ)
+            .await
+            .expect("lock query")
+            .expect("lock free in this test");
+        let while_reconcile_held = run_reconcile(&pool, registry.clone()).await;
+        let backfill_given_back = locks
+            .try_acquire(BACKFILL_LOCK_CLASS, 0)
+            .await
+            .expect("lock query");
+        let given_back = backfill_given_back.is_some();
+        if let Some(lease) = backfill_given_back {
+            lease.release().await;
+        }
+        reconcile.release().await;
+
+        assert_eq!(while_backfill_held, None);
+        assert_eq!(while_reconcile_held, None);
+        assert!(
+            given_back,
+            "the backfill lock is released when the second is busy"
+        );
+    }
+
+    /// #1683: with the schedule disabled (`0`), maintenance runs its one
+    /// startup pass and returns.
+    #[tokio::test]
+    async fn maintenance_with_the_schedule_disabled_returns_after_one_pass_1683() {
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Hold the lock so the pass is a cheap no-op rather than instance-wide.
+        let lease = PgAdvisoryLock::new(pool.clone())
+            .try_acquire(BACKFILL_LOCK_CLASS, 0)
+            .await
+            .expect("lock query")
+            .expect("lock free in this test");
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_maintenance_every(pool.clone(), Arc::new(fs_registry()), 0),
+        )
+        .await;
+        lease.release().await;
+        assert!(
+            finished.is_ok(),
+            "maintenance must return when the schedule is off"
+        );
     }
 }

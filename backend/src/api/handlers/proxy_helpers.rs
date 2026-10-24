@@ -5562,15 +5562,28 @@ pub(crate) struct LocalArtifactRow {
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Check quarantine status on a fetched artifact row, mapping errors to Response.
-#[allow(clippy::result_large_err)]
-pub(crate) fn check_quarantine_row(row: &LocalArtifactRow) -> Result<(), Response> {
-    crate::services::quarantine_service::check_download_allowed(
+/// Check quarantine status on a fetched artifact row of `repo_id`, mapping
+/// errors to Response. A scan-policy hold answers the policy 403, not the
+/// quarantine 409 (#4510, [`refine_hold_refusal`]).
+///
+/// [`refine_hold_refusal`]: crate::services::quarantine_service::refine_hold_refusal
+pub(crate) async fn check_quarantine_row(
+    db: &PgPool,
+    row: &LocalArtifactRow,
+    repo_id: Uuid,
+) -> Result<(), Response> {
+    if let Err(refusal) = crate::services::quarantine_service::check_download_allowed(
         row.quarantine_status.as_deref(),
         row.quarantine_until,
         chrono::Utc::now(),
-    )
-    .map_err(|e| e.into_response())
+    ) {
+        return Err(crate::services::quarantine_service::refine_hold_refusal(
+            db, row.id, repo_id, refusal,
+        )
+        .await
+        .into_response());
+    }
+    Ok(())
 }
 
 /// Selector for the canonical local-artifact lookup. Each variant maps to a
@@ -5696,7 +5709,8 @@ async fn local_lookup_artifact(
     Response,
 > {
     let artifact = lookup.fetch_row(db, repo_id).await?;
-    check_quarantine_row(&artifact)?;
+    // #4510: a scan-policy hold answers the policy 403, not the 409.
+    check_quarantine_row(db, &artifact, repo_id).await?;
     crate::services::quarantine_service::enforce_scan_policy_gate(db, artifact.id, repo_id)
         .await
         .map_err(|e| e.into_response())?;

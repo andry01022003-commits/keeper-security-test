@@ -393,7 +393,24 @@ async fn resolve_snapshot_artifact(
     repo_id: uuid::Uuid,
     snapshot_path: &str,
 ) -> Option<ResolvedSnapshot> {
-    let pattern = snapshot_like_pattern(snapshot_path)?;
+    fetch_snapshot_artifact(db, repo_id, snapshot_path)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`resolve_snapshot_artifact`] that reports a failed query as an error
+/// instead of `None`. A caller that gates on the resolved row (the checksum
+/// gate, #4288 item 2) must not read a database fault as "no artifact here",
+/// or the path would be served without that row's gate.
+async fn fetch_snapshot_artifact(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    snapshot_path: &str,
+) -> Result<Option<ResolvedSnapshot>, sqlx::Error> {
+    let Some(pattern) = snapshot_like_pattern(snapshot_path) else {
+        return Ok(None);
+    };
 
     // Use runtime sqlx::query (not the query! macro) to avoid needing an
     // offline cache entry. The LIKE pattern matches timestamped filenames
@@ -417,16 +434,18 @@ async fn resolve_snapshot_artifact(
     .bind(repo_id)
     .bind(&pattern)
     .fetch_optional(db)
-    .await
-    .ok()??;
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
 
     use sqlx::Row;
-    Some(ResolvedSnapshot {
+    Ok(Some(ResolvedSnapshot {
         id: row.get("id"),
         storage_key: row.get("storage_key"),
         checksum_sha256: row.get("checksum_sha256"),
         path: row.get("path"),
-    })
+    }))
 }
 
 struct ResolvedSnapshot {
@@ -1913,6 +1932,19 @@ async fn download(
         // which embeds this repository's id and therefore needs no catalog
         // attribution gate — it cannot name another repository's object.
         let key_scheme = crate::storage::StorageKeyScheme::from_env();
+        // #4288 item 2: a checksum names the file it describes, so it gets
+        // that file's download gate. Resolved once, before any stored or
+        // computed checksum is read, so a held artifact's stored sidecar
+        // cannot answer either.
+        let hosted_target = if checksum_compute_eligible(&repo.repo_type) {
+            let target = resolve_checksum_target(&state.db, repo.id, base_path).await?;
+            if let Some(target) = &target {
+                gate_checksum_target(&state.db, target).await?;
+            }
+            target
+        } else {
+            None
+        };
         if checksum_compute_eligible(&repo.repo_type) {
             if let Some(scoped_key) =
                 key_scheme.scoped_read_key(&repo.storage_backend, "maven", repo.id, &path)
@@ -1950,42 +1982,45 @@ async fn download(
         // timestamp-resolved filename before falling through to compute. Same
         // shared-namespace hazard as above: the sidecar key is unanchored, so it
         // is served only to its attributed owner (#2504, #2574).
-        if base_path.contains("-SNAPSHOT") {
-            if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
-                let resolved_sidecar_path =
-                    format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
-                // Repo-scoped candidate first (#2624): physically owned by
-                // this repository, no attribution gate needed.
-                if let Some(scoped_key) = key_scheme.scoped_read_key(
-                    &repo.storage_backend,
-                    "maven",
-                    repo.id,
-                    &resolved_sidecar_path,
-                ) {
-                    if let Ok(content) = storage.get(&scoped_key).await {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(content))
-                            .unwrap());
-                    }
+        //
+        // #4288 item 2: the timestamped row is the one `hosted_target`
+        // resolved and gated above, not a second lookup: a second query could
+        // pick a newer (held) upload, or a different row than the exact-path
+        // one the artifact read serves.
+        if let Some(resolved) = hosted_target.as_ref().filter(|t| t.path != base_path) {
+            let resolved_sidecar_path =
+                format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
+            // Repo-scoped candidate first (#2624): physically owned by
+            // this repository, no attribution gate needed.
+            if let Some(scoped_key) = key_scheme.scoped_read_key(
+                &repo.storage_backend,
+                "maven",
+                repo.id,
+                &resolved_sidecar_path,
+            ) {
+                if let Ok(content) = storage.get(&scoped_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
                 }
-                let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
-                if crate::services::maven_flat_attribution::flat_key_readable(
-                    &state.db,
-                    repo.id,
-                    &repo.storage_backend,
-                    &resolved_checksum_key,
-                )
-                .await
-                {
-                    if let Ok(content) = storage.get(&resolved_checksum_key).await {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(content))
-                            .unwrap());
-                    }
+            }
+            let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
+            if crate::services::maven_flat_attribution::flat_key_readable(
+                &state.db,
+                repo.id,
+                &repo.storage_backend,
+                &resolved_checksum_key,
+            )
+            .await
+            {
+                if let Ok(content) = storage.get(&resolved_checksum_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
                 }
             }
         }
@@ -1993,15 +2028,10 @@ async fn download(
         // Compute checksum from locally-stored artifact (Local/Staging only).
         // Remote repos cache artifacts in the proxy cache, not the `artifacts`
         // table, so the DB lookup inside serve_computed_checksum always fails.
-        if checksum_compute_eligible(&repo.repo_type) {
-            if let Ok(response) = serve_computed_checksum(
-                &state,
-                repo.id,
-                &repo.storage_location(),
-                base_path,
-                checksum_type,
-            )
-            .await
+        if let Some(target) = &hosted_target {
+            if let Ok(response) =
+                serve_computed_checksum(&state, &repo.storage_location(), target, checksum_type)
+                    .await
             {
                 return Ok(response);
             }
@@ -2086,11 +2116,19 @@ async fn download(
                     }
                 } else if member.repo_type.is_hosted() {
                     // Local/Staging member: compute checksum from stored artifact.
+                    // #4288 item 2: a held artifact's checksum is refused (404)
+                    // and the walk stops there, as the artifact read itself
+                    // stops at a gated member.
+                    let Some(target) =
+                        resolve_checksum_target(&state.db, member.id, base_path).await?
+                    else {
+                        continue;
+                    };
+                    gate_checksum_target(&state.db, &target).await?;
                     if let Ok(response) = serve_computed_checksum(
                         &state,
-                        member.id,
                         &member.storage_location(),
-                        base_path,
+                        &target,
                         checksum_type,
                     )
                     .await
@@ -3515,13 +3553,28 @@ fn checksum_compute_eligible(repo_type: &str) -> bool {
     repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging
 }
 
-async fn serve_computed_checksum(
-    state: &SharedState,
+/// The hosted artifact row a checksum request describes (#4288 item 2): the
+/// exact path, or for a `-SNAPSHOT` alias the latest timestamped row, the
+/// same resolution the artifact read uses.
+struct ChecksumTarget {
+    id: uuid::Uuid,
+    /// The resolved artifact path: `base_path` itself, or the timestamped
+    /// name a `-SNAPSHOT` alias resolved to.
+    path: String,
+    storage_key: String,
+    checksum_sha256: String,
+}
+
+/// Resolve [`ChecksumTarget`] for `base_path` in a hosted repository.
+/// `Ok(None)` when no live row describes the path (nothing to gate, nothing
+/// to compute). A failed query (exact path or `-SNAPSHOT` alias) is an error,
+/// never `None`, so a database fault cannot let a stored sidecar answer
+/// without its gate.
+async fn resolve_checksum_target(
+    db: &PgPool,
     repo_id: uuid::Uuid,
-    location: &crate::storage::StorageLocation,
     base_path: &str,
-    checksum_type: ChecksumType,
-) -> Result<Response, Response> {
+) -> Result<Option<ChecksumTarget>, Response> {
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, checksum_sha256
@@ -3534,35 +3587,61 @@ async fn serve_computed_checksum(
         repo_id,
         base_path,
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
     .map_err(map_db_err)?;
 
-    // If the exact path was not found and this is a SNAPSHOT request, resolve
-    // the `-SNAPSHOT` filename to the latest timestamped version.
-    let (resolved_storage_key, resolved_sha256) = match artifact {
-        Some(a) => (a.storage_key, a.checksum_sha256),
-        None => {
-            if base_path.contains("-SNAPSHOT") {
-                let resolved = resolve_snapshot_artifact(&state.db, repo_id, base_path)
-                    .await
-                    .ok_or_else(|| {
-                        AppError::NotFound("File not found".to_string()).into_response()
-                    })?;
-                (resolved.storage_key, resolved.checksum_sha256)
-            } else {
-                return Err(AppError::NotFound("File not found".to_string()).into_response());
-            }
-        }
-    };
+    if let Some(a) = artifact {
+        return Ok(Some(ChecksumTarget {
+            id: a.id,
+            path: base_path.to_string(),
+            storage_key: a.storage_key,
+            checksum_sha256: a.checksum_sha256,
+        }));
+    }
+    if !base_path.contains("-SNAPSHOT") {
+        return Ok(None);
+    }
+    Ok(fetch_snapshot_artifact(db, repo_id, base_path)
+        .await
+        .map_err(map_db_err)?
+        .map(|r| ChecksumTarget {
+            id: r.id,
+            path: r.path,
+            storage_key: r.storage_key,
+            checksum_sha256: r.checksum_sha256,
+        }))
+}
 
+/// Apply the described artifact's download gate (quarantine, then scan
+/// policy) to its checksum (#4288 item 2). A refusal answers 404, as if no
+/// checksum existed: the hash of a held artifact is not served, and the 404
+/// says nothing the artifact route does not. A gate that cannot decide
+/// (database error) is that error, never a served checksum.
+async fn gate_checksum_target(db: &PgPool, target: &ChecksumTarget) -> Result<(), Response> {
+    match crate::services::quarantine_service::check_artifact_download(db, target.id).await {
+        Ok(()) => Ok(()),
+        Err(AppError::Conflict(_)) | Err(AppError::Authorization(_)) => {
+            Err(AppError::NotFound("File not found".to_string()).into_response())
+        }
+        Err(e) => Err(e.into_response()),
+    }
+}
+
+/// Serve the checksum of an already resolved and gated [`ChecksumTarget`].
+async fn serve_computed_checksum(
+    state: &SharedState,
+    location: &crate::storage::StorageLocation,
+    target: &ChecksumTarget,
+    checksum_type: ChecksumType,
+) -> Result<Response, Response> {
     // For SHA-256 we already have it stored
     let checksum = match checksum_type {
-        ChecksumType::Sha256 => resolved_sha256,
+        ChecksumType::Sha256 => target.checksum_sha256.clone(),
         _ => {
             let storage = state.storage_for_repo_or_500(location)?;
             let content = storage
-                .get(&resolved_storage_key)
+                .get(&target.storage_key)
                 .await
                 .map_err(map_storage_err)?;
             compute_checksum(&content, checksum_type)
@@ -8017,6 +8096,268 @@ mod tests {
                 "#4286: GET {route} must be refused while the hosted repository's scan \
                  policy blocks the artifact"
             );
+        }
+    }
+
+    /// #4288 item 2: a hosted artifact's checksums (`.sha1`, `.md5`,
+    /// `.sha256`, stored sidecar or computed, exact path or `-SNAPSHOT`
+    /// alias, direct or through a virtual) get the artifact's own download
+    /// gate. While the artifact is quarantined or blocked by a scan policy
+    /// every checksum answers 404; before and after, each serves 200 with the
+    /// right digest (positive control in the same fixture).
+    #[tokio::test]
+    async fn test_checksums_of_gated_hosted_artifacts_are_404_4288() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (hosted_id, hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        tdh::link_virtual_member(&pool, virtual_id, hosted_id, 1).await;
+        tdh::publish_repo(&pool, hosted_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let jar_path = "com/example/gate4288/lib/1.0/lib-1.0.jar";
+        let snap_path = "com/example/gate4288/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/gate4288/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let jar_bytes = Bytes::from_static(b"gate4288-jar");
+        let snap_bytes = Bytes::from_static(b"gate4288-snap");
+        let jar_id = tdh::seed_artifact_with_checksum(
+            &state,
+            &pool,
+            &hosted,
+            &format!("maven/{jar_path}"),
+            jar_path,
+            "gate4288",
+            "1.0",
+            "application/java-archive",
+            jar_bytes.clone(),
+            user_id,
+            &compute_checksum(&jar_bytes, ChecksumType::Sha256),
+        )
+        .await;
+        let snap_id = tdh::seed_artifact_with_checksum(
+            &state,
+            &pool,
+            &hosted,
+            &format!("maven/{snap_path}"),
+            snap_path,
+            "gate4288",
+            "1.0-SNAPSHOT",
+            "application/java-archive",
+            snap_bytes.clone(),
+            user_id,
+            &compute_checksum(&snap_bytes, ChecksumType::Sha256),
+        )
+        .await;
+        // A stored sidecar for the jar, as a deploy writes it: the stored
+        // read is a separate branch from the computed one.
+        let stored_sha1 = compute_checksum(&jar_bytes, ChecksumType::Sha1);
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            &state,
+            &hosted,
+            &format!("maven/{jar_path}.sha1"),
+            Bytes::from(stored_sha1.clone()),
+        )
+        .await
+        .expect("store the jar's .sha1 sidecar");
+        let app = tdh::router_anon(super::router(), state);
+
+        // (route, digest the route must answer when allowed)
+        let probes = vec![
+            (
+                format!("/{hosted_key}/{jar_path}.sha1"),
+                stored_sha1.clone(),
+            ),
+            (
+                format!("/{hosted_key}/{jar_path}.md5"),
+                compute_checksum(&jar_bytes, ChecksumType::Md5),
+            ),
+            (
+                format!("/{hosted_key}/{jar_path}.sha256"),
+                compute_checksum(&jar_bytes, ChecksumType::Sha256),
+            ),
+            (
+                format!("/{hosted_key}/{snap_alias}.sha1"),
+                compute_checksum(&snap_bytes, ChecksumType::Sha1),
+            ),
+            (
+                format!("/{virtual_key}/{jar_path}.sha1"),
+                compute_checksum(&jar_bytes, ChecksumType::Sha1),
+            ),
+            (
+                format!("/{virtual_key}/{snap_alias}.md5"),
+                compute_checksum(&snap_bytes, ChecksumType::Md5),
+            ),
+        ];
+        let probe = |app: axum::Router| {
+            let probes = probes.clone();
+            async move {
+                let mut out = Vec::new();
+                for (route, digest) in probes {
+                    let (status, body) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+                    out.push((route, status, body == digest.as_bytes()));
+                }
+                out
+            }
+        };
+
+        let before = probe(app.clone()).await;
+        // A permanent hold (admin or scan-policy quarantine): 409 on the
+        // artifact route, so its checksums must not answer either.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL \
+             WHERE id = ANY($1)",
+        )
+        .bind(vec![jar_id, snap_id])
+        .execute(&pool)
+        .await
+        .expect("quarantine both artifacts");
+        let quarantined = probe(app.clone()).await;
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'released' WHERE id = ANY($1)")
+            .bind(vec![jar_id, snap_id])
+            .execute(&pool)
+            .await
+            .expect("release both artifacts");
+        let released = probe(app.clone()).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-4288-maven-{hosted_id}"))
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let blocked = probe(app.clone()).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        let after = probe(app).await;
+
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        for (route, status, matched) in before.iter().chain(released.iter()).chain(after.iter()) {
+            assert!(
+                *status == StatusCode::OK && *matched,
+                "positive control: GET {route} must answer the digest while the artifact \
+                 is downloadable (HTTP {status}, digest matched: {matched})"
+            );
+        }
+        for (phase, results) in [
+            ("quarantined", &quarantined),
+            ("scan-policy blocked", &blocked),
+        ] {
+            for (route, status, _) in results {
+                assert_eq!(
+                    *status,
+                    StatusCode::NOT_FOUND,
+                    "#4288: GET {route} must be 404 while the artifact is {phase}"
+                );
+            }
+        }
+    }
+
+    /// #4288 item 2: a database error while resolving a `-SNAPSHOT` alias to
+    /// its timestamped row is an error, never "no artifact". `None` would let
+    /// a stored sidecar under the alias name (or a later lookup that
+    /// succeeds) answer without the artifact's gate.
+    ///
+    /// The fault is injected on the second statement only: the pool's first
+    /// connection serves the exact-path query, and every later acquire must
+    /// open a new connection, which `after_connect` refuses.
+    #[tokio::test]
+    async fn test_checksum_target_snapshot_lookup_error_fails_closed_4288() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let url = crate::testing::require_db_url().expect("DATABASE_URL");
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let state = tdh::build_state(pool.clone(), repo_dir.to_str().unwrap());
+        let repo = tdh::make_repo_info(repo_id, &repo_key, &repo_dir, "local", None);
+        let snap_path = "com/example/gate4288db/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/gate4288db/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let bytes = Bytes::from_static(b"gate4288-db-fault");
+        tdh::seed_artifact_with_checksum(
+            &state,
+            &pool,
+            &repo,
+            &format!("maven/{snap_path}"),
+            snap_path,
+            "gate4288db",
+            "1.0-SNAPSHOT",
+            "application/java-archive",
+            bytes.clone(),
+            user_id,
+            &compute_checksum(&bytes, ChecksumType::Sha256),
+        )
+        .await;
+
+        // Positive control: on a healthy pool the alias resolves to the
+        // timestamped row.
+        let healthy = resolve_checksum_target(&pool, repo_id, snap_alias).await;
+        let resolved_path = healthy
+            .as_ref()
+            .ok()
+            .and_then(|t| t.as_ref())
+            .map(|t| t.path.clone());
+
+        let connects = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = connects.clone();
+        let faulty = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .after_connect(move |_conn, _meta| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        Ok(())
+                    } else {
+                        Err(sqlx::Error::Protocol("injected fault (#4288)".into()))
+                    }
+                })
+            })
+            .before_acquire(|_conn, _meta| Box::pin(async { Ok(false) }))
+            .connect_lazy(&url)
+            .expect("lazy pool");
+        let faulted = resolve_checksum_target(&faulty, repo_id, snap_alias).await;
+        faulty.close().await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&repo_dir);
+
+        assert_eq!(
+            resolved_path.as_deref(),
+            Some(snap_path),
+            "positive control: the alias must resolve to the timestamped row"
+        );
+        assert!(
+            connects.load(Ordering::SeqCst) >= 2,
+            "the fault must hit the alias lookup, after the exact-path query"
+        );
+        match faulted {
+            Err(resp) => assert!(
+                resp.status().is_server_error(),
+                "a failed alias lookup must be a server error, got {}",
+                resp.status()
+            ),
+            Ok(target) => panic!(
+                "#4288: a failed -SNAPSHOT alias lookup must fail closed, got Ok({:?})",
+                target.map(|t| t.path)
+            ),
         }
     }
 

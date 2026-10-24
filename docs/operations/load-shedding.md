@@ -131,6 +131,21 @@ deployment.
   completing is the gate doing its job under a burst; a rate that does not
   fall after the burst means the pool is undersized for the load.
 
+## Hosted conda repodata regeneration
+
+The first request for a hosted conda subdir's documents after a change
+renders them once and keeps them (see
+[conda-hosted-repodata.md](conda-hosted-repodata.md)); concurrent requests
+for the same subdir wait for that one render. Across subdirs and
+repositories, `AK_CONDA_REGEN_CONCURRENCY` (default 2) renders run at once
+per process, so a fleet refreshing many subdirs after a bulk publish cannot
+put every core on JSON encoding and compression. A request that has waited
+`AK_CONDA_REGEN_WAIT_SECS` (default 30) for its render is answered `503` with
+`Retry-After: 5`; the render keeps running and its result serves the next
+requests. Those 503s count in `ak_conda_repodata_requests_shed_total`, and
+`ak_conda_repodata_regenerations_in_flight` shows the renders running now.
+`AK_CONDA_REGEN_WAIT_SECS=0` waits as long as the render takes.
+
 ## Buffered metadata memory budget
 
 Proxied metadata that has to be held in memory before it is answered (npm

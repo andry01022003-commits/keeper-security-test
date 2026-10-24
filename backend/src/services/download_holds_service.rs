@@ -6,11 +6,16 @@
 //! * **Quarantine** — timed upload/age holds and admin blocks (`artifacts`
 //!   status, plus proxy-cache `quarantine_until` / `quarantine_released_at`).
 //!
-//! Scan-policy blocks are currently stored as a quarantine stamp
-//! (`quarantine_status = 'quarantined'` with a `Policy '...'` reason), so they
-//! DO appear in the quarantine queue, as `source: hosted, kind: active`. They
-//! cannot be told apart from other holds until the hold records its origin
-//! (a `quarantine_source` column, #4510).
+//! A scan-policy hold is stored as a quarantine stamp
+//! (`quarantine_status = 'quarantined'`), so it appears in the quarantine
+//! queue as `source: hosted, kind: active`. Since #4510 the hold also records
+//! its origin in `artifacts.quarantine_source` (`upload`, `admin`,
+//! `scan_policy`; NULL for a hold written before migration 299, by a 1.11
+//! replica, or by the scanner until it records its own), which the queue
+//! reports as `hold_source` and can filter on. What a scan policy refuses
+//! right now, held or not, is the separate policy-blocks queue
+//! ([`DownloadHoldsService::list_policy_blocks`]), derived from the gate's
+//! own decision rather than from the stored stamp.
 //!
 //! Proxy-cache rows mirror the hold recorded in the cache sidecar, which is
 //! the read path's authority; the catalog columns are a best-effort mirror of
@@ -118,7 +123,23 @@ pub struct QuarantineHoldRow {
     pub quarantine_status: String,
     pub quarantine_until: Option<DateTime<Utc>>,
     pub quarantine_reason: Option<String>,
+    /// `artifacts.quarantine_source` (#4510); always NULL for proxy-cache rows.
+    pub hold_source: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Parse the `hold_source` filter of the quarantine queue (#4510).
+pub fn parse_hold_source(raw: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    crate::services::quarantine_service::HoldSource::parse(raw)
+        .map(|s| Some(s.as_str().to_string()))
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "Unknown hold source '{raw}'. Expected upload, admin, or scan_policy."
+            ))
+        })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -133,7 +154,9 @@ pub struct DownloadHoldsService {
 }
 
 /// Hosted artifacts + proxy-cache catalog rows that currently match `kind`.
-/// `$1` repository key, `$2` want_active, `$3` want_expired, `$4` want_rejected.
+/// `$1` repository key, `$2` want_active, `$3` want_expired, `$4` want_rejected,
+/// `$5` hold source (#4510; a set filter excludes proxy-cache rows, which
+/// record none).
 ///
 /// `hold_id` is the row's own primary key in either table. It is not part of
 /// the response; it only makes the listing order total, so OFFSET paging
@@ -151,11 +174,13 @@ SELECT
     a.quarantine_status,
     a.quarantine_until,
     a.quarantine_reason,
+    a.quarantine_source AS hold_source,
     a.created_at
 FROM artifacts a
 INNER JOIN repositories repo ON repo.id = a.repository_id
 WHERE a.is_deleted = false
   AND ($1::text IS NULL OR repo.key = $1)
+  AND ($5::text IS NULL OR a.quarantine_source = $5)
   AND (
         ($2::bool AND a.quarantine_status = 'quarantined'
             AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW()))
@@ -176,12 +201,14 @@ SELECT
     'quarantined'::text AS quarantine_status,
     pca.quarantine_until,
     NULL::text AS quarantine_reason,
+    NULL::text AS hold_source,
     pca.cached_at AS created_at
 FROM proxy_cache_artifacts pca
 INNER JOIN repositories repo ON repo.id = pca.repository_id
 WHERE pca.quarantine_released_at IS NULL
   AND pca.quarantine_until IS NOT NULL
   AND ($1::text IS NULL OR repo.key = $1)
+  AND $5::text IS NULL
   AND (
         ($2::bool AND pca.quarantine_until > NOW())
      OR ($3::bool AND pca.quarantine_until <= NOW())
@@ -241,6 +268,7 @@ impl DownloadHoldsService {
         &self,
         repository_key: Option<&str>,
         kinds: &[HoldKind],
+        hold_source: Option<&str>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<QuarantineHoldRow>, i64)> {
@@ -255,6 +283,7 @@ impl DownloadHoldsService {
         .bind(want_active)
         .bind(want_expired)
         .bind(want_rejected)
+        .bind(hold_source)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -273,12 +302,13 @@ impl DownloadHoldsService {
                 holds.quarantine_until ASC NULLS LAST,
                 holds.created_at DESC,
                 holds.hold_id
-             OFFSET $5 LIMIT $6"
+             OFFSET $6 LIMIT $7"
         )))
         .bind(repository_key)
         .bind(want_active)
         .bind(want_expired)
         .bind(want_rejected)
+        .bind(hold_source)
         .bind(offset)
         .bind(limit)
         .fetch_all(&self.db)
@@ -286,6 +316,248 @@ impl DownloadHoldsService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok((rows, total))
+    }
+}
+
+/// One item of the policy-blocks queue (#4510): content the download gate's
+/// scan-policy decision refuses right now.
+#[derive(Debug, Clone)]
+pub struct PolicyBlock {
+    /// `hosted` (an `artifacts` row, refused by a scan policy) or
+    /// `proxy-cache` (a cached path whose stored `vulnerable` verdict the
+    /// repository's proxy scan gate refuses).
+    pub source: &'static str,
+    pub artifact_id: Option<Uuid>,
+    pub repository_key: String,
+    pub repository_format: String,
+    pub path: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub checksum_sha256: String,
+    /// Hosted only: the stored quarantine stamp and where it came from.
+    pub quarantine_status: Option<String>,
+    pub hold_source: Option<String>,
+    /// Hosted only: the violated policy rules, as the gate evaluated them.
+    pub violations: Vec<String>,
+    /// Proxy only: the verdict's highest severity and when it was scanned.
+    pub max_severity: Option<String>,
+    pub scanned_at: Option<DateTime<Utc>>,
+}
+
+/// One page of the policy-blocks queue.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyBlockPage {
+    pub items: Vec<PolicyBlock>,
+    /// Opaque cursor for the next page; `None` once both sources are done.
+    pub next_cursor: Option<String>,
+    /// Hosted artifacts whose scan policy this page evaluated.
+    pub evaluated: i64,
+}
+
+/// Where a policy-blocks page resumes: proxy-cache rows first (an offset into
+/// the ordered listing), then hosted artifacts newest first (a keyset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyBlockCursor {
+    Proxy { offset: usize },
+    Hosted { created_at: DateTime<Utc>, id: Uuid },
+}
+
+impl PolicyBlockCursor {
+    pub fn encode(&self) -> String {
+        match self {
+            Self::Proxy { offset } => format!("p.{offset}"),
+            Self::Hosted { created_at, id } => {
+                format!("h.{}.{id}", created_at.timestamp_micros())
+            }
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        let bad = || AppError::Validation(format!("invalid policy-blocks cursor '{raw}'"));
+        let mut parts = raw.splitn(3, '.');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("p"), Some(offset), None) => Ok(Self::Proxy {
+                offset: offset.parse().map_err(|_| bad())?,
+            }),
+            (Some("h"), Some(micros), Some(id)) => Ok(Self::Hosted {
+                created_at: DateTime::from_timestamp_micros(micros.parse().map_err(|_| bad())?)
+                    .ok_or_else(bad)?,
+                id: id.parse().map_err(|_| bad())?,
+            }),
+            _ => Err(bad()),
+        }
+    }
+}
+
+/// How many hosted candidates one page may evaluate at most, so a page of a
+/// repository with a broad policy (a global `block_unscanned`) stays bounded;
+/// the cursor carries on from where the budget ran out.
+pub(crate) fn hosted_evaluation_budget(limit: i64) -> i64 {
+    (limit * 20).clamp(200, 2_000)
+}
+
+/// Hosted candidates for the policy-blocks queue: live artifacts of every
+/// repository that at least one enabled scan policy applies to (the set
+/// `PolicyService::load_applicable_policies` loads from), newest first.
+const POLICY_BLOCK_CANDIDATES_SQL: &str = r#"
+SELECT a.id, a.repository_id, a.name, a.version, a.path, a.checksum_sha256,
+       a.created_at, a.quarantine_status, a.quarantine_source,
+       r.key AS repository_key, r.format::text AS repository_format
+FROM artifacts a
+JOIN repositories r ON r.id = a.repository_id
+WHERE a.is_deleted = false
+  AND ($1::text IS NULL OR r.key = $1)
+  AND EXISTS (
+        SELECT 1 FROM scan_policies p
+         WHERE p.is_enabled
+           AND (p.repository_id = a.repository_id OR p.repository_id IS NULL))
+  AND ($2::timestamptz IS NULL OR (a.created_at, a.id) < ($2, $3))
+ORDER BY a.created_at DESC, a.id DESC
+LIMIT $4
+"#;
+
+#[derive(Debug, Clone, FromRow)]
+struct PolicyBlockCandidate {
+    id: Uuid,
+    repository_id: Uuid,
+    name: String,
+    version: Option<String>,
+    path: String,
+    checksum_sha256: String,
+    created_at: DateTime<Utc>,
+    quarantine_status: Option<String>,
+    quarantine_source: Option<String>,
+    repository_key: String,
+    repository_format: String,
+}
+
+/// The display name of a proxied path: its last segment.
+fn proxy_path_name(path: &str) -> String {
+    path.rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+impl DownloadHoldsService {
+    /// The policy-blocks queue (#4510): what the download gate's scan-policy
+    /// decision refuses right now, never a separate SQL approximation of it.
+    ///
+    /// * Proxy-cache rows come from
+    ///   [`ScanResultService::list_blocked_proxy_entries`](crate::services::scan_result_service::ScanResultService::list_blocked_proxy_entries):
+    ///   a cached path is listed only where THAT repository's proxy scan gate
+    ///   refuses its digest's verdict (verdicts are shared by digest).
+    /// * Hosted artifacts are evaluated with `PolicyService::evaluate_artifact`,
+    ///   the function the gate itself calls (`block_unscanned`,
+    ///   `block_on_fail`, severity thresholds, predicate policies), so the
+    ///   queue lists exactly what a download would refuse with the policy 403.
+    ///
+    /// Paged by an opaque cursor because the hosted half cannot be counted
+    /// without evaluating every candidate: each page evaluates at most
+    /// [`hosted_evaluation_budget`] hosted candidates and may come back short
+    /// with a cursor; a `None` cursor means both sources are exhausted.
+    pub async fn list_policy_blocks(
+        &self,
+        repository_key: Option<&str>,
+        cursor: Option<&PolicyBlockCursor>,
+        limit: i64,
+    ) -> Result<PolicyBlockPage> {
+        let limit = limit.max(1);
+        let mut page = PolicyBlockPage::default();
+        let mut keyset: Option<(DateTime<Utc>, Uuid)> = None;
+
+        let proxy_offset = match cursor {
+            None => Some(0),
+            Some(PolicyBlockCursor::Proxy { offset }) => Some(*offset),
+            Some(PolicyBlockCursor::Hosted { created_at, id }) => {
+                keyset = Some((*created_at, *id));
+                None
+            }
+        };
+        if let Some(offset) = proxy_offset {
+            let entries =
+                crate::services::scan_result_service::ScanResultService::new(self.db.clone())
+                    .list_blocked_proxy_entries(repository_key)
+                    .await?;
+            let take = (limit as usize).min(entries.len().saturating_sub(offset));
+            for e in entries.iter().skip(offset).take(take) {
+                page.items.push(PolicyBlock {
+                    source: "proxy-cache",
+                    artifact_id: None,
+                    repository_key: e.repository_key.clone(),
+                    repository_format: e.repository_format.clone(),
+                    name: proxy_path_name(&e.path),
+                    path: e.path.clone(),
+                    version: None,
+                    checksum_sha256: e.checksum_sha256.clone(),
+                    quarantine_status: None,
+                    hold_source: None,
+                    violations: Vec::new(),
+                    max_severity: e.max_severity.clone(),
+                    scanned_at: Some(e.scanned_at),
+                });
+            }
+            if offset + take < entries.len() {
+                page.next_cursor = Some(
+                    PolicyBlockCursor::Proxy {
+                        offset: offset + take,
+                    }
+                    .encode(),
+                );
+                return Ok(page);
+            }
+        }
+
+        // Hosted half: evaluate candidates newest first until the page is
+        // full, the evaluation budget is spent, or there are none left.
+        let budget = hosted_evaluation_budget(limit);
+        let policy = crate::services::policy_service::PolicyService::new(self.db.clone());
+        loop {
+            if page.items.len() as i64 >= limit || page.evaluated >= budget {
+                page.next_cursor = keyset
+                    .map(|(created_at, id)| PolicyBlockCursor::Hosted { created_at, id }.encode());
+                return Ok(page);
+            }
+            let batch = (budget - page.evaluated).min(200);
+            let candidates: Vec<PolicyBlockCandidate> = sqlx::query_as(POLICY_BLOCK_CANDIDATES_SQL)
+                .bind(repository_key)
+                .bind(keyset.map(|k| k.0))
+                .bind(keyset.map(|k| k.1))
+                .bind(batch)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            if candidates.is_empty() {
+                page.next_cursor = None;
+                return Ok(page);
+            }
+            for c in candidates {
+                if page.items.len() as i64 >= limit {
+                    break;
+                }
+                keyset = Some((c.created_at, c.id));
+                page.evaluated += 1;
+                let result = policy.evaluate_artifact(c.id, c.repository_id).await?;
+                if result.allowed {
+                    continue;
+                }
+                page.items.push(PolicyBlock {
+                    source: "hosted",
+                    artifact_id: Some(c.id),
+                    repository_key: c.repository_key,
+                    repository_format: c.repository_format,
+                    path: c.path,
+                    name: c.name,
+                    version: c.version,
+                    checksum_sha256: c.checksum_sha256,
+                    quarantine_status: c.quarantine_status,
+                    hold_source: c.quarantine_source,
+                    violations: result.violations,
+                    max_severity: None,
+                    scanned_at: None,
+                });
+            }
+        }
     }
 }
 

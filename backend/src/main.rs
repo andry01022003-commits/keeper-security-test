@@ -692,19 +692,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
-    // One-shot backfill of the first-class `oci_manifests` existence table
-    // (#1683 / #4433) for manifests committed before migration 268. Every
-    // push/cache since then records its row inline. Backgrounded: nothing
-    // reads the table yet, the pass is additive and idempotent (no-op once
-    // every manifest has a row), and it reads each body from storage, so it
-    // must not delay the HTTP listener bind. Failures are logged inside and
-    // retried on the next start.
+    // Maintenance of the first-class `oci_manifests` existence table (#1683 /
+    // #4433): at startup the backfill of manifests committed before migration
+    // 268 plus the reconcile that removes rows for manifests no longer
+    // addressable, then the reconcile again every
+    // `OCI_MANIFESTS_RECONCILE_INTERVAL_SECS`. Every push/cache records its
+    // row inline. Backgrounded: nothing reads the table yet, the pass is
+    // idempotent, and it reads bodies from storage, so it must not delay the
+    // HTTP listener bind. Failures are logged inside and retried next pass.
     {
         let db_pool = db_pool.clone();
         let storage_registry = storage_registry.clone();
         tokio::spawn(async move {
-            artifact_keeper_backend::services::oci_manifests::run_backfill(
-                &db_pool,
+            artifact_keeper_backend::services::oci_manifests::run_maintenance(
+                db_pool,
                 storage_registry,
             )
             .await;

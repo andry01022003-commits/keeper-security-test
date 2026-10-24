@@ -25,6 +25,49 @@ index documents from the catalog on every request (#4172).
 
 The kept documents are per process. Each replica renders a revision once.
 
+## Rendering
+
+A revision is rendered with one cursor over the repository's live rows
+(only the columns that decide which row each document lists), then the
+listed rows in filename order, 512 at a time, each record written straight
+into the pretty `repodata.json`, `current_repodata.json` and the zstd encoder
+of the compact document (#4176). The render holds its output and one chunk of
+rows, not the row set, so its memory is about the size of the documents it
+produces.
+
+A subdir no row has ever named (every write and the backfill give a named
+subdir a revision, so its revision is still 0) is answered its empty
+documents without a catalog walk, a permit or a cache entry, so requests for
+made-up subdirs cost one state lookup and cannot evict real subdirs from the
+cache.
+
+`repodata.json.bz2` is not rendered with the revision: the first `.bz2`
+request renders it from the kept `.zst` document and it is then kept with the
+revision (#4882). It is single-stream bzip2 at level 9, the bytes 1.11
+served. Measured with the backend's encoder (conda-forge documents, one core
+of the reference host):
+
+| Document | Level 9 | Level 1 | Multistream, 4 threads |
+|---|---|---|---|
+| `noarch/current_repodata.json`, 26 MB | 1.50 s, 4.68 MB | 1.21 s, 5.17 MB | 0.49 s, 4.69 MB |
+| `linux-64/repodata.json`, 459 MB | 25.6 s, 61.7 MB | 21.1 s, 67.3 MB | 6.8 s, 61.7 MB |
+
+A lower level saves under a fifth of the time for a tenth more bytes.
+Multistream (independently compressed chunks, concatenated) scales with
+threads but is a different file, and the one client measured to read `.bz2`
+cannot read it: pixi 0.81 (rattler) fetches `.bz2` when a channel has no
+`.zst` and, given a multistream file, parses only the first stream and fails
+("EOF while parsing"). conda 26.9, mamba 2.9 and micromamba 2.0 never request
+`.bz2` (they read `.zst` or `repodata.json`). So the file stays single-stream;
+rendering it once per revision instead of once per request is the saving.
+
+Renders take a permit from a process-wide gate,
+`AK_CONDA_REGEN_CONCURRENCY` (default 2), and a request waits at most
+`AK_CONDA_REGEN_WAIT_SECS` (default 30, `0` for no bound) before it is
+answered `503` with `Retry-After: 5`. The render it was waiting for keeps
+running and serves the requests that follow. See
+[load-shedding.md](load-shedding.md).
+
 ## How changes reach them
 
 Database triggers on `artifacts` and `artifact_metadata` record every

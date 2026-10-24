@@ -268,19 +268,74 @@ pub(crate) struct ProxyBlockCandidate {
 pub(crate) fn count_blocked_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
     let blocked: std::collections::HashSet<&str> = rows
         .iter()
-        .filter(|r| crate::formats::format_key_enforces_scan_on_proxy(&r.format))
         .filter(|r| {
-            crate::services::scan_config_service::proxy_severity_gate_for_row(
+            proxy_gate_refuses(
+                &r.format,
                 r.block_on_policy_violation,
                 &r.severity_threshold,
                 &r.proxy_scan_action,
+                r.max_severity.as_deref(),
             )
-            .blocks(r.max_severity.as_deref().and_then(Severity::from_str_loose))
         })
         .map(|r| r.checksum_sha256.as_str())
         .collect();
     blocked.len() as i64
 }
+
+/// Whether a repository's proxy scan gate refuses a stored `vulnerable`
+/// verdict: the format's proxy path runs the gate (#4582), and the
+/// repository's severity gate blocks the verdict's highest severity
+/// (record-only never does, a verdict below an opted-in threshold serves).
+/// The one predicate the dashboard count and the blocked listings share
+/// (#4380, #4510, #4777), so they cannot disagree with each other or with the
+/// gate.
+pub(crate) fn proxy_gate_refuses(
+    format: &str,
+    block_on_policy_violation: bool,
+    severity_threshold: &str,
+    proxy_scan_action: &str,
+    max_severity: Option<&str>,
+) -> bool {
+    crate::formats::format_key_enforces_scan_on_proxy(format)
+        && crate::services::scan_config_service::proxy_severity_gate_for_row(
+            block_on_policy_violation,
+            severity_threshold,
+            proxy_scan_action,
+        )
+        .blocks(max_severity.and_then(Severity::from_str_loose))
+}
+
+/// One proxied path whose stored verdict its repository's proxy scan gate
+/// currently refuses (#4510, #4777): a `proxy_cache_artifacts` row (or, for
+/// OCI, an image manifest the repository references) whose digest has a
+/// `vulnerable` verdict newer than the scan TTL that the repository's gate
+/// blocks. Verdicts are shared by digest across repositories; a row is only
+/// listed where THAT repository's settings refuse it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProxyBlockedEntry {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    pub repository_format: String,
+    /// The cached logical path; for an OCI manifest, `sha256:<digest>`.
+    pub path: String,
+    pub checksum_sha256: String,
+    pub max_severity: Option<String>,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+    /// The serving repository's gate settings the row was judged under.
+    pub block_on_policy_violation: bool,
+    pub severity_threshold: String,
+    pub proxy_scan_action: String,
+}
+
+/// Upper bound on the candidate rows one blocked-proxy listing reads. The
+/// candidates are vulnerable verdicts on cached paths, a small set in
+/// practice; the cap only bounds a pathological instance, and is logged.
+pub(crate) const PROXY_BLOCKED_CANDIDATE_CAP: i64 = 50_000;
 
 /// Build a DashboardSummary from raw count values.
 pub(crate) fn build_dashboard_summary(
@@ -2538,6 +2593,76 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(hosted + count_blocked_proxy_digests(&rows))
+    }
+
+    /// Every proxied path a repository's proxy scan gate currently refuses
+    /// (#4510, #4777), optionally for one repository, ordered by repository
+    /// key then path. Same candidate set and TTL as
+    /// [`Self::count_policy_violations_blocked`], filtered with
+    /// [`proxy_gate_refuses`], so a listed row is one the gate would refuse.
+    pub async fn list_blocked_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let rows: Vec<ProxyBlockedEntry> = sqlx::query_as(
+            r#"
+            SELECT r.id AS repository_id, r.key AS repository_key,
+                   r.format::text AS repository_format,
+                   cached.path, psr.checksum_sha256, psr.max_severity,
+                   psr.findings_count, psr.critical_count, psr.high_count,
+                   psr.medium_count, psr.low_count, psr.scanned_at,
+                   sc.block_on_policy_violation, sc.severity_threshold,
+                   sc.proxy_scan_action
+            FROM scan_configs sc
+            JOIN repositories r ON r.id = sc.repository_id
+            JOIN LATERAL (
+                SELECT pca.path, pca.checksum_sha256 AS digest
+                  FROM proxy_cache_artifacts pca
+                 WHERE pca.repository_id = sc.repository_id
+                   AND pca.checksum_sha256 IS NOT NULL
+                UNION
+                SELECT DISTINCT mbr.manifest_digest,
+                       REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM manifest_blob_refs mbr
+                 WHERE mbr.repository_id = sc.repository_id
+            ) cached ON true
+            JOIN proxy_scan_results psr
+              ON psr.checksum_sha256 = cached.digest
+             AND psr.scan_type = $1
+             AND psr.verdict = 'vulnerable'
+             AND psr.scanned_at > NOW() - make_interval(days => $2)
+            WHERE sc.scan_on_proxy
+              AND r.repo_type IN ('remote', 'virtual')
+              AND ($3::text IS NULL OR r.key = $3)
+            ORDER BY r.key, cached.path
+            LIMIT $4
+            "#,
+        )
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .bind(repository_key)
+        .bind(PROXY_BLOCKED_CANDIDATE_CAP)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if rows.len() as i64 >= PROXY_BLOCKED_CANDIDATE_CAP {
+            tracing::warn!(
+                cap = PROXY_BLOCKED_CANDIDATE_CAP,
+                "blocked proxy listing reached its candidate cap; later repositories are not listed"
+            );
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                proxy_gate_refuses(
+                    &r.repository_format,
+                    r.block_on_policy_violation,
+                    &r.severity_threshold,
+                    &r.proxy_scan_action,
+                    r.max_severity.as_deref(),
+                )
+            })
+            .collect())
     }
 }
 

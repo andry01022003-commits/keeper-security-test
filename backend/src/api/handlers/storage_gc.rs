@@ -555,6 +555,7 @@ mod tests {
             bytes_freed: 2048,
             errors: vec!["some error".to_string()],
             maven_flat_objects_gated: 0,
+            budget_exhausted: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -584,6 +585,7 @@ mod tests {
             bytes_freed: 4096,
             errors: vec![],
             maven_flat_objects_gated: 0,
+            budget_exhausted: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -607,6 +609,7 @@ mod tests {
                 "Failed to delete key xyz: permission denied".to_string(),
             ],
             maven_flat_objects_gated: 0,
+            budget_exhausted: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: StorageGcResult = serde_json::from_str(&json).unwrap();

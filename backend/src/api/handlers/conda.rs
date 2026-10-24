@@ -66,6 +66,10 @@ mod current_repodata;
 mod merge_gate;
 mod package_gate;
 mod repodata_cache;
+mod repodata_render;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod repodata_render_tests;
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod revision_router_tests;
@@ -1901,6 +1905,7 @@ async fn run_exports_json(
 }
 
 /// The hosted `run_exports.json` document of `subdir` from its rows.
+#[cfg(test)]
 fn run_exports_document(subdir_artifacts: &[&CondaArtifact], subdir: &str) -> serde_json::Value {
     let mut packages = serde_json::Map::new();
 
@@ -1997,6 +2002,7 @@ impl RepodataEncoding {
     /// (hundreds of MiB for a merged conda-forge subdir) is never held in
     /// memory next to its compressed form (#4608).
     #[allow(clippy::result_large_err)]
+    #[cfg(test)]
     fn encode<T: serde::Serialize + ?Sized>(&self, repodata: &T) -> Result<Vec<u8>, Response> {
         fn failed(e: impl std::fmt::Display) -> Response {
             tracing::error!("repodata encoding error: {}", e);
@@ -2658,12 +2664,18 @@ async fn serve_repodata(
 
     // Hosted: every encoding is kept under the subdir's revision (#4174).
     let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, subdir).await?;
-    let doc = match encoding {
-        RepodataEncoding::Json => &docs.json,
-        RepodataEncoding::Zst => &docs.zst,
-        RepodataEncoding::Bz2 => &docs.bz2,
-    };
-    Ok(prepared_response(doc, ct, headers).await)
+    match encoding {
+        RepodataEncoding::Json => Ok(prepared_response(&docs.json, ct, headers).await),
+        RepodataEncoding::Zst => Ok(prepared_response(&docs.zst, ct, headers).await),
+        RepodataEncoding::Bz2 => {
+            let docs = repodata_cache::with_bz2(docs).await?;
+            let bz2 = docs
+                .bz2
+                .get()
+                .ok_or_else(|| virtual_merge::internal_error("bz2 rendering missing"))?;
+            Ok(prepared_response(bz2, ct, headers).await)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5102,6 +5114,7 @@ async fn build_repodata(
 /// The `repodata.json` document of `subdir` from its rows (newest first) and
 /// the filenames of its `removed` array. Pure, so the revision cache renders
 /// every encoding and `current_repodata.json` from one catalog walk (#4174).
+#[cfg(test)]
 fn repodata_document(
     subdir_artifacts: &[&CondaArtifact],
     subdir: &str,
@@ -10167,6 +10180,7 @@ fn build_channeldata_json(
 /// proxy and under a `/t/<token>/` prefix alike. The host-relative
 /// `"/conda/<repo>/<subdir>/"` written before resolved against the proxy's
 /// host behind a proxy and dropped the token prefix from token channels.
+#[cfg(test)]
 fn build_repodata_envelope(
     subdir: &str,
     packages: &serde_json::Map<String, serde_json::Value>,
