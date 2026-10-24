@@ -24,7 +24,7 @@ use crate::services::scanner_adapter_client::{
 };
 use crate::services::scanner_service::{
     fail_scan, IncusScannerCapability, ScanOutput, ScanWorkspace, Scanner, VersionCache,
-    WorkspaceGuard,
+    WorkspaceExtraction, WorkspaceExtractor, WorkspaceGuard,
 };
 
 /// Default ceiling on compressed input size we will attempt to extract
@@ -404,6 +404,36 @@ async fn run_trivy_scan(
         .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))
 }
 
+/// Workspace prefix for Incus scans: jobs extract into
+/// `<base>/incus-<artifact.id>-<job>`.
+const INCUS_WORKSPACE_PREFIX: &str = "incus";
+
+/// The Incus extraction step of the shared scan-workspace lifecycle (#1429).
+///
+/// [`ScanWorkspace::prepare_with`] owns the job directory, its guard and its
+/// cleanup; this only lays the image out under it. A unified tarball is
+/// unpacked with `tar` into the workspace root and the rootfs located by
+/// probing known package-DB markers (`incus image export` and `incus export`
+/// backup layouts, #1427); a squashfs rootfs is unpacked with `unsquashfs`
+/// into `rootfs/`. Both run the same post-extraction guard (escaping
+/// symlinks, extracted-size and entry caps). A QCOW2 disk image is refused.
+struct IncusRootfsExtractor<'a> {
+    scanner: &'a IncusScanner,
+}
+
+#[async_trait]
+impl WorkspaceExtractor for IncusRootfsExtractor<'_> {
+    async fn extract(&self, job: WorkspaceExtraction<'_>) -> Result<PathBuf> {
+        let rootfs_dir = job.workspace.join("rootfs");
+        tokio::fs::create_dir_all(&rootfs_dir)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
+        self.scanner
+            .prepare_workspace_inner(job.artifact, job.content, job.workspace, &rootfs_dir)
+            .await
+    }
+}
+
 /// Vulnerability scanner for Incus/LXC container images.
 ///
 /// Extracts the filesystem contents from container images and runs
@@ -473,79 +503,56 @@ impl IncusScanner {
 
     /// Build the base workspace directory path for a given artifact
     /// (`<base>/incus-<artifact.id>`). The actual per-scan workspace appends a
-    /// random suffix to this; see [`Self::scan_workspace_dir`].
+    /// per-job suffix to this; see [`Self::scan_workspace_dir`].
+    #[cfg(test)]
     fn workspace_dir(&self, artifact: &Artifact) -> PathBuf {
-        ScanWorkspace::workspace_dir(&self.scan_workspace, Some("incus"), artifact)
+        ScanWorkspace::workspace_dir(&self.scan_workspace, Some(INCUS_WORKSPACE_PREFIX), artifact)
     }
 
-    /// Build a per-scan-unique workspace directory
-    /// (`<base>/incus-<artifact.id>-<uuid>`).
-    ///
-    /// Concurrent scans of the *same* artifact (re-scan triggered while a prior
-    /// scan is still extracting, repository-wide rescan, ...) would otherwise
-    /// share `incus-<artifact.id>` and the top-of-`prepare_workspace`
-    /// `remove_dir_all` of one scan would delete the tree the other is mid-way
-    /// through extracting. A random suffix isolates each scan's tree.
+    /// The per-scan-unique workspace directory
+    /// (`<base>/incus-<artifact.id>-<job>`) that [`Self::prepare_workspace`]
+    /// extracts into: [`ScanWorkspace::job_workspace_dir`], the same per-job
+    /// naming every other scanner uses (#4668).
+    #[cfg(test)]
     fn scan_workspace_dir(&self, artifact: &Artifact) -> PathBuf {
-        let mut dir = self.workspace_dir(artifact).into_os_string();
-        dir.push("-");
-        dir.push(uuid::Uuid::new_v4().to_string());
-        PathBuf::from(dir)
+        ScanWorkspace::job_workspace_dir(
+            &self.scan_workspace,
+            Some(INCUS_WORKSPACE_PREFIX),
+            artifact,
+        )
     }
 
     /// Prepare the scan workspace by extracting rootfs from the image.
     ///
-    /// Returns `(rootfs_path, workspace_root)`. The caller cleans up
-    /// `workspace_root` (the per-scan-unique directory) on both success and
-    /// failure.
+    /// Returns `(rootfs_path, workspace)`. The workspace lifecycle is the
+    /// shared one in [`ScanWorkspace::prepare_with`] (#1429): a fresh per-job
+    /// directory owned by a [`WorkspaceGuard`] from the moment it exists,
+    /// removed before any extraction error (QCOW2 refusal included) is
+    /// returned and on drop when the scan's wall-clock budget cancels this
+    /// future (#3565), and a rootfs that must lie inside it. Only the
+    /// extraction step is Incus-specific ([`IncusRootfsExtractor`]). On
+    /// success the caller owns the guard and calls
+    /// [`WorkspaceGuard::cleanup`] when the scan is done.
     async fn prepare_workspace(
         &self,
         artifact: &Artifact,
         content: &Bytes,
     ) -> Result<(PathBuf, WorkspaceGuard)> {
-        let workspace = self.scan_workspace_dir(artifact);
-
-        // Wipe any partial tree left by a previous failed scan (OOM, disk-full,
-        // janitor reap, ...) so extraction below starts from a clean slate.
-        // Best-effort: a missing path is fine; anything else surfaces. With the
-        // per-scan UUID suffix this is effectively always a no-op, but it keeps
-        // extraction robust against a UUID collision or a partially-written tree.
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(AppError::Internal(format!(
-                    "Failed to clear stale scan workspace {}: {}",
-                    workspace.display(),
-                    e
-                )));
-            }
-        }
-
-        let rootfs_dir = workspace.join("rootfs");
-        tokio::fs::create_dir_all(&rootfs_dir)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
-
-        // From here on the workspace dir exists, so a guard owns it: it is
-        // cleaned up before returning any error so a half-built tree (or the
-        // QCOW2 reject path) never lingers on the PVC, and it is removed on
-        // drop so the wall-clock timeout cancelling this future mid-extraction
-        // does not leak it either (#3565). On success the guard — and with it
-        // cleanup of `workspace` — passes to the caller.
-        let mut workspace = WorkspaceGuard::new(workspace);
-        let result = self
-            .prepare_workspace_inner(artifact, content, &workspace, &rootfs_dir)
-            .await;
-        match result {
-            Ok(rootfs) => Ok((rootfs, workspace)),
-            Err(e) => {
-                workspace.cleanup().await;
-                Err(e)
-            }
-        }
+        let prepared = ScanWorkspace::prepare_with(
+            &self.scan_workspace,
+            Some(INCUS_WORKSPACE_PREFIX),
+            artifact,
+            content,
+            &IncusRootfsExtractor { scanner: self },
+        )
+        .await?;
+        Ok((prepared.scan_root, prepared.guard))
     }
 
-    /// Extraction body for [`Self::prepare_workspace`]. Split out so the outer
-    /// function can guarantee workspace cleanup on every error path.
+    /// Extraction body run by [`IncusRootfsExtractor`]: pick the extractor
+    /// for the image layout (tarball plus rootfs probe, or squashfs) and
+    /// return the rootfs to scan. `workspace` is the fresh job directory and
+    /// `rootfs_dir` its `rootfs/` subdirectory, already created.
     async fn prepare_workspace_inner(
         &self,
         artifact: &Artifact,
@@ -614,9 +621,10 @@ impl IncusScanner {
     ///     decompression bomb can't fill the PVC;
     ///   * `--overwrite` is intentionally NOT passed: it disables GNU tar's
     ///     in-archive symlink-overwrite protection, which a crafted archive uses
-    ///     to plant `rootfs -> /etc` then write through it. The per-scan-unique
-    ///     workspace + the `remove_dir_all` wipe above already guarantee a clean
-    ///     target dir, so `--overwrite` is redundant as well as dangerous;
+    ///     to plant `rootfs -> /etc` then write through it. The per-job
+    ///     workspace [`ScanWorkspace::prepare_with`] creates already guarantees
+    ///     a clean target dir, so `--overwrite` is redundant as well as
+    ///     dangerous;
     ///   * `--absolute-names` is NOT passed, so tar strips leading `/` and `..`
     ///     from member paths (the default, safe behaviour);
     ///   * after extraction, [`Self::reject_escaping_symlinks`] walks the tree
@@ -978,9 +986,9 @@ impl IncusScanner {
     ///   * `unsquashfs -f` (force-overwrite) is intentionally NOT passed. `-f`
     ///     only matters when the destination already holds conflicting files;
     ///     it makes unsquashfs unlink and overwrite them, which weakens the
-    ///     defense posture the same way tar's `--overwrite` does. The per-scan
-    ///     UUID workspace + the `remove_dir_all` wipe in `prepare_workspace`
-    ///     guarantee `dest` is freshly-created and empty, and unsquashfs
+    ///     defense posture the same way tar's `--overwrite` does. The per-job
+    ///     workspace [`ScanWorkspace::prepare_with`] creates guarantees
+    ///     `dest` is freshly-created and empty, and unsquashfs
     ///     extracts happily into an existing empty directory without `-f`, so
     ///     the flag is redundant here;
     ///   * run as the non-root backend UID, `unsquashfs` cannot create device
@@ -2839,6 +2847,89 @@ mod tests {
         assert!(resolved.join("etc/os-release").exists());
 
         ScanWorkspace::cleanup_path(&workspace).await;
+    }
+
+    /// #1429: Incus rides the shared scan-workspace lifecycle. Its job
+    /// directory is the one [`ScanWorkspace::job_workspace_dir`] names for
+    /// every scanner (#4668), not a private naming scheme, and the rootfs it
+    /// returns lies inside it.
+    #[tokio::test]
+    async fn test_prepare_workspace_uses_the_shared_job_directory() {
+        if !system_tar_is_gnu() {
+            eprintln!("skipping: system tar is not GNU tar (extraction flags unsupported)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().to_string();
+        let scanner = IncusScanner::new(
+            test_capability(),
+            "http://trivy:8090".to_string(),
+            base.clone(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+        let tarball = build_gzip_tar(&[("rootfs/etc/os-release", b"ID=ubuntu\n")]);
+
+        crate::services::scanner_service::test_scan_job_suffix::fix("incus-job");
+        let expected = ScanWorkspace::job_workspace_dir(&base, Some("incus"), &artifact);
+
+        let (rootfs, mut workspace) = scanner
+            .prepare_workspace(&artifact, &tarball)
+            .await
+            .expect("prepare_workspace must succeed for a valid image tarball");
+
+        assert_eq!(
+            &*workspace,
+            expected.as_path(),
+            "the incus workspace must be the shared per-job directory"
+        );
+        assert_eq!(rootfs, expected.join("rootfs"));
+        assert!(rootfs.join("etc/os-release").exists());
+
+        workspace.cleanup().await;
+        assert!(!expected.exists());
+    }
+
+    /// #1429: every Incus extraction failure (a corrupt tarball, a QCOW2
+    /// image, an unparseable path) leaves nothing under the workspace base
+    /// once the error is returned.
+    #[tokio::test]
+    async fn test_prepare_workspace_failure_leaves_no_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws-base");
+        let scanner = IncusScanner::new(
+            test_capability(),
+            "http://trivy:8090".to_string(),
+            base.to_string_lossy().to_string(),
+        );
+        let mut unparseable = make_incus_artifact("bad.bin", "bad.bin");
+        unparseable.path = "single_segment".to_string();
+
+        for (label, artifact, content) in [
+            (
+                "corrupt tarball",
+                make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz"),
+                Bytes::from_static(b"not a valid tarball"),
+            ),
+            (
+                "qcow2",
+                make_incus_artifact("rootfs.img", "ubuntu-noble/20240215/rootfs.img"),
+                Bytes::from_static(b"fake qcow2 data"),
+            ),
+            ("unparseable path", unparseable, Bytes::from_static(b"data")),
+        ] {
+            assert!(
+                scanner
+                    .prepare_workspace(&artifact, &content)
+                    .await
+                    .is_err(),
+                "{label}: must fail"
+            );
+            let left: Vec<_> = std::fs::read_dir(&base)
+                .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert!(left.is_empty(), "{label}: workspace left behind: {left:?}");
+        }
     }
 
     /// Path-traversal guard: an archive containing a `../`-relative symlink that
