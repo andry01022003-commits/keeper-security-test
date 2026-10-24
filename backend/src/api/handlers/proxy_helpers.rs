@@ -5696,7 +5696,21 @@ async fn local_lookup_artifact(
     Response,
 > {
     let artifact = lookup.fetch_row(db, repo_id).await?;
-    check_quarantine_row(&artifact)?;
+    if let Err(refusal) = crate::services::quarantine_service::check_download_allowed(
+        artifact.quarantine_status.as_deref(),
+        artifact.quarantine_until,
+        chrono::Utc::now(),
+    ) {
+        // #4510: a scan-policy hold answers the policy 403, not the 409.
+        return Err(crate::services::quarantine_service::refine_hold_refusal(
+            db,
+            artifact.id,
+            repo_id,
+            refusal,
+        )
+        .await
+        .into_response());
+    }
     crate::services::quarantine_service::enforce_scan_policy_gate(db, artifact.id, repo_id)
         .await
         .map_err(|e| e.into_response())?;

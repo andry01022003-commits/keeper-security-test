@@ -568,9 +568,18 @@ impl From<crate::models::security::ScanConfig> for ScanConfigResponse {
             block_on_policy_violation: c.block_on_policy_violation,
             severity_threshold: c.severity_threshold,
             proxy_scan_action: c.proxy_scan_action,
+            // Filled in by the handlers that read the lock (#4363).
+            instance_locked: false,
             created_at: c.created_at,
             updated_at: c.updated_at,
         }
+    }
+}
+
+impl ScanConfigResponse {
+    fn with_lock(mut self, instance_locked: bool) -> Self {
+        self.instance_locked = instance_locked;
+        self
     }
 }
 
@@ -803,8 +812,36 @@ pub struct ScanConfigResponse {
     /// SBOM data are recorded but no pull is ever blocked; overrides
     /// `block_on_policy_violation` / `severity_threshold`).
     pub proxy_scan_action: String,
+    /// An instance administrator's lock holds this repository's proxy scan
+    /// policy (#4363): a repository administrator may tighten it but not
+    /// weaken it (turn `scan_on_proxy` off, move `proxy_scan_action` towards
+    /// `record_only`, or loosen the severity threshold).
+    pub instance_locked: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Body of `PUT /api/v1/repositories/{key}/security`: the scan-config fields
+/// plus the instance lock (#4363).
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct UpdateRepoSecurityRequest {
+    #[serde(flatten)]
+    pub config: UpsertScanConfigRequest,
+    /// Instance administrators only. `false` hands the proxy scan policy back
+    /// to the repository's administrators; `true` or omitted locks it (an
+    /// instance administrator's write is an instance decision unless it says
+    /// otherwise). A repository administrator sending this field gets 403.
+    #[serde(default)]
+    pub instance_locked: Option<bool>,
+}
+
+impl From<UpsertScanConfigRequest> for UpdateRepoSecurityRequest {
+    fn from(config: UpsertScanConfigRequest) -> Self {
+        Self {
+            config,
+            instance_locked: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -891,8 +928,14 @@ async fn list_scan_configs(
 ) -> Result<Json<Vec<ScanConfigResponse>>> {
     let svc = ScanConfigService::new(state.db.clone());
     let configs = svc.list_configs().await?;
-    let response: Vec<ScanConfigResponse> =
-        configs.into_iter().map(ScanConfigResponse::from).collect();
+    let locked = svc.instance_locked_repositories().await?;
+    let response: Vec<ScanConfigResponse> = configs
+        .into_iter()
+        .map(|c| {
+            let is_locked = locked.contains(&c.repository_id);
+            ScanConfigResponse::from(c).with_lock(is_locked)
+        })
+        .collect();
     Ok(Json(response))
 }
 
@@ -1847,9 +1890,13 @@ async fn get_repo_security(
 
     let config = config_svc.get_config(repo).await?;
     let score = result_svc.get_score(repo).await?;
+    let instance_locked = match config {
+        Some(_) => config_svc.instance_locked(repo).await?,
+        None => false,
+    };
 
     Ok(Json(RepoSecurityResponse {
-        config: config.map(ScanConfigResponse::from),
+        config: config.map(|c| ScanConfigResponse::from(c).with_lock(instance_locked)),
         score: score.map(ScoreResponse::from),
     }))
 }
@@ -1862,9 +1909,10 @@ async fn get_repo_security(
     params(
         ("key" = String, Path, description = "Repository key")
     ),
-    request_body = UpsertScanConfigRequest,
+    request_body = UpdateRepoSecurityRequest,
     responses(
         (status = 200, description = "Repository security config updated", body = ScanConfigResponse),
+        (status = 403, description = "Not a repository administrator, a repository administrator weakening an instance-locked proxy scan policy, or a repository administrator sending instance_locked", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -1873,7 +1921,7 @@ async fn update_repo_security(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-    Json(body): Json<UpsertScanConfigRequest>,
+    Json(body): Json<UpdateRepoSecurityRequest>,
 ) -> Result<Json<ScanConfigResponse>> {
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
@@ -1896,8 +1944,13 @@ async fn update_repo_security(
     require_repo_admin(&auth, repo.id, &state.permission_service).await?;
     let svc = ScanConfigService::new(state.db.clone());
     // #3645: the previous row is read in the same transaction as the write,
-    // so the audited "before" is exactly what this write replaced.
-    let write = svc.upsert_config_with_previous(repo.id, &body).await?;
+    // so the audited "before" is exactly what this write replaced. #4363: the
+    // instance lock is checked under the same lock; a repository
+    // administrator cannot weaken an instance-locked proxy scan policy.
+    let tier = crate::services::age_gate_service::ActorTier::of(auth.is_admin);
+    let write = svc
+        .upsert_config_as(repo.id, &body.config, tier, body.instance_locked)
+        .await?;
 
     // Every change to the scan configuration is an enforcement change
     // (scanning on/off, threshold, block_on_policy_violation, or the proxy
@@ -1912,7 +1965,10 @@ async fn update_repo_security(
         }
     }
 
-    Ok(Json(ScanConfigResponse::from(write.current)))
+    let now_locked = write.now_locked;
+    Ok(Json(
+        ScanConfigResponse::from(write.current).with_lock(now_locked),
+    ))
 }
 
 /// The audit view of one scan configuration.
@@ -1972,7 +2028,10 @@ fn scan_config_change_audit(
         .map(MergedScanConfig::of)
         .unwrap_or_else(MergedScanConfig::defaults);
     let after = MergedScanConfig::of(&write.current);
-    let changed = scan_config_changed_fields(&before, &after);
+    let mut changed = scan_config_changed_fields(&before, &after);
+    if write.was_locked != write.now_locked {
+        changed.push("instance_locked".to_string());
+    }
     if changed.is_empty() {
         return None;
     }
@@ -3156,6 +3215,8 @@ async fn rescan_proxy_cached_path(
         PolicyResponse,
         RepoSecurityResponse,
         ScanConfigResponse,
+        UpdateRepoSecurityRequest,
+        crate::services::scan_config_service::UpsertScanConfigRequest,
         ProxyScansResponse,
         ProxyScanSummary,
         ProxyScanEntry,
@@ -5221,7 +5282,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path(key.clone()),
-            Json(body()),
+            Json(body().into()),
         )
         .await;
         assert!(
@@ -5246,7 +5307,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path(key.clone()),
-            Json(body()),
+            Json(body().into()),
         )
         .await;
         assert!(
@@ -5260,10 +5321,13 @@ mod tests {
             State(state.clone()),
             Extension(Some(admin)),
             Path(key.clone()),
-            Json(UpsertScanConfigRequest {
-                scan_enabled: Some(true),
-                ..Default::default()
-            }),
+            Json(
+                UpsertScanConfigRequest {
+                    scan_enabled: Some(true),
+                    ..Default::default()
+                }
+                .into(),
+            ),
         )
         .await;
         assert!(
@@ -5309,7 +5373,7 @@ mod tests {
             State(state),
             Extension(Some(token("read:artifacts"))),
             Path(key.clone()),
-            Json(body()),
+            Json(body().into()),
         )
         .await;
         let persisted_after_refusal = ScanConfigService::new(pool.clone())
@@ -5322,7 +5386,7 @@ mod tests {
             State(state),
             Extension(Some(token("write:repositories"))),
             Path(key.clone()),
-            Json(body()),
+            Json(body().into()),
         )
         .await;
 
@@ -5343,6 +5407,142 @@ mod tests {
         assert!(
             allowed.is_ok(),
             "a write:repositories token with repository:admin must pass: {allowed:?}"
+        );
+    }
+
+    /// #4363: an instance administrator's write locks the repository's proxy
+    /// scan policy. While locked, a repository administrator can tighten it
+    /// but every weakening (record_only, fail_closed -> fail_open, scan off,
+    /// opting into or raising a threshold) and any attempt to touch the lock
+    /// is a 403 that writes nothing; the GET shows the lock; the instance
+    /// administrator can hand the policy back, after which the repository
+    /// administrator may weaken it again.
+    #[tokio::test]
+    async fn instance_lock_stops_a_repository_admin_weakening_the_proxy_scan_policy_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let repo_admin = tdh::make_auth(user_id, &username);
+        let instance_admin = tdh::admin_auth(user_id, &username);
+        let put = |auth: AuthExtension, body: serde_json::Value| {
+            let state = state.clone();
+            let key = key.clone();
+            async move {
+                let body: UpdateRepoSecurityRequest =
+                    serde_json::from_value(body).expect("request body");
+                update_repo_security(State(state), Extension(Some(auth)), Path(key), Json(body))
+                    .await
+            }
+        };
+        let current = || async {
+            let c = ScanConfigService::new(pool.clone())
+                .get_config(repo_id)
+                .await
+                .expect("get_config")
+                .expect("config row");
+            (
+                c.scan_on_proxy,
+                c.proxy_scan_action,
+                c.block_on_policy_violation,
+                c.severity_threshold,
+            )
+        };
+
+        // Instance administrator sets the policy: locked by default.
+        let set = put(
+            instance_admin.clone(),
+            serde_json::json!({
+                "scan_enabled": true, "scan_on_proxy": true, "proxy_scan_action": "fail_open",
+                "block_on_policy_violation": true, "severity_threshold": "high"
+            }),
+        )
+        .await
+        .expect("instance write");
+        let locked_after_set = set.0.instance_locked;
+        let shown = get_repo_security(
+            State(state.clone()),
+            Extension(Some(repo_admin.clone())),
+            Path(key.clone()),
+        )
+        .await
+        .expect("get")
+        .0
+        .config
+        .expect("config")
+        .instance_locked;
+        let baseline = current().await;
+
+        let mut refused = Vec::new();
+        for body in [
+            serde_json::json!({"proxy_scan_action": "record_only"}),
+            serde_json::json!({"scan_on_proxy": false}),
+            serde_json::json!({"severity_threshold": "critical"}),
+            serde_json::json!({"instance_locked": false}),
+            serde_json::json!({"instance_locked": true}),
+        ] {
+            let r = put(repo_admin.clone(), body.clone()).await;
+            refused.push((body, matches!(r, Err(AppError::Authorization(_)))));
+        }
+        let after_refusals = current().await;
+
+        // Tightening is still the repository administrator's to make.
+        let tighten_action = put(
+            repo_admin.clone(),
+            serde_json::json!({"proxy_scan_action": "fail_closed"}),
+        )
+        .await;
+        let tighten_threshold = put(
+            repo_admin.clone(),
+            serde_json::json!({"severity_threshold": "medium"}),
+        )
+        .await;
+        let weaken_back = put(
+            repo_admin.clone(),
+            serde_json::json!({"proxy_scan_action": "fail_open"}),
+        )
+        .await;
+
+        // Handed back: the repository administrator may weaken it again.
+        let handed_back = put(
+            instance_admin.clone(),
+            serde_json::json!({"instance_locked": false}),
+        )
+        .await
+        .expect("hand back");
+        let weaken_after_unlock = put(
+            repo_admin.clone(),
+            serde_json::json!({"proxy_scan_action": "record_only"}),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(locked_after_set, "an instance write locks by default");
+        assert!(shown, "the GET shows the lock");
+        for (body, was_refused) in &refused {
+            assert!(
+                was_refused,
+                "a repository admin must be refused (403) for {body} while locked"
+            );
+        }
+        assert_eq!(after_refusals, baseline, "a refused write changes nothing");
+        assert!(tighten_action.is_ok(), "fail_open -> fail_closed tightens");
+        assert!(tighten_threshold.is_ok(), "high -> medium tightens");
+        assert!(
+            matches!(weaken_back, Err(AppError::Authorization(_))),
+            "fail_closed -> fail_open weakens: {weaken_back:?}"
+        );
+        assert!(!handed_back.0.instance_locked);
+        assert!(
+            weaken_after_unlock.is_ok(),
+            "an unlocked policy is the repository admin's again: {weaken_after_unlock:?}"
         );
     }
 
@@ -5369,7 +5569,7 @@ mod tests {
                 State(state.clone()),
                 Extension(Some(auth.clone())),
                 Path(key.clone()),
-                Json(body),
+                Json(body.into()),
             )
         };
 
@@ -6887,6 +7087,7 @@ mod tests {
                 block_on_policy_violation: true,
                 severity_threshold: "high".to_string(),
                 proxy_scan_action: "fail_open".to_string(),
+                instance_locked: false,
                 created_at: now,
                 updated_at: now,
             }),
@@ -6929,6 +7130,7 @@ mod tests {
             block_on_policy_violation: false,
             severity_threshold: "medium".to_string(),
             proxy_scan_action: "fail_closed".to_string(),
+            instance_locked: false,
             created_at: now,
             updated_at: now,
         };

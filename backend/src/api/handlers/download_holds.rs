@@ -1,4 +1,5 @@
-//! Admin download-hold observability: hosted and proxy-cache quarantine queues.
+//! Admin download-hold observability: hosted and proxy-cache quarantine
+//! queues, and the scan-policy blocks queue (#4510).
 
 use axum::extract::{Extension, Query, State};
 use axum::routing::get;
@@ -13,14 +14,15 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
 use crate::services::download_holds_service::{
-    classify_hold, parse_hold_kinds, remaining_seconds, DownloadHoldsService, HoldKind,
-    QuarantineHoldRow,
+    classify_hold, parse_hold_kinds, parse_hold_source, remaining_seconds, DownloadHoldsService,
+    HoldKind, PolicyBlock, PolicyBlockCursor, QuarantineHoldRow,
 };
 
 pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/summary", get(holds_summary))
         .route("/quarantine", get(list_quarantine))
+        .route("/policy-blocks", get(list_policy_blocks))
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -28,6 +30,10 @@ pub struct HoldListQuery {
     pub repository_key: Option<String>,
     /// Comma-separated: `active`, `expired`, `rejected`. Default: `active,rejected`.
     pub kind: Option<String>,
+    /// Only hosted holds recorded with this source: `upload`, `admin` or
+    /// `scan_policy` (#4510). Proxy-cache rows record none and are left out
+    /// when this is set.
+    pub hold_source: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -57,6 +63,11 @@ pub struct QuarantineHoldResponse {
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
     pub remaining_seconds: Option<i64>,
     pub quarantine_reason: Option<String>,
+    /// Where a hosted hold came from (#4510): `upload` (the quarantine
+    /// period), `admin` (quarantine-now) or `scan_policy`. `null` for a
+    /// proxy-cache row and for a hold that recorded no source (written before
+    /// 1.12.0, or by the scanner, which does not record one yet).
+    pub hold_source: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub is_blocked: bool,
 }
@@ -105,6 +116,7 @@ fn to_quarantine_response(row: QuarantineHoldRow) -> QuarantineHoldResponse {
         quarantine_until: row.quarantine_until,
         remaining_seconds: remaining,
         quarantine_reason: row.quarantine_reason,
+        hold_source: row.hold_source,
         created_at: row.created_at,
         is_blocked: matches!(kind, HoldKind::Active | HoldKind::Rejected),
     }
@@ -147,11 +159,13 @@ pub async fn list_quarantine(
 ) -> Result<Json<QuarantineHoldListResponse>> {
     require_queue_admin(&auth)?;
     let kinds = parse_hold_kinds(query.kind.as_deref())?;
+    let hold_source = parse_hold_source(query.hold_source.as_deref())?;
     let (page, per_page, offset) = Pagination::clamp_offset(query.page, query.per_page);
     let (rows, total) = svc(&state)
         .list_quarantine(
             query.repository_key.as_deref(),
             &kinds,
+            hold_source.as_deref(),
             offset,
             i64::from(per_page),
         )
@@ -162,17 +176,133 @@ pub async fn list_quarantine(
     }))
 }
 
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct PolicyBlockListQuery {
+    pub repository_key: Option<String>,
+    /// The `next_cursor` of the previous page; omit for the first page.
+    pub cursor: Option<String>,
+    /// Items per page (default 50, max 200).
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyBlockResponse {
+    /// `proxy-cache` (a cached path whose stored `vulnerable` verdict this
+    /// repository's proxy scan gate refuses) or `hosted` (an artifact a scan
+    /// policy refuses). Proxy-cache items come first, then hosted ones,
+    /// newest first.
+    pub source: String,
+    /// Hosted items only.
+    pub artifact_id: Option<Uuid>,
+    pub repository_key: String,
+    pub repository_format: String,
+    pub path: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub checksum_sha256: String,
+    /// Hosted only: the stored quarantine status (a policy block is refused
+    /// whether or not the scanner also stamped a hold).
+    pub quarantine_status: Option<String>,
+    /// Hosted only: `upload`, `admin`, `scan_policy` or `null`.
+    pub hold_source: Option<String>,
+    /// Hosted only: the violated policy rules, as the gate evaluated them.
+    pub violations: Vec<String>,
+    /// Proxy-cache only: the verdict's highest severity.
+    pub max_severity: Option<String>,
+    /// Proxy-cache only: when the verdict was recorded.
+    pub scanned_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyBlockListResponse {
+    pub items: Vec<PolicyBlockResponse>,
+    /// Pass as `cursor` for the next page; `null` when the queue is exhausted.
+    /// A page can hold fewer than `per_page` items and still have a cursor:
+    /// each page evaluates a bounded number of hosted artifacts.
+    pub next_cursor: Option<String>,
+    /// Hosted artifacts whose scan policy this page evaluated.
+    pub evaluated: i64,
+}
+
+fn to_policy_block_response(b: PolicyBlock) -> PolicyBlockResponse {
+    PolicyBlockResponse {
+        source: b.source.to_string(),
+        artifact_id: b.artifact_id,
+        repository_key: b.repository_key,
+        repository_format: b.repository_format,
+        path: b.path,
+        name: b.name,
+        version: b.version,
+        checksum_sha256: b.checksum_sha256,
+        quarantine_status: b.quarantine_status,
+        hold_source: b.hold_source,
+        violations: b.violations,
+        max_severity: b.max_severity,
+        scanned_at: b.scanned_at,
+    }
+}
+
+/// What the download gate's scan-policy decision refuses right now (#4510),
+/// across every repository: hosted artifacts a scan policy refuses (evaluated
+/// with the gate's own policy evaluation) and proxied paths whose stored
+/// verdict the repository's proxy scan gate refuses. Not derived from the
+/// quarantine stamp, so a policy block shows here whether or not a hold was
+/// recorded, and a hold whose policy no longer refuses does not.
+#[utoipa::path(
+    get,
+    path = "/holds/policy-blocks",
+    context_path = "/api/v1/admin",
+    tag = "holds",
+    security(("bearer_auth" = [])),
+    params(PolicyBlockListQuery),
+    responses(
+        (status = 200, body = PolicyBlockListResponse),
+        (status = 400, description = "Invalid cursor", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn list_policy_blocks(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<PolicyBlockListQuery>,
+) -> Result<Json<PolicyBlockListResponse>> {
+    require_queue_admin(&auth)?;
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(PolicyBlockCursor::parse)
+        .transpose()?;
+    let per_page = i64::from(query.per_page.unwrap_or(50).clamp(1, 200));
+    let page = svc(&state)
+        .list_policy_blocks(query.repository_key.as_deref(), cursor.as_ref(), per_page)
+        .await?;
+    Ok(Json(PolicyBlockListResponse {
+        items: page
+            .items
+            .into_iter()
+            .map(to_policy_block_response)
+            .collect(),
+        next_cursor: page.next_cursor,
+        evaluated: page.evaluated,
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(holds_summary, list_quarantine),
+    paths(holds_summary, list_quarantine, list_policy_blocks),
     components(schemas(
         HoldsSummaryResponse,
         QuarantineHoldResponse,
         QuarantineHoldListResponse,
         HoldListQuery,
+        PolicyBlockListQuery,
+        PolicyBlockResponse,
+        PolicyBlockListResponse,
         Pagination,
     )),
-    tags((name = "holds", description = "Download-hold observability: hosted and proxy-cache quarantine"))
+    tags((name = "holds", description = "Download-hold observability: hosted and proxy-cache quarantine, scan-policy blocks"))
 )]
 pub struct DownloadHoldsApiDoc;
 
@@ -222,6 +352,7 @@ mod tests {
             Query(HoldListQuery {
                 repository_key: None,
                 kind: None,
+                hold_source: None,
                 page: None,
                 per_page: None,
             }),
@@ -277,6 +408,7 @@ mod tests {
             Query(HoldListQuery {
                 repository_key: Some(fx.repo_key.clone()),
                 kind: Some("active".into()),
+                hold_source: None,
                 page: Some(1),
                 per_page: Some(20),
             }),
@@ -333,6 +465,7 @@ mod tests {
             Query(HoldListQuery {
                 repository_key: Some(fx.repo_key.clone()),
                 kind: Some("active".into()),
+                hold_source: None,
                 page: Some(1),
                 per_page: Some(20),
             }),
@@ -434,6 +567,7 @@ mod tests {
             Query(HoldListQuery {
                 repository_key: Some(repository_key.to_string()),
                 kind: kind.map(str::to_string),
+                hold_source: None,
                 page: Some(page),
                 per_page: Some(per_page),
             }),
@@ -640,6 +774,7 @@ mod tests {
             Query(HoldListQuery {
                 repository_key: None,
                 kind: Some("pending".into()),
+                hold_source: None,
                 page: None,
                 per_page: None,
             }),
@@ -658,9 +793,10 @@ mod tests {
 mod router_tests {
     use crate::api::handlers::test_db_helpers as tdh;
 
-    const ROUTES: [&str; 2] = [
+    const ROUTES: [&str; 3] = [
         "/api/v1/admin/holds/summary",
         "/api/v1/admin/holds/quarantine",
+        "/api/v1/admin/holds/policy-blocks",
     ];
 
     #[tokio::test]
@@ -670,5 +806,295 @@ mod router_tests {
         };
         tdh::assert_admin_routes_refuse_repo_scoped_tokens(&fx, &ROUTES).await;
         fx.teardown().await;
+    }
+}
+
+/// #4510: the policy-blocks queue is the gate's own decision, and the
+/// quarantine queue reports and filters the hold source.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod policy_blocks_4510_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use sqlx::PgPool;
+
+    fn admin() -> AuthExtension {
+        tdh::admin_auth(Uuid::new_v4(), "admin")
+    }
+
+    async fn page(
+        state: &SharedState,
+        repository_key: &str,
+        cursor: Option<String>,
+        per_page: u32,
+    ) -> PolicyBlockListResponse {
+        let Json(body) = list_policy_blocks(
+            State(state.clone()),
+            Extension(admin()),
+            Query(PolicyBlockListQuery {
+                repository_key: Some(repository_key.to_string()),
+                cursor,
+                per_page: Some(per_page),
+            }),
+        )
+        .await
+        .expect("admin policy-blocks");
+        body
+    }
+
+    async fn seed_hosted(fx: &tdh::Fixture, path: &str) -> Uuid {
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            path,
+            path,
+            "pkg",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from(path.to_string()),
+            fx.user_id,
+        )
+        .await
+    }
+
+    async fn proxy_repo(pool: &PgPool, action: &str) -> (Uuid, String, std::path::PathBuf) {
+        let (id, key, dir) = tdh::create_repo(pool, "remote", "npm").await;
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                                       scan_on_proxy, block_on_policy_violation, \
+                                       severity_threshold, proxy_scan_action) \
+             VALUES ($1, true, false, true, true, 'high', $2)",
+        )
+        .bind(id)
+        .bind(action)
+        .execute(pool)
+        .await
+        .expect("scan config");
+        (id, key, dir)
+    }
+
+    async fn cache_row(pool: &PgPool, repo_id: Uuid, repo_key: &str, path: &str, digest: &str) {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+                                                size_bytes, checksum_sha256) \
+             VALUES ($1, $2, $3, $4, 8, $5)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("proxy-cache/{repo_key}/{path}/__content__"))
+        .bind(format!("proxy-cache/{repo_key}/{path}/__cache_meta__.json"))
+        .bind(digest)
+        .execute(pool)
+        .await
+        .expect("cache row");
+    }
+
+    async fn verdict(pool: &PgPool, digest: &str, max_severity: &str) {
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, findings_count, \
+                                             critical_count, max_severity) \
+             VALUES ($1, 'grype', 'vulnerable', 1, 1, $2)",
+        )
+        .bind(digest)
+        .bind(max_severity)
+        .execute(pool)
+        .await
+        .expect("verdict");
+    }
+
+    /// Hosted half: an artifact the repository's scan policy refuses is
+    /// listed with its violations; one the policy allows (scanned clean) is
+    /// not; without the policy the queue is empty. Paging by cursor visits
+    /// every item once.
+    #[tokio::test]
+    async fn hosted_policy_blocks_follow_the_gate_decision() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let unscanned = seed_hosted(&fx, "pb/unscanned-1.0.bin").await;
+        let also_unscanned = seed_hosted(&fx, "pb/unscanned-2.0.bin").await;
+        let scanned = seed_hosted(&fx, "pb/scanned-1.0.bin").await;
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', 0, NOW(), NOW())",
+        )
+        .bind(scanned)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("scan the third artifact");
+        let without_policy = page(&fx.state, &fx.repo_key, None, 50).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("pb-4510-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("policy");
+        let with_policy = page(&fx.state, &fx.repo_key, None, 50).await;
+        let first = page(&fx.state, &fx.repo_key, None, 1).await;
+        let second = page(&fx.state, &fx.repo_key, first.next_cursor.clone(), 1).await;
+        let third = page(&fx.state, &fx.repo_key, second.next_cursor.clone(), 1).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert!(
+            without_policy.items.is_empty(),
+            "no policy, nothing blocked"
+        );
+        assert_eq!(without_policy.next_cursor, None);
+        let mut ids: Vec<_> = with_policy.items.iter().map(|i| i.artifact_id).collect();
+        ids.sort();
+        let mut want = vec![Some(unscanned), Some(also_unscanned)];
+        want.sort();
+        assert_eq!(ids, want, "the unscanned artifacts only");
+        assert!(with_policy.items.iter().all(|i| i.source == "hosted"));
+        assert!(with_policy.items[0].violations[0].contains("not been scanned"));
+        assert_eq!(with_policy.next_cursor, None);
+        let mut paged: Vec<_> = [&first, &second, &third]
+            .iter()
+            .flat_map(|p| p.items.iter().map(|i| i.artifact_id))
+            .collect();
+        paged.sort();
+        assert_eq!(paged, want, "cursor paging visits each block once");
+        assert!(first.next_cursor.is_some());
+    }
+
+    /// Proxy half: one digest, a vulnerable verdict, cached in two
+    /// repositories. Only the repository whose gate refuses it lists it: the
+    /// record-only one serves it, so it is not a block there.
+    #[tokio::test]
+    async fn proxy_blocks_are_listed_only_where_that_repositorys_gate_refuses() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+        let (blocking, blocking_key, d1) = proxy_repo(&pool, "fail_open").await;
+        let (recording, recording_key, d2) = proxy_repo(&pool, "record_only").await;
+        cache_row(
+            &pool,
+            blocking,
+            &blocking_key,
+            "left-pad/-/left-pad-1.0.0.tgz",
+            &digest,
+        )
+        .await;
+        cache_row(
+            &pool,
+            recording,
+            &recording_key,
+            "left-pad/-/left-pad-1.0.0.tgz",
+            &digest,
+        )
+        .await;
+        verdict(&pool, &digest, "critical").await;
+        let state = tdh::build_state(pool.clone(), d1.to_string_lossy().as_ref());
+        let blocked = page(&state, &blocking_key, None, 50).await;
+        let recorded = page(&state, &recording_key, None, 50).await;
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        for (id, dir) in [(blocking, d1), (recording, d2)] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(blocked.items.len(), 1, "{:?}", blocked.items.len());
+        let item = &blocked.items[0];
+        assert_eq!(item.source, "proxy-cache");
+        assert_eq!(item.path, "left-pad/-/left-pad-1.0.0.tgz");
+        assert_eq!(item.name, "left-pad-1.0.0.tgz");
+        assert_eq!(item.checksum_sha256, digest);
+        assert_eq!(item.max_severity.as_deref(), Some("critical"));
+        assert!(
+            recorded.items.is_empty(),
+            "a record-only repository never refuses, so it lists nothing"
+        );
+    }
+
+    /// The quarantine queue reports `hold_source` and filters on it.
+    #[tokio::test]
+    async fn quarantine_queue_reports_and_filters_hold_source() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let by_admin = seed_hosted(&fx, "hs/admin-1.0.bin").await;
+        let by_policy = seed_hosted(&fx, "hs/policy-1.0.bin").await;
+        for (id, source) in [(by_admin, "admin"), (by_policy, "scan_policy")] {
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+                 quarantine_source = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(source)
+            .execute(&fx.pool)
+            .await
+            .expect("hold");
+        }
+        let list = |hold_source: Option<&str>| {
+            let state = fx.state.clone();
+            let key = fx.repo_key.clone();
+            let hold_source = hold_source.map(str::to_string);
+            async move {
+                list_quarantine(
+                    State(state),
+                    Extension(admin()),
+                    Query(HoldListQuery {
+                        repository_key: Some(key),
+                        kind: None,
+                        hold_source,
+                        page: Some(1),
+                        per_page: Some(20),
+                    }),
+                )
+                .await
+            }
+        };
+        let all = list(None).await.expect("all").0;
+        let policy_only = list(Some("scan_policy")).await.expect("policy").0;
+        let bad = list(Some("scanner")).await;
+        fx.teardown().await;
+
+        assert_eq!(all.pagination.total, 2);
+        assert_eq!(policy_only.pagination.total, 1);
+        assert_eq!(policy_only.items[0].artifact_id, Some(by_policy));
+        assert_eq!(
+            policy_only.items[0].hold_source.as_deref(),
+            Some("scan_policy")
+        );
+        assert!(matches!(bad, Err(crate::error::AppError::Validation(_))));
+    }
+
+    #[test]
+    fn policy_block_cursor_round_trips_and_rejects_garbage() {
+        let now = chrono::DateTime::from_timestamp_micros(1_700_000_000_123_456).unwrap();
+        for c in [
+            PolicyBlockCursor::Proxy { offset: 7 },
+            PolicyBlockCursor::Hosted {
+                created_at: now,
+                id: Uuid::new_v4(),
+            },
+        ] {
+            assert_eq!(PolicyBlockCursor::parse(&c.encode()).unwrap(), c);
+        }
+        for bad in ["", "x.1", "p.-1", "h.1", "h.abc.def", "p.1.2"] {
+            assert!(PolicyBlockCursor::parse(bad).is_err(), "{bad}");
+        }
     }
 }
