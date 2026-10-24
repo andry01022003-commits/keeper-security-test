@@ -833,6 +833,33 @@ pub fn record_proxy_kept_on_upstream_not_found(repo_key: &str) {
     .increment(1);
 }
 
+/// Entries and bytes the per-Remote proxy-cache cap evicted (#4660). A
+/// steady rate means the cap is smaller than the repository's working set and
+/// clients are refetching what it evicts.
+pub fn record_proxy_cache_cap_evictions(repo_key: &str, entries: u64, bytes: u64) {
+    counter!(
+        "ak_proxy_cache_cap_evicted_entries_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(entries);
+    counter!(
+        "ak_proxy_cache_cap_evicted_bytes_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(bytes);
+}
+
+/// An eviction run for the per-Remote proxy-cache cap could not get the cache
+/// under its cap, so the repository refuses new cache fills for a while
+/// (#4660). Any increment needs attention: storage is refusing deletes.
+pub fn record_proxy_cache_cap_refusing(repo_key: &str) {
+    counter!(
+        "ak_proxy_cache_cap_refusing_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
 /// Counters recorded while a test ran, as `(name, labels, value)`; read one
 /// with [`CounterCapture::get`].
 #[cfg(test)]

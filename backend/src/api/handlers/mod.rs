@@ -466,6 +466,7 @@ pub mod promotion;
 pub mod promotion_rules;
 pub mod protobuf;
 pub mod protobuf_bsr;
+pub mod proxy_cache_cap;
 pub mod proxy_helpers;
 pub(crate) mod proxy_scan_archive;
 pub mod pub_registry;

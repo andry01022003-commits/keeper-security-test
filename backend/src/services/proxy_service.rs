@@ -30,6 +30,7 @@ use crate::services::cache_classifier;
 use crate::services::metrics_service::{
     record_proxy_cache_lookup, record_proxy_stale_if_error_response, ProxyCachePublishFailure,
 };
+use crate::services::proxy_cache_cap::ProxyCacheCap;
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
@@ -1896,6 +1897,53 @@ fn upstream_short_body_error(repo_key: &str, expected: u64, received: u64) -> Ap
     }
 }
 
+/// Delete one proxy-cache entry's objects (body before sidecar), the shared
+/// reclaim behind [`ProxyService::evict_cached_entry`] (lifecycle sweep) and
+/// the per-Remote cap (#4660). See that method for the key rules.
+pub(crate) async fn evict_entry_objects(
+    storage: &StorageService,
+    cache_scope: &ProxyCacheScope,
+    repo_key: &str,
+    path: &str,
+    recorded_keys: [&str; 2],
+) -> Result<usize> {
+    let mut keys: Vec<String> = Vec::with_capacity(4);
+    if let Ok(derived) = CacheKeys::derive(cache_scope, repo_key, path) {
+        keys.push(derived.content);
+        keys.push(derived.metadata);
+    }
+    for recorded in recorded_keys {
+        if keys.iter().any(|k| k == recorded) {
+            continue;
+        }
+        if !cache_scope.owns_entry_key(repo_key, recorded) {
+            return Err(AppError::Conflict(format!(
+                "catalogue row records '{recorded}', which is outside the proxy cache of \
+                 '{repo_key}' (renamed repository or corrupt row); entry kept"
+            )));
+        }
+        keys.push(recorded.to_string());
+    }
+    // Bodies before sidecars, as invalidation orders them.
+    keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
+
+    let mut deleted = 0usize;
+    for key in &keys {
+        if !storage.exists(key).await? {
+            continue;
+        }
+        match storage.delete(key).await {
+            Ok(()) => deleted += 1,
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        if key.ends_with("__cache_meta__.json") {
+            invalidate_proxy_metadata_lru(key).await;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Wait for the first byte of a streaming upstream body that advertised a
 /// non-zero `Content-Length`, before the response is handed to the client
 /// (#4759).
@@ -2707,12 +2755,25 @@ pub(crate) struct CachePersister {
     /// 500 (which was caused by an `artifacts` row, removed under #1280).
     db: PgPool,
     storage: Arc<StorageService>,
+    /// Per-Remote cache cap (#4660): a commit schedules an eviction run.
+    /// `None` in the unit tests that build a persister on its own.
+    cap: Option<Arc<ProxyCacheCap>>,
 }
 
 impl CachePersister {
     /// Construct a `CachePersister` over the given DB + storage handles.
     pub(crate) fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
-        Self { db, storage }
+        Self {
+            db,
+            storage,
+            cap: None,
+        }
+    }
+
+    /// Enforce `cap` after every commit this persister makes (#4660).
+    pub(crate) fn with_cap(mut self, cap: Arc<ProxyCacheCap>) -> Self {
+        self.cap = Some(cap);
+        self
     }
 
     /// Cache artifact content and its metadata sidecar (buffered path).
@@ -2876,6 +2937,9 @@ impl CachePersister {
                 fill_started,
             )
             .await;
+            if let Some(cap) = &self.cap {
+                cap.note_fill(repository_id);
+            }
         }
 
         tracing::debug!(
@@ -2953,6 +3017,7 @@ impl CachePersister {
         let catalog_db = self.db.clone();
         // #4542: serves recorded from here on were fed by this fill.
         let fill_started = Utc::now();
+        let cap = self.cap.clone();
 
         // Channel for chunks flowing reader -> writer. mpsc to keep order
         // (broadcast would let storage skip chunks under backpressure,
@@ -3330,6 +3395,9 @@ impl CachePersister {
                                             fill_started,
                                         )
                                         .await;
+                                        if let Some(cap) = &cap {
+                                            cap.note_fill(template.repository_id);
+                                        }
                                     }
                                 }
                             }
@@ -4839,6 +4907,8 @@ impl UpstreamClient {
 pub struct ProxyService {
     db: PgPool,
     storage: Arc<StorageService>,
+    /// Per-Remote proxy-cache byte cap (#4660), shared with the persister.
+    cache_cap: Arc<ProxyCacheCap>,
     /// Owns the cache body/metadata/invalidate/freshness lifecycle (#1618 S7).
     /// The cache-facing public methods on `ProxyService` delegate here.
     cache_store: CacheStore,
@@ -5020,7 +5090,9 @@ impl ProxyService {
             .expect("Failed to create HTTP client");
 
         let cache_store = CacheStore::new(Arc::clone(&storage), cache_scope.clone());
-        let cache_persister = CachePersister::new(db.clone(), Arc::clone(&storage));
+        let cache_cap = ProxyCacheCap::new(db.clone(), Arc::clone(&storage), cache_scope.clone());
+        let cache_persister =
+            CachePersister::new(db.clone(), Arc::clone(&storage)).with_cap(Arc::clone(&cache_cap));
         let upstream_client = UpstreamClient::new(db.clone(), http_client);
         // #1631 layer 1/3: select the single-flight coordinator from config.
         // Defaults to the in-process buffered coordinator; multi-replica
@@ -5033,6 +5105,7 @@ impl ProxyService {
         Self {
             db,
             storage,
+            cache_cap,
             cache_store,
             cache_persister,
             upstream_client,
@@ -5067,6 +5140,12 @@ impl ProxyService {
     pub(crate) fn without_origin_policy_gate(mut self) -> Self {
         self.origin_policy_gate = false;
         self
+    }
+
+    /// The per-Remote proxy-cache cap enforcer (#4660), for the API that sets
+    /// a cap and runs an eviction at once.
+    pub fn cache_cap(&self) -> &Arc<ProxyCacheCap> {
+        &self.cache_cap
     }
 
     /// This deployment's proxy-cache key scope (#3454). Handlers that derive a
@@ -5884,11 +5963,14 @@ impl ProxyService {
                         // reading the field directly made this guard inert on
                         // exactly the paths that serve proxy traffic. See
                         // [`Self::resolve_quota_bytes`].
-                        let quota_bytes = self.resolve_quota_bytes(repo).await;
+                        // #4660: the Remote's cache cap is a ceiling too, and a
+                        // Remote whose eviction cannot get under its cap takes
+                        // no fills at all.
+                        let quota_bytes = self.resolve_cache_ceiling_bytes(repo).await;
                         let quota_ok = !cache_classifier::exceeds_single_object_quota(
                             quota_bytes,
                             resp.content.len() as i64,
-                        );
+                        ) && self.cache_fill_admitted(repo).await;
                         if !quota_ok {
                             tracing::warn!(
                                 target: "security",
@@ -6883,7 +6965,22 @@ impl ProxyService {
         // Policy hold (#3912): the bypass serves the raw upstream body with no
         // cache write, which would hand out a held artifact with no releasable
         // record. Under a hold the answer is the same 409 the tee path gives.
-        let max_cache_bytes = Self::quota_to_cache_ceiling(self.resolve_quota_bytes(repo).await);
+        let max_cache_bytes =
+            Self::quota_to_cache_ceiling(self.resolve_cache_ceiling_bytes(repo).await);
+        if !self.cache_fill_admitted(repo).await {
+            // #4660 refusal fallback: stream it, write nothing.
+            self.note_served_without_cache(repo.id, cache_path).await;
+            if hold_active {
+                return Err(AppError::Conflict(
+                    "Artifact is quarantined and pending security review".to_string(),
+                ));
+            }
+            return Ok(StreamHandle {
+                body: upstream.body,
+                headers,
+                cache_published: None,
+            });
+        }
         if let (Some(limit), Some(advertised)) = (max_cache_bytes, upstream.content_length) {
             if advertised > limit {
                 tracing::warn!(
@@ -7462,41 +7559,14 @@ impl ProxyService {
         path: &str,
         recorded_keys: [&str; 2],
     ) -> Result<usize> {
-        let mut keys: Vec<String> = Vec::with_capacity(4);
-        if let Ok(derived) = CacheKeys::derive(&self.cache_scope, repo_key, path) {
-            keys.push(derived.content);
-            keys.push(derived.metadata);
-        }
-        for recorded in recorded_keys {
-            if keys.iter().any(|k| k == recorded) {
-                continue;
-            }
-            if !self.cache_scope.owns_entry_key(repo_key, recorded) {
-                return Err(AppError::Conflict(format!(
-                    "catalogue row records '{recorded}', which is outside the proxy cache of \
-                     '{repo_key}' (renamed repository or corrupt row); entry kept"
-                )));
-            }
-            keys.push(recorded.to_string());
-        }
-        // Bodies before sidecars, as invalidation orders them.
-        keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
-
-        let mut deleted = 0usize;
-        for key in &keys {
-            if !self.storage.exists(key).await? {
-                continue;
-            }
-            match self.storage.delete(key).await {
-                Ok(()) => deleted += 1,
-                Err(AppError::NotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-            if key.ends_with("__cache_meta__.json") {
-                invalidate_proxy_metadata_lru(key).await;
-            }
-        }
-        Ok(deleted)
+        evict_entry_objects(
+            &self.storage,
+            &self.cache_scope,
+            repo_key,
+            path,
+            recorded_keys,
+        )
+        .await
     }
 
     /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
@@ -8526,6 +8596,33 @@ impl ProxyService {
             .flatten()
         };
         raw.filter(|q| *q > 0)
+    }
+
+    /// The per-object cache ceiling of a Remote (#4660): its `quota_bytes`
+    /// (#2928) or its proxy-cache cap, whichever is smaller. An object larger
+    /// than the cap can never be cached without evicting everything else and
+    /// still being over it, so it is served without a cache write, like one
+    /// over the quota.
+    async fn resolve_cache_ceiling_bytes(&self, repo: &Repository) -> Option<i64> {
+        let quota = self.resolve_quota_bytes(repo).await;
+        let cap = self.cache_cap.cap_bytes(repo.id).await;
+        match (quota, cap) {
+            (Some(q), Some(c)) => Some(q.min(c)),
+            (q, c) => q.or(c),
+        }
+    }
+
+    /// Whether `repo` takes a cache fill now (#4660): `false` only while its
+    /// last cap eviction could not get the cache under the cap.
+    async fn cache_fill_admitted(&self, repo: &Repository) -> bool {
+        if self.cache_cap.admits_fills(repo.id).await {
+            return true;
+        }
+        tracing::debug!(
+            repository = %repo.key,
+            "proxy cache is over its cap and eviction is failing; serving without caching"
+        );
+        false
     }
 
     /// The configured quota expressed as the per-object cache ceiling used by

@@ -1099,6 +1099,9 @@ fn api_v1_routes(
                 // Bulk artifact presence check for air-gap imports (#3427):
                 // POST /repositories/{key}/artifacts-missing.
                 .merge(handlers::artifact_presence::repo_router())
+                // Per-Remote proxy-cache cap and usage (#4660):
+                // GET/PUT/DELETE /repositories/{key}/proxy-cache-cap.
+                .merge(handlers::proxy_cache_cap::repo_router())
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).
