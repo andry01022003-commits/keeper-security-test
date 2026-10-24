@@ -1309,6 +1309,12 @@ async fn download_archive(
 
     // Strip .zip extension from reference if present
     let reference = reference.trim_end_matches(".zip");
+    // #4365 item 3 (#4105): on a proxying repository these segments name the
+    // upstream metadata document and the dist the gate fetches and caches.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&vendor, &package, &version, reference],
+    )?;
 
     // Find the artifact by name, version, and sha256 reference
     let artifact = sqlx::query!(
@@ -5017,6 +5023,42 @@ mod scan_on_proxy_4105 {
     }
 
     archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/dist/{NAME}/1.0.0%3Fx/{REFERENCE}.zip"),
+                format!("/{key}/dist/{NAME}/1.0.0/{REFERENCE}%3Bx.zip"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
 
     #[test]
     fn a_dist_that_names_the_requested_package_is_graded_on_its_contents() {

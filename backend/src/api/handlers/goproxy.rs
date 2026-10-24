@@ -211,6 +211,13 @@ async fn handle_get(
 ) -> Result<Response, Response> {
     let repo = resolve_go_repo(&state.db, &repo_key).await?;
     let request = parse_path(&path)?;
+    // #4365 item 3 (#4103): on a proxying repository the module and version
+    // are joined into the upstream path of every operation, with only a
+    // suffix after the version (`.mod`, `.info`, `.zip`). A `?` there moves
+    // that suffix into the upstream query, so `v1.0.0.zip%3F.mod` would fetch
+    // the module zip and serve it on the unscanned `.mod` route. Refused
+    // before anything is fetched or cached.
+    reject_ambiguous_go_request(&repo, &request)?;
 
     match request {
         GoProxyRequest::List { module } => {
@@ -229,6 +236,27 @@ async fn handle_get(
             latest_version(&state, auth.as_ref(), &repo, &module).await
         }
         GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
+    }
+}
+
+/// The client-derived segments of a parsed request that a proxying (Remote
+/// or Virtual) repository joins into an upstream path (#4365 item 3), as a
+/// `400` when one is ambiguous. `sumdb/` requests have their own host
+/// allowlist and are not joined onto the repository's upstream.
+#[allow(clippy::result_large_err)]
+fn reject_ambiguous_go_request(repo: &RepoInfo, request: &GoProxyRequest) -> Result<(), Response> {
+    let proxied =
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual;
+    match request {
+        GoProxyRequest::List { module } | GoProxyRequest::Latest { module } => {
+            proxy_helpers::reject_ambiguous_client_segments(proxied, &[module])
+        }
+        GoProxyRequest::Info { module, version }
+        | GoProxyRequest::Mod { module, version }
+        | GoProxyRequest::Zip { module, version } => {
+            proxy_helpers::reject_ambiguous_client_segments(proxied, &[module, version])
+        }
+        GoProxyRequest::SumDb { .. } => Ok(()),
     }
 }
 
@@ -4288,7 +4316,7 @@ mod catalog_registration_tests {
 mod scan_on_proxy_4103 {
     use super::*;
     use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
-    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use crate::api::handlers::proxy_scan_archive::{self, ArchiveIdentity};
 
     const MODULE: &str = "example.com/dtf/Scanned";
     const VERSION: &str = "v1.0.0";
@@ -4337,6 +4365,49 @@ mod scan_on_proxy_4103 {
     }
 
     archive_scan_suite!(case);
+
+    /// #4365 item 3: a `?` in the version moves the route's suffix into the
+    /// upstream query, so `v1.0.0.zip%3F.mod` asked the upstream for the
+    /// module zip on the unscanned `.mod` (and `.info`) route and served it,
+    /// even while the zip route withheld the same bytes. Refused with 400 on
+    /// every operation of a proxying repository, before any upstream fetch.
+    #[tokio::test]
+    async fn a_query_smuggled_into_the_version_is_refused() {
+        let Some(rig) = proxy_scan_archive::test_support::Rig::new(case, Some("fail_closed")).await
+        else {
+            return;
+        };
+        let module = encode_module_path(MODULE);
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for op in [
+                format!("@v/{VERSION}.zip%3F.mod"),
+                format!("@v/{VERSION}.zip%3F.info"),
+                format!("@v/{VERSION}.zip%3Fx.zip"),
+                format!("@v/{VERSION}.zip%23.mod"),
+                format!("@v/{VERSION}.zip%3B.mod"),
+            ] {
+                let (status, body, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(format!("/{key}/{module}/{op}")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{key} {op}");
+                assert_ne!(&body[..], &rig.case.body[..], "{key} {op}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        // The well-formed zip route still answers through the gate.
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED);
+        rig.teardown().await;
+    }
 
     #[test]
     fn a_zip_that_is_the_requested_module_is_graded_on_its_contents() {

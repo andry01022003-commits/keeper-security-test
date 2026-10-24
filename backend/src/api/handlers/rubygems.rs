@@ -220,6 +220,12 @@ async fn download_gem(
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
     let filename = gem_file.trim_start_matches('/');
+    // #4365 item 3 (#4104): on a proxying repository the file name is joined
+    // into the upstream path and keys the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
 
     let artifact =
         match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
@@ -3177,6 +3183,42 @@ mod scan_on_proxy_4104 {
     }
 
     archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/gems/{FILE}%3Fx"),
+                format!("/{key}/gems/{FILE}%23x"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
 
     #[test]
     fn a_gem_that_declares_its_file_name_is_pinned_as_itself() {
