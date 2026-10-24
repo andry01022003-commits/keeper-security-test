@@ -37,7 +37,9 @@ Any other value of an `OTEL_*_EXPORTER` variable keeps that signal's default
 and is reported by a startup warning. The derived endpoints are the shared one
 for gRPC, and for `http/protobuf` the traces URL with `/v1/traces` replaced by
 `/v1/logs` or `/v1/metrics`. The startup line `OpenTelemetry tracing enabled`
-lists the exported signals in its `signals` field.
+lists the exported signals in its `signals` field. The spans and their
+attributes, and how a request joins the trace of the proxy in front of the
+backend (`traceparent`), are described in [tracing.md](tracing.md).
 
 **Log records.** Every event that `RUST_LOG` lets through to stdout is also
 exported, so stdout output is unchanged and is not replaced: turn
