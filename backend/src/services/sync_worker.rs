@@ -504,7 +504,7 @@ struct PeerHeartbeatRow {
 }
 
 /// Lightweight projection of a pending sync task joined with the artifact.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 struct TaskRow {
     id: Uuid,
@@ -1138,6 +1138,26 @@ async fn execute_transfer(
         .await;
     }
 
+    // #4921: a protobuf commit row written before the fix carries the commit
+    // digest in `checksum_sha256`, which the peer would reject as a checksum
+    // mismatch. Repair it from the stored bytes and push the real sha256.
+    let repaired;
+    let task = match repair_legacy_protobuf_commit_checksum(db, &storage_registry, task).await {
+        Some(checksum) => {
+            repaired = Claimed::from_claim_row(
+                TaskRow {
+                    checksum_sha256: checksum,
+                    ..(**task).clone()
+                },
+                task.claim_token(),
+                task.claimed_by().to_string(),
+                task.claim_expires_at(),
+            );
+            &repaired
+        }
+        None => task,
+    };
+
     // Push flow: decide between single-request upload and chunked transfer
     // based on the artifact size or the need to preserve metadata.
     let threshold = chunked_threshold_bytes();
@@ -1199,7 +1219,8 @@ async fn execute_transfer(
                 .await
                 .unwrap_or_else(|_| unreadable_response_body());
             let msg = format_peer_response_failure("Remote peer returned", status.as_u16(), &body);
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            let scope = failure_scope_for_peer_response(status.as_u16(), &body);
+            handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
             Err(msg)
         }
         Err(e) => {
@@ -1743,8 +1764,9 @@ async fn execute_chunked_transfer(
                 .await
                 .unwrap_or_else(|_| unreadable_response_body());
             let msg = format!("Chunked upload session complete returned {status}: {body}");
+            let scope = failure_scope_for_peer_response(status.as_u16(), &body);
             cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
             Err(msg)
         }
         Err(e) => {
@@ -2047,6 +2069,101 @@ pub(crate) fn format_retry_log(
     }
 }
 
+/// Who a failed transfer is charged to (#4921).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureScope {
+    /// The peer could not take the transfer (5xx, connection error, timeout,
+    /// auth): count it against the peer and back the peer off.
+    Peer,
+    /// The peer is healthy but refuses this one artifact for a reason that a
+    /// retry of the same row cannot change (checksum mismatch, immutable path
+    /// already occupied). Fail the task without spending the peer's backoff.
+    Item,
+}
+
+/// Classify a non-success peer response (#4921).
+///
+/// Only a 400 or 409 whose body names a checksum mismatch or an occupied
+/// immutable path is an item rejection. Every other status, including a 409
+/// for a chunk still in progress, stays a peer failure so it backs off and
+/// retries as before.
+pub(crate) fn failure_scope_for_peer_response(status: u16, body: &str) -> FailureScope {
+    if !matches!(status, 400 | 409) {
+        return FailureScope::Peer;
+    }
+    let body = body.to_ascii_lowercase();
+    if body.contains("checksum mismatch") || body.contains("already exists and is immutable") {
+        FailureScope::Item
+    } else {
+        FailureScope::Peer
+    }
+}
+
+/// True for a protobuf commit row written before #4921: its `checksum_sha256`
+/// holds the commit digest (also the row's `version`) instead of the sha256
+/// of the stored bundle.
+fn is_legacy_protobuf_commit_checksum(task: &TaskRow) -> bool {
+    task.task_type == "push"
+        && task.artifact_metadata_format.as_deref() == Some("protobuf")
+        && task.artifact_path.contains("/commits/")
+        && task
+            .artifact_version
+            .as_deref()
+            .is_some_and(|v| !v.is_empty() && v == task.checksum_sha256.trim())
+}
+
+/// Recompute and persist the real sha256 of a pre-#4921 protobuf commit row.
+///
+/// Returns the sha256 of the stored bytes when the row was repaired (or a
+/// concurrent worker already repaired it to the same value), `None` when the
+/// row needs no repair or the bytes cannot be read (the transfer then fails
+/// through its normal path). The UPDATE is guarded on the old value, so it is
+/// idempotent and never overwrites a newer write.
+async fn repair_legacy_protobuf_commit_checksum(
+    db: &PgPool,
+    storage_registry: &StorageRegistry,
+    task: &TaskRow,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    if !is_legacy_protobuf_commit_checksum(task) {
+        return None;
+    }
+    let bytes = match read_artifact_from_storage(storage_registry, task).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "Cannot repair the checksum of protobuf commit '{}' (task {}): {e}",
+                task.artifact_path,
+                task.id
+            );
+            return None;
+        }
+    };
+    let checksum = format!("{:x}", Sha256::digest(&bytes));
+    if let Err(e) = sqlx::query(
+        "UPDATE artifacts SET checksum_sha256 = $2 \
+         WHERE id = $1 AND checksum_sha256 = $3",
+    )
+    .bind(task.artifact_id)
+    .bind(&checksum)
+    .bind(task.checksum_sha256.trim())
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            "Failed to store the repaired checksum of protobuf commit '{}': {e}",
+            task.artifact_path
+        );
+    } else {
+        tracing::info!(
+            "Repaired the checksum of protobuf commit '{}' from its stored bytes before push",
+            task.artifact_path
+        );
+    }
+    Some(checksum)
+}
+
 /// Handle a failed transfer: mark task, apply backoff, update peer counters.
 ///
 /// If the task has remaining retries (`retry_count < max_retries`), it is
@@ -2059,7 +2176,29 @@ async fn handle_transfer_failure(
     error_message: &str,
     retry_policy: SyncRetryPolicy,
 ) {
-    let decision = evaluate_task_failure(task.retry_count, task.max_retries);
+    handle_transfer_failure_scoped(db, task, error_message, retry_policy, FailureScope::Peer).await
+}
+
+/// [`handle_transfer_failure`] with an explicit [`FailureScope`].
+///
+/// An [`FailureScope::Item`] failure marks the task permanently failed (the
+/// peer-recovery reset skips it; a later change to the artifact row re-arms
+/// it through `rearm_if_superseded` or a fresh queue) and leaves the peer's
+/// `consecutive_failures` and `backoff_until` alone, so the peer's other
+/// deliveries continue on the next tick.
+async fn handle_transfer_failure_scoped(
+    db: &PgPool,
+    task: &Claimed<TaskRow>,
+    error_message: &str,
+    retry_policy: SyncRetryPolicy,
+    scope: FailureScope,
+) {
+    let decision = match scope {
+        FailureScope::Peer => evaluate_task_failure(task.retry_count, task.max_retries),
+        FailureScope::Item => RetryDecision::PermanentlyFailed {
+            total_attempts: (task.retry_count + 1).max(task.max_retries),
+        },
+    };
 
     // Mark task as failed with updated retry count (owner only). If the claim
     // was lost, the current owner drives the task's fate; skip the peer
@@ -2101,6 +2240,31 @@ async fn handle_transfer_failure(
             tracing::warn!("Failed to mark sync task {} failed: {e}", task.id);
             return;
         }
+    }
+
+    if scope == FailureScope::Item {
+        tracing::warn!(
+            "Sync task {} rejected by the peer for artifact '{}'; not retrying it and \
+             not backing off the peer: {}",
+            task.id,
+            task.artifact_path,
+            error_message
+        );
+        let _ = sqlx::query(
+            r#"
+            UPDATE peer_instances
+            SET
+                active_transfers = GREATEST(active_transfers - 1, 0),
+                transfer_failures_total = transfer_failures_total + 1,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(task.peer_instance_id)
+        .execute(db)
+        .await;
+        rearm_if_superseded(db, task).await;
+        return;
     }
 
     let log_msg = format_retry_log(task.id, &decision, error_message);
@@ -4878,6 +5042,280 @@ mod tests {
         assert_eq!((status.as_str(), retry_count, token), ("pending", 0, None));
 
         teardown_claim_fixture(&f).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4921: protobuf commit pushes and item-scoped failures
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn peer_response_scope_separates_item_rejections_4921() {
+        assert_eq!(
+            failure_scope_for_peer_response(
+                409,
+                r#"{"error":"checksum mismatch: expected aa, got bb"}"#
+            ),
+            FailureScope::Item
+        );
+        assert_eq!(
+            failure_scope_for_peer_response(
+                400,
+                r#"{"message":"SHA-256 checksum mismatch: declared aa but actual content hashes to bb"}"#
+            ),
+            FailureScope::Item
+        );
+        assert_eq!(
+            failure_scope_for_peer_response(
+                409,
+                r#"{"code":"CONFLICT","message":"Artifact version already exists and is immutable"}"#
+            ),
+            FailureScope::Item
+        );
+        // A chunk still in progress is a transient 409.
+        assert_eq!(
+            failure_scope_for_peer_response(409, "Chunk 0 is already being uploaded"),
+            FailureScope::Peer
+        );
+        for status in [401, 403, 404, 429, 500, 502, 503] {
+            assert_eq!(
+                failure_scope_for_peer_response(status, "checksum mismatch"),
+                FailureScope::Peer,
+                "{status}"
+            );
+        }
+    }
+
+    /// Turn the fixture's single artifact into a stored protobuf commit
+    /// bundle. `legacy` writes the pre-#4921 row shape (commit digest in
+    /// `checksum_sha256`). Returns the bundle bytes and their sha256.
+    async fn make_protobuf_commit_row(f: &ClaimFixture, legacy: bool) -> (Vec<u8>, String) {
+        use sha2::{Digest, Sha256};
+        let bundle = format!("protobuf bundle {}", Uuid::new_v4()).into_bytes();
+        let sha = format!("{:x}", Sha256::digest(&bundle));
+        let digest = format!("{:x}", Sha256::digest(format!("digest-{sha}")));
+        let (artifact_id, storage_key): (Uuid, String) = sqlx::query_as(
+            "SELECT a.id, a.storage_key FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id WHERE st.id = $1",
+        )
+        .bind(f.task_ids[0])
+        .fetch_one(&f.pool)
+        .await
+        .expect("fixture artifact");
+        let (backend, path): (String, String) =
+            sqlx::query_as("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("repo storage");
+        assert_eq!(backend, "filesystem");
+        let fs = crate::storage::filesystem::FilesystemStorage::new(&path);
+        crate::storage::StorageBackend::put(&fs, &storage_key, Bytes::from(bundle.clone()))
+            .await
+            .expect("store bundle");
+        sqlx::query(
+            "UPDATE artifacts SET path = $2, name = 'acme/pushed', version = $3, \
+                 size_bytes = $4, checksum_sha256 = $5, content_type = 'application/gzip' \
+             WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .bind(format!("modules/acme/pushed/commits/{digest}"))
+        .bind(&digest)
+        .bind(bundle.len() as i64)
+        .bind(if legacy { &digest } else { &sha })
+        .execute(&f.pool)
+        .await
+        .expect("protobuf commit row");
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'protobuf', $2)",
+        )
+        .bind(artifact_id)
+        .bind(serde_json::json!({ "moduleName": "acme/pushed", "commitDigest": digest }))
+        .execute(&f.pool)
+        .await
+        .expect("protobuf metadata");
+        (bundle, sha)
+    }
+
+    /// A peer that accepts upload sessions; the session complete answers
+    /// `complete_status` with `complete_body`.
+    async fn mock_upload_peer(complete_status: u16, complete_body: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let session_id = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path("/api/v1/uploads"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "session_id": session_id })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/uploads/{session_id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/api/v1/uploads/[^/]+/complete$"))
+            .respond_with(ResponseTemplate::new(complete_status).set_body_string(complete_body))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn fast_retry_policy() -> SyncRetryPolicy {
+        SyncRetryPolicy {
+            max_retries: 3,
+            backoff_base_secs: 300,
+            backoff_max_secs: 300,
+        }
+    }
+
+    async fn run_claimed_transfer(
+        f: &ClaimFixture,
+        server: &wiremock::MockServer,
+    ) -> Result<(), String> {
+        let claimed = claim_all(f, 5, 5, "worker-4921", 60.0).await;
+        assert_eq!(claimed.len(), 1);
+        let registry = Arc::new(StorageRegistry::new(
+            HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        execute_transfer(
+            &f.pool,
+            &reqwest::Client::new(),
+            registry,
+            &claimed[0],
+            &server.uri(),
+            "peer-key",
+            fast_retry_policy(),
+        )
+        .await
+    }
+
+    /// The checksum the worker declared when it opened the peer session, and
+    /// the bytes it sent.
+    async fn sent_session(server: &wiremock::MockServer) -> (String, Vec<u8>) {
+        let requests = server.received_requests().await.expect("recorded requests");
+        let init = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .expect("session init");
+        let body: serde_json::Value = serde_json::from_slice(&init.body).unwrap();
+        let sent: Vec<u8> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .flat_map(|r| r.body.clone())
+            .collect();
+        (body["checksum_sha256"].as_str().unwrap().to_string(), sent)
+    }
+
+    /// #4921: a protobuf commit row written before the fix still pushes. The
+    /// worker sends the sha256 of the stored bundle (what the peer verifies),
+    /// not the commit digest held in the row, and repairs the row.
+    #[tokio::test]
+    async fn legacy_protobuf_commit_row_pushes_with_bundle_sha256_4921() {
+        use sha2::{Digest, Sha256};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let (bundle, sha) = make_protobuf_commit_row(&f, true).await;
+        let server = mock_upload_peer(200, "{}").await;
+
+        let result = run_claimed_transfer(&f, &server).await;
+        let (declared, sent) = sent_session(&server).await;
+        let (status, row_checksum): (String, String) = sqlx::query_as(
+            "SELECT st.status::TEXT, a.checksum_sha256 FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id WHERE st.id = $1",
+        )
+        .bind(f.task_ids[0])
+        .fetch_one(&f.pool)
+        .await
+        .expect("task");
+        teardown_claim_fixture(&f).await;
+
+        assert_eq!(sent, bundle);
+        assert_eq!(
+            declared,
+            format!("{:x}", Sha256::digest(&sent)),
+            "the declared checksum must be the sha256 of the pushed bytes"
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(status, "completed");
+        assert_eq!(row_checksum.trim(), sha, "the legacy row is repaired");
+    }
+
+    /// #4921: a permanent rejection of one artifact (409 checksum mismatch)
+    /// fails that task for good but must not back off the whole peer; a
+    /// transient 5xx still does.
+    #[tokio::test]
+    async fn item_rejection_does_not_back_off_the_peer_4921() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        make_protobuf_commit_row(&f, false).await;
+        let server =
+            mock_upload_peer(409, r#"{"error":"checksum mismatch: expected aa, got bb"}"#).await;
+
+        let result = run_claimed_transfer(&f, &server).await;
+        let (backoff_set, consecutive, active): (bool, i32, i32) = sqlx::query_as(
+            "SELECT backoff_until IS NOT NULL AND backoff_until > NOW(), \
+                    consecutive_failures, active_transfers \
+             FROM peer_instances WHERE id = $1",
+        )
+        .bind(f.peer_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("peer");
+        let (status, retry_count, max_retries): (String, i32, i32) = sqlx::query_as(
+            "SELECT status::TEXT, retry_count, max_retries FROM sync_tasks WHERE id = $1",
+        )
+        .bind(f.task_ids[0])
+        .fetch_one(&f.pool)
+        .await
+        .expect("task");
+
+        // Control: a transient failure of the same task backs the peer off.
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'pending', retry_count = 0, \
+                 completed_at = NULL, error_message = NULL WHERE id = $1",
+        )
+        .bind(f.task_ids[0])
+        .execute(&f.pool)
+        .await
+        .expect("reset task");
+        let flaky = mock_upload_peer(503, "unavailable").await;
+        let transient = run_claimed_transfer(&f, &flaky).await;
+        let transient_backoff: bool = sqlx::query_scalar(
+            "SELECT backoff_until IS NOT NULL AND backoff_until > NOW() \
+             FROM peer_instances WHERE id = $1",
+        )
+        .bind(f.peer_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("peer");
+        teardown_claim_fixture(&f).await;
+
+        assert!(result.is_err());
+        assert!(
+            !backoff_set,
+            "a per-artifact rejection must not put the peer into backoff"
+        );
+        assert_eq!(consecutive, 0);
+        assert_eq!(active, 0);
+        assert_eq!(status, "failed");
+        assert!(
+            retry_count >= max_retries.max(fast_retry_policy().max_retries),
+            "the rejected task must not be reset for retry ({retry_count}/{max_retries})"
+        );
+        assert!(transient.is_err());
+        assert!(transient_backoff, "a 503 still backs the peer off");
     }
 
     /// The in-statement live-claim count caps the batch at the peer's
