@@ -189,6 +189,48 @@ async fn cursor_render_is_byte_identical_to_the_document_render_4176() {
     .execute(&fx.pool)
     .await
     .unwrap();
+    // Held now: an upload hold that has not lapsed, and a permanent admin
+    // hold (no expiry). Neither is listed; the name's older build is.
+    let live_hold = seed(
+        &fx,
+        &format!("{s}/rr-h-2.0-h0_0.conda"),
+        "rr-h",
+        Some(meta("rr-h", "2.0", s)),
+        4,
+    )
+    .await;
+    seed(
+        &fx,
+        &format!("{s}/rr-h-1.0-h0_0.conda"),
+        "rr-h",
+        Some(meta("rr-h", "1.0", s)),
+        45,
+    )
+    .await;
+    let admin_hold = seed(
+        &fx,
+        &format!("{s}/rr-i-1.0-h0_0.tar.bz2"),
+        "rr-i",
+        Some(meta("rr-i", "1.0", s)),
+        3,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'quarantined', \
+                quarantine_until = NOW() + INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind(live_hold)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL \
+          WHERE id = $1",
+    )
+    .bind(admin_hold)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
     // Soft-deleted: named in `removed`.
     let gone = seed(
         &fx,
@@ -203,6 +245,31 @@ async fn cursor_render_is_byte_identical_to_the_document_render_4176() {
         .execute(&fx.pool)
         .await
         .unwrap();
+
+    // The fixture exercises every case it names: the listed set is exactly
+    // the visible packages.
+    let (json, ..) = reference(&fx, s, chrono::Utc::now()).await;
+    let doc: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let mut listed: Vec<&str> = doc["packages"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .chain(doc["packages.conda"].as_object().unwrap().keys())
+        .map(String::as_str)
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![
+            "rr-a-1.0-h0_0.tar.bz2",
+            "rr-a-2.0-h0_0.conda",
+            "rr-a-2.0-h0_0.tar.bz2",
+            "rr-b-1.0-h0_0.conda",
+            "rr-c-0.1-0.tar.bz2",
+            "rr-f-1.0-h0_0.conda",
+            "rr-h-1.0-h0_0.conda",
+        ]
+    );
 
     for subdir in [s, "noarch", "osx-arm64"] {
         let now = chrono::Utc::now();
