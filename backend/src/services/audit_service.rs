@@ -1425,10 +1425,16 @@ const PROXY_SCAN_BLOCK_MAX_KEYS: usize = 10_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockAdmission {
     /// First block of this key in a window: write a row now (`attempts: 1`).
-    Write,
-    /// A repeat inside the window: count it. `schedule_flush` is true for the
-    /// first repeat, whose caller schedules the window's summary row.
-    Suppress { schedule_flush: bool },
+    /// `closed_repeats` is the repeat count of the expired window this block
+    /// replaced when its summary row had not been written yet; the caller
+    /// writes that summary too, so no repeat is lost or counted twice.
+    Write { closed_repeats: u64 },
+    /// A repeat inside the window: count it. `flush_window` is the window's
+    /// start for the first repeat, whose caller schedules the window's
+    /// summary row for when the window closes; `None` for later repeats.
+    Suppress {
+        flush_window: Option<std::time::Instant>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1450,17 +1456,26 @@ impl BlockAggregator {
         key: (String, String, Uuid),
         now: std::time::Instant,
     ) -> BlockAdmission {
+        let mut closed_repeats = 0;
         if let Some(w) = self.windows.get_mut(&key) {
             if now.duration_since(w.started) < PROXY_SCAN_BLOCK_WINDOW {
                 w.suppressed += 1;
                 return BlockAdmission::Suppress {
-                    schedule_flush: w.suppressed == 1,
+                    flush_window: (w.suppressed == 1).then_some(w.started),
                 };
             }
+            // The window closed but its summary has not been taken yet: this
+            // block takes it over (the pending flush then finds a newer
+            // window and writes nothing).
+            closed_repeats = w.suppressed;
         }
         if self.windows.len() >= PROXY_SCAN_BLOCK_MAX_KEYS {
-            self.windows
-                .retain(|_, w| now.duration_since(w.started) < PROXY_SCAN_BLOCK_WINDOW);
+            // Drop closed windows that owe no summary. One that does is
+            // removed by its own flush within a window, so the map stays
+            // bounded.
+            self.windows.retain(|_, w| {
+                now.duration_since(w.started) < PROXY_SCAN_BLOCK_WINDOW || w.suppressed > 0
+            });
         }
         if self.windows.len() < PROXY_SCAN_BLOCK_MAX_KEYS || self.windows.contains_key(&key) {
             self.windows.insert(
@@ -1471,13 +1486,25 @@ impl BlockAggregator {
                 },
             );
         }
-        BlockAdmission::Write
+        BlockAdmission::Write { closed_repeats }
     }
 
-    /// Close a window: the repeats it absorbed, for its summary row. The key
-    /// is forgotten, so the next block starts a new window with a fresh row.
-    pub(crate) fn take_suppressed(&mut self, key: &(String, String, Uuid)) -> u64 {
-        self.windows.remove(key).map(|w| w.suppressed).unwrap_or(0)
+    /// Close the window that started at `started`: the repeats it absorbed,
+    /// for its summary row. The key is forgotten, so the next block starts a
+    /// new window with a fresh row. A newer window under the same key (a
+    /// block that arrived after `started`'s window closed and took its
+    /// count over) is left alone and yields 0.
+    pub(crate) fn take_suppressed(
+        &mut self,
+        key: &(String, String, Uuid),
+        started: std::time::Instant,
+    ) -> u64 {
+        match self.windows.get(key) {
+            Some(w) if w.started == started => {
+                self.windows.remove(key).map(|w| w.suppressed).unwrap_or(0)
+            }
+            _ => 0,
+        }
     }
 }
 
@@ -1555,26 +1582,35 @@ pub fn record_proxy_scan_blocked(db: &PgPool, event: ProxyScanBlockEvent) {
     };
     let db = db.clone();
     match admission {
-        BlockAdmission::Write => {
+        BlockAdmission::Write { closed_repeats } => {
             tokio::spawn(async move {
+                if closed_repeats > 0 {
+                    write_proxy_scan_blocked(&db, &event, &principal, closed_repeats, true).await;
+                }
                 write_proxy_scan_blocked(&db, &event, &principal, 1, false).await;
             });
         }
         BlockAdmission::Suppress {
-            schedule_flush: true,
+            flush_window: Some(started),
         } => {
             tokio::spawn(async move {
-                tokio::time::sleep(PROXY_SCAN_BLOCK_WINDOW).await;
+                // Flush when the window closes, not a full window after its
+                // first repeat: a block arriving in between would otherwise
+                // start a new window under the same key.
+                tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    started + PROXY_SCAN_BLOCK_WINDOW,
+                ))
+                .await;
                 let repeats = match block_aggregator().lock() {
-                    Ok(mut agg) => agg.take_suppressed(&key),
-                    Err(poisoned) => poisoned.into_inner().take_suppressed(&key),
+                    Ok(mut agg) => agg.take_suppressed(&key, started),
+                    Err(poisoned) => poisoned.into_inner().take_suppressed(&key, started),
                 };
                 if repeats > 0 {
                     write_proxy_scan_blocked(&db, &event, &principal, repeats, true).await;
                 }
             });
         }
-        BlockAdmission::Suppress { .. } => {}
+        BlockAdmission::Suppress { flush_window: None } => {}
     }
 }
 
@@ -1682,40 +1718,90 @@ mod proxy_scan_blocked_4777_tests {
     fn aggregation_writes_once_per_window_and_counts_repeats() {
         let mut agg = BlockAggregator::default();
         let t0 = Instant::now();
+        let write = BlockAdmission::Write { closed_repeats: 0 };
         let k = key("d1", "user:ci");
-        assert_eq!(agg.admit(k.clone(), t0), BlockAdmission::Write);
+        assert_eq!(agg.admit(k.clone(), t0), write);
         assert_eq!(
             agg.admit(k.clone(), t0 + Duration::from_secs(1)),
             BlockAdmission::Suppress {
-                schedule_flush: true
+                flush_window: Some(t0)
             }
         );
         for i in 2..50 {
             assert_eq!(
                 agg.admit(k.clone(), t0 + Duration::from_millis(1000 + i)),
-                BlockAdmission::Suppress {
-                    schedule_flush: false
-                }
+                BlockAdmission::Suppress { flush_window: None }
             );
         }
-        assert_eq!(agg.admit(key("d2", "user:ci"), t0), BlockAdmission::Write);
+        assert_eq!(agg.admit(key("d2", "user:ci"), t0), write);
+        assert_eq!(agg.admit(key("d1", "user:other"), t0), write);
+        assert_eq!(agg.take_suppressed(&k, t0), 49);
         assert_eq!(
-            agg.admit(key("d1", "user:other"), t0),
-            BlockAdmission::Write
+            agg.take_suppressed(&k, t0),
+            0,
+            "a closed window is forgotten"
         );
-        assert_eq!(agg.take_suppressed(&k), 49);
-        assert_eq!(agg.take_suppressed(&k), 0, "a closed window is forgotten");
-        assert_eq!(
-            agg.admit(k.clone(), t0 + Duration::from_secs(61)),
-            BlockAdmission::Write
-        );
-        // An expired window that was never flushed also restarts.
+        assert_eq!(agg.admit(k.clone(), t0 + Duration::from_secs(61)), write);
+        // An expired window that owes no summary also restarts.
         let k3 = key("d3", "anonymous:10.0.0.1");
-        assert_eq!(agg.admit(k3.clone(), t0), BlockAdmission::Write);
+        assert_eq!(agg.admit(k3.clone(), t0), write);
+        assert_eq!(agg.admit(k3, t0 + PROXY_SCAN_BLOCK_WINDOW), write);
+    }
+
+    /// A block that arrives after a window closed but before its flush ran
+    /// takes the closed window's count over (the caller writes its summary),
+    /// and the late flush writes nothing: every repeat is reported exactly
+    /// once, under a continuous retry loop too.
+    #[test]
+    fn a_block_after_the_window_closes_carries_its_unflushed_count() {
+        let mut agg = BlockAggregator::default();
+        let t0 = Instant::now();
+        let k = key("d1", "user:ci");
         assert_eq!(
-            agg.admit(k3, t0 + PROXY_SCAN_BLOCK_WINDOW),
-            BlockAdmission::Write
+            agg.admit(k.clone(), t0),
+            BlockAdmission::Write { closed_repeats: 0 }
         );
+        for i in 1..=10 {
+            agg.admit(k.clone(), t0 + Duration::from_secs(i));
+        }
+        let t1 = t0 + PROXY_SCAN_BLOCK_WINDOW + Duration::from_millis(5);
+        assert_eq!(
+            agg.admit(k.clone(), t1),
+            BlockAdmission::Write { closed_repeats: 10 },
+            "the closed window's 10 repeats are handed to this block"
+        );
+        assert_eq!(
+            agg.take_suppressed(&k, t0),
+            0,
+            "the late flush of the closed window writes nothing"
+        );
+        agg.admit(k.clone(), t1 + Duration::from_secs(1));
+        assert_eq!(
+            agg.take_suppressed(&k, t1),
+            1,
+            "the new window keeps its own count"
+        );
+    }
+
+    /// At the key bound, a closed window that still owes its summary is
+    /// kept for its flush; one that owes nothing is dropped.
+    #[test]
+    fn the_key_bound_keeps_windows_that_owe_a_summary() {
+        let mut agg = BlockAggregator::default();
+        let t0 = Instant::now();
+        for i in 0..PROXY_SCAN_BLOCK_MAX_KEYS {
+            agg.admit(key(&format!("d{i}"), "user:ci"), t0);
+        }
+        let owes = key("d0", "user:ci");
+        agg.admit(owes.clone(), t0 + Duration::from_secs(1));
+        let later = t0 + PROXY_SCAN_BLOCK_WINDOW + Duration::from_secs(1);
+        agg.admit(key("fresh", "user:ci"), later);
+        assert_eq!(
+            agg.windows.len(),
+            2,
+            "only the owing window and the new key"
+        );
+        assert_eq!(agg.take_suppressed(&owes, t0), 1);
     }
 
     #[test]
