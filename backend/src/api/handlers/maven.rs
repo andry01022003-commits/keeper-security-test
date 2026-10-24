@@ -3576,11 +3576,11 @@ async fn lock_maven_publish_key(
 /// Every upload of one coordinate writes the same key. This cleanup and a
 /// publishing transaction both hold [`lock_maven_publish_key`] for the key:
 ///
-/// * The publishing transaction holds the lock across its upsert and storage
-///   write. A competing first upload therefore waits before it can write, and
-///   its upsert returns no row for an immutable coordinate, so it answers 409
-///   without touching the winner's object. There is no post-write restore
-///   window left for a cleanup to race into.
+/// * The publishing transaction holds the lock across its storage write and
+///   its commit. A competing first upload therefore waits before it can
+///   write, then sees the winner's committed row for an immutable coordinate
+///   and answers 409 without touching the winner's object. There is no
+///   post-write restore window left for a cleanup to race into.
 /// * The cleanup decides under the same lock: a live `artifacts` row naming
 ///   the key means a publish has committed, and the object is left alone.
 ///   While a publish transaction holds the lock the cleanup waits, and it then
@@ -3956,8 +3956,8 @@ async fn upload(
     //
     // #4837/#4892: the storage write runs INSIDE this transaction, after
     // `lock_maven_publish_key`. Two first uploads of one immutable coordinate
-    // therefore serialise here, and the upsert runs BEFORE the write: the
-    // loser's `DO UPDATE ... WHERE false` returns no row, so it answers 409
+    // therefore serialise here, and the second one sees the first one's
+    // committed row under the lock BEFORE its write, so it answers 409
     // without ever touching the winner's object. The winner writes under the
     // same lock, so no overlapping upload or failed-publish cleanup can
     // replace the bytes the row names. Every failure after the write rolls the
@@ -3968,6 +3968,29 @@ async fn upload(
         lock_maven_publish_key(&mut tx, repo.id, &repo.storage_backend, &storage_key)
             .await
             .map_err(map_db_err)?;
+        // Decide the race for an immutable coordinate under the lock, BEFORE
+        // the write: every hosted publish of this key holds the lock across
+        // its write and its commit, so a row committed by a competing first
+        // upload is visible here, and the loser answers 409 without touching
+        // the winner's object (#4892). The upsert below keeps its
+        // `WHERE false` guard as the backstop for writers that do not take
+        // this lock.
+        if !republishable {
+            let taken: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false)",
+            )
+            .bind(repo.id)
+            .bind(&path)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+            if taken {
+                return Err(
+                    AppError::Conflict("Artifact already exists".to_string()).into_response()
+                );
+            }
+        }
         // Re-assert the attribution claim under the lock: a cleanup that ran
         // between the pre-write claim above and this transaction may have
         // released it. The row and this claim commit or roll back together.
@@ -3979,6 +4002,20 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
+
+        // Store the file while holding only this key's publish lock. The
+        // repository-wide locks this transaction takes next (the quota
+        // admission's ledger and project rows, and the usage-ledger row the
+        // `artifacts` insert trigger updates) are acquired after the write,
+        // so a slow object write never stalls other uploads into the same
+        // repository or project. The bytes are streamed from the staged
+        // scratch file, not a heap buffer (#2517).
+        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+        storage
+            .put_stream(&storage_key, stream)
+            .await
+            .map_err(map_storage_err)?;
+
         super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
             .await?;
         let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
@@ -4024,22 +4061,12 @@ async fn upload(
             // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
             // row: a concurrent PUT won the race between the duplicate check above
             // and this statement. Answer it the same 409 the check itself would
-            // have, rather than the 500 the bare INSERT raised (#3587). This is
-            // also what keeps the loser's bytes out of storage (#4892): the
-            // write below only runs for the transaction that got a row.
+            // have, rather than the 500 the bare INSERT raised (#3587). Hosted
+            // publishes of this key are already decided by the locked check
+            // above (#4892); this guards writers that do not take the lock.
             .ok_or_else(|| {
                 AppError::Conflict("Artifact already exists".to_string()).into_response()
             })?;
-
-        // Store the file now that this transaction has won the coordinate. The
-        // bytes are streamed from the staged scratch file, not a heap buffer
-        // (#2517). The publish lock is still held, so no overlapping first
-        // upload can write this key between the upsert and the commit.
-        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
-        storage
-            .put_stream(&storage_key, stream)
-            .await
-            .map_err(map_storage_err)?;
 
         // The durable attribution claim for this key was already committed by
         // the atomic `claim_flat_key_for_write` gate above (before the write),
@@ -6809,6 +6836,10 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        // Give a pre-#4892 put, which follows the claim directly, time to
+        // land, so the check below does not depend on poll timing. On the
+        // fixed ordering the upload is parked on the lock and stores nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let stored_while_locked = mem.objects.lock().unwrap().contains_key(&scoped_key);
         holder.commit().await.expect("release publish lock");
 
@@ -6838,6 +6869,96 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(stored, Some(jar.clone()));
         assert_eq!(claim_owner, Some(repo_id));
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_body, jar);
+    }
+
+    /// #4892 review: the storage write runs inside the publish transaction, so
+    /// it must come before the repository-wide row locks that transaction
+    /// takes (the usage-ledger row the `artifacts` insert trigger updates, and
+    /// the quota admission's ledger and project rows). Otherwise every hosted
+    /// Maven upload into one repository waits for any other one's object
+    /// write, holding a pool connection while it waits. The test holds the
+    /// repository's ledger row lock and requires the upload to store its
+    /// object anyway, then lets the commit through.
+    #[tokio::test]
+    async fn test_publish_stores_before_repository_ledger_lock_4892() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let Some(pool) = crate::testing::try_pool_with(6).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let path = "com/example/ledger4892/demo/1.0.0/demo-1.0.0.jar";
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let jar = bytes::Bytes::from_static(b"stored-before-ledger-lock-4892");
+
+        sqlx::query(
+            "INSERT INTO repository_usage_ledger (repository_id) VALUES ($1) \
+             ON CONFLICT (repository_id) DO NOTHING",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed ledger row");
+        let mut holder = pool.begin().await.expect("ledger holder tx");
+        sqlx::query("SELECT 1 FROM repository_usage_ledger WHERE repository_id = $1 FOR UPDATE")
+            .bind(repo_id)
+            .execute(&mut *holder)
+            .await
+            .expect("lock ledger row");
+
+        let put = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), jar.clone())),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stored_while_locked = false;
+        while std::time::Instant::now() < deadline {
+            if mem.objects.lock().unwrap().contains_key(&scoped_key) {
+                stored_while_locked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let finished_while_locked = put.is_finished();
+        holder.commit().await.expect("release ledger lock");
+
+        let status = put.await.expect("join put").expect("put").status();
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            stored_while_locked,
+            "the object write must not wait for the repository's usage-ledger row lock"
+        );
+        assert!(
+            !finished_while_locked,
+            "the artifacts insert does take the ledger row lock, so the upload \
+             cannot have committed while the test held it"
+        );
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(get_status, StatusCode::OK);
         assert_eq!(get_body, jar);
     }
