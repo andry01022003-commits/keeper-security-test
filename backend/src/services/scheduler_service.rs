@@ -1095,6 +1095,67 @@ pub fn spawn_all(
         });
     }
 
+    // Download statistics retention (#4541): opt-in via
+    // DOWNLOAD_STATS_RETENTION_DAYS. Trims download_statistics and
+    // proxy_download_statistics on one replica at a time; the lease is renewed
+    // for the whole pass and a lost lease stops it between batches (#3502).
+    {
+        use crate::services::download_stats_retention as retention;
+        let days = retention::retention_days_from_env();
+        let every = retention::interval_secs_from_env();
+        tracing::info!("{}", retention::startup_message(days, every));
+        if let Some(days) = days {
+            let db = db.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(jittered_startup_delay(every.min(240))).await;
+                let mut ticker = interval(Duration::from_secs(every));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let Some(lease) =
+                        crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                            &db,
+                            retention::DOWNLOAD_STATS_RETENTION_LEASE_NAME,
+                            retention::DOWNLOAD_STATS_RETENTION_LEASE_TTL_SECS,
+                        )
+                        .await
+                    else {
+                        tracing::debug!(
+                            "Another replica owns the download statistics retention lease"
+                        );
+                        continue;
+                    };
+                    let (renewal, lost) = lease.spawn_renewal_with_cancellation(
+                        db.clone(),
+                        retention::DOWNLOAD_STATS_RETENTION_LEASE_TTL_SECS,
+                    );
+                    match retention::apply_retention(
+                        &db,
+                        Some(days),
+                        retention::DOWNLOAD_STATS_RETENTION_BATCH_SIZE,
+                        Some(&lost),
+                    )
+                    .await
+                    {
+                        Ok(r) => tracing::info!(
+                            retention_days = days,
+                            hosted_rows_deleted = r.hosted_rows_deleted,
+                            proxy_rows_deleted = r.proxy_rows_deleted,
+                            batches = r.batches,
+                            interrupted = r.interrupted,
+                            "Download statistics retention pass"
+                        ),
+                        Err(e) => {
+                            tracing::warn!("Download statistics retention pass failed: {}", e)
+                        }
+                    }
+                    drop(renewal);
+                    lease.release(&db).await;
+                }
+            });
+        }
+    }
+
     // Chunked upload session cleanup + orphaned incus staging sweep (every hour)
     {
         let db = db.clone();

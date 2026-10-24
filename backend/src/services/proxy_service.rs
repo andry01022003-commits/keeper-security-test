@@ -1856,6 +1856,34 @@ async fn discard_bad_publish(storage: &StorageService, cache_key: &str) {
 /// started (#4759).
 const UPSTREAM_SHORT_BODY: &str = "UPSTREAM_SHORT_BODY";
 
+/// How far before a fill's start a serve may have been recorded and still be
+/// one the fill fed (#4542): the statistics row is stamped by the database
+/// clock, the fill start by this process's.
+const FILL_ATTRIBUTION_SKEW_SECS: i64 = 60;
+
+/// Attribute the serves a committed fill fed to its digest (#4542).
+/// Best-effort like the catalog upsert it follows: a failure leaves those
+/// rows reachable through the catalog row for as long as it lives.
+async fn attribute_fill_downloads(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    checksum_sha256: &str,
+    fill_started: DateTime<Utc>,
+) {
+    let since = fill_started - chrono::Duration::seconds(FILL_ATTRIBUTION_SKEW_SECS);
+    if let Err(e) =
+        proxy_catalog::attribute_fill_downloads(db, repository_id, path, checksum_sha256, since)
+            .await
+    {
+        tracing::warn!(
+            repository_id = %repository_id,
+            error = %e,
+            "could not attribute the downloads a proxy-cache fill served to its digest"
+        );
+    }
+}
+
 /// The client-facing error for an upstream body that ended short (#4759):
 /// names the repository and both byte counts, never the upstream URL.
 fn upstream_short_body_error(repo_key: &str, expected: u64, received: u64) -> AppError {
@@ -2727,6 +2755,9 @@ impl CachePersister {
             return Ok(());
         }
 
+        // #4542: serves recorded from here on were fed by this write.
+        let fill_started = Utc::now();
+
         // Calculate checksum
         let checksum = StorageService::calculate_hash(content);
 
@@ -2836,6 +2867,15 @@ impl CachePersister {
                 "proxy-cache catalog upsert failed (buffered write); accounting may \
                  undercount this object until it is re-cached or lazily backfilled"
             );
+        } else {
+            attribute_fill_downloads(
+                &self.db,
+                repository_id,
+                artifact_path,
+                &metadata.checksum_sha256,
+                fill_started,
+            )
+            .await;
         }
 
         tracing::debug!(
@@ -2911,6 +2951,8 @@ impl CachePersister {
         // upsert the persisted proxy-cache catalog row (#2218/#2270) with the
         // TRUE `bytes_written`/checksum, once the tee has fully written the body.
         let catalog_db = self.db.clone();
+        // #4542: serves recorded from here on were fed by this fill.
+        let fill_started = Utc::now();
 
         // Channel for chunks flowing reader -> writer. mpsc to keep order
         // (broadcast would let storage skip chunks under backpressure,
@@ -3279,6 +3321,15 @@ impl CachePersister {
                                              commit); accounting may undercount this object \
                                              until re-cache or lazy backfill"
                                         );
+                                    } else {
+                                        attribute_fill_downloads(
+                                            &catalog_db,
+                                            template.repository_id,
+                                            &template.path,
+                                            &metadata.checksum_sha256,
+                                            fill_started,
+                                        )
+                                        .await;
                                     }
                                 }
                             }

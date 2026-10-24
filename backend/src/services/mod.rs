@@ -35,6 +35,7 @@ pub mod dependency_track_service;
 pub mod device_service;
 pub mod download_event_dispatch;
 pub mod download_holds_service;
+pub mod download_stats_retention;
 pub mod egress_proxy;
 pub mod email_dispatcher;
 pub mod email_rate_limiter;
