@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
+## [1.11.7] - 2026-10-24
+
+### Fixed
+
+- **`PUT /api/v1/peers/{id}/network-profile` now routes to the peer network-profile handler instead of returning a 500 with a raw axum extractor error** (#4884, #4906). The router had been mounted at `/peers/network-profile` without the `:id` segment; it now requires the peer ID, rejects malformed IDs with a normal 400, and returns 404 for an unknown peer.
+
+- **Label moves and late format metadata now reach push peers** (#4889, #4899). The protobuf `_labels` index was a zero-byte row that the sync worker had nothing to transfer, and the NuGet, PyPI, Debian and nested-layout RPM routes queued their push before writing the format `artifact_metadata`. The label index is now stored as a real JSON object (with a refreshable, content-addressed row) and queued like any other upload, and those four routes queue after their metadata is committed; the metadata-diff re-arm now covers every format, so a worker that finished a transfer before the document landed redelivers it. Client-uploaded `maven-metadata.xml` remains intentionally row-less and unpushed: peers regenerate it from the versioned artifacts they receive rather than accepting one deploy's snapshot over their own generated view.
+
+- **Concurrent first Maven uploads of one immutable release coordinate can no longer leave the winner's row pointing at the loser's bytes** (#4892, #4897). The object is now written inside the publishing transaction while holding the per-key publish lock, and an upload that finds the coordinate already published under that lock returns 409 without touching the winner's storage key; previously both uploads wrote the same object before either row was inserted, and a loser whose write landed last replaced the winner's bytes while its own row was rejected. The write happens before the repository-wide quota and usage-ledger row locks are taken, so other uploads into the same repository do not wait on it. In Artifactory migration path mode a hosted Maven artifact upload now writes its object once instead of twice (#4893).
+
+- **A retried OCI blob completion no longer fails with 409 "upload session is already being modified"** (#4902, #4919). When a reverse proxy timed out the final `PUT ?digest=` of a large layer (Envoy and Envoy Gateway cut at 15 s by default) or the client dropped the connection, the backend abandoned the completion mid-way and left the upload session locked for six hours, so the identical `PUT` that containerd 2.x re-sends after a 504 was refused and the push failed. The completion now runs to its end even when its request is dropped. A retry with the same digest waits for it (up to `OCI_UPLOAD_COMPLETION_RETRY_WAIT_SECS`, default 30 s) and gets the same result, or 503 with `Retry-After` while it is still running; a retry after it finished gets 201; a retry with a different digest is still 409. A session held by a replica that died is reclaimable after five minutes instead of six hours. See `docs/operations/oci-reverse-proxy-timeouts.md` for the proxy timeouts to set.
+
+- **The rollback guide now warns that a 1.11.x database cannot serve a 1.10.x backend for OCI pushes** (#4915, #4917). Migration 243 (1.11.0, #3851) replaced the unique key on `oci_upload_cleanup_keys` that the 1.10.x upload path names in `ON CONFLICT (storage_key)`, so after a rollback to 1.10.x with `SKIP_MIGRATIONS=true` every `docker push` failed with "there is no unique or exclusion constraint matching the ON CONFLICT specification". `docs/operations/rollback.md` now says so up front, lists migration 243 in a new table of releases that cannot be rolled back across, and widens its boundary condition to dropped or replaced unique constraints.
+
+- **Protobuf commits now replicate to push peers** (#4921, #4934). A protobuf (BSR) commit row recorded the commit digest as its `checksum_sha256`, so the receiving peer, which verifies the pushed bundle against that value, refused every commit push with 409 "checksum mismatch". New commit rows record the sha256 of the stored bundle (the commit digest stays the row's version and is still what every lookup uses). Rows written before this release need no operator step: the sync worker recomputes the sha256 from the stored bundle before pushing such a row and stores the corrected value. A push that the peer refuses for that one artifact (a checksum mismatch, or an immutable path already occupied) now fails only that task and no longer puts the whole peer into retry backoff; connection errors and 5xx responses still back the peer off as before.
+
+### Security
+
+- **`crypto-bigint` bumped 0.7.5 -> 0.7.6 for RUSTSEC-2026-0387** (#4941, #4940). `crypto-bigint` 0.7.5 could take secret-dependent branches in some operations intended to be constant-time. It reaches the backend through the `bergshamra` XML signature crates. A second copy, 0.5.5, stays in the tree through `elliptic-curve` 0.13 (`pgp` and `bergshamra`) because the 0.5 line has no patched release; the advisory is ignored in `.cargo/audit.toml` until those crates move off it (#4940). Lockfile-only; no behaviour change.
+
 ## [1.11.6] - 2026-10-23
 
 ### Fixed
