@@ -1133,6 +1133,11 @@ struct RenderStats {
 /// async runtime and dropped. The bytes are identical to
 /// [`render_repodata_at`] over the same rows, and the uncompressed documents
 /// to the ones the whole-catalogue render built.
+///
+/// The transaction stays open for the whole render, heal included, so on a
+/// large root it holds back the vacuum horizon (its snapshot xmin) for that
+/// long, like any long-running read. It is read-only and takes no row locks;
+/// rows changed meanwhile are reclaimed by the first vacuum after it ends.
 async fn render_repodata_streamed(
     state: &SharedState,
     repo_ids: &[uuid::Uuid],
