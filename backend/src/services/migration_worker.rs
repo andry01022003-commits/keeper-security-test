@@ -3886,7 +3886,7 @@ fn debian_component_from_properties(
 /// repository (see [`is_pool_prefix_layout`]). The source path, minus a
 /// leading `pool/`, follows the component unless it already starts with it.
 /// Every other file keeps its path.
-fn debian_destination_path(artifact_path: &str, component: Option<&str>) -> String {
+pub(crate) fn debian_destination_path(artifact_path: &str, component: Option<&str>) -> String {
     let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
     if !is_debian_package_file(filename) {
         return artifact_path.to_string();

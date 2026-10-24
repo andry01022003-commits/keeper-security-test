@@ -424,17 +424,23 @@ pub struct DebianBackfillRequest {
     /// 1000, max 10000). `truncated` says when more remain.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Continue a truncated walk: the `next_after` of the previous call.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = Uuid)]
+    pub after: Option<uuid::Uuid>,
 }
 
 /// POST /api/v1/admin/repositories/{key}/backfill-debian
 ///
 /// Repairs a hosted Debian repository migrated before #4657 without the
-/// source system: walks live `pool/**/*.deb` rows that have no `debian`
-/// control document, reads the `control.tar` member from the repository's own
+/// source system: walks live `.deb` rows that have no `debian` control
+/// document, reads the `control.tar` member from the repository's own
 /// storage, and records the same control document, catalog row, and
-/// maintainer-script analysis a native upload writes. Migration-origin
-/// `dists/` index copies are removed from the artifact list. Idempotent and
-/// safe on a live repository.
+/// maintainer-script analysis a native upload writes. A package outside
+/// `pool/<component>/` (`pool/<file>.deb`, a `pool/<letter>/<name>/` layout)
+/// is moved under `pool/main/`, as the migration importer now files it.
+/// Migration-origin `dists/` index copies are removed from the artifact list.
+/// Idempotent and safe on a live repository.
 #[utoipa::path(
     post,
     path = "/repositories/{key}/backfill-debian",
@@ -467,7 +473,7 @@ pub async fn backfill_debian_packages(
         MAX_DEBIAN_BACKFILL_LIMIT,
     );
     let outcome = DebianBackfillService::new(state.db.clone(), state.storage_registry.clone())
-        .backfill(&repo, payload.dry_run, limit)
+        .backfill(&repo, payload.dry_run, limit, payload.after)
         .await;
 
     // Audited on success and on refusal/failure (409 lock held, 422 the wrong
@@ -478,10 +484,13 @@ pub async fn backfill_debian_packages(
             "dry_run": payload.dry_run,
             "artifacts_scanned": result.artifacts_scanned,
             "packages_registered": result.packages_registered,
+            "packages_relocated": result.packages_relocated,
             "artifacts_skipped": result.artifacts_skipped,
             "artifacts_failed": result.artifacts_failed,
             "dists_removed": result.dists_removed,
             "truncated": result.truncated,
+            "after": payload.after,
+            "next_after": result.next_after,
             "errors": result.errors.len(),
         }),
         Err(e) => serde_json::json!({
@@ -754,6 +763,7 @@ mod tests {
             Json(DebianBackfillRequest {
                 dry_run: false,
                 limit: Some(10),
+                after: None,
             }),
         )
         .await
@@ -776,6 +786,7 @@ mod tests {
             Json(DebianBackfillRequest {
                 dry_run: true,
                 limit: Some(10),
+                after: None,
             }),
         )
         .await
@@ -799,6 +810,7 @@ mod tests {
             Json(DebianBackfillRequest {
                 dry_run: true,
                 limit: Some(10),
+                after: None,
             }),
         )
         .await
