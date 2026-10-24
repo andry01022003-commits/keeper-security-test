@@ -7910,6 +7910,14 @@ mod tests {
             insert_maven_artifact_row(&pool, hosted_id, user_id, "com.example.vdl", "counted")
                 .await;
         let path = "com/example/vdl/counted/1.0.0/counted-1.0.0.jar";
+        // The virtual serve verifies the stored bytes against the row (#4323),
+        // so the row records the real digest of the seeded `j`.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
+            .bind(crate::services::artifact_service::ArtifactService::calculate_sha256(b"j"))
+            .bind(artifact_row_id)
+            .execute(&pool)
+            .await
+            .expect("record the real digest");
 
         let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
         state

@@ -3504,6 +3504,9 @@ fn is_quarantine_block(e: &crate::error::AppError) -> bool {
 /// `helm::download_chart_via_index` and `pypi::serve_file`.
 pub(crate) fn is_member_policy_block_response(resp: &Response) -> bool {
     matches!(resp.status(), StatusCode::CONFLICT | StatusCode::FORBIDDEN)
+        // #4323: a member whose stored bytes failed verification holds the
+        // artifact; falling through would serve another member's bytes.
+        || crate::storage::verify::is_integrity_failure(resp)
 }
 
 /// Which member served a virtual download, and so which statistics table (if
@@ -5560,6 +5563,12 @@ pub(crate) struct LocalArtifactRow {
     pub size_bytes: i64,
     pub quarantine_status: Option<String>,
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recorded SHA-256 and path, for serve-time verification (#4323). A query
+    /// that does not select them reads as empty, and the serve is unverified.
+    #[sqlx(default)]
+    pub checksum_sha256: String,
+    #[sqlx(default)]
+    pub path: String,
 }
 
 /// Check quarantine status on a fetched artifact row of `repo_id`, mapping
@@ -5610,19 +5619,19 @@ impl LocalLookup<'_> {
     pub(crate) fn select_sql(&self) -> &'static str {
         match self {
             LocalLookup::Path(_) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
                  FROM artifacts \
                  WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersion(_, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersionSuffix(_, _, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE $4 AND is_deleted = false \
                  LIMIT 1"
@@ -5725,13 +5734,22 @@ async fn read_local_content(
     artifact: &LocalArtifactRow,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<Bytes, Response> {
-    match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => Ok(bytes),
+    let bytes = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
         Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await?
         }
-        Err(e) => Err(map_storage_err(e)),
-    }
+        Err(e) => return Err(map_storage_err(e)),
+    };
+    // #4323: never serve stored bytes that do not match their record.
+    crate::storage::verify::verify_stored_bytes(
+        &bytes,
+        &artifact.checksum_sha256,
+        &artifact.path,
+        artifact.size_bytes,
+        || artifact.path.clone(),
+    )?;
+    Ok(bytes)
 }
 
 /// Streaming sibling of [`read_local_content`]: open the artifact body as a
@@ -5757,6 +5775,17 @@ async fn read_local_stream(
         }
         Err(e) => return Err(map_storage_err(e)),
     };
+    // #4323: verify against the record (a 502 for a small object, see
+    // `verify_stored_body`); terminal for virtual resolution via
+    // `is_member_policy_block_response`.
+    let body = crate::storage::verify::verify_stored_body(
+        body,
+        &artifact.checksum_sha256,
+        &artifact.path,
+        artifact.size_bytes,
+        || artifact.path.clone(),
+    )
+    .await?;
     Ok(StreamingFetchResult {
         commit_sha: None,
         content_encoding: None,
@@ -25242,7 +25271,9 @@ mod virtual_winner_recording_tests_3844 {
         )
         .bind(local_id)
         .bind(&path)
-        .bind(format!("{:0>64}", "3844"))
+        // The real digest of the seeded bytes: the hosted fetch verifies it
+        // (#4323).
+        .bind(crate::services::artifact_service::ArtifactService::calculate_sha256(b"hosted"))
         .bind(&storage_key)
         .fetch_one(&pool)
         .await

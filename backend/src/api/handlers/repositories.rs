@@ -9851,6 +9851,8 @@ pub async fn list_artifact_versions(
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        ("If-Match" = Option<String>, Header, description = "Compare-and-swap (#4186): write only if the live artifact's ETag (its quoted SHA-256, as the download route and this route's 201 emit) is one of the listed strong entity tags, or `*` for any live artifact. A match replaces the live artifact even on a repository without versioning; a released coordinate (a versioned path) still cannot change bytes. Otherwise 412."),
+        ("If-None-Match" = Option<String>, Header, description = "`*`: create only if the path holds no live artifact, otherwise 412 (#4186). An entity-tag list: refuse with 412 if the live artifact's ETag is listed."),
     ),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer_auth" = [])),
@@ -9858,8 +9860,9 @@ pub async fn list_artifact_versions(
         // 201, not 200: the handler has always returned StatusCode::CREATED
         // (package-manager clients depend on it); the spec must say so or
         // strict generated SDKs treat every successful upload as an error.
-        (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
-        (status = 400, description = "Invalid artifact path, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
+        (status = 201, description = "Artifact uploaded", body = ArtifactResponse,
+            headers(("ETag" = String, description = "Strong entity tag of the stored artifact: its quoted SHA-256"))),
+        (status = 400, description = "Invalid artifact path, the repository is virtual (direct uploads are not accepted), or a malformed `If-Match` / `If-None-Match`", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
@@ -9868,6 +9871,8 @@ pub async fn list_artifact_versions(
             The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`. \
             Delete the artifact first, or enable versioning on the repository (Generic and Mlmodel) to append a revision instead. \
             Of several concurrent uploads to one free path exactly one is answered 201; the others get this 409 (#4832).", body = crate::api::openapi::ErrorResponse),
+        (status = 412, description = "An `If-Match` or `If-None-Match` precondition does not hold against the live artifact (`code: PRECONDITION_FAILED`, #4186). \
+            Evaluated before the body is read and again, with the artifact row locked, when the upload commits: of several conditional uploads against one ETag exactly one succeeds and the others get 412.", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
@@ -9894,6 +9899,22 @@ pub async fn upload_artifact(
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+
+    // #4186: refuse a conditional PUT whose precondition already fails
+    // before reading its body. Not authoritative (the publishing transaction
+    // re-evaluates it with the row locked), but it spares a client that lost
+    // a compare-and-swap the upload of a body that would be thrown away.
+    if let Some(precondition) = parse_write_precondition(&headers).map_err(|e| e.into_response())? {
+        let current =
+            crate::services::artifact_service::current_live_checksum(&state.db, repo.id, &path)
+                .await
+                .map_err(|e| e.into_response())?;
+        if !precondition.holds(current.as_deref()) {
+            return Err(
+                crate::services::artifact_service::WritePrecondition::failed(&path).into_response(),
+            );
+        }
+    }
 
     // Stream the request body into staging, computing SHA-256/SHA-1/MD5 in a
     // single pass — the whole artifact is never buffered in memory (#2517).
@@ -9928,6 +9949,45 @@ pub async fn upload_artifact(
         digests,
     )
     .await
+}
+
+/// Parse the `If-Match` / `If-None-Match` preconditions of a generic write
+/// (#4186). `Ok(None)` for an unconditional write. A header that is present
+/// but not a valid `*` / entity-tag list is a 400: ignoring it would turn the
+/// client's compare-and-swap into a blind overwrite.
+fn parse_write_precondition(
+    headers: &HeaderMap,
+) -> Result<Option<crate::services::artifact_service::WritePrecondition>> {
+    use crate::services::artifact_service::{EntityTagCondition, WritePrecondition};
+    let parse = |name: header::HeaderName| -> Result<Option<EntityTagCondition>> {
+        let values: Vec<&str> = headers
+            .get_all(&name)
+            .iter()
+            .map(|v| v.to_str())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| AppError::Validation(format!("Invalid {name} header")))?;
+        if values.is_empty() {
+            return Ok(None);
+        }
+        // Repeated headers are one comma-separated list (RFC 9110 5.3).
+        EntityTagCondition::parse(&values.join(","))
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::Validation(format!(
+                    "Invalid {name} header: expected * or a list of quoted entity tags"
+                ))
+            })
+    };
+    Ok(WritePrecondition::new(
+        parse(header::IF_MATCH)?,
+        parse(header::IF_NONE_MATCH)?,
+    ))
+}
+
+/// The strong `ETag` of a stored artifact: its recorded SHA-256, quoted
+/// (#4186). The value conditional writes compare against.
+pub(crate) fn artifact_etag(checksum_sha256: &str) -> String {
+    format!("\"{}\"", checksum_sha256.trim())
 }
 
 /// A generic upload body after staging: a local scratch file, or an object on
@@ -10196,6 +10256,10 @@ async fn persist_generic_staged_upload(
     )
     .map_err(|e| e.into_response())?;
 
+    // #4186: the preconditions travel to the service, which re-evaluates
+    // them with the target row locked in the publishing transaction.
+    let precondition = parse_write_precondition(headers).map_err(|e| e.into_response())?;
+
     // #3801: an `.rpm` pushed into an RPM repository through this generic
     // endpoint gets the same header parse as the native and chunked paths —
     // on the blocking pool, BEFORE anything is stored — so a header over the
@@ -10354,6 +10418,7 @@ async fn persist_generic_staged_upload(
             Some(auth.user_id),
             !is_replication_request(headers),
             None,
+            precondition.as_ref(),
         )
         .await;
     // The staging copy is no longer needed once the service has consumed it,
@@ -10386,8 +10451,10 @@ async fn persist_generic_staged_upload(
         (None, None)
     };
 
+    let etag = artifact_etag(&artifact.checksum_sha256);
     Ok((
         StatusCode::CREATED,
+        [(header::ETAG, etag)],
         Json(ArtifactResponse {
             id: artifact.id,
             repository_key: key,
@@ -10841,6 +10908,7 @@ fn slice_byte_stream(
 /// `base_headers` are applied to the `200` and `206` responses; `416` carries
 /// only `Accept-Ranges` and `Content-Range` (no body). The helper always
 /// advertises `Accept-Ranges: bytes`, so clients know they may resume.
+/// Unverified; see [`ranged_stream_response_advertised`] (#4323).
 pub(crate) fn ranged_stream_response(
     range_header: Option<&str>,
     total: u64,
@@ -10848,6 +10916,65 @@ pub(crate) fn ranged_stream_response(
     base_headers: Vec<(header::HeaderName, String)>,
 ) -> Result<Response> {
     ranged_stream_response_verified(range_header, total, body, base_headers, None)
+}
+
+/// [`ranged_stream_response`] that verifies a whole-object serve against the
+/// SHA-256 the response itself advertises (#4323): `X-Checksum-Sha256`, or a
+/// `sha256:` `Docker-Content-Digest`. Skipped when the response declares a
+/// `Content-Encoding` (the digest then names the decoded bytes) or
+/// `DOWNLOAD_VERIFY_CHECKSUMS=false`. The status is already decided here, so
+/// a mismatch aborts the body before its last chunk; callers that can await
+/// first use [`ranged_stream_response_checked`] to answer a small object's
+/// mismatch with a `502` instead.
+pub(crate) fn ranged_stream_response_advertised(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    base_headers: Vec<(header::HeaderName, String)>,
+) -> Result<Response> {
+    let verify = crate::storage::verify::serve_verification_enabled()
+        .then(|| crate::storage::verify::advertised_sha256(&base_headers))
+        .flatten()
+        .map(|expected_sha256| ServeVerification {
+            expected_sha256,
+            label: format!("sha256:{}", hex::encode(expected_sha256)),
+        });
+    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
+}
+
+/// Whether `range_header` asks for every byte of a `total`-byte object (no
+/// range, an unparseable one, or a satisfiable range covering all of it).
+fn range_is_whole_object(range_header: Option<&str>, total: u64) -> bool {
+    match parse_byte_range(range_header, total) {
+        RangeOutcome::Full => true,
+        RangeOutcome::Satisfiable { start, end } => start == 0 && end + 1 == total,
+        RangeOutcome::Unsatisfiable => false,
+    }
+}
+
+/// [`ranged_stream_response_verified`] that verifies a small whole-object
+/// serve BEFORE the status is chosen (#4323): an object of at most
+/// [`crate::storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES`] that fails
+/// verification is answered `502 STORED_OBJECT_INTEGRITY` with no body, not
+/// a `200` cut short. Larger objects keep the streaming verifier. A HEAD
+/// (`is_head`) reads nothing.
+pub(crate) async fn ranged_stream_response_checked(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    base_headers: Vec<(header::HeaderName, String)>,
+    verify: Option<ServeVerification>,
+    is_head: bool,
+) -> Result<Response> {
+    let (body, verify) = match verify {
+        Some(v) if !is_head && range_is_whole_object(range_header, total) => (
+            crate::storage::verify::verify_before_serve(body, v.expected_sha256, total, v.label)
+                .await?,
+            None,
+        ),
+        other => (body, other),
+    };
+    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
 }
 
 /// What a full-body (`200`) serve should verify the streamed bytes against
@@ -10972,6 +11099,7 @@ async fn download_artifact_version(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", download_filename(path)),
         ),
+        (header::ETAG, artifact_etag(&checksum)),
         (
             header::HeaderName::from_static("x-checksum-sha256"),
             checksum,
@@ -11003,7 +11131,7 @@ async fn download_artifact_version(
         format!("{repo_id}/{path}@{}", stored.revision)
     });
     let body = artifact_service.download_version_stream(&stored).await?;
-    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
+    ranged_stream_response_checked(range_header, total, body, base_headers, verify, is_head).await
 }
 
 /// What the generic download route does with a proxied file of a format whose
@@ -11139,10 +11267,12 @@ async fn generic_route_virtual_refusal(
         ArtifactVersionQuery,
     ),
     responses(
-        (status = 200, description = "Artifact binary content", content_type = "application/octet-stream"),
+        (status = 200, description = "Artifact binary content. A hosted artifact carries `ETag: \"<sha256>\"` (its recorded SHA-256, the value `If-Match` on the generic PUT compares against) and `X-Checksum-Sha256`.", content_type = "application/octet-stream",
+            headers(("ETag" = String, description = "Strong entity tag: the quoted SHA-256 of the artifact"))),
         (status = 302, description = "Redirect to S3 presigned URL"),
         (status = 403, description = "A proxied file of a scan-on-proxy enforced format, in a Remote or Virtual repository that scans on proxy: download it through the format's own route (`error: scan_on_proxy_route_required`)"),
         (status = 404, description = "Artifact not found"),
+        (status = 502, description = "The stored object no longer matches its recorded SHA-256 (`code: STORED_OBJECT_INTEGRITY`, #4323). Objects up to 4 MiB are checked before any byte is sent; a larger corrupted object is aborted before its last bytes instead. Set `DOWNLOAD_VERIFY_CHECKSUMS=false` to turn verification off.", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "The repository's scan-on-proxy configuration could not be read"),
     )
 )]
@@ -11387,6 +11517,8 @@ pub async fn download_artifact(
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{}\"", download_filename(&path)),
                 ),
+                // #4186: the strong ETag conditional writes compare against.
+                (header::ETAG, artifact_etag(&checksum)),
                 (
                     header::HeaderName::from_static("x-checksum-sha256"),
                     checksum,
@@ -11405,8 +11537,15 @@ pub async fn download_artifact(
                 &artifact.checksum_sha256,
                 || format!("{key}/{path}"),
             );
-            let response =
-                ranged_stream_response_verified(range_header, total, body, base_headers, verify)?;
+            let response = ranged_stream_response_checked(
+                range_header,
+                total,
+                body,
+                base_headers,
+                verify,
+                is_head,
+            )
+            .await?;
             Ok(response)
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
@@ -11536,7 +11675,7 @@ pub async fn download_artifact(
             }
             let db = state.db.clone();
             let path_clone = path.clone();
-            let result = proxy_helpers::resolve_virtual_download_from_members(
+            let result = match proxy_helpers::resolve_virtual_download_from_members(
                 members,
                 proxy_for_virtual,
                 &path,
@@ -11552,7 +11691,15 @@ pub async fn download_artifact(
                 },
             )
             .await
-            .map_err(|_| not_found())?;
+            {
+                Ok(result) => result,
+                // #4323: a member whose stored bytes failed verification is
+                // answered as such (502), not as a miss.
+                Err(resp) if crate::storage::verify::is_integrity_failure(&resp) => {
+                    return Ok(resp)
+                }
+                Err(_) => return Err(not_found()),
+            };
 
             // #2398 (sibling of #2394): this arm is only reached when
             // `download_stream` returned NotFound for the virtual repo
@@ -25391,10 +25538,26 @@ mod tests {
         Some((status, checksum, body))
     }
 
+    /// Assert the #4323 answer to a corrupted small object: `502
+    /// STORED_OBJECT_INTEGRITY`, no digest header, none of the stored bytes.
+    fn assert_integrity_502_4323(
+        status: axum::http::StatusCode,
+        checksum: Option<String>,
+        body: std::result::Result<Bytes, axum::Error>,
+        what: &str,
+    ) {
+        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{what}");
+        assert!(checksum.is_none(), "{what}: a 502 vouches for no digest");
+        let body = body.expect("the 502 body is complete");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+        assert_eq!(json["code"], "STORED_OBJECT_INTEGRITY", "{what}");
+    }
+
     /// #3919: a stored object whose bytes no longer match the recorded
     /// SHA-256 (one byte flipped on disk) must not be delivered as a complete
-    /// body under the original `X-Checksum-Sha256`. The header is already on
-    /// the wire, so the body is aborted instead of completing.
+    /// body under the original `X-Checksum-Sha256`. #4323: a small object is
+    /// checked before the status is sent, so it is a 502 with none of its
+    /// bytes rather than a 200 whose body is aborted.
     #[tokio::test]
     async fn test_download_corrupted_blob_is_not_served_complete_3919() {
         let Some((status, checksum, body)) =
@@ -25403,12 +25566,7 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(checksum.is_some());
-        assert!(
-            body.is_err(),
-            "a corrupted object must abort the body, not serve it complete: {body:?}"
-        );
+        assert_integrity_502_4323(status, checksum, body, "corrupted");
     }
 
     /// #3919 companion: an intact object with a real recorded SHA-256 still
@@ -25446,11 +25604,8 @@ mod tests {
             else {
                 return;
             };
-            assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT, "{range}");
-            assert!(
-                body.is_err(),
-                "{range}: whole-object 206 must abort: {body:?}"
-            );
+            // #4323: checked before the status, like the 200 path.
+            assert_integrity_502_4323(status, None, body, range);
         }
         let Some((status, _, body)) = download_with_recorded_sha_range_3919(
             b"original-artifact-bytes",
@@ -25482,11 +25637,8 @@ mod tests {
             else {
                 return;
             };
-            assert_eq!(status, axum::http::StatusCode::OK);
-            assert!(
-                body.is_err(),
-                "an oversized object must abort, not serve a clean prefix: {body:?}"
-            );
+            // #4323: a 502, not a clean prefix.
+            assert_integrity_502_4323(status, None, body, "oversized");
         }
     }
 
@@ -25503,8 +25655,7 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
-        assert!(body.is_err(), "{body:?}");
+        assert_integrity_502_4323(status, None, body, "oversized whole range");
     }
 
     #[test]
@@ -37036,5 +37187,602 @@ mod npm_cached_packument_listing_tests {
             .collect();
         assert_eq!(paths, vec![TARBALL], "{json}");
         assert_eq!(json["pagination"]["total"], 1, "{json}");
+    }
+}
+
+/// #4186 conditional generic writes and #4323 serve-time verification.
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt, it buffers bounded response bodies only to assert on them (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod conditional_put_and_serve_verification_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn sha(body: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(body))
+    }
+
+    fn quoted(body: &[u8]) -> String {
+        format!("\"{}\"", sha(body))
+    }
+
+    fn put_with(uri: String, body: Bytes, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder().method("PUT").uri(uri);
+        for (name, value) in headers {
+            b = b.header(*name, *value);
+        }
+        b.body(Body::from(body)).expect("build PUT")
+    }
+
+    struct Fx {
+        pool: sqlx::PgPool,
+        state: crate::api::SharedState,
+        mem: Arc<tdh::MemStorage>,
+        user_id: Uuid,
+        username: String,
+        repos: Vec<(Uuid, std::path::PathBuf)>,
+    }
+
+    impl Fx {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+            Some(Self {
+                pool,
+                state,
+                mem,
+                user_id,
+                username,
+                repos: Vec::new(),
+            })
+        }
+
+        /// A repository of `repo_type`/`format` on the in-memory s3 backend.
+        async fn repo(
+            &mut self,
+            repo_type: &str,
+            format: &str,
+            versioning: bool,
+        ) -> (Uuid, String) {
+            let (id, key, dir) = tdh::create_repo(&self.pool, repo_type, format).await;
+            sqlx::query(
+                "UPDATE repositories SET storage_backend = 's3', storage_path = key, \
+                 versioning_enabled = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(versioning)
+            .execute(&self.pool)
+            .await
+            .expect("configure repo");
+            self.repos.push((id, dir));
+            (id, key)
+        }
+
+        fn router(&self) -> axum::Router {
+            tdh::router_with_auth(
+                super::router().merge(super::download_router()),
+                self.state.clone(),
+                tdh::admin_auth(self.user_id, &self.username),
+            )
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            path: &str,
+            body: &'static [u8],
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+            tdh::send_with_headers(
+                self.router(),
+                put_with(
+                    format!("/{key}/artifacts/{path}"),
+                    Bytes::from_static(body),
+                    headers,
+                ),
+            )
+            .await
+        }
+
+        /// GET the download route; the body is read only for a 2xx.
+        async fn download(&self, key: &str, path: &str) -> (StatusCode, Option<Bytes>, Bytes) {
+            let resp = tower::ServiceExt::oneshot(
+                self.router(),
+                tdh::get(format!("/{key}/download/{path}")),
+            )
+            .await
+            .expect("oneshot");
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024).await;
+            match body {
+                Ok(b) if status.is_success() => (status, Some(b.clone()), b),
+                Ok(b) => (status, None, b),
+                // A body aborted mid-stream: the status was already sent.
+                Err(_) => (status, None, Bytes::new()),
+            }
+        }
+
+        async fn live_checksum(&self, repo_id: Uuid, path: &str) -> Option<String> {
+            sqlx::query_scalar::<_, String>(
+                "SELECT checksum_sha256 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND NOT is_deleted",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await
+            .expect("live row")
+            .map(|c| c.trim().to_string())
+        }
+
+        /// Overwrite the stored object of `(repo_id, path)` with `bytes`.
+        async fn corrupt(&self, repo_id: Uuid, path: &str, bytes: &'static [u8]) {
+            let key: String = sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_one(&self.pool)
+            .await
+            .expect("storage key");
+            self.mem
+                .objects
+                .lock()
+                .unwrap()
+                .insert(key, Bytes::from_static(bytes));
+        }
+
+        async fn teardown(self) {
+            for (id, dir) in &self.repos {
+                let _ =
+                    sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+                tdh::cleanup_member_repo(&self.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(self.user_id)
+                .execute(&self.pool)
+                .await;
+        }
+    }
+
+    fn code_of(body: &Bytes) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// #4186: `If-None-Match: *` creates only when the path is free; a second
+    /// one is a 412, not the unconditional 409. The 201 carries the ETag.
+    #[tokio::test]
+    async fn if_none_match_star_creates_once_then_412_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+
+        let (first, _, headers) = fx
+            .put(&key, "index.yaml", b"v1", &[("if-none-match", "*")])
+            .await;
+        let (second, body, _) = fx
+            .put(&key, "index.yaml", b"v2", &[("if-none-match", "*")])
+            .await;
+        let current = fx.live_checksum(repo_id, "index.yaml").await;
+        fx.teardown().await;
+
+        assert_eq!(first, StatusCode::CREATED);
+        assert_eq!(
+            headers.get("etag").and_then(|v| v.to_str().ok()),
+            Some(quoted(b"v1").as_str()),
+            "the 201 must carry the new strong ETag"
+        );
+        assert_eq!(
+            second,
+            StatusCode::PRECONDITION_FAILED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(code_of(&body), "PRECONDITION_FAILED");
+        assert_eq!(current.as_deref(), Some(sha(b"v1").as_str()));
+    }
+
+    /// #4186: a matching `If-Match` replaces the live artifact (the
+    /// compare-and-swap an index document needs); a stale one is a 412 and
+    /// leaves the stored bytes alone. The download serves the new ETag.
+    #[tokio::test]
+    async fn if_match_replaces_on_match_and_refuses_stale_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+
+        let (created, _, _) = fx.put(&key, "index.yaml", b"v1", &[]).await;
+        let v1 = quoted(b"v1");
+        let (swapped, swap_body, _) = fx
+            .put(&key, "index.yaml", b"v2", &[("if-match", &v1)])
+            .await;
+        let (stale, stale_body, _) = fx
+            .put(&key, "index.yaml", b"v3", &[("if-match", &v1)])
+            .await;
+        let (dl, bytes, dl_headers) = {
+            let resp = tower::ServiceExt::oneshot(
+                fx.router(),
+                tdh::get(format!("/{key}/download/index.yaml")),
+            )
+            .await
+            .expect("download");
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("body");
+            (status, body, headers)
+        };
+        let candidate: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_gc_candidates WHERE source_repository_id = $1 \
+             AND storage_key = $2",
+        )
+        .bind(repo_id)
+        .bind(
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&sha(
+                b"v1",
+            )),
+        )
+        .fetch_one(&fx.pool)
+        .await
+        .expect("candidates");
+        fx.teardown().await;
+
+        assert_eq!(created, StatusCode::CREATED);
+        assert_eq!(
+            swapped,
+            StatusCode::CREATED,
+            "a matching If-Match must replace: {}",
+            String::from_utf8_lossy(&swap_body)
+        );
+        assert_eq!(
+            stale,
+            StatusCode::PRECONDITION_FAILED,
+            "{}",
+            String::from_utf8_lossy(&stale_body)
+        );
+        assert_eq!(dl, StatusCode::OK);
+        assert_eq!(&bytes[..], b"v2");
+        assert_eq!(
+            dl_headers.get("etag").and_then(|v| v.to_str().ok()),
+            Some(quoted(b"v2").as_str())
+        );
+        assert_eq!(candidate, 1, "the replaced object is handed to storage GC");
+    }
+
+    /// #4186 acceptance: of several conditional PUTs against one ETag exactly
+    /// one wins (2xx) and every other gets 412, and the stored bytes are the
+    /// winner's. Same single-winner shape as #4832.
+    #[tokio::test]
+    async fn racing_if_match_puts_have_one_winner_4186_db() {
+        const RACERS: usize = 8;
+        static BODIES: [&[u8]; RACERS] = [b"r0", b"r1", b"r2", b"r3", b"r4", b"r5", b"r6", b"r7"];
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+        let (created, _, _) = fx.put(&key, "index.yaml", b"base", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        let etag = quoted(b"base");
+
+        let fx = Arc::new(fx);
+        let mut tasks = Vec::new();
+        for body in BODIES {
+            let fx = fx.clone();
+            let key = key.clone();
+            let etag = etag.clone();
+            tasks.push(tokio::spawn(async move {
+                let (status, _, _) = fx
+                    .put(&key, "index.yaml", body, &[("if-match", &etag)])
+                    .await;
+                (status, body)
+            }));
+        }
+        let mut winners = Vec::new();
+        let mut refused = 0;
+        let mut other = Vec::new();
+        for t in tasks {
+            let (status, body) = t.await.expect("racer");
+            match status {
+                StatusCode::CREATED => winners.push(body),
+                StatusCode::PRECONDITION_FAILED => refused += 1,
+                s => other.push(s),
+            }
+        }
+        let current = fx.live_checksum(repo_id, "index.yaml").await;
+        let fx = Arc::into_inner(fx).expect("racers done");
+        fx.teardown().await;
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one winner, other statuses: {other:?}"
+        );
+        assert_eq!(
+            refused,
+            RACERS - 1,
+            "every loser gets 412, other: {other:?}"
+        );
+        assert_eq!(current.as_deref(), Some(sha(winners[0]).as_str()));
+    }
+
+    /// #4186: racing `If-None-Match: *` creates on a free path: one 201, the
+    /// rest 412 (unconditional racers get 409, #4832).
+    #[tokio::test]
+    async fn racing_if_none_match_creates_have_one_winner_4186_db() {
+        const RACERS: usize = 8;
+        static BODIES: [&[u8]; RACERS] = [b"c0", b"c1", b"c2", b"c3", b"c4", b"c5", b"c6", b"c7"];
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (_, key) = fx.repo("local", "generic", false).await;
+        let fx = Arc::new(fx);
+        let mut tasks = Vec::new();
+        for body in BODIES {
+            let fx = fx.clone();
+            let key = key.clone();
+            tasks.push(tokio::spawn(async move {
+                fx.put(&key, "lock.json", body, &[("if-none-match", "*")])
+                    .await
+                    .0
+            }));
+        }
+        let mut statuses = Vec::new();
+        for t in tasks {
+            statuses.push(t.await.expect("racer"));
+        }
+        let fx = Arc::into_inner(fx).expect("racers done");
+        fx.teardown().await;
+
+        let created = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count();
+        let refused = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::PRECONDITION_FAILED)
+            .count();
+        assert_eq!((created, refused), (1, RACERS - 1), "{statuses:?}");
+    }
+
+    /// #4186: on a versioning-enabled repository a matched `If-Match` appends
+    /// one revision; racers on the same ETag still get one winner.
+    #[tokio::test]
+    async fn versioned_repo_if_match_racers_append_once_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", true).await;
+        let (created, _, _) = fx.put(&key, "tool/tool.bin", b"rev1", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        let etag = quoted(b"rev1");
+        let fx = Arc::new(fx);
+        let a = {
+            let (fx, key, etag) = (fx.clone(), key.clone(), etag.clone());
+            tokio::spawn(async move {
+                fx.put(&key, "tool/tool.bin", b"rev2-a", &[("if-match", &etag)])
+                    .await
+                    .0
+            })
+        };
+        let b = {
+            let (fx, key, etag) = (fx.clone(), key.clone(), etag.clone());
+            tokio::spawn(async move {
+                fx.put(&key, "tool/tool.bin", b"rev2-b", &[("if-match", &etag)])
+                    .await
+                    .0
+            })
+        };
+        let mut statuses = vec![a.await.expect("a"), b.await.expect("b")];
+        statuses.sort();
+        let revisions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_versions WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind("tool/tool.bin")
+        .fetch_one(&fx.pool)
+        .await
+        .expect("revisions");
+        let fx = Arc::into_inner(fx).expect("racers done");
+        fx.teardown().await;
+
+        assert_eq!(
+            statuses,
+            vec![StatusCode::CREATED, StatusCode::PRECONDITION_FAILED]
+        );
+        assert_eq!(revisions, 2, "one base revision plus exactly one appended");
+    }
+
+    /// #4186 controls: an unconditional second PUT keeps its 409; a matched
+    /// `If-Match` cannot swap a released coordinate (a versioned path) for
+    /// different bytes; a malformed precondition is a 400, not ignored.
+    #[tokio::test]
+    async fn preconditions_keep_the_immutability_rules_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (_, key) = fx.repo("local", "generic", false).await;
+        let (a, _, _) = fx.put(&key, "pkg/1.0/pkg.bin", b"one", &[]).await;
+        let (again, _, _) = fx.put(&key, "pkg/1.0/pkg.bin", b"two", &[]).await;
+        let one = quoted(b"one");
+        let (released, released_body, _) = fx
+            .put(&key, "pkg/1.0/pkg.bin", b"two", &[("if-match", &one)])
+            .await;
+        let (malformed, _, _) = fx
+            .put(&key, "free.bin", b"x", &[("if-match", "not-quoted")])
+            .await;
+        let (stale_on_free, _, _) = fx.put(&key, "free.bin", b"x", &[("if-match", &one)]).await;
+        let (weak, _, _) = fx
+            .put(
+                &key,
+                "pkg/1.0/pkg.bin",
+                b"two",
+                &[("if-match", &format!("W/{one}"))],
+            )
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(a, StatusCode::CREATED);
+        assert_eq!(
+            again,
+            StatusCode::CONFLICT,
+            "unconditional writes are unchanged"
+        );
+        assert_eq!(
+            released,
+            StatusCode::CONFLICT,
+            "a released coordinate stays immutable: {}",
+            String::from_utf8_lossy(&released_body)
+        );
+        assert_eq!(malformed, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            stale_on_free,
+            StatusCode::PRECONDITION_FAILED,
+            "If-Match on an absent artifact fails"
+        );
+        assert_eq!(
+            weak,
+            StatusCode::PRECONDITION_FAILED,
+            "If-Match uses the strong comparison"
+        );
+    }
+
+    /// #4323: a small object whose stored bytes no longer match the record is
+    /// answered `502 STORED_OBJECT_INTEGRITY` on the generic download route,
+    /// with none of its bytes, instead of a `200` cut short.
+    #[tokio::test]
+    async fn corrupted_object_is_a_502_on_the_generic_route_4323_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+        let (created, _, _) = fx.put(&key, "a/1/a.bin", b"intact bytes", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        fx.corrupt(repo_id, "a/1/a.bin", b"rotten bytes").await;
+        let (status, ok_body, err_body) = fx.download(&key, "a/1/a.bin").await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "served {:?}",
+            ok_body.map(|b| String::from_utf8_lossy(&b).into_owned())
+        );
+        assert_eq!(code_of(&err_body), "STORED_OBJECT_INTEGRITY");
+    }
+
+    /// #4323: the shared hosted fetch behind the format-native routes and
+    /// every virtual-member serve verifies too. A mismatch is a terminal
+    /// refusal (`is_member_policy_block_response`), so a virtual repository
+    /// answers 502 instead of serving the corrupt member or falling through
+    /// to the next member's bytes.
+    #[tokio::test]
+    async fn corrupted_member_is_a_terminal_502_through_a_virtual_4323_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (first_id, first_key) = fx.repo("local", "generic", false).await;
+        let (_, second_key) = fx.repo("local", "generic", false).await;
+        let (virtual_id, virtual_key) = fx.repo("virtual", "generic", false).await;
+        tdh::link_virtual_member(&fx.pool, virtual_id, first_id, 1).await;
+        let second_id = fx.repos[1].0;
+        tdh::link_virtual_member(&fx.pool, virtual_id, second_id, 2).await;
+        let (a, _, _) = fx
+            .put(&first_key, "shared/x.bin", b"first member", &[])
+            .await;
+        let (b, _, _) = fx
+            .put(&second_key, "shared/x.bin", b"second member", &[])
+            .await;
+        assert_eq!((a, b), (StatusCode::CREATED, StatusCode::CREATED));
+        fx.corrupt(first_id, "shared/x.bin", b"first membe!").await;
+
+        let direct = crate::api::handlers::proxy_helpers::local_fetch_by_path(
+            &fx.pool,
+            &fx.state,
+            first_id,
+            &crate::storage::StorageLocation {
+                backend: "s3".into(),
+                path: first_key.clone(),
+            },
+            "shared/x.bin",
+        )
+        .await;
+        let direct_status = match &direct {
+            Ok(_) => StatusCode::OK,
+            Err(resp) => resp.status(),
+        };
+        let terminal = direct
+            .as_ref()
+            .err()
+            .is_some_and(crate::api::handlers::proxy_helpers::is_member_policy_block_response);
+        drop(direct);
+        let (via_virtual, served, err_body) = fx.download(&virtual_key, "shared/x.bin").await;
+        fx.teardown().await;
+
+        assert_eq!(direct_status, StatusCode::BAD_GATEWAY);
+        assert!(terminal, "an integrity failure must stop the member walk");
+        assert_eq!(
+            via_virtual,
+            StatusCode::BAD_GATEWAY,
+            "served {:?}",
+            served.map(|b| String::from_utf8_lossy(&b).into_owned())
+        );
+        assert_eq!(code_of(&err_body), "STORED_OBJECT_INTEGRITY");
+    }
+
+    /// #4323: `ranged_stream_response_advertised` (Incus images) verifies a
+    /// whole-object serve against the digest its own headers advertise, and
+    /// leaves a content-coded body alone.
+    #[tokio::test]
+    async fn ranged_stream_response_verifies_the_advertised_digest_4323() {
+        use axum::http::header;
+        use futures::StreamExt;
+        let good = b"layer bytes".as_slice();
+        let digest = format!("sha256:{}", sha(good));
+        let serve = |body: &'static [u8], extra: Option<(header::HeaderName, String)>| {
+            let mut headers = vec![(
+                header::HeaderName::from_static("docker-content-digest"),
+                digest.clone(),
+            )];
+            headers.extend(extra);
+            let body = futures::stream::iter(vec![Ok(Bytes::from_static(body))]).boxed();
+            super::ranged_stream_response_advertised(None, good.len() as u64, body, headers)
+                .expect("response")
+        };
+        let read = |resp: axum::response::Response| async move {
+            axum::body::to_bytes(resp.into_body(), 1 << 20).await
+        };
+        assert_eq!(
+            &read(serve(b"layer bytes", None)).await.expect("intact")[..],
+            good
+        );
+        assert!(
+            read(serve(b"layer bytez", None)).await.is_err(),
+            "a corrupt whole-object serve must not complete"
+        );
+        assert!(
+            read(serve(
+                b"layer bytez",
+                Some((header::CONTENT_ENCODING, "gzip".into()))
+            ))
+            .await
+            .is_ok(),
+            "a coded body is not the advertised digest's bytes"
+        );
     }
 }

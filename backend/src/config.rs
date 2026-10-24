@@ -1407,11 +1407,14 @@ pub struct Config {
     /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
     pub presigned_download_expiry_secs: u64,
 
-    /// Verify a stored artifact's bytes against its recorded SHA-256 while the
-    /// generic download route streams them (#3919). The digest is computed
-    /// incrementally (one chunk held back, no buffering); on a mismatch the
-    /// response is aborted before the final bytes, so a corrupted object is
-    /// never delivered in full under the original `X-Checksum-Sha256`.
+    /// Verify a stored artifact's bytes against its recorded SHA-256 while
+    /// downloads stream them (#3919, #4323; the generic route, virtual-member
+    /// serves, the shared hosted fetch and Incus image downloads). An
+    /// object up to `storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES` is
+    /// checked before the response starts (a mismatch is a 502); a larger one
+    /// is hashed incrementally (one chunk held back) and aborted before its
+    /// final bytes on a mismatch. Paths without a `Config` at hand read the
+    /// same variable through `storage::verify::serve_verification_enabled`.
     /// Default: true. Set `DOWNLOAD_VERIFY_CHECKSUMS=false` to skip the
     /// per-download hash (integrity is then the client's responsibility).
     pub download_verify_checksums: bool,

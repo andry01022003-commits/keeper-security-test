@@ -157,6 +157,33 @@ pub(crate) async fn enforce_path_immutability(
     version: Option<&str>,
     checksum_sha256: &str,
 ) -> Result<()> {
+    enforce_path_immutability_with(
+        db,
+        repository_id,
+        repo,
+        path,
+        version,
+        checksum_sha256,
+        false,
+    )
+    .await
+}
+
+/// [`enforce_path_immutability`] for a conditional write (#4186).
+/// `replaces_current` is true when the write carries an `If-Match` that the
+/// caller has already found to hold: the client named the live content it
+/// replaces, so check 1 (live overwrite) does not apply. Check 2, the
+/// release-immutability backstop, still does, so a released coordinate
+/// cannot be swapped for different bytes even with a matching `If-Match`.
+pub(crate) async fn enforce_path_immutability_with(
+    db: &PgPool,
+    repository_id: Uuid,
+    repo: Option<&Repository>,
+    path: &str,
+    version: Option<&str>,
+    checksum_sha256: &str,
+    replaces_current: bool,
+) -> Result<()> {
     let versioning_active = repo
         .map(|r| versioning_applies(&r.format, r.versioning_enabled))
         .unwrap_or(false);
@@ -172,7 +199,8 @@ pub(crate) async fn enforce_path_immutability(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     if let Some(existing) = existing {
-        if !versioning_active && existing.version == version.map(String::from) {
+        if !versioning_active && !replaces_current && existing.version == version.map(String::from)
+        {
             return Err(AppError::Conflict(
                 "Artifact version already exists and is immutable".to_string(),
             ));
@@ -382,6 +410,191 @@ async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
             );
             false
         }
+    }
+}
+
+/// Journal the object a conditional replace (#4186) left without a row as a
+/// storage GC candidate. Recorded in the publishing transaction so it exists
+/// exactly when the replace commits. Idempotent; the candidate sweep drops
+/// the row without touching the object if anything still references the key.
+async fn record_replaced_object_gc_candidate(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo: &Repository,
+    old_key: &str,
+) -> Result<()> {
+    let scope =
+        crate::services::storage_gc_service::oci_gc_candidate_scope(&repo.storage_location());
+    sqlx::query(
+        "INSERT INTO oci_gc_candidates \
+             (storage_key, storage_backend, storage_path, source_repository_id) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+    )
+    .bind(old_key)
+    .bind(&scope.backend)
+    .bind(&scope.path)
+    .bind(repo.id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// The live artifact's recorded SHA-256 at `(repository_id, path)`, the value
+/// a precondition is evaluated against (#4186). `None` when the path holds no
+/// live artifact; a soft-deleted row counts as absent, as it does for a GET.
+pub(crate) async fn current_live_checksum(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map(|v| v.map(|c| c.trim().to_string()))
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// One `If-Match` / `If-None-Match` header value (#4186): the wildcard `*`, or
+/// a list of entity tags. Only the opaque part of each tag is kept; a weak tag
+/// (`W/"..."`) is remembered as weak because `If-Match` uses the strong
+/// comparison (RFC 9110 section 13.1.1), under which a weak tag never matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityTagCondition {
+    Any,
+    Tags(Vec<EntityTag>),
+}
+
+/// One entity tag from a precondition header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityTag {
+    pub weak: bool,
+    pub opaque: String,
+}
+
+impl EntityTagCondition {
+    /// Parse a header value. `None` when the value is not a valid
+    /// `*` / entity-tag list, which the caller answers with 400 rather than
+    /// silently ignoring a precondition the client meant to set.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw == "*" {
+            return Some(Self::Any);
+        }
+        let mut tags = Vec::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (weak, rest) = match part.strip_prefix("W/") {
+                Some(rest) => (true, rest),
+                None => (false, part),
+            };
+            let opaque = rest.strip_prefix('"')?.strip_suffix('"')?;
+            if opaque.contains('"') {
+                return None;
+            }
+            tags.push(EntityTag {
+                weak,
+                opaque: opaque.to_string(),
+            });
+        }
+        (!tags.is_empty()).then_some(Self::Tags(tags))
+    }
+
+    /// Whether `current` (the target's ETag opaque value, `None` when there is
+    /// no current representation) satisfies this condition as `If-Match`
+    /// (strong comparison).
+    fn matches_strong(&self, current: Option<&str>) -> bool {
+        match (self, current) {
+            (_, None) => false,
+            (Self::Any, Some(_)) => true,
+            (Self::Tags(tags), Some(cur)) => tags
+                .iter()
+                .any(|t| !t.weak && t.opaque.eq_ignore_ascii_case(cur)),
+        }
+    }
+
+    /// Whether `current` matches this condition under the weak comparison
+    /// `If-None-Match` uses.
+    fn matches_weak(&self, current: Option<&str>) -> bool {
+        match (self, current) {
+            (_, None) => false,
+            (Self::Any, Some(_)) => true,
+            (Self::Tags(tags), Some(cur)) => {
+                tags.iter().any(|t| t.opaque.eq_ignore_ascii_case(cur))
+            }
+        }
+    }
+}
+
+/// The preconditions of a conditional write (#4186), evaluated against the
+/// artifact's current ETag, which is its recorded SHA-256 (the value the
+/// generic download route emits as `ETag` and `X-Checksum-Sha256`).
+///
+/// The handler evaluates it once before reading the body, so a write that is
+/// bound to fail is refused before any byte is staged. The authoritative
+/// evaluation runs again in the publishing transaction with the target row
+/// locked ([`ArtifactService::upload_content_conditional`]), so of two
+/// conditional writers racing on the same ETag exactly one commits and the
+/// other gets 412, the same single-winner shape #4832 gives unconditional
+/// writers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WritePrecondition {
+    pub if_match: Option<EntityTagCondition>,
+    pub if_none_match: Option<EntityTagCondition>,
+}
+
+impl WritePrecondition {
+    /// `None` when neither header was sent: an unconditional write.
+    pub fn new(
+        if_match: Option<EntityTagCondition>,
+        if_none_match: Option<EntityTagCondition>,
+    ) -> Option<Self> {
+        (if_match.is_some() || if_none_match.is_some()).then_some(Self {
+            if_match,
+            if_none_match,
+        })
+    }
+
+    /// RFC 9110 section 13.2.2 order for a state-changing method: `If-Match`
+    /// first, then `If-None-Match`. `current` is the live artifact's SHA-256,
+    /// `None` when the path holds no live artifact (absent or soft-deleted).
+    pub fn holds(&self, current: Option<&str>) -> bool {
+        let current = current.map(str::trim);
+        if let Some(cond) = &self.if_match {
+            if !cond.matches_strong(current) {
+                return false;
+            }
+        }
+        if let Some(cond) = &self.if_none_match {
+            if cond.matches_weak(current) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a write that passed this precondition replaces the live
+    /// artifact the client named. A matched `If-Match` is an explicit
+    /// compare-and-swap on the current content, so it lifts the
+    /// "a second upload to an occupied path is a 409" rule (the live-overwrite
+    /// check); the release-immutability backstop still applies.
+    pub fn replaces_current(&self) -> bool {
+        self.if_match.is_some()
+    }
+
+    /// The 412 a failed precondition is answered with.
+    pub fn failed(path: &str) -> AppError {
+        AppError::PreconditionFailed(format!(
+            "Precondition failed: the current state of '{path}' does not match If-Match / If-None-Match"
+        ))
     }
 }
 
@@ -644,8 +857,15 @@ impl ArtifactService {
 
         // Quota, live-overwrite check, and the release-immutability
         // backstop — shared with the streaming path.
-        self.preflight_upload(repository_id, path, version, size_bytes, &checksum_sha256)
-            .await?;
+        self.preflight_upload(
+            repository_id,
+            path,
+            version,
+            size_bytes,
+            &checksum_sha256,
+            None,
+        )
+        .await?;
 
         // Check if content already exists (deduplication)
         let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
@@ -668,6 +888,7 @@ impl ArtifactService {
             &storage_key,
             uploaded_by,
             enqueue_sync_tasks,
+            None,
             None,
         )
         .await
@@ -714,6 +935,7 @@ impl ArtifactService {
             uploaded_by,
             enqueue_sync_tasks,
             catalog_name,
+            None,
         )
         .await
     }
@@ -724,6 +946,10 @@ impl ArtifactService {
     /// the content-addressed key with a backend `copy` (server-side on S3 and
     /// GCS) so the body never touches local disk. Every other semantic --
     /// preflight, dedup-first, finalize -- is shared.
+    ///
+    /// `precondition` makes the write conditional (#4186): it is checked in
+    /// the preflight (412 before any byte is written) and again, with the
+    /// target row locked, in the publishing transaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_content_with_sync_options(
         &self,
@@ -738,11 +964,19 @@ impl ArtifactService {
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
         catalog_name: Option<&str>,
+        precondition: Option<&WritePrecondition>,
     ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
-        self.preflight_upload(repository_id, path, version, size_bytes, &digests.sha256)
-            .await?;
+        self.preflight_upload(
+            repository_id,
+            path,
+            version,
+            size_bytes,
+            &digests.sha256,
+            precondition,
+        )
+        .await?;
 
         // Dedup check FIRST: skip `put_stream` on a warm blob so we never
         // rewrite content that is already present under its content-addressed
@@ -786,6 +1020,7 @@ impl ArtifactService {
             uploaded_by,
             enqueue_sync_tasks,
             catalog_name,
+            precondition,
         )
         .await
     }
@@ -804,7 +1039,18 @@ impl ArtifactService {
         version: Option<&str>,
         size_bytes: i64,
         checksum_sha256: &str,
+        precondition: Option<&WritePrecondition>,
     ) -> Result<()> {
+        // #4186: a precondition is evaluated before any other refusal, so a
+        // compare-and-swap that lost gets 412 rather than the immutability
+        // 409 below. Unlocked here (an early, cheap refusal); the publishing
+        // transaction re-evaluates it with the row locked.
+        if let Some(precondition) = precondition {
+            let current = current_live_checksum(&self.db, repository_id, path).await?;
+            if !precondition.holds(current.as_deref()) {
+                return Err(WritePrecondition::failed(path));
+            }
+        }
         crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
         // Check quota (repository quota and, if any, its project's aggregate
         // quota, #2474).
@@ -823,13 +1069,14 @@ impl ArtifactService {
         // (#3924), because this function — the documented chokepoint — was
         // simply never on it.
         let repo = self.repo_service.get_by_id(repository_id).await;
-        enforce_path_immutability(
+        enforce_path_immutability_with(
             &self.db,
             repository_id,
             repo.as_ref().ok(),
             path,
             version,
             checksum_sha256,
+            precondition.is_some_and(WritePrecondition::replaces_current),
         )
         .await?;
 
@@ -858,6 +1105,7 @@ impl ArtifactService {
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
         catalog_name: Option<&str>,
+        precondition: Option<&WritePrecondition>,
     ) -> Result<Artifact> {
         // #2367: for versioning-enabled Generic/Mlmodel repos, capture the
         // pre-upsert HEAD state so the history append below can (a) stay
@@ -912,77 +1160,140 @@ impl ArtifactService {
             return Err(scope.into_error());
         }
 
-        // Create artifact record.
+        // #4186: a conditional write re-evaluates its precondition here, with
+        // the target row (live or tombstone) locked, so the decision and the
+        // upsert below see the same state. Of two writers racing on one ETag
+        // the second blocks on this lock, then reads the first one's commit
+        // and fails the precondition: exactly one 2xx and one 412.
         //
-        // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
-        // lockstep with sha256 -- otherwise an artifact whose content was
-        // replaced would still expose the *old* sha1/md5 via the
-        // checksum-search endpoint, which would point dedup-by-checksum
-        // clients at the wrong artifact.
-        //
-        // #4832: the `WHERE` on the update is the live-overwrite rule of
-        // `enforce_path_immutability` (check 1), applied atomically. That
-        // check runs in the preflight, before the bytes are stored and outside
-        // this transaction, so concurrent uploads to one path all passed it
-        // and every one answered 201 while the last upsert silently replaced
-        // the others. Here the conflicting row is locked: a live row at the
-        // same version is left untouched (no row returned) and the upload is
-        // refused with the preflight's own 409. A tombstone is resurrected
-        // and a versioning-enabled repository appends, as before.
-        let artifact = sqlx::query_as!(
-            Artifact,
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_sha1, checksum_md5,
-                content_type, storage_key, uploaded_by
+        // A path with no row at all has nothing to lock. `expect_absent`
+        // makes the upsert refuse to overwrite a live row that a concurrent
+        // writer committed after this read; the loop then re-reads (the row
+        // now exists and is locked by the refused upsert) and evaluates the
+        // precondition against it.
+        let mut attempt = 0;
+        let artifact = loop {
+            attempt += 1;
+            let mut expect_absent = false;
+            let mut replaces_current = false;
+            let mut replaced_key = None;
+            if let Some(precondition) = precondition {
+                let row = sqlx::query_as::<_, (String, String, bool)>(
+                    "SELECT checksum_sha256, storage_key, is_deleted FROM artifacts \
+                     WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+                )
+                .bind(repository_id)
+                .bind(path)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                let live = row.filter(|(_, _, deleted)| !deleted);
+                let live_checksum = live.as_ref().map(|(checksum, _, _)| checksum.trim());
+                if !precondition.holds(live_checksum) {
+                    return Err(WritePrecondition::failed(path));
+                }
+                expect_absent = live.is_none();
+                replaces_current = live.is_some() && precondition.replaces_current();
+                replaced_key = live.map(|(_, key, _)| key);
+            }
+            // Create artifact record.
+            //
+            // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
+            // lockstep with sha256 -- otherwise an artifact whose content was
+            // replaced would still expose the *old* sha1/md5 via the
+            // checksum-search endpoint, which would point dedup-by-checksum
+            // clients at the wrong artifact.
+            //
+            // #4832: the `WHERE` on the update is the live-overwrite rule of
+            // `enforce_path_immutability` (check 1), applied atomically. That
+            // check runs in the preflight, before the bytes are stored and outside
+            // this transaction, so concurrent uploads to one path all passed it
+            // and every one answered 201 while the last upsert silently replaced
+            // the others. Here the conflicting row is locked: a live row at the
+            // same version is left untouched (no row returned) and the upload is
+            // refused with the preflight's own 409. A tombstone is resurrected
+            // and a versioning-enabled repository appends, as before.
+            let artifact = sqlx::query_as!(
+                Artifact,
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, checksum_sha1, checksum_md5,
+                    content_type, storage_key, uploaded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (repository_id, path) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    version = EXCLUDED.version,
+                    size_bytes = EXCLUDED.size_bytes,
+                    checksum_sha256 = EXCLUDED.checksum_sha256,
+                    checksum_sha1 = EXCLUDED.checksum_sha1,
+                    checksum_md5 = EXCLUDED.checksum_md5,
+                    content_type = EXCLUDED.content_type,
+                    storage_key = EXCLUDED.storage_key,
+                    uploaded_by = EXCLUDED.uploaded_by,
+                    is_deleted = false,
+                    updated_at = NOW()
+                WHERE (artifacts.is_deleted
+                    OR $12
+                    OR artifacts.version IS DISTINCT FROM EXCLUDED.version
+                    OR $13)
+                  AND (NOT $14 OR artifacts.is_deleted)
+                RETURNING
+                    id, repository_id, path, name, version, size_bytes,
+                    checksum_sha256, checksum_md5, checksum_sha1,
+                    content_type, storage_key, is_deleted, uploaded_by,
+                    quarantine_status, quarantine_until,
+                    created_at, updated_at
+                "#,
+                repository_id,
+                path,
+                name,
+                version,
+                size_bytes,
+                checksum_sha256,
+                checksum_sha1,
+                checksum_md5,
+                content_type,
+                storage_key,
+                uploaded_by,
+                versioning_active,
+                replaces_current,
+                expect_absent
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (repository_id, path) DO UPDATE SET
-                name = EXCLUDED.name,
-                version = EXCLUDED.version,
-                size_bytes = EXCLUDED.size_bytes,
-                checksum_sha256 = EXCLUDED.checksum_sha256,
-                checksum_sha1 = EXCLUDED.checksum_sha1,
-                checksum_md5 = EXCLUDED.checksum_md5,
-                content_type = EXCLUDED.content_type,
-                storage_key = EXCLUDED.storage_key,
-                uploaded_by = EXCLUDED.uploaded_by,
-                is_deleted = false,
-                updated_at = NOW()
-            WHERE artifacts.is_deleted
-                OR $12
-                OR artifacts.version IS DISTINCT FROM EXCLUDED.version
-            RETURNING
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_md5, checksum_sha1,
-                content_type, storage_key, is_deleted, uploaded_by,
-                quarantine_status, quarantine_until,
-                created_at, updated_at
-            "#,
-            repository_id,
-            path,
-            name,
-            version,
-            size_bytes,
-            checksum_sha256,
-            checksum_sha1,
-            checksum_md5,
-            content_type,
-            storage_key,
-            uploaded_by,
-            versioning_active
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        let Some(artifact) = artifact else {
-            // Drop `tx` (rolls back the quota admission). The content blob is
-            // content-addressed; if this upload orphaned it, storage GC
-            // reclaims it, as on the quota-deny path above.
-            return Err(AppError::Conflict(
-                "Artifact version already exists and is immutable".to_string(),
-            ));
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            match artifact {
+                Some(artifact) => {
+                    // #4186: an `If-Match` replace on a repository without
+                    // revision history leaves the old object with no row.
+                    // Hand its key to storage GC's candidate sweep, which
+                    // re-checks every reference before deleting, so a key
+                    // another row still shares is kept.
+                    if replaces_current && !versioning_active {
+                        if let (Some(old_key), Some(repo)) =
+                            (replaced_key.as_deref(), repo_for_upload.as_ref())
+                        {
+                            if old_key != storage_key {
+                                record_replaced_object_gc_candidate(&mut tx, repo, old_key).await?;
+                            }
+                        }
+                    }
+                    break artifact;
+                }
+                // #4186: a live row appeared under a conditional write that
+                // expected none; evaluate the precondition against it.
+                None if expect_absent && attempt == 1 => continue,
+                None => {
+                    // Drop `tx` (rolls back the quota admission). The content
+                    // blob is content-addressed; if this upload orphaned it,
+                    // storage GC reclaims it, as on the quota-deny path above.
+                    return Err(AppError::Conflict(
+                        "Artifact version already exists and is immutable".to_string(),
+                    ));
+                }
+            }
         };
 
         // Commit the admission + INSERT together, releasing the ledger-row
@@ -2801,6 +3112,52 @@ pub(crate) async fn record_safetensors_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4186: header parsing and RFC 9110 evaluation of the preconditions.
+    #[test]
+    fn write_precondition_parses_and_evaluates_4186() {
+        let c = |raw: &str| EntityTagCondition::parse(raw).expect(raw);
+        assert_eq!(c("*"), EntityTagCondition::Any);
+        assert_eq!(
+            c(r#""a", W/"b""#),
+            EntityTagCondition::Tags(vec![
+                EntityTag {
+                    weak: false,
+                    opaque: "a".into()
+                },
+                EntityTag {
+                    weak: true,
+                    opaque: "b".into()
+                },
+            ])
+        );
+        assert!(EntityTagCondition::parse("unquoted").is_none());
+        assert!(EntityTagCondition::parse("").is_none());
+        assert!(EntityTagCondition::parse(r#""a"b""#).is_none());
+
+        let if_match = |raw| WritePrecondition::new(Some(c(raw)), None).unwrap();
+        let if_none = |raw| WritePrecondition::new(None, Some(c(raw))).unwrap();
+        assert!(WritePrecondition::new(None, None).is_none());
+        assert!(if_match(r#""abc""#).holds(Some("abc")));
+        assert!(
+            if_match(r#""ABC""#).holds(Some("abc")),
+            "hex compares case-insensitively"
+        );
+        assert!(!if_match(r#""abc""#).holds(Some("def")));
+        assert!(!if_match(r#""abc""#).holds(None));
+        assert!(
+            !if_match(r#"W/"abc""#).holds(Some("abc")),
+            "strong comparison"
+        );
+        assert!(if_match("*").holds(Some("x")));
+        assert!(!if_match("*").holds(None));
+        assert!(if_none("*").holds(None));
+        assert!(!if_none("*").holds(Some("x")));
+        assert!(!if_none(r#"W/"x""#).holds(Some("x")), "weak comparison");
+        assert!(if_none(r#""y""#).holds(Some("x")));
+        assert!(if_match(r#""abc""#).replaces_current());
+        assert!(!if_none("*").replaces_current());
+    }
 
     #[test]
     fn test_calculate_sha256() {
