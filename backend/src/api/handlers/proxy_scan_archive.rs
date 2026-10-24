@@ -289,7 +289,7 @@ pub(crate) enum LocalLookup<'a> {
     PathSuffix(&'a str),
     /// By exact artifact path (Conan).
     ExactPath(&'a str),
-    /// By `(name, version)` (Pub).
+    /// By `(name, version)` (Pub, CocoaPods, Swift).
     NameVersion { name: &'a str, version: &'a str },
 }
 

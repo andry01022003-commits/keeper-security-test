@@ -250,6 +250,8 @@ mod tests {
             "composer",
             "pub",
             "conan",
+            "cocoapods",
+            "swift",
         ] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),

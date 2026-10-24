@@ -24002,6 +24002,44 @@ mod proxy_download_recording_tests {
                 "serve_scanned_proxy_file(",
                 1,
             ),
+            // #4109: CocoaPods pod archives, Remote and Virtual.
+            (
+                "cocoapods.rs",
+                "download_pod",
+                "serve_scanned_pod_download(",
+                1,
+            ),
+            (
+                "cocoapods.rs",
+                "serve_scanned_pod_download",
+                "serve_scanned_pod_archive(",
+                1,
+            ),
+            (
+                "cocoapods.rs",
+                "serve_scanned_pod_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4110: Swift source archives, Remote and Virtual.
+            (
+                "swift.rs",
+                "download_archive",
+                "serve_scanned_swift_download(",
+                1,
+            ),
+            (
+                "swift.rs",
+                "serve_scanned_swift_download",
+                "serve_scanned_swift_archive(",
+                1,
+            ),
+            (
+                "swift.rs",
+                "serve_scanned_swift_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
         ];
         // Body of the top-level `fn name(` or generic `fn name<` (brace-matched
         // from its first `{`).

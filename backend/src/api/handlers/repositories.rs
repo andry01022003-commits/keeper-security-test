@@ -28051,6 +28051,8 @@ mod tests {
             Composer,
             Pub,
             Conan,
+            Cocoapods,
+            Swift,
         ] {
             assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }

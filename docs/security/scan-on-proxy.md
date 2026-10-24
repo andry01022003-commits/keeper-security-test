@@ -66,15 +66,19 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
-**Archive formats graded on their contents (Go, Composer, Conan).** The gate
+**Archive formats graded on their contents (Go, Composer, Conan, CocoaPods, Swift).** The gate
 takes the coordinate from the request and checks it against the archive
 first, as for every format: a Go module zip must hold only
 `{module}@{version}/` entries and its `go.mod` (when it has one) must declare
 that module; a Composer dist's own `composer.json` (at the archive root, or
 under the one top-level directory a VCS zipball wraps it in) must name the
 requested package, and a `version` it declares must be the requested one;
-a Conan archive carries no coordinate of its own, so it must only be a
-readable gzipped tar. Bytes that fail that check, or are not a readable archive of that kind, are
+a CocoaPods pod archive's own `{name}.podspec.json` (at the root or one
+directory down) must declare the requested name and version; a Conan
+archive carries no coordinate of its own, so it must only be a readable
+gzipped tar, and a Swift source archive must be a readable zip with a
+`Package.swift` at the root or under its one top-level directory (the
+registry's `scope.name` appears nowhere in the archive). Bytes that fail that check, or are not a readable archive of that kind, are
 inconclusive and are not scanned, so no verdict is recorded for them:
 `423` under `fail_closed`, served `pending` under `fail_open` and
 `record_only`.
@@ -274,8 +278,8 @@ have no core proxy path to gate.
 | `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
 | `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
 | `hex` | `hex` | accepted | |
-| `cocoapods` | `cocoapods` | accepted | |
-| `swift` | `swift` | accepted | |
+| `cocoapods` | `cocoapods` | enforced | Pod archives on the `pods/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). The pod's own `.podspec.json` must declare the requested name and version. Specs and CDN index files are not gated. |
+| `swift` | `swift` | enforced | Source archives (`{scope}/{name}/{version}.zip`), Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Release metadata, release lists and `Package.swift` are not gated. |
 | `pub` | `pub` | enforced | Package archives on the `packages/{name}/versions/{version}.tar.gz` route, Remote and Virtual. The root `pubspec.yaml` must declare the requested name and version; the scanner then catalogs the package from it. The JSON API is not gated. |
 | `sbt` | `sbt` | enforced | As `maven`, on the Ivy route. |
 | `chef` | `chef` | accepted | |
@@ -330,6 +334,11 @@ have no core proxy path to gate.
   file name (a binary it recognises under its upstream name or version), the
   scan is still inconclusive: `423` under `fail_closed`, served `pending`
   (and not recorded) under `fail_open`.
+- **CocoaPods and Swift have no advisory data in the bundled scanner.** The
+  engine catalogs a `Podfile.lock` or `Package.resolved`, but no advisory
+  database it ships covers either ecosystem, so a pod or Swift package is
+  only ever `vulnerable` for something of another ecosystem inside it (a
+  vendored `Gemfile.lock`, `package-lock.json`, a jar).
 - **Go modules, Composer packages and Conan references are not graded as
   themselves.** A module zip, a dist archive or a Conan archive is graded on what it contains (see
   [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)).
