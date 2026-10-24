@@ -36,6 +36,15 @@ Every policy type accepts these optional `config` keys:
   to it or is global, so neither its artifact sweep nor its proxy-cache
   eviction touches that repository. Formats are matched exactly: `docker`
   does not include `podman` or `oras` repositories.
+  `match.format` is new in 1.12.0. A 1.11.x server rejects the unknown key
+  instead of ignoring it, so in a fleet that mixes 1.11.x and 1.12.0
+  replicas a policy that carries it never runs unscoped on the older ones:
+  there a run or preview answers 400 `unknown key 'match.format'` before
+  anything is deleted, a scheduled run logs
+  `Failed to execute lifecycle policy '<name>'` and leaves `last_run_at`
+  unchanged so a later tick runs it again, and creating or updating such a
+  policy through a 1.11.x replica is refused with the same 400. Finish the
+  upgrade before relying on the policy's schedule.
 
 Every lifecycle regex -- `match.version_pattern`, each
 `exclude.version_patterns` entry, and the `pattern` of `tag_pattern_keep` /
