@@ -2015,121 +2015,175 @@ const PLAIN_REPODATA_SOURCES: [RepodataEncoding; 3] = [
     RepodataEncoding::Json,
 ];
 
+/// Output chunk size of the plain `repodata.json` transcode (#4180).
+const TRANSCODE_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The file codec that undoes `encoding`, for the shared streaming decoder.
+fn repodata_file_codec(encoding: RepodataEncoding) -> virtual_merge::FileCodec {
+    match encoding {
+        RepodataEncoding::Json => virtual_merge::FileCodec::Plain,
+        RepodataEncoding::Zst => virtual_merge::FileCodec::Zstd,
+        RepodataEncoding::Bz2 => virtual_merge::FileCodec::Bzip2,
+    }
+}
+
 /// Undo the HTTP transfer coding and the file compression of one upstream
 /// repodata document, returning a reader over the plain JSON.
 ///
 /// The decoders stream: neither this function nor its caller ever holds the
 /// uncompressed document, which is several hundred MiB for a conda-forge
-/// subdir (#4180). The returned reader is `Send` because it is driven on the
-/// blocking pool.
+/// subdir (#4180).
 fn decoded_repodata_reader(
     compressed: Bytes,
     transfer_encoding: Option<&str>,
     encoding: RepodataEncoding,
 ) -> Result<Box<dyn Read + Send>, String> {
-    let transfer: Box<dyn Read + Send> = match transfer_encoding.map(str::trim) {
-        None | Some("") | Some("identity") => Box::new(std::io::Cursor::new(compressed)),
-        Some(c) if c.eq_ignore_ascii_case("gzip") || c.eq_ignore_ascii_case("x-gzip") => Box::new(
-            flate2::read::MultiGzDecoder::new(std::io::Cursor::new(compressed)),
-        ),
-        Some(c) if c.eq_ignore_ascii_case("deflate") => Box::new(flate2::read::ZlibDecoder::new(
-            std::io::Cursor::new(compressed),
-        )),
-        Some(c) if c.eq_ignore_ascii_case("zstd") => Box::new(
-            zstd::stream::read::Decoder::new(std::io::Cursor::new(compressed))
-                .map_err(|e| format!("zstd transfer coding: {e}"))?,
-        ),
-        Some(other) => return Err(format!("unsupported Content-Encoding {other:?}")),
+    virtual_merge::decoding_reader(
+        std::io::Cursor::new(compressed),
+        transfer_encoding,
+        repodata_file_codec(encoding),
+    )
+}
+
+/// Read up to [`TRANSCODE_CHUNK_BYTES`] from `reader`; an empty result is EOF.
+fn read_transcode_chunk(reader: &mut (dyn Read + Send)) -> std::io::Result<Vec<u8>> {
+    let mut chunk = Vec::with_capacity(TRANSCODE_CHUNK_BYTES);
+    reader
+        .take(TRANSCODE_CHUNK_BYTES as u64)
+        .read_to_end(&mut chunk)?;
+    Ok(chunk)
+}
+
+/// The ETag of a plain `repodata.json` decoded from an upstream compressed
+/// document (#4180). Derived from the compressed bytes, so it changes exactly
+/// when the upstream document does and costs no decode, but tagged with the
+/// representation: the same bytes served as `.zst` carry the untagged
+/// [`compute_etag`], and two representations must not share a strong ETag.
+fn transcoded_repodata_etag(compressed: &[u8], source: RepodataEncoding) -> String {
+    let etag = compute_etag(compressed);
+    let tag = match source {
+        RepodataEncoding::Zst => "from-zst",
+        RepodataEncoding::Bz2 => "from-bz2",
+        RepodataEncoding::Json => "plain",
     };
-    let reader: Box<dyn Read + Send> = match encoding {
-        RepodataEncoding::Json => transfer,
-        RepodataEncoding::Zst => {
-            Box::new(zstd::stream::read::Decoder::new(transfer).map_err(|e| format!("zstd: {e}"))?)
+    format!("{}-{tag}\"", etag.trim_end_matches('"'))
+}
+
+/// The proxy-cache entry a transcode reads, evicted when it does not decode
+/// (#4180), so the next request fetches the upstream document again instead
+/// of failing on the same cached bytes until the entry expires.
+struct TranscodeSource {
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    repo_key: String,
+    path: String,
+}
+
+impl TranscodeSource {
+    async fn evict(&self, reason: &str) {
+        tracing::warn!(
+            repo = %self.repo_key,
+            path = %self.path,
+            reason = %reason,
+            "cached upstream conda repodata does not decode; evicting it (#4180)"
+        );
+        if let Err(e) = self
+            .proxy
+            .invalidate_cache_by_key(&self.repo_key, &self.path)
+            .await
+        {
+            tracing::warn!(
+                repo = %self.repo_key,
+                path = %self.path,
+                error = %e,
+                "evicting undecodable conda repodata from the proxy cache failed"
+            );
         }
-        RepodataEncoding::Bz2 => Box::new(bzip2::read::MultiBzDecoder::new(transfer)),
-    };
-    Ok(reader)
+    }
 }
 
 /// Serve a plain `repodata.json` decoded from an upstream compressed document
 /// (#4180).
 ///
-/// The body is produced by a blocking task that streams the decoder into the
-/// response channel; the compressed bytes (and their buffered-metadata
-/// reservation) live only until the body has been read. `Content-Encoding`
-/// and `Content-Length` are the only headers that differ from
-/// [`cacheable_response_coded`]: the body is not in memory, so its length is
-/// unknown and the optional gzip pass is streaming too.
-fn streamed_repodata_response(
+/// The first chunk is decoded before the status is chosen: a body that is not
+/// a valid zstd/bzip2 document, or one that decodes to nothing, answers 502
+/// (and its cache entry is evicted) instead of a 200 with an empty or broken
+/// index. The rest is decoded chunk by chunk on the blocking pool as the
+/// client reads it, so a slow client holds no thread, and a decode failure
+/// past the first chunk aborts the body (the client sees a truncated
+/// transfer, never a short document that looks complete) and evicts the
+/// entry as well.
+///
+/// The caller's buffered-metadata reservation is released when this returns,
+/// i.e. when the body is handed to the response writer, as for every other
+/// buffered metadata serve (#2684): holding it for the whole transfer would
+/// let slow anonymous clients pin the budget every format shares.
+async fn streamed_repodata_response(
     compressed: Bytes,
     transfer_encoding: Option<&str>,
     encoding: RepodataEncoding,
     headers: &HeaderMap,
-    budget_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    source: Option<TranscodeSource>,
 ) -> Response {
-    let etag = compute_etag(&compressed);
+    let etag = transcoded_repodata_etag(&compressed, encoding);
     if let Some(not_modified) = check_conditional_request(headers, &etag) {
         return not_modified;
     }
 
+    let decoded = decoded_repodata_reader(compressed, transfer_encoding, encoding);
+    let first = tokio::task::spawn_blocking(move || {
+        let mut reader = decoded?;
+        let first = read_transcode_chunk(&mut *reader).map_err(|e| e.to_string())?;
+        if first.is_empty() {
+            return Err("decodes to an empty document".to_string());
+        }
+        Ok((first, reader))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("decoder task failed: {e}")));
+    let (first, reader) = match first {
+        Ok(first) => first,
+        Err(e) => {
+            if let Some(source) = &source {
+                source.evict(&e).await;
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream conda repodata could not be decoded: {e}"),
+            )
+                .into_response();
+        }
+    };
+
     let gzip = accepts_gzip(headers);
-    let mut reader = match decoded_repodata_reader(compressed, transfer_encoding, encoding) {
-        Ok(reader) => reader,
-        Err(e) => {
-            tracing::error!("repodata transcode error: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
+    let reader: Box<dyn Read + Send> = {
+        let rest = std::io::Cursor::new(first).chain(reader);
+        if gzip {
+            Box::new(flate2::read::GzEncoder::new(
+                rest,
+                flate2::Compression::default(),
+            ))
+        } else {
+            Box::new(rest)
         }
     };
-    if gzip {
-        reader = Box::new(flate2::read::GzEncoder::new(
-            reader,
-            flate2::Compression::default(),
-        ));
-    }
 
-    // Read the first chunk before committing to a 200: a body that is not a
-    // valid zstd/bzip2 document fails here, where the client can still get an
-    // error status, rather than halfway through a successful response.
-    let mut first = vec![0u8; 64 * 1024];
-    let first_len = match reader.read(&mut first) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!("repodata transcode error: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
-        }
-    };
-    let first_chunk = (first_len > 0).then(|| Bytes::copy_from_slice(&first[..first_len]));
-    drop(first);
-
-    // A bounded channel gives the blocking decoder backpressure: it reads
-    // ahead by at most a few chunks while the client consumes the body.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-    tokio::task::spawn_blocking(move || {
-        // The reservation covers the compressed buffer until the last chunk
-        // has been decoded and handed to the response.
-        let _budget_permit = budget_permit;
-        if let Some(chunk) = first_chunk {
-            if tx.blocking_send(Ok(chunk)).is_err() {
-                return;
-            }
-        }
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx
-                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                        .is_err()
-                    {
-                        break;
-                    }
+    let body = futures::stream::unfold(Some((reader, source)), |state| async move {
+        let (mut reader, source) = state?;
+        let step = tokio::task::spawn_blocking(move || {
+            let chunk = read_transcode_chunk(&mut *reader);
+            (reader, chunk)
+        })
+        .await;
+        match step {
+            Ok((_, Ok(chunk))) if chunk.is_empty() => None,
+            Ok((reader, Ok(chunk))) => Some((Ok(Bytes::from(chunk)), Some((reader, source)))),
+            Ok((_, Err(e))) => {
+                if let Some(source) = &source {
+                    source.evict(&e.to_string()).await;
                 }
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
-                    break;
-                }
+                Some((Err(e), None))
             }
+            Err(e) => Some((Err(std::io::Error::other(e)), None)),
         }
     });
 
@@ -2146,12 +2200,7 @@ fn streamed_repodata_response(
             .header(CONTENT_ENCODING, "gzip")
             .header("Vary", "Accept-Encoding");
     }
-    builder
-        .body(Body::from_stream(futures::stream::unfold(
-            rx,
-            |mut rx| async move { rx.recv().await.map(|item| (item, rx)) },
-        )))
-        .unwrap()
+    builder.body(Body::from_stream(body)).unwrap()
 }
 
 /// Proxy a Remote repository's plain `repodata.json` (#4180).
@@ -2167,7 +2216,7 @@ fn streamed_repodata_response(
 #[allow(clippy::too_many_arguments)]
 async fn proxy_plain_repodata(
     state: &SharedState,
-    proxy: &crate::services::proxy_service::ProxyService,
+    proxy: &Arc<crate::services::proxy_service::ProxyService>,
     repo: &RepoInfo,
     upstream_url: &str,
     subdir: &str,
@@ -2193,16 +2242,24 @@ async fn proxy_plain_repodata(
             Ok(proxy_helpers::CappedMetadataGet::Buffered {
                 content,
                 content_encoding,
-                budget_permit,
+                budget_permit: _budget_permit,
                 ..
             }) => {
+                // `_budget_permit` is held until the body is handed to the
+                // response writer, as for the compressed endpoints.
+                let evict_from = TranscodeSource {
+                    proxy: Arc::clone(proxy),
+                    repo_key: repo.key.clone(),
+                    path: upstream_path.clone(),
+                };
                 return Ok(streamed_repodata_response(
                     content,
                     content_encoding.as_deref(),
                     source,
                     headers,
-                    Some(budget_permit),
-                ));
+                    Some(evict_from),
+                )
+                .await);
             }
             Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
                 tracing::warn!(
@@ -14532,7 +14589,8 @@ mod tests {
             RepodataEncoding::Zst,
             &HeaderMap::new(),
             None,
-        );
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -14560,7 +14618,8 @@ mod tests {
             RepodataEncoding::Bz2,
             &headers,
             None,
-        );
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -14580,7 +14639,12 @@ mod tests {
     #[tokio::test]
     async fn streamed_plain_repodata_honours_if_none_match_4180() {
         let compressed = Bytes::from(zstd_repodata_4180(REPODATA_4180));
-        let etag = compute_etag(&compressed);
+        let etag = super::transcoded_repodata_etag(&compressed, RepodataEncoding::Zst);
+        assert_ne!(
+            etag,
+            compute_etag(&compressed),
+            "the plain rendering must not share the .zst document's strong ETag"
+        );
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
 
@@ -14590,7 +14654,8 @@ mod tests {
             RepodataEncoding::Zst,
             &headers,
             None,
-        );
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(
@@ -14607,11 +14672,72 @@ mod tests {
             RepodataEncoding::Zst,
             &HeaderMap::new(),
             None,
-        );
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert!(
             super::decoded_repodata_reader(Bytes::new(), Some("br"), RepodataEncoding::Json)
                 .is_err()
+        );
+    }
+
+    /// #4180: an upstream that answers 200 with an empty `.zst`/`.bz2` body,
+    /// or a truncated one, must not turn into a 200 plain index that is empty
+    /// or ends early and looks complete.
+    #[tokio::test]
+    async fn streamed_plain_repodata_never_serves_an_empty_or_truncated_index_4180() {
+        for (label, body, encoding) in [
+            ("empty zst", Vec::new(), RepodataEncoding::Zst),
+            ("empty bz2", Vec::new(), RepodataEncoding::Bz2),
+            (
+                "zst of nothing",
+                zstd_repodata_4180(b""),
+                RepodataEncoding::Zst,
+            ),
+            (
+                "bz2 of nothing",
+                bzip2_repodata_4180(b""),
+                RepodataEncoding::Bz2,
+            ),
+        ] {
+            let response = super::streamed_repodata_response(
+                Bytes::from(body),
+                None,
+                encoding,
+                &HeaderMap::new(),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{label}");
+        }
+
+        // Truncated past the first chunk: the status is already sent, so the
+        // body must fail rather than end cleanly short of the document.
+        // Incompressible bytes, so the cut lands well past the first chunk.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let large: Vec<u8> = (0..(super::TRANSCODE_CHUNK_BYTES * 4))
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (x >> 56) as u8
+            })
+            .collect();
+        let compressed = zstd_repodata_4180(&large);
+        let truncated = Bytes::copy_from_slice(&compressed[..compressed.len() / 2]);
+        let response = super::streamed_repodata_response(
+            truncated,
+            None,
+            RepodataEncoding::Zst,
+            &HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        assert!(
+            response.into_body().collect().await.is_err(),
+            "a truncated upstream document must abort the body"
         );
     }
 
@@ -14758,6 +14884,65 @@ mod tests {
 
         assert_eq!(zst_hits, 1, "the warm request must be a cache read");
         assert_eq!(plain_hits, 0, "plain upstream repodata must not be fetched");
+    }
+
+    /// #4180: a cached upstream `.zst` that does not decode must not pin the
+    /// plain index to a 502 until the entry expires. The failing request
+    /// evicts it, and the next one fetches the upstream document again.
+    #[tokio::test]
+    async fn undecodable_cached_zst_is_evicted_and_refetched_4180() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not a zstd frame".to_vec()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(zstd_repodata_4180(REPODATA_4180)),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state.clone());
+        let (first_status, _) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+        let app = tdh::router_anon(router(), state.clone());
+        let (second_status, second_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+        let zst_hits = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests")
+            .iter()
+            .filter(|request| request.url.path() == "/noarch/repodata.json.zst")
+            .count();
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(first_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "the evicted entry must be refetched"
+        );
+        assert_eq!(second_body.as_ref(), REPODATA_4180);
+        assert_eq!(
+            zst_hits, 2,
+            "the undecodable entry must not be served again"
+        );
     }
 
     /// #4180: `.zst` is preferred, but a channel that publishes only `.bz2`

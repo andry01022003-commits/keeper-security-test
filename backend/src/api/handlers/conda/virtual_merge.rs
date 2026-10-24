@@ -240,14 +240,16 @@ pub(super) struct MemberDocument {
 }
 
 /// Undo the HTTP transfer coding (normally none: the proxy asks for identity)
-/// and then the file compression, refusing to produce more than `cap` bytes.
-pub(super) fn decode_member_document(
-    content: &[u8],
+/// and then the file compression of one upstream document, returning a reader
+/// over the plain bytes. The decoders stream, so nothing here holds the decoded
+/// document; the remote plain `repodata.json` transcode (#4180) and
+/// [`decode_member_document`] share it.
+pub(super) fn decoding_reader<'a, R: Read + Send + 'a>(
+    content: R,
     transfer_coding: Option<&str>,
     codec: FileCodec,
-    cap: usize,
-) -> Result<Vec<u8>, String> {
-    let transfer: Box<dyn Read + '_> = match transfer_coding.map(str::trim) {
+) -> Result<Box<dyn Read + Send + 'a>, String> {
+    let transfer: Box<dyn Read + Send + 'a> = match transfer_coding.map(str::trim) {
         None | Some("") | Some("identity") => Box::new(content),
         Some(c) if c.eq_ignore_ascii_case("gzip") || c.eq_ignore_ascii_case("x-gzip") => {
             Box::new(flate2::read::MultiGzDecoder::new(content))
@@ -261,13 +263,24 @@ pub(super) fn decode_member_document(
         ),
         Some(other) => return Err(format!("unsupported Content-Encoding {other:?}")),
     };
-    let file: Box<dyn Read + '_> = match codec {
+    Ok(match codec {
         FileCodec::Plain => transfer,
         FileCodec::Zstd => {
             Box::new(zstd::stream::read::Decoder::new(transfer).map_err(|e| format!("zstd: {e}"))?)
         }
         FileCodec::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(transfer)),
-    };
+    })
+}
+
+/// Undo the HTTP transfer coding and then the file compression, refusing to
+/// produce more than `cap` bytes.
+pub(super) fn decode_member_document(
+    content: &[u8],
+    transfer_coding: Option<&str>,
+    codec: FileCodec,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    let file = decoding_reader(content, transfer_coding, codec)?;
     let mut out = Vec::new();
     file.take(cap as u64 + 1)
         .read_to_end(&mut out)
