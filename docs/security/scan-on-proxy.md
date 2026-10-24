@@ -486,10 +486,6 @@ have no core proxy path to gate.
   from `pool/` (`apt-get source` fails), and a scanning RPM Remote withholds
   every file that is not an `.rpm` and not repository metadata (`.drpm`
   deltas, installer trees under `images/` or `LiveOS/`).
-- **One verdict per digest across releases.** A verdict is stored per
-  content digest, so a package file published unchanged in two releases (an
-  `Architecture: all` package in two suites) carries the verdict of the
-  release it was first graded against.
 - **Debian and RPM rows in a Remote repository.** As for NuGet, an
   `artifacts` row a Remote repository holds for a package path (from
   replication or a publish into the remote) is served from storage without
