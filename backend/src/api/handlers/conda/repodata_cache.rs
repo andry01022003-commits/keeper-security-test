@@ -281,7 +281,7 @@ pub(crate) fn regen_gate() -> &'static RegenGate {
     })
 }
 
-fn regen_wait() -> Option<Duration> {
+pub(crate) fn regen_wait() -> Option<Duration> {
     static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
     *WAIT.get_or_init(|| parse_regen_wait(std::env::var(REGEN_WAIT_ENV).ok().as_deref()))
 }
