@@ -29,10 +29,22 @@ const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
 /// A storage key is "orphaned" when:
 /// 1. Every artifact pointing at it is soft-deleted (no live artifact shares
 ///    the key);
-/// 2. It is not protected by an `oci_tags` row (manifests still tagged);
-/// 3. It is not protected by an `oci_blobs` row (named blobs);
-/// 4. It is not the per-architecture child of a still-tagged OCI image index
+/// 2. No repository on its backend records the manifest in `oci_manifests`
+///    (#1683): the row is the registry's record that the manifest exists, so
+///    a manifest still pullable by digest keeps its object even with no tag,
+///    including the child of an untagged index that is itself still pullable
+///    (the reconcile keeps the child's row while its parent's row lives);
+/// 3. It is not protected by an `oci_tags` row (manifests still tagged);
+/// 4. It is not protected by an `oci_blobs` row (named blobs);
+/// 5. It is not the per-architecture child of a still-tagged OCI image index
 ///    (`oci_manifest_refs` joined against `oci_tags`; see migration 092).
+///
+/// Arms 3 and 5 are what the GC keyed on before the `oci_manifests` readers.
+/// They are implied by arm 2 for every manifest the registry recorded, and
+/// stay as a guard for one it has not recorded yet: a push served by a
+/// pre-1.11 replica during a rolling upgrade gets its row from the next
+/// reconcile, and the readers serve it from its tag until then. They can
+/// only keep an object, never release one.
 ///
 /// The fragment expects two bindings: the outer `artifacts` row aliased
 /// `a` and the outer `repositories` row aliased `r`. Callers either inline
@@ -63,6 +75,20 @@ AND NOT EXISTS (
       AND (
         r.storage_backend <> 'filesystem'
         OR a2r.storage_path = r.storage_path
+      )
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM repositories omr_repo
+    JOIN oci_manifests om ON om.repository_id = omr_repo.id
+    WHERE a.storage_key LIKE 'oci-manifests/%'
+      AND om.digest = SUBSTRING(
+        a.storage_key FROM LENGTH('oci-manifests/') + 1
+      )
+      AND omr_repo.storage_backend = r.storage_backend
+      AND (
+        r.storage_backend <> 'filesystem'
+        OR omr_repo.storage_path = r.storage_path
       )
 )
 AND NOT EXISTS (
@@ -696,27 +722,34 @@ fn candidate_reference_arm(table: &str, match_expr: &str) -> String {
 /// own, and a blob by a `manifest_blob_refs` edge, so testing only the scan
 /// tables would delete objects another repository is still serving (#1598).
 static OCI_GC_CANDIDATE_REFERENCED_SQL: Lazy<String> =
-    Lazy::new(|| candidate_referenced_sql("t.storage_key = $1", false));
+    Lazy::new(|| candidate_referenced_sql("t.storage_key = $1"));
 
 /// [`OCI_GC_CANDIDATE_REFERENCED_SQL`] for a key the blob sweep has
 /// tombstoned (#2524): identical, except that the sweep's own tombstoned
 /// cleanup-key row (`$4`) is not counted as a reference.
 static TOMBSTONED_KEY_REFERENCED_SQL: Lazy<String> =
-    Lazy::new(|| candidate_referenced_sql("t.storage_key = $1 AND t.id <> $4", false));
+    Lazy::new(|| candidate_referenced_sql("t.storage_key = $1 AND t.id <> $4"));
 
 /// [`OCI_GC_CANDIDATE_REFERENCED_SQL`] for a key the orphan-key sweep has just
-/// claimed (#2524). An image-index edge protects a manifest only while its
-/// parent is tagged, exactly as in [`ORPHAN_PREDICATE_SQL`], which is the
-/// predicate the claim itself proved: an edge left behind by a deleted or
-/// re-pointed index tag must not resurrect a key that predicate released,
-/// or its object would be kept with no row left to find it by.
+/// claimed (#2524). Since the #1683 readers the two are the same predicate:
+/// an image-index edge protects a manifest only while its parent is tagged,
+/// exactly as in [`ORPHAN_PREDICATE_SQL`], which is the predicate the claim
+/// itself proved, and a manifest the registry still records is protected by
+/// its `oci_manifests` row instead of by edges.
 static ORPHAN_KEY_REFERENCED_SQL: Lazy<String> =
-    Lazy::new(|| candidate_referenced_sql("t.storage_key = $1", true));
+    Lazy::new(|| candidate_referenced_sql("t.storage_key = $1"));
 
 /// Build the candidate reference predicate; `journal_match` is the
-/// `oci_upload_cleanup_keys` arm's match expression. `live_index_edges_only`
-/// counts an `oci_manifest_refs` edge only as the child of a tagged parent.
-fn candidate_referenced_sql(journal_match: &str, live_index_edges_only: bool) -> String {
+/// `oci_upload_cleanup_keys` arm's match expression.
+///
+/// For a manifest key the arms are the `oci_manifests` row (#1683, the
+/// registry's record that some repository on the backend still holds the
+/// manifest), plus the two arms the GC keyed on before it, as a guard for a
+/// manifest not recorded yet: a tag, and an edge from a tagged index. An edge
+/// whose parent is untagged no longer counts on its own: a still-pullable
+/// parent keeps its child's row, and a stale edge left by a deleted index
+/// used to keep the object with no record of why (the #2524 stale-edge leak).
+fn candidate_referenced_sql(journal_match: &str) -> String {
     let blob_digest = format!("SUBSTRING($1 FROM LENGTH('{OCI_BLOB_STORAGE_PREFIX}') + 1)");
     let manifest_digest = format!(
         "SUBSTRING($1 FROM LENGTH('{}') + 1)",
@@ -746,32 +779,22 @@ fn candidate_referenced_sql(journal_match: &str, live_index_edges_only: bool) ->
             &format!("{is_blob} AND t.blob_digest = {blob_digest}"),
         ),
         candidate_reference_arm(
+            "oci_manifests",
+            &format!("{is_manifest} AND t.digest = {manifest_digest}"),
+        ),
+        candidate_reference_arm(
             "oci_tags",
             &format!("{is_manifest} AND t.manifest_digest = {manifest_digest}"),
         ),
-        if live_index_edges_only {
-            candidate_reference_arm(
-                "oci_manifest_refs",
-                &format!(
-                    "{is_manifest} AND t.child_digest = {manifest_digest} \
-                     AND EXISTS (SELECT 1 FROM oci_tags pt \
-                                  WHERE pt.repository_id = t.repository_id \
-                                    AND pt.manifest_digest = t.parent_digest)"
-                ),
-            )
-        } else {
-            [
-                candidate_reference_arm(
-                    "oci_manifest_refs",
-                    &format!("{is_manifest} AND t.child_digest = {manifest_digest}"),
-                ),
-                candidate_reference_arm(
-                    "oci_manifest_refs",
-                    &format!("{is_manifest} AND t.parent_digest = {manifest_digest}"),
-                ),
-            ]
-            .join("\n   OR ")
-        },
+        candidate_reference_arm(
+            "oci_manifest_refs",
+            &format!(
+                "{is_manifest} AND t.child_digest = {manifest_digest} \
+                 AND EXISTS (SELECT 1 FROM oci_tags pt \
+                              WHERE pt.repository_id = t.repository_id \
+                                AND pt.manifest_digest = t.parent_digest)"
+            ),
+        ),
         // #3851: another repository's cleanup-journal row for the key is an
         // in-flight (or not yet reaped) push of this very object; the journal
         // sweeps own it from here.
@@ -2566,37 +2589,93 @@ impl StorageGcService {
     /// Delete `manifest_blob_refs` rows whose manifest is no longer live, so
     /// the blobs they pinned become reclaimable (#1409 H1).
     ///
-    /// A ref is stale when its `manifest_digest` is neither tagged in its repo
-    /// (`oci_tags`) nor a live per-architecture child of a tagged index
-    /// (`oci_manifest_refs` -> tagged `parent_digest`). Tag overwrite, lifecycle
-    /// expiry and manifest/index deletion all leave such orphan refs behind;
-    /// without pruning them [`BLOB_PROTECTED_BY_REFS_SQL`] would protect the
-    /// digest forever. Conservative: any still-reachable manifest keeps its
-    /// refs, so this can only ever over-protect (a leak), never expose a live
-    /// blob.
+    /// A ref is stale when its `manifest_digest`, in its repository, is
+    /// neither tagged (`oci_tags`), nor stored by a live `artifacts` row (by
+    /// the `oci-manifests/<digest>` key or, for a pre-#2457 migrated
+    /// manifest, by checksum), nor the child of an index that is tagged or
+    /// still recorded in `oci_manifests` (#1683: the child of an untagged
+    /// index that is still pullable by digest keeps its blobs, or pulling
+    /// the index would fail on the child's layers). Tag overwrite, lifecycle
+    /// expiry and manifest/index deletion all leave such refs behind; without
+    /// pruning them [`BLOB_PROTECTED_BY_REFS_SQL`] would protect the digest
+    /// forever. Conservative: any still-reachable manifest keeps its refs, so
+    /// this can only ever over-protect (a leak), never expose a live blob.
+    ///
+    /// The refs are the last proof a 1.11 reader accepts for an untagged
+    /// manifest (#1681), so the `oci_manifests` rows that only they kept are
+    /// retired right after, under the reconcile's locked re-check
+    /// ([`retire_rows_if_stale`](crate::services::oci_manifests::retire_rows_if_stale)):
+    /// a manifest is never served by digest after its blobs became
+    /// reclaimable. A row the re-check keeps (a fresh write, or another
+    /// reference) is left for the reconcile.
     async fn prune_orphan_blob_refs(&self) -> Result<u64> {
-        let res = sqlx::query(
+        let pruned: Vec<(Uuid, String, i64)> = sqlx::query_as(
             r#"
-            DELETE FROM manifest_blob_refs mbr
-            WHERE NOT EXISTS (
-                SELECT 1 FROM oci_tags ot
-                WHERE ot.repository_id = mbr.repository_id
-                  AND ot.manifest_digest = mbr.manifest_digest
+            WITH pruned AS (
+                DELETE FROM manifest_blob_refs mbr
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM oci_tags ot
+                    WHERE ot.repository_id = mbr.repository_id
+                      AND ot.manifest_digest = mbr.manifest_digest
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM oci_manifest_refs omr
+                    WHERE omr.repository_id = mbr.repository_id
+                      AND omr.child_digest = mbr.manifest_digest
+                      AND (
+                            EXISTS (
+                                SELECT 1 FROM oci_tags ot2
+                                WHERE ot2.repository_id = omr.repository_id
+                                  AND ot2.manifest_digest = omr.parent_digest
+                            )
+                         OR EXISTS (
+                                SELECT 1 FROM oci_manifests pm
+                                WHERE pm.repository_id = omr.repository_id
+                                  AND pm.digest = omr.parent_digest
+                            )
+                      )
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM artifacts a
+                    WHERE a.repository_id = mbr.repository_id
+                      AND a.is_deleted = false
+                      AND a.storage_key = 'oci-manifests/' || mbr.manifest_digest
+                )
+                AND NOT (
+                    mbr.manifest_digest LIKE 'sha256:%'
+                    AND EXISTS (
+                        SELECT 1 FROM artifacts a
+                        WHERE a.repository_id = mbr.repository_id
+                          AND a.is_deleted = false
+                          AND a.checksum_sha256 = SUBSTRING(mbr.manifest_digest FROM 8)::bpchar
+                    )
+                )
+                RETURNING mbr.repository_id, mbr.manifest_digest
             )
-            AND NOT EXISTS (
-                SELECT 1 FROM oci_manifest_refs omr
-                JOIN oci_tags ot2
-                  ON ot2.repository_id = omr.repository_id
-                 AND ot2.manifest_digest = omr.parent_digest
-                WHERE omr.repository_id = mbr.repository_id
-                  AND omr.child_digest = mbr.manifest_digest
-            )
+            SELECT repository_id, manifest_digest, COUNT(*) AS refs
+            FROM pruned
+            GROUP BY repository_id, manifest_digest
             "#,
         )
-        .execute(&self.db)
+        .fetch_all(&self.db)
         .await
         .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
-        Ok(res.rows_affected())
+        let ref_rows: i64 = pruned.iter().map(|(_, _, refs)| refs).sum();
+        let manifests: Vec<(Uuid, String)> = pruned
+            .into_iter()
+            .map(|(repo_id, digest, _)| (repo_id, digest))
+            .collect();
+        if !manifests.is_empty() {
+            let retired =
+                crate::services::oci_manifests::retire_rows_if_stale(&self.db, &manifests).await;
+            if retired > 0 {
+                tracing::info!(
+                    "Blob GC: retired {} oci_manifests rows of manifests whose blob refs were pruned",
+                    retired
+                );
+            }
+        }
+        Ok(u64::try_from(ref_rows).unwrap_or(0))
     }
 
     /// List `oci_blobs` rows older than the grace period whose digest is
@@ -9508,6 +9587,177 @@ mod tests {
                 key
             );
         }
+    }
+
+    /// #1683: the blob-ref prune keeps the refs of the child of an untagged
+    /// index the registry still records (so the index pull does not lose the
+    /// child's layers), prunes those of an image whose tag moved away, and
+    /// retires that image's `oci_manifests` row in the same run: a 1.11
+    /// reader stops serving it by digest when its refs go, and so does this
+    /// one.
+    ///
+    /// FAILS ON MAIN: the child's refs are pruned (its parent is untagged) and
+    /// the overwritten image keeps its row after its refs are gone.
+    #[tokio::test]
+    async fn blob_ref_prune_follows_oci_manifests_1683() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let repo = fixture.repo_id;
+        let index = format!("sha256:{}", "a1".repeat(32));
+        let child = format!("sha256:{}", "b2".repeat(32));
+        let moved = format!("sha256:{}", "c3".repeat(32));
+        let blob = format!("sha256:{}", "d4".repeat(32));
+        for digest in [&index, &child, &moved] {
+            sqlx::query(
+                "INSERT INTO oci_manifests (repository_id, digest, content_type, size_bytes, \
+                 last_referenced_at) VALUES ($1, $2, 'application/json', 2, NOW() - INTERVAL '1 hour')",
+            )
+            .bind(repo)
+            .bind(digest)
+            .execute(&fixture.pool)
+            .await
+            .expect("seed oci_manifests row");
+        }
+        sqlx::query(
+            "INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(&index)
+        .bind(&child)
+        .bind(repo)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed index edge");
+        for digest in [&child, &moved] {
+            sqlx::query(
+                "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+                 VALUES ($1, $2, $3, 'layer')",
+            )
+            .bind(digest)
+            .bind(&blob)
+            .bind(repo)
+            .execute(&fixture.pool)
+            .await
+            .expect("seed blob ref");
+        }
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        service.prune_orphan_blob_refs().await.expect("prune");
+        let refs = |digest: String| {
+            let pool = fixture.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM manifest_blob_refs \
+                     WHERE repository_id = $1 AND manifest_digest = $2",
+                )
+                .bind(repo)
+                .bind(digest)
+                .fetch_one(&pool)
+                .await
+                .expect("count refs")
+            }
+        };
+        let rows = |digest: String| {
+            let pool = fixture.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM oci_manifests WHERE repository_id = $1 AND digest = $2",
+                )
+                .bind(repo)
+                .bind(digest)
+                .fetch_one(&pool)
+                .await
+                .expect("count rows")
+            }
+        };
+        let child_refs = refs(child.clone()).await;
+        let moved_refs = refs(moved.clone()).await;
+        let child_rows = rows(child.clone()).await;
+        let moved_rows = rows(moved.clone()).await;
+        let index_rows = rows(index.clone()).await;
+        fixture.teardown().await;
+
+        assert_eq!(
+            child_refs, 1,
+            "the child of a recorded index keeps its refs"
+        );
+        assert_eq!(moved_refs, 0, "the overwritten image's refs are pruned");
+        assert_eq!(moved_rows, 0, "and its row is retired with them");
+        assert_eq!((child_rows, index_rows), (1, 1));
+    }
+
+    /// #1683: the orphan predicate keeps an `oci-manifests/` object while any
+    /// repository on the backend records the digest in `oci_manifests`, with
+    /// no tag and no tagged parent.
+    ///
+    /// FAILS ON MAIN: the predicate does not read `oci_manifests`, so the
+    /// trashed row is reaped and the object deleted.
+    #[tokio::test]
+    async fn test_run_gc_keeps_a_manifest_recorded_in_oci_manifests_1683() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let digest = format!("sha256:{}", "e5".repeat(32));
+        let key = format!("oci-manifests/{digest}");
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(&key, Bytes::from_static(b"{}"))
+            .await
+            .expect("write manifest stub");
+        sqlx::query(
+            "INSERT INTO oci_manifests (repository_id, digest, content_type, size_bytes) \
+             VALUES ($1, $2, 'application/json', 2)",
+        )
+        .bind(fixture.repo_id)
+        .bind(&digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed row");
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by, is_deleted
+            )
+            VALUES ($1, $2, $3, 'app:tmp', 'tmp', 2, $4,
+                    'application/vnd.oci.image.manifest.v1+json', $5, $6, true)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.repo_id)
+        .bind("v2/app/manifests/tmp")
+        .bind(digest.trim_start_matches("sha256:"))
+        .bind(&key)
+        .bind(fixture.user_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed trashed row");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let _ = service.run_gc(false).await.expect("live gc succeeds");
+        let still_there = storage.exists(&key).await.expect("exists check");
+        let trashed = count_soft_deleted_with_key(&fixture.pool, &key).await;
+        fixture.teardown().await;
+
+        assert!(still_there, "the recorded manifest's object must stay");
+        assert_eq!(trashed, 1, "its trashed row waits for the record to go");
     }
 
     /// Counterpart: once the parent index tag is gone, the children
