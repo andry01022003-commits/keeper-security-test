@@ -606,7 +606,7 @@ async fn complete(
     //
     // complete_session takes the completion lease (pending/in_progress ->
     // 'committing' with a state token) before verifying chunks/size/checksum,
-    // so a duplicate complete request — even one routed to another replica —
+    // so a duplicate complete request, even one routed to another replica,
     // gets a conflict here instead of a second storage copy + artifact
     // upsert. Everything after runs under that lease and the terminal
     // transition is token-guarded.
