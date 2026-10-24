@@ -1696,7 +1696,7 @@ impl StorageGcService {
         }
 
         // Proxy-cache content is NOT this sweep's to reclaim (#3368). A
-        // soft-deleted `artifacts` row can carry a `proxy-cache/` key — legacy
+        // soft-deleted `artifacts` row can carry a `proxy-cache/` key: legacy
         // rows from before the proxy catalog was split out (#1278). The key is
         // derived purely from `(repo_key, path)`, so the object such a row
         // names is the SAME object a live `proxy_cache_artifacts` row points
@@ -1710,7 +1710,7 @@ impl StorageGcService {
         // point of skipping only the delete rather than excluding the key from
         // the candidate scan: the row is a redundant second reference to an
         // object the proxy catalog owns, and leaving it behind would make
-        // these rows unreclaimable — apart from an explicit trash purge, the
+        // these rows unreclaimable. Apart from an explicit trash purge, the
         // hard-delete here is the only reaper of soft-deleted `artifacts` rows.
         let is_cache_object =
             crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key);
@@ -4496,7 +4496,7 @@ pub(crate) fn oci_gc_candidate_scope(location: &StorageLocation) -> StorageLocat
 ///
 /// Generic over the executor so the dry-run scan can ask on the pool while the
 /// destructive sweep asks inside the transaction that holds the candidate
-/// row's lock — one predicate, two call sites, no drift (the #1180 lesson).
+/// row's lock: one predicate, two call sites, no drift (the #1180 lesson).
 async fn candidate_is_still_referenced<'e, E>(
     executor: E,
     storage_key: &str,
