@@ -87,12 +87,23 @@ pub const DEFAULT_FAILURE_TTL_SECS: u64 = 60;
 /// Typical AD lockout thresholds start at 10; three distinct failures stays
 /// below the common deployments and leaves room for the cached-failure path.
 pub const DEFAULT_MAX_FAILED_PASSWORDS: usize = 3;
-/// AD's bad-password observation window is commonly 30 minutes; 15 minutes is
-/// short enough that an attacker cannot bank failures indefinitely.
-pub const DEFAULT_FAILED_WINDOW_SECS: u64 = 900;
-/// Per-cache entry bound. At the limit the cache is cleared wholesale, exactly
-/// like the repository miss cache: a predictable bound without an LRU.
+/// AD's bad-password observation window ("reset account lockout counter
+/// after") is commonly 30 minutes. The AK window must be at least as long as
+/// the directory's, otherwise AK forgets failures the directory still counts
+/// and a fresh set of binds lands inside the same directory window.
+pub const DEFAULT_FAILED_WINDOW_SECS: u64 = 1800;
+/// Per-cache entry bound. At the limit the success and exact-credential
+/// failure caches are cleared wholesale, exactly like the repository miss
+/// cache: a predictable bound without an LRU. The per-username failure ledger
+/// is never cleared wholesale (see [`FAILURE_LEDGER_BOUND_FACTOR`]).
 pub const DEFAULT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// The per-username failure ledger holds this many times
+/// `max_cache_entries` usernames before it evicts. Clearing it would hand
+/// every username a fresh failure budget, so it is sized above what the
+/// shared login backstop lets through in one failure window, and at the
+/// bound it evicts the usernames whose last failure is oldest instead.
+pub const FAILURE_LEDGER_BOUND_FACTOR: usize = 16;
 
 /// Effective settings for one passthrough attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +280,51 @@ pub(crate) struct Cache {
     success: HashMap<Tag, SuccessEntry>,
     failure: HashMap<Tag, FailureEntry>,
     failures_by_username: HashMap<String, UserFailures>,
+    /// Binds in flight, by credential tag. Concurrent requests carrying the
+    /// same credential wait for the one bind instead of each binding, and
+    /// in-flight distinct credentials count toward the per-username cap, so
+    /// a burst of parallel guesses cannot outrun it.
+    pending: HashMap<Tag, PendingBind>,
+}
+
+#[derive(Debug)]
+struct PendingBind {
+    failure_key: String,
+    gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Result of [`Cache::claim`].
+#[derive(Debug)]
+pub(crate) enum Claim {
+    /// This caller owns the bind for the credential. Dropping the
+    /// [`BindFlight`] releases waiters.
+    Bind(BindFlight),
+    /// Another request is binding the same credential; wait on the gate, then
+    /// re-run the precheck.
+    Wait(std::sync::Arc<tokio::sync::Mutex<()>>),
+    /// Failed plus in-flight distinct credentials already reach the cap.
+    TooManyFailures,
+}
+
+/// Ownership of one in-flight bind. On drop (including cancellation of the
+/// request future) the pending entry is removed and waiters are released.
+#[derive(Debug)]
+pub(crate) struct BindFlight {
+    tag: Tag,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for BindFlight {
+    fn drop(&mut self) {
+        // Remove the pending entry before the guard is released (fields drop
+        // after this body), so a woken waiter re-runs the precheck against
+        // the recorded result rather than finding the flight still pending.
+        cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .remove(&self.tag);
+    }
 }
 
 /// Result of the cache/cap check that runs before any network I/O.
@@ -309,9 +365,78 @@ impl Cache {
         if self.failure.len() > max_entries {
             self.failure.clear();
         }
-        if self.failures_by_username.len() > max_entries {
-            self.failures_by_username.clear();
+        let ledger_bound = max_entries.saturating_mul(FAILURE_LEDGER_BOUND_FACTOR);
+        if self.failures_by_username.len() > ledger_bound {
+            let mut by_age: Vec<(String, Instant)> = self
+                .failures_by_username
+                .iter()
+                .map(|(key, failures)| {
+                    let newest = failures
+                        .entries
+                        .iter()
+                        .map(|(_, expires_at)| *expires_at)
+                        .max()
+                        .unwrap_or_else(Instant::now);
+                    (key.clone(), newest)
+                })
+                .collect();
+            by_age.sort_by_key(|(_, newest)| *newest);
+            let excess = self.failures_by_username.len() - ledger_bound;
+            for (key, _) in by_age.into_iter().take(excess) {
+                self.failures_by_username.remove(&key);
+            }
         }
+    }
+
+    /// Distinct failed credentials recorded for `username` that are still
+    /// inside the failure window.
+    fn distinct_failures(&self, username: &str, now: Instant) -> usize {
+        self.failures_by_username
+            .get(&Self::failure_key(username))
+            .map(|failures| {
+                failures
+                    .entries
+                    .iter()
+                    .filter(|(_, expires_at)| *expires_at > now)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn cap_enabled(settings: &Settings) -> bool {
+        settings.max_failed_passwords > 0 && !settings.failed_window.is_zero()
+    }
+
+    /// Claim the bind for `tag` after [`Self::precheck`] answered
+    /// [`Precheck::Proceed`].
+    pub(crate) fn claim(
+        &mut self,
+        tag: &Tag,
+        username: &str,
+        settings: &Settings,
+        now: Instant,
+    ) -> Claim {
+        if let Some(pending) = self.pending.get(tag) {
+            return Claim::Wait(pending.gate.clone());
+        }
+        let failure_key = Self::failure_key(username);
+        if Self::cap_enabled(settings) {
+            let in_flight = self
+                .pending
+                .values()
+                .filter(|pending| pending.failure_key == failure_key)
+                .count();
+            if self.distinct_failures(username, now) + in_flight >= settings.max_failed_passwords {
+                return Claim::TooManyFailures;
+            }
+        }
+        let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let guard = gate.clone().try_lock_owned().ok();
+        self.pending.insert(*tag, PendingBind { failure_key, gate });
+        Claim::Bind(BindFlight {
+            tag: *tag,
+            _guard: guard,
+        })
     }
 
     pub(crate) fn precheck(
@@ -328,16 +453,23 @@ impl Cache {
         if self.failure.contains_key(tag) {
             return Precheck::CachedFailure;
         }
-        if settings.max_failed_passwords > 0 && !settings.failed_window.is_zero() {
+        if Self::cap_enabled(settings) {
             if let Some(failures) = self.failures_by_username.get(&Self::failure_key(username)) {
-                let distinct = failures
+                // A credential the directory already rejected inside the
+                // window is never bound again in that window. Without this,
+                // one wrong password re-binds every time the short failure
+                // TTL lapses and walks the account into directory lockout
+                // without ever reaching the distinct-password cap.
+                if failures
                     .entries
                     .iter()
-                    .filter(|(_, expires_at)| *expires_at > now)
-                    .count();
-                if distinct >= settings.max_failed_passwords {
-                    return Precheck::TooManyFailures;
+                    .any(|(seen, expires_at)| seen == tag && *expires_at > now)
+                {
+                    return Precheck::CachedFailure;
                 }
+            }
+            if self.distinct_failures(username, now) >= settings.max_failed_passwords {
+                return Precheck::TooManyFailures;
             }
         }
         Precheck::Proceed
@@ -383,7 +515,7 @@ impl Cache {
                 },
             );
         }
-        if settings.max_failed_passwords > 0 && !settings.failed_window.is_zero() {
+        if Self::cap_enabled(settings) {
             let failures = self
                 .failures_by_username
                 .entry(Self::failure_key(username))
@@ -621,6 +753,39 @@ async fn check_login_budget(username: &str) -> Result<(), u64> {
     Ok(())
 }
 
+/// `<8 hex>_<32 hex>`: the shape of an Artifact Keeper API token.
+fn is_api_token_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 41
+        && bytes[8] == b'_'
+        && bytes[..8].iter().all(u8::is_ascii_hexdigit)
+        && bytes[9..].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Three non-empty base64url segments with a JSON header: a compact JWS.
+fn is_jwt_shape(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let base64url = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    header.starts_with("eyJ") && base64url(header) && base64url(payload) && base64url(signature)
+}
+
+/// Whether a Basic password is a credential Artifact Keeper itself issues.
+pub(crate) fn looks_like_issued_token(password: &str) -> bool {
+    is_api_token_shape(password) || is_jwt_shape(password)
+}
+
 /// Try to authenticate a package-manager Basic credential against the
 /// configured LDAP/AD provider.
 ///
@@ -634,15 +799,11 @@ pub(crate) async fn try_authenticate(
     path: &str,
     method: &str,
 ) -> Outcome {
-    try_authenticate_with_settings(
-        auth_service,
-        username,
-        password,
-        path,
-        method,
-        Settings::from_env(),
-    )
-    .await
+    #[cfg(test)]
+    let settings = test_seam::settings_override().unwrap_or_else(Settings::from_env);
+    #[cfg(not(test))]
+    let settings = Settings::from_env();
+    try_authenticate_with_settings(auth_service, username, password, path, method, settings).await
 }
 
 /// [`try_authenticate`] with explicit settings, for tests that cannot mutate
@@ -658,34 +819,58 @@ pub(crate) async fn try_authenticate_with_settings(
     if !settings.enabled || username.is_empty() || password.is_empty() {
         return Outcome::Invalid;
     }
+    // A credential Artifact Keeper issued (API token, JWT) reaches this point
+    // only because it is expired, revoked or malformed. It is never sent to
+    // the directory as a password: that would hand the token to a third
+    // system and spend the account's directory failure budget.
+    if looks_like_issued_token(password) {
+        return Outcome::Invalid;
+    }
 
     let tag = credential_tag(username, password);
-    let now = Instant::now();
-    let precheck = {
-        let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
-        cache.precheck(&tag, username, &settings, now)
+    let (now, _flight) = loop {
+        let now = Instant::now();
+        let step = {
+            let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+            match cache.precheck(&tag, username, &settings, now) {
+                Precheck::Proceed => Ok(cache.claim(&tag, username, &settings, now)),
+                other => Err(other),
+            }
+        };
+        let precheck = match step {
+            Ok(Claim::Bind(flight)) => break (now, flight),
+            Ok(Claim::Wait(gate)) => {
+                // Wait for the in-flight bind of this exact credential, then
+                // re-check: its result is normally cached by then.
+                drop(gate.lock().await);
+                continue;
+            }
+            Ok(Claim::TooManyFailures) => Precheck::TooManyFailures,
+            Err(precheck) => precheck,
+        };
+        match precheck {
+            Precheck::Cached(user_id) => {
+                return revalidate_cached(auth_service, user_id, &tag, username, path, method)
+                    .await;
+            }
+            Precheck::CachedFailure => {
+                audit_failure(auth_service.db(), username, path, method, "cached_failure").await;
+                return Outcome::Invalid;
+            }
+            Precheck::TooManyFailures => {
+                audit_failure(
+                    auth_service.db(),
+                    username,
+                    path,
+                    method,
+                    "failed_password_cap",
+                )
+                .await;
+                return Outcome::Invalid;
+            }
+            Precheck::Proceed => unreachable!("Proceed is answered by a claim"),
+        }
     };
-    match precheck {
-        Precheck::Cached(user_id) => {
-            return revalidate_cached(auth_service, user_id, &tag, username, path, method).await;
-        }
-        Precheck::CachedFailure => {
-            audit_failure(auth_service.db(), username, path, method, "cached_failure").await;
-            return Outcome::Invalid;
-        }
-        Precheck::TooManyFailures => {
-            audit_failure(
-                auth_service.db(),
-                username,
-                path,
-                method,
-                "failed_password_cap",
-            )
-            .await;
-            return Outcome::Invalid;
-        }
-        Precheck::Proceed => {}
-    }
 
     // Only an actual bind consumes the login budget. Cached hits above do not,
     // so a busy CI job cannot exhaust the bucket without touching the
@@ -999,6 +1184,41 @@ async fn audit_failure(db: &PgPool, username: &str, path: &str, method: &str, re
             auth_method: Some("basic".to_string()),
         });
     audit_fire_and_forget(db.clone(), entry).await;
+}
+
+/// Test seam: settings a `#[tokio::test]` (current-thread runtime) pins for
+/// the middleware entry point, instead of mutating the process environment
+/// that parallel tests share.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use super::Settings;
+
+    thread_local! {
+        static SETTINGS_OVERRIDE: std::cell::Cell<Option<Settings>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn settings_override() -> Option<Settings> {
+        SETTINGS_OVERRIDE.with(|cell| cell.get())
+    }
+
+    /// Pins `settings` on this thread until dropped.
+    #[allow(dead_code)]
+    pub(crate) struct SettingsOverride;
+
+    #[allow(dead_code)]
+    impl SettingsOverride {
+        pub(crate) fn set(settings: Settings) -> Self {
+            SETTINGS_OVERRIDE.with(|cell| cell.set(Some(settings)));
+            Self
+        }
+    }
+
+    impl Drop for SettingsOverride {
+        fn drop(&mut self) {
+            SETTINGS_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -1463,6 +1683,592 @@ mod tests {
             .count();
         assert_eq!(binds_after, 3, "the cap must short-circuit before binding");
 
+        cleanup(&pool, provider_id, &username).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Directory lockout guard, issued-token refusal, outage mapping.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rejected_credential_is_not_rebound_inside_the_window() {
+        let mut cache = Cache::default();
+        let s = settings();
+        let now = Instant::now();
+        let tag = credential_tag_with_key(b"k", "alice", "wrong");
+        cache.record_failure(tag, "alice", None, &s, now);
+        // After the short exact-credential TTL lapses the same rejected
+        // password must still not reach the directory again: re-binding it
+        // every minute would walk the account into lockout without ever
+        // tripping the distinct-password cap.
+        let later = now + s.failure_ttl + Duration::from_secs(1);
+        assert!(later < now + s.failed_window);
+        assert_eq!(
+            cache.precheck(&tag, "alice", &s, later),
+            Precheck::CachedFailure
+        );
+        assert_eq!(
+            cache.precheck(&tag, "alice", &s, now + s.failed_window),
+            Precheck::Proceed,
+            "the ledger entry expires with the failure window"
+        );
+    }
+
+    #[test]
+    fn test_default_failure_window_covers_a_typical_directory_window() {
+        assert!(
+            Settings::default().failed_window >= Duration::from_secs(1800),
+            "AK must not forget failures before a 30 minute directory window does"
+        );
+    }
+
+    #[test]
+    fn test_claim_single_flights_and_counts_in_flight_guesses() {
+        let mut cache = Cache::default();
+        let s = settings();
+        let now = Instant::now();
+        let tags: Vec<Tag> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|p| credential_tag_with_key(b"k", "alice", p))
+            .collect();
+
+        let first = cache.claim(&tags[0], "alice", &s, now);
+        assert!(matches!(first, Claim::Bind(_)));
+        // The same credential in parallel waits for the one bind.
+        assert!(matches!(
+            cache.claim(&tags[0], "alice", &s, now),
+            Claim::Wait(_)
+        ));
+        // Distinct credentials in flight count toward the cap before any of
+        // them has failed.
+        let second = cache.claim(&tags[1], "ALICE", &s, now);
+        assert!(matches!(second, Claim::Bind(_)));
+        let third = cache.claim(&tags[2], "alice", &s, now);
+        assert!(matches!(third, Claim::Bind(_)));
+        assert!(matches!(
+            cache.claim(&tags[3], "alice", &s, now),
+            Claim::TooManyFailures
+        ));
+        // Another username is unaffected.
+        let bob = credential_tag_with_key(b"k", "bob", "a");
+        assert!(matches!(cache.claim(&bob, "bob", &s, now), Claim::Bind(_)));
+        drop((first, second, third));
+    }
+
+    #[test]
+    fn test_failure_ledger_is_never_cleared_wholesale() {
+        let mut cache = Cache::default();
+        let s = Settings {
+            max_cache_entries: 2,
+            ..settings()
+        };
+        let bound = 2 * FAILURE_LEDGER_BOUND_FACTOR;
+        let now = Instant::now();
+        for index in 0..bound {
+            let user = format!("other{index}");
+            let tag = credential_tag_with_key(b"k", &user, "x");
+            cache.record_failure(tag, &user, None, &s, now);
+        }
+        let later = now + Duration::from_secs(1);
+        for password in ["one", "two", "three"] {
+            let tag = credential_tag_with_key(b"k", "victim", password);
+            cache.record_failure(tag, "victim", None, &s, later);
+        }
+        // Overflowing the ledger evicts the oldest usernames; it does not
+        // hand the capped username a fresh budget.
+        let flood = credential_tag_with_key(b"k", "flood", "x");
+        cache.record_failure(flood, "flood", None, &s, later + Duration::from_secs(1));
+        assert!(cache.failures_by_username.len() <= bound);
+        let fourth = credential_tag_with_key(b"k", "victim", "four");
+        assert_eq!(
+            cache.precheck(&fourth, "victim", &s, later + Duration::from_secs(2)),
+            Precheck::TooManyFailures
+        );
+    }
+
+    /// An unknown API-token-shaped value, generated so no literal lands in
+    /// the source.
+    fn fake_api_token() -> String {
+        let id = Uuid::new_v4().simple().to_string();
+        format!("{}_{}", &id[..8], Uuid::new_v4().simple())
+    }
+
+    /// A compact-JWS-shaped value with a random, unverifiable signature.
+    fn fake_jwt() -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.{}",
+            b64.encode(br#"{"alg":"HS256","typ":"JWT"}"#),
+            b64.encode(format!(r#"{{"sub":"{}"}}"#, Uuid::new_v4())),
+            b64.encode(Uuid::new_v4().as_bytes()),
+        )
+    }
+
+    #[test]
+    fn test_issued_token_shapes_are_recognised() {
+        assert!(looks_like_issued_token(&fake_api_token()));
+        assert!(looks_like_issued_token(&fake_jwt()));
+        for password in [
+            "Correct horse battery staple",
+            "P@ssw0rd!",
+            "eyJ-but-no-dots",
+            "a.b.c",
+            "0123abcd_short",
+        ] {
+            assert!(!looks_like_issued_token(password), "{password}");
+        }
+    }
+
+    fn count(ops: &crate::services::ldap_service::tests::OpsLog, op: &str) -> usize {
+        ops.lock().unwrap().iter().filter(|o| **o == op).count()
+    }
+
+    async fn scripted_directory(
+        username: &str,
+        dn: &str,
+        user_bind_rc: u8,
+    ) -> (u16, crate::services::ldap_service::tests::OpsLog) {
+        let ops: crate::services::ldap_service::tests::OpsLog = Default::default();
+        let port = spawn_mock_directory(MockDirectory {
+            service_dn: MOCK_SERVICE_DN.to_string(),
+            entry: Some((
+                dn.to_string(),
+                username.to_string(),
+                format!("{username}@example.com"),
+            )),
+            user_bind_rc,
+            ops: ops.clone(),
+        })
+        .await;
+        (port, ops)
+    }
+
+    fn test_auth_service(pool: &PgPool) -> AuthService {
+        AuthService::new(
+            pool.clone(),
+            std::sync::Arc::new(crate::config::Config::test_config()),
+        )
+    }
+
+    /// The format-route resolver: a directory credential resolves only
+    /// through the passthrough, a local account's wrong password is never
+    /// sent to the directory, and an expired AK token in the password field
+    /// is never sent either.
+    #[tokio::test]
+    async fn test_format_resolver_passthrough_ordering() {
+        use crate::api::middleware::auth::{
+            try_resolve_auth_outcome_with_passthrough, AuthOutcome, ExtractedToken,
+        };
+        use base64::Engine as _;
+
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let dir_user = format!("ldapfmt{suffix}");
+        let local_user = format!("localfmt{suffix}");
+        let dn = format!("uid={dir_user},ou=people,{BASE}");
+        // The directory accepts ANY password for both names, so a refusal
+        // below can only come from AK's own guards.
+        let (port, ops) = scripted_directory(&dir_user, &dn, 0x00).await;
+        let provider_id = create_provider(&pool, &format!("fmt-{suffix}"), port).await;
+        insert_known_user(&pool, &dir_user, &dn, provider_id).await;
+        let local_hash = AuthService::hash_password("Local!Secret9").await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
+             VALUES ($1, $2, $3, $4, 'local', true, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&local_user)
+        .bind(format!("{local_user}@example.com"))
+        .bind(&local_hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+        let auth = test_auth_service(&pool);
+        let _pin = test_seam::SettingsOverride::set(settings());
+        let basic = |user: &str, pass: &str| {
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+        };
+
+        // A directory user's directory password authenticates the format route.
+        let encoded = basic(&dir_user, "directory-password");
+        match try_resolve_auth_outcome_with_passthrough(
+            &auth,
+            ExtractedToken::Basic(&encoded),
+            true,
+            "/pypi/private/simple/",
+            "GET",
+        )
+        .await
+        {
+            AuthOutcome::Resolved(ext) => assert_eq!(ext.username, dir_user),
+            other => panic!("expected the passthrough to resolve, got {other:?}"),
+        }
+        assert_eq!(count(&ops, "bind"), 1);
+
+        // The management API surface (`allow_basic_api_token = false`) never
+        // runs the passthrough.
+        let encoded = basic(&dir_user, "another-password");
+        assert!(matches!(
+            try_resolve_auth_outcome_with_passthrough(
+                &auth,
+                ExtractedToken::Basic(&encoded),
+                false,
+                "/api/v1/repositories",
+                "GET",
+            )
+            .await,
+            AuthOutcome::InvalidCredential
+        ));
+        assert_eq!(count(&ops, "bind"), 1);
+
+        // A local account with a different password: no bind, no login,
+        // whatever case the client sends.
+        let connects_before = count(&ops, "connect");
+        for name in [local_user.clone(), local_user.to_uppercase()] {
+            let encoded = basic(&name, "directory-password");
+            assert!(matches!(
+                try_resolve_auth_outcome_with_passthrough(
+                    &auth,
+                    ExtractedToken::Basic(&encoded),
+                    true,
+                    "/pypi/private/simple/",
+                    "GET",
+                )
+                .await,
+                AuthOutcome::InvalidCredential
+            ));
+        }
+        assert_eq!(
+            count(&ops, "connect"),
+            connects_before,
+            "a local account's username must never reach the directory"
+        );
+
+        // The local account still works with its own password.
+        let encoded = basic(&local_user, "Local!Secret9");
+        assert!(matches!(
+            try_resolve_auth_outcome_with_passthrough(
+                &auth,
+                ExtractedToken::Basic(&encoded),
+                true,
+                "/pypi/private/simple/",
+                "GET",
+            )
+            .await,
+            AuthOutcome::Resolved(_)
+        ));
+
+        // A revoked/unknown API token or an expired JWT in the password field
+        // is refused without contacting the directory.
+        let api_token = fake_api_token();
+        let jwt = fake_jwt();
+        for password in [api_token.as_str(), jwt.as_str()] {
+            let encoded = basic(&dir_user, password);
+            assert!(matches!(
+                try_resolve_auth_outcome_with_passthrough(
+                    &auth,
+                    ExtractedToken::Basic(&encoded),
+                    true,
+                    "/pypi/private/simple/",
+                    "GET",
+                )
+                .await,
+                AuthOutcome::InvalidCredential
+            ));
+        }
+        assert_eq!(
+            count(&ops, "connect"),
+            connects_before,
+            "an AK-issued token must never be sent to the directory"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE username = $1")
+            .bind(&local_user)
+            .execute(&pool)
+            .await;
+        cleanup(&pool, provider_id, &dir_user).await;
+    }
+
+    /// The same rejected password is bound once per failure window, even
+    /// with the short exact-credential cache disabled, and parallel requests
+    /// cannot outrun the distinct-password cap.
+    #[tokio::test]
+    async fn test_lockout_guard_bounds_directory_binds() {
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let username = format!("ldaplock{suffix}");
+        let dn = format!("uid={username},ou=people,{BASE}");
+        let (port, ops) = scripted_directory(&username, &dn, 0x31).await;
+        let provider_id = create_provider(&pool, &format!("lock-{suffix}"), port).await;
+        insert_known_user(&pool, &username, &dn, provider_id).await;
+        let auth = test_auth_service(&pool);
+        let settings = Settings {
+            enabled: true,
+            failure_ttl: Duration::ZERO,
+            ..Settings::default()
+        };
+        let attempt = |password: &'static str| {
+            try_authenticate_with_settings(
+                &auth,
+                &username,
+                password,
+                "/maven/private/a/b/1/b-1.pom",
+                "GET",
+                settings,
+            )
+        };
+
+        for _ in 0..3 {
+            assert!(matches!(attempt("stale-password").await, Outcome::Invalid));
+        }
+        assert_eq!(
+            count(&ops, "bind"),
+            1,
+            "a rejected password is not replayed against the directory"
+        );
+
+        // Parallel distinct guesses: at most the cap is ever bound.
+        let results =
+            futures::future::join_all(["g1", "g2", "g3", "g4", "g5", "g6"].map(attempt)).await;
+        assert!(results.iter().all(|r| matches!(r, Outcome::Invalid)));
+        assert!(
+            count(&ops, "bind") <= settings.max_failed_passwords,
+            "binds {} exceed the cap {}",
+            count(&ops, "bind"),
+            settings.max_failed_passwords
+        );
+
+        cleanup(&pool, provider_id, &username).await;
+    }
+
+    /// Parallel requests with the same good credential bind once.
+    #[tokio::test]
+    async fn test_parallel_same_credential_binds_once() {
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let username = format!("ldappar{suffix}");
+        let dn = format!("uid={username},ou=people,{BASE}");
+        let (port, ops) = scripted_directory(&username, &dn, 0x00).await;
+        let provider_id = create_provider(&pool, &format!("par-{suffix}"), port).await;
+        insert_known_user(&pool, &username, &dn, provider_id).await;
+        let auth = test_auth_service(&pool);
+        let results = futures::future::join_all((0..5).map(|_| {
+            try_authenticate_with_settings(
+                &auth,
+                &username,
+                "good-password",
+                "/npm/private/pkg",
+                "GET",
+                settings(),
+            )
+        }))
+        .await;
+        assert!(results.iter().all(|r| matches!(r, Outcome::Resolved(_))));
+        assert_eq!(count(&ops, "bind"), 1);
+        cleanup(&pool, provider_id, &username).await;
+    }
+
+    /// A directory outage is a retryable 503, never a 401, and is not
+    /// charged to the user's failure budget.
+    #[tokio::test]
+    async fn test_directory_outage_is_unavailable() {
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let username = format!("ldapdown{suffix}");
+        let dn = format!("uid={username},ou=people,{BASE}");
+        // A port with nothing listening.
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let provider_id = create_provider(&pool, &format!("down-{suffix}"), closed).await;
+        insert_known_user(&pool, &username, &dn, provider_id).await;
+        let auth = test_auth_service(&pool);
+        for _ in 0..4 {
+            assert!(matches!(
+                try_authenticate_with_settings(
+                    &auth,
+                    &username,
+                    "good-password",
+                    "/npm/private/pkg",
+                    "GET",
+                    settings(),
+                )
+                .await,
+                Outcome::Unavailable
+            ));
+        }
+        let tag = credential_tag(&username, "good-password");
+        assert_eq!(
+            cache()
+                .lock()
+                .unwrap()
+                .precheck(&tag, &username, &settings(), Instant::now()),
+            Precheck::Proceed,
+            "an outage must not be recorded as a failed password"
+        );
+        cleanup(&pool, provider_id, &username).await;
+    }
+
+    /// A rejected service-account bind is a provider fault: 503, and the
+    /// user's correct password is not recorded as a failure.
+    #[tokio::test]
+    async fn test_service_bind_rejection_is_unavailable() {
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let username = format!("ldapsvc{suffix}");
+        let dn = format!("uid={username},ou=people,{BASE}");
+        // The mock only accepts MOCK_SERVICE_DN as the service account; the
+        // provider binds with a different DN, which the mock rejects (49).
+        let (port, _ops) = scripted_directory(&username, &dn, 0x31).await;
+        let provider_id = AuthConfigService::create_ldap(
+            &pool,
+            CreateLdapConfigRequest {
+                name: format!("svc-{suffix}"),
+                server_url: format!("ldap://127.0.0.1:{port}"),
+                bind_dn: Some("cn=expired,dc=example,dc=com".into()),
+                bind_password: Some("svc-secret".into()),
+                user_base_dn: BASE.into(),
+                user_filter: Some("(uid={0})".into()),
+                group_base_dn: None,
+                group_filter: None,
+                email_attribute: None,
+                display_name_attribute: None,
+                username_attribute: None,
+                groups_attribute: None,
+                admin_group_dn: None,
+                use_starttls: None,
+                insecure_skip_verify: None,
+                ca_certificate: None,
+                is_enabled: Some(true),
+                priority: Some(0),
+            },
+        )
+        .await
+        .expect("create provider")
+        .id;
+        insert_known_user(&pool, &username, &dn, provider_id).await;
+        let auth = test_auth_service(&pool);
+        assert!(matches!(
+            try_authenticate_with_settings(
+                &auth,
+                &username,
+                "good-password",
+                "/npm/private/pkg",
+                "GET",
+                settings(),
+            )
+            .await,
+            Outcome::Unavailable
+        ));
+        let tag = credential_tag(&username, "good-password");
+        assert_eq!(
+            cache()
+                .lock()
+                .unwrap()
+                .precheck(&tag, &username, &settings(), Instant::now()),
+            Precheck::Proceed
+        );
+        cleanup(&pool, provider_id, &username).await;
+    }
+
+    /// First bind for a directory user with no local row provisions it.
+    #[tokio::test]
+    async fn test_first_bind_provisions_unknown_directory_user() {
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let username = format!("ldapnew{suffix}");
+        let dn = format!("uid={username},ou=people,{BASE}");
+        let (port, _ops) = scripted_directory(&username, &dn, 0x00).await;
+        // No local row yet, so the provider is chosen by priority; sort
+        // ahead of any provider another test left enabled, and retire what an
+        // earlier aborted run of this test may have left behind.
+        sqlx::query("UPDATE ldap_configs SET is_enabled = false WHERE name LIKE '0000-new-%'")
+            .execute(&pool)
+            .await
+            .expect("retire stale providers");
+        let provider_id = AuthConfigService::create_ldap(
+            &pool,
+            CreateLdapConfigRequest {
+                name: format!("0000-new-{suffix}"),
+                server_url: format!("ldap://127.0.0.1:{port}"),
+                bind_dn: Some(MOCK_SERVICE_DN.into()),
+                bind_password: Some("svc-secret".into()),
+                user_base_dn: BASE.into(),
+                user_filter: Some("(uid={0})".into()),
+                group_base_dn: None,
+                group_filter: None,
+                email_attribute: None,
+                display_name_attribute: None,
+                username_attribute: None,
+                groups_attribute: None,
+                admin_group_dn: None,
+                use_starttls: None,
+                insecure_skip_verify: None,
+                ca_certificate: None,
+                is_enabled: Some(true),
+                priority: Some(i32::MIN),
+            },
+        )
+        .await
+        .expect("create provider")
+        .id;
+        let auth = test_auth_service(&pool);
+        match try_authenticate_with_settings(
+            &auth,
+            &username,
+            "good-password",
+            "/npm/private/pkg",
+            "GET",
+            settings(),
+        )
+        .await
+        {
+            Outcome::Resolved(user) => {
+                assert_eq!(user.username, username);
+                assert_eq!(user.external_id.as_deref(), Some(dn.as_str()));
+                assert!(!user.is_admin);
+            }
+            other => panic!("expected the first bind to provision, got {other:?}"),
+        }
+        let recorded: Option<Uuid> =
+            sqlx::query_scalar("SELECT ldap_provider_id FROM users WHERE username = $1")
+                .bind(&username)
+                .fetch_one(&pool)
+                .await
+                .expect("provisioned row");
+        assert_eq!(recorded, Some(provider_id));
         cleanup(&pool, provider_id, &username).await;
     }
 }

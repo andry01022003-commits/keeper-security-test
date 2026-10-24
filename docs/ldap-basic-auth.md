@@ -69,9 +69,21 @@ password; the directory is not consulted.
   cache hit does not consume the budget; only a real bind does.
 - **Bounded AD lockout exposure.** After three distinct failed passwords for
   the same username (configurable), further passwords fail fast without
-  binding until the failure window expires. The default stays below typical
-  AD lockout thresholds. The same rejected password is remembered briefly and
-  is not replayed.
+  binding until the failure window expires. A password the directory rejected
+  is not bound again for that username inside the window, parallel requests
+  with the same credential share one bind, and parallel distinct passwords
+  count toward the cap while they are in flight. The default therefore binds
+  at most three failed passwords per username per 30 minutes, below typical
+  AD lockout thresholds. A password that becomes valid inside the window
+  (for example after an AD password reset to a value just tried) is accepted
+  once the window expires, or immediately after a successful login with any
+  other accepted password clears the username's failures.
+- **Tokens are never sent to the directory.** A Basic password shaped like an
+  Artifact Keeper API token or JWT that failed the token checks (expired,
+  revoked) is refused without a bind.
+- **Directory outages are 503.** An unreachable directory, a timeout, or a
+  rejected service-account bind answers a retryable `503`, not `401`, and is
+  not counted as a failed password.
 - **No plaintext credential cache.** Success and failure entries are hashed
   with a per-process random HMAC key over a domain-separated,
   length-prefixed `username || password` input. Only the tags and user IDs are
@@ -98,8 +110,8 @@ password; the directory is not consulted.
 | `LDAP_BASIC_AUTH_CACHE_TTL_SECS` | `300` | Success cache lifetime. `0` disables the success cache. |
 | `LDAP_BASIC_AUTH_FAILURE_TTL_SECS` | `60` | How long a rejected credential is remembered. `0` disables the failure cache. |
 | `LDAP_BASIC_AUTH_MAX_FAILED_PASSWORDS` | `3` | Distinct failed passwords per username before failing fast. `0` disables the cap. |
-| `LDAP_BASIC_AUTH_FAILED_WINDOW_SECS` | `900` | Window in which distinct failures are counted. |
-| `LDAP_BASIC_AUTH_CACHE_MAX_ENTRIES` | `4096` | Bound for each in-process cache. |
+| `LDAP_BASIC_AUTH_FAILED_WINDOW_SECS` | `1800` | Window in which distinct failures are counted and a rejected password is not bound again. Keep it at least as long as the directory's lockout observation window. |
+| `LDAP_BASIC_AUTH_CACHE_MAX_ENTRIES` | `4096` | Bound for the success and exact-credential failure caches. The per-username failure ledger holds 16 times this many usernames and evicts the oldest instead of clearing. |
 
 The per-username failure cap is a client-side guard against Artifact Keeper
 walking an account into lockout. It does not make the directory's own lockout

@@ -828,7 +828,22 @@ impl LdapService {
             }
         };
 
-        let mut ldap = self.connect_and_bind(bind_dn, bind_pw).await?;
+        // A rejected service-account bind is a provider misconfiguration (or
+        // an expired/locked service account), not the submitting user's bad
+        // password: it fails identically for every username, so reporting it
+        // as an outage leaks nothing, and it keeps callers that count
+        // credential failures (the Basic-auth passthrough) from charging the
+        // user for it.
+        let mut ldap = self
+            .connect_and_bind(bind_dn, bind_pw)
+            .await
+            .map_err(|e| match e {
+                AppError::Authentication(_) => {
+                    tracing::error!("LDAP service account bind rejected");
+                    AppError::Internal("LDAP service account bind rejected".into())
+                }
+                other => other,
+            })?;
 
         let search_filter = self.build_search_filter(username);
         let attrs = self.user_search_attrs();
