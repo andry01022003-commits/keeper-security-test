@@ -1183,7 +1183,11 @@ fn api_v1_routes(
                 .nest("/:id/transfer", handlers::transfer::router())
                 .nest("/:id/connections", handlers::peer::peer_router())
                 .nest("/:id/chunks", handlers::peer::chunk_router())
-                .merge(handlers::peer::network_profile_router())
+                // The handler extracts the peer id from this path segment.
+                // Merging the router at `/peers` instead matched
+                // `/peers/network-profile` and produced a 500 PathRejection
+                // (#4884).
+                .nest("/:id", handlers::peer::network_profile_router())
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     auth_middleware,
@@ -1622,6 +1626,116 @@ mod tests {
             "expected handlers::incus::router() to be referenced at least \
              twice (once for /incus, once for /lxc); found {incus_count}"
         );
+    }
+
+    /// #4884: `network_profile_router()` was merged at `/peers` instead of
+    /// nested under `/:id`, so axum routed `PUT /api/v1/peers/network-profile`
+    /// to a handler whose `Path<Uuid>` then rejected the zero-argument path
+    /// with a raw 500 extractor error. Exercise the production router so the
+    /// mount shape, the sanitized 400, and the unknown-peer 404 are pinned
+    /// together; a hand-built `/:id` nest (as the handler unit tests use)
+    /// would mask the regression.
+    #[tokio::test]
+    async fn peer_network_profile_route_is_mounted_under_peer_id_4884() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/peers-network-profile-4884");
+        let (admin_id, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = TRUE WHERE id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await
+            .expect("promote test user to admin");
+        let peer_id = tdh::register_test_peer(&pool, "network-profile-4884", "route").await;
+        let bearer = tdh::bearer_for(&state, admin_id).await;
+        let app = super::create_router(state);
+        let put_profile = |uri: String, body: &'static str| {
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("authorization", bearer.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let (status, body) = tdh::send(
+            app.clone(),
+            put_profile(
+                format!("/api/v1/peers/{peer_id}/network-profile"),
+                r#"{"max_bandwidth_bps":123456}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "PUT /peers/:id/network-profile must reach the handler: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let stored: Option<i64> =
+            sqlx::query_scalar("SELECT max_bandwidth_bps FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read stored network profile");
+        assert_eq!(stored, Some(123456));
+
+        // The old, miswired path must never reach the handler again. It is a
+        // method mismatch on `GET/DELETE /peers/:id` (or no route at all), but
+        // crucially not the old 500 with axum's PathRejection text.
+        let (status, body) = tdh::send(
+            app.clone(),
+            put_profile(
+                "/api/v1/peers/network-profile".to_string(),
+                r#"{"max_bandwidth_bps":1}"#,
+            ),
+        )
+        .await;
+        assert!(
+            status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::NOT_FOUND,
+            "the pre-#4884 miswired path must not route to the handler; got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("Wrong number of path arguments"),
+            "an extractor error must not leak through the production router"
+        );
+
+        // A syntactically invalid id is a normal 400, not a raw PathRejection.
+        let (status, body) = tdh::send(
+            app.clone(),
+            put_profile(
+                "/api/v1/peers/not-a-uuid/network-profile".to_string(),
+                r#"{"max_bandwidth_bps":1}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("error body is JSON");
+        assert_eq!(error["code"], "VALIDATION_ERROR");
+        assert_eq!(error["message"], "Invalid peer id");
+
+        // The documented endpoint still reports an unknown peer as 404
+        // instead of accepting a no-op UPDATE.
+        let (status, _) = tdh::send(
+            app,
+            put_profile(
+                format!("/api/v1/peers/{}/network-profile", uuid::Uuid::new_v4()),
+                r#"{"max_bandwidth_bps":1}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, admin_id).await;
     }
 
     #[test]
