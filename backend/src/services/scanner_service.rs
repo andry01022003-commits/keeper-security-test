@@ -1435,6 +1435,16 @@ impl ScanWorkspace {
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
     ) -> Result<()> {
+        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
+
+        // #1966: an ISO9660 live or installer medium is not staged as one
+        // opaque file (which catalogs nothing and read as clean). Only the
+        // package database of its embedded rootfs is staged, or nothing at
+        // all when there is none to be had.
+        if Self::stages_iso_rootfs(original_filename, content, pin.is_some()) {
+            return Self::stage_iso_rootfs(workspace, artifact, content).await;
+        }
+
         // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
         // control files, the archive is unpacked into a dedicated subdirectory
         // instead of the workspace root, so the archive's namespace and ours
@@ -1458,7 +1468,6 @@ impl ScanWorkspace {
             None => workspace.to_path_buf(),
         };
 
-        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
         let artifact_path = extract_root.join(&safe_filename);
 
@@ -1858,6 +1867,45 @@ impl ScanWorkspace {
                 e
             );
         }
+    }
+
+    /// Whether this upload is staged as an ISO9660 image (#1966): its bytes
+    /// carry the ISO9660 volume descriptor, detected by magic and never by
+    /// the `.iso` extension.
+    ///
+    /// A name [`Self::is_archive`] recognises keeps the archive path even
+    /// when the bytes are also ISO9660 (a polyglot), and so does a pinned
+    /// scan: an image cannot stand in for the package its name or pin says
+    /// it is. The orchestrator uses the same predicate to decide that the
+    /// upload expects a catalog, so staging and grading never disagree.
+    pub(crate) fn stages_iso_rootfs(filename: &str, content: &[u8], pinned: bool) -> bool {
+        !pinned && !Self::is_archive(filename) && crate::services::iso_rootfs::is_iso9660(content)
+    }
+
+    /// Stage an ISO9660 image's rootfs package database into `workspace`
+    /// (see [`crate::services::iso_rootfs`]). An image with no scannable
+    /// rootfs leaves the workspace empty, never holding the raw image: the
+    /// engines then catalog nothing and the scan is recorded
+    /// `not_cataloged`, because [`Self::stages_iso_rootfs`] made it expect a
+    /// catalog.
+    async fn stage_iso_rootfs(
+        workspace: &Path,
+        artifact: &Artifact,
+        content: &Bytes,
+    ) -> Result<()> {
+        use crate::services::iso_rootfs::{stage_iso_rootfs, IsoLimits, IsoStaging};
+        match stage_iso_rootfs(workspace, content, IsoLimits::for_scan_workspace()).await? {
+            IsoStaging::Extracted { probe } => info!(
+                "ISO9660 image {} ({}): staged the package database of {} for the scan",
+                artifact.name, artifact.id, probe
+            ),
+            IsoStaging::Unscannable(reason) => warn!(
+                "ISO9660 image {} ({}) has no scannable root filesystem: {}. Nothing was staged; \
+                 the scan is recorded not_cataloged",
+                artifact.name, artifact.id, reason
+            ),
+        }
+        Ok(())
     }
 
     /// Check if the file is an extractable archive.
@@ -2734,6 +2782,21 @@ pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) ->
     }
 }
 
+/// Whether this upload expects a catalog: [`format_expects_catalog`] for its
+/// format and file name, or an ISO9660 image the scan workspace stages as
+/// a rootfs package database (#1966, [`ScanWorkspace::stages_iso_rootfs`]),
+/// in any repository format. An image that yields no package database is
+/// then `not_cataloged` rather than a clean grade.
+pub(crate) fn upload_expects_catalog(
+    repository_format: &str,
+    filename: &str,
+    content: &[u8],
+    pinned: bool,
+) -> bool {
+    format_expects_catalog(repository_format, filename)
+        || ScanWorkspace::stages_iso_rootfs(filename, content, pinned)
+}
+
 /// Whether an archive in a GENERIC repository expects a catalog (#4154, grace
 /// A3). It is exactly as inventoriable as one in a typed repository -- the
 /// scan workspace extracts it -- so an empty result means "nothing was
@@ -3303,7 +3366,7 @@ const DEFAULT_MAX_SCAN_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Maximum number of archive entries extracted into a scan workspace. Bounds
 /// inode-exhaustion bombs (millions of tiny files).
-const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
+pub(crate) const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
 
 /// Env var overriding the extracted-tree byte ceiling. The value is a plain
 /// decimal byte count (e.g. `4294967296` for 4 GiB).
@@ -3326,7 +3389,7 @@ fn positive_env_or(name: &str, default: u64) -> u64 {
 /// [`MAX_SCAN_EXTRACTED_BYTES_ENV`] over [`DEFAULT_MAX_SCAN_EXTRACTED_BYTES`].
 /// A blank, non-numeric, or zero override is treated as "unset" (a zero cap
 /// would reject every archive).
-fn max_scan_extracted_bytes() -> u64 {
+pub(crate) fn max_scan_extracted_bytes() -> u64 {
     positive_env_or(
         MAX_SCAN_EXTRACTED_BYTES_ENV,
         DEFAULT_MAX_SCAN_EXTRACTED_BYTES,
@@ -9181,7 +9244,12 @@ impl ScannerService {
             require_nonempty_catalog: false,
         };
         let mut catalog_set = CatalogSetTally::default();
-        let expects_catalog = format_expects_catalog(&repository_format, upload_filename);
+        let expects_catalog = upload_expects_catalog(
+            &repository_format,
+            upload_filename,
+            &content,
+            upload_pin.is_some(),
+        );
 
         for scanner in &self.scanners {
             // Take any pre-allocated row id committed by the trigger handler.
@@ -9509,7 +9577,7 @@ impl ScannerService {
                     // component with 2 real vulnerabilities, and openssl
                     // (.conda) as one component with 0 findings; both were
                     // wrongly floored to F before this guard.
-                    let uncataloged = format_expects_catalog(&repository_format, upload_filename)
+                    let uncataloged = expects_catalog
                         && matches!(&cataloged, Some(c) if c.is_empty())
                         && findings.is_empty()
                         && packages.is_empty();
@@ -11635,6 +11703,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1966: an upload is staged as an ISO9660 image when its BYTES carry
+    /// the volume descriptor, whatever it is called; the `.iso` name alone is
+    /// not trusted. A name the archive path recognises, or a pinned scan,
+    /// keeps the archive path, so a polyglot cannot swap a package's contents
+    /// for an image's.
+    #[test]
+    fn stages_iso_rootfs_detects_iso9660_by_magic_unless_named_or_pinned_as_an_archive() {
+        use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+        let iso = build(&IsoSpec::live(
+            "live",
+            "filesystem.squashfs",
+            b"hsqs".to_vec(),
+        ));
+        for name in ["debian-live-12.iso", "debian-live-12.img", "download"] {
+            assert!(
+                ScanWorkspace::stages_iso_rootfs(name, &iso, false),
+                "{name}"
+            );
+        }
+        assert!(
+            !ScanWorkspace::stages_iso_rootfs("debian-live-12.iso", b"not an image", false),
+            "the .iso name alone must not select the ISO path"
+        );
+        for archive in ["pkg-1.0.tar.gz", "lib-1.0.jar", "tool-1.0-py3-none-any.whl"] {
+            assert!(
+                !ScanWorkspace::stages_iso_rootfs(archive, &iso, false),
+                "{archive} keeps the archive path"
+            );
+        }
+        assert!(
+            !ScanWorkspace::stages_iso_rootfs("debian-live-12.iso", &iso, true),
+            "a pinned scan keeps its pin"
+        );
+    }
+
+    /// #1966: an ISO9660 upload expects a catalog in any repository format,
+    /// so an image that yields no package database is `not_cataloged`
+    /// rather than a clean grade; everything else keeps
+    /// `format_expects_catalog`'s answer.
+    #[test]
+    fn an_iso9660_upload_expects_a_catalog() {
+        use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+        let iso = build(&IsoSpec::live("boot", "vmlinuz", b"kernel".to_vec()));
+        assert!(upload_expects_catalog("generic", "media.iso", &iso, false));
+        assert!(upload_expects_catalog("debian", "media.iso", &iso, false));
+        assert!(!upload_expects_catalog(
+            "generic",
+            "media.iso",
+            b"plain text",
+            false
+        ));
+        assert!(!upload_expects_catalog(
+            "generic",
+            "notes.txt",
+            b"plain text",
+            false
+        ));
+        assert!(upload_expects_catalog(
+            "generic",
+            "lib-1.0.jar",
+            b"PK",
+            false
+        ));
+    }
+
+    /// #1966: an ISO with no embedded rootfs stages NOTHING. Before, the raw
+    /// image was written into the workspace, the engines cataloged nothing
+    /// inside it, and the scan read as clean.
+    #[tokio::test]
+    async fn prepare_pinned_stages_nothing_for_an_iso_without_a_rootfs() {
+        use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact = test_helpers::make_test_artifact(
+            "installer.iso",
+            "application/octet-stream",
+            "media/installer.iso",
+        );
+        let content = Bytes::from(build(&IsoSpec::live("boot", "vmlinuz", b"kernel".to_vec())));
+        let mut guard =
+            ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, &content, None)
+                .await
+                .expect("an unscannable image is not a workspace error");
+        let staged: Vec<_> = std::fs::read_dir(&*guard)
+            .expect("workspace exists")
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "nothing may be staged for an image without a rootfs, got {staged:?}"
+        );
+        guard.cleanup().await;
     }
 
     /// #1429: the lifecycle hands the extractor this job's own directory
@@ -30282,6 +30444,102 @@ tonic-build = "0.12"
                 "generic blob must not flag has_uncataloged_scan"
             );
 
+            finish(fx).await;
+        }
+
+        /// #1966: an ISO9660 image in a GENERIC repository whose rootfs could
+        /// not be staged (here: none embedded) is `not_cataloged` with a
+        /// reason and `inventory_status='partial'`, and flags the repository
+        /// (`has_uncataloged_scan`), instead of reading as a complete clean
+        /// scan. It is not package-shaped, so the grade letter stays (#4154).
+        #[tokio::test]
+        async fn test_iso_without_a_rootfs_is_not_cataloged() {
+            use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+            let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let iso = Bytes::from(build(&IsoSpec::live("boot", "vmlinuz", b"kernel".to_vec())));
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "installer.iso",
+                "1",
+                "media/installer.iso",
+                iso,
+            )
+            .await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(
+                row.scan_completeness, "not_cataloged",
+                "an ISO whose rootfs was not inventoried must not read complete"
+            );
+            assert!(row.scan_completeness_reason.is_some());
+            assert_eq!(row.inventory_status, "partial");
+
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert!(
+                score.has_uncataloged_scan,
+                "the repository must be flagged has_uncataloged_scan"
+            );
+            assert_eq!(
+                score.grade, "A",
+                "a generic image does not floor the grade (#4154)"
+            );
+
+            finish(fx).await;
+        }
+
+        /// #1966 negative control: the same name with bytes that are not
+        /// ISO9660 keeps the generic-blob behaviour (complete, no flag): the
+        /// decision is the magic, not the `.iso` extension.
+        #[tokio::test]
+        async fn test_iso_named_blob_without_the_magic_stays_complete() {
+            let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "installer.iso",
+                "1",
+                "media/installer.iso",
+                Bytes::from_static(b"not an image"),
+            )
+            .await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.scan_completeness, "complete");
             finish(fx).await;
         }
 
