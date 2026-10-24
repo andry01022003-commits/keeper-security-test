@@ -1,5 +1,5 @@
 -- no-transaction
--- 296_proxy_download_statistics_checksum_index.sql
+-- 297_proxy_download_statistics_checksum_index.sql
 -- #4542: the admin blast-radius report finds the proxy pulls of a CVE's
 -- digests by `checksum_sha256`, so the lookup does not scan every proxy
 -- download row. Partial: rows recorded before the column existed (and serves

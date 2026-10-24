@@ -1,4 +1,4 @@
--- 294_proxy_download_statistics_checksum.sql
+-- 295_proxy_download_statistics_checksum.sql
 -- #4542: record the digest that was served on every proxy download row, so the
 -- admin blast-radius report can still attribute a pull to a digest after the
 -- cache entry it was served from is evicted or purged (a remediation purge of
@@ -19,7 +19,7 @@
 --
 -- Cost on a million-row table: catalogue-only. A nullable column with no
 -- default takes ACCESS EXCLUSIVE for a catalogue update, bounded by
--- lock_timeout; the index is built online by 296.
+-- lock_timeout; the index is built online by 297.
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE proxy_download_statistics
