@@ -22610,6 +22610,14 @@ mod oci_blob_upload_streaming_tests {
         copy_started: tokio::sync::Notify,
         release_copy: tokio::sync::Notify,
         should_block_copy: AtomicBool,
+        /// #2524: park the next copy AFTER it wrote its destination (signals
+        /// `copy_started`, waits for `release_copy`), so a completion holds
+        /// its committing lease with the final blob object already written.
+        block_after_copy: AtomicBool,
+        /// #2524: park the next delete before it removes anything.
+        block_delete: AtomicBool,
+        delete_started: tokio::sync::Notify,
+        release_delete: tokio::sync::Notify,
     }
 
     impl BlockingCopyStorage {
@@ -22619,6 +22627,10 @@ mod oci_blob_upload_streaming_tests {
                 copy_started: tokio::sync::Notify::new(),
                 release_copy: tokio::sync::Notify::new(),
                 should_block_copy: AtomicBool::new(true),
+                block_after_copy: AtomicBool::new(false),
+                block_delete: AtomicBool::new(false),
+                delete_started: tokio::sync::Notify::new(),
+                release_delete: tokio::sync::Notify::new(),
             }
         }
     }
@@ -22647,6 +22659,10 @@ mod oci_blob_upload_streaming_tests {
         }
 
         async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            if self.block_delete.swap(false, AtomicOrdering::SeqCst) {
+                self.delete_started.notify_one();
+                self.release_delete.notified().await;
+            }
             self.objects.lock().unwrap().remove(key);
             Ok(())
         }
@@ -22655,6 +22671,18 @@ mod oci_blob_upload_streaming_tests {
             if self.should_block_copy.swap(false, AtomicOrdering::SeqCst) {
                 self.copy_started.notify_one();
                 self.release_copy.notified().await;
+            }
+            if self.block_after_copy.swap(false, AtomicOrdering::SeqCst) {
+                let content = self.objects.lock().unwrap().get(source).cloned();
+                if let Some(content) = content {
+                    self.objects
+                        .lock()
+                        .unwrap()
+                        .insert(dest.to_string(), content);
+                }
+                self.copy_started.notify_one();
+                self.release_copy.notified().await;
+                return Ok(());
             }
 
             let content = self
@@ -26944,6 +26972,172 @@ mod oci_blob_upload_streaming_tests {
             .fetch_optional(&f.inner.pool)
             .await
             .expect("read upload session state")
+    }
+
+    /// Seed a marked, aged orphan `oci_blobs` row for `content` in the
+    /// fixture repository and put its object in `storage` (#2524).
+    async fn seed_marked_orphan_blob(
+        f: &OciUploadFixture,
+        storage: &BlockingCopyStorage,
+        content: &Bytes,
+    ) -> String {
+        let digest = compute_sha256(content);
+        storage
+            .put(&blob_storage_key(&digest), content.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, created_at, \
+                 pending_delete_at) \
+             VALUES ($1, $2, $3, $4, NOW() - INTERVAL '3 days', NOW() - INTERVAL '2 hours')",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .bind(content.len() as i64)
+        .bind(blob_storage_key(&digest))
+        .execute(&f.inner.pool)
+        .await
+        .expect("seed marked orphan blob");
+        digest
+    }
+
+    /// A blob GC service resolving the fixture's `blocking` backend to
+    /// `storage` (#2524).
+    fn blocking_blob_gc(
+        f: &OciUploadFixture,
+        storage: &Arc<BlockingCopyStorage>,
+    ) -> crate::services::storage_gc_service::StorageGcService {
+        let mut backends = HashMap::new();
+        let backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("blocking".to_string(), backend);
+        crate::services::storage_gc_service::StorageGcService::new(
+            f.inner.pool.clone(),
+            Arc::new(StorageRegistry::new(backends, "blocking".into())),
+        )
+        .with_run_budget(Default::default())
+    }
+
+    /// #2524: a blob whose upload completion holds the committing lease, with
+    /// the final `oci-blobs/<digest>` object already written but its
+    /// `oci_blobs` row not yet committed, must not be swept, even though an
+    /// older marked row for the same digest looks like an orphan.
+    ///
+    /// FAILS ON MAIN: the sweep deleted the object under the marked row's
+    /// lock, then the completion committed a fresh `oci_blobs` row for bytes
+    /// that were gone (HEAD 200, GET of the object fails).
+    #[tokio::test]
+    async fn blob_sweep_spares_a_blob_whose_completion_holds_the_lease_2524() {
+        let _gc_guard = crate::services::storage_gc_service::storage_gc_test_guard().await;
+        let _blob_gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let (storage, app) = blocking_copy_app(&f).await;
+        storage
+            .should_block_copy
+            .store(false, AtomicOrdering::SeqCst);
+        let content = Bytes::from(format!("layer pushed while GC sweeps {}", Uuid::new_v4()));
+        let digest = seed_marked_orphan_blob(&f, &storage, &content).await;
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+
+        storage.block_after_copy.store(true, AtomicOrdering::SeqCst);
+        let push = spawn_send(&app, final_put(&f, upload_uuid, &digest));
+        tokio::time::timeout(Duration::from_secs(10), storage.copy_started.notified())
+            .await
+            .expect("the completion should write the final object");
+        assert_eq!(
+            session_row_state(&f, upload_uuid).await.as_deref(),
+            Some("committing"),
+            "the completion holds its lease"
+        );
+
+        let gc = blocking_blob_gc(&f, &storage);
+        let swept =
+            tokio::time::timeout(Duration::from_secs(30), gc.run_blob_gc_sweep(false, 3600))
+                .await
+                .expect("the sweep must not wait on the completion")
+                .expect("sweep");
+        storage.release_copy.notify_one();
+        let (status, _, body) = push.await.expect("push task");
+
+        let object = storage.get(&blob_storage_key(&digest)).await;
+        let rows = oci_blob_count(&f, &digest).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::CREATED, "{:?}", body);
+        assert_eq!(rows, 1);
+        assert_eq!(
+            object.ok(),
+            Some(content),
+            "the committed blob's object must survive the sweep: {swept:?}"
+        );
+    }
+
+    /// #2524: a push of a digest the sweep has claimed (tombstoned, delete in
+    /// flight) is refused retryably instead of committing a row for bytes the
+    /// sweep is deleting; a retry after the sweep publishes the blob intact.
+    ///
+    /// FAILS ON MAIN: the push committed its `oci_blobs` row (201) while the
+    /// sweep's delete was in flight, and the delete then removed its object.
+    #[tokio::test]
+    async fn push_during_a_claimed_blob_delete_is_refused_then_retry_succeeds_2524() {
+        let _gc_guard = crate::services::storage_gc_service::storage_gc_test_guard().await;
+        let _blob_gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let (storage, app) = blocking_copy_app(&f).await;
+        storage
+            .should_block_copy
+            .store(false, AtomicOrdering::SeqCst);
+        let content = Bytes::from(format!("layer re-pushed mid-sweep {}", Uuid::new_v4()));
+        let digest = seed_marked_orphan_blob(&f, &storage, &content).await;
+
+        storage.block_delete.store(true, AtomicOrdering::SeqCst);
+        let gc = Arc::new(blocking_blob_gc(&f, &storage));
+        let sweep = {
+            let gc = gc.clone();
+            tokio::spawn(async move { gc.run_blob_gc_sweep(false, 3600).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), storage.delete_started.notified())
+            .await
+            .expect("the sweep should reach its storage delete");
+
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+        let racing = tokio::time::timeout(
+            Duration::from_secs(5),
+            send(app.clone(), final_put(&f, upload_uuid, &digest)),
+        )
+        .await;
+        storage.release_delete.notify_one();
+        sweep.await.expect("sweep task").expect("sweep");
+
+        let racing_ok = match &racing {
+            Ok((status, _, _)) => *status == StatusCode::CREATED,
+            Err(_) => false,
+        };
+        let object_after_race = storage.get(&blob_storage_key(&digest)).await.ok();
+        let rows_after_race = oci_blob_count(&f, &digest).await;
+
+        let retry_uuid = open_session_with(&f, &app, &content).await;
+        let (retry_status, _, retry_body) =
+            send(app.clone(), final_put(&f, retry_uuid, &digest)).await;
+        let object_after_retry = storage.get(&blob_storage_key(&digest)).await.ok();
+        f.teardown().await;
+
+        if racing_ok {
+            assert_eq!(
+                object_after_race,
+                Some(content.clone()),
+                "a push answered 201 during the sweep must keep its object"
+            );
+        } else {
+            let (status, _, body) = racing.expect("the racing push must answer, not hang");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", body);
+            assert_eq!(rows_after_race, 0, "a refused push commits no row");
+        }
+        assert_eq!(retry_status, StatusCode::CREATED, "{:?}", retry_body);
+        assert_eq!(object_after_retry, Some(content));
     }
 
     /// #4902 (1): the request that owns a completion is dropped (a proxy 504
