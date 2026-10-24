@@ -4600,6 +4600,12 @@ async fn tombstoned_key_is_still_referenced(
 ///
 /// MUST run BEFORE the repository row is deleted. Idempotent, like
 /// [`record_oci_gc_candidates`]. Returns the number of rows newly recorded.
+///
+/// The repository delete job (#4311) journals every key of each batch it
+/// deletes instead ([`journal_repository_delete_keys`] and the job's batch
+/// statement), spared or not, and its purge leaves the spared ones journaled;
+/// this whole-repository form remains for the tests that pin the hand-off.
+#[cfg(test)]
 pub(crate) async fn record_spared_artifact_gc_candidates(
     db: &PgPool,
     repo_id: Uuid,
@@ -4636,6 +4642,39 @@ pub(crate) async fn record_spared_artifact_gc_candidates(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .rows_affected();
+    Ok(recorded)
+}
+
+/// Journal keys a repository delete is about to purge (#4311): one
+/// `oci_gc_candidates` row per key, carrying the repository as
+/// `source_repository_id`, so the row reads as a waiting candidate (not a GC
+/// lease) to the upload commit guard. The purge re-checks each key right
+/// before its delete; a key it keeps, or a job that never gets to it, is left
+/// to the candidate sweep. Idempotent.
+pub(crate) async fn journal_repository_delete_keys(
+    db: &PgPool,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    keys: &[String],
+) -> Result<u64> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let scope = oci_gc_candidate_scope(location);
+    let recorded = sqlx::query(
+        "INSERT INTO oci_gc_candidates \
+             (storage_key, storage_backend, storage_path, source_repository_id) \
+         SELECT DISTINCT k, $2, $3, $1 FROM UNNEST($4::text[]) AS k \
+         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+    )
+    .bind(repo_id)
+    .bind(&scope.backend)
+    .bind(&scope.path)
+    .bind(keys)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .rows_affected();
     Ok(recorded)
 }
 

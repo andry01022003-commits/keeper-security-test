@@ -1212,6 +1212,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #4311: resume repository delete jobs that are pending or whose replica
+    // died mid-delete (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_repository_delete_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),

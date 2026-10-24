@@ -70,6 +70,18 @@ stored:
   succeeds; the candidate sweep later re-checks the record and keeps the
   object.
 
+A repository delete hands its objects to the same record and re-checks
+references before each delete (#4311): every storage key the deleted
+repository's rows named is recorded in `oci_gc_candidates` (with the
+repository as `source_repository_id`, so it reads as a waiting candidate, not a
+lease), and the delete job then takes each key's slot as a lease, checks
+whether any other repository on the same storage still references the key, and
+deletes the object only if none does. An upload of identical content into
+another repository that committed before that check keeps the object; one that
+reaches its commit while the lease is fresh waits for the delete to finish and
+writes its bytes again. A key the job keeps, or fails to delete, stays recorded
+for the candidate sweep. See `docs/operations/repository-delete.md`.
+
 The slot is held only for the commit and a HEAD of the object, never across a
 write. Uploads of identical content take the same slot, so their commits run
 one after another (each waiting on a database connection meanwhile). Format handlers that write their own content-addressed rows outside the

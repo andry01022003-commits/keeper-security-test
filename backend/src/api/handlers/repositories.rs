@@ -5802,6 +5802,59 @@ pub async fn update_repository(
     Ok(Json(response))
 }
 
+mod delete_job;
+
+/// `GET /api/v1/repository-deletions/{id}`: status of a repository delete
+/// job (#4311).
+pub fn deletion_router() -> Router<SharedState> {
+    delete_job::router()
+}
+
+/// Start this replica's loop that resumes repository delete jobs (#4311).
+pub fn spawn_repository_delete_resumer(
+    state: SharedState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    delete_job::spawn_resumer(state, shutdown);
+}
+
+/// SQL boolean over the key expression `col`: the key belongs to the
+/// artifact object space a repository-delete purge reclaims. Proxy-cache keys
+/// (owned by the proxy catalog, #3368) and OCI objects (owned by storage GC's
+/// candidate sweep, #1598/#3733) are not.
+fn purgeable_key_sql(col: &str) -> String {
+    format!(
+        "{col} NOT LIKE 'proxy-cache/%' \
+         AND {col} NOT LIKE '{manifest}%' \
+         AND {col} NOT LIKE 'oci-blobs/%'",
+        manifest = crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX,
+    )
+}
+
+/// SQL boolean: a repository other than `repo` still references the object
+/// at `key` on the storage `(backend, path)` (#4833 scope: any repository on
+/// the same cloud backend, one rooted at the same `storage_path` on
+/// filesystem), as a live or trashed artifact, an older revision, or a Maven
+/// row-less object it owns. The exclusivity rule
+/// [`collect_repo_artifact_object_keys`] applies when it collects keys, which
+/// the purge re-applies to each key right before its delete (#4311).
+fn key_held_by_another_repository_sql(key: &str, backend: &str, path: &str, repo: &str) -> String {
+    let arm = |table: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM {table} t JOIN repositories r ON r.id = t.repository_id \
+              WHERE t.storage_key = {key} AND t.repository_id <> {repo} \
+                AND r.storage_backend = {backend} \
+                AND (r.storage_backend <> 'filesystem' OR r.storage_path = {path}))"
+        )
+    };
+    format!(
+        "({} OR {} OR {})",
+        arm("artifacts"),
+        arm("artifact_versions"),
+        arm("maven_flat_object_owner")
+    )
+}
+
 /// Batch size for [`collect_repo_oci_upload_temp_keys`]: the union of a
 /// repository's cleanup-key/session/part storage keys is drained in bounded
 /// chunks of this size instead of one unbounded query, so a repository with a
@@ -6021,6 +6074,12 @@ async fn purge_repo_artifact_objects(
 /// repository's cache. Before the layout was anchored the delete resolved to a
 /// key nothing had written and silently hit nothing; anchoring it makes the
 /// delete land, so the exclusion lands with it.
+///
+/// The delete job (#4311) does not run this whole-repository query: it
+/// journals each batch's keys as it deletes the batch, and the purge applies
+/// the same exclusivity rule ([`key_held_by_another_repository_sql`]) to
+/// each key right before its delete. Kept for the tests that pin the rule.
+#[cfg(test)]
 async fn collect_repo_artifact_object_keys(
     state: &SharedState,
     repo_id: Uuid,
@@ -6088,10 +6147,17 @@ async fn collect_repo_artifact_object_keys(
 /// from a repository's storage backend, given the keys previously gathered by
 /// [`collect_repo_artifact_object_keys`].
 ///
-/// Split out from collection so the delete path can defer this (potentially
-/// O(objects)) work to a background task AFTER a successful DB delete, keeping
-/// the request path bounded (#2776). Never blocks the delete: storage
-/// resolution and per-object failures are logged and swallowed.
+/// Each key is deleted through [`delete_job::purge_key_unless_referenced`]:
+/// journaled in `oci_gc_candidates` and re-checked against every other
+/// repository immediately before its delete, behind the slot the upload
+/// commit guard takes (#4311). The collection's exclusivity verdict is as old
+/// as the collection; an upload of identical content into another repository
+/// committed since then references the key and keeps its object.
+///
+/// Never blocks the delete: storage resolution and per-object failures are
+/// logged and swallowed (a failed key stays journaled for storage GC).
+/// The delete job walks its journal with the same per-key purge.
+#[cfg(test)]
 async fn purge_storage_object_keys(
     state: &SharedState,
     repo_id: Uuid,
@@ -6114,29 +6180,29 @@ async fn purge_storage_object_keys(
     };
 
     let total = keys.len();
-    let mut failed = 0usize;
+    let (mut kept, mut failed) = (0usize, 0usize);
     for key in keys {
-        match storage.delete(&key).await {
-            Ok(()) | Err(AppError::NotFound(_)) => {}
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    repo_id = %repo_id,
-                    storage_key = %key,
-                    error = %e,
-                    "Failed to purge artifact object for repository delete"
-                );
-            }
+        match delete_job::purge_key_unless_referenced(
+            &state.db,
+            storage.as_ref(),
+            location,
+            repo_id,
+            &key,
+        )
+        .await
+        {
+            delete_job::PurgeOutcome::Deleted => {}
+            delete_job::PurgeOutcome::Kept => kept += 1,
+            delete_job::PurgeOutcome::Failed => failed += 1,
         }
     }
-    if total > 0 {
-        tracing::info!(
-            repo_id = %repo_id,
-            purged = total - failed,
-            failed,
-            "Purged artifact storage objects for deleted repository"
-        );
-    }
+    tracing::info!(
+        repo_id = %repo_id,
+        purged = total - kept - failed,
+        kept,
+        failed,
+        "Purged artifact storage objects for deleted repository"
+    );
 }
 
 /// Storage keys of this repository's *row-less* Maven flat objects — checksum
@@ -6349,6 +6415,14 @@ async fn collect_repo_maven_derived_keys(state: &SharedState, repo_id: Uuid) -> 
 }
 
 /// Delete repository
+///
+/// The delete runs as a background job (#4311): the repository is renamed out
+/// of the way at once (its key is free and stops resolving), and a worker
+/// deletes its rows in bounded batches and reclaims its storage under a
+/// cluster-wide claim, so a repository of any size answers well inside a
+/// proxy timeout. Poll the returned job at
+/// `GET /api/v1/repository-deletions/{id}`. A second delete while the job
+/// runs returns the same job.
 #[utoipa::path(
     delete,
     path = "/{key}",
@@ -6359,7 +6433,7 @@ async fn collect_repo_maven_derived_keys(state: &SharedState, repo_id: Uuid) -> 
     ),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Repository deleted"),
+        (status = 202, description = "Delete accepted; the job runs in the background. `Location` is its status", body = delete_job::RepositoryDeleteJobResponse),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Repository not found"),
@@ -6369,7 +6443,7 @@ pub async fn delete_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-) -> Result<()> {
+) -> Result<Response> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete:repositories")?;
     let service = state.create_repository_service();
@@ -6381,122 +6455,12 @@ pub async fn delete_repository(
     // role (`repository-owner`), not only a rule (#4834).
     require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
-    // Gather this repo's in-flight / abandoned OCI upload temp storage keys
-    // BEFORE the repository row is deleted — the journal/session/part rows
-    // CASCADE away with it, so the keys must be captured up front. The actual
-    // storage purge is deferred until AFTER a successful delete (below) so a
-    // failed delete does not prematurely destroy temp objects the surviving
-    // repository may still retry (#1533 GC-LOW-2). Best-effort throughout.
-    let oci_upload_temp_keys = collect_repo_oci_upload_temp_keys(&state, repo.id).await;
-
-    // Collect the storage keys of this repo's committed artifact objects BEFORE
-    // the repository row is deleted (the `artifacts` / `artifact_versions` /
-    // `maven_flat_object_owner` rows CASCADE away with it, after which the
-    // owning keys are no longer derivable — #1551/#2668/#4865). Collection is a
-    // handful of SELECTs; the actual object deletion is deferred below.
-    let location = repo.storage_location();
-    let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
-
-    // The keys the purge spares because another repository on the same
-    // storage still holds them lose their last record of THIS repository's
-    // reference with the cascade below. Hand them to GC's candidate set, whose
-    // sweep deletes each object once no surviving repository references it, so
-    // a key spared for a repository that is deleted next (or concurrently)
-    // cannot leak (#4833). The same hand-off covers this repository's own
-    // revision history (`artifact_versions`), whose rows cascade away just as
-    // the live ones do (#4865). Best-effort, like the OCI hand-off below.
-    if let Err(e) = crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
-        &state.db,
-        repo.id,
-        &location,
-        &artifact_object_keys,
-    )
-    .await
-    {
-        tracing::warn!(
-            repo_id = %repo.id,
-            error = %e,
-            "Failed to record spared artifact objects as GC candidates before repository delete"
-        );
-    }
-
-    // Committed OCI objects are deliberately NOT in `artifact_object_keys`:
-    // they are content-addressed and can be shared cross-repo through
-    // `oci_tags` / `oci_manifest_refs` / `oci_blobs` / `manifest_blob_refs`,
-    // so the artifacts-only exclusivity guard cannot prove any of them
-    // unreferenced and deleting one here would destroy a manifest or layer
-    // another repository still serves (#1598). Reclaiming them is GC's job —
-    // but the delete below CASCADEs away exactly the rows GC scans from, so
-    // without this hand-off the objects become undiscoverable at the moment
-    // they become reclaimable and leak forever (#3733). Record them into the
-    // durable candidate set first; GC re-tests each key against every
-    // surviving repository and deletes only what nothing references.
-    //
-    // Best-effort, like the rest of the storage cleanup: a failure here must
-    // not block the delete (it leaves the pre-#3733 behaviour, a leak, not a
-    // data loss). Recording BEFORE the delete is also safe if the delete then
-    // fails — the repository's own rows still reference every recorded key, so
-    // the sweep drops the candidates untouched.
-    if let Err(e) =
-        crate::services::storage_gc_service::record_oci_gc_candidates(&state.db, repo.id, &location)
-            .await
-    {
-        tracing::warn!(
-            repo_id = %repo.id,
-            error = %e,
-            "Failed to record OCI GC candidates before repository delete; \
-             orphaned OCI objects may be left on storage"
-        );
-    }
-
-    service.delete(repo.id).await?;
-
-    // Storage cleanup is best-effort and O(objects), so it runs OFF the request
-    // path in a background task (#2776): a LARGE repository (many thousands of
-    // stored objects) would otherwise drive O(objects) synchronous storage
-    // round-trips inside the DELETE request and trip the global request-timeout
-    // backstop with a 503 "server overloaded". The task is spawned only after a
-    // *successful* DB delete, preserving the invariant that a failed delete
-    // never destroys objects a surviving repository may still serve or retry
-    // (#1533 GC-LOW-2 / #1551 / #2047). All failures are logged and swallowed.
-    {
-        let state = state.clone();
-        let repo_id = repo.id;
-        let repo_key = repo.key.clone();
-        tokio::spawn(async move {
-            // Committed artifact objects (keys gathered before the delete).
-            purge_storage_object_keys(&state, repo_id, &location, artifact_object_keys).await;
-
-            // In-flight / abandoned OCI upload temp objects (keys gathered
-            // before the delete; the journal/session/part rows have CASCADED
-            // away with the repository row).
-            purge_oci_upload_temp_objects(&state, repo_id, &location, oci_upload_temp_keys).await;
-
-            // Proxy-cache subtree, keyed by the repo KEY and not tracked in
-            // `artifacts` (#1278); left behind, a new repository created with
-            // the same key would serve the deleted repo's stale upstream
-            // content (#2047). The key space is derived from the repo key (not
-            // from now-deleted rows), so purging here — after the DB delete —
-            // is safe. Hosted repos have no proxy cache, so this is a no-op.
-            if let Some(proxy) = state.proxy_service.as_ref() {
-                match proxy.purge_repo_cache(&repo_key).await {
-                    Ok(purged) if purged > 0 => tracing::info!(
-                        repo_id = %repo_id,
-                        repo_key = %repo_key,
-                        purged,
-                        "Purged proxy-cache storage objects for deleted repository"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        repo_id = %repo_id,
-                        repo_key = %repo_key,
-                        error = %e,
-                        "Failed to list proxy-cache objects to purge after repository delete"
-                    ),
-                }
-            }
-        });
-    }
+    // Record the job and rename the repository to `~deleting~<job id>` in one
+    // transaction: from here every lookup by its key misses (no new upload or
+    // read reaches it) and the key can be reused. The rows, the objects
+    // (journaled and re-checked per key, see `delete_job`), the OCI upload
+    // temp objects and the proxy-cache subtree are removed by the job.
+    let (job, created) = delete_job::enqueue(&state.db, &repo, auth.user_id).await?;
 
     // Remove the deleted repo from the in-memory caches. The negative cache is
     // cleared rather than seeded (#3750): the next probe re-confirms the miss
@@ -6504,46 +6468,55 @@ pub async fn delete_repository(
     // lifetime tied to an observed lookup instead of to the delete.
     crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &key).await;
 
-    state.event_bus.emit_repository_event(
-        "repository.deleted",
-        repo.id,
-        Some(auth.username.clone()),
-    );
+    if created {
+        delete_job::spawn_job(state.clone(), job.id);
 
-    // Audit trail (#2366): repository deleted. Best-effort.
-    audit_fire_and_forget(
-        state.db.clone(),
-        AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
-            .user(auth.user_id)
-            .resource(repo.id)
-            .actor_name(auth.username.clone())
-            .resource_name(repo.key.clone())
-            .details_typed(audit_details::RepositoryDetails {
-                actor_id: auth.user_id,
-                key: repo.key.clone(),
-                is_public: repo.is_public,
-                format: Some(derive_format_key(&repo.format)),
-                // The authoritative three-state value. Deriving this from the
-                // `is_public` mirror would record `internal` repositories as
-                // `private` in the audit log -- wrong, and wrong in the
-                // direction that hides a real access change from the reader.
-                visibility: Some(repo.visibility.as_str().to_owned()),
-                age_gate_enabled: None,
-                age_gate_min_age_days: None,
-                age_gate_mode: None,
-                scan_config: None,
-                previous_scan_config: None,
-                scan_config_changed: None,
-                upstream_change: None,
-                project_change: None,
-                allow_public_with_upstream_credentials: None,
-                upstream_auth_change: None,
-                age_gate_change: None,
-            }),
+        // Audit trail (#2366): repository deleted. Best-effort.
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
+                .user(auth.user_id)
+                .resource(repo.id)
+                .actor_name(auth.username.clone())
+                .resource_name(repo.key.clone())
+                .details_typed(audit_details::RepositoryDetails {
+                    actor_id: auth.user_id,
+                    key: repo.key.clone(),
+                    is_public: repo.is_public,
+                    format: Some(derive_format_key(&repo.format)),
+                    // The authoritative three-state value. Deriving this from the
+                    // `is_public` mirror would record `internal` repositories as
+                    // `private` in the audit log -- wrong, and wrong in the
+                    // direction that hides a real access change from the reader.
+                    visibility: Some(repo.visibility.as_str().to_owned()),
+                    age_gate_enabled: None,
+                    age_gate_min_age_days: None,
+                    age_gate_mode: None,
+                    scan_config: None,
+                    previous_scan_config: None,
+                    scan_config_changed: None,
+                    upstream_change: None,
+                    project_change: None,
+                    allow_public_with_upstream_credentials: None,
+                    upstream_auth_change: None,
+                    age_gate_change: None,
+                }),
+        )
+        .await;
+    }
+
+    let location = delete_job::status_url(job.id);
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(delete_job::RepositoryDeleteJobResponse::from(job)),
     )
-    .await;
-
-    Ok(())
+        .into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&location) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::LOCATION, value);
+    }
+    Ok(response)
 }
 
 // Artifact handlers (nested under repository)
@@ -13830,9 +13803,11 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_conda_allowlist,
         set_conda_allowlist,
         delete_conda_allowlist,
+        delete_job::get_repository_deletion,
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
+        delete_job::RepositoryDeleteJobResponse,
         ListRepositoriesQuery,
         CreateRepositoryRequest,
         UpdateRepositoryRequest,
@@ -22982,6 +22957,14 @@ mod tests {
             ok.is_ok(),
             "delete_repository must admit a repository-owner: {ok:?}"
         );
+        // #4311: the delete runs as a job; wait for it.
+        let job_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM repository_delete_jobs WHERE repository_id = $1")
+                .bind(del_id)
+                .fetch_one(&pool)
+                .await
+                .expect("job row");
+        delete_job::run_to_completion(&state(), job_id).await;
         assert!(!row_exists(del_id).await, "owner delete removes the row");
 
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
@@ -27015,15 +26998,30 @@ mod tests {
         let mut auth = tdh::make_auth(fx.user_id, &fx.username);
         auth.is_admin = true;
 
+        // #4311: the request only enqueues the job; the job's repository-row
+        // delete is what the trigger blocks, on every retry until the job is
+        // marked failed.
         let res = delete_repository(
             State(fx.state.clone()),
             Extension(Some(auth)),
             Path(fx.repo_key.clone()),
         )
-        .await;
+        .await
+        .expect("the delete request is accepted");
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let job_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM repository_delete_jobs WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("job row");
+        let job = delete_job::run_to_completion(&fx.state, job_id).await;
+        assert_eq!(job.status, "failed", "{job:?}");
         assert!(
-            res.is_err(),
-            "the repository delete must fail (blocking trigger present)"
+            job.error_summary
+                .as_deref()
+                .is_some_and(|e| e.contains("ph blocked repo delete")),
+            "{job:?}"
         );
 
         assert!(
@@ -27286,6 +27284,208 @@ mod tests {
             .await
             .expect("delete other repo");
         fx.teardown().await;
+    }
+
+    /// #4311: the repository-delete purge decides per key, immediately before
+    /// the delete. Repository A is deleted on a shared cloud namespace while
+    /// repository B, on the same backend, receives an upload of identical
+    /// content after A's keys were collected but before they are purged: the
+    /// upload deduplicates against A's object and commits B's row. The purge
+    /// must keep that object. Before the fix it deleted every key judged
+    /// unshared at collection time, so B's artifact lost its bytes.
+    #[tokio::test]
+    async fn repository_delete_purge_keeps_an_object_uploaded_into_another_repository_meanwhile_4311(
+    ) {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = ANY($1)",
+        )
+        .bind(vec![repo_a, repo_b])
+        .execute(&pool)
+        .await
+        .expect("put both repositories on one bucket");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: String::new(),
+        };
+        let storage = state.storage_for_repo(&location).expect("s3 storage");
+        let body = bytes::Bytes::from(format!("identical bytes {}", Uuid::new_v4()));
+        let service = state.create_artifact_service(storage.clone());
+        let a = service
+            .upload(
+                repo_a,
+                "tool/1.0/tool.bin",
+                "tool.bin",
+                None,
+                "application/octet-stream",
+                body.clone(),
+                Some(user_id),
+            )
+            .await
+            .expect("upload into A");
+        let key = a.storage_key.clone();
+
+        // The delete collects A's keys while A is the only holder ...
+        let collected = collect_repo_artifact_object_keys(&state, repo_a, &location).await;
+        assert!(
+            collected.contains(&key),
+            "A's object is A's alone at collection time"
+        );
+        state
+            .create_repository_service()
+            .delete(repo_a)
+            .await
+            .expect("delete repository A");
+
+        // ... then the same bytes arrive in B, deduplicating against the
+        // object A's purge is about to remove ...
+        let b = service
+            .upload(
+                repo_b,
+                "copy/1.0/copy.bin",
+                "copy.bin",
+                None,
+                "application/octet-stream",
+                body.clone(),
+                Some(user_id),
+            )
+            .await
+            .expect("upload into B");
+        assert_eq!(b.storage_key, key, "content-addressed: one object");
+
+        // ... and A's purge runs.
+        purge_storage_object_keys(&state, repo_a, &location, collected).await;
+
+        let kept = mem.objects.lock().unwrap().get(&key).cloned();
+        let downloaded = service
+            .download(repo_b, "copy/1.0/copy.bin", None, None, None)
+            .await;
+        tdh::cleanup(&pool, repo_b, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        assert_eq!(
+            kept.as_ref(),
+            Some(&body),
+            "the purge must keep an object another repository committed a row for after collection"
+        );
+        assert!(
+            downloaded.is_ok(),
+            "B's artifact must still download: {downloaded:?}"
+        );
+    }
+
+    /// #4311: an object no other repository references is still purged, and
+    /// leaves no journal row behind; one that another repository references
+    /// is kept and its journal row stays for storage GC, without a lease that
+    /// would hold uploads of that content.
+    #[tokio::test]
+    async fn repository_delete_purge_journals_and_rechecks_each_key_4311() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = ANY($1)",
+        )
+        .bind(vec![repo_a, repo_b])
+        .execute(&pool)
+        .await
+        .expect("one bucket");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: String::new(),
+        };
+        let storage = state.storage_for_repo(&location).expect("s3 storage");
+        let service = state.create_artifact_service(storage.clone());
+        let own = bytes::Bytes::from(format!("only in A {}", Uuid::new_v4()));
+        let shared = bytes::Bytes::from(format!("in A and B {}", Uuid::new_v4()));
+        let own_key = service
+            .upload(
+                repo_a,
+                "own.bin",
+                "own.bin",
+                None,
+                "application/octet-stream",
+                own,
+                Some(user_id),
+            )
+            .await
+            .expect("own")
+            .storage_key;
+        let shared_key = service
+            .upload(
+                repo_a,
+                "shared.bin",
+                "shared.bin",
+                None,
+                "application/octet-stream",
+                shared.clone(),
+                Some(user_id),
+            )
+            .await
+            .expect("shared in A")
+            .storage_key;
+        service
+            .upload(
+                repo_b,
+                "shared.bin",
+                "shared.bin",
+                None,
+                "application/octet-stream",
+                shared,
+                Some(user_id),
+            )
+            .await
+            .expect("shared in B");
+        state
+            .create_repository_service()
+            .delete(repo_a)
+            .await
+            .expect("delete A");
+
+        let keys: std::collections::BTreeSet<String> =
+            [own_key.clone(), shared_key.clone()].into_iter().collect();
+        purge_storage_object_keys(&state, repo_a, &location, keys).await;
+
+        let (own_left, shared_left) = {
+            let objects = mem.objects.lock().unwrap();
+            (
+                objects.contains_key(&own_key),
+                objects.contains_key(&shared_key),
+            )
+        };
+        let journal: Vec<(String, Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT storage_key, source_repository_id, leased_at IS NOT NULL \
+               FROM oci_gc_candidates WHERE storage_key = ANY($1) ORDER BY storage_key",
+        )
+        .bind(vec![own_key.clone(), shared_key.clone()])
+        .fetch_all(&pool)
+        .await
+        .expect("journal rows");
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = ANY($1)")
+            .bind(vec![own_key.clone(), shared_key.clone()])
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_b, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+
+        assert!(!own_left, "an object only A held is purged");
+        assert!(shared_left, "an object B still references is kept");
+        assert_eq!(
+            journal,
+            vec![(shared_key, Some(repo_a), false)],
+            "only the kept key stays journaled, as a waiting candidate (no lease)"
+        );
     }
 
     /// #4833: on `filesystem` every repository roots its own tree, so two
