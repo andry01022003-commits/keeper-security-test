@@ -1231,6 +1231,7 @@ async fn complete_session_commit(
     }
 
     tracing::info!(
+        assembly = if stream_assembly { "backend" } else { "local" },
         "Finalized chunked upload {} -> artifact {} ({}B, sha256:{})",
         session_id,
         artifact_id,
@@ -2077,6 +2078,7 @@ mod tests {
         fail_put_file: AtomicBool,
         exists_may_match_fallback_key: AtomicBool,
         streamed_assembly: AtomicBool,
+        fail_copy: AtomicBool,
     }
 
     impl CompleteRecordingStorage {
@@ -2118,6 +2120,10 @@ mod tests {
         /// the local assembly path.
         fn set_streamed_assembly(&self, streamed: bool) {
             self.streamed_assembly.store(streamed, Ordering::SeqCst);
+        }
+
+        fn set_fail_copy(&self, fail: bool) {
+            self.fail_copy.store(fail, Ordering::SeqCst);
         }
     }
 
@@ -2176,6 +2182,11 @@ mod tests {
 
         async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
             self.copy_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_copy.load(Ordering::SeqCst) {
+                return Err(crate::error::AppError::Storage(
+                    "injected copy failure".to_string(),
+                ));
+            }
             let content = self.get(source).await?;
             self.put(dest, content).await
         }
@@ -5314,6 +5325,133 @@ mod tests {
             "the failed assembly must delete its staging object"
         );
         assert_completion_is_retryable(&f, session_id, &staged).await;
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// #3916: a failed promotion (`copy` from the staging object to the
+    /// content-addressed key) is retryable like a failed local `put_file`:
+    /// 500, the lease is released, the chunks stay staged, and neither the
+    /// staging object nor a final object nor an artifact row is left behind.
+    /// The retry then completes from the same chunks.
+    #[tokio::test]
+    async fn complete_streaming_copy_failure_is_retryable() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let payload = b"chunked completion streaming copy failure";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/copy-fail.bin").await;
+
+        storage.set_fail_copy(true);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state.clone(), auth);
+        let (status, _body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            storage.content(&expected_key).is_none(),
+            "a failed promotion must not leave a final object"
+        );
+        assert!(
+            !storage.contains(&upload_service::staged_assembly_key(session_id)),
+            "a failed promotion must delete its staging object"
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind("authz/copy-fail.bin")
+        .fetch_one(&f.pool)
+        .await
+        .expect("count rows");
+        assert_eq!(rows, 0, "a failed promotion must not publish a row");
+        assert_completion_is_retryable(&f, session_id, &staged).await;
+
+        storage.set_fail_copy(false);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the same session completes once the copy succeeds: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            storage.content(&expected_key),
+            Some(Bytes::copy_from_slice(payload))
+        );
+        assert!(!storage.contains(&upload_service::staged_assembly_key(session_id)));
+
+        cleanup_staged_session(&f, session_id, &staged).await;
+        f.teardown().await;
+    }
+
+    /// #3916 with #2516: on the streaming path the locked quota admission
+    /// still runs in the transaction that inserts the row, so a completion
+    /// over the repository quota answers 507, publishes no row, fails the
+    /// session and leaves no staging object behind.
+    #[tokio::test]
+    async fn complete_streaming_quota_denial_publishes_no_row() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_streamed_assembly(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+
+        let payload = b"chunked completion streaming over quota";
+        let (session_id, staged) =
+            stage_completable_session_in(&f, storage.clone(), payload, "authz/over-quota.bin")
+                .await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("set a quota the payload exceeds");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind("authz/over-quota.bin")
+        .fetch_one(&f.pool)
+        .await
+        .expect("count rows");
+        assert_eq!(rows, 0, "a quota denial must not publish a row");
+        let session_status: String =
+            sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session");
+        assert_eq!(session_status, "failed");
+        assert!(
+            !storage.contains(&upload_service::staged_assembly_key(session_id)),
+            "the denied completion must not leave its staging object"
+        );
+        assert!(
+            !staged.exists().await,
+            "the terminal session purges its chunks"
+        );
 
         cleanup_staged_session(&f, session_id, &staged).await;
         f.teardown().await;

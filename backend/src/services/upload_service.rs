@@ -4015,3 +4015,227 @@ mod tests {
             .await;
     }
 }
+
+/// Live checks of the on-backend chunk assembly (#3916) against a real
+/// S3-compatible store, Azure Blob or GCS endpoint (MinIO, Azurite and
+/// fake-gcs-server locally). Ignored by default; pick the backend with
+/// `AK_STREAMED_ASSEMBLY_LIVE=s3|azure|gcs` and that backend's usual
+/// `S3_*`, `AZURE_STORAGE_*` or `GCS_*` variables, e.g.
+///
+///   AK_STREAMED_ASSEMBLY_LIVE=s3 S3_BUCKET=ak-test S3_REGION=us-east-1 \
+///   S3_ENDPOINT=http://127.0.0.1:39000 S3_ACCESS_KEY_ID=... \
+///   S3_SECRET_ACCESS_KEY=... cargo test streamed_assembly_live -- --ignored
+#[cfg(test)]
+mod streamed_assembly_live {
+    use super::*;
+    use bytes::Bytes;
+
+    async fn live_backend() -> Option<Arc<dyn StorageBackend>> {
+        let kind = std::env::var("AK_STREAMED_ASSEMBLY_LIVE").ok()?;
+        let backend: Arc<dyn StorageBackend> = match kind.as_str() {
+            "s3" => Arc::new(
+                crate::storage::s3::S3Backend::new(
+                    crate::storage::s3::S3Config::from_env().expect("S3Config::from_env"),
+                )
+                .await
+                .expect("S3Backend::new"),
+            ),
+            "azure" => Arc::new(
+                crate::storage::azure::AzureBackend::new(
+                    crate::storage::azure::AzureConfig::from_env().expect("AzureConfig::from_env"),
+                )
+                .await
+                .expect("AzureBackend::new"),
+            ),
+            "gcs" => Arc::new(
+                crate::storage::gcs::GcsBackend::new(
+                    crate::storage::gcs::GcsConfig::from_env().expect("GcsConfig::from_env"),
+                )
+                .await
+                .expect("GcsBackend::new"),
+            ),
+            other => panic!("unknown AK_STREAMED_ASSEMBLY_LIVE backend {other:?}"),
+        };
+        Some(backend)
+    }
+
+    fn session(id: Uuid, total_size: i64, total_chunks: i32, checksum: String) -> UploadSession {
+        let now = chrono::Utc::now();
+        UploadSession {
+            id,
+            user_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            repository_key: "live".into(),
+            artifact_path: "live/streamed.bin".into(),
+            artifact_name: None,
+            artifact_version: None,
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
+            is_replication: false,
+            content_type: "application/octet-stream".into(),
+            total_size,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            total_chunks,
+            completed_chunks: total_chunks,
+            bytes_received: total_size,
+            checksum_sha256: checksum,
+            temp_file_path: String::new(),
+            status: "committing".into(),
+            error_message: None,
+            state_token: None,
+            committing_expires_at: None,
+            staged_in_storage: true,
+            staging_purged_at: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now,
+        }
+    }
+
+    /// Four 10 MiB chunks plus a short tail (~40 MiB): several S3 multipart
+    /// parts, more than one 32 MiB GCS resumable request and several Azure
+    /// blocks. Each chunk carries distinct bytes so a reordered or dropped
+    /// chunk changes the digest.
+    fn chunks() -> Vec<Bytes> {
+        let mut out: Vec<Bytes> = (0..4u8)
+            .map(|i| {
+                Bytes::from(
+                    (0..10 * 1024 * 1024)
+                        .map(|n: usize| (n as u8).wrapping_mul(31).wrapping_add(i))
+                        .collect::<Vec<u8>>(),
+                )
+            })
+            .collect();
+        out.push(Bytes::from_static(b"tail of the streamed assembly"));
+        out
+    }
+
+    async fn read_digest(storage: &Arc<dyn StorageBackend>, key: &str) -> (i64, String) {
+        let mut stream = storage.get_stream(key).await.expect("get_stream");
+        let mut digest = Sha256::new();
+        let mut len = 0i64;
+        while let Some(block) = stream.next().await {
+            let block = block.expect("read block");
+            digest.update(&block);
+            len += block.len() as i64;
+        }
+        (len, format!("{:x}", digest.finalize()))
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn streamed_assembly_live_roundtrip_and_failures() {
+        let Some(storage) = live_backend().await else {
+            println!("Skipping: set AK_STREAMED_ASSEMBLY_LIVE=s3|azure|gcs to run");
+            return;
+        };
+        assert!(
+            storage.supports_streamed_assembly(),
+            "every object-store backend must advertise streamed assembly"
+        );
+
+        let parts = chunks();
+        let mut hasher = Sha256::new();
+        let mut total = 0i64;
+        for part in &parts {
+            hasher.update(part);
+            total += part.len() as i64;
+        }
+        let checksum = format!("{:x}", hasher.finalize());
+        let id = Uuid::new_v4();
+        for (index, part) in parts.iter().enumerate() {
+            storage
+                .put(&staged_chunk_key(id, index as i32), part.clone())
+                .await
+                .expect("stage chunk");
+        }
+        let good = session(id, total, parts.len() as i32, checksum.clone());
+
+        // Happy path: assemble on the backend and verify; the staging object
+        // must hold exactly the staged bytes.
+        let staged = assemble_staged_chunks_on_backend(&storage, &good)
+            .await
+            .expect("assemble on backend");
+        assert_eq!(staged, staged_assembly_key(id));
+        assert_eq!(
+            read_digest(&storage, &staged).await,
+            (total, checksum.clone())
+        );
+
+        // Promote with copy and read the final key back. Azurite does not
+        // serve Put Blob From URL, so `AK_STREAMED_ASSEMBLY_LIVE_SKIP_COPY=1`
+        // skips this step there (the copy primitive predates #3916).
+        let final_key = format!("live-3916/{}", checksum);
+        let copy_checked =
+            std::env::var("AK_STREAMED_ASSEMBLY_LIVE_SKIP_COPY").as_deref() != Ok("1");
+        if copy_checked {
+            storage
+                .copy(&staged, &final_key)
+                .await
+                .expect("promote by copy");
+            assert_eq!(
+                read_digest(&storage, &final_key).await,
+                (total, checksum.clone()),
+                "final object holds the exact staged bytes"
+            );
+        }
+        verify_staged_chunks(&storage, &good)
+            .await
+            .expect("read-only verification of good chunks");
+
+        // A wrong declared digest: refused, and the staging object is gone.
+        storage.delete(&staged).await.expect("drop staging object");
+        let wrong_digest = session(id, total, parts.len() as i32, "0".repeat(64));
+        let err = assemble_staged_chunks_on_backend(&storage, &wrong_digest)
+            .await
+            .expect_err("checksum mismatch must fail");
+        assert!(matches!(err, UploadError::ChecksumMismatch { .. }), "{err}");
+        assert!(
+            !storage.exists(&staged_assembly_key(id)).await.unwrap(),
+            "a failed assembly must not leave its staging object"
+        );
+        let err = verify_staged_chunks(&storage, &wrong_digest)
+            .await
+            .expect_err("read-only verification must fail too");
+        assert!(matches!(err, UploadError::ChecksumMismatch { .. }), "{err}");
+
+        // A wrong declared size: refused as a size mismatch, nothing left.
+        let wrong_size = session(id, total + 1, parts.len() as i32, checksum.clone());
+        let err = assemble_staged_chunks_on_backend(&storage, &wrong_size)
+            .await
+            .expect_err("size mismatch must fail");
+        assert!(matches!(err, UploadError::SizeMismatch { .. }), "{err}");
+        assert!(!storage.exists(&staged_assembly_key(id)).await.unwrap());
+
+        // A missing chunk: a storage error (retryable), nothing left.
+        storage
+            .delete(&staged_chunk_key(id, 2))
+            .await
+            .expect("drop a chunk");
+        let err = assemble_staged_chunks_on_backend(&storage, &good)
+            .await
+            .expect_err("missing chunk must fail");
+        assert!(matches!(err, UploadError::Storage(_)), "{err}");
+        assert!(!storage.exists(&staged_assembly_key(id)).await.unwrap());
+
+        // The purge reclaims every chunk and any assembled object.
+        storage
+            .put(&staged_assembly_key(id), Bytes::from_static(b"leftover"))
+            .await
+            .expect("simulate a leftover assembly");
+        delete_staged_chunk_objects(storage.as_ref(), id, parts.len() as i32)
+            .await
+            .expect("purge");
+        for index in 0..parts.len() as i32 {
+            assert!(!storage.exists(&staged_chunk_key(id, index)).await.unwrap());
+        }
+        assert!(!storage.exists(&staged_assembly_key(id)).await.unwrap());
+        if copy_checked {
+            storage.delete(&final_key).await.expect("cleanup final");
+        }
+        println!("#3916 live streamed assembly OK ({total} bytes)");
+    }
+}
