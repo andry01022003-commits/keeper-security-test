@@ -102,7 +102,12 @@ own acquire timeout applies. Remote and Virtual package requests make further
 database calls after the lookup (cache catalog, member resolution, download
 records) on the normal pool.
 
-Sizing for a fleet:
+Sizing for a fleet. These figures are reasoned from the request path and
+the defaults, not measured: unlike the table under Measured behaviour, no
+fleet run has confirmed them yet. The fleet measurements are tracked in
+#4188; treat the numbers below as a starting point and check them against
+`ak_conda_package_requests_shed_total` and the pool metrics on your own
+deployment.
 
 - **Pool per replica.** A hosted lookup holds a connection for about one
   round trip (well under 5 ms on a local network), so a pool of 50 serves on
