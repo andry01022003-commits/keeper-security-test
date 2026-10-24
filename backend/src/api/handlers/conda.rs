@@ -25182,6 +25182,7 @@ mod upload_body_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod package_conditional_tests {
     //! #4181 / #4579: the package route resolves a hosted package in one
