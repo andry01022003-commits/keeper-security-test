@@ -64,6 +64,7 @@ use crate::services::signing_service::SigningService;
 
 mod current_repodata;
 mod merge_gate;
+mod package_gate;
 mod virtual_merge;
 
 // ---------------------------------------------------------------------------
@@ -5825,7 +5826,7 @@ SELECT r.id, r.key, r.storage_backend, r.storage_path, r.format::TEXT AS format,
 /// of another format 400, exactly as [`resolve_conda_repo`] answers; a
 /// saturated pool is a retryable 503 (`map_db_err`).
 async fn lookup_package(
-    db: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     repo_key: &str,
     artifact_path: &str,
     cache_key: &str,
@@ -5835,7 +5836,7 @@ async fn lookup_package(
         .bind(repo_key)
         .bind(artifact_path)
         .bind(cache_key)
-        .fetch_optional(db)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(crate::api::handlers::error_helpers::map_db_err)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
@@ -6132,7 +6133,14 @@ async fn download_package(
         is_public,
         artifact,
         cached,
-    } = lookup_package(&state.db, &repo_key, &artifact_path, &serve_key.cache_key).await?;
+    } = {
+        // #4182: the lookup's connection comes through the fast-fail gate, so
+        // a saturated pool sheds this request with 503 + Retry-After instead
+        // of queueing it to the acquire timeout. The connection goes back to
+        // the pool before anything is streamed.
+        let mut conn = package_gate::acquire(&state.db).await?;
+        lookup_package(&mut conn, &repo_key, &artifact_path, &serve_key.cache_key).await?
+    };
 
     // Same decision `check_read_access` makes, from the row already read.
     if !is_public {
@@ -25564,5 +25572,53 @@ mod package_conditional_tests {
         assert!(if_none_match_matches("*", "\"abc\""));
         assert!(!if_none_match_matches("\"abcd\"", "\"abc\""));
         assert!(!if_none_match_matches("", "\"abc\""));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod package_gate_router_tests {
+    //! #4182: a package request that finds the pool saturated is shed at once
+    //! with 503 + Retry-After instead of queueing to the acquire timeout.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn a_saturated_pool_sheds_package_requests_with_retry_after_4182() {
+        let Some(url) = crate::testing::require_db_url() else {
+            return;
+        };
+        // One connection, and an acquire timeout far beyond the gate's wait:
+        // without the gate the request below would wait the full 10 s.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&url)
+            .await
+            .expect("single-connection pool");
+        let dir = tempfile::tempdir().expect("storage dir");
+        let state = tdh::build_state(pool.clone(), dir.path().to_str().unwrap());
+        let app = || tdh::router_anon(router(), state.clone());
+        let uri = || "/no-such-channel/noarch/pkg-1.0-0.tar.bz2".to_string();
+
+        let held = pool.acquire().await.expect("hold the only connection");
+        let started = std::time::Instant::now();
+        let (status, _, headers) = tdh::send_with_headers(app(), tdh::get(uri())).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[axum::http::header::RETRY_AFTER], "1");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "shed after {elapsed:?}, not at the gate's wait"
+        );
+
+        // A free connection is used as before.
+        drop(held);
+        let (status, _, _) = tdh::send_with_headers(app(), tdh::get(uri())).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the request reaches the lookup"
+        );
     }
 }
