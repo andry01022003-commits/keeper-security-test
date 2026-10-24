@@ -31,7 +31,7 @@ A Virtual repository has its own scan configuration too. See
 ### Instance lock
 
 An instance administrator can hold a repository's proxy scan policy
-centrally (#4363, migration 299). Any `PUT .../security` by an instance
+centrally (#4363, migration 300). Any `PUT .../security` by an instance
 administrator locks the policy unless the body says `"instance_locked": false`,
 which hands it back to the repository's administrators. The lock is shown as
 `instance_locked` on `GET .../security` and on `GET /api/v1/security/configs`.

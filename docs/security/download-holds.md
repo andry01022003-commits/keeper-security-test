@@ -29,7 +29,7 @@ of a refused artifact answers `404`.
 
 ## Where a hold came from
 
-`artifacts.quarantine_source` (migration 298) records the origin of a hosted
+`artifacts.quarantine_source` (migration 299) records the origin of a hosted
 hold next to `quarantine_status = 'quarantined'`:
 
 | Value | Written by |

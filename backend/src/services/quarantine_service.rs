@@ -105,7 +105,7 @@ impl QuarantineState {
     }
 }
 
-/// Where a hold came from (`artifacts.quarantine_source`, migration 298,
+/// Where a hold came from (`artifacts.quarantine_source`, migration 299,
 /// #4510). Recorded next to `quarantine_status = 'quarantined'`, which stays
 /// the one status every filter and guard reads, so the download gate can
 /// answer a scan-policy hold with the policy 403 instead of the quarantine
@@ -149,7 +149,7 @@ pub enum HoldAnswer {
     ScanPolicy,
     /// The recorded source does not settle it (no source: a hold written by
     /// the scanner, by a 1.11 replica during a rolling upgrade, or before
-    /// migration 298; or a source that contradicts the row): ask the scan
+    /// migration 299; or a source that contradicts the row): ask the scan
     /// policy, the same evaluation the gate's policy half runs.
     AskPolicy,
 }

@@ -10,7 +10,7 @@
 //! (`quarantine_status = 'quarantined'`), so it appears in the quarantine
 //! queue as `source: hosted, kind: active`. Since #4510 the hold also records
 //! its origin in `artifacts.quarantine_source` (`upload`, `admin`,
-//! `scan_policy`; NULL for a hold written before migration 298, by a 1.11
+//! `scan_policy`; NULL for a hold written before migration 299, by a 1.11
 //! replica, or by the scanner until it records its own), which the queue
 //! reports as `hold_source` and can filter on. What a scan policy refuses
 //! right now, held or not, is the separate policy-blocks queue

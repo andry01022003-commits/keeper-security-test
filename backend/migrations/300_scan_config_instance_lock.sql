@@ -1,4 +1,4 @@
--- 299_scan_config_instance_lock.sql
+-- 300_scan_config_instance_lock.sql
 -- #4363: an instance administrator's proxy scan policy for a repository can
 -- only be weakened by an instance administrator, mirroring the age-gate
 -- policy lock of migration 290.
