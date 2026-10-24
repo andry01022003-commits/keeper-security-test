@@ -393,7 +393,24 @@ async fn resolve_snapshot_artifact(
     repo_id: uuid::Uuid,
     snapshot_path: &str,
 ) -> Option<ResolvedSnapshot> {
-    let pattern = snapshot_like_pattern(snapshot_path)?;
+    fetch_snapshot_artifact(db, repo_id, snapshot_path)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`resolve_snapshot_artifact`] that reports a failed query as an error
+/// instead of `None`. A caller that gates on the resolved row (the checksum
+/// gate, #4288 item 2) must not read a database fault as "no artifact here",
+/// or the path would be served without that row's gate.
+async fn fetch_snapshot_artifact(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    snapshot_path: &str,
+) -> Result<Option<ResolvedSnapshot>, sqlx::Error> {
+    let Some(pattern) = snapshot_like_pattern(snapshot_path) else {
+        return Ok(None);
+    };
 
     // Use runtime sqlx::query (not the query! macro) to avoid needing an
     // offline cache entry. The LIKE pattern matches timestamped filenames
@@ -417,16 +434,18 @@ async fn resolve_snapshot_artifact(
     .bind(repo_id)
     .bind(&pattern)
     .fetch_optional(db)
-    .await
-    .ok()??;
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
 
     use sqlx::Row;
-    Some(ResolvedSnapshot {
+    Ok(Some(ResolvedSnapshot {
         id: row.get("id"),
         storage_key: row.get("storage_key"),
         checksum_sha256: row.get("checksum_sha256"),
         path: row.get("path"),
-    })
+    }))
 }
 
 struct ResolvedSnapshot {
@@ -1963,42 +1982,45 @@ async fn download(
         // timestamp-resolved filename before falling through to compute. Same
         // shared-namespace hazard as above: the sidecar key is unanchored, so it
         // is served only to its attributed owner (#2504, #2574).
-        if base_path.contains("-SNAPSHOT") {
-            if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
-                let resolved_sidecar_path =
-                    format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
-                // Repo-scoped candidate first (#2624): physically owned by
-                // this repository, no attribution gate needed.
-                if let Some(scoped_key) = key_scheme.scoped_read_key(
-                    &repo.storage_backend,
-                    "maven",
-                    repo.id,
-                    &resolved_sidecar_path,
-                ) {
-                    if let Ok(content) = storage.get(&scoped_key).await {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(content))
-                            .unwrap());
-                    }
+        //
+        // #4288 item 2: the timestamped row is the one `hosted_target`
+        // resolved and gated above, not a second lookup: a second query could
+        // pick a newer (held) upload, or a different row than the exact-path
+        // one the artifact read serves.
+        if let Some(resolved) = hosted_target.as_ref().filter(|t| t.path != base_path) {
+            let resolved_sidecar_path =
+                format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
+            // Repo-scoped candidate first (#2624): physically owned by
+            // this repository, no attribution gate needed.
+            if let Some(scoped_key) = key_scheme.scoped_read_key(
+                &repo.storage_backend,
+                "maven",
+                repo.id,
+                &resolved_sidecar_path,
+            ) {
+                if let Ok(content) = storage.get(&scoped_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
                 }
-                let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
-                if crate::services::maven_flat_attribution::flat_key_readable(
-                    &state.db,
-                    repo.id,
-                    &repo.storage_backend,
-                    &resolved_checksum_key,
-                )
-                .await
-                {
-                    if let Ok(content) = storage.get(&resolved_checksum_key).await {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(content))
-                            .unwrap());
-                    }
+            }
+            let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
+            if crate::services::maven_flat_attribution::flat_key_readable(
+                &state.db,
+                repo.id,
+                &repo.storage_backend,
+                &resolved_checksum_key,
+            )
+            .await
+            {
+                if let Ok(content) = storage.get(&resolved_checksum_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
                 }
             }
         }
@@ -3536,14 +3558,18 @@ fn checksum_compute_eligible(repo_type: &str) -> bool {
 /// same resolution the artifact read uses.
 struct ChecksumTarget {
     id: uuid::Uuid,
+    /// The resolved artifact path: `base_path` itself, or the timestamped
+    /// name a `-SNAPSHOT` alias resolved to.
+    path: String,
     storage_key: String,
     checksum_sha256: String,
 }
 
 /// Resolve [`ChecksumTarget`] for `base_path` in a hosted repository.
 /// `Ok(None)` when no live row describes the path (nothing to gate, nothing
-/// to compute). A failed exact-path query is an error, never `None`, so a
-/// database fault cannot let a stored sidecar answer without its gate.
+/// to compute). A failed query (exact path or `-SNAPSHOT` alias) is an error,
+/// never `None`, so a database fault cannot let a stored sidecar answer
+/// without its gate.
 async fn resolve_checksum_target(
     db: &PgPool,
     repo_id: uuid::Uuid,
@@ -3568,6 +3594,7 @@ async fn resolve_checksum_target(
     if let Some(a) = artifact {
         return Ok(Some(ChecksumTarget {
             id: a.id,
+            path: base_path.to_string(),
             storage_key: a.storage_key,
             checksum_sha256: a.checksum_sha256,
         }));
@@ -3575,10 +3602,12 @@ async fn resolve_checksum_target(
     if !base_path.contains("-SNAPSHOT") {
         return Ok(None);
     }
-    Ok(resolve_snapshot_artifact(db, repo_id, base_path)
+    Ok(fetch_snapshot_artifact(db, repo_id, base_path)
         .await
+        .map_err(map_db_err)?
         .map(|r| ChecksumTarget {
             id: r.id,
+            path: r.path,
             storage_key: r.storage_key,
             checksum_sha256: r.checksum_sha256,
         }))
@@ -8235,6 +8264,100 @@ mod tests {
                     "#4288: GET {route} must be 404 while the artifact is {phase}"
                 );
             }
+        }
+    }
+
+    /// #4288 item 2: a database error while resolving a `-SNAPSHOT` alias to
+    /// its timestamped row is an error, never "no artifact". `None` would let
+    /// a stored sidecar under the alias name (or a later lookup that
+    /// succeeds) answer without the artifact's gate.
+    ///
+    /// The fault is injected on the second statement only: the pool's first
+    /// connection serves the exact-path query, and every later acquire must
+    /// open a new connection, which `after_connect` refuses.
+    #[tokio::test]
+    async fn test_checksum_target_snapshot_lookup_error_fails_closed_4288() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let url = crate::testing::require_db_url().expect("DATABASE_URL");
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let state = tdh::build_state(pool.clone(), repo_dir.to_str().unwrap());
+        let repo = tdh::make_repo_info(repo_id, &repo_key, &repo_dir, "local", None);
+        let snap_path = "com/example/gate4288db/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/gate4288db/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let bytes = Bytes::from_static(b"gate4288-db-fault");
+        tdh::seed_artifact_with_checksum(
+            &state,
+            &pool,
+            &repo,
+            &format!("maven/{snap_path}"),
+            snap_path,
+            "gate4288db",
+            "1.0-SNAPSHOT",
+            "application/java-archive",
+            bytes.clone(),
+            user_id,
+            &compute_checksum(&bytes, ChecksumType::Sha256),
+        )
+        .await;
+
+        // Positive control: on a healthy pool the alias resolves to the
+        // timestamped row.
+        let healthy = resolve_checksum_target(&pool, repo_id, snap_alias).await;
+        let resolved_path = healthy
+            .as_ref()
+            .ok()
+            .and_then(|t| t.as_ref())
+            .map(|t| t.path.clone());
+
+        let connects = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = connects.clone();
+        let faulty = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .after_connect(move |_conn, _meta| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        Ok(())
+                    } else {
+                        Err(sqlx::Error::Protocol("injected fault (#4288)".into()))
+                    }
+                })
+            })
+            .before_acquire(|_conn, _meta| Box::pin(async { Ok(false) }))
+            .connect_lazy(&url)
+            .expect("lazy pool");
+        let faulted = resolve_checksum_target(&faulty, repo_id, snap_alias).await;
+        faulty.close().await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&repo_dir);
+
+        assert_eq!(
+            resolved_path.as_deref(),
+            Some(snap_path),
+            "positive control: the alias must resolve to the timestamped row"
+        );
+        assert!(
+            connects.load(Ordering::SeqCst) >= 2,
+            "the fault must hit the alias lookup, after the exact-path query"
+        );
+        match faulted {
+            Err(resp) => assert!(
+                resp.status().is_server_error(),
+                "a failed alias lookup must be a server error, got {}",
+                resp.status()
+            ),
+            Ok(target) => panic!(
+                "#4288: a failed -SNAPSHOT alias lookup must fail closed, got Ok({:?})",
+                target.map(|t| t.path)
+            ),
         }
     }
 
