@@ -2912,10 +2912,9 @@ mod tests {
     }
 
     /// #4725: a `buf push` to a hosted repository must queue a push sync task
-    /// for a subscribed push peer. The registry-generated `_labels` row carries
-    /// no stored bytes, so it must not be queued, and a push that arrives as
-    /// peer replication must not be fanned back out. Fails on `main` (nothing
-    /// queued).
+    /// for a subscribed push peer. Since #4889 the registry-generated `_labels`
+    /// index is a stored JSON document and is queued alongside the commit, and
+    /// a push that arrives as peer replication must not be fanned back out.
     #[tokio::test]
     async fn protobuf_upload_queues_push_sync_task_4725() {
         use crate::api::handlers::test_db_helpers as tdh;

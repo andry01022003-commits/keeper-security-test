@@ -74,9 +74,20 @@ const REARM_SUPERSEDED_PUSH_SQL: &str = r#"
               FROM artifact_metadata am
               WHERE am.artifact_id = a.id
                 AND (
+                    -- Pacman's file list is compared on neither side: the
+                    -- claim merges `pacman_file_lists` into what it sends, and
+                    -- a row written by a pre-#4424 replica during a rolling
+                    -- upgrade can still hold `files` in the document itself.
+                    -- Comparing one stripped side with one unstripped side
+                    -- would re-arm that package after every push, forever.
                     (
                         $3::jsonb IS NOT NULL
-                        AND am.metadata IS DISTINCT FROM (
+                        AND (
+                            CASE WHEN r.format::text = 'pacman' AND jsonb_typeof(am.metadata) = 'object'
+                                 THEN am.metadata - 'files'
+                                 ELSE am.metadata
+                            END
+                        ) IS DISTINCT FROM (
                             CASE WHEN r.format::text = 'pacman' AND jsonb_typeof($3::jsonb) = 'object'
                                  THEN $3::jsonb - 'files'
                                  ELSE $3::jsonb
@@ -2403,6 +2414,31 @@ mod tests {
         .unwrap();
         svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
         assert_eq!(push_task_state(&pool, task_id).await.0, "pending");
+
+        // #4889: a document that still holds its file list (written by a
+        // pre-#4424 replica during a rolling upgrade) is sent as stored. With
+        // the re-arm now applying to every pacman push, comparing it against
+        // a stripped copy would re-queue the package after every delivery.
+        let legacy = serde_json::json!({ "filename": "x", "pgpsig": "AAE=", "files": ["usr/"] });
+        sqlx::query("UPDATE artifact_metadata SET metadata = $2 WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .bind(&legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !svc.rearm_superseded_push(task_id, Some(&checksum), Some(&legacy))
+                .await
+                .unwrap(),
+            "an unchanged pacman document with an inline file list must not loop"
+        );
 
         sqlx::query("DELETE FROM artifact_metadata WHERE artifact_id = $1")
             .bind(artifact_id)

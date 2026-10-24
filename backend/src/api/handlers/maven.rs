@@ -5512,6 +5512,66 @@ mod tests {
         assert!(xml.contains("<value>1.0-20260702.120000-1</value>"));
     }
 
+    /// #4889 decision: a client-deployed `maven-metadata.xml` stays row-less
+    /// and is never queued to push peers. Only the versioned files travel; the
+    /// peer regenerates its metadata from those rows (see the snapshot test
+    /// above). This pins the decision so a later change that gives the
+    /// document a row, and so a push, is a deliberate one.
+    #[tokio::test]
+    async fn client_maven_metadata_xml_is_not_pushed_4889() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "maven-4889").await;
+        let router = fx.router_with_auth(super::router());
+        let jar = "org/example/ak/push/lib/1.0/lib-1.0.jar";
+        let metadata = "org/example/ak/push/lib/maven-metadata.xml";
+        let uploads = [
+            (jar, bytes::Bytes::from_static(b"release jar bytes")),
+            (
+                metadata,
+                bytes::Bytes::from_static(
+                    br#"<metadata><groupId>org.example.ak.push</groupId><artifactId>lib</artifactId><versioning><release>1.0</release><versions><version>1.0</version></versions></versioning></metadata>"#,
+                ),
+            ),
+        ];
+        let mut statuses = Vec::new();
+        for (path, body) in uploads {
+            let (status, _) = tdh::send(
+                router.clone(),
+                tdh::put(format!("/{}/{}", fx.repo_key, path), body),
+            )
+            .await;
+            statuses.push(status);
+        }
+
+        let queued = tdh::queued_push_paths_settled(&fx.pool, peer_id, fx.repo_id, jar).await;
+        let metadata_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(metadata)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count metadata rows");
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::CREATED),
+            "both deploys must succeed: {statuses:?}"
+        );
+        assert_eq!(metadata_rows, 0, "maven-metadata.xml must stay row-less");
+        assert_eq!(
+            queued,
+            vec![jar.to_string()],
+            "only the versioned file is pushed; peers regenerate maven-metadata.xml"
+        );
+    }
+
     // ── DB-backed HTTP-level regression tests (no_op without DATABASE_URL) ──
     //
     // These exercise the maven `download` handler end-to-end through the
