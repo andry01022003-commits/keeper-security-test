@@ -272,6 +272,26 @@ pub(super) fn decoding_reader<'a, R: Read + Send + 'a>(
     })
 }
 
+/// Why a member document could not be decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MemberDecodeError {
+    /// The bytes do not decode: empty, truncated, corrupt, or in a coding this
+    /// build cannot undo. A cached entry holding them is worth evicting so the
+    /// next request refetches it (#4929).
+    Corrupt(String),
+    /// The document decoded past the configured ceiling. The bytes are valid,
+    /// the cap is the problem, so the cache entry must not be evicted.
+    OverCap(String),
+}
+
+impl std::fmt::Display for MemberDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt(message) | Self::OverCap(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Undo the HTTP transfer coding and then the file compression, refusing to
 /// produce more than `cap` bytes.
 pub(super) fn decode_member_document(
@@ -279,22 +299,69 @@ pub(super) fn decode_member_document(
     transfer_coding: Option<&str>,
     codec: FileCodec,
     cap: usize,
-) -> Result<Vec<u8>, String> {
-    let file = decoding_reader(content, transfer_coding, codec)?;
+) -> Result<Vec<u8>, MemberDecodeError> {
+    let file =
+        decoding_reader(content, transfer_coding, codec).map_err(MemberDecodeError::Corrupt)?;
     let mut out = Vec::new();
     file.take(cap as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|e| format!("decode failed: {e}"))?;
+        .map_err(|e| MemberDecodeError::Corrupt(format!("decode failed: {e}")))?;
     if out.len() > cap {
-        return Err(format!(
+        return Err(MemberDecodeError::OverCap(format!(
             "decoded document exceeds the {cap}-byte member ceiling ({MEMBER_MAX_DECODED_BYTES_ENV})"
-        ));
+        )));
     }
     Ok(out)
 }
 
+/// Drop a cached member document that does not decode (#4929), so the next
+/// request refetches it instead of failing on the same bytes until the entry
+/// expires. Best-effort: a failed eviction still fails this request, and the
+/// cache expiry is the backstop.
+async fn evict_undecodable_member(
+    proxy: &ProxyService,
+    member: &Repository,
+    path: &str,
+    reason: &str,
+) {
+    tracing::warn!(
+        member = %member.key,
+        path = %path,
+        reason = %reason,
+        "cached upstream conda member document does not decode; evicting it (#4929)"
+    );
+    if let Err(e) = proxy.invalidate_cache_by_key(&member.key, path).await {
+        tracing::warn!(
+            member = %member.key,
+            path = %path,
+            error = %e,
+            "evicting undecodable conda member document from the proxy cache failed"
+        );
+    }
+}
+
+/// Whether a failed candidate probe means "this upstream does not publish this
+/// encoding", so the next candidate is worth trying (#4929).
+///
+/// A compressed candidate is absent not only on 404: S3 buckets without list
+/// permission answer 403 for a key that does not exist (and some upstreams
+/// answer 401), so falling through to the plain `.json` keeps channels that
+/// publish only the plain document working. The upstream status survives the
+/// proxy-error mapping in the [`proxy_helpers::UpstreamRefusal`] response
+/// extension. The plain candidate is never treated this way: a 401/403 there
+/// is an access failure worth reporting, not a missing document.
+fn candidate_is_absent(response: &Response, codec: FileCodec) -> bool {
+    response.status() == StatusCode::NOT_FOUND
+        || (codec != FileCodec::Plain
+            && matches!(
+                proxy_helpers::upstream_refusal_status(response),
+                Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            ))
+}
+
 /// Fetch one remote member's document, trying `candidates` in order and moving
-/// to the next only when the upstream answers 404 for the current one.
+/// to the next when the upstream does not publish the current one (404, or a
+/// 401/403 for a compressed candidate; see [`candidate_is_absent`]).
 ///
 /// The fetch buffer and the decoded document are covered by the merge's own
 /// budget reservation (#4608) and tracked in `account`: the buffer until it is
@@ -358,9 +425,19 @@ pub(super) async fn fetch_member_document(
                 account.release(fetched_len);
                 let (json, checksum) = match decoded {
                     Ok(Ok(decoded)) => decoded,
-                    Ok(Err(e)) => return Err(fail("decode", format!("{path}: {e}"))),
+                    Ok(Err(e)) => {
+                        if matches!(&e, MemberDecodeError::Corrupt(_)) {
+                            evict_undecodable_member(proxy, member, path, &e.to_string()).await;
+                        }
+                        return Err(fail("decode", format!("{path}: {e}")));
+                    }
                     Err(e) => return Err(fail("decode", format!("decoder task failed: {e}"))),
                 };
+                if json.is_empty() {
+                    let reason = format!("{path}: decodes to an empty document");
+                    evict_undecodable_member(proxy, member, path, &reason).await;
+                    return Err(fail("decode", reason));
+                }
                 account.track(json.len());
                 // The entry must still be fresh and hold the bytes just read;
                 // otherwise the merge is served but not kept.
@@ -388,8 +465,10 @@ pub(super) async fn fetch_member_document(
                     ),
                 ));
             }
-            Err(response) if response.status() == StatusCode::NOT_FOUND => {
-                last_status = Some(response.status());
+            Err(response) if candidate_is_absent(&response, *codec) => {
+                last_status = Some(
+                    proxy_helpers::upstream_refusal_status(&response).unwrap_or(response.status()),
+                );
                 continue;
             }
             Err(response) => {

@@ -888,7 +888,12 @@ fn map_proxy_error_classified(
                     e
                 );
             }
-            (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
+            let mut response =
+                (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response();
+            if let Some(status) = crate::services::proxy_service::upstream_refusal_status(&e) {
+                response.extensions_mut().insert(UpstreamRefusal(status));
+            }
+            response
         }
     }
 }
@@ -902,6 +907,22 @@ pub(crate) struct UpstreamAuthFailure;
 /// Whether a proxy error `Response` is an upstream authentication failure.
 pub(crate) fn is_upstream_auth_failure(response: &Response) -> bool {
     response.extensions().get::<UpstreamAuthFailure>().is_some()
+}
+
+/// Response extension carrying the upstream `401`/`403` that produced a
+/// generic 502 (#4929).
+///
+/// The error mapping deliberately renders every non-404 4xx as the opaque
+/// "Failed to fetch from upstream" 502, so a format handler that knows the
+/// resource is OPTIONAL (a compressed conda repodata candidate, a `.sig`) can
+/// no longer tell an absent key from a real failure. This extension preserves
+/// only the status classification, never the upstream URL or body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamRefusal(pub(crate) StatusCode);
+
+/// The upstream `401`/`403` behind a proxy error `Response`, if any.
+pub(crate) fn upstream_refusal_status(response: &Response) -> Option<StatusCode> {
+    response.extensions().get::<UpstreamRefusal>().map(|r| r.0)
 }
 
 /// Shared scaffolding for the trivial `proxy_fetch*` wrappers.

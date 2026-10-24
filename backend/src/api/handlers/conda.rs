@@ -2294,6 +2294,93 @@ async fn streamed_repodata_response(
     builder.body(Body::from_stream(body)).unwrap()
 }
 
+/// Whether a failed probe for an optional upstream document means the upstream
+/// does not publish it (#4929).
+///
+/// Used for the compressed `repodata.json` candidates and for a remote
+/// `repodata.json.sig`: S3 buckets without list permission answer 403 for a key
+/// that does not exist, and some upstreams answer 401, so treating those as
+/// "not published" lets a channel that only ships the plain `.json` keep
+/// working. The upstream status survives the proxy-error mapping in the
+/// [`UpstreamRefusal`] response extension. A plain `repodata.json` error is
+/// never handled here: that document is not optional, so its failure is the
+/// client's error and must be surfaced.
+fn optional_probe_is_absent(response: &Response) -> bool {
+    response.status() == StatusCode::NOT_FOUND
+        || matches!(
+            proxy_helpers::upstream_refusal_status(response),
+            Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        )
+}
+
+/// Whether the upstream publishes a `repodata.json.sig` for `subdir` (#4929).
+///
+/// Probed through the same capped, budgeted proxy-cache path the signature
+/// endpoint uses, so a signed channel's later `.sig` request is a cache hit.
+/// A probe failure is treated as "no signature": the plain read still has to
+/// happen, and the `.sig` endpoint reports the real upstream failure.
+async fn upstream_publishes_repodata_sig(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    subdir: &str,
+) -> bool {
+    let upstream_path = format!("{subdir}/repodata.json.sig");
+    match proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(proxy_helpers::CappedMetadataGet::Buffered { .. })
+        | Ok(proxy_helpers::CappedMetadataGet::OverCap) => true,
+        Err(response) if optional_probe_is_absent(&response) => false,
+        Err(response) => {
+            tracing::warn!(
+                repo = %repo.key,
+                path = %upstream_path,
+                status = response.status().as_u16(),
+                "probing the upstream conda repodata signature failed; serving the \
+                 transcoded document (#4929)"
+            );
+            false
+        }
+    }
+}
+
+/// Stream a Remote repository's upstream `repodata.json` through the proxy
+/// cache, teeing it to the client without materialising the document (#4149).
+///
+/// Used for an upstream that publishes no compressed encoding, and for a
+/// signed channel whose `.sig` covers these exact plain bytes (#4929).
+async fn proxy_plain_repodata_document(
+    state: &SharedState,
+    proxy: &Arc<crate::services::proxy_service::ProxyService>,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    subdir: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let upstream_path = format!("{}/{}", subdir, RepodataEncoding::Json.upstream_filename());
+    let response = proxy_helpers::proxy_fetch_streaming(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        RepodataEncoding::Json.content_type(),
+    )
+    .await?;
+    // #3649: count the proxied serve once the streaming helper resolves, on
+    // the same cache path this fetch commits under.
+    proxy_helpers::record_proxy_download(state, repo.id, &repo.key, &upstream_path, ctx).await;
+    Ok(response)
+}
+
 /// Proxy a Remote repository's plain `repodata.json` (#4180).
 ///
 /// Tries the compressed upstream documents in [`PLAIN_REPODATA_SOURCES`]
@@ -2304,6 +2391,11 @@ async fn streamed_repodata_response(
 /// compressed candidate that exceeds the buffered ceiling is a hard failure
 /// (the ceiling is the point of fetching it); only an upstream that publishes
 /// no compressed document at all falls through to the plain streaming path.
+///
+/// A channel that publishes `repodata.json.sig` is the exception (#4929): the
+/// signature covers upstream's plain `.json`, so the decoded `.zst`/`.bz2`
+/// bytes would no longer verify. Those channels keep the plain streaming path;
+/// unsigned channels (conda-forge among them) still get the transcode.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_plain_repodata(
     state: &SharedState,
@@ -2314,6 +2406,10 @@ async fn proxy_plain_repodata(
     headers: &HeaderMap,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    if upstream_publishes_repodata_sig(proxy, repo, upstream_url, subdir).await {
+        return proxy_plain_repodata_document(state, proxy, repo, upstream_url, subdir, ctx).await;
+    }
+
     let mut over_cap = None;
     for source in PLAIN_REPODATA_SOURCES
         .into_iter()
@@ -2360,7 +2456,7 @@ async fn proxy_plain_repodata(
                 );
                 over_cap = Some(upstream_path);
             }
-            Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            Err(response) if optional_probe_is_absent(&response) => {}
             Err(response) => return Err(response),
         }
     }
@@ -2379,20 +2475,7 @@ async fn proxy_plain_repodata(
     // No compressed encoding upstream: stream the plain document instead of
     // buffering it, so a channel that predates `.zst`/`.bz2` still works
     // without materialising its index (#4149).
-    let upstream_path = format!("{}/{}", subdir, RepodataEncoding::Json.upstream_filename());
-    let response = proxy_helpers::proxy_fetch_streaming(
-        proxy,
-        repo.id,
-        &repo.key,
-        upstream_url,
-        &upstream_path,
-        RepodataEncoding::Json.content_type(),
-    )
-    .await?;
-    // #3649: count the proxied serve once the streaming helper resolves, on
-    // the same cache path this fetch commits under.
-    proxy_helpers::record_proxy_download(state, repo.id, &repo.key, &upstream_path, ctx).await;
-    Ok(response)
+    proxy_plain_repodata_document(state, proxy, repo, upstream_url, subdir, ctx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2581,7 +2664,9 @@ async fn serve_repodata(
                 // streamed through a decoder, so the buffered ceiling applies
                 // to the 20-60 MiB compressed body instead of the 160-200 MiB
                 // plain one. The compressed `.zst`/`.bz2` endpoints keep
-                // proxying their own upstream document.
+                // proxying their own upstream document. A channel publishing a
+                // `.sig` stays on upstream's plain `.json` so the proxied
+                // signature verifies (#4929).
                 let mut response = if encoding == RepodataEncoding::Json {
                     proxy_plain_repodata(state, proxy, &repo, upstream_url, subdir, headers, ctx)
                         .await?
@@ -2738,7 +2823,10 @@ async fn repodata_json_bz2(
 /// document (signed with the virtual's key, as a degraded merge is served when
 /// the virtual allows one). A Remote repository's `repodata.json` is upstream
 /// content we never sign with our key: its upstream's `.sig` is proxied when
-/// there is one, and otherwise this answers 404.
+/// there is one, and otherwise this answers 404. When the upstream does
+/// publish a `.sig`, the plain `repodata.json` route serves upstream's plain
+/// `.json` bytes rather than decoding its `.zst`/`.bz2`, so the proxied
+/// signature covers exactly what the client downloads (#4929).
 async fn repodata_json_sig(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -3372,7 +3460,8 @@ where
             content_encoding.as_deref(),
             virtual_merge::FileCodec::Zstd,
             CEP16_MAX_DECODED_BYTES,
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         rmp_serde::from_slice::<T>(&msgpack)
             .map(|document| CheckedShardDocument { document, checksum })
             .map_err(|e| format!("shard index does not parse: {e}"))
@@ -3513,6 +3602,7 @@ async fn decode_upstream_shard(content: Bytes, coding: Option<String>) -> Result
             virtual_merge::FileCodec::Plain,
             CEP16_UPSTREAM_SHARD_MAX_BYTES,
         )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("decoder task failed: {e}"))?
@@ -15734,6 +15824,145 @@ mod tests {
         assert_eq!(plain_hits, 0, "plain upstream repodata must not be fetched");
     }
 
+    /// #4929: S3 buckets without list permission answer 403 for a key that
+    /// does not exist. A channel that only publishes the plain
+    /// `repodata.json` must still serve it instead of returning the compressed
+    /// probe's 403.
+    #[tokio::test]
+    async fn plain_repodata_falls_back_to_upstream_json_on_403_4929() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        for path in ["/noarch/repodata.json.zst", "/noarch/repodata.json.bz2"] {
+            Mock::given(method("GET"))
+                .and(wm_path(path))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(REPODATA_4180))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let app = tdh::router_anon(router(), state);
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let hits = |path: &str| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        };
+        let zst_hits = hits("/noarch/repodata.json.zst");
+        let bz2_hits = hits("/noarch/repodata.json.bz2");
+        let plain_hits = hits("/noarch/repodata.json");
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a 403 compressed probe means the encoding is absent, not that the plain \
+             document is unavailable: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), REPODATA_4180);
+        assert_eq!(zst_hits, 1, "the .zst candidate is still probed first");
+        assert_eq!(bz2_hits, 1);
+        assert_eq!(plain_hits, 1, "the plain document is the fallback");
+    }
+
+    /// #4929: a remote channel that publishes `repodata.json.sig` signs
+    /// upstream's plain `.json`. The plain route must serve those exact bytes,
+    /// not decode a different `.zst`, or the proxied signature cannot verify.
+    #[tokio::test]
+    async fn signed_remote_plain_repodata_serves_upstream_json_bytes_4929() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SIGNED: &[u8] = br#"{"info":{"subdir":"noarch"},"packages":{"signed-1.0-0.tar.bz2":{"name":"signed","version":"1.0","build":"0","build_number":0,"depends":[],"subdir":"noarch"}},"packages.conda":{},"repodata_version":1}"#;
+        const DIFFERENT: &[u8] = br#"{"info":{"subdir":"noarch"},"packages":{"other-2.0-0.tar.bz2":{"name":"other","version":"2.0","build":"0","build_number":0,"depends":[],"subdir":"noarch"}},"packages.conda":{},"repodata_version":1}"#;
+        const SIGNATURE: &[u8] = b"signature-over-the-plain-repodata.json";
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(SIGNED))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zstd_repodata_4180(DIFFERENT)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.sig"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(SIGNATURE))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let app = tdh::router_anon(router(), state.clone());
+        let (json_status, json_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+        let app = tdh::router_anon(router(), state);
+        let (sig_status, sig_body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata.json.sig")),
+        )
+        .await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let hits = |path: &str| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        };
+        let zst_hits = hits("/noarch/repodata.json.zst");
+        let plain_hits = hits("/noarch/repodata.json");
+        let sig_hits = hits("/noarch/repodata.json.sig");
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(json_status, StatusCode::OK);
+        assert_eq!(
+            json_body.as_ref(),
+            SIGNED,
+            "a signed channel must serve the bytes its .sig covers"
+        );
+        assert_eq!(sig_status, StatusCode::OK);
+        assert_eq!(sig_body.as_ref(), SIGNATURE);
+        assert_eq!(
+            zst_hits, 0,
+            "the decoded .zst must not replace the signed .json"
+        );
+        assert_eq!(plain_hits, 1);
+        assert_eq!(sig_hits, 1, "the probe warms the .sig cache entry");
+    }
+
     // #4577: a Remote repo proxies its upstream's CEP-16 index. When the
     // upstream publishes none (404), the registry answers 404 too, so clients
     // take the documented fallback to repodata.json -- never a syntactically
@@ -21018,6 +21247,7 @@ mod virtual_channel_tests {
         let bomb = zst(&vec![b' '; 4 * 1024 * 1024]);
         assert!(bomb.len() < 4096, "fixture must compress well");
         let err = decode_member_document(&bomb, None, FileCodec::Zstd, 1024 * 1024).unwrap_err();
+        let err = err.to_string();
         assert!(err.contains("ceiling"), "{err}");
         assert!(decode_member_document(&bomb, None, FileCodec::Zstd, 4 * 1024 * 1024).is_ok());
     }
@@ -21148,6 +21378,112 @@ mod virtual_channel_tests {
         assert_eq!(
             decoded, doc,
             "every encoding serves the same merged document"
+        );
+    }
+
+    /// #4929: a virtual's remote member gets the same 403-means-absent
+    /// fallback as a single remote channel: a channel that only publishes the
+    /// plain `repodata.json` still contributes to the merge.
+    #[tokio::test]
+    async fn virtual_member_falls_back_to_plain_json_on_403_4929() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        for path in ["/noarch/repodata.json.zst", "/noarch/repodata.json.bz2"] {
+            Mock::given(method("GET"))
+                .and(wm_path(path))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+        }
+        let upstream = serde_json::to_vec(&upstream_repodata("noarch", &["rich-13.0-0.conda"]))
+            .expect("upstream repodata");
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream))
+            .mount(&server)
+            .await;
+
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let (status, doc) = rig.repodata("noarch").await;
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let hits = |path: &str| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        };
+        let zst_hits = hits("/noarch/repodata.json.zst");
+        let bz2_hits = hits("/noarch/repodata.json.bz2");
+        let plain_hits = hits("/noarch/repodata.json");
+        rig.cleanup().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a compressed 403 must not fail the member"
+        );
+        assert!(
+            listed(&doc).contains(&"rich-13.0-0.conda".to_string()),
+            "the plain document must contribute to the merge: {doc}"
+        );
+        assert_eq!(zst_hits, 1);
+        assert_eq!(bz2_hits, 1);
+        assert_eq!(plain_hits, 1);
+    }
+
+    /// #4929: a virtual member that reads an undecodable cached `.zst` must
+    /// evict it, so the next request refetches instead of failing until the
+    /// entry expires.
+    #[tokio::test]
+    async fn virtual_member_evicts_undecodable_cached_zst_4929() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not a zstd frame".to_vec()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let upstream = serde_json::to_vec(&upstream_repodata("noarch", &["rich-13.0-0.conda"]))
+            .expect("upstream repodata");
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zst(&upstream)))
+            .mount(&server)
+            .await;
+
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let (first_status, _) = rig.repodata("noarch").await;
+        let (second_status, second_doc) = rig.repodata("noarch").await;
+        let zst_hits = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests")
+            .iter()
+            .filter(|request| request.url.path() == "/noarch/repodata.json.zst")
+            .count();
+        rig.cleanup().await;
+
+        assert_eq!(first_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "the evicted member entry must be refetched"
+        );
+        assert!(
+            listed(&second_doc).contains(&"rich-13.0-0.conda".to_string()),
+            "the refetched document must contribute to the merge: {second_doc}"
+        );
+        assert_eq!(
+            zst_hits, 2,
+            "the undecodable cached entry must not be served again"
         );
     }
 
@@ -22050,10 +22386,16 @@ mod virtual_channel_tests {
         rig.cleanup().await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The lower bound is the contract: the merge waited for the 1 s queue
+        // deadline before shedding. The upper bound only catches a hang; a
+        // tight one flakes when the machine is loaded (#4929).
         assert!(
-            waited >= std::time::Duration::from_millis(900)
-                && waited < std::time::Duration::from_secs(5),
-            "shed at the 1 s deadline, took {waited:?}"
+            waited >= std::time::Duration::from_millis(900),
+            "shed before the 1 s deadline, took {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(30),
+            "shed far past the 1 s deadline, took {waited:?}"
         );
         assert_eq!(
             headers
