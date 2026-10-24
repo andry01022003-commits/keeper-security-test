@@ -1302,6 +1302,73 @@ mod tests {
         upstream.verify().await;
     }
 
+    /// #4795: PATCH goes through the same guards as the other verbs. A path
+    /// outside the relay allow-list, a relay-of-relay path and another user's
+    /// instance are all refused before anything reaches the upstream.
+    #[tokio::test]
+    async fn test_relay_patch_keeps_path_and_owner_guards() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let instance = RemoteInstanceService::create(
+            &fixture.pool,
+            fixture.user_id,
+            "peer",
+            &upstream.uri(),
+            "peer-key",
+        )
+        .await
+        .expect("create remote instance");
+        let (other_id, other_name) = tdh::create_user(&fixture.pool).await;
+
+        let patch = |auth: AuthExtension, uri: String| {
+            let app = tdh::router_with_auth_ext(router(), fixture.state.clone(), auth);
+            let req = axum::http::Request::builder()
+                .method("PATCH")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"description":"x"}"#))
+                .expect("build request");
+            async move { app.oneshot(req).await.expect("router").status() }
+        };
+        let owner = tdh::make_auth(fixture.user_id, &fixture.username);
+
+        for sub in [
+            "admin/settings",
+            "api/v1/instances/00000000-0000-0000-0000-000000000000",
+            "api/../admin",
+        ] {
+            assert_eq!(
+                patch(owner.clone(), format!("/{}/proxy/{sub}", instance.id)).await,
+                axum::http::StatusCode::BAD_REQUEST,
+                "PATCH to {sub} must be refused"
+            );
+        }
+        assert_eq!(
+            patch(
+                tdh::make_auth(other_id, &other_name),
+                format!("/{}/proxy/api/v1/repositories/r", instance.id)
+            )
+            .await,
+            axum::http::StatusCode::NOT_FOUND,
+            "another user's instance must not be relayable"
+        );
+
+        upstream.verify().await;
+        tdh::cleanup_user(&fixture.pool, other_id).await;
+    }
+
     #[tokio::test]
     async fn test_reqwest_to_axum_forwards_allow_listed_headers_only() {
         let upstream = http::response::Builder::new()
