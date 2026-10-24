@@ -3936,13 +3936,20 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
-    // Stream the request body to a bounded scratch file, computing
-    // SHA-256/SHA-1/MD5 in one pass — never buffering the artifact in memory
-    // (#2517). All three branches below (checksum sidecar, maven-metadata.xml,
-    // and the artifact itself) store from the staged file. The stager enforces
-    // `max_upload_size_bytes` mid-stream (413 on breach).
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stage the request body, computing SHA-256/SHA-1/MD5 in one pass and
+    // never buffering the artifact in memory (#2517): on the repository's own
+    // backend when it streams natively (S3, GCS, Azure; #3916), so a large jar
+    // needs no local disk, else in a bounded scratch file. All three branches
+    // below (checksum sidecar, maven-metadata.xml, and the artifact itself)
+    // store from the staged body. The stager enforces `max_upload_size_bytes`
+    // mid-stream (413 on breach).
+    let (staged, digests) = super::repositories::GenericStagedBody::stage(
+        &state,
+        &repo.storage_location(),
+        super::repositories::stages_on_backend(&repo.storage_backend, storage.as_ref()),
+        body.into_data_stream(),
+    )
+    .await?;
 
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return.
     // These row-less puts create no artifact row, so attribution is committed
@@ -3953,7 +3960,7 @@ async fn upload(
         // bytes and the attributed owner can never disagree (#2586). Release the
         // freshly-inserted claim if the put itself fails (V3b). The staged
         // stream is opened first so a local scratch-file failure never claims.
-        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+        let write = staged.prepare_write().await?;
         let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
@@ -3962,7 +3969,7 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
-        if let Err(e) = storage.put_stream(&storage_key, stream).await {
+        if let Err(e) = write.write(storage.as_ref(), &storage_key).await {
             release_flat_key_claim_best_effort(
                 &state.db,
                 claim,
@@ -3992,7 +3999,7 @@ async fn upload(
         // Row-less metadata put: atomic claim-gate before the write, same as the
         // checksum branch (#2586); release on put failure (V3b). Staged stream
         // opened first so a local scratch-file failure never claims.
-        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+        let write = staged.prepare_write().await?;
         let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
@@ -4001,7 +4008,7 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
-        if let Err(e) = storage.put_stream(&storage_key, stream).await {
+        if let Err(e) = write.write(storage.as_ref(), &storage_key).await {
             release_flat_key_claim_best_effort(
                 &state.db,
                 claim,
@@ -4094,8 +4101,8 @@ async fn upload(
     // cannot be read is rejected without writing anything.
     let handler = MavenHandler::new();
     let pom_bytes = if MavenHandler::is_pom(&path) {
-        match tokio::fs::read(staged.path()).await {
-            Ok(bytes) => Bytes::from(bytes),
+        match staged.read_all(storage.as_ref()).await {
+            Ok(bytes) => bytes,
             Err(e) => {
                 return Err(proxy_helpers::internal_error("Reading staged POM", e));
             }
@@ -4211,10 +4218,12 @@ async fn upload(
         // `artifacts` insert trigger updates) are acquired after the write,
         // so a slow object write never stalls other uploads into the same
         // repository or project. The bytes are streamed from the staged
-        // scratch file, not a heap buffer (#2517).
-        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
-        storage
-            .put_stream(&storage_key, stream)
+        // scratch file, not a heap buffer (#2517), or copied server-side from
+        // the staging object on the backend (#3916).
+        staged
+            .prepare_write()
+            .await?
+            .write(storage.as_ref(), &storage_key)
             .await
             .map_err(map_storage_err)?;
 
@@ -4294,9 +4303,9 @@ async fn upload(
         Ok((artifact_id, artifact_created))
     }
     .await;
-    // Scratch file no longer needed once the publish has settled; the write
-    // above consumed it inside the locked transaction.
-    drop(staged);
+    // The staged body is no longer needed once the publish has settled; the
+    // write above consumed it inside the locked transaction.
+    staged.discard().await;
 
     let (artifact_id, artifact_created) = match published {
         Ok(published) => published,

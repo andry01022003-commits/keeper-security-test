@@ -9992,15 +9992,103 @@ pub(crate) fn artifact_etag(checksum_sha256: &str) -> String {
     format!("\"{}\"", checksum_sha256.trim())
 }
 
-/// A generic upload body after staging: a local scratch file, or an object on
-/// the repository's own backend (#3916).
-enum GenericStagedBody {
+/// An upload body after staging: a local scratch file, or an object on the
+/// repository's own backend (#3916). Shared by the generic upload routes and
+/// the single-PUT format routes that stage the same way (Maven).
+pub(crate) enum GenericStagedBody {
     Local(proxy_helpers::StagedUpload),
     Backend(proxy_helpers::BackendStagedUpload),
 }
 
+/// How a staged body reaches its final key: re-read from local scratch and
+/// streamed, or copied server-side from the staging object.
+pub(crate) enum StagedWrite {
+    Stream(futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>),
+    Copy(String),
+}
+
+impl StagedWrite {
+    /// Write the staged bytes to `key` on `storage` (the backend the body was
+    /// staged on, for a backend-staged body).
+    pub(crate) async fn write(
+        self,
+        storage: &dyn crate::storage::StorageBackend,
+        key: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Stream(stream) => storage.put_stream(key, stream).await.map(|_| ()),
+            Self::Copy(staged_key) => storage.copy(&staged_key, key).await,
+        }
+    }
+}
+
+/// Whether a single upload into `repo` stages its body on the repository's
+/// own backend instead of local scratch (#3916): the backend must stream
+/// natively (`StorageBackend::supports_streamed_assembly`, S3, GCS and Azure
+/// today), the same capability bit chunked completion keys on. A filesystem
+/// repository and any backend without native streaming spool locally.
+pub(crate) fn stages_on_backend(
+    storage_backend: &str,
+    storage: &dyn crate::storage::StorageBackend,
+) -> bool {
+    storage_backend != "filesystem" && storage.supports_streamed_assembly()
+}
+
 impl GenericStagedBody {
-    fn size_bytes(&self) -> i64 {
+    /// Stage `stream` on the repository's backend at `location` when
+    /// `on_backend`, else in local scratch, computing SHA-256 / SHA-1 / MD5 in
+    /// the same pass either way.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn stage<S, E>(
+        state: &SharedState,
+        location: &crate::storage::StorageLocation,
+        on_backend: bool,
+        stream: S,
+    ) -> std::result::Result<(Self, crate::services::artifact_service::ContentDigests), Response>
+    where
+        S: futures::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
+        E: std::error::Error + 'static,
+    {
+        if on_backend {
+            let (staged, digests) =
+                proxy_helpers::stage_stream_on_backend(state, location, stream).await?;
+            Ok((Self::Backend(staged), digests))
+        } else {
+            let (staged, digests) =
+                proxy_helpers::stage_stream_content_addressed(state, stream).await?;
+            Ok((Self::Local(staged), digests))
+        }
+    }
+
+    /// How the staged bytes reach their final key. Opening a local scratch
+    /// file can fail; a backend copy is prepared without I/O.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn prepare_write(&self) -> std::result::Result<StagedWrite, Response> {
+        Ok(match self {
+            Self::Local(staged) => {
+                StagedWrite::Stream(proxy_helpers::open_staged_upload_stream(staged).await?)
+            }
+            Self::Backend(staged) => StagedWrite::Copy(staged.key().to_string()),
+        })
+    }
+
+    /// Read the whole staged body into memory, for a small document a
+    /// handler parses (a Maven POM). `storage` is the backend the body was
+    /// staged on.
+    pub(crate) async fn read_all(
+        &self,
+        storage: &dyn crate::storage::StorageBackend,
+    ) -> Result<bytes::Bytes> {
+        match self {
+            Self::Local(staged) => tokio::fs::read(staged.path())
+                .await
+                .map(bytes::Bytes::from)
+                .map_err(AppError::from),
+            Self::Backend(staged) => storage.get(staged.key()).await,
+        }
+    }
+
+    pub(crate) fn size_bytes(&self) -> i64 {
         match self {
             Self::Local(staged) => staged.size_bytes(),
             Self::Backend(staged) => staged.size_bytes(),
@@ -10034,7 +10122,7 @@ impl GenericStagedBody {
     }
 
     /// Release the staging copy once the service has consumed it.
-    async fn discard(self) {
+    pub(crate) async fn discard(self) {
         match self {
             Self::Local(staged) => drop(staged),
             Self::Backend(staged) => staged.discard().await,
@@ -10043,9 +10131,9 @@ impl GenericStagedBody {
 }
 
 /// Where a generic upload's body is staged (#3916): on the repository's own
-/// object-storage backend, unless the repository is filesystem-backed or a
-/// downstream consumer reads the body as a local file -- the RPM header parse
-/// (#3801) or a WASM format plugin (#2517 plugin-input decision).
+/// object-storage backend when it streams natively ([`stages_on_backend`]),
+/// unless a downstream consumer reads the body as a local file -- the RPM
+/// header parse (#3801) or a WASM format plugin (#2517 plugin-input decision).
 struct GenericStagingPlan {
     format: crate::models::repository::RepositoryFormat,
     location: Option<crate::storage::StorageLocation>,
@@ -10060,7 +10148,10 @@ impl GenericStagingPlan {
         repo_service: &RepositoryService,
         repo: &crate::models::repository::Repository,
     ) -> std::result::Result<Self, Response> {
-        let object_storage = repo.storage_backend != "filesystem";
+        let storage = state
+            .storage_for_repo(&repo.storage_location())
+            .map_err(|e| e.into_response())?;
+        let object_storage = stages_on_backend(&repo.storage_backend, storage.as_ref());
         let plugin = object_storage && repo_has_wasm_format(state, repo_service, repo).await?;
         Ok(Self {
             format: repo.format.clone(),
@@ -20417,6 +20508,116 @@ mod tests {
         assert_eq!(
             tracked, 0,
             "the staging tracking row must go with the object"
+        );
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3916: a Maven PUT into an object-storage repository stages its body on
+    /// the repository's backend, as a generic PUT does, instead of a local
+    /// scratch file. Proven the same way: local scratch is unusable
+    /// (STORAGE_PATH sits under a regular file). Before the change the jar and
+    /// the POM failed on the scratch spool (503); now both land byte-exact at
+    /// their keys, the POM's metadata is parsed from the staged object, and no
+    /// staging object or tracking row is left.
+    #[tokio::test]
+    async fn maven_put_into_object_storage_repo_needs_no_local_scratch_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let blocker = std::env::temp_dir().join(format!("ak-3916-mvn-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .storage_path = blocker.join("storage").to_string_lossy().into_owned();
+        let router = tdh::router_with_auth(
+            crate::api::handlers::maven::router(),
+            state,
+            tdh::admin_auth(user_id, &username),
+        );
+
+        let jar = Bytes::from(vec![7u8; 3 * 1024 * 1024 + 11]);
+        let pom = Bytes::from_static(
+            br#"<project><modelVersion>4.0.0</modelVersion><groupId>com.acme.big</groupId><artifactId>big</artifactId><version>2.0</version><description>staged on the backend</description></project>"#,
+        );
+        for (file, body) in [("big-2.0.jar", &jar), ("big-2.0.pom", &pom)] {
+            let (status, resp) = tdh::send(
+                router.clone(),
+                tdh::put(
+                    format!("/{repo_key}/com/acme/big/big/2.0/{file}"),
+                    body.clone(),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{file}: a Maven PUT into an S3-backed repository must not need local scratch: {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+
+        let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT a.path, a.storage_key, am.metadata FROM artifacts a \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 ORDER BY a.path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("artifact rows");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert_eq!(objects.get(&rows[0].1), Some(&jar), "jar bytes at its key");
+            assert_eq!(objects.get(&rows[1].1), Some(&pom), "POM bytes at its key");
+            assert!(
+                !objects
+                    .keys()
+                    .any(|k| k.starts_with(proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX)),
+                "no staging object may be left, got {:?}",
+                objects.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            rows[1].2.as_ref().and_then(|m| m.get("description")),
+            Some(&serde_json::json!("staged on the backend")),
+            "the POM is parsed from the staged object"
+        );
+        // The tracking row goes with the staging object (deleted in the
+        // background when a branch drops its handle).
+        let mut tracked = 1_i64;
+        for _ in 0..50 {
+            tracked = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+            )
+            .bind(&repo_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count staging rows");
+            if tracked == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            tracked, 0,
+            "the staging tracking rows must go with the objects"
         );
 
         let _ = std::fs::remove_file(&blocker);

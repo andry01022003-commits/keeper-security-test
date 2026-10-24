@@ -1173,6 +1173,7 @@ impl ArtifactService {
         // object before the row commits (#4980): a body the dedup hit left
         // unread, or the staged object, which the caller keeps until this
         // returns.
+        let wrote_object = !content_exists;
         let rewrite = if content_exists {
             match content {
                 UploadContent::Stream(stream) => CasRewrite::Stream(stream),
@@ -1203,24 +1204,61 @@ impl ArtifactService {
             }
         };
 
-        self.finalize_upload(
-            repository_id,
-            path,
-            name,
-            version,
-            content_type,
-            size_bytes,
-            &digests.sha256,
-            &digests.sha1,
-            &digests.md5,
-            &storage_key,
-            uploaded_by,
-            enqueue_sync_tasks,
-            catalog_name,
-            precondition,
-            rewrite,
+        let finalized = self
+            .finalize_upload(
+                repository_id,
+                path,
+                name,
+                version,
+                content_type,
+                size_bytes,
+                &digests.sha256,
+                &digests.sha1,
+                &digests.md5,
+                &storage_key,
+                uploaded_by,
+                enqueue_sync_tasks,
+                catalog_name,
+                precondition,
+                rewrite,
+            )
+            .await;
+        if finalized.is_err() && wrote_object {
+            // #3916: this upload wrote the content-addressed object but its row
+            // did not commit (a conditional writer that lost, a racing
+            // immutable publish, a quota denial). Hand the key to storage GC's
+            // candidate sweep, which deletes it after its grace window unless
+            // a row references it by then; nothing else would ever find it.
+            self.journal_unreferenced_upload_object(repository_id, &storage_key)
+                .await;
+        }
+        finalized
+    }
+
+    /// Record `storage_key`, written by an upload into `repository_id` whose
+    /// row did not commit, as a storage GC candidate (#3916). Best-effort: a
+    /// failure only leaves the object as it was before this hand-off existed.
+    async fn journal_unreferenced_upload_object(&self, repository_id: Uuid, storage_key: &str) {
+        let Ok(repo) = self.repo_service.get_by_id(repository_id).await else {
+            return;
+        };
+        let scope =
+            crate::services::storage_gc_service::oci_gc_candidate_scope(&repo.storage_location());
+        if let Err(e) = sqlx::query(
+            "INSERT INTO oci_gc_candidates \
+                 (storage_key, storage_backend, storage_path, source_repository_id) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
         )
+        .bind(storage_key)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .bind(repository_id)
+        .execute(&self.db)
         .await
+        {
+            tracing::warn!(storage_key, error = %e, "Could not hand an uncommitted upload's object to storage GC");
+        }
     }
 
     /// Pre-storage validation shared by the buffered and streaming upload
@@ -7155,5 +7193,143 @@ mod gc_commit_guard_tests {
         r.fx.teardown().await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(journal, 0);
+    }
+}
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod uncommitted_object_journal_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use futures::StreamExt;
+
+    /// A backend that, when the upload writes its object, first commits a
+    /// competing artifact at the same path: the moment a conditional writer
+    /// loses between its unlocked pre-check and its locked check.
+    struct WinnerCommitsDuringWrite {
+        inner: Arc<tdh::MemStorage>,
+        pool: PgPool,
+        repo_id: Uuid,
+        path: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for WinnerCommitsDuringWrite {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.inner.put(key, content).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.inner.get(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<crate::storage::PutStreamResult> {
+            let winner = format!("{:x}", Sha256::digest(b"the winner's bytes"));
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+                     content_type, storage_key) \
+                 VALUES ($1, $2, $2, 18, $3, 'application/json', $4)",
+            )
+            .bind(self.repo_id)
+            .bind(self.path)
+            .bind(&winner)
+            .bind(ArtifactService::storage_key_from_checksum(&winner))
+            .execute(&self.pool)
+            .await
+            .expect("winner commits");
+            self.inner.put_stream(key, stream).await
+        }
+    }
+
+    /// #3916: a conditional writer (`If-None-Match: *`) whose pre-check passed
+    /// writes its object, then loses to a writer that committed meanwhile and
+    /// gets 412. Its object has no row; it is handed to storage GC's
+    /// candidate sweep (a waiting candidate, `source_repository_id` set, no
+    /// lease). Before the change it stayed on storage with no record at all.
+    #[tokio::test]
+    async fn a_conditional_writer_that_loses_after_writing_hands_its_object_to_gc_3916() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let path = "index/doc.json";
+        let storage: Arc<dyn StorageBackend> = Arc::new(WinnerCommitsDuringWrite {
+            inner: mem.clone(),
+            pool: pool.clone(),
+            repo_id,
+            path,
+        });
+        let service = state.create_artifact_service(storage);
+        let body = Bytes::from(format!("the loser's bytes {}", Uuid::new_v4()));
+        let mut hasher = MultiHasher::new();
+        hasher.update(&body);
+        let digests = hasher.finalize();
+        let loser_key = ArtifactService::storage_key_from_checksum(&digests.sha256);
+        let precondition = WritePrecondition::new(None, Some(EntityTagCondition::Any)).unwrap();
+        let outcome = service
+            .upload_content_with_sync_options(
+                repo_id,
+                path,
+                "doc.json",
+                None,
+                "application/json",
+                UploadContent::Stream(
+                    futures::stream::once({
+                        let body = body.clone();
+                        async move { Ok(body) }
+                    })
+                    .boxed(),
+                ),
+                digests,
+                body.len() as i64,
+                Some(user_id),
+                false,
+                None,
+                Some(&precondition),
+            )
+            .await;
+        let written = mem.objects.lock().unwrap().contains_key(&loser_key);
+        let journal: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT source_repository_id, leased_at IS NOT NULL FROM oci_gc_candidates \
+             WHERE storage_key = $1",
+        )
+        .bind(&loser_key)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&loser_key)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(outcome, Err(AppError::PreconditionFailed(_))),
+            "the late loser gets 412: {outcome:?}"
+        );
+        assert!(written, "the loser wrote its object before it lost");
+        assert_eq!(
+            journal,
+            Some((Some(repo_id), false)),
+            "the loser's object is journaled for storage GC as a waiting candidate"
+        );
     }
 }
