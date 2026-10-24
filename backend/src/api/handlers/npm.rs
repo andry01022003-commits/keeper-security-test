@@ -2562,6 +2562,21 @@ async fn npm_meta_get(
     // scope policy (#2424) so search cannot list out-of-scope packages.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
+            // #840: the Remote's upstream filter applies to the meta
+            // namespace too; a refused path is a 404 without upstream contact,
+            // as on every other proxied path.
+            if !npm_meta_upstream_allowed(
+                &state,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &rest,
+                query.as_deref(),
+            )
+            .await?
+            {
+                return Err(npm_meta_filtered_response());
+            }
             let policy = fetch_npm_scope_policy(&state.db, repo.id)
                 .await
                 .map_err(IntoResponse::into_response)?;
@@ -2599,6 +2614,20 @@ async fn npm_meta_get(
             let Some(ref upstream_url) = member.upstream_url else {
                 continue;
             };
+            // #840: a member whose upstream filter refuses the path is
+            // skipped without being contacted.
+            if !npm_meta_upstream_allowed(
+                &state,
+                member.id,
+                &member.key,
+                upstream_url,
+                &rest,
+                query.as_deref(),
+            )
+            .await?
+            {
+                continue;
+            }
             let policy = fetch_npm_scope_policy(&state.db, member.id)
                 .await
                 .map_err(IntoResponse::into_response)?;
@@ -2655,6 +2684,69 @@ async fn npm_meta_get(
         .into_response())
 }
 
+/// The upstream-relative wire path of a `/-/` meta request, as
+/// `npm_meta_upstream_bytes` sends it: `-/<rest>` plus the query string.
+fn npm_meta_fetch_path(meta_path: &str, query: Option<&str>) -> String {
+    let path = format!("-/{}", meta_path.trim_start_matches('/'));
+    match query {
+        Some(q) if !q.is_empty() => format!("{path}?{q}"),
+        _ => path,
+    }
+}
+
+/// Whether the upstream filter of Remote `repo_id` admits a `/-/` meta
+/// request (#840). An unreadable filter is a 500, never an admission.
+async fn npm_meta_upstream_allowed(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+) -> Result<bool, Response> {
+    crate::services::upstream_filter::upstream_allows(
+        &state.db,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &npm_meta_fetch_path(meta_path, query),
+    )
+    .await
+    .map_err(IntoResponse::into_response)
+}
+
+/// The 404 a Remote answers for a `/-/` path its upstream filter refuses,
+/// the same answer as for any other refused path (#840).
+fn npm_meta_filtered_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "path excluded by the repository's upstream filter"
+        })),
+    )
+        .into_response()
+}
+
+/// Whether the upstream filter of a Remote admits an npm audit POST to
+/// `path` (#840).
+async fn npm_audit_upstream_allowed(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<bool, Response> {
+    crate::services::upstream_filter::upstream_allows(
+        &state.db,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+    )
+    .await
+    .map_err(IntoResponse::into_response)
+}
+
 /// Handler for `POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk`.
 ///
 /// This endpoint is used by `npm audit` (npm >= 7) to look up known security
@@ -2675,6 +2767,11 @@ async fn security_advisories_bulk(
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
+            // #840: a path the Remote's upstream filter refuses is never sent
+            // upstream; the audit answers as for a repository with none.
+            if !npm_audit_upstream_allowed(&state, repo.id, &repo_key, upstream_url, PATH).await? {
+                return Ok(empty_advisories_bulk_response());
+            }
             let policy = fetch_npm_scope_policy(&state.db, repo.id)
                 .await
                 .map_err(IntoResponse::into_response)?;
@@ -2729,6 +2826,11 @@ async fn security_audits_quick(
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
+            // #840: a path the Remote's upstream filter refuses is never sent
+            // upstream; the audit answers as for a repository with none.
+            if !npm_audit_upstream_allowed(&state, repo.id, &repo_key, upstream_url, PATH).await? {
+                return Ok(empty_audits_quick_response());
+            }
             let policy = fetch_npm_scope_policy(&state.db, repo.id)
                 .await
                 .map_err(IntoResponse::into_response)?;
@@ -15014,6 +15116,108 @@ mod tests {
             parsed.is_object() && parsed.as_object().unwrap().is_empty(),
             "proxied /-/ping must return the upstream payload, got {parsed:?}"
         );
+    }
+
+    /// #840: a Remote's upstream filter covers the `/-/` meta passthrough and
+    /// npm audit. A refused search is a 404 and an excluded audit answers the
+    /// empty advisories body, both without contacting the upstream; a path the
+    /// filter admits is still proxied. Before, neither passthrough consulted
+    /// the filter.
+    #[tokio::test]
+    async fn test_upstream_filter_applies_to_meta_and_audit_passthroughs_840() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("{}"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"leaked":[]}"#),
+            )
+            .mount(&mock_server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+        save_upstream_filter(
+            &fx.pool,
+            fx.repo_id,
+            &UpstreamFilter {
+                include_patterns: vec![],
+                exclude_patterns: vec![
+                    "^-/v1/search".to_string(),
+                    "^-/npm/v1/security/".to_string(),
+                ],
+            },
+        )
+        .await
+        .expect("save filter");
+        crate::services::upstream_filter::invalidate_cached_filter(fx.repo_id).await;
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let (search_status, _) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/{}/-/v1/search?text=express", fx.repo_key)),
+        )
+        .await;
+        let (audit_status, audit_body) = tdh::send(
+            app.clone(),
+            tdh::post(
+                format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key),
+                "application/json",
+                Bytes::from(r#"{"express":["4.17.0"]}"#),
+            ),
+        )
+        .await;
+        let after_refused = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+        let (ping_status, _) = tdh::send(app, tdh::get(format!("/{}/-/ping", fx.repo_key))).await;
+        let after_ping = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            search_status,
+            StatusCode::NOT_FOUND,
+            "a refused search is a 404"
+        );
+        assert_eq!(audit_status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&audit_body).unwrap(),
+            serde_json::json!({}),
+            "an excluded audit answers the empty advisories body, not the upstream's"
+        );
+        assert_eq!(after_refused, 0, "refused paths never reach the upstream");
+        assert_eq!(
+            ping_status,
+            StatusCode::OK,
+            "an admitted path is still proxied"
+        );
+        assert_eq!(after_ping, 1);
     }
 
     /// Regression guard: requests that previously fell into the /:package/:version

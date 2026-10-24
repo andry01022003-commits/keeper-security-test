@@ -486,6 +486,105 @@ fn put_blob_from_url_timeout(size: u64, floor: Duration) -> Duration {
     .max(floor)
 }
 
+/// One page of a List Blobs response (#4320).
+#[derive(Debug, Default, PartialEq)]
+struct ListBlobsPage {
+    keys: Vec<crate::storage::ListedKey>,
+    /// The marker of the next page; `None` when this is the last one.
+    next_marker: Option<String>,
+}
+
+/// Parse a List Blobs `EnumerationResults` document: each
+/// `Blobs/Blob/Name` with its `Properties/Last-Modified` (RFC 1123), and the
+/// `NextMarker`. Entity references and CDATA in names are decoded. A document
+/// whose root is not `EnumerationResults` (an `<Error>` body) is an error, so
+/// a failure is never read as an empty listing.
+fn parse_list_blobs_result(xml: &str) -> Result<ListBlobsPage> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut page = ListBlobsPage::default();
+    let mut stack: Vec<String> = Vec::new();
+    let mut root: Option<String> = None;
+    let mut text = String::new();
+    let mut name: Option<String> = None;
+    let mut modified: Option<chrono::DateTime<Utc>> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let tag = e.local_name().as_ref().to_owned();
+                if stack.is_empty() && root.is_none() {
+                    root = Some(tag.clone());
+                }
+                stack.push(tag);
+                text.clear();
+            }
+            Ok(Event::Text(e)) => text.push_str(&e),
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(Some(resolved)) = e.resolve_char_ref() {
+                    text.push(resolved);
+                } else {
+                    let entity: &str = &e;
+                    match entity {
+                        "amp" => text.push('&'),
+                        "lt" => text.push('<'),
+                        "gt" => text.push('>'),
+                        "quot" => text.push('"'),
+                        "apos" => text.push('\''),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => text.push_str(&e),
+            Ok(Event::End(e)) => {
+                let closed = stack
+                    .pop()
+                    .unwrap_or_else(|| e.local_name().as_ref().to_owned());
+                let parent = stack.last().map(String::as_str).unwrap_or("");
+                match (parent, closed.as_str()) {
+                    ("Blob", "Name") => name = Some(std::mem::take(&mut text)),
+                    ("Properties", "Last-Modified") => {
+                        modified = chrono::DateTime::parse_from_rfc2822(text.trim())
+                            .ok()
+                            .map(|d| d.with_timezone(&Utc));
+                    }
+                    ("Blobs", "Blob") => {
+                        if let Some(key) = name.take() {
+                            page.keys.push(crate::storage::ListedKey {
+                                key,
+                                last_modified: modified.take(),
+                            });
+                        }
+                        modified = None;
+                    }
+                    ("EnumerationResults", "NextMarker") => {
+                        let marker = text.trim();
+                        page.next_marker = (!marker.is_empty()).then(|| marker.to_string());
+                    }
+                    _ => {}
+                }
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => {
+                return Err(AppError::Storage(format!(
+                    "Failed to parse the Azure List Blobs response: {}",
+                    e
+                )))
+            }
+        }
+    }
+    match root.as_deref() {
+        Some("EnumerationResults") => Ok(page),
+        _ => Err(AppError::Storage(format!(
+            "Azure List Blobs response is not an EnumerationResults document: {}",
+            xml.chars().take(512).collect::<String>()
+        ))),
+    }
+}
+
 impl AzureBackend {
     /// Create a new Azure Blob Storage backend
     pub async fn new(config: AzureConfig) -> Result<Self> {
@@ -756,6 +855,23 @@ impl AzureBackend {
         )
     }
 
+    /// String-to-sign for a Put Blob From URL request in Shared Key mode
+    /// (#4320): no body (empty Content-Length field) and no Content-Type, the
+    /// four `x-ms-*` headers the request sends in canonical (sorted) order.
+    fn put_blob_from_url_string_to_sign(
+        &self,
+        date_str: &str,
+        key: &str,
+        source_url: &str,
+    ) -> String {
+        format!(
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-copy-source:{}\nx-ms-date:{}\nx-ms-version:2021-06-08\n{}",
+            source_url,
+            date_str,
+            self.shared_key_canonicalized_resource(key)
+        )
+    }
+
     /// String-to-sign for a Delete Blob request in Shared Key mode.
     fn delete_blob_string_to_sign(&self, date_str: &str, key: &str) -> String {
         format!(
@@ -879,6 +995,7 @@ impl AzureBackend {
     async fn authorized_put_blob_from_url(
         &self,
         dest_url: &str,
+        dest_key: &str,
         source_url: &str,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
@@ -893,12 +1010,22 @@ impl AzureBackend {
             .header("x-ms-copy-source", source_url)
             .header("Content-Length", "0");
 
-        if let AzureAuthMode::TokenCredential { provider } = &self.auth {
-            let token = provider.get_token().await?;
-            let bearer = format!("Bearer {}", token);
-            request = request
-                .header("Authorization", bearer.clone())
-                .header("x-ms-copy-source-authorization", bearer);
+        match &self.auth {
+            AzureAuthMode::TokenCredential { provider } => {
+                let token = provider.get_token().await?;
+                let bearer = format!("Bearer {}", token);
+                request = request
+                    .header("Authorization", bearer.clone())
+                    .header("x-ms-copy-source-authorization", bearer);
+            }
+            AzureAuthMode::SharedKey { decoded_key } => {
+                let string_to_sign =
+                    self.put_blob_from_url_string_to_sign(&date_str, dest_key, source_url);
+                request = request.header(
+                    "Authorization",
+                    Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?,
+                );
+            }
         }
 
         request
@@ -1332,7 +1459,8 @@ impl AzureBackend {
         })
     }
 
-    async fn size(&self, key: &str) -> Result<u64> {
+    /// The size of blob `key` in bytes (a HEAD). `NotFound` when absent.
+    pub async fn size(&self, key: &str) -> Result<u64> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1353,6 +1481,141 @@ impl AzureBackend {
         let stream = self.get_stream(source).await?;
         self.put_stream(dest, stream).await?;
         Ok(())
+    }
+
+    /// Server-side copy of blob `source` onto `dest` (the [`StorageBackend`]
+    /// copy), reachable as an inherent method for the storage facade wrapper.
+    pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        <Self as StorageBackend>::copy(self, source, dest).await
+    }
+
+    /// List the blob names under `prefix` (#4320), following `NextMarker`
+    /// until the listing ends.
+    pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        Ok(self
+            .list_with_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|l| l.key)
+            .collect())
+    }
+
+    /// [`Self::list`] that also carries each blob's `Last-Modified`.
+    ///
+    /// List Blobs is a container operation: with Shared Key auth it is
+    /// authorized by a container SAS with list permission, with a token
+    /// credential by the bearer token, as every other request here.
+    pub async fn list_with_modified(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<crate::storage::ListedKey>> {
+        let mut keys = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut query = String::from("restype=container&comp=list&maxresults=5000");
+            if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+                query.push_str("&prefix=");
+                query.push_str(&urlencoding::encode(prefix));
+            }
+            if let Some(marker) = marker.as_deref() {
+                query.push_str("&marker=");
+                query.push_str(&urlencoding::encode(marker));
+            }
+            let url = self.list_url(&query)?;
+            let response = self.authorized_get(&url).await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AppError::Storage(format!(
+                    "Azure List Blobs failed with status {}: {}",
+                    status,
+                    body.chars().take(512).collect::<String>()
+                )));
+            }
+            let body = response
+                .text()
+                .await
+                .map_err(|e| AppError::Storage(format!("Azure List Blobs body: {e}")))?;
+            let page = parse_list_blobs_result(&body)?;
+            keys.extend(page.keys);
+            match page.next_marker {
+                Some(next) => marker = Some(next),
+                None => break,
+            }
+        }
+        Ok(keys)
+    }
+
+    /// URL of a List Blobs request carrying `query` (`restype=container&...`).
+    fn list_url(&self, query: &str) -> Result<String> {
+        let url = format!(
+            "{}/{}?{}",
+            self.base_url(),
+            self.config.container_name,
+            query
+        );
+        match &self.auth {
+            AzureAuthMode::SharedKey { .. } => Ok(Self::append_query(
+                url,
+                &self.generate_container_sas_token("l", Duration::from_secs(300), Utc::now())?,
+            )),
+            AzureAuthMode::TokenCredential { .. } => Ok(url),
+        }
+    }
+
+    /// A service SAS for the whole container (`sr=c`), for container
+    /// operations such as List Blobs. Same signing as the blob SAS in
+    /// [`Self::generate_sas_token_at`], with the container as the resource.
+    fn generate_container_sas_token(
+        &self,
+        signed_permissions: &str,
+        expires_in: Duration,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String> {
+        let decoded_key = match &self.auth {
+            AzureAuthMode::SharedKey { decoded_key } => decoded_key,
+            AzureAuthMode::TokenCredential { .. } => {
+                return Err(AppError::Storage(
+                    "SAS token generation requires Shared Key auth (AZURE_STORAGE_ACCESS_KEY)"
+                        .to_string(),
+                ));
+            }
+        };
+        let expiry = now + ChronoDuration::seconds(expires_in.as_secs() as i64);
+        let start = now - ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES);
+        let signed_version = "2021-06-08";
+        let signed_resource = "c";
+        let signed_start = start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let signed_expiry = expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let signed_protocol = "https";
+        let canonicalized_resource = format!(
+            "/blob/{}/{}",
+            self.config.account_name, self.config.container_name
+        );
+        let string_to_sign = format!(
+            "{}\n{}\n{}\n{}\n\n\n{}\n{}\n{}\n\n\n\n\n\n\n",
+            signed_permissions,
+            signed_start,
+            signed_expiry,
+            canonicalized_resource,
+            signed_protocol,
+            signed_version,
+            signed_resource,
+        );
+        let mut mac = HmacSha256::new_from_slice(decoded_key)
+            .map_err(|e| AppError::Storage(format!("Failed to create HMAC: {}", e)))?;
+        mac.update(string_to_sign.as_bytes());
+        let signature = BASE64.encode(mac.finalize().into_bytes());
+        Ok(format!(
+            "sv={}&st={}&se={}&sr={}&sp={}&spr={}&sig={}",
+            urlencoding::encode(signed_version),
+            urlencoding::encode(&signed_start),
+            urlencoding::encode(&signed_expiry),
+            signed_resource,
+            signed_permissions,
+            signed_protocol,
+            urlencoding::encode(&signature),
+        ))
     }
 
     /// Whether this backend is using RBAC (token credential) auth.
@@ -1658,10 +1921,32 @@ impl StorageBackend for AzureBackend {
             return self.copy_via_stream(source, dest).await;
         }
 
-        let dest_url = self.write_url(dest)?;
+        // #4320: in Shared Key mode the destination is authorized with a
+        // signed Authorization header rather than a SAS in its URL. Azure
+        // accepts either. An endpoint that rejects the SAS form with an error
+        // of its own (the Azurite emulator answers 500) reports a missing API
+        // as 501 under Shared Key, which the fallback below handles; and the
+        // header keeps a signed URL out of the request line besides.
+        let dest_url = match &self.auth {
+            AzureAuthMode::SharedKey { .. } => self.blob_url(dest),
+            AzureAuthMode::TokenCredential { .. } => self.write_url(dest)?,
+        };
         let response = self
-            .authorized_put_blob_from_url(&dest_url, &source_url, timeout)
+            .authorized_put_blob_from_url(&dest_url, dest, &source_url, timeout)
             .await?;
+        // #4320: an Azure-compatible endpoint that does not implement Put
+        // Blob From URL at all (the Azurite emulator answers 501) gets the
+        // streamed copy instead. 501 is "this API does not exist here", never
+        // a transient failure of one that does, so a real Azure copy error
+        // still surfaces below.
+        if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                "Azure endpoint does not implement Put Blob From URL; streaming the copy"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -1775,6 +2060,10 @@ impl StorageBackend for AzureBackend {
     }
 
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
+    async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<crate::storage::ListedKey>>> {
+        self.list_with_modified(Some(prefix)).await.map(Some)
+    }
+
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -2648,6 +2937,138 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #4320: List Blobs and the proxy-cache arm.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_list_blobs_result_reads_names_times_and_marker_4320() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://a.blob.core.windows.net/" ContainerName="c">
+  <Prefix>proxy-cache/r/</Prefix>
+  <Blobs>
+    <Blob><Name>proxy-cache/r/a&amp;b/__content__</Name>
+      <Properties><Last-Modified>Fri, 23 Oct 2026 10:00:00 GMT</Last-Modified></Properties></Blob>
+    <Blob><Name><![CDATA[proxy-cache/r/<x>/__cache_meta__.json]]></Name><Properties/></Blob>
+  </Blobs>
+  <NextMarker>2!88!MDAwMDQ3</NextMarker>
+</EnumerationResults>"#;
+        let page = parse_list_blobs_result(xml).expect("parse");
+        let keys: Vec<&str> = page.keys.iter().map(|k| k.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "proxy-cache/r/a&b/__content__",
+                "proxy-cache/r/<x>/__cache_meta__.json"
+            ]
+        );
+        assert_eq!(
+            page.keys[0].last_modified.map(|t| t.to_rfc3339()),
+            Some("2026-10-23T10:00:00+00:00".to_string())
+        );
+        assert_eq!(page.keys[1].last_modified, None);
+        assert_eq!(page.next_marker.as_deref(), Some("2!88!MDAwMDQ3"));
+
+        let last = parse_list_blobs_result(
+            "<EnumerationResults><Blobs/><NextMarker/></EnumerationResults>",
+        )
+        .expect("empty last page");
+        assert!(last.keys.is_empty());
+        assert_eq!(last.next_marker, None);
+
+        // An error body is a failure, never an empty listing.
+        assert!(
+            parse_list_blobs_result("<Error><Code>AuthenticationFailed</Code></Error>").is_err()
+        );
+    }
+
+    /// #4320: `list` pages through `NextMarker`, sends the List Blobs query
+    /// and returns every name; the trait's `list_keys` is the same listing
+    /// (before, Azure answered `Ok(None)`: cannot enumerate).
+    #[tokio::test]
+    async fn test_list_follows_next_marker_4320() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("restype", "container"))
+            .and(query_param("comp", "list"))
+            .and(query_param("prefix", "proxy-cache/"))
+            .and(query_param("marker", "page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/b</Name></Blob></Blobs>\
+                 <NextMarker/></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("restype", "container"))
+            .and(query_param("comp", "list"))
+            .and(query_param("prefix", "proxy-cache/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/a</Name></Blob></Blobs>\
+                 <NextMarker>page2</NextMarker></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let keys = backend.list(Some("proxy-cache/")).await.expect("list");
+        assert_eq!(keys, vec!["proxy-cache/a", "proxy-cache/b"]);
+        let listed = StorageBackendTrait::list_keys(&backend, "proxy-cache/")
+            .await
+            .expect("list_keys")
+            .expect("Azure can enumerate its blobs");
+        assert_eq!(listed.len(), 2);
+    }
+
+    /// #4320: a Shared Key List Blobs request carries a container SAS
+    /// (`sr=c`, list permission).
+    #[tokio::test]
+    async fn test_list_url_carries_a_container_list_sas_4320() {
+        let backend = create_test_backend().await;
+        let url = backend
+            .list_url("restype=container&comp=list")
+            .expect("url");
+        assert!(url.starts_with(
+            "https://testaccount.blob.core.windows.net/testcontainer?restype=container&comp=list&"
+        ));
+        assert!(url.contains("&sr=c&"), "{url}");
+        assert!(url.contains("&sp=l&"), "{url}");
+        assert!(url.contains("&sig="), "{url}");
+    }
+
+    /// #4320: a Shared Key Put Blob From URL signs its destination with the
+    /// copy source among the canonical headers, in sorted order, with an
+    /// empty Content-Length field.
+    #[tokio::test]
+    async fn test_put_blob_from_url_string_to_sign_4320() {
+        let backend = create_azurite_backend().await;
+        let sts = backend.put_blob_from_url_string_to_sign(
+            "Mon, 06 Jul 2026 22:37:12 GMT",
+            "proxy-cache/r/p/__content__",
+            "https://azurite:10000/devstoreaccount1/c/staging?sv=x&sig=y",
+        );
+        let fields: Vec<&str> = sts.split('\n').collect();
+        assert_eq!(fields[0], "PUT");
+        assert_eq!(fields[3], "", "zero Content-Length signs as empty");
+        assert_eq!(fields[12], "x-ms-blob-type:BlockBlob");
+        assert_eq!(
+            fields[13],
+            "x-ms-copy-source:https://azurite:10000/devstoreaccount1/c/staging?sv=x&sig=y"
+        );
+        assert_eq!(fields[14], "x-ms-date:Mon, 06 Jul 2026 22:37:12 GMT");
+        assert_eq!(fields[15], "x-ms-version:2021-06-08");
+        assert_eq!(
+            fields[16],
+            "/devstoreaccount1/devstoreaccount1/testcontainer/proxy-cache/r/p/__content__"
+        );
+    }
+
     #[tokio::test]
     async fn test_exists_checks_migration_fallback_after_primary_404() {
         use crate::storage::StorageBackend as StorageBackendTrait;
@@ -3302,6 +3723,67 @@ mod tests {
             "the operation is still named: {message}"
         );
         assert_no_sas_query(&message);
+    }
+
+    /// #4320: an endpoint that answers Put Blob From URL with 501 Not
+    /// Implemented (Azurite) gets the streamed copy, so the proxy cache's
+    /// staging-to-live publish still lands there. Any other failure status
+    /// still fails the copy.
+    #[tokio::test]
+    async fn test_copy_streams_when_put_blob_from_url_is_not_implemented_4320() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{header_exists, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, expect_ok) in [(501u16, true), (500u16, false)] {
+            let server = MockServer::start().await;
+            let source_path = "/testcontainer/proxy-cache-staging/x";
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "10"))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(source_path))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(Vec::from(&b"small-copy"[..])),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(header_exists("x-ms-copy-source"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("<Error/>"))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(query_param("comp", "block"))
+                .respond_with(ResponseTemplate::new(201))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(query_param("comp", "blocklist"))
+                .respond_with(ResponseTemplate::new(201))
+                .mount(&server)
+                .await;
+
+            let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+            let result =
+                StorageBackendTrait::copy(&backend, "proxy-cache-staging/x", "proxy-cache/r/p")
+                    .await;
+            let requests = server.received_requests().await.unwrap_or_default();
+            let committed = requests.iter().any(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .any(|(key, value)| key == "comp" && value == "blocklist")
+            });
+            if expect_ok {
+                result.expect("a 501 falls back to the streamed copy");
+                assert!(committed, "the streamed copy commits the destination");
+            } else {
+                assert!(result.is_err(), "a 500 is a copy failure, not a fallback");
+                assert!(!committed);
+            }
+        }
     }
 
     #[tokio::test]
