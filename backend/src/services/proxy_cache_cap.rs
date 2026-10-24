@@ -150,6 +150,22 @@ pub async fn usage(db: &PgPool, repository_id: Uuid) -> Result<CacheUsage> {
     Ok(CacheUsage { bytes, entries })
 }
 
+/// The bytes half of [`usage`], without the entry count: what an eviction
+/// run compares with the cap after every commit and every page, where a
+/// `COUNT(*)` over a large cache would be wasted work.
+async fn usage_bytes(db: &PgPool, repository_id: Uuid) -> Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COALESCE( \
+             (SELECT proxy_bytes FROM repository_usage_ledger WHERE repository_id = $1), \
+             (SELECT SUM(size_bytes) FROM proxy_cache_artifacts WHERE repository_id = $1), \
+             0)::BIGINT",
+    )
+    .bind(repository_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 /// Current proxy-cache usage of one repository.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CacheUsage {
@@ -319,7 +335,7 @@ impl ProxyCacheCap {
     /// other replicas are accounted for; two replicas running at once can
     /// overshoot by at most a page, which only costs refetches.
     pub async fn enforce(&self, repository_id: Uuid, cap_bytes: i64) -> Result<CapEnforcement> {
-        let mut current = usage(&self.db, repository_id).await?.bytes;
+        let mut current = usage_bytes(&self.db, repository_id).await?;
         let mut report = CapEnforcement {
             usage_before: current,
             usage_after: current,
@@ -398,7 +414,7 @@ impl ProxyCacheCap {
                     kept.push(entry.id);
                 }
             }
-            current = usage(&self.db, repository_id).await?.bytes;
+            current = usage_bytes(&self.db, repository_id).await?;
         }
         report.usage_after = current;
         if current > cap_bytes {
@@ -576,6 +592,121 @@ mod tests {
             "over the cap with eviction failing, fills are refused"
         );
         assert!(admits_again);
+    }
+
+    /// #4660 refusal fallback, end to end: while eviction cannot get the
+    /// cache under its cap, a proxied fetch still answers the client with the
+    /// full upstream body (buffered and streamed), writes nothing to the
+    /// cache, and is not counted as an over-quota object.
+    #[test]
+    fn refused_fills_are_still_served_to_the_client() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (outcome, counters) =
+            crate::services::metrics_service::capture_counters_async(|| async {
+                let pool = tdh::try_pool().await?;
+                let body = vec![9u8; 4096];
+                let mock = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path_regex(r"^/pkgs/.*"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                    .mount(&mock)
+                    .await;
+                let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "generic").await;
+                sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                    .bind(mock.uri())
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                tdh::publish_repo(&pool, repo_id).await;
+                // Over a 1 MiB cap with entries eviction refuses to delete.
+                for n in 0..3 {
+                    seed_entry(&pool, repo_id, "proxy-cache/elsewhere", n, 10).await;
+                }
+                save_cap(&pool, repo_id, Some(MIB)).await.unwrap();
+
+                let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+                proxy
+                    .cache_cap()
+                    .enforce(repo_id, MIB)
+                    .await
+                    .expect("enforce");
+                let refusing = !proxy.cache_cap().admits_fills(repo_id).await;
+                let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+                    repo_id,
+                    &key,
+                    &mock.uri(),
+                    crate::models::repository::RepositoryFormat::Generic,
+                );
+
+                let (buffered, _) = proxy
+                    .fetch_artifact(&repo, "pkgs/buffered.bin")
+                    .await
+                    .expect("a refused buffered fill still serves the client");
+                let mut streamed = proxy
+                    .fetch_artifact_streaming_with_cache_path(
+                        &repo,
+                        "pkgs/streamed.bin",
+                        "pkgs/streamed.bin",
+                    )
+                    .await
+                    .expect("a refused streamed fill still serves the client");
+                let mut streamed_len = 0usize;
+                while let Some(chunk) = streamed.body.next().await {
+                    streamed_len += chunk.expect("chunk").len();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let cached = [
+                    dir.join(format!(
+                        "proxy-cache/{key}/pkgs/buffered.bin/__cache_meta__.json"
+                    )),
+                    dir.join(format!(
+                        "proxy-cache/{key}/pkgs/streamed.bin/__cache_meta__.json"
+                    )),
+                ]
+                .iter()
+                .any(|p| p.exists());
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await;
+                Some((
+                    refusing,
+                    buffered.len(),
+                    streamed_len,
+                    body.len(),
+                    cached,
+                    key,
+                ))
+            });
+        let Some((refusing, buffered_len, streamed_len, body_len, cached, key)) = outcome else {
+            return;
+        };
+
+        assert!(
+            refusing,
+            "the setup must leave the repository refusing fills"
+        );
+        assert_eq!(
+            buffered_len, body_len,
+            "buffered client gets the whole body"
+        );
+        assert_eq!(
+            streamed_len, body_len,
+            "streamed client gets the whole body"
+        );
+        assert!(!cached, "a refused fill writes no cache entry");
+        assert_eq!(
+            counters.get(
+                "ak_proxy_cache_quota_exceeded_total",
+                &[("repository", key.as_str())]
+            ),
+            0,
+            "a refused fill is not an over-quota object"
+        );
     }
 
     /// #4660 end to end: a capped Remote that streams objects through the

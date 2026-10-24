@@ -5967,11 +5967,19 @@ impl ProxyService {
                         // Remote whose eviction cannot get under its cap takes
                         // no fills at all.
                         let quota_bytes = self.resolve_cache_ceiling_bytes(repo).await;
-                        let quota_ok = !cache_classifier::exceeds_single_object_quota(
+                        let within_ceiling = !cache_classifier::exceeds_single_object_quota(
                             quota_bytes,
                             resp.content.len() as i64,
-                        ) && self.cache_fill_admitted(repo).await;
-                        if !quota_ok {
+                        );
+                        // The refusal fallback is not an over-quota object:
+                        // `cache_fill_admitted` logs it, and the quota warn and
+                        // counter below stay for objects over the ceiling.
+                        let fill_admitted = !within_ceiling || self.cache_fill_admitted(repo).await;
+                        let quota_ok = within_ceiling && fill_admitted;
+                        if !fill_admitted {
+                            self.note_served_without_cache(repo.id, cache_path).await;
+                        }
+                        if !within_ceiling {
                             tracing::warn!(
                                 target: "security",
                                 repository = %repo.key,
