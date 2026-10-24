@@ -5053,8 +5053,8 @@ async fn push_package(
             digests,
             size_bytes,
             Some(user_id),
-            // #4792: a push replayed by a peer must not fan back out.
-            !super::is_replication_request(&headers),
+            // #4889: queue after the metadata write below, not before it.
+            false,
             Some(&catalog_name),
         )
         .await
@@ -5076,6 +5076,19 @@ async fn push_package(
         metadata,
     )
     .execute(&state.db)
+    .await;
+
+    // #4889: the metadata document is now written, so a worker that claims the
+    // task immediately can send it. The helper also applies the #4725 guard
+    // that stops a replication write from fanning back out.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact.id,
+        &artifact_path,
+        size_bytes,
+    )
     .await;
 
     // Populate packages / package_versions tables (best-effort) so the

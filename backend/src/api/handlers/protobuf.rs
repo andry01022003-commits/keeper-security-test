@@ -716,73 +716,95 @@ async fn load_label_index(
     }
 }
 
-/// Save the label index for a module. Creates or updates the _labels artifact.
+/// Save the label index for a module. Creates or updates the `_labels` artifact.
+///
+/// #4889: the index used to be a zero-byte row with checksum `none`, so the
+/// push-sync worker had no object to transfer and a label move never reached
+/// peers. Store the rendered label document in content-addressed storage and
+/// queue a normal push after the row and metadata are committed. The peer's
+/// generic upload path refreshes the row in place (the `_labels` path is a
+/// known mutable index) so an updated label map replaces the old one.
 async fn save_label_index(
-    db: &PgPool,
-    repo_id: uuid::Uuid,
+    state: &SharedState,
+    repo: &RepoInfo,
     module_name: &str,
     labels: &serde_json::Map<String, serde_json::Value>,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<(), Response> {
     let label_path = build_label_path(module_name);
     let metadata = serde_json::json!({ "labels": labels });
+    let bytes = Bytes::from(serde_json::to_vec(&metadata).map_err(|e| {
+        connect_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            crate::api::handlers::internal_err_message("Failed to serialize label index", &e),
+        )
+    })?);
+    let size_bytes = bytes.len() as i64;
+    let checksum_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let storage_key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+        &checksum_sha256,
+    );
+    let storage = state.storage_for_repo_or_500(&repo.storage_location())?;
+    storage.put(&storage_key, bytes).await.map_err(|e| {
+        connect_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            crate::api::handlers::storage_err_message(&e),
+        )
+    })?;
 
-    // Check if the label artifact already exists
-    let existing_id: Option<uuid::Uuid> = sqlx::query(
-        r#"SELECT id FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        LIMIT 1"#,
-    )
-    .bind(repo_id)
-    .bind(&label_path)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
+    // Write the row and its metadata together: a sync task must never observe
+    // a row whose label document is still the previous revision.
+    let mut tx = state.db.begin().await.map_err(|e| {
         connect_error(
             crate::api::handlers::db_status(&e),
             "internal",
             crate::api::handlers::db_err_message(&e),
         )
-    })?
-    .map(|row| row.get("id"));
+    })?;
 
-    let artifact_id = match existing_id {
-        Some(id) => id,
-        None => {
-            crate::api::handlers::cleanup_soft_deleted_artifact(db, repo_id, &label_path).await;
-            // Create label index artifact
-            // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated
-            // JSON document, not uploaded content; the module upload itself
-            // triggers the scan (#4166).
-            // NO-QUOTA-ADMISSION: the generated `_labels` index is a few bytes
-            // the registry writes for an already-admitted module commit (#4422).
-            let row = sqlx::query(
-                r#"INSERT INTO artifacts (
-                    repository_id, path, name, version, size_bytes,
-                    checksum_sha256, content_type, storage_key, uploaded_by
-                )
-                VALUES ($1, $2, $3, '_labels', 0, 'none', 'application/json', $4, $5)
-                RETURNING id"#,
-            )
-            .bind(repo_id)
-            .bind(&label_path)
-            .bind(module_name)
-            .bind(&label_path)
-            .bind(user_id)
-            .fetch_one(db)
-            .await
-            .map_err(|e| {
-                connect_error(
-                    crate::api::handlers::db_status(&e),
-                    "internal",
-                    &format!("Database error creating label index: {}", e),
-                )
-            })?;
-            row.get("id")
-        }
-    };
+    // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated JSON
+    // document, not uploaded content; the module upload itself triggers the
+    // scan (#4166).
+    // NO-QUOTA-ADMISSION: the generated `_labels` index is a few bytes the
+    // registry writes for an already-admitted module commit (#4422).
+    let artifact_id: uuid::Uuid = sqlx::query_scalar(
+        r#"INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, '_labels', $4, $5, 'application/json', $6, $7)
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            name = EXCLUDED.name,
+            version = EXCLUDED.version,
+            size_bytes = EXCLUDED.size_bytes,
+            checksum_sha256 = EXCLUDED.checksum_sha256,
+            content_type = EXCLUDED.content_type,
+            storage_key = EXCLUDED.storage_key,
+            uploaded_by = EXCLUDED.uploaded_by,
+            is_deleted = false,
+            updated_at = NOW()
+        RETURNING id"#,
+    )
+    .bind(repo.id)
+    .bind(&label_path)
+    .bind(module_name)
+    .bind(size_bytes)
+    .bind(&checksum_sha256)
+    .bind(&storage_key)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        connect_error(
+            crate::api::handlers::db_status(&e),
+            "internal",
+            &format!("Database error creating label index: {}", e),
+        )
+    })?;
 
-    // Upsert metadata with the label map
     sqlx::query(
         r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
         VALUES ($1, 'protobuf', $2)
@@ -790,7 +812,7 @@ async fn save_label_index(
     )
     .bind(artifact_id)
     .bind(&metadata)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         connect_error(
@@ -800,23 +822,46 @@ async fn save_label_index(
         )
     })?;
 
+    tx.commit().await.map_err(|e| {
+        connect_error(
+            crate::api::handlers::db_status(&e),
+            "internal",
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+
+    // #4725/#4889: fan the label index out like any other upload (the helper
+    // skips a write that is itself a replication). The sync worker sends the
+    // JSON bytes and the `protobuf` metadata document; the receiver's generic
+    // upload restores both.
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        headers,
+        repo.id,
+        artifact_id,
+        &label_path,
+        size_bytes,
+    )
+    .await;
+
     Ok(())
 }
 
 /// Update labels for a module, mapping each label name to a commit digest.
 async fn update_labels(
-    db: &PgPool,
-    repo_id: uuid::Uuid,
+    state: &SharedState,
+    repo: &RepoInfo,
     module_name: &str,
     label_refs: &[LabelRef],
     commit_digest: &str,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<(), Response> {
     if label_refs.is_empty() {
         return Ok(());
     }
 
-    let mut labels = load_label_index(db, repo_id, module_name).await?;
+    let mut labels = load_label_index(&state.db, repo.id, module_name).await?;
 
     for label_ref in label_refs {
         labels.insert(
@@ -825,7 +870,7 @@ async fn update_labels(
         );
     }
 
-    save_label_index(db, repo_id, module_name, &labels, user_id).await
+    save_label_index(state, repo, module_name, &labels, user_id, headers).await
 }
 
 /// Resolve a label to a commit digest for a given module.
@@ -1169,12 +1214,13 @@ async fn upload(
 
             // Still update labels if provided
             update_labels(
-                &state.db,
-                repo.id,
+                &state,
+                &repo,
                 &module_name,
                 &content.label_refs,
                 &commit_digest,
                 user_id,
+                &headers,
             )
             .await?;
 
@@ -1301,12 +1347,13 @@ async fn upload(
             });
         }
         update_labels(
-            &state.db,
-            repo.id,
+            &state,
+            &repo,
             &module_name,
             &effective_labels,
             &commit_digest,
             user_id,
+            &headers,
         )
         .await?;
 
@@ -1633,6 +1680,7 @@ async fn create_or_update_labels(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<CreateOrUpdateLabelsRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -1691,14 +1739,15 @@ async fn create_or_update_labels(
         }
 
         update_labels(
-            &state.db,
-            repo.id,
+            &state,
+            &repo,
             &module_name,
             &[LabelRef {
                 name: value.name.clone(),
             }],
             &value.commit_id,
             user_id,
+            &headers,
         )
         .await?;
 
@@ -2849,10 +2898,9 @@ mod tests {
     }
 
     /// #4725: a `buf push` to a hosted repository must queue a push sync task
-    /// for a subscribed push peer. The registry-generated `_labels` row carries
-    /// no stored bytes, so it must not be queued, and a push that arrives as
-    /// peer replication must not be fanned back out. Fails on `main` (nothing
-    /// queued).
+    /// for a subscribed push peer. Since #4889 the registry-generated `_labels`
+    /// index is a stored JSON document and is queued alongside the commit, and
+    /// a push that arrives as peer replication must not be fanned back out.
     #[tokio::test]
     async fn protobuf_upload_queues_push_sync_task_4725() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -2927,12 +2975,36 @@ mod tests {
         );
 
         let queued = tdh::queued_push_paths(&fx.pool, peer_id, fx.repo_id).await;
+
+        // #4889: the `_labels` row must carry real bytes so the sync worker can
+        // transfer it, and the label move must be queued to the push peer. The
+        // replicated push above must not queue another task.
+        let (label_size, label_checksum, label_key): (i64, String, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256, storage_key FROM artifacts \
+             WHERE repository_id = $1 AND path = 'modules/acme/repl/_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("load _labels row");
+        assert!(label_size > 0, "the _labels document must have bytes");
+        assert_ne!(label_checksum, "none");
+        let stored = tokio::fs::read(fx.storage_dir.join(&label_key))
+            .await
+            .expect("read the stored _labels document");
+        let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert!(stored["labels"]["main"].is_string());
+
         tdh::delete_push_peer(&fx.pool, peer_id).await;
         fx.teardown().await;
         assert_eq!(
             queued,
-            vec![format!("modules/acme/repl/commits/{digest}")],
-            "only the client push queues a task; the _labels index and the replicated push must not"
+            vec![
+                "modules/acme/repl/_labels".to_string(),
+                format!("modules/acme/repl/commits/{digest}"),
+            ],
+            "the client push queues the commit and the label index; \
+             the replicated push must not queue another task"
         );
     }
 }

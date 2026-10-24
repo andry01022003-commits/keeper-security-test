@@ -3941,7 +3941,9 @@ async fn persist_debian_upload(
             DEBIAN_BINARY_CONTENT_TYPE,
             body,
             user_id,
-            enqueue_sync_tasks,
+            // #4889: queue after the control document is written below, not
+            // before it.
+            false,
         )
         .await
         .map_err(|e| e.into_response())?;
@@ -3958,6 +3960,17 @@ async fn persist_debian_upload(
     )
     .await
     .map_err(|e| e.into_response())?;
+
+    if enqueue_sync_tasks {
+        super::queue_push_sync_tasks_now(
+            &state.db,
+            repo.id,
+            artifact.id,
+            &upload.artifact_path,
+            artifact.size_bytes,
+        )
+        .await;
+    }
 
     Ok(artifact)
 }

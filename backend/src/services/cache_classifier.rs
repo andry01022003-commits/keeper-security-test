@@ -374,6 +374,12 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         // is a no-op for conan (matching the conan upload handlers' intent).
         RepositoryFormat::Conan => true,
 
+        // #4889: the protobuf `_labels` index is a registry-generated pointer
+        // (label name -> commit digest) that is rewritten in place on every
+        // label move. It is the only mutable coordinate in a protobuf module;
+        // commits and their bundles remain release-immutable.
+        RepositoryFormat::Protobuf => lower == "_labels" || lower.ends_with("/_labels"),
+
         // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
         // every stored path is a release coordinate. The GitHub mirror
@@ -908,6 +914,16 @@ mod tests {
         assert!(is_explicitly_mutable_index(
             &Conan,
             "relib/1.0/_/_/revisions/rev1/files/conanfile.py"
+        ));
+        // #4889: protobuf's `_labels` index moves with every label update;
+        // commit bundles stay immutable.
+        assert!(is_explicitly_mutable_index(
+            &Protobuf,
+            "modules/acme/widgets/_labels"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Protobuf,
+            "modules/acme/widgets/commits/abc123"
         ));
         // Debian: dists/ indices are mutable indexes; pool/ and by-hash/
         // artifacts are protected release coordinates.
