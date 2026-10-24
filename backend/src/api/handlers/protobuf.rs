@@ -1231,6 +1231,11 @@ async fn upload(
         let bundle = build_bundle(&content.files)?;
         let bundle_bytes = Bytes::from(bundle);
         let size_bytes = bundle_bytes.len() as i64;
+        // #4921: `checksum_sha256` is the sha256 of the stored bundle, the
+        // value a replication peer verifies the pushed bytes against. The
+        // commit digest is the row's `version` (and `commitDigest` in the
+        // protobuf metadata), which is what every lookup keys on.
+        let bundle_sha256 = format!("{:x}", Sha256::digest(&bundle_bytes));
 
         // Refuse an over-quota commit before its bundle is stored (#4422).
         let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
@@ -1287,7 +1292,7 @@ async fn upload(
         .bind(&module_name)
         .bind(&commit_digest)
         .bind(size_bytes)
-        .bind(&commit_digest)
+        .bind(&bundle_sha256)
         .bind("application/gzip")
         .bind(&storage_key)
         .bind(user_id)
@@ -1377,7 +1382,7 @@ async fn upload(
             &module_name,
             &commit_digest,
             size_bytes,
-            &commit_digest,
+            &bundle_sha256,
             None,
         )
         .await;
@@ -3007,6 +3012,187 @@ mod tests {
              the replicated push must not queue another task"
         );
     }
+
+    /// #4921: a pushed commit must be accepted by the receiving peer. The
+    /// sync worker sends the row's `checksum_sha256` with the stored bundle,
+    /// and the peer's upload session verifies the bytes against it; before
+    /// the fix the row held the commit digest and every push was refused 409
+    /// "checksum mismatch". This replays the worker's session against a
+    /// second repository (the peer) with the source row's values.
+    #[tokio::test]
+    async fn protobuf_commit_push_is_accepted_by_peer_4921() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::Extension;
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let Some(peer) = tdh::Fixture::setup("local", "protobuf").await else {
+            fx.teardown().await;
+            return;
+        };
+
+        let file = (
+            "acme/pushed/v1/pushed.proto".to_string(),
+            b"syntax = \"proto3\";\npackage acme.pushed.v1;\n"
+                .as_slice()
+                .to_vec(),
+        );
+        let digest = compute_commit_digest(std::slice::from_ref(&file));
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "pushed" },
+                "files": [{
+                    "path": file.0,
+                    "content": base64::engine::general_purpose::STANDARD.encode(&file.1),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // What the sync worker reads for the push task.
+        let (path, name, version, size, checksum, storage_key, content_type, metadata): (
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+            String,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                    a.storage_key, a.content_type, am.metadata \
+             FROM artifacts a LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("modules/acme/pushed/commits/{digest}"))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("load commit row");
+        let stored = tokio::fs::read(fx.storage_dir.join(&storage_key))
+            .await
+            .expect("read the stored commit bundle");
+        assert_eq!(version.as_deref(), Some(digest.as_str()));
+        assert_eq!(size, stored.len() as i64);
+
+        let mut auth = tdh::make_auth(peer.user_id, &peer.username);
+        auth.is_admin = true;
+        let upload_app = || {
+            crate::api::handlers::upload::router()
+                .with_state(peer.state.clone())
+                .layer(Extension::<crate::api::middleware::auth::AuthExtension>(
+                    auth.clone(),
+                ))
+        };
+        let replication = |mut req: axum::http::Request<axum::body::Body>| {
+            req.headers_mut().insert(
+                "x-artifact-keeper-replication",
+                axum::http::HeaderValue::from_static("true"),
+            );
+            req
+        };
+
+        let session_body = serde_json::json!({
+            "repository_key": peer.repo_key,
+            "artifact_path": path,
+            "artifact_name": name,
+            "artifact_version": version,
+            "artifact_metadata_format": "protobuf",
+            "artifact_metadata": metadata,
+            "total_size": size,
+            "checksum_sha256": checksum.trim(),
+            "chunk_size": 8 * 1024 * 1024,
+            "content_type": content_type,
+        });
+        let (status, resp) = tdh::send(
+            upload_app(),
+            replication(tdh::post(
+                "/".to_string(),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&session_body).unwrap()),
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create session: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let session: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let session_id = session["session_id"].as_str().unwrap().to_string();
+
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session_id}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", stored.len() - 1, stored.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(stored.clone()))
+            .unwrap();
+        let (status, resp) = tdh::send(upload_app(), replication(req)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunk PATCH: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{session_id}/complete"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (complete_status, complete_resp) = tdh::send(upload_app(), replication(req)).await;
+
+        let peer_row: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT version, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(peer.repo_id)
+        .bind(&path)
+        .fetch_optional(&peer.pool)
+        .await
+        .expect("load peer row");
+
+        peer.teardown().await;
+        fx.teardown().await;
+
+        assert_eq!(
+            complete_status,
+            StatusCode::OK,
+            "the peer must accept the pushed commit: {}",
+            String::from_utf8_lossy(&complete_resp)
+        );
+        let (peer_version, peer_checksum) = peer_row.expect("the peer holds the commit");
+        assert_eq!(peer_version.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            peer_checksum.trim(),
+            format!("{:x}", Sha256::digest(&stored)),
+            "the peer row carries the sha256 of the bundle"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3134,9 +3320,9 @@ mod catalog_registration_tests {
     }
 }
 
-/// #3919 review (B1): a protobuf commit row records the COMMIT digest (over
-/// file paths + contents), not the SHA-256 of the stored gzip bundle.
-/// Download verification must not abort those downloads.
+/// #3919 review (B1): a protobuf commit row written before #4921 records the
+/// COMMIT digest (over file paths + contents), not the SHA-256 of the stored
+/// gzip bundle. Download verification must not abort those downloads.
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 pub(crate) mod integrity_tests {
@@ -3193,6 +3379,18 @@ pub(crate) mod integrity_tests {
         };
         assert!(fx.state.config.download_verify_checksums);
         let digest = push_module(&fx).await;
+        // Since #4921 a new commit row records the bundle's sha256; rows
+        // written before that still hold the commit digest. Put the row in
+        // that legacy shape: its download must not be aborted either.
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha256 = version \
+             WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .execute(&fx.pool)
+        .await
+        .expect("legacy checksum");
         let (size, recorded): (i64, String) = sqlx::query_as(
             "SELECT size_bytes, checksum_sha256 FROM artifacts \
              WHERE repository_id = $1 AND version = $2",
