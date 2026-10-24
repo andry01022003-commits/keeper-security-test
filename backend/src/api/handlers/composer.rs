@@ -5024,6 +5024,11 @@ mod scan_on_proxy_4105 {
             body,
             recorded_path: format!("dist/{NAME}/1.0.0/{REFERENCE}.zip"),
             file: "scanned-1.0.0.zip".to_string(),
+            pin: Some(crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Composer,
+                NAME,
+                "1.0.0",
+            )),
         }
     }
 

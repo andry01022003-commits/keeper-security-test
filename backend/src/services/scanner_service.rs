@@ -4547,6 +4547,62 @@ impl ComponentEcosystem {
             ComponentEcosystem::Debian | ComponentEcosystem::Rpm | ComponentEcosystem::Alpine
         )
     }
+
+    /// Whether this ecosystem's pin is built by a proxy serve route from the
+    /// REQUEST (#4952, #4111, #4112, #4113) rather than read from the bytes
+    /// alone: a Composer dist usually declares no version, a Conan archive
+    /// names no reference, and an OS package is graded against the release
+    /// its repository names. The same bytes can then grade differently under
+    /// two requests, so a stored proxy verdict is reused for one of these
+    /// only when it was graded as the coordinate being requested (see
+    /// [`ExpectedComponent::pin_identity_is_request_pinned`]).
+    pub fn is_request_pinned(self) -> bool {
+        matches!(
+            self,
+            ComponentEcosystem::Go
+                | ComponentEcosystem::Composer
+                | ComponentEcosystem::Conan
+                | ComponentEcosystem::Debian
+                | ComponentEcosystem::Rpm
+                | ComponentEcosystem::Alpine
+        )
+    }
+
+    /// The ecosystem prefix of [`ExpectedComponent::pin_identity`].
+    fn identity_token(self) -> &'static str {
+        match self {
+            ComponentEcosystem::Npm => "npm",
+            ComponentEcosystem::Python => "python",
+            ComponentEcosystem::RubyGems => "rubygems",
+            ComponentEcosystem::Cargo => "cargo",
+            ComponentEcosystem::NuGet => "nuget",
+            ComponentEcosystem::Conda => "conda",
+            ComponentEcosystem::Maven => "maven",
+            ComponentEcosystem::Go => "go",
+            ComponentEcosystem::Composer => "composer",
+            ComponentEcosystem::Conan => "conan",
+            ComponentEcosystem::Debian => "debian",
+            ComponentEcosystem::Rpm => "rpm",
+            ComponentEcosystem::Alpine => "alpine",
+        }
+    }
+
+    /// Every ecosystem, for the identity-token round trip.
+    const ALL: [ComponentEcosystem; 13] = [
+        ComponentEcosystem::Npm,
+        ComponentEcosystem::Python,
+        ComponentEcosystem::RubyGems,
+        ComponentEcosystem::Cargo,
+        ComponentEcosystem::NuGet,
+        ComponentEcosystem::Conda,
+        ComponentEcosystem::Maven,
+        ComponentEcosystem::Go,
+        ComponentEcosystem::Composer,
+        ComponentEcosystem::Conan,
+        ComponentEcosystem::Debian,
+        ComponentEcosystem::Rpm,
+        ComponentEcosystem::Alpine,
+    ];
 }
 
 /// The operating-system release an OS package pin is graded against
@@ -4860,24 +4916,9 @@ impl ExpectedComponent {
     /// (trimmed), matching [`ExpectedComponent::matches`]. The ecosystem is a
     /// prefix so the same name+version in two ecosystems cannot alias.
     pub fn pin_identity(&self) -> String {
-        let eco = match self.ecosystem {
-            ComponentEcosystem::Npm => "npm",
-            ComponentEcosystem::Python => "python",
-            ComponentEcosystem::RubyGems => "rubygems",
-            ComponentEcosystem::Cargo => "cargo",
-            ComponentEcosystem::NuGet => "nuget",
-            ComponentEcosystem::Conda => "conda",
-            ComponentEcosystem::Maven => "maven",
-            ComponentEcosystem::Go => "go",
-            ComponentEcosystem::Composer => "composer",
-            ComponentEcosystem::Conan => "conan",
-            ComponentEcosystem::Debian => "debian",
-            ComponentEcosystem::Rpm => "rpm",
-            ComponentEcosystem::Alpine => "alpine",
-        };
         let identity = format!(
             "{}|{}|{}",
-            eco,
+            self.ecosystem.identity_token(),
             Self::normalize_name(self.ecosystem, &self.name),
             self.version.trim()
         );
@@ -4887,6 +4928,16 @@ impl ExpectedComponent {
             Some(os) => format!("{identity}|{}", os.release.label()),
             None => identity,
         }
+    }
+
+    /// Whether a recorded [`pin_identity`](Self::pin_identity) names an
+    /// ecosystem whose pin comes from the request
+    /// ([`ComponentEcosystem::is_request_pinned`]).
+    pub fn pin_identity_is_request_pinned(identity: &str) -> bool {
+        let token = identity.split('|').next().unwrap_or_default();
+        ComponentEcosystem::ALL
+            .iter()
+            .any(|eco| eco.identity_token() == token && eco.is_request_pinned())
     }
 }
 

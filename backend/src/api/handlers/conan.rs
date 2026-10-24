@@ -12513,6 +12513,11 @@ mod scan_on_proxy_4108 {
             ]),
             recorded_path: path,
             file: "conan_package.tgz".to_string(),
+            pin: Some(crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Conan,
+                "dtfscan",
+                "1.0.0",
+            )),
         }
     }
 

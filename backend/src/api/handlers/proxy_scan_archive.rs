@@ -492,6 +492,10 @@ pub(crate) mod test_support {
         pub recorded_path: String,
         /// The `file` a 403 / 423 body names.
         pub file: String,
+        /// The pin the gate grades this file as, for a format whose pin
+        /// comes from the request (#4952): a seeded verdict records it, as a
+        /// verdict the gate graded would. `None` for the other formats.
+        pub pin: Option<crate::services::scanner_service::ExpectedComponent>,
     }
 
     pub(crate) type CaseFn = fn(&str) -> ArchiveCase;
@@ -572,8 +576,13 @@ pub(crate) mod test_support {
         /// Seed `verdict` for the package's digest (`clean` / `vulnerable`).
         pub(crate) async fn seed(&self, verdict: &str) {
             let vulnerable = verdict == "vulnerable";
+            let pin = self
+                .case
+                .pin
+                .as_ref()
+                .map(crate::services::scanner_service::ExpectedComponent::pin_identity);
             crate::services::proxy_scan_service::ProxyScanService::new(self.fx.pool.clone())
-                .record_verdict(
+                .record_verdict_with_catalog(
                     &self.digest(),
                     "grype",
                     verdict,
@@ -585,6 +594,8 @@ pub(crate) mod test_support {
                     vulnerable.then_some("critical"),
                     Some("grype-4097-test"),
                     Some(self.fx.repo_id),
+                    None,
+                    pin.as_deref(),
                 )
                 .await
                 .expect("seed verdict");

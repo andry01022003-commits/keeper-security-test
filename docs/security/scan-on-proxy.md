@@ -248,6 +248,22 @@ repository falls back to the 30-day window alone. A `fail_closed` repository
 reuses a `clean` verdict only when both versions are known and equal;
 otherwise it scans again, and an inconclusive result is `423`.
 
+A verdict also records the coordinate it was graded as (`pin_identity`,
+migration 301). For most formats the bytes name that coordinate themselves (an
+npm tarball's `package.json`, a crate's `Cargo.toml`), so one verdict per
+digest is enough. Go, Composer, Conan, Debian, RPM and Alpine are graded as
+the coordinate the REQUEST names, which the bytes need not carry: a Composer
+dist usually declares no version, a Conan archive names no reference, and an
+OS package is graded against the release its repository names. For those
+formats a stored verdict is reused only when it was graded as the coordinate
+being requested. A verdict graded as another version, reference or release,
+or a `clean` one graded without a coordinate (the rescan endpoint), is not
+reused, and the bytes are scanned again as for a first pull; a `vulnerable`
+verdict graded without a coordinate still blocks. A pull whose identity
+cannot be established (for example an OS package whose release cannot be
+determined) never inherits a `clean` verdict graded as another coordinate,
+and is still refused by a stored `vulnerable` one (#4952).
+
 Each verdict also records `components_cataloged`: how many distinct
 components the scanner cataloged when it graded the bytes (migration 287).
 `GET /api/v1/repositories/{key}/security/proxy-scans` returns it on every
@@ -407,11 +423,11 @@ have no core proxy path to gate.
   there, not through the `pods/` route; the same holds for a Composer
   package installed from `source` (a VCS checkout) instead of its `dist`,
   and for a Go client whose `GOPROXY` falls back to `direct`.
-- **One verdict per digest across coordinates.** Verdicts are stored per
-  content digest. A Conan archive carries no reference of its own and a
-  Composer dist usually declares no version, so byte-identical archives
-  requested under two references (or two versions of one package) share the
-  verdict of the first one graded.
+- **One stored verdict per digest.** A digest holds one verdict row, so
+  byte-identical files pulled alternately as two coordinates (see
+  [Verdicts and freshness](#verdicts-and-freshness)) are scanned again on
+  each switch, and the proxy-scans view, the dashboard and the listings show
+  the verdict of the coordinate graded last.
 - **Conan references are graded by name and version only.** The Conan pin
   is the requested `name/version`; the user, channel and revisions are not
   part of what the engine grades, so two revisions of one version get the

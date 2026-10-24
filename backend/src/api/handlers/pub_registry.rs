@@ -2698,6 +2698,7 @@ mod scan_on_proxy_4107 {
             body: archive(NAME, "1.0.0"),
             recorded_path: path,
             file: format!("{NAME}-1.0.0.tar.gz"),
+            pin: None,
         }
     }
 

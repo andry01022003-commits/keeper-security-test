@@ -4368,6 +4368,11 @@ mod scan_on_proxy_4103 {
             body: module_zip(MODULE, VERSION, MODULE),
             recorded_path: upstream,
             file: format!("{VERSION}.zip"),
+            pin: Some(crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Go,
+                MODULE,
+                VERSION,
+            )),
         }
     }
 
