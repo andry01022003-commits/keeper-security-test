@@ -838,6 +838,15 @@ async fn reconcile_unlocked(
 /// referrers API, the GC orphan predicate) trusts the table. Idempotent,
 /// best-effort, and skipped when another replica holds the lock.
 pub async fn run_reconcile(db: &PgPool, registry: Arc<StorageRegistry>) -> Option<ReconcileStats> {
+    run_reconcile_scoped(db, &registry, None).await
+}
+
+/// [`run_reconcile`] optionally scoped to one repository (tests).
+async fn run_reconcile_scoped(
+    db: &PgPool,
+    registry: &StorageRegistry,
+    repository_id: Option<Uuid>,
+) -> Option<ReconcileStats> {
     let locks = PgAdvisoryLock::new(db.clone());
     let backfill_lease = match locks.try_acquire(BACKFILL_LOCK_CLASS, 0).await {
         Ok(Some(lease)) => lease,
@@ -860,7 +869,7 @@ pub async fn run_reconcile(db: &PgPool, registry: Arc<StorageRegistry>) -> Optio
             return None;
         }
     };
-    let stats = reconcile_unlocked(db, &registry, None, BACKFILL_PAGE_SIZE).await;
+    let stats = reconcile_unlocked(db, registry, repository_id, BACKFILL_PAGE_SIZE).await;
     lease.release().await;
     backfill_lease.release().await;
     Some(stats)
@@ -883,6 +892,12 @@ pub async fn run_maintenance(db: PgPool, registry: Arc<StorageRegistry>) {
             .ok()
             .as_deref(),
     );
+    run_maintenance_every(db, registry, interval).await;
+}
+
+/// [`run_maintenance`] with the interval given: one pass now, then one every
+/// `interval_secs` seconds; returns after the first pass when it is `0`.
+async fn run_maintenance_every(db: PgPool, registry: Arc<StorageRegistry>, interval: u64) {
     run_reconcile(&db, registry.clone()).await;
     if interval == 0 {
         return;
@@ -1593,6 +1608,8 @@ mod tests {
     /// `run_backfill` returns immediately without scanning.
     #[tokio::test]
     async fn run_backfill_skips_when_another_replica_holds_the_lock() {
+        // The backfill lock is shared with the reconcile tests below.
+        let _serial = tdh::oci_reindex_serial_lock().await;
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -1865,6 +1882,110 @@ mod tests {
         assert_eq!(
             parse_reconcile_interval(Some("soon")),
             RECONCILE_INTERVAL_SECS_DEFAULT
+        );
+    }
+
+    /// #1683: the locked entry point runs the pass when it gets both locks,
+    /// and releases them afterwards.
+    #[tokio::test]
+    async fn run_reconcile_takes_and_releases_both_locks_1683() {
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let body = image_body("locked-pass-1683");
+        let digest = compute_sha256(&body);
+        persist_image(&fx.pool, fx.repo_id, "v1", &digest, &body).await;
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        age_row(&fx.pool, fx.repo_id, &digest).await;
+
+        let stats = run_reconcile_scoped(&fx.pool, &fs_registry(), Some(fx.repo_id)).await;
+        let locks = PgAdvisoryLock::new(fx.pool.clone());
+        let mut free = true;
+        for obj in [0, RECONCILE_LOCK_OBJ] {
+            match locks.try_acquire(BACKFILL_LOCK_CLASS, obj).await {
+                Ok(Some(lease)) => lease.release().await,
+                _ => free = false,
+            }
+        }
+        let row = manifest_row(&fx.pool, fx.repo_id, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(stats.map(|s| s.rows_removed), Some(1));
+        assert_eq!(row, None);
+        assert!(free, "both locks are released after the pass");
+    }
+
+    /// #1683: another replica holding either lock makes the pass a no-op, and
+    /// a pass that got the first lock but not the second gives the first back.
+    #[tokio::test]
+    async fn run_reconcile_skips_while_another_replica_holds_a_lock_1683() {
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let locks = PgAdvisoryLock::new(pool.clone());
+        let registry = Arc::new(fs_registry());
+
+        let backfill = locks
+            .try_acquire(BACKFILL_LOCK_CLASS, 0)
+            .await
+            .expect("lock query")
+            .expect("lock free in this test");
+        let while_backfill_held = run_reconcile(&pool, registry.clone()).await;
+        backfill.release().await;
+
+        let reconcile = locks
+            .try_acquire(BACKFILL_LOCK_CLASS, RECONCILE_LOCK_OBJ)
+            .await
+            .expect("lock query")
+            .expect("lock free in this test");
+        let while_reconcile_held = run_reconcile(&pool, registry.clone()).await;
+        let backfill_given_back = locks
+            .try_acquire(BACKFILL_LOCK_CLASS, 0)
+            .await
+            .expect("lock query");
+        let given_back = backfill_given_back.is_some();
+        if let Some(lease) = backfill_given_back {
+            lease.release().await;
+        }
+        reconcile.release().await;
+
+        assert_eq!(while_backfill_held, None);
+        assert_eq!(while_reconcile_held, None);
+        assert!(
+            given_back,
+            "the backfill lock is released when the second is busy"
+        );
+    }
+
+    /// #1683: with the schedule disabled (`0`), maintenance runs its one
+    /// startup pass and returns.
+    #[tokio::test]
+    async fn maintenance_with_the_schedule_disabled_returns_after_one_pass_1683() {
+        let _serial = tdh::oci_reindex_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Hold the lock so the pass is a cheap no-op rather than instance-wide.
+        let lease = PgAdvisoryLock::new(pool.clone())
+            .try_acquire(BACKFILL_LOCK_CLASS, 0)
+            .await
+            .expect("lock query")
+            .expect("lock free in this test");
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_maintenance_every(pool.clone(), Arc::new(fs_registry()), 0),
+        )
+        .await;
+        lease.release().await;
+        assert!(
+            finished.is_ok(),
+            "maintenance must return when the schedule is off"
         );
     }
 }
