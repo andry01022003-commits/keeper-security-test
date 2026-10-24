@@ -1799,6 +1799,10 @@ pub struct ListDownloadsQuery {
     pub artifact_id: Option<Uuid>,
     /// Filter to downloads by one user.
     pub user_id: Option<Uuid>,
+    /// Filter on whether the download was attributed to a user: `all`
+    /// (default), `anonymous` (no user, `user_id` is null) or `authenticated`
+    /// (any user). `anonymous` together with `user_id` is rejected (#4839).
+    pub downloader: Option<DownloaderFilter>,
     /// Filter to downloads from one client IP (exact match).
     pub ip: Option<String>,
     /// Inclusive lower bound on `downloaded_at` (RFC 3339).
@@ -1814,6 +1818,21 @@ pub struct ListDownloadsQuery {
     pub repository_id: Option<Uuid>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
+}
+
+/// Which downloaders the listing returns (#4839). Anonymous downloads are
+/// recorded with a null `user_id`, which the UUID-typed `user_id` filter
+/// cannot select.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloaderFilter {
+    /// Every download, attributed or not.
+    #[default]
+    All,
+    /// Only downloads with no authenticated user (`user_id` is null).
+    Anonymous,
+    /// Only downloads attributed to a user.
+    Authenticated,
 }
 
 /// Where a download event was recorded (#4539). Hosted artifacts and proxy
@@ -1918,6 +1937,15 @@ fn push_download_filters(
     if let Some(user_id) = query.user_id {
         builder.push(" AND d.user_id = ").push_bind(user_id);
     }
+    match query.downloader.unwrap_or_default() {
+        DownloaderFilter::All => {}
+        DownloaderFilter::Anonymous => {
+            builder.push(" AND d.user_id IS NULL");
+        }
+        DownloaderFilter::Authenticated => {
+            builder.push(" AND d.user_id IS NOT NULL");
+        }
+    }
     if let Some(ip) = &query.ip {
         builder.push(" AND d.ip_address = ").push_bind(ip);
     }
@@ -1946,6 +1974,18 @@ const DOWNLOAD_EVENTS_FROM: &str = " FROM ( \
        FROM proxy_download_statistics \
      ) d LEFT JOIN artifacts a ON a.id = d.artifact_id";
 
+/// `downloader=anonymous` selects rows with no user, so pairing it with a
+/// `user_id` (query or path) can only ever match nothing: refuse it instead
+/// of answering an empty page (#4839).
+fn validate_downloader_filter(query: &ListDownloadsQuery) -> Result<()> {
+    if query.downloader == Some(DownloaderFilter::Anonymous) && query.user_id.is_some() {
+        return Err(AppError::Validation(
+            "`downloader=anonymous` cannot be combined with `user_id`".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Shared listing core for the three download-telemetry endpoints.
 async fn query_downloads(
     db: &sqlx::PgPool,
@@ -1956,6 +1996,7 @@ async fn query_downloads(
     let offset = ((page - 1) * per_page) as i64;
     let from = parse_rfc3339_bound(query.from.as_deref(), "from")?;
     let to = parse_rfc3339_bound(query.to.as_deref(), "to")?;
+    validate_downloader_filter(query)?;
 
     let mut count_builder = sqlx::QueryBuilder::new("SELECT COUNT(*)");
     count_builder.push(DOWNLOAD_EVENTS_FROM);
@@ -2047,6 +2088,7 @@ pub async fn list_downloads(
         ("source" = Option<DownloadSource>, Query, description = "Filter to `hosted` or `proxy` downloads"),
         ("repository_id" = Option<Uuid>, Query, description = "Filter to downloads served from one repository"),
         ("user_id" = Option<Uuid>, Query, description = "Filter to downloads by one user"),
+        ("downloader" = Option<DownloaderFilter>, Query, description = "`all` (default), `anonymous` (no user) or `authenticated` (any user); `anonymous` with `user_id` is rejected"),
         ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
         ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
         ("page" = Option<u32>, Query),
@@ -2092,6 +2134,7 @@ pub async fn list_downloads_by_ip(
         ("source" = Option<DownloadSource>, Query, description = "Filter to `hosted` or `proxy` downloads"),
         ("repository_id" = Option<Uuid>, Query, description = "Filter to downloads served from one repository"),
         ("ip" = Option<String>, Query, description = "Filter to downloads from one client IP (exact match)"),
+        ("downloader" = Option<DownloaderFilter>, Query, description = "`all` (default) or `authenticated`; `anonymous` is rejected because the path names a user"),
         ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
         ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
         ("page" = Option<u32>, Query),
@@ -2099,6 +2142,7 @@ pub async fn list_downloads_by_ip(
     ),
     responses(
         (status = 200, description = "Downloads by the user", body = DownloadListResponse),
+        (status = 400, description = "Invalid filter parameter, or `downloader=anonymous` with a user"),
         (status = 403, description = "Admin privileges required, or the token is repository-scoped")
     ),
     security(("bearer_auth" = []))
@@ -2756,6 +2800,7 @@ pub async fn delete_proxy_scan_verdicts(
         GuestAccessSource,
         SystemStats,
         ListDownloadsQuery,
+        DownloaderFilter,
         DownloadSource,
         DownloadRecord,
         DownloadListResponse,
@@ -4720,6 +4765,143 @@ mod tests {
         assert_eq!(paged.page, 2);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #4839: `downloader=anonymous|authenticated` selects rows by whether a
+    /// user is attached, on hosted and proxy rows alike, combines with the
+    /// other filters, and refuses `anonymous` together with a user.
+    #[tokio::test]
+    async fn test_query_downloads_downloader_filter() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'dl-downloader', '1.0.0', 10, $3, 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("dl-downloader/{}.bin", Uuid::new_v4()))
+        .bind(format!("{:0>64}", "2"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+        // Two hosted rows (one per kind of downloader) and two proxy rows
+        // recorded under the same repository.
+        for user in [Some(user_id), None] {
+            sqlx::query(
+                "INSERT INTO download_statistics (artifact_id, user_id, ip_address) \
+                 VALUES ($1, $2, '203.0.113.20')",
+            )
+            .bind(artifact_id)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("insert hosted download");
+            sqlx::query(
+                "INSERT INTO proxy_download_statistics (repository_id, path, user_id, ip_address) \
+                 VALUES ($1, 'proxied/pkg.bin', $2, '203.0.113.21')",
+            )
+            .bind(repo_id)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("insert proxy download");
+        }
+
+        let list = |downloader, source| {
+            let pool = pool.clone();
+            async move {
+                query_downloads(
+                    &pool,
+                    &ListDownloadsQuery {
+                        repository_id: Some(repo_id),
+                        downloader,
+                        source,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("query downloads")
+            }
+        };
+
+        assert_eq!(list(None, None).await.total, 4);
+        assert_eq!(list(Some(DownloaderFilter::All), None).await.total, 4);
+
+        let anon = list(Some(DownloaderFilter::Anonymous), None).await;
+        assert_eq!(anon.total, 2, "one hosted and one proxy anonymous row");
+        assert!(anon.downloads.iter().all(|d| d.user_id.is_none()));
+
+        let authed = list(Some(DownloaderFilter::Authenticated), None).await;
+        assert_eq!(authed.total, 2);
+        assert!(authed.downloads.iter().all(|d| d.user_id == Some(user_id)));
+
+        // Combines with the source filter.
+        let anon_proxy = list(
+            Some(DownloaderFilter::Anonymous),
+            Some(DownloadSource::Proxy),
+        )
+        .await;
+        assert_eq!(anon_proxy.total, 1);
+        assert_eq!(anon_proxy.downloads[0].source, DownloadSource::Proxy);
+        assert_eq!(anon_proxy.downloads[0].user_id, None);
+
+        // `authenticated` with a user is redundant but valid.
+        let authed_user = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                repository_id: Some(repo_id),
+                user_id: Some(user_id),
+                downloader: Some(DownloaderFilter::Authenticated),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("authenticated + user_id");
+        assert_eq!(authed_user.total, 2);
+
+        // `anonymous` with a user can only match nothing: refused.
+        let err = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                user_id: Some(user_id),
+                downloader: Some(DownloaderFilter::Anonymous),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    /// #4839: the query string spelling of the filter.
+    #[test]
+    fn test_downloader_filter_query_parsing() {
+        use axum::extract::Query;
+        let parse = |qs: &str| {
+            let uri: axum::http::Uri = format!("/downloads?{qs}").parse().unwrap();
+            Query::<ListDownloadsQuery>::try_from_uri(&uri).map(|q| q.0.downloader)
+        };
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(
+            parse("downloader=all").unwrap(),
+            Some(DownloaderFilter::All)
+        );
+        assert_eq!(
+            parse("downloader=anonymous").unwrap(),
+            Some(DownloaderFilter::Anonymous)
+        );
+        assert_eq!(
+            parse("downloader=authenticated").unwrap(),
+            Some(DownloaderFilter::Authenticated)
+        );
+        assert!(parse("downloader=bots").is_err());
     }
 
     /// #4539: the download listing returns proxy pull-through serves alongside
