@@ -45,6 +45,10 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
 pub const MIN_INTERVAL_SECS: u64 = 10;
 /// Rows deleted per statement.
 pub const DOWNLOAD_STATS_RETENTION_BATCH_SIZE: i64 = 5000;
+/// The longest period accepted (about 1000 years); a larger value is lowered
+/// to it. `NOW() - make_interval(days => n)` is out of the timestamp range for
+/// an `n` near `i32::MAX`, which would fail every pass.
+pub const MAX_RETENTION_DAYS: i32 = 365_000;
 
 /// The tables a pass trims, in the order it trims them, each with its batch
 /// statement.
@@ -66,12 +70,13 @@ const RETAINED_TABLES: [(&str, &str); 2] = [
 ];
 
 /// The retention period an environment value configures: `Some(days)` for a
-/// positive integer, `None` (retention off) for anything else.
+/// positive integer (at most [`MAX_RETENTION_DAYS`]), `None` (retention off)
+/// for anything else.
 pub fn retention_days_from_value(value: Option<&str>) -> Option<i32> {
     value
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|days| *days > 0)
-        .map(|days| i32::try_from(days).unwrap_or(i32::MAX))
+        .map(|days| days.min(i64::from(MAX_RETENTION_DAYS)) as i32)
 }
 
 /// The pass interval an environment value configures.
@@ -194,7 +199,11 @@ mod tests {
         assert_eq!(retention_days_from_value(None), None);
         assert_eq!(
             retention_days_from_value(Some("99999999999")),
-            Some(i32::MAX)
+            Some(MAX_RETENTION_DAYS)
+        );
+        assert_eq!(
+            retention_days_from_value(Some("2147483647")),
+            Some(MAX_RETENTION_DAYS)
         );
         assert_eq!(interval_secs_from_value(None), DEFAULT_INTERVAL_SECS);
         assert_eq!(interval_secs_from_value(Some("120")), 120);

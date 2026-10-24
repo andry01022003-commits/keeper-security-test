@@ -10,7 +10,7 @@ without bound (#4541).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DOWNLOAD_STATS_RETENTION_DAYS` | unset (off) | Delete statistics rows whose `downloaded_at` is older than this many days. Zero, negative or not a number also means off. |
+| `DOWNLOAD_STATS_RETENTION_DAYS` | unset (off) | Delete statistics rows whose `downloaded_at` is older than this many days. Zero, negative or not a number also means off; a value above 365000 is lowered to it. |
 | `DOWNLOAD_STATS_RETENTION_INTERVAL_SECS` | `3600` | How often the pass runs (at least 10 seconds). |
 
 With a period set, a scheduler pass trims both tables every interval. It runs
