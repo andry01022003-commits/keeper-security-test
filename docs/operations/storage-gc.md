@@ -53,14 +53,17 @@ first takes the key's `oci_gc_candidates` slot and checks that the object is
 stored:
 
 - While GC holds the record as a lease for a delete it is running (it took
-  the record in the last 15 minutes; the `leased_at` column, migration 301),
+  the record in the last 15 minutes; the `leased_at` column, migration 302),
   the delete may still land, so the upload waits for it for up to 5 seconds.
   GC deletes right after its claim, so the wait normally ends quickly. A
   record a repository delete wrote, which only waits out
   `BLOB_GC_MIN_AGE_SECS`, is not a lease and does not hold uploads up.
-- If the object is gone, the upload writes it again and re-checks. A chunked
-  completion releases its lease instead and answers `503`; retrying the
-  completion writes the object again from the staged chunks.
+- If the object is gone, the upload writes it again from the bytes it still
+  holds (the request body, its staged copy, or a body the deduplication left
+  unread) and re-checks. An upload that streamed its body straight to the
+  final key no longer holds it and answers `503` instead. A chunked completion
+  releases its lease and answers `503`; retrying the completion writes the
+  object again from the staged chunks.
 - If the lease outlives the wait, which happens when a GC delete failed less
   than 15 minutes ago, the upload is answered `503 SERVICE_UNAVAILABLE`
   ("retry the upload") and commits nothing. A retry after the lease ages out
@@ -68,7 +71,8 @@ stored:
   object.
 
 The slot is held only for the commit and a HEAD of the object, never across a
-write. Format handlers that write their own content-addressed rows outside the
+write. Uploads of identical content take the same slot, so their commits run
+one after another (each waiting on a database connection meanwhile). Format handlers that write their own content-addressed rows outside the
 shared upload service are not covered yet.
 
 That re-check consults every reference table, which is wider than the

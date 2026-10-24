@@ -557,7 +557,7 @@ pub(crate) enum CasKeyGuard {
 pub(crate) const CAS_COMMIT_GC_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long after a storage GC pass took an `oci_gc_candidates` row as a lease
-/// (`leased_at`, migration 301) the upload commit guard assumes its delete may
+/// (`leased_at`, migration 302) the upload commit guard assumes its delete may
 /// still be in flight (#4980). GC deletes a claimed key right after claiming it,
 /// so a lease older than this belongs to a delete that failed or a pass that
 /// stopped; the candidate sweep retries those with a fresh re-check. The same
@@ -582,7 +582,7 @@ const GC_DELETE_LEASE_SQL: &str = "INTERVAL '15 minutes'";
 ///   keeps the object;
 /// * a candidate sweep skips the locked row, or re-checks after this commit;
 /// * a GC claim that journaled or leased the row before this point stamped
-///   its `leased_at` (migration 301), which is reported as
+///   its `leased_at` (migration 302), which is reported as
 ///   [`CasKeyGuard::Collecting`] for 15 minutes: its delete may not have run
 ///   yet and its re-check may already have passed, so the upload must not
 ///   commit.
@@ -6791,6 +6791,10 @@ mod gc_commit_guard_tests {
     const BACKEND: &str = "gc-race-4980";
 
     struct Race {
+        // Storage GC tests age and sweep `oci_gc_candidates` cluster-wide
+        // (for example `age_oci_gc_candidates`), which would lapse or consume
+        // the journal rows these tests seed; serialize with them.
+        _serial: tokio::sync::MutexGuard<'static, ()>,
         fx: tdh::Fixture,
         storage: Arc<dyn StorageBackend>,
         registry: Arc<crate::storage::StorageRegistry>,
@@ -6804,6 +6808,7 @@ mod gc_commit_guard_tests {
     /// key for `data` is referenced only by a row trashed past retention, so a
     /// GC pass claims and deletes it.
     async fn setup() -> Option<Race> {
+        let serial = crate::services::storage_gc_service::storage_gc_test_guard().await;
         let fx = tdh::Fixture::setup("local", "generic").await?;
         let data = Bytes::from(format!("gc commit race {}", Uuid::new_v4()));
         let key =
@@ -6850,6 +6855,7 @@ mod gc_commit_guard_tests {
         .await
         .expect("trash the first copy");
         Some(Race {
+            _serial: serial,
             fx,
             storage,
             registry,

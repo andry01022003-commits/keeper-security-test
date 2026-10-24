@@ -1,4 +1,4 @@
--- 301_oci_gc_candidates_leased_at.sql
+-- 302_oci_gc_candidates_leased_at.sql
 -- #4980: record when a storage GC pass took an `oci_gc_candidates` row as a
 -- lease for a delete it is about to run, so the upload commit guard can tell
 -- an in-flight delete from a candidate that is only waiting out its grace

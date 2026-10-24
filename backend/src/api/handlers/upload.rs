@@ -545,7 +545,7 @@ async fn get_session_status(
             The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`; no bytes are written and the session stays open, \
             so this request can be repeated once the occupying artifact is deleted.", body = crate::api::openapi::ErrorResponse),
         (status = 410, description = "Session expired, or created by an earlier server version and not resumable; start a new session", body = crate::api::openapi::ErrorResponse),
-        (status = 503, description = "Staging storage or database temporarily unavailable; the session is left completable, retry (honour Retry-After)", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "Staging storage or database temporarily unavailable, or storage garbage collection is removing identical content at this moment (#4980); the session is left completable, retry (honour Retry-After)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -5056,6 +5056,9 @@ mod tests {
     /// lease, and the same session completes once the lease is gone.
     #[tokio::test]
     async fn complete_waits_out_a_gc_delete_lease_then_refuses_retryably_4980() {
+        // Serialized with the storage GC tests, which age and sweep
+        // `oci_gc_candidates` cluster-wide and would lapse the seeded lease.
+        let _serial = crate::services::storage_gc_service::storage_gc_test_guard().await;
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };

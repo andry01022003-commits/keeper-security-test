@@ -9873,6 +9873,8 @@ pub async fn list_artifact_versions(
             Of several concurrent uploads to one free path exactly one is answered 201; the others get this 409 (#4832).", body = crate::api::openapi::ErrorResponse),
         (status = 412, description = "An `If-Match` or `If-None-Match` precondition does not hold against the live artifact (`code: PRECONDITION_FAILED`, #4186). \
             Evaluated before the body is read and again, with the artifact row locked, when the upload commits: of several conditional uploads against one ETag exactly one succeeds and the others get 412.", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "Storage garbage collection is removing identical content at this moment (`code: SERVICE_UNAVAILABLE`, #4980). \
+            The upload waited up to 5 seconds for the delete to finish and committed nothing; retry the upload.", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
