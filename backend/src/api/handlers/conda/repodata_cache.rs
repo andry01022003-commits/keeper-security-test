@@ -1,8 +1,9 @@
 //! Conda as the second consumer of the metadata revision cache (#4174).
 //!
 //! A hosted subdir's documents (`repodata.json` and its `.zst`/`.bz2`
-//! encodings, `current_repodata.json`, `run_exports.json` and the bootstrap
-//! `repodata.json.jlap`) are rendered together from one catalog walk and
+//! encodings, `current_repodata.json`, `run_exports.json` and the
+//! `repodata.json.jlap` recorded for them, [`super::jlap_store`]) are
+//! rendered together from one catalog walk and
 //! kept under the subdir's revision ([`super::shard_store::subdir_state`]);
 //! the CEP-16 shard index is kept the same way from the stored shard map, and
 //! `channeldata.json` under the repository's revision. A request reads the
@@ -100,7 +101,7 @@ impl CachedRender for Prepared {
 /// Every document of one hosted subdir at one revision.
 pub(crate) struct SubdirDocs {
     /// `repodata.json` as served (pretty-printed); what `.sig` signs and the
-    /// JLAP footer hashes.
+    /// JLAP footer hashes. `zst` and `bz2` hold these same bytes.
     pub json: Prepared,
     pub zst: Prepared,
     /// Rendered from `zst` by the first `.bz2` request of the revision and
@@ -109,6 +110,7 @@ pub(crate) struct SubdirDocs {
     pub bz2: tokio::sync::OnceCell<Prepared>,
     pub current: Prepared,
     pub run_exports: Prepared,
+    /// The stored JLAP whose footer names `json`'s hash (#4175).
     pub jlap: Prepared,
 }
 
@@ -376,6 +378,7 @@ pub(crate) async fn hosted_subdir_docs(
                     db.clone(),
                     repo_id,
                     subdir.clone(),
+                    state.revision,
                     state.now,
                 ))
             })
@@ -426,20 +429,37 @@ pub(crate) async fn with_bz2(docs: Arc<SubdirDocs>) -> Result<Arc<SubdirDocs>, R
 }
 
 /// Render every document of a hosted subdir with one cursor walk of the
-/// catalog ([`super::repodata_render`]), deciding visibility at `now`.
+/// catalog ([`super::repodata_render`]), deciding visibility at `now`, and
+/// record the new `repodata.json` in the subdir's stored JLAP before any of
+/// them is kept or served ([`super::jlap_store::record`]), so the JLAP served
+/// with a revision's `repodata.json` always ends at that document.
 async fn render_subdir_docs(
     db: PgPool,
     repo_id: Uuid,
     subdir: String,
+    revision: i64,
     now: DateTime<Utc>,
 ) -> Result<SubdirDocs, Response> {
     let removed = super::list_removed_artifacts_at(&db, repo_id, &subdir, now).await?;
     let rendered =
         super::repodata_render::render_subdir(&db, repo_id, &subdir, now, &removed).await?;
-    let jlap = super::build_bootstrap_jlap(&rendered.json);
+    let json = Bytes::from(rendered.json);
+    let zst = Bytes::from(rendered.zst);
+    let jlap = match super::jlap_store::record(&db, repo_id, &subdir, revision, &json, &zst).await {
+        Ok(jlap) => jlap,
+        Err(e) => {
+            // Repodata is still served; a JLAP with no patches makes a
+            // client download the whole document, which is correct.
+            tracing::warn!(
+                repo = %repo_id, subdir = %subdir, error = %e,
+                "conda JLAP: could not record the revision; serving a JLAP without patches"
+            );
+            super::build_bootstrap_jlap(&json)
+        }
+    };
     Ok(SubdirDocs {
-        json: Prepared::new(rendered.json),
-        zst: Prepared::new(rendered.zst),
+        json: Prepared::new(json),
+        zst: Prepared::new(zst),
         bz2: tokio::sync::OnceCell::new(),
         current: Prepared::new(rendered.current),
         run_exports: Prepared::new(rendered.run_exports),

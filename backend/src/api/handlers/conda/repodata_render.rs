@@ -13,8 +13,9 @@
 //!    `repodata_document` makes over the full listing: per filename the
 //!    oldest row, per package name the newest row for `current_repodata.json`;
 //! 2. the listed rows, in filename order, [`ROWS_PER_CHUNK`] at a time, each
-//!    record written straight into the pretty `repodata.json`, the pretty
-//!    `current_repodata.json` and the zstd encoder of the compact document.
+//!    record written straight into the pretty `repodata.json` (fed on into
+//!    the zstd encoder chunk by chunk, so `.zst` holds the same bytes) and the
+//!    pretty `current_repodata.json`.
 //!
 //! What is held is the output plus one chunk of rows, so peak memory is
 //! bounded by the encoded documents, not by the row set. The bytes are the
@@ -39,7 +40,7 @@ const ROWS_PER_CHUNK: usize = 512;
 pub(crate) struct RenderedSubdir {
     /// `repodata.json` as served: pretty-printed.
     pub json: Vec<u8>,
-    /// `repodata.json.zst`: the compact document, zstd level 3.
+    /// `repodata.json.zst`: zstd (level 3) of exactly the `json` bytes.
     pub zst: Vec<u8>,
     /// `current_repodata.json`, pretty-printed.
     pub current: Vec<u8>,
@@ -206,56 +207,33 @@ impl PrettyDoc {
     }
 }
 
-/// The compact `repodata.json` written member by member into zstd, the
-/// bytes `RepodataEncoding::Zst.encode` makes of the whole document.
-struct CompactZst {
+/// `repodata.json.zst`: the pretty `repodata.json` bytes fed into zstd as
+/// they are written, so the compressed document decompresses to exactly the
+/// bytes `repodata.json` serves. A JLAP client hashes whichever encoding it
+/// downloaded, and the JLAP chain names that one hash (#4175).
+struct ZstTee {
     encoder: zstd::stream::write::Encoder<'static, Vec<u8>>,
-    in_section: usize,
+    /// Bytes of the pretty document already written into the encoder.
+    fed: usize,
 }
 
-impl CompactZst {
-    fn new(subdir: &str) -> Result<Self, Response> {
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).map_err(failed)?;
-        encoder.write_all(b"{\"info\":").map_err(failed)?;
-        serde_json::to_writer(&mut encoder, &serde_json::json!({ "subdir": subdir }))
-            .map_err(failed)?;
+impl ZstTee {
+    fn new() -> Result<Self, Response> {
         Ok(Self {
-            encoder,
-            in_section: 0,
+            encoder: zstd::stream::write::Encoder::new(Vec::new(), 3).map_err(failed)?,
+            fed: 0,
         })
     }
 
-    fn open_section(&mut self, key: &str) -> Result<(), Response> {
-        self.encoder.write_all(b",").map_err(failed)?;
-        serde_json::to_writer(&mut self.encoder, key).map_err(failed)?;
-        self.encoder.write_all(b":").map_err(failed)?;
-        self.in_section = 0;
+    /// Feed what `json` gained since the last call.
+    fn feed(&mut self, json: &[u8]) -> Result<(), Response> {
+        self.encoder.write_all(&json[self.fed..]).map_err(failed)?;
+        self.fed = json.len();
         Ok(())
     }
 
-    fn member(&mut self, filename: &str, entry: &serde_json::Value) -> Result<(), Response> {
-        self.encoder
-            .write_all(if self.in_section == 0 { b"{" } else { b"," })
-            .map_err(failed)?;
-        serde_json::to_writer(&mut self.encoder, filename).map_err(failed)?;
-        self.encoder.write_all(b":").map_err(failed)?;
-        serde_json::to_writer(&mut self.encoder, entry).map_err(failed)?;
-        self.in_section += 1;
-        Ok(())
-    }
-
-    fn close_section(&mut self) -> Result<(), Response> {
-        self.encoder
-            .write_all(if self.in_section == 0 { b"{}" } else { b"}" })
-            .map_err(failed)
-    }
-
-    fn finish(mut self, removed: &serde_json::Value) -> Result<Vec<u8>, Response> {
-        self.encoder.write_all(b",\"removed\":").map_err(failed)?;
-        serde_json::to_writer(&mut self.encoder, removed).map_err(failed)?;
-        self.encoder
-            .write_all(b",\"repodata_version\":1}")
-            .map_err(failed)?;
+    fn finish(mut self, json: &[u8]) -> Result<Vec<u8>, Response> {
+        self.feed(json)?;
         self.encoder.finish().map_err(failed)
     }
 }
@@ -263,7 +241,7 @@ impl CompactZst {
 /// The three streamed documents, moved onto the blocking pool per chunk.
 struct Writers {
     json: PrettyDoc,
-    zst: CompactZst,
+    zst: ZstTee,
     current: PrettyDoc,
 }
 
@@ -318,23 +296,22 @@ async fn rows_by_id(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, CondaArti
 pub(crate) fn render_empty(subdir: &str) -> Result<RenderedSubdir, Response> {
     let removed = serde_json::json!([]);
     let mut json = PrettyDoc::new(subdir)?;
-    let mut zst = CompactZst::new(subdir)?;
     let mut current = PrettyDoc::new(subdir)?;
     for section in ["packages", "packages.conda"] {
         json.open_section(section)?;
-        zst.open_section(section)?;
         current.open_section(section)?;
         json.close_section();
-        zst.close_section()?;
         current.close_section();
     }
+    let json = json.finish(&removed)?;
+    let zst = ZstTee::new()?.finish(&json)?;
     let run_exports = serde_json::json!({
         "info": { "subdir": subdir },
         "packages": {},
     });
     Ok(RenderedSubdir {
-        json: json.finish(&removed)?,
-        zst: zst.finish(&removed)?,
+        json,
+        zst,
         current: current.finish(&removed)?,
         run_exports: serde_json::to_vec_pretty(&run_exports).map_err(failed)?,
     })
@@ -367,14 +344,13 @@ pub(crate) async fn render_subdir_chunked(
     let removed = serde_json::json!(removed);
     let mut writers = Writers {
         json: PrettyDoc::new(subdir)?,
-        zst: CompactZst::new(subdir)?,
+        zst: ZstTee::new()?,
         current: PrettyDoc::new(subdir)?,
     };
     let mut run_exports = serde_json::Map::new();
 
     for (section, v2) in [("packages", false), ("packages.conda", true)] {
         writers.json.open_section(section)?;
-        writers.zst.open_section(section)?;
         writers.current.open_section(section)?;
         // Filename order, the order a sorted map serialises in; a filename
         // may be listed by one document and not the other.
@@ -410,19 +386,18 @@ pub(crate) async fn render_subdir_chunked(
                 for (filename, full, current) in &entries {
                     if let Some(entry) = full {
                         writers.json.member(filename, entry)?;
-                        writers.zst.member(filename, entry)?;
                     }
                     if let Some(entry) = current {
                         writers.current.member(filename, entry)?;
                     }
                 }
+                writers.zst.feed(&writers.json.out)?;
                 Ok(writers)
             })
             .await
             .map_err(failed)??;
         }
         writers.json.close_section();
-        writers.zst.close_section()?;
         writers.current.close_section();
     }
 
@@ -432,9 +407,11 @@ pub(crate) async fn render_subdir_chunked(
             "info": { "subdir": subdir },
             "packages": run_exports,
         });
+        let json = writers.json.finish(&removed)?;
+        let zst = writers.zst.finish(&json)?;
         Ok(RenderedSubdir {
-            json: writers.json.finish(&removed)?,
-            zst: writers.zst.finish(&removed)?,
+            json,
+            zst,
             current: writers.current.finish(&removed)?,
             run_exports: serde_json::to_vec_pretty(&run_exports).map_err(failed)?,
         })

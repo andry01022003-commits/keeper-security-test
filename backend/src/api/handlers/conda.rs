@@ -10,7 +10,8 @@
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.bz2        - Compressed repodata
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.sig        - Repodata signature (raw bytes)
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.zst        - Compressed repodata (zstd)
-//!   GET  /conda/{repo_key}/{subdir}/repodata.json.jlap       - JLAP incremental updates
+//!   GET  /conda/{repo_key}/{subdir}/repodata.jlap            - JLAP incremental updates
+//!   GET  /conda/{repo_key}/{subdir}/repodata.json.jlap       - the same (1.11 name)
 //!   GET  /conda/{repo_key}/{subdir}/current_repodata.json    - Current (latest) repodata
 //!   GET  /conda/{repo_key}/{subdir}/run_exports.json         - Run exports metadata (CEP-12)
 //!   GET  /conda/{repo_key}/{subdir}/patch_instructions.json  - Repodata patch instructions (remote only)
@@ -63,6 +64,10 @@ use crate::services::curation::attestation_verify::{self, cep27};
 use crate::services::signing_service::SigningService;
 
 mod current_repodata;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod jlap_router_tests;
+mod jlap_store;
 mod merge_gate;
 mod package_gate;
 mod repodata_cache;
@@ -503,11 +508,6 @@ async fn prepared_response(
 // The checksum chain uses BLAKE2b-256 in keyed mode where each line's
 // checksum depends on the previous line's checksum.
 
-/// JLAP patch step limit. If a diff produces more operations than this,
-/// skip the patch (clients will fall back to full download).
-#[allow(dead_code)]
-const JLAP_PATCH_STEPS_LIMIT: usize = 8192;
-
 /// Compute BLAKE2b-256 keyed hash (32-byte digest).
 ///
 /// Uses BLAKE2b in MAC mode with a 32-byte key as specified by the JLAP
@@ -541,145 +541,44 @@ fn blake2_256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Generate RFC 6902 JSON Patch operations to transform `old` repodata into `new`.
-///
-/// Only diffs the `packages` and `packages.conda` maps (the volatile parts).
-/// Returns the operations as a JSON array, or None if there are no changes.
-#[allow(dead_code)]
+/// RFC 6902 operations turning `old` repodata into `new`
+/// ([`jlap_store::diff_documents`] over the serialised documents).
+#[cfg(test)]
 fn generate_repodata_patch(
     old: &serde_json::Value,
     new: &serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
-    let mut ops = Vec::new();
-
-    for section in &["packages", "packages.conda"] {
-        let old_map = old.get(section).and_then(|v| v.as_object());
-        let new_map = new.get(section).and_then(|v| v.as_object());
-
-        let old_map = old_map.cloned().unwrap_or_default();
-        let new_map = new_map.cloned().unwrap_or_default();
-
-        // Removed packages
-        for key in old_map.keys() {
-            if !new_map.contains_key(key) {
-                ops.push(serde_json::json!({
-                    "op": "remove",
-                    "path": format!("/{}/{}", section, escape_json_pointer(key)),
-                }));
-            }
-        }
-
-        // Added packages
-        for (key, value) in &new_map {
-            if !old_map.contains_key(key) {
-                ops.push(serde_json::json!({
-                    "op": "add",
-                    "path": format!("/{}/{}", section, escape_json_pointer(key)),
-                    "value": value,
-                }));
-            }
-        }
-
-        // Changed packages
-        for (key, new_value) in &new_map {
-            if let Some(old_value) = old_map.get(key) {
-                if old_value != new_value {
-                    ops.push(serde_json::json!({
-                        "op": "replace",
-                        "path": format!("/{}/{}", section, escape_json_pointer(key)),
-                        "value": new_value,
-                    }));
-                }
-            }
-        }
-    }
-
-    // Also diff the "removed" array
-    let old_removed = old.get("removed");
-    let new_removed = new.get("removed");
-    if old_removed != new_removed {
-        if let Some(nr) = new_removed {
-            ops.push(serde_json::json!({
-                "op": "replace",
-                "path": "/removed",
-                "value": nr,
-            }));
-        }
-    }
-
-    if ops.is_empty() {
-        None
-    } else if ops.len() > JLAP_PATCH_STEPS_LIMIT {
-        tracing::debug!(
-            ops = ops.len(),
-            limit = JLAP_PATCH_STEPS_LIMIT,
-            "JLAP patch too large, skipping"
-        );
-        None
-    } else {
-        Some(ops)
-    }
+    jlap_store::diff_documents(
+        &serde_json::to_vec(old).unwrap(),
+        &serde_json::to_vec(new).unwrap(),
+    )
+    .unwrap()
 }
 
 /// Escape a JSON Pointer token per RFC 6901 (~ -> ~0, / -> ~1).
-#[allow(dead_code)]
 fn escape_json_pointer(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
 
-/// Build a complete JLAP file from a series of patch entries.
-///
-/// Each entry is (from_hash, patch_ops, to_hash). The function constructs
-/// the IV line, patch lines, metadata line, and trailing checksum.
+/// Build a complete JLAP file from a series of patch entries, each
+/// `(from_hash, patch_ops, to_hash)`, starting from the zero IV.
+#[cfg(test)]
 fn build_jlap_file(
     patches: &[([u8; 32], Vec<serde_json::Value>, [u8; 32])],
     latest_hash: &[u8; 32],
 ) -> Vec<u8> {
-    let mut lines: Vec<String> = Vec::new();
-    let iv = [0u8; 32];
-
-    // Line 0: IV (all zeros for a fresh JLAP file)
-    lines.push(hex::encode(iv));
-
-    // Patch lines
-    for (from_hash, ops, to_hash) in patches {
-        let patch_line = serde_json::json!({
-            "from": hex::encode(from_hash),
-            "patch": ops,
-            "to": hex::encode(to_hash),
-        });
-        // Compact JSON, sorted keys
-        lines.push(sorted_compact_json(&patch_line));
+    let mut jlap = jlap_store::Jlap::fresh(*latest_hash);
+    for (from, ops, to) in patches {
+        jlap.append(from, ops.clone(), *to);
     }
-
-    // Metadata line
-    let metadata = serde_json::json!({
-        "latest": hex::encode(latest_hash),
-        "url": "repodata.json",
-    });
-    lines.push(sorted_compact_json(&metadata));
-
-    // Compute checksum chain to produce trailing checksum
-    let mut checksum = iv;
-    for line in &lines[1..] {
-        checksum = blake2_256_keyed(line.as_bytes(), &checksum);
-    }
-
-    // Trailing checksum line
-    lines.push(hex::encode(checksum));
-
-    // Join with newlines, no trailing newline
-    lines.join("\n").into_bytes()
+    jlap.latest = *latest_hash;
+    jlap.render()
 }
 
-/// Build a minimal "bootstrap" JLAP file with no patches.
-///
-/// This tells clients the current repodata hash without providing any
-/// incremental patches. Clients will compare their cached hash against
-/// `latest` and fall back to a full download if they differ.
+/// A JLAP file with no patches naming the hash of `repodata_bytes`: what a
+/// subdir with no stored revision history serves.
 fn build_bootstrap_jlap(repodata_bytes: &[u8]) -> Vec<u8> {
-    let hash = blake2_256(repodata_bytes);
-    build_jlap_file(&[], &hash)
+    jlap_store::bootstrap(repodata_bytes)
 }
 
 /// Serialize a JSON value with sorted keys and compact separators.
@@ -715,7 +614,6 @@ fn sorted_compact_json(value: &serde_json::Value) -> String {
 /// Verify a JLAP file's checksum chain integrity.
 ///
 /// Returns Ok(()) if the chain is valid, Err with a description if not.
-#[allow(dead_code)]
 fn verify_jlap_chain(content: &[u8]) -> Result<(), String> {
     let text = std::str::from_utf8(content).map_err(|e| format!("invalid UTF-8: {}", e))?;
     let lines: Vec<&str> = text.split('\n').collect();
@@ -780,7 +678,10 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/:subdir/repodata.json.zst",
             get(repodata_json_zst),
         )
-        // JLAP incremental repodata updates
+        // JLAP incremental repodata updates. conda and rattler request
+        // `repodata.jlap` (the JLAP specification's name, which conda-forge
+        // serves); `repodata.json.jlap` is the name 1.11 served it under.
+        .route("/:repo_key/:subdir/repodata.jlap", get(repodata_json_jlap))
         .route(
             "/:repo_key/:subdir/repodata.json.jlap",
             get(repodata_json_jlap),
@@ -926,6 +827,10 @@ fn token_routes(conda: &str) -> Router<SharedState> {
         .route(
             &format!("/:token{conda}/:repo_key/:subdir/repodata.json.zst"),
             get(repodata_json_zst_with_token),
+        )
+        .route(
+            &format!("/:token{conda}/:repo_key/:subdir/repodata.jlap"),
+            get(repodata_json_jlap_with_token),
         )
         .route(
             &format!("/:token{conda}/:repo_key/:subdir/repodata.json.jlap"),
@@ -1997,35 +1902,6 @@ impl RepodataEncoding {
         }
     }
 
-    /// Serialize `repodata` in this encoding. The compressed encodings
-    /// serialize straight into the compressor, so the uncompressed document
-    /// (hundreds of MiB for a merged conda-forge subdir) is never held in
-    /// memory next to its compressed form (#4608).
-    #[allow(clippy::result_large_err)]
-    #[cfg(test)]
-    fn encode<T: serde::Serialize + ?Sized>(&self, repodata: &T) -> Result<Vec<u8>, Response> {
-        fn failed(e: impl std::fmt::Display) -> Response {
-            tracing::error!("repodata encoding error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        }
-        const BUF: usize = 256 * 1024;
-        match self {
-            Self::Json => Ok(serde_json::to_vec_pretty(repodata).unwrap()),
-            Self::Bz2 => {
-                let mut out = std::io::BufWriter::with_capacity(
-                    BUF,
-                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default()),
-                );
-                serde_json::to_writer(&mut out, repodata).map_err(failed)?;
-                out.into_inner()
-                    .map_err(|e| failed(e.error()))?
-                    .finish()
-                    .map_err(failed)
-            }
-            Self::Zst => Self::encode_zst_counted(repodata).map(|(body, _)| body),
-        }
-    }
-
     /// Serialize `repodata` as compact JSON straight into zstd, returning the
     /// compressed document and the length of the JSON it holds. This is how
     /// a merged virtual `repodata.json` is kept; its other encodings are
@@ -2845,32 +2721,31 @@ async fn repodata_json_zst(
     .await
 }
 // ---------------------------------------------------------------------------
-// GET /conda/{repo_key}/{subdir}/repodata.json.jlap
+// GET /conda/{repo_key}/{subdir}/repodata.jlap (and repodata.json.jlap)
 // ---------------------------------------------------------------------------
 
 /// Return a JLAP (JSON Lines And Patches) file for incremental repodata updates.
 ///
-/// Conda 23.9+ and mamba clients request this endpoint first to check for
-/// incremental updates. The JLAP file contains a BLAKE2b-256 checksum chain
-/// and RFC 6902 JSON patches that transform old repodata into current.
+/// conda (with `--experimental=jlap`) and rattler request this endpoint to
+/// update a cached `repodata.json` without downloading it again. The file is
+/// the subdir's stored JLAP ([`jlap_store`], #4175): one RFC 6902 patch line
+/// per kept change of the subdir, a footer naming the BLAKE2b-256 of the
+/// `repodata.json` served at the same revision, and the BLAKE2b checksum
+/// chain over every line. It is kept with that revision's documents, so it
+/// never names a document other than the one `repodata.json` serves next to
+/// it.
 ///
-/// Currently serves a "bootstrap" JLAP that communicates the current repodata
-/// hash without patches. Clients compare against their cached hash and fall
-/// back to a full download when no applicable patches exist.
+/// Range requests (`Range: bytes=<pos>-`, what conda sends with the position
+/// of the footer it last saw) are answered `206` with the bytes from there:
+/// new patch lines are appended where the old footer was, so those bytes
+/// are exactly what changed. A position past the end is `416`, which makes
+/// the client fetch the whole file.
 ///
-/// Supports HTTP Range requests (`Accept-Ranges: bytes`) so clients can
-/// fetch only newly appended lines on subsequent requests.
-///
-/// Local repos only (#2915). The bootstrap JLAP's footer advertises `latest` =
-/// the BLAKE2b hash of the document [`build_repodata`] produces from our own DB
-/// rows, and that is only the document `repodata.json` actually serves for a
-/// Local repo. For a Remote repo `repodata.json` serves the UPSTREAM document,
-/// and for a Virtual repo the aggregation of its members' — so the advertised
-/// hash can never match what the client holds, the client concludes its cached
-/// index is stale on every single run, and it refetches the full
-/// `repodata.json` anyway (having paid for a JLAP round trip first). 404ing is
-/// the documented "no JLAP available" signal and sends the client straight to
-/// the full fetch, which is the outcome it would have reached regardless.
+/// Local repos only (#2915). For a Remote repo `repodata.json` serves the
+/// UPSTREAM document, and for a Virtual repo the aggregation of its
+/// members', so a hash of a document we render could never match what the
+/// client holds. 404ing is the documented "no JLAP available" signal and
+/// sends the client straight to the full fetch.
 async fn repodata_json_jlap(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -2885,7 +2760,7 @@ async fn repodata_json_jlap(
         )
             .into_response());
     }
-    // The bootstrap JLAP of the kept `repodata.json` (#4174).
+    // The stored JLAP kept with the subdir's current revision (#4175).
     let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir).await?;
     let jlap_body = docs.jlap.body.clone();
     let etag = docs.jlap.etag.clone();
@@ -2895,24 +2770,21 @@ async fn repodata_json_jlap(
         return Ok(not_modified);
     }
 
-    // Check for Range request
-    if let Some(range_header) = headers
+    let range = headers
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok())
-    {
-        if let Some(start) = parse_range_start(range_header, jlap_body.len()) {
-            let end = jlap_body.len() - 1;
-            if start > end {
-                // 416 Range Not Satisfiable
-                return Ok(Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header("Content-Range", format!("bytes */{}", jlap_body.len()))
-                    .body(Body::empty())
-                    .unwrap());
-            }
-
-            let slice = &jlap_body[start..=end];
-            return Ok(Response::builder()
+        .and_then(|h| parse_byte_range(h, jlap_body.len()));
+    match range {
+        Some(Err(())) => Ok(Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header("Content-Range", format!("bytes */{}", jlap_body.len()))
+            .header("Accept-Ranges", "bytes")
+            .header(ETAG, &etag)
+            .body(Body::empty())
+            .unwrap()),
+        Some(Ok((start, end))) => {
+            let slice = jlap_body.slice(start..=end);
+            Ok(Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_TYPE, "application/json")
                 .header(CONTENT_LENGTH, slice.len().to_string())
@@ -2923,40 +2795,54 @@ async fn repodata_json_jlap(
                 .header("Accept-Ranges", "bytes")
                 .header(ETAG, &etag)
                 .header(CACHE_CONTROL, "public, max-age=60")
-                .body(Body::from(slice.to_vec()))
-                .unwrap());
+                .body(Body::from(slice))
+                .unwrap())
         }
+        None => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_LENGTH, jlap_body.len().to_string())
+            .header("Accept-Ranges", "bytes")
+            .header(ETAG, &etag)
+            .header(CACHE_CONTROL, "public, max-age=60")
+            .body(Body::from(jlap_body))
+            .unwrap()),
     }
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .header(CONTENT_LENGTH, jlap_body.len().to_string())
-        .header("Accept-Ranges", "bytes")
-        .header(ETAG, &etag)
-        .header(CACHE_CONTROL, "public, max-age=60")
-        .body(Body::from(jlap_body))
-        .unwrap())
 }
 
-/// Parse a `Range: bytes=N-` header and return the start offset.
-fn parse_range_start(range_header: &str, total_len: usize) -> Option<usize> {
-    let range = range_header.strip_prefix("bytes=")?;
-    if let Some(start_str) = range.strip_suffix('-') {
-        let start: usize = start_str.parse().ok()?;
-        if start < total_len {
-            return Some(start);
-        }
+/// Parse a single-range `Range` header (`bytes=N-`, `bytes=N-M` or the
+/// suffix form `bytes=-N`) against a body of `total_len` bytes. `None` when
+/// it is not one byte range (the whole body is served, as RFC 9110 allows),
+/// `Some(Ok((start, end)))` with `end` inclusive, `Some(Err(()))` when no
+/// byte of the body is in range (416).
+fn parse_byte_range(range_header: &str, total_len: usize) -> Option<Result<(usize, usize), ()>> {
+    let range = range_header.trim().strip_prefix("bytes=")?.trim();
+    if range.contains(',') {
+        return None;
     }
-    // Handle "bytes=N-M" format
-    let parts: Vec<&str> = range.splitn(2, '-').collect();
-    if parts.len() == 2 {
-        let start: usize = parts[0].parse().ok()?;
-        if start < total_len {
-            return Some(start);
+    let (first, last) = range.split_once('-')?;
+    let (first, last) = (first.trim(), last.trim());
+    if first.is_empty() {
+        let suffix: usize = last.parse().ok()?;
+        if suffix == 0 || total_len == 0 {
+            return Some(Err(()));
         }
+        return Some(Ok((total_len.saturating_sub(suffix), total_len - 1)));
     }
-    None
+    let start: usize = first.parse().ok()?;
+    let end = if last.is_empty() {
+        usize::MAX
+    } else {
+        let end: usize = last.parse().ok()?;
+        if end < start {
+            return None;
+        }
+        end
+    };
+    if start >= total_len {
+        return Some(Err(()));
+    }
+    Some(Ok((start, end.min(total_len - 1))))
 }
 
 // ---------------------------------------------------------------------------
@@ -14328,27 +14214,39 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_range_start_basic() {
-        assert_eq!(parse_range_start("bytes=100-", 1000), Some(100));
-        assert_eq!(parse_range_start("bytes=0-", 1000), Some(0));
-        assert_eq!(parse_range_start("bytes=999-", 1000), Some(999));
+    fn test_parse_byte_range_open_ended() {
+        assert_eq!(parse_byte_range("bytes=100-", 1000), Some(Ok((100, 999))));
+        assert_eq!(parse_byte_range("bytes=0-", 1000), Some(Ok((0, 999))));
+        assert_eq!(parse_byte_range("bytes=999-", 1000), Some(Ok((999, 999))));
     }
 
     #[test]
-    fn test_parse_range_start_beyond_length() {
-        assert_eq!(parse_range_start("bytes=1000-", 1000), None);
-        assert_eq!(parse_range_start("bytes=5000-", 100), None);
+    fn test_parse_byte_range_beyond_length_is_unsatisfiable() {
+        assert_eq!(parse_byte_range("bytes=1000-", 1000), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=5000-", 100), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=0-", 0), Some(Err(())));
     }
 
     #[test]
-    fn test_parse_range_start_with_end() {
-        assert_eq!(parse_range_start("bytes=100-200", 1000), Some(100));
+    fn test_parse_byte_range_with_end_and_suffix() {
+        assert_eq!(
+            parse_byte_range("bytes=100-200", 1000),
+            Some(Ok((100, 200)))
+        );
+        assert_eq!(
+            parse_byte_range("bytes=900-5000", 1000),
+            Some(Ok((900, 999)))
+        );
+        assert_eq!(parse_byte_range("bytes=-10", 1000), Some(Ok((990, 999))));
+        assert_eq!(parse_byte_range("bytes=-5000", 1000), Some(Ok((0, 999))));
     }
 
     #[test]
-    fn test_parse_range_start_invalid() {
-        assert_eq!(parse_range_start("invalid", 1000), None);
-        assert_eq!(parse_range_start("bytes=abc-", 1000), None);
+    fn test_parse_byte_range_invalid() {
+        assert_eq!(parse_byte_range("invalid", 1000), None);
+        assert_eq!(parse_byte_range("bytes=abc-", 1000), None);
+        assert_eq!(parse_byte_range("bytes=200-100", 1000), None);
+        assert_eq!(parse_byte_range("bytes=0-1,5-6", 1000), None);
     }
 
     #[test]

@@ -15,13 +15,16 @@ index documents from the catalog on every request (#4172).
   (`repodata_shards.msgpack.zst`) is serialised from the stored map.
 - **A revision per subdir** (#4174). Every rebuild of a subdir bumps its
   revision. `repodata.json`, `.zst`, `.bz2`, `current_repodata.json`,
-  `run_exports.json` and the bootstrap `repodata.json.jlap` are rendered
+  `run_exports.json` and `repodata.json.jlap` are rendered
   together from one catalog walk the first time a revision is read, and kept
   in memory under it. `channeldata.json` is kept under the sum of the
   repository's subdir revisions. A request reads the revision (one statement
   against the conda state tables, no catalog rows) and serves the kept bytes
   when it matches; concurrent requests for a new revision share one render.
-  The served bytes are unchanged from 1.11.
+  `repodata.json` is unchanged from 1.11; since #4175 `.zst` and `.bz2`
+  decompress to exactly those bytes (1.11 compressed a compact rendering).
+- **The last N `repodata.json` revisions and a JLAP** (#4175), see
+  [JLAP](#jlap-incremental-repodata) below.
 
 The kept documents are per process. Each replica renders a revision once.
 
@@ -30,8 +33,8 @@ The kept documents are per process. Each replica renders a revision once.
 A revision is rendered with one cursor over the repository's live rows
 (only the columns that decide which row each document lists), then the
 listed rows in filename order, 512 at a time, each record written straight
-into the pretty `repodata.json`, `current_repodata.json` and the zstd encoder
-of the compact document (#4176). The render holds its output and one chunk of
+into the pretty `repodata.json` (and on into the zstd encoder, so `.zst`
+holds the same bytes) and `current_repodata.json` (#4176). The render holds its output and one chunk of
 rows, not the row set, so its memory is about the size of the documents it
 produces.
 
@@ -67,6 +70,47 @@ Renders take a permit from a process-wide gate,
 answered `503` with `Retry-After: 5`. The render it was waiting for keeps
 running and serves the requests that follow. See
 [load-shedding.md](load-shedding.md).
+
+## JLAP incremental repodata
+
+`repodata.jlap` (also served as `repodata.json.jlap`, the name 1.11 used;
+conda and rattler request `repodata.jlap`) lets a client that holds an
+older `repodata.json`
+update it with a patch instead of downloading the index again (conda with
+`--experimental=jlap` (conda 23.9 and later, before 26.9, which dropped it), rattler and pixi when the channel has no
+shard index or sharding is disabled). From 1.12.0 a hosted subdir serves a
+real JLAP (#4175); before, it served a file with no patches and every
+client downloaded the whole index anyway.
+
+- Each render of a new revision records its `repodata.json` in
+  `conda_repodata_revisions` (zstd-compressed, with its BLAKE2b-256) and,
+  when the document changed, appends one RFC 6902 patch line from the
+  previous document to the subdir's stored JLAP in `conda_repodata_jlap`.
+  The new line replaces the old footer, so the bytes before it never move,
+  and the BLAKE2b checksum chain continues from the stored bytes. A client's
+  `Range: bytes=<pos>-` request (conda sends the offset of the footer it
+  last saw) is answered `206` with only the new lines; a position past the
+  end is `416` and the client fetches the whole file.
+- `AK_CONDA_JLAP_REVISIONS` (default 8, 1 to 1024) revisions are kept per
+  subdir and the JLAP keeps one patch line fewer. A client that last
+  refreshed more than that many changes ago finds no patch from its hash
+  and downloads `repodata.json`, as it would without JLAP. When the window
+  moves the oldest line is dropped and the IV line takes its chain value:
+  the kept lines' checksums do not change, but their offsets do, so a
+  client's next range request does not verify and it fetches the whole
+  (small) JLAP once, still without downloading the index. A value of 1
+  keeps only the current document: the JLAP names its hash and carries no
+  patches. Storage per subdir is about N compressed copies of its index.
+- A patch is not written when it would have more than 8192 operations (a
+  bulk import): clients holding the older document download the index once.
+- Ordering: the JLAP is recorded inside the render of the revision, before
+  that revision's documents are kept or served, under the JLAP row's lock.
+  The JLAP a replica serves always ends at the `repodata.json` it serves, so
+  a withdrawal is absent from the JLAP tail as soon as it is absent from
+  `repodata.json`. A render that finds a newer revision already recorded
+  (another replica moved on) does not append, so the tail never moves back.
+- Only hosted channels serve a JLAP; Remote and Virtual channels answer 404
+  and clients fetch `repodata.json`.
 
 ## How changes reach them
 
