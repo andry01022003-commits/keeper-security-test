@@ -101,9 +101,11 @@ values are validated, so this is not a header-injection path.
 All spans carry the resource attributes `service.name` (`OTEL_SERVICE_NAME`,
 default `artifact-keeper`), `service.version` and `service.instance.id`.
 Every span except the database statement spans (which are built directly,
-not from a `tracing` span) also carries the code location and thread attributes
-the tracing bridge adds (`code.file.path`, `code.module.name`,
-`code.line.number`, `thread.id`, `thread.name`). The tables below list the rest.
+not from a `tracing` span) also carries the attributes the tracing bridge adds:
+the code location and thread (`code.file.path`, `code.module.name`,
+`code.line.number`, `thread.id`, `thread.name`), the `tracing` target
+(`target`), and the time the span was busy and idle in nanoseconds (`busy_ns`,
+`idle_ns`). The tables below list the rest.
 
 A span is marked as an error (status `ERROR`) only where its section says so,
 and then `error.type` names the cause.
