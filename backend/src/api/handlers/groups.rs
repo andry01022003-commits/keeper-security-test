@@ -516,8 +516,10 @@ async fn load_visible_group(
         .ok_or_else(|| AppError::NotFound("Group not found".to_string()))
 }
 
-/// Load a page of a group's members, newest-first join order preserved from
-/// `user_group_members.joined_at`, mirroring `GET /api/v1/groups/{id}`.
+/// Load a page of a group's members in join order (oldest `joined_at` first,
+/// `user_id` breaking ties so pages never overlap or skip a member when several
+/// members joined in the same transaction). Shared by `GET /api/v1/groups/{id}`
+/// and `GET /api/v1/groups/{id}/members`.
 async fn fetch_group_members(
     db: &sqlx::PgPool,
     group_id: Uuid,
@@ -530,7 +532,7 @@ async fn fetch_group_members(
         FROM user_group_members ugm
         JOIN users u ON u.id = ugm.user_id
         WHERE ugm.group_id = $1
-        ORDER BY ugm.joined_at
+        ORDER BY ugm.joined_at, ugm.user_id
         LIMIT $2
         OFFSET $3
         "#,
@@ -2329,6 +2331,119 @@ mod tests {
             .await;
         tdh::cleanup_user(&pool, viewer_id).await;
         tdh::cleanup_user(&pool, member_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Router-level (#4027): `GET /{id}/members` dispatches to the list handler
+    /// instead of answering 405, also for an LDAP-synced group whose membership
+    /// is read-only locally, and pages walk the whole group in a stable order
+    /// even when every member shares one `joined_at`.
+    #[tokio::test]
+    async fn test_group_members_get_route_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-members-rt-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let mut members = Vec::new();
+        for _ in 0..3 {
+            members.push(tdh::create_user(&pool).await.0);
+        }
+
+        let group = Uuid::new_v4();
+        sqlx::query("INSERT INTO groups (id, name, external_source) VALUES ($1, $2, 'ldap')")
+            .bind(group)
+            .bind(format!("ph-grp-members-ldap-{group}"))
+            .execute(&pool)
+            .await
+            .expect("seed ldap group");
+        // One statement, so all three rows share the same joined_at.
+        sqlx::query(
+            "INSERT INTO user_group_members (user_id, group_id) \
+             SELECT u, $1 FROM UNNEST($2::uuid[]) AS u",
+        )
+        .bind(group)
+        .bind(&members)
+        .execute(&pool)
+        .await
+        .expect("seed membership");
+
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(admin_id, &admin_name)
+        };
+        let outsider = tdh::make_auth(outsider_id, &outsider_name);
+        let app = |auth: AuthExtension| tdh::router_with_auth_ext(router(), state.clone(), auth);
+        let page = |status: axum::http::StatusCode, body: &[u8]| {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            let v: serde_json::Value = serde_json::from_slice(body).expect("json");
+            assert_eq!(v["members_total"], 3);
+            v["members"]
+                .as_array()
+                .expect("members array")
+                .iter()
+                .map(|m| m["user_id"].as_str().unwrap().parse::<Uuid>().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let (s1, b1) = tdh::send(
+            app(admin.clone()),
+            tdh::get(format!("/{group}/members?member_limit=2")),
+        )
+        .await;
+        let mut seen = page(s1, &b1);
+        assert_eq!(seen.len(), 2);
+        let (s2, b2) = tdh::send(
+            app(admin.clone()),
+            tdh::get(format!("/{group}/members?member_limit=2&member_offset=2")),
+        )
+        .await;
+        seen.extend(page(s2, &b2));
+        let mut expected = members.clone();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "pages must cover every member once, in order"
+        );
+
+        // Reading stays allowed for an LDAP-synced group; writes keep their 409.
+        let (post_status, _) = tdh::send(
+            app(admin.clone()),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{group}/members"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    r#"{{"user_ids":["{outsider_id}"]}}"#
+                )))
+                .expect("build POST"),
+        )
+        .await;
+        assert_eq!(post_status, axum::http::StatusCode::CONFLICT);
+
+        // A non-admin outside the group gets the same 404 as GET /groups/{id}.
+        let (out_status, _) =
+            tdh::send(app(outsider.clone()), tdh::get(format!("/{group}/members"))).await;
+        assert_eq!(out_status, axum::http::StatusCode::NOT_FOUND);
+        let (detail_status, _) = tdh::send(app(outsider), tdh::get(format!("/{group}"))).await;
+        assert_eq!(detail_status, axum::http::StatusCode::NOT_FOUND);
+
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group)
+            .execute(&pool)
+            .await;
+        for id in members.into_iter().chain([admin_id, outsider_id]) {
+            tdh::cleanup_user(&pool, id).await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
