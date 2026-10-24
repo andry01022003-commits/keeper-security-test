@@ -466,6 +466,12 @@ async fn download_archive(
             "Invalid archive path: expected .tar.gz extension",
         )
     })?;
+    // #4365 item 3 (#4107): on a proxying repository the name and version
+    // are joined into the upstream path and key the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[pkg_name, version],
+    )?;
 
     let artifact = sqlx::query!(
         r#"
@@ -495,6 +501,17 @@ async fn download_archive(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4107: scan-on-proxy routes the archive through the inline
+            // scan-and-block gate INSTEAD of the streaming paths below: the
+            // Remote arm when this repository scans, the Virtual walk when
+            // any Remote member scans (stricter of virtual and member
+            // policy). Repositories that have not opted in are unchanged.
+            if let Some(served) =
+                serve_scanned_pub_download(&state, auth.as_ref(), &repo, pkg_name, version, &ctx)
+                    .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -1106,6 +1123,153 @@ async fn extract_pubspec_from_staged(
 #[cfg(test)]
 fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::PubSpec, String> {
     extract_pubspec_from_reader(data)
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy for package archives (#4107, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied archive
+/// (#4365 item 1): every file on the archive route is a package, cached
+/// under the `packages/{name}/versions/{version}.tar.gz` path the streaming
+/// arm commits to.
+fn pub_archive_serve_key(
+    name: &str,
+    version: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!(
+        "packages/{name}/versions/{version}.tar.gz"
+    ))
+}
+
+/// The Pub half of the generic gate: an archive must be the package version
+/// the request names (#4107).
+struct PubArchive<'a> {
+    name: &'a str,
+    version: &'a str,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for PubArchive<'_> {
+    const LABEL: &'static str = "pub archive";
+    const CONTENT_TYPE: &'static str = "application/octet-stream";
+
+    fn requested(&self) -> String {
+        format!("{} {}", self.name, self.version)
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &bytes::Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        pub_archive_identity(self.name, self.version, bytes)
+    }
+}
+
+/// What a package archive says about itself (#4107): its root
+/// `pubspec.yaml` must declare the requested `name` and `version`. The
+/// scanner has no Pub pin, but the bundled engine catalogs a `pubspec.yaml`
+/// as the package it declares, so an archive that agrees is graded as that
+/// package (plus anything else it contains).
+fn pub_archive_identity(
+    name: &str,
+    version: &str,
+    bytes: &bytes::Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{read_tar_gz_entry, ArchiveIdentity};
+    let manifest = read_tar_gz_entry(bytes, |path| {
+        path == std::path::Path::new("pubspec.yaml")
+            || path == std::path::Path::new("./pubspec.yaml")
+    });
+    let body = match manifest {
+        Ok(Some(body)) => body,
+        Ok(None) => return ArchiveIdentity::Unreadable("no root pubspec.yaml".to_string()),
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    let Ok(spec) = serde_yaml::from_slice::<crate::formats::r#pub::PubSpec>(&body) else {
+        return ArchiveIdentity::Unreadable("pubspec.yaml does not parse".to_string());
+    };
+    if spec.name != name || spec.version.trim() != version {
+        return ArchiveIdentity::Disagrees(format!(
+            "pubspec.yaml declares {} {}",
+            spec.name, spec.version
+        ));
+    }
+    ArchiveIdentity::ContentGraded
+}
+
+/// Inline scan-and-block for one archive from one Remote repository (#4107).
+async fn serve_scanned_pub_archive(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (Uuid, &str, &str),
+    (name, version): (&str, &str),
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let serve_key = pub_archive_serve_key(name, version);
+    let filename = format!("{name}-{version}.tar.gz");
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Pub,
+        source_path: &serve_key.cache_key,
+        cache_path: &serve_key.cache_key,
+        filename: &filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: PubArchive { name, version },
+        disposition: None,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of the archive route (#4107): `Ok(None)` when
+/// nothing scans, so the caller keeps its untouched path.
+async fn serve_scanned_pub_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    name: &str,
+    version: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let serve_key = pub_archive_serve_key(name, version);
+    let route = ScannedRoute {
+        upstream_path: &serve_key.cache_key,
+        lookup: LocalLookup::NameVersion { name, version },
+        default_content_type: "application/octet-stream",
+        virtual_disposition: None,
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream_url), policy, _disposition| async move {
+            serve_scanned_pub_archive(
+                state,
+                proxy,
+                (id, &key, &upstream_url),
+                (name, version),
+                policy,
+                ctx,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
@@ -2476,5 +2640,158 @@ mod catalog_registration_tests {
             row.description.as_deref(),
             Some("a catalogued dart package")
         );
+    }
+}
+
+/// #4107: scan-on-proxy on Pub package archives, Remote and Virtual, through
+/// the shared archive scenarios, plus the Pub identity rule.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_proxy_4107 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use bytes::Bytes;
+
+    const NAME: &str = "dtf_scanned";
+
+    fn tar_gz(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, data.as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A package archive whose root `pubspec.yaml` declares `name`
+    /// `version`. The random description keeps every digest unique.
+    fn archive(name: &str, version: &str) -> Vec<u8> {
+        tar_gz(&[
+            (
+                "pubspec.yaml",
+                format!(
+                    "name: {name}\nversion: {version}\ndescription: {}\nenvironment:\n  sdk: '>=2.12.0 <4.0.0'\n",
+                    uuid::Uuid::new_v4()
+                ),
+            ),
+            ("lib/dtf.dart", "void main() {}\n".to_string()),
+        ])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        let path = format!("packages/{NAME}/versions/1.0.0.tar.gz");
+        ArchiveCase {
+            format: "pub",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/packages/{NAME}/versions/1.0.0.tar.gz")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: archive(NAME, "1.0.0"),
+            recorded_path: path,
+            file: format!("{NAME}-1.0.0.tar.gz"),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/packages/{NAME}/versions/1.0.0%3Fx.tar.gz"),
+                format!("/{key}/packages/{NAME}%3B/versions/1.0.0.tar.gz"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn an_archive_that_declares_the_requested_version_is_graded() {
+        let bytes = Bytes::from(archive(NAME, "1.0.0"));
+        assert_eq!(
+            pub_archive_identity(NAME, "1.0.0", &bytes),
+            ArchiveIdentity::ContentGraded
+        );
+        let dotted = Bytes::from(tar_gz(&[(
+            "./pubspec.yaml",
+            format!("name: {NAME}\nversion: 1.0.0\n"),
+        )]));
+        assert_eq!(
+            pub_archive_identity(NAME, "1.0.0", &dotted),
+            ArchiveIdentity::ContentGraded
+        );
+    }
+
+    #[test]
+    fn an_archive_that_is_not_the_requested_version_is_unestablished() {
+        for bytes in [archive(NAME, "2.0.0"), archive("other", "1.0.0")] {
+            assert!(matches!(
+                pub_archive_identity(NAME, "1.0.0", &Bytes::from(bytes)),
+                ArchiveIdentity::Disagrees(_)
+            ));
+        }
+        let nested = tar_gz(&[(
+            "example/pubspec.yaml",
+            format!("name: {NAME}\nversion: 1.0.0\n"),
+        )]);
+        for bytes in [
+            Bytes::from(nested),
+            Bytes::from_static(b"not a tarball"),
+            Bytes::from(tar_gz(&[("pubspec.yaml", "name: [".to_string())])),
+        ] {
+            assert!(matches!(
+                pub_archive_identity(NAME, "1.0.0", &bytes),
+                ArchiveIdentity::Unreadable(_)
+            ));
+        }
+    }
+}
+
+/// #4365 item 1: Pub decides by route (every archive is a package); the
+/// cache key is `packages/{name}/versions/{version}.tar.gz`.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn pub_archive_serve_key_table() {
+        let got = pub_archive_serve_key("http", "0.12.0");
+        assert_eq!(got.cache_key, "packages/http/versions/0.12.0.tar.gz");
+        assert!(got.scannable);
     }
 }

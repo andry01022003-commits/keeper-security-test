@@ -28,8 +28,9 @@ use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
 use crate::services::metrics_service::{
-    record_proxy_cache_lookup, record_proxy_stale_if_error_response,
+    record_proxy_cache_lookup, record_proxy_stale_if_error_response, ProxyCachePublishFailure,
 };
+use crate::services::proxy_cache_cap::ProxyCacheCap;
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
@@ -1640,6 +1641,33 @@ fn repo_key_from_cache_key<'k>(scope: &ProxyCacheScope, cache_key: &'k str) -> &
         .unwrap_or("unknown")
 }
 
+/// A cached body measured and opened alongside its sidecar read (#4331).
+struct PrefetchedBody {
+    size: Result<u64>,
+    stream: Result<BoxStream<'static, Result<Bytes>>>,
+}
+
+/// Whether a body read that started at `read_started` can be trusted to be
+/// the one `metadata` describes (#4331): it can unless the entry was
+/// (re)published after the read began. A publish replaces the content object
+/// before it writes the sidecar it stamps with `cached_at`, so a read that
+/// started before `cached_at` may have opened the previous object and is
+/// redone; one that started after it saw the published object. Almost every
+/// hit is on an entry cached long before the request.
+///
+/// `cached_at` is stamped by the clock of the replica that published, which
+/// on a shared filesystem need not be this one, so the read must have started
+/// [`PREFETCH_PUBLISH_SKEW_SECS`] after it to be trusted. An entry younger
+/// than that is read again after its sidecar, as before #4331.
+fn prefetch_is_current(read_started: DateTime<Utc>, metadata: Option<&CacheMetadata>) -> bool {
+    metadata.is_some_and(|m| {
+        read_started > m.cached_at + chrono::Duration::seconds(PREFETCH_PUBLISH_SKEW_SECS)
+    })
+}
+
+/// Clock skew between replicas tolerated by [`prefetch_is_current`] (#4331).
+const PREFETCH_PUBLISH_SKEW_SECS: i64 = 5;
+
 /// Matches the shape of an S3 *multipart* upload ETag: 32 hex digits (the MD5
 /// of the concatenated part digests) followed by `-<partcount>`, e.g.
 /// `d41d8cd98f00b204e9800998ecf8427e-3`.
@@ -1736,6 +1764,24 @@ async fn discard_staging(storage: &StorageService, staging_key: &str) {
     }
 }
 
+/// Count a failed proxy-cache publish against the backend the cache runs on
+/// (#4319), next to the `warn` that already logs it.
+fn count_publish_failure(storage: &StorageService, class: ProxyCachePublishFailure) {
+    crate::services::metrics_service::record_proxy_cache_publish_failure(
+        storage.backend_kind(),
+        class,
+    );
+}
+
+/// Whether a failed `put_stream` into the staging key is the storage side's
+/// failure (#4319). The tee forwards an upstream body error as `BadGateway`
+/// and abandons the cache half under the per-object ceiling (#2928) with a
+/// `Validation` error; `put_stream` returns either one unchanged, and neither
+/// says anything about the backend.
+fn put_stream_failure_is_storage_side(error: &AppError) -> bool {
+    !matches!(error, AppError::BadGateway(_) | AppError::Validation(_))
+}
+
 /// Best-effort removal of an object a publish just landed on the LIVE cache
 /// key and that must not be served (#4630).
 ///
@@ -1811,6 +1857,34 @@ async fn discard_bad_publish(storage: &StorageService, cache_key: &str) {
 /// started (#4759).
 const UPSTREAM_SHORT_BODY: &str = "UPSTREAM_SHORT_BODY";
 
+/// How far before a fill's start a serve may have been recorded and still be
+/// one the fill fed (#4542): the statistics row is stamped by the database
+/// clock, the fill start by this process's.
+const FILL_ATTRIBUTION_SKEW_SECS: i64 = 60;
+
+/// Attribute the serves a committed fill fed to its digest (#4542).
+/// Best-effort like the catalog upsert it follows: a failure leaves those
+/// rows reachable through the catalog row for as long as it lives.
+async fn attribute_fill_downloads(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    checksum_sha256: &str,
+    fill_started: DateTime<Utc>,
+) {
+    let since = fill_started - chrono::Duration::seconds(FILL_ATTRIBUTION_SKEW_SECS);
+    if let Err(e) =
+        proxy_catalog::attribute_fill_downloads(db, repository_id, path, checksum_sha256, since)
+            .await
+    {
+        tracing::warn!(
+            repository_id = %repository_id,
+            error = %e,
+            "could not attribute the downloads a proxy-cache fill served to its digest"
+        );
+    }
+}
+
 /// The client-facing error for an upstream body that ended short (#4759):
 /// names the repository and both byte counts, never the upstream URL.
 fn upstream_short_body_error(repo_key: &str, expected: u64, received: u64) -> AppError {
@@ -1821,6 +1895,53 @@ fn upstream_short_body_error(repo_key: &str, expected: u64, received: u64) -> Ap
              but its body ended after {received} bytes"
         ),
     }
+}
+
+/// Delete one proxy-cache entry's objects (body before sidecar), the shared
+/// reclaim behind [`ProxyService::evict_cached_entry`] (lifecycle sweep) and
+/// the per-Remote cap (#4660). See that method for the key rules.
+pub(crate) async fn evict_entry_objects(
+    storage: &StorageService,
+    cache_scope: &ProxyCacheScope,
+    repo_key: &str,
+    path: &str,
+    recorded_keys: [&str; 2],
+) -> Result<usize> {
+    let mut keys: Vec<String> = Vec::with_capacity(4);
+    if let Ok(derived) = CacheKeys::derive(cache_scope, repo_key, path) {
+        keys.push(derived.content);
+        keys.push(derived.metadata);
+    }
+    for recorded in recorded_keys {
+        if keys.iter().any(|k| k == recorded) {
+            continue;
+        }
+        if !cache_scope.owns_entry_key(repo_key, recorded) {
+            return Err(AppError::Conflict(format!(
+                "catalogue row records '{recorded}', which is outside the proxy cache of \
+                 '{repo_key}' (renamed repository or corrupt row); entry kept"
+            )));
+        }
+        keys.push(recorded.to_string());
+    }
+    // Bodies before sidecars, as invalidation orders them.
+    keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
+
+    let mut deleted = 0usize;
+    for key in &keys {
+        if !storage.exists(key).await? {
+            continue;
+        }
+        match storage.delete(key).await {
+            Ok(()) => deleted += 1,
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        if key.ends_with("__cache_meta__.json") {
+            invalidate_proxy_metadata_lru(key).await;
+        }
+    }
+    Ok(deleted)
 }
 
 /// Wait for the first byte of a streaming upstream body that advertised a
@@ -2261,6 +2382,31 @@ impl CacheStore {
         preloaded_metadata: Option<CacheMetadata>,
         mutability: Option<cache_classifier::Mutability>,
     ) -> Result<Option<CachedBody>> {
+        self.get_inner(
+            cache_key,
+            metadata_key,
+            allow_stale,
+            preloaded_metadata,
+            mutability,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::get`] with the body read already done (#4331): the caller read
+    /// the content object alongside the sidecar instead of after it, and
+    /// `prefetched_body` is that read's result. Everything the body is judged
+    /// by (the expiry gate, the checksum against the sidecar, the miss on an
+    /// absent or unreadable object) is unchanged.
+    async fn get_inner(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        allow_stale: bool,
+        preloaded_metadata: Option<CacheMetadata>,
+        mutability: Option<cache_classifier::Mutability>,
+        prefetched_body: Option<Result<Bytes>>,
+    ) -> Result<Option<CachedBody>> {
         // Per-branch proxy-cache observability (#1263 follow-up / PR #1284).
         // Only the FRESH lookup (`allow_stale == false`) is counted: that is
         // the single per-request cache-read decision the original PR
@@ -2317,8 +2463,12 @@ impl CacheStore {
             return Ok(None);
         }
 
-        // Try to get cached content
-        match self.storage.get(cache_key).await {
+        // Try to get cached content (#4331: unless the caller already did).
+        let body = match prefetched_body {
+            Some(body) => body,
+            None => self.storage.get(cache_key).await,
+        };
+        match body {
             Ok(content) => {
                 // Verify checksum (identical for fresh and stale)
                 let actual_checksum = StorageService::calculate_hash(&content);
@@ -2605,12 +2755,25 @@ pub(crate) struct CachePersister {
     /// 500 (which was caused by an `artifacts` row, removed under #1280).
     db: PgPool,
     storage: Arc<StorageService>,
+    /// Per-Remote cache cap (#4660): a commit schedules an eviction run.
+    /// `None` in the unit tests that build a persister on its own.
+    cap: Option<Arc<ProxyCacheCap>>,
 }
 
 impl CachePersister {
     /// Construct a `CachePersister` over the given DB + storage handles.
     pub(crate) fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
-        Self { db, storage }
+        Self {
+            db,
+            storage,
+            cap: None,
+        }
+    }
+
+    /// Enforce `cap` after every commit this persister makes (#4660).
+    pub(crate) fn with_cap(mut self, cap: Arc<ProxyCacheCap>) -> Self {
+        self.cap = Some(cap);
+        self
     }
 
     /// Cache artifact content and its metadata sidecar (buffered path).
@@ -2653,13 +2816,19 @@ impl CachePersister {
             return Ok(());
         }
 
+        // #4542: serves recorded from here on were fed by this write.
+        let fill_started = Utc::now();
+
         // Calculate checksum
         let checksum = StorageService::calculate_hash(content);
 
         // #1618 S9: body → sidecar write ordering. Store content first so we
         // can read the backend's ETag back for the integrity-revalidation
         // pin (#1051).
-        self.storage.put(cache_key, content.clone()).await?;
+        if let Err(e) = self.storage.put(cache_key, content.clone()).await {
+            count_publish_failure(&self.storage, ProxyCachePublishFailure::PutFailed);
+            return Err(e);
+        }
 
         // #1618 S9 / #1051: best-effort capture of the backend's ETag right
         // after the PUT so the fast path can re-HEAD on each hit and reject
@@ -2690,9 +2859,14 @@ impl CachePersister {
 
         // #1618 S9: sidecar written second, after the content object above.
         let metadata_json = serde_json::to_vec(&metadata)?;
-        self.storage
+        if let Err(e) = self
+            .storage
             .put(metadata_key, Bytes::from(metadata_json))
-            .await?;
+            .await
+        {
+            count_publish_failure(&self.storage, ProxyCachePublishFailure::CommitFailed);
+            return Err(e);
+        }
         invalidate_proxy_metadata_lru(metadata_key).await;
 
         // Proxy-cached content is intentionally NOT recorded in the
@@ -2754,6 +2928,18 @@ impl CachePersister {
                 "proxy-cache catalog upsert failed (buffered write); accounting may \
                  undercount this object until it is re-cached or lazily backfilled"
             );
+        } else {
+            attribute_fill_downloads(
+                &self.db,
+                repository_id,
+                artifact_path,
+                &metadata.checksum_sha256,
+                fill_started,
+            )
+            .await;
+            if let Some(cap) = &self.cap {
+                cap.note_fill(repository_id);
+            }
         }
 
         tracing::debug!(
@@ -2829,6 +3015,9 @@ impl CachePersister {
         // upsert the persisted proxy-cache catalog row (#2218/#2270) with the
         // TRUE `bytes_written`/checksum, once the tee has fully written the body.
         let catalog_db = self.db.clone();
+        // #4542: serves recorded from here on were fed by this fill.
+        let fill_started = Utc::now();
+        let cap = self.cap.clone();
 
         // Channel for chunks flowing reader -> writer. mpsc to keep order
         // (broadcast would let storage skip chunks under backpressure,
@@ -2995,6 +3184,10 @@ impl CachePersister {
                                  not caching (no metadata sidecar) so the next request refetches \
                                  upstream"
                             );
+                            count_publish_failure(
+                                &storage_clone,
+                                ProxyCachePublishFailure::CopyRejected,
+                            );
                             discard_staging(&storage_clone, &staging_key).await;
                             return;
                         }
@@ -3041,6 +3234,10 @@ impl CachePersister {
                                     "published proxy-cache object does not have the size that \
                                      was staged; not caching (no metadata sidecar) and dropping \
                                      the live key so the next request refetches upstream"
+                                );
+                                count_publish_failure(
+                                    &storage_clone,
+                                    ProxyCachePublishFailure::PublishMismatch,
                                 );
                                 // Unlike every other reject arm here, this one
                                 // runs AFTER a `copy()` that reported success,
@@ -3111,6 +3308,10 @@ impl CachePersister {
                                  object; not caching (no metadata sidecar) and dropping the \
                                  live key so the next request refetches upstream (#4630)"
                             );
+                            count_publish_failure(
+                                &storage_clone,
+                                ProxyCachePublishFailure::PublishMismatch,
+                            );
                             discard_bad_publish(&storage_clone, &cache_key_for_writer).await;
                             return;
                         }
@@ -3147,6 +3348,10 @@ impl CachePersister {
                                         error = %e,
                                         "proxy cache metadata sidecar write failed; cache will refetch next request"
                                     );
+                                    count_publish_failure(
+                                        &storage_clone,
+                                        ProxyCachePublishFailure::CommitFailed,
+                                    );
                                 } else {
                                     invalidate_proxy_metadata_lru(&metadata_key).await;
                                     // #2218/#2270: persist the catalog row now
@@ -3181,6 +3386,18 @@ impl CachePersister {
                                              commit); accounting may undercount this object \
                                              until re-cache or lazy backfill"
                                         );
+                                    } else {
+                                        attribute_fill_downloads(
+                                            &catalog_db,
+                                            template.repository_id,
+                                            &template.path,
+                                            &metadata.checksum_sha256,
+                                            fill_started,
+                                        )
+                                        .await;
+                                        if let Some(cap) = &cap {
+                                            cap.note_fill(template.repository_id);
+                                        }
                                     }
                                 }
                             }
@@ -3242,6 +3459,9 @@ impl CachePersister {
                         error = %e,
                         "proxy cache put_stream failed; cache will refetch next request"
                     );
+                    if put_stream_failure_is_storage_side(&e) {
+                        count_publish_failure(&storage_clone, ProxyCachePublishFailure::PutFailed);
+                    }
                     // May leave a partial staging object; cache_key is untouched.
                     discard_staging(&storage_clone, &staging_key).await;
                 }
@@ -4687,6 +4907,8 @@ impl UpstreamClient {
 pub struct ProxyService {
     db: PgPool,
     storage: Arc<StorageService>,
+    /// Per-Remote proxy-cache byte cap (#4660), shared with the persister.
+    cache_cap: Arc<ProxyCacheCap>,
     /// Owns the cache body/metadata/invalidate/freshness lifecycle (#1618 S7).
     /// The cache-facing public methods on `ProxyService` delegate here.
     cache_store: CacheStore,
@@ -4868,7 +5090,9 @@ impl ProxyService {
             .expect("Failed to create HTTP client");
 
         let cache_store = CacheStore::new(Arc::clone(&storage), cache_scope.clone());
-        let cache_persister = CachePersister::new(db.clone(), Arc::clone(&storage));
+        let cache_cap = ProxyCacheCap::new(db.clone(), Arc::clone(&storage), cache_scope.clone());
+        let cache_persister =
+            CachePersister::new(db.clone(), Arc::clone(&storage)).with_cap(Arc::clone(&cache_cap));
         let upstream_client = UpstreamClient::new(db.clone(), http_client);
         // #1631 layer 1/3: select the single-flight coordinator from config.
         // Defaults to the in-process buffered coordinator; multi-replica
@@ -4881,6 +5105,7 @@ impl ProxyService {
         Self {
             db,
             storage,
+            cache_cap,
             cache_store,
             cache_persister,
             upstream_client,
@@ -4915,6 +5140,12 @@ impl ProxyService {
     pub(crate) fn without_origin_policy_gate(mut self) -> Self {
         self.origin_policy_gate = false;
         self
+    }
+
+    /// The per-Remote proxy-cache cap enforcer (#4660), for the API that sets
+    /// a cap and runs an eviction at once.
+    pub fn cache_cap(&self) -> &Arc<ProxyCacheCap> {
+        &self.cache_cap
     }
 
     /// This deployment's proxy-cache key scope (#3454). Handlers that derive a
@@ -5732,12 +5963,23 @@ impl ProxyService {
                         // reading the field directly made this guard inert on
                         // exactly the paths that serve proxy traffic. See
                         // [`Self::resolve_quota_bytes`].
-                        let quota_bytes = self.resolve_quota_bytes(repo).await;
-                        let quota_ok = !cache_classifier::exceeds_single_object_quota(
+                        // #4660: the Remote's cache cap is a ceiling too, and a
+                        // Remote whose eviction cannot get under its cap takes
+                        // no fills at all.
+                        let quota_bytes = self.resolve_cache_ceiling_bytes(repo).await;
+                        let within_ceiling = !cache_classifier::exceeds_single_object_quota(
                             quota_bytes,
                             resp.content.len() as i64,
                         );
-                        if !quota_ok {
+                        // The refusal fallback is not an over-quota object:
+                        // `cache_fill_admitted` logs it, and the quota warn and
+                        // counter below stay for objects over the ceiling.
+                        let fill_admitted = !within_ceiling || self.cache_fill_admitted(repo).await;
+                        let quota_ok = within_ceiling && fill_admitted;
+                        if !fill_admitted {
+                            self.note_served_without_cache(repo.id, cache_path).await;
+                        }
+                        if !within_ceiling {
                             tracing::warn!(
                                 target: "security",
                                 repository = %repo.key,
@@ -6338,10 +6580,25 @@ impl ProxyService {
         // A sidecar read/parse error is treated as "no entry" (Miss) — the same
         // B6-safe stance as the buffered path. Waits (bounded) for an in-flight
         // tail-phase streaming publish of the same key first (#3335).
-        let metadata = self
-            .load_cache_metadata_awaiting_publish(metadata_key, mutability)
-            .await;
+        //
+        // #4331: on a filesystem cache the body is measured and opened
+        // alongside the sidecar read instead of after it, so a first-touch hit
+        // on network storage costs one round trip of latency, not three
+        // (sidecar read, size probe, open). See [`Self::speculative_cache_reads`].
+        let read_started = Utc::now();
+        let (metadata, prefetched) = tokio::join!(
+            self.load_cache_metadata_awaiting_publish(metadata_key, mutability),
+            async {
+                if self.speculative_cache_reads() {
+                    Some(self.prefetch_cached_body(cache_key).await)
+                } else {
+                    None
+                }
+            },
+        );
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
+        let mut prefetched =
+            prefetched.filter(|_| prefetch_is_current(read_started, metadata.as_ref()));
 
         match cache_classifier::evaluate(entry.as_ref(), Utc::now()) {
             cache_classifier::Freshness::Miss => Ok(StreamingCacheReadOutcome::Miss),
@@ -6354,7 +6611,12 @@ impl ProxyService {
                 // never degraded to a Miss (which would refetch upstream).
                 check_quarantine_until(metadata.quarantine_until)?;
                 match self
-                    .open_cached_stream(cache_key, metadata_key, &metadata)
+                    .open_cached_stream_prefetched(
+                        cache_key,
+                        metadata_key,
+                        &metadata,
+                        prefetched.take(),
+                    )
                     .await?
                 {
                     Some(result) => Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata))),
@@ -6387,6 +6649,10 @@ impl ProxyService {
                         if stale_since.is_some() {
                             self.note_stale_served(repo).await;
                         }
+                        // The verdict may have rewritten the sidecar (a 304
+                        // extends it), so the body opened before it is
+                        // reopened rather than trusted.
+                        drop(prefetched.take());
                         match self
                             .open_cached_stream(cache_key, metadata_key, &metadata)
                             .await?
@@ -6430,12 +6696,18 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
         metadata: &CacheMetadata,
+        // #4331: the size measured alongside the sidecar read, when it was.
+        prefetched_size: Option<Result<u64>>,
     ) -> bool {
         if metadata.storage_etag.is_some() {
             return false;
         }
         let expected = metadata.size_bytes.max(0) as u64;
-        let stored = match self.storage.size(cache_key).await {
+        let measured = match prefetched_size {
+            Some(size) => size,
+            None => self.storage.size(cache_key).await,
+        };
+        let stored = match measured {
             Ok(stored) if stored != expected => stored,
             Ok(_) => return false,
             Err(e) => {
@@ -6473,6 +6745,46 @@ impl ProxyService {
         metadata_key: &str,
         metadata: &CacheMetadata,
     ) -> Result<Option<StreamingFetchResult>> {
+        self.open_cached_stream_prefetched(cache_key, metadata_key, metadata, None)
+            .await
+    }
+
+    /// Whether this cache reads the body alongside the sidecar (#4331).
+    ///
+    /// Only on the filesystem backend: there the speculative work is a `stat`
+    /// and an `open` (no bytes are read until the stream is polled), so a read
+    /// that turns out a miss costs a file handle, while on network storage
+    /// (NFS, the #4331 report) it removes two sequential round trips from
+    /// every first-touch hit. On an object store a speculative open is a GET
+    /// that starts transferring the body, which a miss or a stale entry would
+    /// throw away, so those keep the sequential reads.
+    fn speculative_cache_reads(&self) -> bool {
+        self.storage.backend_kind() == "filesystem"
+    }
+
+    /// Measure and open the cached body of `cache_key` at once (#4331).
+    async fn prefetch_cached_body(&self, cache_key: &str) -> PrefetchedBody {
+        let (size, stream) = tokio::join!(
+            self.storage.size(cache_key),
+            self.storage.get_stream(cache_key)
+        );
+        PrefetchedBody { size, stream }
+    }
+
+    /// [`Self::open_cached_stream`] reusing a body measured and opened
+    /// alongside the sidecar read (#4331), when there is one. The checks are
+    /// the same ones, applied to the prefetched size and handle.
+    async fn open_cached_stream_prefetched(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        metadata: &CacheMetadata,
+        prefetched: Option<PrefetchedBody>,
+    ) -> Result<Option<StreamingFetchResult>> {
+        let (prefetched_size, prefetched_stream) = match prefetched {
+            Some(p) => (Some(p.size), Some(p.stream)),
+            None => (None, None),
+        };
         // #4630: a sidecar that vouches for N > 0 bytes while pinning the ETag
         // of a zero-byte object describes an object that cannot exist. Serving
         // it sends `Content-Length: N` ahead of an empty body and hyper aborts
@@ -6496,12 +6808,16 @@ impl ProxyService {
         // never fires there, and an emptied or truncated body under an intact
         // sidecar went out as `Content-Length: N` over fewer bytes, forever.
         if self
-            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, metadata)
+            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, metadata, prefetched_size)
             .await
         {
             return Ok(None);
         }
-        match self.storage.get_stream(cache_key).await {
+        let stream = match prefetched_stream {
+            Some(stream) => stream,
+            None => self.storage.get_stream(cache_key).await,
+        };
+        match stream {
             Ok(body) => Ok(Some(StreamingFetchResult {
                 body,
                 content_type: metadata.content_type.clone(),
@@ -6657,7 +6973,22 @@ impl ProxyService {
         // Policy hold (#3912): the bypass serves the raw upstream body with no
         // cache write, which would hand out a held artifact with no releasable
         // record. Under a hold the answer is the same 409 the tee path gives.
-        let max_cache_bytes = Self::quota_to_cache_ceiling(self.resolve_quota_bytes(repo).await);
+        let max_cache_bytes =
+            Self::quota_to_cache_ceiling(self.resolve_cache_ceiling_bytes(repo).await);
+        if !self.cache_fill_admitted(repo).await {
+            // #4660 refusal fallback: stream it, write nothing.
+            self.note_served_without_cache(repo.id, cache_path).await;
+            if hold_active {
+                return Err(AppError::Conflict(
+                    "Artifact is quarantined and pending security review".to_string(),
+                ));
+            }
+            return Ok(StreamHandle {
+                body: upstream.body,
+                headers,
+                cache_published: None,
+            });
+        }
         if let (Some(limit), Some(advertised)) = (max_cache_bytes, upstream.content_length) {
             if advertised > limit {
                 tracing::warn!(
@@ -6896,7 +7227,7 @@ impl ProxyService {
         // truncated body under an unpinned sidecar would otherwise be handed
         // out exactly when upstream is down.
         if self
-            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, &metadata)
+            .evict_if_unpinned_body_disagrees(cache_key, metadata_key, &metadata, None)
             .await
         {
             return Err(upstream_err);
@@ -7236,41 +7567,14 @@ impl ProxyService {
         path: &str,
         recorded_keys: [&str; 2],
     ) -> Result<usize> {
-        let mut keys: Vec<String> = Vec::with_capacity(4);
-        if let Ok(derived) = CacheKeys::derive(&self.cache_scope, repo_key, path) {
-            keys.push(derived.content);
-            keys.push(derived.metadata);
-        }
-        for recorded in recorded_keys {
-            if keys.iter().any(|k| k == recorded) {
-                continue;
-            }
-            if !self.cache_scope.owns_entry_key(repo_key, recorded) {
-                return Err(AppError::Conflict(format!(
-                    "catalogue row records '{recorded}', which is outside the proxy cache of \
-                     '{repo_key}' (renamed repository or corrupt row); entry kept"
-                )));
-            }
-            keys.push(recorded.to_string());
-        }
-        // Bodies before sidecars, as invalidation orders them.
-        keys.sort_by_key(|k| k.ends_with("__cache_meta__.json"));
-
-        let mut deleted = 0usize;
-        for key in &keys {
-            if !self.storage.exists(key).await? {
-                continue;
-            }
-            match self.storage.delete(key).await {
-                Ok(()) => deleted += 1,
-                Err(AppError::NotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-            if key.ends_with("__cache_meta__.json") {
-                invalidate_proxy_metadata_lru(key).await;
-            }
-        }
-        Ok(deleted)
+        evict_entry_objects(
+            &self.storage,
+            &self.cache_scope,
+            repo_key,
+            path,
+            recorded_keys,
+        )
+        .await
     }
 
     /// Read the proxy cache metadata blob (`cached_at`, `expires_at`,
@@ -8302,6 +8606,33 @@ impl ProxyService {
         raw.filter(|q| *q > 0)
     }
 
+    /// The per-object cache ceiling of a Remote (#4660): its `quota_bytes`
+    /// (#2928) or its proxy-cache cap, whichever is smaller. An object larger
+    /// than the cap can never be cached without evicting everything else and
+    /// still being over it, so it is served without a cache write, like one
+    /// over the quota.
+    async fn resolve_cache_ceiling_bytes(&self, repo: &Repository) -> Option<i64> {
+        let quota = self.resolve_quota_bytes(repo).await;
+        let cap = self.cache_cap.cap_bytes(repo.id).await;
+        match (quota, cap) {
+            (Some(q), Some(c)) => Some(q.min(c)),
+            (q, c) => q.or(c),
+        }
+    }
+
+    /// Whether `repo` takes a cache fill now (#4660): `false` only while its
+    /// last cap eviction could not get the cache under the cap.
+    async fn cache_fill_admitted(&self, repo: &Repository) -> bool {
+        if self.cache_cap.admits_fills(repo.id).await {
+            return true;
+        }
+        tracing::debug!(
+            repository = %repo.key,
+            "proxy cache is over its cap and eviction is failing; serving without caching"
+        );
+        false
+    }
+
     /// The configured quota expressed as the per-object cache ceiling used by
     /// the streaming write path: the quota is an inclusive ceiling.
     ///
@@ -8768,9 +9099,19 @@ impl ProxyService {
         // as "no entry" (Miss) — same B6-safe stance as the fresh read path.
         // Waits (bounded) for an in-flight tail-phase streaming publish of the
         // same key so a just-cached entry is not misread as a miss (#3335).
-        let metadata = self
-            .load_cache_metadata_awaiting_publish(metadata_key, mutability)
-            .await;
+        // #4331: on a filesystem cache the body is read alongside the sidecar
+        // rather than after it (see [`Self::speculative_cache_reads`]).
+        let read_started = Utc::now();
+        let (metadata, prefetched_body) = tokio::join!(
+            self.load_cache_metadata_awaiting_publish(metadata_key, mutability),
+            async {
+                if self.speculative_cache_reads() {
+                    Some(self.storage.get(cache_key).await)
+                } else {
+                    None
+                }
+            },
+        );
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
 
         match cache_classifier::evaluate(entry.as_ref(), Utc::now()) {
@@ -8792,8 +9133,18 @@ impl ProxyService {
                 // just loaded (#3951 — previously a second, LRU-bypassing
                 // storage read of the same `__cache_meta__.json`); a
                 // missing/poisoned body degrades to Miss (B6).
+                let prefetched_body = prefetched_body
+                    .filter(|_| prefetch_is_current(read_started, metadata.as_ref()));
                 match self
-                    .get_cached_artifact(cache_key, metadata_key, metadata.clone())
+                    .cache_store
+                    .get_inner(
+                        cache_key,
+                        metadata_key,
+                        false,
+                        metadata.clone(),
+                        None,
+                        prefetched_body,
+                    )
                     .await?
                 {
                     Some(body) => Ok(CacheReadOutcome::Hit(
@@ -15021,6 +15372,139 @@ mod tests {
         let deletes = backend.deletes.lock().await;
         assert_eq!(deletes.len(), 1, "the staging object must be discarded");
         assert!(deletes[0].starts_with(TEE_STAGING_KEY_PREFIX));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4319: every publish failure the writer logs is also counted, labelled
+    // by backend and failure class; a body the writer abandons for an
+    // upstream reason is not a publish failure and is not counted.
+    // -----------------------------------------------------------------------
+
+    /// Drive one streaming cache write of `upstream` through `backend` on a
+    /// current-thread runtime and return the `ak_proxy_cache_publish_failures_total`
+    /// series it recorded, as `(class, value)` pairs for the `custom` backend
+    /// a [`RealStorageService::new`] handle reports.
+    fn publish_failures_4319(
+        backend: Arc<TeeRecordingBackend>,
+        upstream: Vec<Result<Bytes>>,
+        expected_len: Option<u64>,
+    ) -> Vec<(&'static str, u64)> {
+        let (_, counters) = crate::services::metrics_service::capture_counters_async(|| async {
+            let storage = Arc::new(RealStorageService::new(backend.clone()));
+            let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+                Box::pin(futures::stream::iter(upstream)),
+                "cache-key".to_string(),
+                format!(
+                    "proxy-cache/tee-4319-{}/__cache_meta__.json",
+                    Uuid::new_v4()
+                ),
+                template(),
+                expected_len,
+                None,
+            );
+            while let Some(chunk) = client.next().await {
+                if chunk.is_err() {
+                    break;
+                }
+            }
+            // The writer runs on this runtime; give it its publish tail.
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        [
+            "put_failed",
+            "copy_rejected",
+            "publish_mismatch",
+            "commit_failed",
+        ]
+        .into_iter()
+        .map(|class| {
+            (
+                class,
+                counters.get(
+                    "ak_proxy_cache_publish_failures_total",
+                    &[("backend", "custom"), ("class", class)],
+                ),
+            )
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect()
+    }
+
+    fn eleven_bytes() -> Vec<Result<Bytes>> {
+        vec![Ok(Bytes::from_static(b"first-chunk"))]
+    }
+
+    #[test]
+    fn test_rejected_publish_copy_is_counted_4319() {
+        assert_eq!(
+            publish_failures_4319(
+                TeeRecordingBackend::copy_failing(),
+                eleven_bytes(),
+                Some(11)
+            ),
+            vec![("copy_rejected", 1)]
+        );
+    }
+
+    #[test]
+    fn test_failed_staging_write_is_counted_4319() {
+        assert_eq!(
+            publish_failures_4319(TeeRecordingBackend::failing(), eleven_bytes(), Some(11)),
+            vec![("put_failed", 1)]
+        );
+    }
+
+    #[test]
+    fn test_publish_that_lands_short_is_counted_4319() {
+        assert_eq!(
+            publish_failures_4319(
+                TeeRecordingBackend::publish_lands_truncated(3),
+                eleven_bytes(),
+                Some(11)
+            ),
+            vec![("publish_mismatch", 1)]
+        );
+    }
+
+    #[test]
+    fn test_clean_publish_counts_nothing_4319() {
+        assert_eq!(
+            publish_failures_4319(TeeRecordingBackend::ok(), eleven_bytes(), Some(11)),
+            vec![]
+        );
+    }
+
+    /// An upstream that fails mid-body takes the writer down its
+    /// `put_stream` error arm too, but the backend did nothing wrong: not a
+    /// publish failure.
+    #[test]
+    fn test_upstream_failure_is_not_a_publish_failure_4319() {
+        assert_eq!(
+            publish_failures_4319(
+                TeeRecordingBackend::ok(),
+                vec![
+                    Ok(Bytes::from_static(b"first")),
+                    Err(AppError::BadGateway("connection reset".into())),
+                ],
+                Some(11)
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_put_stream_failure_classification_4319() {
+        assert!(!put_stream_failure_is_storage_side(&AppError::BadGateway(
+            "upstream".into()
+        )));
+        assert!(!put_stream_failure_is_storage_side(&AppError::Validation(
+            "ceiling".into()
+        )));
+        assert!(put_stream_failure_is_storage_side(&AppError::Storage(
+            "disk full".into()
+        )));
     }
 
     // -----------------------------------------------------------------------
@@ -26790,5 +27274,311 @@ mod client_path_tests {
         ] {
             assert!(reject_ambiguous_client_path(ok, false).is_ok(), "{ok}");
         }
+    }
+}
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod cache_read_overlap_tests {
+    //! #4331: a cache hit on the filesystem backend reads the body alongside
+    //! the sidecar, not after it.
+    use super::*;
+    use crate::services::storage_service::{
+        FilesystemBackend, PutStreamResult as ServicePutStreamResult,
+        StorageBackend as ServiceStorageBackend,
+    };
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
+
+    /// A filesystem backend whose sidecar reads take [`SIDECAR_DELAY`], and
+    /// which records when each body open and sidecar read happened.
+    struct SlowSidecarBackend {
+        inner: FilesystemBackend,
+        events: StdMutex<Vec<(&'static str, Instant)>>,
+    }
+
+    const SIDECAR_DELAY: Duration = Duration::from_millis(300);
+
+    impl SlowSidecarBackend {
+        fn event(&self, name: &'static str) {
+            self.events.lock().unwrap().push((name, Instant::now()));
+        }
+        fn first(&self, name: &str) -> Option<Instant> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, t)| *t)
+        }
+        fn count(&self, name: &str) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| *n == name)
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStorageBackend for SlowSidecarBackend {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.inner.put(key, content).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            if key.ends_with("__cache_meta__.json") {
+                tokio::time::sleep(SIDECAR_DELAY).await;
+                let r = self.inner.get(key).await;
+                self.event("sidecar_read_done");
+                return r;
+            }
+            self.event("body_get");
+            self.inner.get(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+            self.inner.copy(source, dest).await
+        }
+        async fn size(&self, key: &str) -> Result<u64> {
+            self.event("size");
+            self.inner.size(key).await
+        }
+        async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+            self.event("open");
+            self.inner.get_stream(key).await
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<ServicePutStreamResult> {
+            self.inner.put_stream(key, stream).await
+        }
+    }
+
+    const BODY: &[u8] = b"overlapped-cache-read-4331";
+
+    /// Seed a fresh, immutable-path entry (a release jar) at `path` with the
+    /// sidecar cached `cached_ago` before now.
+    async fn seed(
+        backend: &SlowSidecarBackend,
+        repo_key: &str,
+        path: &str,
+        cached_ago: chrono::Duration,
+    ) -> (String, String) {
+        let scope = ProxyCacheScope::unscoped();
+        let keys = CacheKeys::derive(&scope, repo_key, path).unwrap();
+        let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at: Utc::now() - cached_ago,
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            content_type: Some("application/java-archive".to_string()),
+            size_bytes: BODY.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(BODY),
+        };
+        backend
+            .inner
+            .put(&keys.content, Bytes::from_static(BODY))
+            .await
+            .unwrap();
+        backend
+            .inner
+            .put(
+                &keys.metadata,
+                Bytes::from(serde_json::to_vec(&metadata).unwrap()),
+            )
+            .await
+            .unwrap();
+        (keys.content, keys.metadata)
+    }
+
+    fn service(backend: Arc<SlowSidecarBackend>) -> ProxyService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        ProxyService::new(
+            pool,
+            Arc::new(StorageService::new(backend).with_kind("filesystem")),
+            ProxyCacheScope::unscoped(),
+        )
+        .without_origin_policy_gate()
+    }
+
+    fn repo(key: &str) -> Repository {
+        crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            Uuid::new_v4(),
+            key,
+            "http://upstream.invalid/",
+            RepositoryFormat::Generic,
+        )
+    }
+
+    async fn drain(mut body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        out
+    }
+
+    /// #4331, streaming: the body is measured and opened before the slow
+    /// sidecar read has returned, and the hit serves the right bytes with one
+    /// open and one size probe (no second sequential round trip).
+    #[tokio::test]
+    async fn streaming_hit_opens_the_body_alongside_the_sidecar_read_4331() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(SlowSidecarBackend {
+            inner: FilesystemBackend::new(dir.path().to_path_buf()),
+            events: StdMutex::new(Vec::new()),
+        });
+        let repo_key = format!("overlap-{}", Uuid::new_v4());
+        let path = "com/acme/lib/1.0/lib-1.0.jar";
+        let (content, metadata) =
+            seed(&backend, &repo_key, path, chrono::Duration::seconds(10)).await;
+        let proxy = service(Arc::clone(&backend));
+
+        let outcome = proxy
+            .read_cached_with_revalidation_streaming(
+                &repo(&repo_key),
+                path,
+                path,
+                &content,
+                &metadata,
+            )
+            .await
+            .expect("read");
+        let result = match outcome {
+            StreamingCacheReadOutcome::Hit(result, _) => result,
+            StreamingCacheReadOutcome::Miss => {
+                panic!("miss; events {:?}", backend.events.lock().unwrap())
+            }
+            _ => panic!("a fresh entry must be a hit"),
+        };
+        assert_eq!(drain(result.body).await, BODY);
+
+        let open = backend.first("open").expect("body opened");
+        let size = backend.first("size").expect("body measured");
+        let sidecar = backend.first("sidecar_read_done").expect("sidecar read");
+        assert!(
+            open < sidecar && size < sidecar,
+            "the body must be measured and opened while the sidecar read is in flight"
+        );
+        assert_eq!(backend.count("open"), 1);
+        assert_eq!(backend.count("size"), 1);
+    }
+
+    /// #4331, buffered: the body read overlaps the sidecar read too, and the
+    /// checksum against the sidecar still decides the hit.
+    #[tokio::test]
+    async fn buffered_hit_reads_the_body_alongside_the_sidecar_read_4331() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(SlowSidecarBackend {
+            inner: FilesystemBackend::new(dir.path().to_path_buf()),
+            events: StdMutex::new(Vec::new()),
+        });
+        let repo_key = format!("overlap-{}", Uuid::new_v4());
+        let path = "com/acme/lib/1.0/lib-1.0.pom";
+        let (content, metadata) =
+            seed(&backend, &repo_key, path, chrono::Duration::seconds(10)).await;
+        let proxy = service(Arc::clone(&backend));
+
+        let outcome = proxy
+            .read_cached_with_revalidation(&repo(&repo_key), path, path, &content, &metadata, None)
+            .await
+            .expect("read");
+        let CacheReadOutcome::Hit(bytes, ..) = outcome else {
+            panic!("a fresh entry must be a hit");
+        };
+        assert_eq!(&bytes[..], BODY);
+        let body = backend.first("body_get").expect("body read");
+        let sidecar = backend.first("sidecar_read_done").expect("sidecar read");
+        assert!(
+            body < sidecar,
+            "the body read must overlap the sidecar read"
+        );
+        assert_eq!(backend.count("body_get"), 1, "the body is read once");
+    }
+
+    /// An entry published after the speculative read began may be described
+    /// by a sidecar newer than the object that read opened: that read is
+    /// discarded and redone.
+    #[test]
+    fn prefetch_is_trusted_only_when_it_started_after_the_publish_4331() {
+        let now = Utc::now();
+        let meta = |cached_at| CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at,
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: now + chrono::Duration::hours(1),
+            content_type: None,
+            size_bytes: 1,
+            checksum_sha256: String::new(),
+        };
+        let old = meta(now - chrono::Duration::hours(1));
+        let new = meta(now + chrono::Duration::seconds(1));
+        // Published "just before" the read by another replica's clock: inside
+        // the skew allowance, so not trusted either.
+        let just_before = meta(now - chrono::Duration::seconds(1));
+        assert!(prefetch_is_current(now, Some(&old)));
+        assert!(!prefetch_is_current(now, Some(&new)));
+        assert!(!prefetch_is_current(now, Some(&just_before)));
+        assert!(!prefetch_is_current(now, None));
+    }
+
+    /// On an object store the reads stay sequential: a speculative open there
+    /// is a GET that starts transferring a body a miss would discard.
+    #[tokio::test]
+    async fn object_store_hits_do_not_speculate_4331() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(SlowSidecarBackend {
+            inner: FilesystemBackend::new(dir.path().to_path_buf()),
+            events: StdMutex::new(Vec::new()),
+        });
+        let repo_key = format!("overlap-{}", Uuid::new_v4());
+        let path = "com/acme/lib/1.0/lib-1.0.jar";
+        let (content, metadata) =
+            seed(&backend, &repo_key, path, chrono::Duration::seconds(10)).await;
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let proxy = ProxyService::new(
+            pool,
+            Arc::new(
+                StorageService::new(Arc::clone(&backend) as Arc<dyn ServiceStorageBackend>)
+                    .with_kind("s3"),
+            ),
+            ProxyCacheScope::unscoped(),
+        )
+        .without_origin_policy_gate();
+        let outcome = proxy
+            .read_cached_with_revalidation_streaming(
+                &repo(&repo_key),
+                path,
+                path,
+                &content,
+                &metadata,
+            )
+            .await
+            .expect("read");
+        assert!(matches!(outcome, StreamingCacheReadOutcome::Hit(..)));
+        let open = backend.first("open").expect("body opened");
+        let sidecar = backend.first("sidecar_read_done").expect("sidecar read");
+        assert!(open > sidecar, "no speculative open on an object store");
     }
 }

@@ -64,6 +64,7 @@ use crate::services::signing_service::SigningService;
 
 mod current_repodata;
 mod merge_gate;
+mod package_gate;
 mod virtual_merge;
 
 // ---------------------------------------------------------------------------
@@ -1046,9 +1047,17 @@ async fn download_package_with_token(
     state: State<SharedState>,
     auth: Extension<Option<AuthExtension>>,
     Path((_token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    download_package(state, auth, Path((repo_key, subdir, filename)), ctx).await
+    download_package(
+        state,
+        auth,
+        Path((repo_key, subdir, filename)),
+        headers,
+        ctx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -5759,15 +5768,384 @@ fn conda_package_content_type(filename: &str) -> &'static str {
     }
 }
 
+/// Everything the package route needs from the database before it can serve
+/// a hosted package, read in ONE statement (#4181): the repository record,
+/// its visibility, the artifact at the requested path with its quarantine
+/// fields, whether any enabled scan policy applies to the repository, and,
+/// for a Remote, the proxy-cache catalog row of the package. Before this the
+/// route issued five sequential statements per hosted GET (resolve, the
+/// `is_public` read, the artifact lookup, the quarantine read and the scan
+/// policy lookup).
+struct PackageLookup {
+    repo: RepoInfo,
+    is_public: bool,
+    artifact: Option<HostedPackageRow>,
+    /// The Remote's catalogued copy of the package (`proxy_cache_artifacts`).
+    cached: Option<PackageValidator>,
+}
+
+/// The hosted artifact row the package route serves.
+struct HostedPackageRow {
+    id: uuid::Uuid,
+    size_bytes: i64,
+    checksum_sha256: String,
+    storage_key: String,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    /// An enabled scan policy (repository-specific or global) applies, so the
+    /// scan-policy half of the download gate has to be evaluated.
+    scan_policy_applies: bool,
+}
+
+const PACKAGE_LOOKUP_SQL: &str = "\
+SELECT r.id, r.key, r.storage_backend, r.storage_path, r.format::TEXT AS format, \
+       r.repo_type::TEXT AS repo_type, r.upstream_url, r.promotion_only, \
+       r.age_gate_enabled, r.age_gate_min_age_days, r.age_gate_mode, \
+       r.curation_enabled, r.curation_default_action, r.is_public, \
+       a.id AS artifact_id, a.size_bytes, a.checksum_sha256, a.storage_key, \
+       a.quarantine_status, a.quarantine_until, a.updated_at AS artifact_updated_at, \
+       (a.id IS NOT NULL AND EXISTS ( \
+           SELECT 1 FROM scan_policies sp \
+            WHERE sp.is_enabled = true \
+              AND (sp.repository_id = r.id OR sp.repository_id IS NULL))) AS scan_policy_applies, \
+       pc.checksum_sha256 AS cached_sha256, pc.size_bytes AS cached_size, \
+       pc.cached_at \
+  FROM repositories r \
+  LEFT JOIN LATERAL ( \
+       SELECT id, size_bytes, checksum_sha256, storage_key, quarantine_status, \
+              quarantine_until, updated_at \
+         FROM artifacts \
+        WHERE repository_id = r.id AND is_deleted = false AND path = $2 \
+        LIMIT 1) a ON true \
+  LEFT JOIN proxy_cache_artifacts pc \
+         ON r.repo_type = 'remote' AND pc.repository_id = r.id AND pc.path = $3 \
+ WHERE r.key = $1";
+
+/// Run [`PACKAGE_LOOKUP_SQL`]. A missing repository is 404 and a repository
+/// of another format 400, exactly as [`resolve_conda_repo`] answers; a
+/// saturated pool is a retryable 503 (`map_db_err`).
+async fn lookup_package(
+    conn: &mut sqlx::PgConnection,
+    repo_key: &str,
+    artifact_path: &str,
+    cache_key: &str,
+) -> Result<PackageLookup, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(PACKAGE_LOOKUP_SQL)
+        .bind(repo_key)
+        .bind(artifact_path)
+        .bind(cache_key)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(crate::api::handlers::error_helpers::map_db_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
+
+    let format: String = row.try_get("format").unwrap_or_default();
+    if !["conda", "conda_native"].contains(&format.to_lowercase().as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Repository '{repo_key}' is not a Conda repository (format: {format})"),
+        )
+            .into_response());
+    }
+    let repo = RepoInfo {
+        id: row.try_get("id").unwrap_or_default(),
+        key: row.try_get("key").unwrap_or_default(),
+        storage_path: row.try_get("storage_path").unwrap_or_default(),
+        storage_backend: row.try_get("storage_backend").unwrap_or_default(),
+        repo_type: row.try_get("repo_type").unwrap_or_default(),
+        format,
+        upstream_url: row.try_get("upstream_url").ok(),
+        promotion_only: row.try_get("promotion_only").unwrap_or(false),
+        age_gate_enabled: row.try_get("age_gate_enabled").unwrap_or(false),
+        age_gate_min_age_days: row.try_get("age_gate_min_age_days").unwrap_or(7),
+        age_gate_mode: row
+            .try_get("age_gate_mode")
+            .unwrap_or_else(|_| "upstream_publish_time".to_string()),
+        curation_enabled: row.try_get("curation_enabled").unwrap_or(false),
+        curation_default_action: row
+            .try_get("curation_default_action")
+            .unwrap_or_else(|_| "allow".to_string()),
+    };
+    let artifact = match row.try_get::<Option<uuid::Uuid>, _>("artifact_id") {
+        Ok(Some(id)) => Some(HostedPackageRow {
+            id,
+            size_bytes: row.try_get("size_bytes").unwrap_or_default(),
+            checksum_sha256: row.try_get("checksum_sha256").unwrap_or_default(),
+            storage_key: row.try_get("storage_key").unwrap_or_default(),
+            quarantine_status: row.try_get("quarantine_status").unwrap_or(None),
+            quarantine_until: row.try_get("quarantine_until").unwrap_or(None),
+            updated_at: row
+                .try_get("artifact_updated_at")
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            // Unreadable means "evaluate the policy", never "skip it".
+            scan_policy_applies: row.try_get("scan_policy_applies").unwrap_or(true),
+        }),
+        _ => None,
+    };
+    let cached = match (
+        row.try_get::<Option<String>, _>("cached_sha256"),
+        row.try_get::<Option<i64>, _>("cached_size"),
+    ) {
+        (Ok(Some(sha256)), Ok(Some(size))) => Some(PackageValidator {
+            sha256,
+            size_bytes: Some(size),
+            last_modified: row.try_get("cached_at").ok(),
+        }),
+        _ => None,
+    };
+    Ok(PackageLookup {
+        is_public: row.try_get("is_public").unwrap_or(false),
+        repo,
+        artifact,
+        cached,
+    })
+}
+
+/// The validator of the bytes a package response carries (#4579): the
+/// content's sha256, which becomes the strong `ETag`, and when known the
+/// time the content was stored, which becomes `Last-Modified`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageValidator {
+    sha256: String,
+    /// The catalogued size. A proxied serve whose `Content-Length` differs
+    /// is not the catalogued copy, so the validator is not applied to it.
+    size_bytes: Option<i64>,
+    last_modified: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PackageValidator {
+    fn etag(&self) -> String {
+        format!("\"{}\"", self.sha256)
+    }
+}
+
+/// `true` when the request's `If-None-Match` names `etag` (or is `*`),
+/// using the weak comparison RFC 9110 prescribes for `If-None-Match`.
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let opaque = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let wanted = opaque(etag);
+    header
+        .split(',')
+        .any(|candidate| candidate.trim() == "*" || opaque(candidate) == wanted)
+}
+
+fn http_date(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+/// Give a `200` package response its validators and answer a conditional
+/// request that matches them with `304 Not Modified` and no body (#4579).
+///
+/// The validator is, in order: `validator` (the hosted artifact or the
+/// catalogued proxy-cache copy the route resolved), the response's own
+/// `X-Checksum-SHA256` (the scan-on-proxy gate's digest of the bytes it
+/// serves), and otherwise the response's existing `ETag`. A 304 is only
+/// answered on a sha256 validator (one of the first two) and when
+/// `allow_not_modified` is set: the caller clears it for a proxied serve that
+/// may be a cold fetch, so dropping the body never cancels a cache fill. A
+/// response that only carries the upstream's `ETag` (the streaming arms of
+/// the scan-on-proxy walk, which may be a cold fetch) is always served in
+/// full. Every gate (access, quarantine, scan policy, holds) has
+/// already run by the time a `200` reaches this point, so a blocked package
+/// is never answered 304.
+fn finish_package_response(
+    request: &HeaderMap,
+    mut response: Response,
+    validator: Option<&PackageValidator>,
+    allow_not_modified: bool,
+) -> Response {
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok());
+    let validator = validator.filter(|v| match (v.size_bytes, content_length) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => true,
+    });
+    let header_digest = response
+        .headers()
+        .get("X-Checksum-SHA256")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let (etag, last_modified, sha_based) = match (validator, header_digest) {
+        (Some(v), _) => (Some(v.etag()), v.last_modified, true),
+        (None, Some(digest)) => (Some(format!("\"{digest}\"")), None, true),
+        (None, None) => (
+            response
+                .headers()
+                .get(ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            None,
+            false,
+        ),
+    };
+    if let Some(etag) = etag.as_deref().filter(|_| sha_based) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(etag) {
+            response.headers_mut().insert(ETAG, value);
+        }
+    }
+    if let Some(at) = last_modified {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&http_date(at)) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LAST_MODIFIED, value);
+        }
+    }
+    let not_modified = match request
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        // RFC 9110 13.2.2: If-None-Match takes precedence; If-Modified-Since
+        // is only evaluated without it.
+        Some(header) => etag
+            .as_deref()
+            .is_some_and(|etag| if_none_match_matches(header, etag)),
+        None => match (
+            last_modified,
+            request
+                .get(axum::http::header::IF_MODIFIED_SINCE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok()),
+        ) {
+            (Some(modified), Some(since)) => modified.timestamp() <= since.timestamp(),
+            _ => false,
+        },
+    };
+    if !not_modified || !allow_not_modified || !sha_based {
+        return response;
+    }
+    let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+    for name in [
+        ETAG,
+        axum::http::header::LAST_MODIFIED,
+        axum::http::header::CACHE_CONTROL,
+        axum::http::header::VARY,
+    ] {
+        if let Some(value) = response.headers().get(&name) {
+            builder = builder.header(name, value.clone());
+        }
+    }
+    // Dropping `response` releases its body stream unread.
+    builder.body(Body::empty()).unwrap()
+}
+
+/// Find the validator of the package a Virtual is about to serve (#4579),
+/// in ONE statement over its (already authorized and filtered) members.
+///
+/// The members are walked in priority order, as the download resolver walks
+/// them: a hosted member without the artifact is a definite miss and is
+/// skipped; the first hosted member that holds it, or the first Remote member
+/// with a catalogued copy, is the one that serves, and its sha256 is the
+/// validator. A Remote member WITHOUT a catalogued copy ahead of that would
+/// go upstream and could serve different bytes, so the walk stops there with
+/// no validator. The second element is the hosted artifact id, which the
+/// caller checks against the artifact the resolver actually served.
+async fn virtual_package_validator(
+    db: &sqlx::PgPool,
+    members: &[crate::models::repository::Repository],
+    artifact_path: &str,
+    cache_key: &str,
+    proxy_enabled: bool,
+) -> Option<(PackageValidator, Option<uuid::Uuid>)> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        member_id: uuid::Uuid,
+        artifact_id: Option<uuid::Uuid>,
+        artifact_sha256: Option<String>,
+        artifact_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+        cached_sha256: Option<String>,
+        cached_size: Option<i64>,
+        cached_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    if members.is_empty() {
+        return None;
+    }
+    let ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT m.id AS member_id, a.id AS artifact_id, a.checksum_sha256 AS artifact_sha256, \
+                a.updated_at AS artifact_updated_at, pc.checksum_sha256 AS cached_sha256, \
+                pc.size_bytes AS cached_size, pc.cached_at \
+           FROM unnest($1::UUID[]) AS m(id) \
+           LEFT JOIN LATERAL ( \
+                SELECT id, checksum_sha256, updated_at FROM artifacts \
+                 WHERE repository_id = m.id AND is_deleted = false AND path = $2 \
+                 LIMIT 1) a ON true \
+           LEFT JOIN proxy_cache_artifacts pc \
+                  ON pc.repository_id = m.id AND pc.path = $3",
+    )
+    .bind(&ids)
+    .bind(artifact_path)
+    .bind(cache_key)
+    .fetch_all(db)
+    .await
+    .ok()?;
+    for member in members {
+        let row = rows.iter().find(|r| r.member_id == member.id)?;
+        if member.repo_type == RepositoryType::Remote {
+            if !proxy_enabled || member.upstream_url.is_none() {
+                continue;
+            }
+            return match (&row.cached_sha256, row.cached_size) {
+                (Some(sha256), Some(size)) => Some((
+                    PackageValidator {
+                        sha256: sha256.clone(),
+                        size_bytes: Some(size),
+                        last_modified: row.cached_at,
+                    },
+                    None,
+                )),
+                _ => None,
+            };
+        }
+        if let (Some(id), Some(sha256)) = (row.artifact_id, &row.artifact_sha256) {
+            return Some((
+                PackageValidator {
+                    sha256: sha256.clone(),
+                    size_bytes: None,
+                    last_modified: row.artifact_updated_at,
+                },
+                Some(id),
+            ));
+        }
+    }
+    None
+}
+
 async fn download_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    request_headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    let artifact_path = build_conda_artifact_path(&subdir, &filename);
+    let serve_key = conda_package_serve_key(&subdir, &filename);
+    let PackageLookup {
+        repo,
+        is_public,
+        artifact,
+        cached,
+    } = {
+        // #4182: the lookup's connection comes through the fast-fail gate, so
+        // a saturated pool sheds this request with 503 + Retry-After instead
+        // of queueing it to the acquire timeout. The connection goes back to
+        // the pool before anything is streamed.
+        let mut conn = package_gate::acquire(&state.db).await?;
+        lookup_package(&mut conn, &repo_key, &artifact_path, &serve_key.cache_key).await?
+    };
 
-    check_read_access(&state.db, auth.clone(), &repo).await?;
+    // Same decision `check_read_access` makes, from the row already read.
+    if !is_public {
+        require_auth_basic(auth.clone(), "conda")?;
+    }
 
     // #4365 item 3: on a proxying repository the subdir and file name are
     // joined into the upstream path and key the proxy cache, so a segment an
@@ -5784,37 +6162,14 @@ async fn download_package(
         return serve_sidecar(&state, auth.as_ref(), &repo, &subdir, &filename, request).await;
     }
 
-    // Look up artifact by path
-    let artifact_path = build_conda_artifact_path(&subdir, &filename);
-
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, size_bytes, checksum_sha256, storage_key
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path = $2
-        LIMIT 1
-        "#,
-        repo.id,
-        artifact_path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Database error looking up package: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
-
+    let not_found = || (StatusCode::NOT_FOUND, "Package not found").into_response();
     let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
+        Some(a) => a,
+        None => {
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let serve_key = conda_package_serve_key(&subdir, &filename);
                     // #4585: with scan-on-proxy on, a package goes through the
                     // inline scan-and-block gate (buffered, cache-first,
                     // digest-keyed verdict) INSTEAD of the streaming path
@@ -5829,7 +6184,10 @@ async fn download_package(
                                 cache_key: &serve_key.cache_key,
                                 ctx: &ctx,
                             };
-                            return serve_scanned_conda_package(
+                            // The gate buffers and commits before it serves, so
+                            // a 304 never cancels a cache fill; its response
+                            // names the digest it served (#4579).
+                            let response = serve_scanned_conda_package(
                                 &state,
                                 proxy,
                                 (repo.id, &repo_key),
@@ -5837,10 +6195,16 @@ async fn download_package(
                                 &target,
                                 policy,
                             )
-                            .await;
+                            .await?;
+                            return Ok(finish_package_response(
+                                &request_headers,
+                                response,
+                                None,
+                                true,
+                            ));
                         }
                     }
-                    let upstream_path = serve_key.cache_key;
+                    let upstream_path = serve_key.cache_key.clone();
                     // #2915 BLOCKER: this is the PACKAGE path, not a metadata
                     // path, and it used to go through the buffered
                     // `proxy_fetch_capped` at the 8 MiB metadata ceiling. Real
@@ -5889,6 +6253,20 @@ async fn download_package(
                             crate::models::repository::RepositoryFormat::Conda,
                         )
                         .await?;
+                    // #4579: a catalogued package is immutable and answers from
+                    // the cache, so it carries its sha256 as the ETag and a
+                    // matching conditional request is a 304. Without a catalog
+                    // row the serve may be the cold fetch that fills the cache,
+                    // whose body must not be dropped.
+                    let response = finish_package_response(
+                        &request_headers,
+                        response,
+                        cached.as_ref(),
+                        cached.is_some(),
+                    );
+                    if response.status() == StatusCode::NOT_MODIFIED {
+                        return Ok(response);
+                    }
                     // #3649: count the proxied serve. The streaming helper answers a warm
                     // cache HIT from storage and a cold MISS from upstream through the same
                     // call, so recording once it resolves counts both -- the cache hit #3649
@@ -5951,7 +6329,14 @@ async fn download_package(
                 if had_members && members.is_empty() {
                     return Err(proxy_helpers::no_accessible_members_response());
                 }
-                let serve_key = conda_package_serve_key(&subdir, &filename);
+                let validator = virtual_package_validator(
+                    &state.db,
+                    &members,
+                    &artifact_path,
+                    &serve_key.cache_key,
+                    proxy_service.is_some(),
+                )
+                .await;
                 let db = state.db.clone();
                 let artifact_path_clone = artifact_path.clone();
                 let local_fetch = |member_id, location| {
@@ -5983,7 +6368,9 @@ async fn download_package(
                     )
                     .await
                     {
-                        return served;
+                        return served.map(|response| {
+                            finish_package_response(&request_headers, response, None, true)
+                        });
                     }
                 }
 
@@ -5996,14 +6383,27 @@ async fn download_package(
                 )
                 .await?;
 
-                return proxy_helpers::stream_fetch_result(
+                // #4579: apply the validator only to the bytes it describes:
+                // a hosted member's serve must be the artifact it names, and a
+                // Remote member's serve must come from a catalogued copy.
+                let validator = validator.filter(|(_, artifact_id)| match artifact_id {
+                    Some(id) => result.artifact_id == Some(*id),
+                    None => result.artifact_id.is_none(),
+                });
+                let response = proxy_helpers::stream_fetch_result(
                     result,
                     conda_package_content_type(&filename),
                     Some(&filename),
-                );
+                )?;
+                return Ok(match validator {
+                    Some((validator, _)) => {
+                        finish_package_response(&request_headers, response, Some(&validator), true)
+                    }
+                    None => finish_package_response(&request_headers, response, None, false),
+                });
             }
 
-            return Err(not_found);
+            return Err(not_found());
         }
     };
 
@@ -6011,10 +6411,37 @@ async fn download_package(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
-        .await
-        .map_err(|e| e.into_response())?;
+    // Quarantine and scan-policy gate before serving, from the row already
+    // read (#4181).
+    crate::services::quarantine_service::enforce_download_gate_for_row(
+        &state.db,
+        &crate::services::quarantine_service::DownloadGateRow {
+            artifact_id: artifact.id,
+            repository_id: repo.id,
+            quarantine_status: artifact.quarantine_status.as_deref(),
+            quarantine_until: artifact.quarantine_until,
+            scan_policy_applies: artifact.scan_policy_applies,
+        },
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
+    // #4579: a matching conditional request is answered before the storage
+    // read, with the validators the 200 would carry.
+    let validator = PackageValidator {
+        sha256: artifact.checksum_sha256.clone(),
+        size_bytes: None,
+        last_modified: Some(artifact.updated_at),
+    };
+    let unread = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::empty())
+        .unwrap();
+    let probe = finish_package_response(&request_headers, unread, Some(&validator), true);
+    if probe.status() == StatusCode::NOT_MODIFIED {
+        return Ok(probe);
+    }
 
     let stream = storage
         .get_stream(&artifact.storage_key)
@@ -6027,7 +6454,7 @@ async fn download_package(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    Ok(Response::builder()
+    let response = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, conda_package_content_type(&filename))
         .header(
@@ -6037,7 +6464,13 @@ async fn download_package(
         .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
-        .unwrap())
+        .unwrap();
+    Ok(finish_package_response(
+        &request_headers,
+        response,
+        Some(&validator),
+        false,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -24756,6 +25189,436 @@ mod upload_body_tests {
             budget.available_bytes(),
             64 * 1024 * 1024,
             "the body's budget is released once the request is done"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod package_conditional_tests {
+    //! #4181 / #4579: the package route resolves a hosted package in one
+    //! statement, carries `ETag` (the sha256) and `Last-Modified` on every
+    //! package response, and answers a matching conditional request with
+    //! `304 Not Modified` and no body on hosted, cached-remote and virtual
+    //! channels, direct and under both token layouts.
+    use super::virtual_channel_tests::VirtualRig;
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FILE: &str = "acme-etag-1.0-0.tar.bz2";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Store `bytes` as the hosted package `noarch/{FILE}` of `repo_id`.
+    async fn seed_hosted_package(state: &SharedState, repo_id: uuid::Uuid, bytes: &[u8]) -> String {
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("repository");
+        let location = crate::storage::StorageLocation {
+            backend: row.get("storage_backend"),
+            path: row.get("storage_path"),
+        };
+        let storage_key = format!("conda/{repo_id}/noarch/{FILE}");
+        state
+            .storage_for_repo(&location)
+            .expect("storage")
+            .put(&storage_key, Bytes::copy_from_slice(bytes))
+            .await
+            .expect("store package");
+        let sha = sha256_hex(bytes);
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'acme-etag', '1.0', $3, $4, 'application/x-tar', $5)",
+        )
+        .bind(repo_id)
+        .bind(format!("noarch/{FILE}"))
+        .bind(bytes.len() as i64)
+        .bind(&sha)
+        .bind(&storage_key)
+        .execute(&state.db)
+        .await
+        .expect("insert hosted package");
+        sha
+    }
+
+    fn app(state: &SharedState) -> axum::Router {
+        tdh::router_anon(
+            axum::Router::new()
+                .nest("/conda", router())
+                .nest("/conda/t", token_router())
+                .nest("/t", rattler_token_router()),
+            state.clone(),
+        )
+    }
+
+    async fn get(
+        state: &SharedState,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        let mut req = axum::http::Request::builder().method("GET").uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        tdh::send_with_headers(app(state), req.body(Body::empty()).unwrap()).await
+    }
+
+    /// The three URL layouts of one package.
+    fn layouts(key: &str) -> [String; 3] {
+        [
+            format!("/conda/{key}/noarch/{FILE}"),
+            format!("/conda/t/some-token/{key}/noarch/{FILE}"),
+            format!("/t/some-token/conda/{key}/noarch/{FILE}"),
+        ]
+    }
+
+    /// Assert the 200 / 304 contract for `key` on every layout: the 200
+    /// carries `ETag: "<sha>"` and `Last-Modified`; the same ETag, a weak
+    /// form of it, a list naming it, and a later `If-Modified-Since` are 304
+    /// with an empty body; a different ETag is a full 200.
+    async fn assert_conditional(state: &SharedState, key: &str, sha: &str, bytes: &[u8]) {
+        let etag = format!("\"{sha}\"");
+        for uri in layouts(key) {
+            let (status, body, headers) = get(state, &uri, &[]).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(&body[..], bytes, "{uri}");
+            assert_eq!(headers[ETAG], etag.as_str(), "{uri}");
+            let last_modified = headers
+                .get(axum::http::header::LAST_MODIFIED)
+                .unwrap_or_else(|| panic!("{uri}: no Last-Modified"))
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            let weak = format!("W/{etag}");
+            let listed = format!("\"other\", {etag}");
+            for inm in [etag.as_str(), weak.as_str(), listed.as_str(), "*"] {
+                let (status, body, headers) = get(state, &uri, &[("if-none-match", inm)]).await;
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_MODIFIED,
+                    "{uri} If-None-Match {inm}"
+                );
+                assert!(body.is_empty(), "{uri}: a 304 has no body");
+                assert_eq!(headers[ETAG], etag.as_str(), "{uri}");
+            }
+            let (status, _, _) = get(
+                state,
+                &uri,
+                &[("if-modified-since", last_modified.as_str())],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{uri} If-Modified-Since");
+
+            let (status, body, _) = get(state, &uri, &[("if-none-match", "\"0000\"")]).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: a stale validator is a full 200"
+            );
+            assert_eq!(&body[..], bytes, "{uri}");
+            // If-None-Match takes precedence over a matching If-Modified-Since.
+            let (status, _, _) = get(
+                state,
+                &uri,
+                &[
+                    ("if-none-match", "\"0000\""),
+                    ("if-modified-since", last_modified.as_str()),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{uri}: If-None-Match wins");
+        }
+    }
+
+    /// Wait for the proxy cache to catalog `path` under `repo_id`.
+    async fn wait_for_catalog(pool: &sqlx::PgPool, repo_id: uuid::Uuid, path: &str) -> String {
+        for _ in 0..100 {
+            let sha: Option<String> = sqlx::query_scalar(
+                "SELECT checksum_sha256 FROM proxy_cache_artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .flatten();
+            if let Some(sha) = sha {
+                return sha;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{path} was never catalogued");
+    }
+
+    #[tokio::test]
+    async fn hosted_remote_and_virtual_packages_answer_304_on_a_matching_validator_4579() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let remote_bytes = b"remote package bytes for the #4579 conditional test".to_vec();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/noarch/{FILE}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"upstream-etag\"")
+                    .set_body_bytes(remote_bytes.clone()),
+            )
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let hosted_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.hosted_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+
+        // Hosted.
+        let hosted_bytes = b"hosted package bytes for the #4579 conditional test".to_vec();
+        let hosted_sha = seed_hosted_package(&rig.state, rig.hosted_id, &hosted_bytes).await;
+        assert_conditional(&rig.state, &hosted_key, &hosted_sha, &hosted_bytes).await;
+        // Virtual, served by its hosted member.
+        assert_conditional(&rig.state, &rig.virtual_key, &hosted_sha, &hosted_bytes).await;
+
+        // Remote: the first GET fills the cache; once catalogued the package
+        // carries its sha256 and revalidates without a body.
+        let (status, body, _) = get(
+            &rig.state,
+            &format!("/conda/{}/noarch/{FILE}", rig.remote_key),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &remote_bytes[..]);
+        let remote_sha =
+            wait_for_catalog(&rig.pool, rig.remote_id, &format!("noarch/{FILE}")).await;
+        assert_eq!(remote_sha, sha256_hex(&remote_bytes));
+        assert_conditional(&rig.state, &rig.remote_key, &remote_sha, &remote_bytes).await;
+
+        // Virtual, served by its cached Remote member once the hosted member
+        // no longer holds the package.
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(rig.hosted_id)
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+        assert_conditional(&rig.state, &rig.virtual_key, &remote_sha, &remote_bytes).await;
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(rig.remote_id)
+            .execute(&rig.pool)
+            .await;
+        rig.cleanup().await;
+    }
+
+    /// A quarantined hosted package is refused before any validator is
+    /// consulted: a conditional request is 409, never a 304.
+    #[tokio::test]
+    async fn a_held_package_is_never_answered_304_4579() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let state = fx.state.clone();
+        let bytes = b"held package".to_vec();
+        let sha = seed_hosted_package(&state, fx.repo_id, &bytes).await;
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NOW() + INTERVAL '1 hour' WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let etag = format!("\"{sha}\"");
+        let (status, _, _) = get(
+            &state,
+            &format!("/conda/{}/noarch/{FILE}", fx.repo_key),
+            &[("if-none-match", etag.as_str())],
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// #4181: a hosted package request reads the database in ONE statement
+    /// before it streams. It used to be five: resolve, visibility, artifact,
+    /// quarantine, scan policy. Counted as pool acquisitions on a pool that
+    /// only this request uses (every statement outside a transaction
+    /// acquires once); a HEAD, so the off-path download record (which a HEAD
+    /// does not write) cannot race the count.
+    #[tokio::test]
+    async fn a_hosted_package_request_issues_one_statement_4181() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let bytes = b"one statement".to_vec();
+        seed_hosted_package(&fx.state, fx.repo_id, &bytes).await;
+
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let counter = acquired.clone();
+        let url = crate::testing::require_db_url().expect("DATABASE_URL");
+        let counted = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .after_release(move |_conn, _meta| {
+                let counter = counter.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("counting pool");
+        let state = tdh::build_state(counted.clone(), fx.storage_dir.to_str().unwrap());
+        let uri = format!("/conda/{}/noarch/{FILE}", fx.repo_key);
+
+        sqlx::query("SELECT 1").execute(&counted).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let before = acquired.load(Ordering::SeqCst);
+        let (status, _, headers) = tdh::send_with_headers(app(&state), tdh::head(uri)).await;
+        // A dropped connection goes back to the pool on a spawned task.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let statements = acquired.load(Ordering::SeqCst) - before;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[CONTENT_LENGTH], bytes.len().to_string().as_str());
+        assert_eq!(statements, 1, "one statement per hosted package request");
+    }
+
+    /// A rejected hosted package is refused before any validator is
+    /// consulted: a conditional request is 403, never a 304.
+    #[tokio::test]
+    async fn a_rejected_package_is_never_answered_304_4579() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let state = fx.state.clone();
+        let bytes = b"rejected package".to_vec();
+        let sha = seed_hosted_package(&state, fx.repo_id, &bytes).await;
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let etag = format!("\"{sha}\"");
+        let (status, _, _) = get(
+            &state,
+            &format!("/conda/{}/noarch/{FILE}", fx.repo_key),
+            &[("if-none-match", etag.as_str())],
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A streamed proxy serve that only carries the upstream's `ETag` (the
+    /// scan-on-proxy walk's streaming arms, which may be the cold fetch that
+    /// fills the cache) is never answered 304, even when the caller allows a
+    /// 304 and the request names that `ETag`: dropping the body would cancel
+    /// the cache fill, and the upstream's tag is not the sha256 validator.
+    #[test]
+    fn an_upstream_etag_alone_never_yields_304_4579() {
+        let response = || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(ETAG, "\"upstream-etag\"")
+                .header(CONTENT_LENGTH, "5")
+                .body(Body::from("bytes"))
+                .unwrap()
+        };
+        let mut request = HeaderMap::new();
+        request.insert(
+            axum::http::header::IF_NONE_MATCH,
+            "\"upstream-etag\"".parse().unwrap(),
+        );
+        let served = finish_package_response(&request, response(), None, true);
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers()[ETAG], "\"upstream-etag\"");
+
+        // The scan gate's digest header is a sha256 validator and does 304.
+        let mut digested = response();
+        digested
+            .headers_mut()
+            .insert("X-Checksum-SHA256", "abc".parse().unwrap());
+        request.insert(
+            axum::http::header::IF_NONE_MATCH,
+            "\"abc\"".parse().unwrap(),
+        );
+        let served = finish_package_response(&request, digested, None, true);
+        assert_eq!(served.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(served.headers()[ETAG], "\"abc\"");
+    }
+
+    #[test]
+    fn if_none_match_uses_the_weak_comparison() {
+        assert!(if_none_match_matches("\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("W/\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("\"x\", \"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("*", "\"abc\""));
+        assert!(!if_none_match_matches("\"abcd\"", "\"abc\""));
+        assert!(!if_none_match_matches("", "\"abc\""));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod package_gate_router_tests {
+    //! #4182: a package request that finds the pool saturated is shed at once
+    //! with 503 + Retry-After instead of queueing to the acquire timeout.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn a_saturated_pool_sheds_package_requests_with_retry_after_4182() {
+        let Some(url) = crate::testing::require_db_url() else {
+            return;
+        };
+        // One connection, and an acquire timeout far beyond the gate's wait:
+        // without the gate the request below would wait the full 10 s.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&url)
+            .await
+            .expect("single-connection pool");
+        let dir = tempfile::tempdir().expect("storage dir");
+        let state = tdh::build_state(pool.clone(), dir.path().to_str().unwrap());
+        let app = || tdh::router_anon(router(), state.clone());
+        let uri = || "/no-such-channel/noarch/pkg-1.0-0.tar.bz2".to_string();
+
+        let held = pool.acquire().await.expect("hold the only connection");
+        let started = std::time::Instant::now();
+        let (status, _, headers) = tdh::send_with_headers(app(), tdh::get(uri())).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[axum::http::header::RETRY_AFTER], "1");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "shed after {elapsed:?}, not at the gate's wait"
+        );
+
+        // A free connection is used as before.
+        drop(held);
+        let (status, _, _) = tdh::send_with_headers(app(), tdh::get(uri())).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the request reaches the lookup"
         );
     }
 }

@@ -2058,6 +2058,23 @@ async fn recipe_file_download(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4108: a recipe archive (`conan_export.tgz`,
+            // `conan_sources.tgz`) through a scanning Remote or Virtual goes
+            // through the inline scan-and-block gate.
+            let scan_path =
+                build_recipe_upstream_path(&name, &version, &user, &channel, &revision, &file_path);
+            if let Some(served) = serve_scanned_conan_file_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &scan_path,
+                &artifact_path,
+                &ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -3348,6 +3365,31 @@ async fn package_file_download(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4108: a binary package archive (`conan_package.tgz`) through a
+            // scanning Remote or Virtual goes through the inline
+            // scan-and-block gate.
+            let scan_path = build_package_upstream_path(
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+                &package_id,
+                &pkg_revision,
+                &file_path,
+            );
+            if let Some(served) = serve_scanned_conan_file_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &scan_path,
+                &artifact_path,
+                &ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -4164,6 +4206,150 @@ fn build_package_upstream_path(
         pkg_revision,
         file_path.trim_start_matches('/')
     )
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy for recipe and package archives (#4108, on the #4098 gate)
+// ---------------------------------------------------------------------------
+
+/// The recipe and package files a Conan client reads as metadata, which
+/// stream unscanned on a scanning repository (#4108). Matched exactly: the
+/// client always asks for these spellings.
+const CONAN_METADATA_FILES: &[&str] = &["conanfile.py", "conanmanifest.txt", "conaninfo.txt"];
+
+/// The canonical `(cache_key, scannable)` decision for a proxied Conan file
+/// (#4365 item 1). Like the Maven control, everything except a short
+/// metadata allowlist ([`CONAN_METADATA_FILES`]) goes through the gate: the
+/// `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`,
+/// `conan_package.tgz`), and also any other file name, so an archive under
+/// another name (a zstd `.tzst`, an upstream's own layout) is never streamed
+/// unscanned. Cached under the upstream path the streaming arm commits to.
+fn conan_file_serve_key(upstream_path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::proxy_serve_key(upstream_path, |file| {
+        !CONAN_METADATA_FILES.contains(&file)
+    })
+}
+
+/// The Conan half of the generic gate (#4108). A Conan archive carries no
+/// identity of its own (the reference lives in the URL and in the separate
+/// `conaninfo.txt` / `conanfile.py`), so the rule is only that the bytes are
+/// a readable gzipped tar; they are graded on their contents (a bundled
+/// `conanfile.txt` or `conan.lock`, binaries the engine recognises).
+struct ConanArchive;
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ConanArchive {
+    const LABEL: &'static str = "conan archive";
+    const CONTENT_TYPE: &'static str = "application/octet-stream";
+
+    fn requested(&self) -> String {
+        "a conan archive".to_string()
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &bytes::Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        conan_archive_identity(bytes)
+    }
+}
+
+fn conan_archive_identity(
+    bytes: &bytes::Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{read_tar_gz_entry, ArchiveIdentity};
+    // No entry matches: a full header walk, which only a readable gzipped
+    // tar survives.
+    match read_tar_gz_entry(bytes, |_| false) {
+        Ok(_) => ArchiveIdentity::ContentGraded,
+        Err(e) => ArchiveIdentity::Unreadable(e),
+    }
+}
+
+/// Inline scan-and-block for one Conan archive from one Remote repository
+/// (#4108).
+async fn serve_scanned_conan_archive(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    cache_key: &str,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let filename = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Conan,
+        source_path: cache_key,
+        cache_path: cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: ConanArchive,
+        disposition: None,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of the recipe and package file routes (#4108):
+/// `Ok(None)` for a file that is not an archive, or when nothing scans, so
+/// the caller keeps its untouched path.
+async fn serve_scanned_conan_file_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    upstream_path: &str,
+    artifact_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    // #4365 item 3: on a proxying repository the reference and file path are
+    // the upstream path and key the proxy cache, so an ambiguous one is a
+    // 400 before anything is fetched, scanned or not.
+    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+        crate::services::proxy_service::reject_ambiguous_client_path(upstream_path, false)
+            .map_err(IntoResponse::into_response)?;
+    }
+    let serve_key = conan_file_serve_key(upstream_path);
+    if !serve_key.scannable {
+        return Ok(None);
+    }
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let cache_key = serve_key.cache_key.as_str();
+    let route = ScannedRoute {
+        upstream_path: cache_key,
+        lookup: LocalLookup::ExactPath(artifact_path),
+        default_content_type: "application/octet-stream",
+        virtual_disposition: None,
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream_url), policy, _disposition| async move {
+            serve_scanned_conan_archive(
+                state,
+                proxy,
+                (id, &key, &upstream_url),
+                cache_key,
+                policy,
+                ctx,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -12234,5 +12420,178 @@ mod push_sync_4725 {
             ],
             "the manifest publish must queue the whole revision; a replicated publish must queue nothing"
         );
+    }
+}
+
+/// #4108: scan-on-proxy on Conan archives, Remote and Virtual, through the
+/// shared archive scenarios, plus which files the gate sees.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4108 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+
+    const REV: &str = "0123456789abcdef0123456789abcdef";
+    const PKG: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    fn tar_gz(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, data.as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        let path = build_package_upstream_path(
+            "dtfscan",
+            "1.0.0",
+            "_",
+            "_",
+            REV,
+            PKG,
+            REV,
+            "conan_package.tgz",
+        );
+        ArchiveCase {
+            format: "conan",
+            router: super::router,
+            uri: Box::new(|key| {
+                format!(
+                    "/{key}/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/packages/{PKG}/revisions/{REV}/files/conan_package.tgz"
+                )
+            }),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: tar_gz(&[
+                (
+                    "conaninfo.txt",
+                    format!("[settings]\n# {}\n", uuid::Uuid::new_v4()),
+                ),
+                ("lib/libdtf.a", "!<arch>\n".to_string()),
+            ]),
+            recorded_path: path,
+            file: "conan_package.tgz".to_string(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [format!("/{key}/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/packages/{PKG}/revisions/{REV}/files/conan_package.tgz%3Fx"), format!("/{key}/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/files/conanfile.py%3Fx")] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    /// An archive under a name outside the metadata allowlist (a zstd
+    /// `.tzst`) goes through the gate like a `.tgz`: under `fail_closed` the
+    /// bytes, which are not a gzipped tar, are withheld and never streamed.
+    #[tokio::test]
+    async fn an_archive_under_another_name_is_gated() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        let tzst = format!(
+            "/{}/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/packages/{PKG}/revisions/{REV}/files/conan_package.tzst",
+            rig.fx.repo_key
+        );
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/packages/{PKG}/revisions/{REV}/files/conan_package.tzst"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"(zstd frame)".to_vec()))
+            .mount(&rig.server)
+            .await;
+        let (status, body, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+            crate::api::handlers::test_db_helpers::router_anon(super::router(), rig.state.clone()),
+            crate::api::handlers::test_db_helpers::get(tzst),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_ne!(&body[..], b"(zstd frame)");
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn only_a_readable_gzipped_tar_is_graded() {
+        let ok = Bytes::from(tar_gz(&[("conanfile.txt", "[requires]\n".to_string())]));
+        assert_eq!(conan_archive_identity(&ok), ArchiveIdentity::ContentGraded);
+        assert!(matches!(
+            conan_archive_identity(&Bytes::from_static(b"not a tarball")),
+            ArchiveIdentity::Unreadable(_)
+        ));
+    }
+}
+
+/// #4365 item 1: Conan decides by file name: the `.tgz` archives are gated,
+/// the recipe and package text files are not.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn conan_file_serve_key_table() {
+        let base = "v2/conans/zlib/1.3/_/_/revisions/r/files";
+        for (file, scannable) in [
+            ("conan_export.tgz", true),
+            ("conan_sources.tgz", true),
+            ("CONAN_PACKAGE.TGZ", true),
+            ("conanfile.py", false),
+            ("conanmanifest.txt", false),
+            ("conaninfo.txt", false),
+            ("conan_package.tgz;x", true),
+            // Anything outside the metadata allowlist is gated, as on Maven.
+            ("conan_package.tzst", true),
+            ("conan_sources.tar.gz", true),
+            ("metadata/logs/build.log", true),
+            ("ConanFile.py", true),
+        ] {
+            let got = conan_file_serve_key(&format!("{base}/{file}"));
+            assert_eq!(got.scannable, scannable, "{file}");
+            assert_eq!(got.cache_key, format!("{base}/{file}"));
+        }
     }
 }

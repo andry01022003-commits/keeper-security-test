@@ -66,6 +66,40 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
+**Archive formats graded on their contents (Go, Composer, Conan, CocoaPods, Swift).** The gate
+takes the coordinate from the request and checks it against the archive
+first, as for every format: a Go module zip must hold only
+`{module}@{version}/` entries and its `go.mod` (when it has one) must declare
+that module; a Composer dist's own `composer.json` (at the archive root, or
+under the one top-level directory a VCS zipball wraps it in) must name the
+requested package, and a `version` it declares must be the requested one;
+a CocoaPods pod archive's own `{name}.podspec.json` (at the root or one
+directory down) must declare the requested name and version; a Conan
+archive carries no coordinate of its own, so it must only be a readable
+gzipped tar, and a Swift source archive must be a readable zip with a
+`Package.swift` at the root or under its one top-level directory (the
+registry's `scope.name` appears nowhere in the archive). Bytes that fail that check, or are not a readable archive of that kind, are
+inconclusive and are not scanned, so no verdict is recorded for them:
+`423` under `fail_closed`, served `pending` under `fail_open` and
+`record_only`.
+
+What happens next differs from npm or Cargo. The scanner has no pin for
+these ecosystems, and the bundled engine does not catalog a module zip or a
+dist archive as itself, so it cannot look up the requested module's or
+package's own advisories. It grades what the archive contains instead: the
+requirements in a module's `go.mod`, a `composer.lock` or `installed.json`
+shipped in a dist, a `conanfile.txt` or `conan.lock` in a recipe's
+sources, a binary in a package, a vendored package of any ecosystem it
+recognises. A
+finding is `vulnerable` as usual. A scan that ran to completion and found
+nothing is `clean`, recorded with how many components were cataloged (often
+`0`) and reused like any other verdict. See [Known gaps](#known-gaps).
+
+**Pub.** A Pub archive's root `pubspec.yaml` must declare the requested
+name and version, or the archive is inconclusive and not scanned. The
+bundled engine catalogs a `pubspec.yaml` as the package it declares, so an
+archive that agrees is graded as that package version.
+
 **Packages the scanner does not catalog as themselves (conda).** For npm,
 PyPI, RubyGems, Cargo, NuGet and Maven the scanner catalogs the package itself
 (through the pin the gate writes, or the archive's own metadata), so a scan
@@ -229,24 +263,24 @@ have no core proxy path to gate.
 | `npm` | `npm`, `yarn`, `bower`, `pnpm` | enforced | Package tarballs, Remote and Virtual. |
 | `pypi` | `pypi`, `poetry`, `jupyter` | enforced | Package files (wheels and sdists), Remote and Virtual. |
 | `nuget` | `nuget`, `chocolatey`, `powershell` | enforced | `.nupkg` downloads on the V3 flat container and the V2 `package/{id}/{version}` route, Remote and Virtual. The `.nuspec` manifest passes unscanned; against a V2 upstream, which has no separate manifest, the flat container answers only the `.nupkg` itself. |
-| `go` | `go` | accepted | |
-| `rubygems` | `rubygems` | accepted | |
+| `go` | `go` | enforced | Module `.zip` downloads, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). `.mod`, `.info`, `@v/list` and `@latest` are not gated. |
+| `rubygems` | `rubygems` | enforced | `.gem` downloads, Remote and Virtual. The gem is graded as the `{name}-{version}` its file name names, which its gemspec must declare. Spec indexes and the JSON API are not gated. |
 | `oci` | `docker`, `podman`, `buildx`, `oras`, `wasm_oci`, `helm_oci` | enforced | Image manifests: the whole image (config and layers) is scanned, and blob pulls re-check the verdict of the image they belong to. Remote and Virtual. |
 | `helm` | `helm` | accepted | |
 | `rpm` | `rpm` | accepted | |
 | `debian` | `debian` | accepted | |
-| `conan` | `conan` | accepted | |
+| `conan` | `conan` | enforced | Every recipe and package file except `conanfile.py`, `conanmanifest.txt` and `conaninfo.txt`, Remote and Virtual: the `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`) and any other file name, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). A file that is not a gzipped tar (a zstd `.tzst`, a Conan 2 metadata file) is inconclusive: `423` under `fail_closed`. The three metadata files, revision lists and search are not gated. |
 | `cargo` | `cargo` | enforced | `.crate` downloads, Remote and Virtual. |
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
 | `conda` | `conda` | enforced | `.conda` and `.tar.bz2` package downloads, Remote and Virtual, including the `/t/<token>/` URL forms. A `.sigs` attestation sidecar follows its package: a stored verdict that blocks the package refuses the sidecar too. Channel indexes (repodata in every encoding, channeldata, shards) are not gated. |
 | `terraform` | `terraform`, `opentofu` | accepted | |
 | `alpine` | `alpine` | accepted | |
 | `conda_native` | `conda_native` | enforced | As `conda` (the same route). |
-| `composer` | `composer` | accepted | |
+| `composer` | `composer` | enforced | Dist archives on the `dist/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Package metadata is not gated. |
 | `hex` | `hex` | accepted | |
-| `cocoapods` | `cocoapods` | accepted | |
-| `swift` | `swift` | accepted | |
-| `pub` | `pub` | accepted | |
+| `cocoapods` | `cocoapods` | enforced | Pod archives on the `pods/` route, Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). The pod's own `.podspec.json` must declare the requested name and version. Specs and CDN index files are not gated. |
+| `swift` | `swift` | enforced | Source archives (`{scope}/{name}/{version}.zip`), Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). Release metadata, release lists and `Package.swift` are not gated. |
+| `pub` | `pub` | enforced | Package archives on the `packages/{name}/versions/{version}.tar.gz` route, Remote and Virtual. The root `pubspec.yaml` must declare the requested name and version; the scanner then catalogs the package from it. The JSON API is not gated. |
 | `sbt` | `sbt` | enforced | As `maven`, on the Ivy route. |
 | `chef` | `chef` | accepted | |
 | `puppet` | `puppet` | accepted | |
@@ -300,6 +334,27 @@ have no core proxy path to gate.
   file name (a binary it recognises under its upstream name or version), the
   scan is still inconclusive: `423` under `fail_closed`, served `pending`
   (and not recorded) under `fail_open`.
+- **CocoaPods and Swift have no advisory data in the bundled scanner.** The
+  engine catalogs a `Podfile.lock` or `Package.resolved`, but no advisory
+  database it ships covers either ecosystem, so a pod or Swift package is
+  only ever `vulnerable` for something of another ecosystem inside it (a
+  vendored `Gemfile.lock`, `package-lock.json`, a jar).
+- **Hex is not gated.** `hex` stays `accepted` (#4106): the scan workspace
+  does not unpack a Hex tarball (an uncompressed outer tar around
+  `contents.tar.gz`), so wiring the gate would grade bytes nothing read.
+- **Only bytes fetched through the repository are gated.** A CocoaPods
+  Remote proxying the CocoaPods CDN serves podspecs whose `source` names a
+  git repository or an outside URL, and the client fetches the pod from
+  there, not through the `pods/` route; the same holds for a Composer
+  package installed from `source` (a VCS checkout) instead of its `dist`,
+  and for a Go client whose `GOPROXY` falls back to `direct`.
+- **Go modules, Composer packages and Conan references are not graded as
+  themselves.** A module zip, a dist archive or a Conan archive is graded on what it contains (see
+  [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)).
+  An advisory against the requested module or package itself (for example
+  `golang.org/x/text v0.3.0`, pulled as its own module zip) is not found, and
+  the pull is `clean` unless something inside the archive is vulnerable.
+  Grading the coordinate itself needs a scanner pin for these ecosystems.
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.

@@ -23096,10 +23096,11 @@ mod scan_on_upload_coverage_tests {
     ];
 
     /// The `oci_blobs` writers of a `docker push`: monolithic upload, chunked
-    /// completion and cross-repository mount.
+    /// completion (run on its own task by `handle_complete_upload` since #4902)
+    /// and cross-repository mount.
     const ISSUE_4422_OCI_BLOB_HANDLERS: &[&str] = &[
         "handle_start_upload",
-        "handle_complete_upload",
+        "complete_claimed_oci_upload",
         "try_mount_blob",
     ];
 
@@ -23293,6 +23294,12 @@ mod proxy_download_recording_tests {
         ("pub_registry.rs", include_str!("pub_registry.rs")),
         ("puppet.rs", include_str!("puppet.rs")),
         ("pypi.rs", include_str!("pypi.rs")),
+        // #4097: the archive formats' shared scan-on-proxy half (its over-cap
+        // stream).
+        (
+            "proxy_scan_archive.rs",
+            include_str!("proxy_scan_archive.rs"),
+        ),
         ("rpm.rs", include_str!("rpm.rs")),
         ("rubygems.rs", include_str!("rubygems.rs")),
         ("sbt.rs", include_str!("sbt.rs")),
@@ -23882,6 +23889,154 @@ mod proxy_download_recording_tests {
             (
                 "nuget.rs",
                 "serve_scanned_nupkg",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4103: Go module zips, the Remote arm and the Virtual walk.
+            ("goproxy.rs", "download_zip", "serve_scanned_go_zip(", 1),
+            (
+                "goproxy.rs",
+                "download_zip",
+                "serve_scanned_virtual_go_zip(",
+                1,
+            ),
+            (
+                "goproxy.rs",
+                "serve_scanned_virtual_go_zip",
+                "serve_scanned_go_zip(",
+                1,
+            ),
+            (
+                "goproxy.rs",
+                "serve_scanned_go_zip",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4104: RubyGems `.gem` downloads, Remote and Virtual (both arms
+            // of `proxy_scan_archive::serve_scanned_package_download` call the
+            // one `serve_scanned_gem` closure).
+            (
+                "rubygems.rs",
+                "download_gem",
+                "serve_scanned_gem_download(",
+                1,
+            ),
+            (
+                "rubygems.rs",
+                "serve_scanned_gem_download",
+                "serve_scanned_gem(",
+                1,
+            ),
+            (
+                "rubygems.rs",
+                "serve_scanned_gem",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4105: Composer dist archives, Remote and Virtual.
+            (
+                "composer.rs",
+                "download_archive",
+                "serve_scanned_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "download_archive",
+                "serve_scanned_virtual_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "serve_scanned_virtual_composer_dist",
+                "serve_scanned_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "serve_scanned_composer_dist",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4107: Pub package archives, Remote and Virtual.
+            (
+                "pub_registry.rs",
+                "download_archive",
+                "serve_scanned_pub_download(",
+                1,
+            ),
+            (
+                "pub_registry.rs",
+                "serve_scanned_pub_download",
+                "serve_scanned_pub_archive(",
+                1,
+            ),
+            (
+                "pub_registry.rs",
+                "serve_scanned_pub_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4108: Conan recipe and package archives, Remote and Virtual.
+            (
+                "conan.rs",
+                "recipe_file_download",
+                "serve_scanned_conan_file_download(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "package_file_download",
+                "serve_scanned_conan_file_download(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "serve_scanned_conan_file_download",
+                "serve_scanned_conan_archive(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "serve_scanned_conan_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4109: CocoaPods pod archives, Remote and Virtual.
+            (
+                "cocoapods.rs",
+                "download_pod",
+                "serve_scanned_pod_download(",
+                1,
+            ),
+            (
+                "cocoapods.rs",
+                "serve_scanned_pod_download",
+                "serve_scanned_pod_archive(",
+                1,
+            ),
+            (
+                "cocoapods.rs",
+                "serve_scanned_pod_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4110: Swift source archives, Remote and Virtual.
+            (
+                "swift.rs",
+                "download_archive",
+                "serve_scanned_swift_download(",
+                1,
+            ),
+            (
+                "swift.rs",
+                "serve_scanned_swift_download",
+                "serve_scanned_swift_archive(",
+                1,
+            ),
+            (
+                "swift.rs",
+                "serve_scanned_swift_archive",
                 "serve_scanned_proxy_file(",
                 1,
             ),

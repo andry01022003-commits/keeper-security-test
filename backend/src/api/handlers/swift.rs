@@ -520,6 +520,150 @@ async fn get_release_metadata(
 }
 
 // ---------------------------------------------------------------------------
+// Scan-on-proxy for source archives (#4110, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied source
+/// archive (#4365 item 1): every `.zip` on the archive route is a package,
+/// cached under the `{scope}/{name}/{version}.zip` path the streaming arm
+/// commits to.
+fn swift_archive_serve_key(
+    scope: &str,
+    name: &str,
+    version: &str,
+) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!(
+        "{scope}/{name}/{version}.zip"
+    ))
+}
+
+/// The Swift half of the generic gate (#4110). A source archive names its
+/// registry identity nowhere (`scope.name` lives in the URL; the manifest's
+/// own `name:` need not match it), so the rule is that the bytes are a
+/// readable zip carrying a `Package.swift` at the root or under the one
+/// top-level directory `swift package archive-source` wraps it in. The
+/// bundled scanner has no Swift advisory data, so an archive that agrees is
+/// graded on its contents (a vendored package of an ecosystem it does grade).
+struct SwiftSourceArchive;
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for SwiftSourceArchive {
+    const LABEL: &'static str = "swift source archive";
+    const CONTENT_TYPE: &'static str = "application/zip";
+
+    fn requested(&self) -> String {
+        "a swift source archive".to_string()
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &bytes::Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        swift_archive_identity(bytes)
+    }
+}
+
+fn swift_archive_identity(
+    bytes: &bytes::Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{zip_entry_names, ArchiveIdentity};
+    let Some(names) = zip_entry_names(bytes) else {
+        return ArchiveIdentity::Unreadable("not a readable zip".to_string());
+    };
+    let has_root_manifest = names.iter().any(|n| n == "Package.swift");
+    let wrapped_manifest = names
+        .first()
+        .and_then(|first| first.split('/').next())
+        .is_some_and(|top| {
+            names.iter().all(|n| n.split('/').next() == Some(top))
+                && names.iter().any(|n| *n == format!("{top}/Package.swift"))
+        });
+    if has_root_manifest || wrapped_manifest {
+        ArchiveIdentity::ContentGraded
+    } else {
+        ArchiveIdentity::Unreadable("no top-level Package.swift".to_string())
+    }
+}
+
+/// Inline scan-and-block for one source archive from one Remote repository
+/// (#4110).
+async fn serve_scanned_swift_archive(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    (scope, name, version): (&str, &str, &str),
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let serve_key = swift_archive_serve_key(scope, name, version);
+    let filename = format!("{name}-{version}.zip");
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Swift,
+        source_path: &serve_key.cache_key,
+        cache_path: &serve_key.cache_key,
+        filename: &filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: SwiftSourceArchive,
+        disposition: None,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of the source archive route (#4110): `Ok(None)`
+/// when nothing scans, so the caller keeps its untouched path.
+async fn serve_scanned_swift_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    (scope, name, version): (&str, &str, &str),
+    package_id: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let serve_key = swift_archive_serve_key(scope, name, version);
+    let route = ScannedRoute {
+        upstream_path: &serve_key.cache_key,
+        lookup: LocalLookup::NameVersion {
+            name: package_id,
+            version,
+        },
+        default_content_type: "application/zip",
+        virtual_disposition: None,
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream_url), policy, _disposition| async move {
+            serve_scanned_swift_archive(
+                state,
+                proxy,
+                (id, &key, &upstream_url),
+                (scope, name, version),
+                policy,
+                ctx,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // GET /swift/:repo_key/:scope/:name/:version.zip -- Download source archive
 // ---------------------------------------------------------------------------
 
@@ -534,6 +678,12 @@ async fn download_archive(
 ) -> Result<Response, Response> {
     let repo = resolve_swift_repo(&state.db, repo_key).await?;
     let package_id = format!("{}.{}", scope, name);
+    // #4365 item 3 (#4110): on a proxying repository the scope, name and
+    // version are joined into the upstream path and key the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[scope, name, version],
+    )?;
 
     let artifact = sqlx::query!(
         r#"
@@ -561,6 +711,23 @@ async fn download_archive(
     let artifact = match artifact {
         Some(a) => a,
         None => {
+            // #4110: scan-on-proxy routes the source archive through the
+            // inline scan-and-block gate INSTEAD of the streaming paths
+            // below: the Remote arm when this repository scans, the Virtual
+            // walk when any Remote member scans. Repositories that have not
+            // opted in are unchanged.
+            if let Some(served) = serve_scanned_swift_download(
+                &state,
+                auth,
+                &repo,
+                (scope, name, version),
+                &package_id,
+                ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -2525,5 +2692,132 @@ mod catalog_registration_tests {
             vec!["example/ExamplePackage/1.0.0/ExamplePackage.zip".to_string()],
             "only the client publish queues a push task; the replicated one must not"
         );
+    }
+}
+
+/// #4110: scan-on-proxy on Swift source archives, Remote and Virtual,
+/// through the shared archive scenarios, plus the archive rule.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_proxy_4110 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use bytes::Bytes;
+
+    fn zip_of(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            for (name, data) in entries {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, data.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn archive() -> Vec<u8> {
+        zip_of(&[
+            (
+                "dtf-scanned/Package.swift",
+                format!(
+                    "// swift-tools-version:5.5\n// {}\nimport PackageDescription\nlet package = Package(name: \"dtf-scanned\")\n",
+                    uuid::Uuid::new_v4()
+                ),
+            ),
+            ("dtf-scanned/Sources/Dtf/Dtf.swift", "struct Dtf {}\n".to_string()),
+        ])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        ArchiveCase {
+            format: "swift",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/dtf/scanned/1.0.0.zip")),
+            package_path: "/dtf/scanned/1.0.0.zip".to_string(),
+            extra: Vec::new(),
+            body: archive(),
+            recorded_path: "dtf/scanned/1.0.0.zip".to_string(),
+            file: "scanned-1.0.0.zip".to_string(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/dtf/scanned/1.0.0%3Fx.zip"),
+                format!("/{key}/dtf/scanned%3B/1.0.0.zip"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn only_an_archive_with_a_top_level_manifest_is_graded() {
+        assert_eq!(
+            swift_archive_identity(&Bytes::from(archive())),
+            ArchiveIdentity::ContentGraded
+        );
+        let root = zip_of(&[("Package.swift", "// m\n".to_string())]);
+        assert_eq!(
+            swift_archive_identity(&Bytes::from(root)),
+            ArchiveIdentity::ContentGraded
+        );
+        let fixture_only = zip_of(&[
+            ("a/Tests/Fixture/Package.swift", "// m\n".to_string()),
+            ("a/x.swift", "\n".to_string()),
+        ]);
+        for bytes in [Bytes::from(fixture_only), Bytes::from_static(b"not a zip")] {
+            assert!(matches!(
+                swift_archive_identity(&bytes),
+                ArchiveIdentity::Unreadable(_)
+            ));
+        }
+    }
+}
+
+/// #4365 item 1: Swift decides by route (every source archive is a
+/// package); the cache key is `{scope}/{name}/{version}.zip`.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn swift_archive_serve_key_table() {
+        let got = swift_archive_serve_key("apple", "swift-nio", "2.29.0");
+        assert_eq!(got.cache_key, "apple/swift-nio/2.29.0.zip");
+        assert!(got.scannable);
     }
 }

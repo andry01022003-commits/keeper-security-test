@@ -2122,7 +2122,11 @@ impl Config {
                     v == "true" || v == "1"
                 })
                 .unwrap_or(false),
-            otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            // An empty or blank value counts as unset, as in
+            // `telemetry::init_tracing` (#4931).
+            otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_trash_retention_days:

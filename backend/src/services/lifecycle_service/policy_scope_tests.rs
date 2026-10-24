@@ -113,7 +113,7 @@ async fn match_validation_2024() {
             .unwrap_or_else(|e| panic!("{policy_type} must accept match.path_prefix: {e}"));
     }
     // Proposed selectors that are not implemented yet must fail loudly.
-    for key in ["format", "tag_pattern", "repository", "path_prefixes"] {
+    for key in ["tag_pattern", "repository", "path_prefixes"] {
         let err = service
             .validate_policy_config("max_age_days", &json!({"days": 1, "match": {key: "x"}}))
             .expect_err(&format!("match.{key} must be rejected"));
@@ -373,4 +373,197 @@ async fn match_path_prefix_is_literal_2024() {
     }
     assert!(!is_deleted(&mut tx, id).await);
     tx.rollback().await.expect("rollback test transaction");
+}
+
+// ── match.format ──────────────────────────────────────────────────────────
+
+/// `match.format` takes one format key or a non-empty array of them, rejects
+/// anything else, and is accepted by every policy type (#2024).
+#[tokio::test]
+async fn match_format_validation_2024() {
+    let service = make_service_for_validation();
+    for (policy_type, base) in [
+        ("max_age_days", json!({"days": 14})),
+        ("max_versions", json!({"keep": 2})),
+        ("no_downloads_days", json!({"days": 14})),
+        ("tag_pattern_keep", json!({"pattern": "^v"})),
+        ("tag_pattern_delete", json!({"pattern": "^v"})),
+        ("size_quota_bytes", json!({"quota_bytes": 10})),
+    ] {
+        for format in [json!("docker"), json!(["npm", "conda_native"])] {
+            let mut config = base.clone();
+            config["match"] = json!({"format": format, "path_prefix": "builds/"});
+            service
+                .validate_policy_config(policy_type, &config)
+                .unwrap_or_else(|e| panic!("{policy_type} must accept match.format: {e}"));
+        }
+    }
+    for bad in [
+        json!(""),
+        json!("Docker"),
+        json!("oci"),
+        json!([]),
+        json!(["npm", 5]),
+        json!(["npm", "nope"]),
+        json!(5),
+        json!(null),
+        json!({"name": "npm"}),
+    ] {
+        let err = service
+            .validate_policy_config(
+                "max_age_days",
+                &json!({"days": 1, "match": {"format": bad}}),
+            )
+            .expect_err(&format!("match.format {bad} must be rejected"));
+        assert!(err.to_string().contains("match.format"), "{bad}: {err}");
+    }
+    assert!(parse_match_formats(&json!({"days": 1})).unwrap().is_empty());
+    assert_eq!(
+        parse_match_formats(&json!({"match": {"format": ["npm", "yarn", "npm"]}})).unwrap(),
+        vec!["npm".to_string(), "yarn".to_string()],
+    );
+    // The SQL-level filters are unchanged by a format scope.
+    assert_eq!(
+        parse_policy_filters(&json!({"days": 1, "match": {"format": "npm"}})).unwrap(),
+        PolicyFilters::default(),
+    );
+}
+
+/// A policy with `match.format` runs only in repositories of that format: the
+/// preview and the live run of an assigned and of a global policy skip a
+/// repository of another format entirely (#2024).
+#[tokio::test]
+async fn match_format_limits_execution_to_matching_repositories_2024() {
+    let Some(pool) = crate::testing::try_pool_with(3).await else {
+        return;
+    };
+    let svc = LifecycleService::new(pool.clone());
+    let make_repo = |format: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+                 VALUES ($1, $2, $2, $2, 'local', $3::repository_format)",
+            )
+            .bind(id)
+            .bind(format!("match-format-2024-{id}"))
+            .bind(format)
+            .execute(&pool)
+            .await
+            .expect("insert repository");
+            id
+        }
+    };
+    let make_artifact = |repository_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, created_at) \
+                 VALUES ($1, $2, 'package', $3, '1', 100, $4, 'application/octet-stream', $3, \
+                 NOW() - INTERVAL '30 days')",
+            )
+            .bind(id)
+            .bind(repository_id)
+            .bind(id.to_string())
+            .bind("b".repeat(64))
+            .execute(&pool)
+            .await
+            .expect("insert artifact");
+            id
+        }
+    };
+    let deleted = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT is_deleted FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read artifact")
+        }
+    };
+
+    let npm = make_repo("npm").await;
+    let generic = make_repo("generic").await;
+    let npm_artifact = make_artifact(npm).await;
+    let generic_artifact = make_artifact(generic).await;
+
+    let policy = svc
+        .create_policy(CreateLifecyclePolicyRequest {
+            name: format!("match-format-2024-{}", Uuid::new_v4()),
+            policy_type: "max_age_days".into(),
+            config: json!({"days": 1, "match": {"format": "npm"}}),
+            repository_ids: Some(vec![npm, generic]),
+            ..Default::default()
+        })
+        .await
+        .expect("create policy with match.format");
+
+    let preview = svc.execute_policy(policy.id, true).await.expect("preview");
+    assert_eq!(
+        (preview.artifacts_matched, preview.bytes_matched),
+        (1, 100),
+        "only the npm repository is in scope: {preview:?}"
+    );
+    let run = svc
+        .execute_policy(policy.id, false)
+        .await
+        .expect("live run");
+    assert_eq!(run.artifacts_removed, 1, "{run:?}");
+    assert!(deleted(npm_artifact).await);
+    assert!(
+        !deleted(generic_artifact).await,
+        "a generic repository is outside match.format"
+    );
+
+    // A global policy is scoped the same way. Preview only: a live global run
+    // would sweep every repository in the shared test database.
+    let global = svc
+        .create_policy(CreateLifecyclePolicyRequest {
+            name: format!("match-format-2024-global-{}", Uuid::new_v4()),
+            policy_type: "tag_pattern_delete".into(),
+            config: json!({"pattern": ".*", "match": {"format": ["generic"],
+                           "path_prefix": generic_artifact.to_string()}}),
+            applies_to_all: true,
+            ..Default::default()
+        })
+        .await
+        .expect("create global policy with match.format");
+    let preview = svc.execute_policy(global.id, true).await.expect("preview");
+    assert_eq!(preview.artifacts_matched, 1, "{preview:?}");
+    let npm_scoped = svc
+        .update_policy(
+            global.id,
+            UpdateLifecyclePolicyRequest {
+                config: Some(json!({"pattern": ".*", "match": {"format": "npm",
+                                    "path_prefix": generic_artifact.to_string()}})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("narrow the global policy to npm");
+    let preview = svc
+        .execute_policy(npm_scoped.id, true)
+        .await
+        .expect("preview");
+    assert_eq!(
+        preview.artifacts_matched, 0,
+        "the generic artifact is outside an npm-only global policy: {preview:?}"
+    );
+
+    for id in [policy.id, global.id] {
+        sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("delete policy");
+    }
+    sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+        .bind(vec![npm, generic])
+        .execute(&pool)
+        .await
+        .expect("delete repositories");
 }

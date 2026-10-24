@@ -81,7 +81,7 @@ use serde_json::json;
 use crate::api::extractors::request_base_url_from_request;
 use crate::api::middleware::auth::{
     extract_visibility_token, is_browser_request, service_unavailable_response,
-    try_resolve_auth_outcome, AuthOutcome,
+    try_resolve_auth_outcome_with_passthrough, AuthOutcome,
 };
 use crate::api::middleware::oci_errors::{is_oci_v2_path, oci_unauthorized_response};
 use crate::services::auth_service::AuthService;
@@ -224,6 +224,10 @@ fn guard_short_circuit(
         // Transient bcrypt-capacity shed: retryable 503, never a 401 — on the
         // OCI surface as on every other.
         AuthOutcome::Overloaded => Some(service_unavailable_response()),
+        // The shared login limiter refused a passthrough bind (#3830).
+        AuthOutcome::RateLimited(retry_after) => {
+            Some(super::auth::rate_limited_response(*retry_after))
+        }
         // No/invalid credential presented: guest access is disabled → 401,
         // shaped for the protocol the client is speaking.
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => Some(match oci_base_url {
@@ -281,7 +285,14 @@ pub async fn guest_access_guard(
     // `optional_auth_middleware` / `admin_middleware` re-resolve with
     // `allow_basic_api_token=false` and still refuse an API token as the Basic
     // password on the management API.
-    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted, true).await;
+    let outcome = try_resolve_auth_outcome_with_passthrough(
+        &state.auth_service,
+        extracted,
+        true,
+        path,
+        request.method().as_str(),
+    )
+    .await;
     // Browser-originated requests get the popup-free 401 variant so the web
     // UI can show its login / OIDC screen instead of the native Basic dialog
     // (#2936 / #3082). Classified from request headers only (Fetch Metadata /

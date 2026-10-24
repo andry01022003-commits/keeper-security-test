@@ -648,7 +648,13 @@ pub async fn record_proxy_download(
     ip_address: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<u64> {
-    let res = sqlx::query!(
+    // #4542: the digest served is the catalog row's, read in the same
+    // statement that links the serve to it. A cache hit records the digest of
+    // the bytes it was served from; a fill's placeholder row has none yet, and
+    // the fill attributes the serve when it commits
+    // ([`attribute_fill_downloads`]). Runtime-checked so the offline `.sqlx`
+    // cache carries no entry for it.
+    let res = sqlx::query(
         r#"
         WITH ensured AS (
             INSERT INTO proxy_cache_artifacts
@@ -657,20 +663,60 @@ pub async fn record_proxy_download(
             VALUES ($1, $2, $3, $4, 0, now(), now())
             ON CONFLICT (repository_id, path) DO UPDATE SET
                 last_accessed_at = now()
-            RETURNING id
+            RETURNING id, checksum_sha256
         )
         INSERT INTO proxy_download_statistics
-            (proxy_cache_id, repository_id, path, user_id, ip_address, user_agent)
-        SELECT id, $1, $2, $5, $6, $7 FROM ensured
+            (proxy_cache_id, repository_id, path, user_id, ip_address, user_agent,
+             checksum_sha256)
+        SELECT id, $1, $2, $5, $6, $7, checksum_sha256 FROM ensured
         "#,
-        repository_id,
-        path,
-        storage_key,
-        metadata_key,
-        user_id,
-        ip_address,
-        user_agent,
     )
+    .bind(repository_id)
+    .bind(path)
+    .bind(storage_key)
+    .bind(metadata_key)
+    .bind(user_id)
+    .bind(ip_address)
+    .bind(user_agent)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(res.rows_affected())
+}
+
+/// Attribute the serves a cache fill fed to the digest it committed (#4542).
+///
+/// A cold miss records its download against the catalog placeholder, which
+/// has no digest until the fill's tee commits, and requests that joined the
+/// fill in flight do the same. Once the fill knows the digest, every row
+/// still without one that is linked to the entry and was recorded since
+/// `since` (the fill's start, less a margin for clock skew between this
+/// process and the database) received exactly these bytes. Older rows without
+/// a digest are left alone: they predate this fill and may describe other
+/// bytes at a mutable path.
+pub async fn attribute_fill_downloads(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    checksum_sha256: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        UPDATE proxy_download_statistics d
+           SET checksum_sha256 = $3
+          FROM proxy_cache_artifacts c
+         WHERE c.repository_id = $1
+           AND c.path = $2
+           AND d.proxy_cache_id = c.id
+           AND d.checksum_sha256 IS NULL
+           AND d.downloaded_at >= $4
+        "#,
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(checksum_sha256)
+    .bind(since)
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2008,5 +2054,82 @@ mod tests {
             vec![(false, repo, path.to_string())]
         );
         cleanup_repo(&pool, repo).await;
+    }
+
+    /// #4542: a cold-miss serve is recorded against the placeholder (no
+    /// digest yet); the fill's commit attributes it. A row recorded before the
+    /// fill started is left alone, and a hit after the commit carries the
+    /// digest from the catalog row.
+    #[tokio::test]
+    async fn test_fill_attributes_the_serves_it_fed_4542() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo, _key, _dir) =
+            crate::api::handlers::test_db_helpers::create_repo(&pool, "remote", "pypi").await;
+        let path = format!("simple/fill/{}.whl", Uuid::new_v4());
+        let storage_key = format!("proxy-cache/{repo}/{path}/__content__");
+        let metadata_key = format!("proxy-cache/{repo}/{path}/__cache_meta__.json");
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        let record = || {
+            record_proxy_download(
+                &pool,
+                repo,
+                &path,
+                &storage_key,
+                &metadata_key,
+                None,
+                None,
+                None,
+            )
+        };
+
+        record().await.unwrap();
+        // An older digest-less row (a previous fill, or a 1.11 pod) predates
+        // this fill.
+        sqlx::query(
+            "UPDATE proxy_download_statistics SET downloaded_at = NOW() - INTERVAL '1 day' \
+             WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fill_started = chrono::Utc::now() - chrono::Duration::seconds(60);
+        record().await.unwrap();
+        upsert(
+            &pool,
+            repo,
+            &path,
+            &storage_key,
+            &metadata_key,
+            16,
+            Some(&digest),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let attributed = attribute_fill_downloads(&pool, repo, &path, &digest, fill_started)
+            .await
+            .unwrap();
+        record().await.unwrap();
+
+        let rows: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM proxy_download_statistics \
+             WHERE repository_id = $1 ORDER BY downloaded_at",
+        )
+        .bind(repo)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(attributed, 1);
+        assert_eq!(rows, vec![None, Some(digest.clone()), Some(digest)]);
     }
 }

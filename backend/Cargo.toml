@@ -91,6 +91,7 @@ tracing-opentelemetry.workspace = true
 # Metrics
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+metrics-util.workspace = true
 
 # Error handling
 thiserror.workspace = true
@@ -262,7 +263,8 @@ tokio-test = "0.4"
 libc = "0.2"
 axum-test = "19"
 wiremock = "0.6"
-metrics-util = "0.20"
+metrics-util = { workspace = true, features = ["debugging"] }
+opentelemetry_sdk = { workspace = true, features = ["testing", "experimental_metrics_custom_reader"] }
 # Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
 # suite (#2955 Stage 4, rows 3 and 8 — the Stage-1 fixtures were missing them).
 rcgen = "0.14"

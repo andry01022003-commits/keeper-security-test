@@ -83,6 +83,54 @@ health check briefly removed the endpoint.
   backend's `503` and `Retry-After` through rather than turning upstream
   overload into a connection error.
 
+## Conda package downloads under an installer fleet
+
+rattler-based installers (pixi, micromamba, conda with the libmamba solver)
+fetch up to 50 packages at once each, so N installers put up to 50 x N
+package requests in flight. A hosted package request reads the database once
+(#4181) and then streams from storage without holding a connection, so the
+pool only has to cover the lookups, not the transfers.
+
+The lookup takes its connection through a fast-fail gate (#4182): when no
+pooled connection frees up within `CONDA_PACKAGE_DB_WAIT_MS` (default 500),
+the request is answered at once with `503` and `Retry-After: 1` instead of
+queueing until `DATABASE_ACQUIRE_TIMEOUT_SECS` (5 s) runs out. rattler, conda
+and mamba retry a 503, so a shed request costs the installer one short
+back-off rather than a 5 s stall. Shed requests are counted in
+`ak_conda_package_requests_shed_total`; `0` turns the gate off and the pool's
+own acquire timeout applies. Remote and Virtual package requests make further
+database calls after the lookup (cache catalog, member resolution, download
+records) on the normal pool.
+
+Sizing for a fleet. These figures are reasoned from the request path and
+the defaults, not measured: unlike the table under Measured behaviour, no
+fleet run has confirmed them yet. The fleet measurements are tracked in
+#4188; treat the numbers below as a starting point and check them against
+`ak_conda_package_requests_shed_total` and the pool metrics on your own
+deployment.
+
+- **Pool per replica.** A hosted lookup holds a connection for about one
+  round trip (well under 5 ms on a local network), so a pool of 50 serves on
+  the order of 10,000 lookups per second before requests start to queue.
+  Shedding in steady state therefore means something else holds the
+  connections: long transactions, slow storage reads in other handlers, or
+  `DATABASE_MAX_CONNECTIONS` set far below the default.
+- **Postgres `max_connections`.** Keep `DATABASE_MAX_CONNECTIONS` x replicas,
+  plus one surge replica and the connections other clients hold, below the
+  server's limit (see the database connection budget below). For 24
+  installers against two replicas, the defaults (2 x 50 + 50 surge) need a
+  server limit of at least 160; raise `max_connections` or lower
+  `DATABASE_MAX_CONNECTIONS` rather than adding replicas.
+- **Global concurrency.** Every package download holds a
+  `GLOBAL_MAX_CONCURRENCY` permit for the whole transfer. 24 installers x 50
+  fetches is 1,200 transfers, above the default 512 for one replica, so either
+  run three or more replicas or raise the limit on a replica with the CPU and
+  network to serve it.
+- **What to watch.** A sustained non-zero
+  `rate(ak_conda_package_requests_shed_total[5m])` with installs still
+  completing is the gate doing its job under a burst; a rate that does not
+  fall after the burst means the pool is undersized for the load.
+
 ## Buffered metadata memory budget
 
 Proxied metadata that has to be held in memory before it is answered (npm

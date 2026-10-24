@@ -1825,16 +1825,26 @@ fn decode_upload_part_row(row: PgRow) -> std::result::Result<OciUploadPartRecord
     })
 }
 
+/// How often a running completion refreshes its lease (`updated_at`).
+const OCI_UPLOAD_COMPLETION_HEARTBEAT_SECS: u64 = 60;
+
+/// Age of `updated_at` after which a `committing` lease counts as dead and may
+/// be reclaimed: five missed heartbeats. Before #4902 this was 6 hours, so a
+/// completion cancelled by a dropped connection blocked every retry for hours.
+const OCI_UPLOAD_COMPLETION_LEASE_STALE_SECS: u64 = 5 * OCI_UPLOAD_COMPLETION_HEARTBEAT_SECS;
+
 /// Atomically take the completion lease on an upload session.
 ///
 /// Flips the row `open -> committing` and stamps `state_token` so exactly one
 /// PUT completion (or cancel) can own the session at a time. A session already
-/// `committing` is only reclaimed once its `updated_at` is older than the 6h
-/// staleness window — far larger than the 60s heartbeat
-/// ([`start_oci_upload_completion_heartbeat`]) that keeps a live lease fresh, so
-/// an in-flight completion is never stolen out from under itself. Returns `None`
-/// when the session is owned by another live completion (the caller maps this to
-/// `409 CONFLICT`).
+/// `committing` is only reclaimed once its `updated_at` is older than the
+/// staleness window ([`OCI_UPLOAD_COMPLETION_LEASE_STALE_SECS`], five 60s
+/// heartbeats of [`start_oci_upload_completion_heartbeat`]), so a live
+/// completion is never stolen out from under itself while a lease whose owner
+/// died (pod kill, crash) becomes reclaimable within minutes (#4902). Returns
+/// `None` when the session is owned by another live completion; the caller
+/// then waits for that completion or answers 409/503
+/// ([`claim_or_await_oci_upload_completion`]).
 async fn claim_oci_upload_session_for_completion(
     db: &PgPool,
     session_id: Uuid,
@@ -1849,7 +1859,7 @@ async fn claim_oci_upload_session_for_completion(
           AND repository_id = $2
           AND (
             state = $5
-            OR (state = $4 AND updated_at < NOW() - INTERVAL '6 hours')
+            OR (state = $4 AND updated_at < NOW() - make_interval(secs => $6))
           )
         RETURNING
             repository_id,
@@ -1869,6 +1879,7 @@ async fn claim_oci_upload_session_for_completion(
     .bind(state_token)
     .bind(UploadSessionState::Committing.as_str())
     .bind(UploadSessionState::Open.as_str())
+    .bind(OCI_UPLOAD_COMPLETION_LEASE_STALE_SECS as f64)
     .fetch_optional(db)
     .await
     .map_err(|e| {
@@ -1886,7 +1897,7 @@ async fn claim_oci_upload_session_for_completion(
 
 /// RAII guard over the background task that renews a completion lease.
 ///
-/// While the guard is alive a spawned task refreshes `updated_at` so the 6h
+/// While the guard is alive a spawned task refreshes `updated_at` so the
 /// staleness reclaim in [`claim_oci_upload_session_for_completion`] cannot steal
 /// the session. `Drop` aborts the task, so the heartbeat can never outlive the
 /// guard's scope — every early return in `handle_complete_upload` cancels it
@@ -1924,7 +1935,7 @@ fn start_oci_upload_completion_heartbeat(
         session_id,
         repository_id,
         state_token,
-        Duration::from_secs(60),
+        Duration::from_secs(OCI_UPLOAD_COMPLETION_HEARTBEAT_SECS),
         3,
     )
 }
@@ -7737,30 +7748,385 @@ async fn handle_complete_upload(
     };
 
     let completion_state_token = Uuid::new_v4();
-    let session = match claim_oci_upload_session_for_completion(
+    let session = match claim_or_await_oci_upload_completion(
         &state.db,
         session_id,
         repo.id,
         completion_state_token,
+        &digest,
+        image_name,
+        oci_upload_completion_retry_wait(),
     )
     .await
     {
-        Ok(Some(session)) => session,
-        Ok(None) => match fetch_oci_upload_session(&state.db, session_id, repo.id).await {
-            Ok(Some(_)) => {
-                return upload_session_conflict("upload session is already being modified")
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+
+    run_claimed_oci_upload_completion(OciUploadCompletionJob {
+        state: Arc::clone(state),
+        headers: headers.clone(),
+        image_name: image_name.to_string(),
+        digest,
+        requested_digest,
+        session_id,
+        session,
+        completion_state_token,
+        storage,
+        body,
+    })
+    .await
+}
+
+/// Everything a claimed completion needs, owned, so it can run on its own task.
+struct OciUploadCompletionJob {
+    state: SharedState,
+    headers: HeaderMap,
+    image_name: String,
+    digest: String,
+    requested_digest: Sha256Digest,
+    session_id: Uuid,
+    session: OciUploadSessionRecord,
+    completion_state_token: Uuid,
+    storage: Arc<dyn crate::storage::StorageBackend>,
+    body: Body,
+}
+
+/// The response a completion produced, kept so a retry of the same PUT that
+/// waited for it can be answered the same way (#4902).
+#[derive(Clone, Debug)]
+struct OciUploadCompletionOutcome {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+impl OciUploadCompletionOutcome {
+    fn into_response(self) -> Response {
+        let mut response = Response::new(Body::from(self.body));
+        *response.status_mut() = self.status;
+        *response.headers_mut() = self.headers;
+        response
+    }
+}
+
+/// A completion running on this replica, published so that a retry of the same
+/// PUT can wait for its result instead of failing the claim with 409.
+struct InflightOciUploadCompletion {
+    state_token: Uuid,
+    digest: String,
+    outcome: tokio::sync::watch::Receiver<Option<OciUploadCompletionOutcome>>,
+}
+
+type InflightOciUploadCompletions =
+    std::sync::Mutex<std::collections::HashMap<(Uuid, Uuid), InflightOciUploadCompletion>>;
+
+static INFLIGHT_OCI_UPLOAD_COMPLETIONS: std::sync::LazyLock<InflightOciUploadCompletions> =
+    std::sync::LazyLock::new(Default::default);
+
+fn inflight_oci_upload_completions() -> std::sync::MutexGuard<
+    'static,
+    std::collections::HashMap<(Uuid, Uuid), InflightOciUploadCompletion>,
+> {
+    INFLIGHT_OCI_UPLOAD_COMPLETIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Removes this completion's registry entry when the completion task ends,
+/// whether it returned or panicked.
+struct InflightOciUploadCompletionRegistration {
+    key: (Uuid, Uuid),
+    state_token: Uuid,
+}
+
+impl InflightOciUploadCompletionRegistration {
+    fn register(
+        repository_id: Uuid,
+        session_id: Uuid,
+        state_token: Uuid,
+        digest: &str,
+        outcome: tokio::sync::watch::Receiver<Option<OciUploadCompletionOutcome>>,
+    ) -> Self {
+        let key = (repository_id, session_id);
+        inflight_oci_upload_completions().insert(
+            key,
+            InflightOciUploadCompletion {
+                state_token,
+                digest: digest.to_string(),
+                outcome,
+            },
+        );
+        Self { key, state_token }
+    }
+}
+
+impl Drop for InflightOciUploadCompletionRegistration {
+    fn drop(&mut self) {
+        let mut inflight = inflight_oci_upload_completions();
+        if inflight
+            .get(&self.key)
+            .is_some_and(|entry| entry.state_token == self.state_token)
+        {
+            inflight.remove(&self.key);
+        }
+    }
+}
+
+const OCI_UPLOAD_COMPLETION_RETRY_WAIT_ENV: &str = "OCI_UPLOAD_COMPLETION_RETRY_WAIT_SECS";
+const DEFAULT_OCI_UPLOAD_COMPLETION_RETRY_WAIT_SECS: u64 = 30;
+/// `Retry-After` on the 503 a retry gets when the first completion outlasts the wait.
+const OCI_UPLOAD_COMPLETION_RETRY_AFTER_SECS: u64 = 5;
+/// How often a waiting retry re-reads a session owned by another replica.
+const OCI_UPLOAD_COMPLETION_RETRY_POLL: Duration = Duration::from_millis(500);
+
+fn parse_oci_upload_completion_retry_wait(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_OCI_UPLOAD_COMPLETION_RETRY_WAIT_SECS);
+    Duration::from_secs(secs.min(3600))
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only override of [`oci_upload_completion_retry_wait`] for requests
+    /// served inside the scope.
+    static OCI_UPLOAD_COMPLETION_RETRY_WAIT_OVERRIDE: Duration;
+}
+
+/// How long a retried completion PUT waits for the completion it duplicates
+/// (`OCI_UPLOAD_COMPLETION_RETRY_WAIT_SECS`, default 30 s; 0 answers 503 at once).
+fn oci_upload_completion_retry_wait() -> Duration {
+    #[cfg(test)]
+    if let Ok(wait) = OCI_UPLOAD_COMPLETION_RETRY_WAIT_OVERRIDE.try_with(|wait| *wait) {
+        return wait;
+    }
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        parse_oci_upload_completion_retry_wait(
+            std::env::var(OCI_UPLOAD_COMPLETION_RETRY_WAIT_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn upload_completion_in_progress_response() -> Response {
+    let mut response = oci_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "UNAVAILABLE",
+        "upload completion is still in progress; retry the request",
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(OCI_UPLOAD_COMPLETION_RETRY_AFTER_SECS),
+    );
+    response
+}
+
+/// Whether `digest` is a live (not GC-marked) blob of the repository.
+async fn oci_blob_is_published(
+    db: &PgPool,
+    repository_id: Uuid,
+    digest: &str,
+) -> Result<bool, Response> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM oci_blobs WHERE repository_id = $1 AND digest = $2 AND pending_delete_at IS NULL)",
+    )
+    .bind(repository_id)
+    .bind(digest)
+    .fetch_one(db)
+    .await
+    .map_err(|e| {
+        oci_error(
+            crate::api::handlers::db_status(&e),
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )
+    })
+}
+
+/// Take the completion lease, or settle a PUT that duplicates a completion
+/// already running (#4902).
+///
+/// containerd re-sends the identical completion PUT after a proxy 504 while
+/// the first one is still working (or after it finished). Such a retry must not
+/// fail with "already being modified":
+///
+/// - The same digest with a completion running on this replica waits up to
+///   `wait` for it and answers with the first completion's response. A
+///   different digest is a real conflict and stays 409.
+/// - A session another replica holds (lease fresh) is polled until it is
+///   released, finished or `wait` runs out (then 503 with `Retry-After`).
+/// - A session that is gone while the digest is a published blob of the
+///   repository answers 201, as the finished completion did.
+/// - A session that is open again (the first completion failed and released
+///   it) or whose lease went stale is claimed by this request.
+///
+/// `Ok` carries the claimed session; `Err` is the response to send.
+async fn claim_or_await_oci_upload_completion(
+    db: &PgPool,
+    session_id: Uuid,
+    repository_id: Uuid,
+    state_token: Uuid,
+    digest: &str,
+    image_name: &str,
+    wait: Duration,
+) -> Result<OciUploadSessionRecord, Response> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if let Some(session) =
+            claim_oci_upload_session_for_completion(db, session_id, repository_id, state_token)
+                .await?
+        {
+            return Ok(session);
+        }
+
+        let inflight = inflight_oci_upload_completions()
+            .get(&(repository_id, session_id))
+            .map(|entry| (entry.digest.clone(), entry.outcome.clone()));
+        if let Some((inflight_digest, mut outcome)) = inflight {
+            if inflight_digest != digest {
+                return Err(upload_session_conflict(
+                    "upload session is already being modified",
+                ));
             }
-            Ok(None) => {
-                return oci_error(
+            match tokio::time::timeout_at(deadline, outcome.wait_for(Option::is_some)).await {
+                Ok(Ok(done)) => {
+                    let done = done.clone().expect("wait_for returned a settled outcome");
+                    info!(
+                        upload_session_id = %session_id,
+                        digest = %digest,
+                        status = done.status.as_u16(),
+                        "Retried OCI upload completion answered with the result of the completion it duplicated"
+                    );
+                    return Err(done.into_response());
+                }
+                // The completion task ended without publishing a result; read
+                // the session state below.
+                Ok(Err(_)) => {}
+                Err(_) => return Err(upload_completion_in_progress_response()),
+            }
+        }
+
+        match fetch_oci_upload_session(db, session_id, repository_id).await? {
+            None => {
+                if oci_blob_is_published(db, repository_id, digest).await? {
+                    info!(
+                        upload_session_id = %session_id,
+                        digest = %digest,
+                        "Retried OCI upload completion found the blob already published"
+                    );
+                    return Err(upload_complete_created_response(image_name, digest));
+                }
+                return Err(oci_error(
                     StatusCode::NOT_FOUND,
                     "BLOB_UPLOAD_UNKNOWN",
                     "upload session not found",
-                )
+                ));
             }
-            Err(resp) => return resp,
-        },
-        Err(resp) => return resp,
+            // Released between the claim and the read: claim again.
+            Some(session) if session.state == UploadSessionState::Open => {}
+            Some(_) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(upload_completion_in_progress_response());
+                }
+                tokio::time::sleep((deadline - now).min(OCI_UPLOAD_COMPLETION_RETRY_POLL)).await;
+            }
+        }
+    }
+}
+
+/// Run a claimed completion on its own task and wait for it.
+///
+/// The work after the claim (final part, assembly, digest check, promotion and
+/// the row publish) used to run inside the request future, so a proxy or
+/// client that dropped the connection cancelled it mid-way: the lease stayed
+/// `committing` with no heartbeat and the retry got 409 (#4902). On a spawned
+/// task it runs to its own end (success or an error path that reopens the
+/// session) whatever happens to the request, and its result is published for
+/// retries of the same PUT.
+async fn run_claimed_oci_upload_completion(job: OciUploadCompletionJob) -> Response {
+    let db = job.state.db.clone();
+    let repository_id = job.session.repository_id;
+    let session_id = job.session_id;
+    let state_token = job.completion_state_token;
+    let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
+    let registration = InflightOciUploadCompletionRegistration::register(
+        repository_id,
+        session_id,
+        state_token,
+        &job.digest,
+        outcome_rx,
+    );
+
+    let task = async move {
+        let _registration = registration;
+        let response = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            complete_claimed_oci_upload(job),
+        ))
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                tracing::error!(
+                    upload_session_id = %session_id,
+                    "OCI upload completion panicked; reopening the session"
+                );
+                let _ = sqlx::query(
+                    "UPDATE oci_upload_sessions SET state = $4, state_token = NULL, updated_at = NOW() WHERE id = $1 AND repository_id = $2 AND state_token = $3",
+                )
+                .bind(session_id)
+                .bind(repository_id)
+                .bind(state_token)
+                .bind(UploadSessionState::Open.as_str())
+                .execute(&db)
+                .await;
+                oci_internal_error("upload completion failed")
+            }
+        };
+        let (parts, body) = response.into_parts();
+        let body = collect_completion_response_body(body).await;
+        let _ = outcome_tx.send(Some(OciUploadCompletionOutcome {
+            status: parts.status,
+            headers: parts.headers.clone(),
+            body: body.clone(),
+        }));
+        Response::from_parts(parts, Body::from(body))
     };
+
+    match tokio::spawn(tracing::Instrument::in_current_span(task)).await {
+        Ok(response) => response,
+        Err(e) => oci_internal_error(&format!("upload completion task failed: {e}")),
+    }
+}
+
+/// Read a completion's response body so it can be replayed to waiting retries.
+/// Completion responses are an empty 201 or a small OCI error document.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
+async fn collect_completion_response_body(body: Body) -> Bytes {
+    // STREAMING-EXEMPT: our own completion response (empty or a small error document), bounded at 64 KiB; #1608
+    to_bytes(body, 64 * 1024).await.unwrap_or_default()
+}
+
+/// The completion proper, from the claimed lease to the published blob.
+async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
+    let OciUploadCompletionJob {
+        state,
+        headers,
+        image_name,
+        digest,
+        requested_digest,
+        session_id,
+        session,
+        completion_state_token,
+        storage,
+        body,
+    } = job;
+    let state = &state;
+    let headers = &headers;
+    let image_name = image_name.as_str();
     let completion_heartbeat = start_oci_upload_completion_heartbeat(
         state.db.clone(),
         session_id,
@@ -24916,7 +25282,7 @@ mod oci_blob_upload_streaming_tests {
         );
 
         sqlx::query(
-            "UPDATE oci_upload_sessions SET state = 'committing', state_token = $2, updated_at = NOW() - INTERVAL '6 hours 1 minute' WHERE id = $1",
+            "UPDATE oci_upload_sessions SET state = 'committing', state_token = $2, updated_at = NOW() - INTERVAL '5 minutes 5 seconds' WHERE id = $1",
         )
         .bind(upload_uuid)
         .bind(Uuid::new_v4())
@@ -26410,8 +26776,10 @@ mod oci_blob_upload_streaming_tests {
         .await
         .expect("first final PUT should reach storage copy");
 
-        // Fire the second PUT while the first is mid-commit. It must lose the
-        // claim_oci_upload_session_for_completion race (state already 'committing').
+        // Fire the second PUT while the first is mid-commit. It loses the
+        // claim_oci_upload_session_for_completion race (state already
+        // 'committing') and, carrying the same digest, waits for the first
+        // completion instead of failing with 409 (#4902).
         let second_app = app.clone();
         let second_repo = f.inner.repo_key.clone();
         let second_auth = f.authorization.clone();
@@ -26434,13 +26802,10 @@ mod oci_blob_upload_streaming_tests {
 
         let second_result =
             tokio::time::timeout(std::time::Duration::from_millis(500), &mut second_put).await;
-        let (second_status, _second_headers, _second_body) = second_result
-            .expect("second final PUT should be rejected promptly while first is committing")
-            .expect("second PUT task should complete");
-        assert_eq!(
-            second_status,
-            StatusCode::CONFLICT,
-            "second concurrent final PUT must lose the completion claim"
+        assert!(
+            second_result.is_err(),
+            "a same-digest retry must wait for the running completion, got {:?}",
+            second_result.map(|r| r.map(|(status, _, body)| (status, body)))
         );
 
         storage.release_copy.notify_one();
@@ -26453,6 +26818,27 @@ mod oci_blob_upload_streaming_tests {
             StatusCode::CREATED,
             "first final PUT failed: {:?}",
             first_body
+        );
+        let (second_status, second_headers, second_body) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut second_put)
+                .await
+                .expect("second PUT should finish once the first completion does")
+                .expect("second PUT task should complete");
+        assert_eq!(
+            second_status,
+            StatusCode::CREATED,
+            "the waiting retry must get the first completion's 201: {:?}",
+            second_body
+        );
+        assert_eq!(
+            second_headers
+                .get("Docker-Content-Digest")
+                .and_then(|v| v.to_str().ok()),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            second_headers.get(LOCATION).and_then(|v| v.to_str().ok()),
+            Some(format!("/v2/{}/image/blobs/{}", f.inner.repo_key, digest).as_str())
         );
 
         assert_eq!(
@@ -26467,6 +26853,456 @@ mod oci_blob_upload_streaming_tests {
         );
 
         f.teardown().await;
+    }
+
+    // ---- #4902: a completion PUT that is cut off, and its retry ----
+
+    /// A router whose repository stores into a [`BlockingCopyStorage`], so a
+    /// single-part completion parks at its `copy()` until released.
+    async fn blocking_copy_app(f: &OciUploadFixture) -> (Arc<BlockingCopyStorage>, Router) {
+        let storage = Arc::new(BlockingCopyStorage::new());
+        let mut backends = HashMap::new();
+        let storage_backend: Arc<dyn StorageBackend> = storage.clone();
+        backends.insert("blocking".to_string(), storage_backend);
+        sqlx::query("UPDATE repositories SET storage_backend = 'blocking' WHERE id = $1")
+            .bind(f.inner.repo_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("update repository storage backend");
+        let mut state = (*f.inner.state).clone();
+        state.storage_registry = Arc::new(StorageRegistry::new(backends, "blocking".into()));
+        (storage, router(None).with_state(Arc::new(state)))
+    }
+
+    /// POST then one PATCH carrying `content`; returns the session id.
+    async fn open_session_with(f: &OciUploadFixture, app: &Router, content: &Bytes) -> Uuid {
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "start upload: {:?}", body);
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                content.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "patch upload: {:?}", body);
+        upload_uuid
+    }
+
+    fn final_put(f: &OciUploadFixture, upload_uuid: Uuid, digest: &str) -> Request<Body> {
+        request(
+            Method::PUT,
+            format!(
+                "/{}/image/blobs/uploads/{}?digest={}",
+                f.inner.repo_key, upload_uuid, digest
+            ),
+            &f.authorization,
+            Bytes::new(),
+        )
+    }
+
+    fn spawn_send(
+        app: &Router,
+        req: Request<Body>,
+    ) -> tokio::task::JoinHandle<(StatusCode, HeaderMap, Bytes)> {
+        let app = app.clone();
+        tokio::spawn(async move { send(app, req).await })
+    }
+
+    fn spawn_send_with_retry_wait(
+        app: &Router,
+        req: Request<Body>,
+        wait: Duration,
+    ) -> tokio::task::JoinHandle<(StatusCode, HeaderMap, Bytes)> {
+        let app = app.clone();
+        tokio::spawn(
+            OCI_UPLOAD_COMPLETION_RETRY_WAIT_OVERRIDE
+                .scope(wait, async move { send(app, req).await }),
+        )
+    }
+
+    async fn session_row_state(f: &OciUploadFixture, upload_uuid: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT state FROM oci_upload_sessions WHERE id = $1")
+            .bind(upload_uuid)
+            .fetch_optional(&f.inner.pool)
+            .await
+            .expect("read upload session state")
+    }
+
+    /// #4902 (1): the request that owns a completion is dropped (a proxy 504
+    /// or a client timeout resets the connection) while the completion is
+    /// mid-way. The completion must still run to its end instead of leaving
+    /// the session `committing` with no heartbeat.
+    #[tokio::test]
+    async fn completion_survives_a_dropped_request_and_releases_the_session() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let (storage, app) = blocking_copy_app(&f).await;
+        let content = Bytes::from_static(b"completion outlives its request");
+        let digest = compute_sha256(&content);
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+
+        let first = spawn_send(&app, final_put(&f, upload_uuid, &digest));
+        tokio::time::timeout(Duration::from_secs(5), storage.copy_started.notified())
+            .await
+            .expect("final PUT should reach storage copy");
+        assert_eq!(
+            session_row_state(&f, upload_uuid).await.as_deref(),
+            Some("committing")
+        );
+
+        // The connection goes away: hyper drops the request future.
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        storage.release_copy.notify_one();
+
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            while session_row_state(&f, upload_uuid).await.is_some() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the completion must finish after its request was dropped; session is still {:?}",
+            session_row_state(&f, upload_uuid).await
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+        assert_eq!(
+            storage.get(&blob_storage_key(&digest)).await.unwrap(),
+            content
+        );
+
+        f.teardown().await;
+    }
+
+    /// #4902 (2): a same-digest retry that waits for a completion which then
+    /// fails is answered with that completion's error, not 409.
+    #[tokio::test]
+    async fn waiting_retry_gets_the_error_of_the_completion_it_waited_for() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let (storage, app) = blocking_copy_app(&f).await;
+        let content = Bytes::from_static(b"completion that fails at copy");
+        let digest = compute_sha256(&content);
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+
+        let first = spawn_send(&app, final_put(&f, upload_uuid, &digest));
+        tokio::time::timeout(Duration::from_secs(5), storage.copy_started.notified())
+            .await
+            .expect("final PUT should reach storage copy");
+        let retry = spawn_send(&app, final_put(&f, upload_uuid, &digest));
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(
+            !retry.is_finished(),
+            "the same-digest retry must wait for the running completion"
+        );
+
+        // The copy source vanishes, so the first completion fails at copy().
+        storage.objects.lock().unwrap().clear();
+        storage.release_copy.notify_one();
+
+        let (first_status, _, first_body) = first.await.expect("first PUT task");
+        assert_eq!(first_status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (retry_status, _, retry_body) = tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("retry should finish with the first completion")
+            .expect("retry task");
+        assert_eq!(retry_status, first_status, "retry body: {:?}", retry_body);
+        assert_eq!(retry_body, first_body);
+        assert_eq!(
+            session_row_state(&f, upload_uuid).await.as_deref(),
+            Some("open"),
+            "the failed completion reopens the session"
+        );
+
+        f.teardown().await;
+    }
+
+    /// #4902 (2): a retry carrying a different digest is a real conflict and
+    /// is refused at once, without waiting.
+    #[tokio::test]
+    async fn retry_with_a_different_digest_is_still_a_conflict() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let (storage, app) = blocking_copy_app(&f).await;
+        let content = Bytes::from_static(b"the first digest");
+        let digest = compute_sha256(&content);
+        let other_digest = compute_sha256(b"some other digest");
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+
+        let first = spawn_send(&app, final_put(&f, upload_uuid, &digest));
+        tokio::time::timeout(Duration::from_secs(5), storage.copy_started.notified())
+            .await
+            .expect("final PUT should reach storage copy");
+
+        let other = spawn_send_with_retry_wait(
+            &app,
+            final_put(&f, upload_uuid, &other_digest),
+            Duration::from_secs(60),
+        );
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(10), other)
+            .await
+            .expect("a different-digest retry must not wait")
+            .expect("retry task");
+        assert_eq!(status, StatusCode::CONFLICT, "body: {:?}", body);
+        assert!(String::from_utf8_lossy(&body).contains("already being modified"));
+
+        storage.release_copy.notify_one();
+        let (first_status, _, first_body) = first.await.expect("first PUT task");
+        assert_eq!(first_status, StatusCode::CREATED, "{:?}", first_body);
+
+        f.teardown().await;
+    }
+
+    /// #4902 (2): a retry whose wait runs out while the first completion is
+    /// still working answers 503 with `Retry-After`, and the next retry after
+    /// the completion finished gets 201.
+    #[tokio::test]
+    async fn retry_past_the_wait_bound_gets_503_then_201() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let (storage, app) = blocking_copy_app(&f).await;
+        let content = Bytes::from_static(b"slow completion");
+        let digest = compute_sha256(&content);
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+
+        let first = spawn_send(&app, final_put(&f, upload_uuid, &digest));
+        tokio::time::timeout(Duration::from_secs(5), storage.copy_started.notified())
+            .await
+            .expect("final PUT should reach storage copy");
+
+        let (status, headers, body) = spawn_send_with_retry_wait(
+            &app,
+            final_put(&f, upload_uuid, &digest),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("retry task");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {:?}", body);
+        assert_eq!(
+            headers
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+
+        storage.release_copy.notify_one();
+        let (first_status, _, first_body) = first.await.expect("first PUT task");
+        assert_eq!(first_status, StatusCode::CREATED, "{:?}", first_body);
+
+        let (status, headers, body) = send(app.clone(), final_put(&f, upload_uuid, &digest)).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {:?}", body);
+        assert_eq!(
+            headers
+                .get("Docker-Content-Digest")
+                .and_then(|v| v.to_str().ok()),
+            Some(digest.as_str())
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+
+        f.teardown().await;
+    }
+
+    /// #4902 (2): a session whose live lease is held by another replica (no
+    /// in-process completion to wait on) is polled: 503 at the bound while it
+    /// stays `committing`, 201 once the other replica published the blob.
+    #[tokio::test]
+    async fn retry_polls_a_completion_owned_by_another_replica() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let content = Bytes::from_static(b"completed by another replica");
+        let digest = compute_sha256(&content);
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+        sqlx::query(
+            "UPDATE oci_upload_sessions SET state = 'committing', state_token = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .bind(Uuid::new_v4())
+        .execute(&f.inner.pool)
+        .await
+        .expect("hand the lease to another replica");
+
+        let (status, headers, body) = spawn_send_with_retry_wait(
+            &app,
+            final_put(&f, upload_uuid, &digest),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("retry task");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {:?}", body);
+        assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(
+            session_row_state(&f, upload_uuid).await.as_deref(),
+            Some("committing"),
+            "a live lease must not be stolen"
+        );
+
+        let retry = spawn_send_with_retry_wait(
+            &app,
+            final_put(&f, upload_uuid, &digest),
+            Duration::from_secs(20),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The other replica finishes: blob row published, session deleted.
+        let blob_key = blob_storage_key(&digest);
+        f.storage().put(&blob_key, content.clone()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .bind(content.len() as i64)
+        .bind(&blob_key)
+        .execute(&f.inner.pool)
+        .await
+        .expect("publish blob row");
+        sqlx::query("DELETE FROM oci_upload_sessions WHERE id = $1")
+            .bind(upload_uuid)
+            .execute(&f.inner.pool)
+            .await
+            .expect("delete finished session");
+
+        let (status, headers, body) = tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("retry should settle once the other replica finished")
+            .expect("retry task");
+        assert_eq!(status, StatusCode::CREATED, "body: {:?}", body);
+        assert_eq!(
+            headers
+                .get("Docker-Content-Digest")
+                .and_then(|v| v.to_str().ok()),
+            Some(digest.as_str())
+        );
+
+        f.teardown().await;
+    }
+
+    /// #4902 (3): a retry that arrives after the completion committed (the
+    /// session row is gone) answers 201 for a digest the repository holds,
+    /// and still 404 for one it does not.
+    #[tokio::test]
+    async fn retry_after_commit_is_idempotent_for_a_published_digest() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let content = Bytes::from_static(b"already committed");
+        let digest = compute_sha256(&content);
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+
+        let (status, _, body) = send(app.clone(), final_put(&f, upload_uuid, &digest)).await;
+        assert_eq!(status, StatusCode::CREATED, "first PUT: {:?}", body);
+        assert!(session_row_state(&f, upload_uuid).await.is_none());
+
+        let (status, headers, body) = send(app.clone(), final_put(&f, upload_uuid, &digest)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a retry after the commit must be idempotent: {:?}",
+            body
+        );
+        assert_eq!(
+            headers
+                .get("Docker-Content-Digest")
+                .and_then(|v| v.to_str().ok()),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            headers.get(LOCATION).and_then(|v| v.to_str().ok()),
+            Some(format!("/v2/{}/image/blobs/{}", f.inner.repo_key, digest).as_str())
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+
+        let unknown = compute_sha256(b"never uploaded");
+        let (status, _, body) = send(app.clone(), final_put(&f, upload_uuid, &unknown)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {:?}", body);
+        assert!(String::from_utf8_lossy(&body).contains("BLOB_UPLOAD_UNKNOWN"));
+
+        f.teardown().await;
+    }
+
+    /// #4902 (4): a `committing` lease whose heartbeat stopped a few minutes
+    /// ago is not yet stale and is not stolen (the retry gets 503 rather than
+    /// 409), while one past five heartbeats is reclaimed by the retry
+    /// (`final_put_recovers_expired_committing_upload_session_lease`).
+    #[tokio::test]
+    async fn committing_lease_younger_than_the_stale_window_is_not_reclaimed() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let content = Bytes::from_static(b"lease still fresh");
+        let digest = compute_sha256(&content);
+        let upload_uuid = open_session_with(&f, &app, &content).await;
+        sqlx::query(
+            "UPDATE oci_upload_sessions SET state = 'committing', state_token = $2, updated_at = NOW() - INTERVAL '4 minutes' WHERE id = $1",
+        )
+        .bind(upload_uuid)
+        .bind(Uuid::new_v4())
+        .execute(&f.inner.pool)
+        .await
+        .expect("mark a four-minute-old committing lease");
+
+        let (status, _, body) =
+            spawn_send_with_retry_wait(&app, final_put(&f, upload_uuid, &digest), Duration::ZERO)
+                .await
+                .expect("retry task");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {:?}", body);
+        assert_eq!(
+            session_row_state(&f, upload_uuid).await.as_deref(),
+            Some("committing")
+        );
+
+        f.teardown().await;
+    }
+
+    #[test]
+    fn completion_retry_wait_parses_the_env_value() {
+        assert_eq!(
+            parse_oci_upload_completion_retry_wait(None),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_oci_upload_completion_retry_wait(Some(" 90 ")),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            parse_oci_upload_completion_retry_wait(Some("0")),
+            Duration::ZERO
+        );
+        assert_eq!(
+            parse_oci_upload_completion_retry_wait(Some("soon")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_oci_upload_completion_retry_wait(Some("999999")),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(OCI_UPLOAD_COMPLETION_LEASE_STALE_SECS, 300);
     }
 
     #[tokio::test]

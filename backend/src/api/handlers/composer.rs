@@ -1309,6 +1309,12 @@ async fn download_archive(
 
     // Strip .zip extension from reference if present
     let reference = reference.trim_end_matches(".zip");
+    // #4365 item 3 (#4105): on a proxying repository these segments name the
+    // upstream metadata document and the dist the gate fetches and caches.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[&vendor, &package, &version, reference],
+    )?;
 
     // Find the artifact by name, version, and sha256 reference
     let artifact = sqlx::query!(
@@ -1358,6 +1364,32 @@ async fn download_archive(
                         reference,
                     )
                     .await?;
+                    // #4105: scan-on-proxy routes the dist archive through the
+                    // inline scan-and-block gate INSTEAD of the streaming path
+                    // below, under the same content-addressed cache key.
+                    // Repositories that have not opted in keep the untouched
+                    // streaming path.
+                    if let Some(policy) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                    {
+                        let dist = ComposerDistCoordinate {
+                            full_name: &full_name,
+                            package: &package,
+                            version: &version,
+                            reference,
+                        };
+                        return serve_scanned_composer_dist(
+                            &state,
+                            proxy,
+                            (repo.id, &repo_key),
+                            &target,
+                            &dist,
+                            policy,
+                            None,
+                            &ctx,
+                        )
+                        .await;
+                    }
                     let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
                         proxy,
                         repo.id,
@@ -1388,6 +1420,30 @@ async fn download_archive(
             }
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
+                // #4105: a member with scan-on-proxy on (stricter of virtual
+                // and member policy) serves only through the inline gate,
+                // fetching from the dist URL its own metadata names.
+                if let Some(proxy) = state.proxy_service.as_deref() {
+                    let dist = ComposerDistCoordinate {
+                        full_name: &full_name,
+                        package: &package,
+                        version: &version,
+                        reference,
+                    };
+                    if let Some(served) = serve_scanned_virtual_composer_dist(
+                        &state,
+                        auth.as_ref(),
+                        proxy,
+                        repo.id,
+                        &dist,
+                        &vendor,
+                        &ctx,
+                    )
+                    .await?
+                    {
+                        return served;
+                    }
+                }
                 let db = state.db.clone();
                 let vname = full_name.clone();
                 let vversion = version.clone();
@@ -1463,6 +1519,218 @@ async fn download_archive(
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy for dist archives (#4105, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The `{vendor}/{package}` `{version}` one dist request asks for, as the
+/// route named it.
+struct ComposerDistCoordinate<'a> {
+    full_name: &'a str,
+    package: &'a str,
+    version: &'a str,
+    reference: &'a str,
+}
+
+impl ComposerDistCoordinate<'_> {
+    /// The file name the gate names the scan, the block body and the 423
+    /// after, and the Virtual arm's attachment name.
+    fn filename(&self) -> String {
+        format!("{}-{}.zip", self.package, self.version)
+    }
+}
+
+/// The canonical `(cache_key, scannable)` decision for a proxied dist
+/// archive (#4365 item 1): every file on the dist route is a package, cached
+/// under the content-addressed key [`composer_dist_cache_path`] derives.
+fn composer_dist_serve_key(cache_path: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(cache_path)
+}
+
+/// The Composer half of the generic gate: a dist archive must be the
+/// package the request names (#4105).
+struct ComposerDist<'a> {
+    full_name: &'a str,
+    version: &'a str,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ComposerDist<'_> {
+    const LABEL: &'static str = "composer dist";
+    const CONTENT_TYPE: &'static str = "application/zip";
+
+    fn requested(&self) -> String {
+        format!("{} {}", self.full_name, self.version)
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        composer_dist_identity(self.full_name, self.version, bytes)
+    }
+}
+
+/// What a dist archive says about itself (#4105): its package's own
+/// `composer.json`, at the archive root or under the single top-level
+/// directory a VCS zipball wraps it in, must name the requested package, and
+/// a `version` it declares (most do not) must be the requested one. A
+/// nested `composer.json` (a vendored or test fixture package) is never
+/// consulted. The scanner has no Composer pin, so an archive that agrees is
+/// graded on its contents (a bundled `composer.lock`, a vendored package).
+fn composer_dist_identity(
+    full_name: &str,
+    version: &str,
+    bytes: &Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{
+        read_zip_entry, zip_entry_names, ArchiveIdentity,
+    };
+    let Some(names) = zip_entry_names(bytes) else {
+        return ArchiveIdentity::Unreadable("not a readable zip".to_string());
+    };
+    let manifest = names.iter().find(|n| *n == "composer.json").or_else(|| {
+        let top = names.first()?.split('/').next()?;
+        let wrapped = names
+            .iter()
+            .all(|n| n.split('/').next() == Some(top) && n.len() > top.len());
+        let entry = format!("{top}/composer.json");
+        wrapped
+            .then(|| names.iter().find(|n| **n == entry))
+            .flatten()
+    });
+    let Some(manifest) = manifest else {
+        return ArchiveIdentity::Unreadable("no top-level composer.json".to_string());
+    };
+    let body = match read_zip_entry(bytes, manifest) {
+        Ok(Some(body)) => body,
+        Ok(None) => return ArchiveIdentity::Unreadable("composer.json unreadable".to_string()),
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return ArchiveIdentity::Unreadable("composer.json is not JSON".to_string());
+    };
+    let Some(declared) = doc.get("name").and_then(|n| n.as_str()) else {
+        return ArchiveIdentity::Unreadable("composer.json names no package".to_string());
+    };
+    if !declared.eq_ignore_ascii_case(full_name) {
+        return ArchiveIdentity::Disagrees(format!("composer.json names {declared}"));
+    }
+    let bare = |v: &str| v.trim().trim_start_matches(['v', 'V']).to_string();
+    match doc.get("version").and_then(|v| v.as_str()) {
+        Some(declared) if bare(declared) != bare(version) => {
+            ArchiveIdentity::Disagrees(format!("composer.json declares version {declared}"))
+        }
+        _ => ArchiveIdentity::ContentGraded,
+    }
+}
+
+/// Inline scan-and-block for one dist archive from one Remote repository
+/// (#4105), fetched from the dist URL the repository's own metadata names.
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_composer_dist(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key): (uuid::Uuid, &str),
+    target: &ComposerRemoteDistTarget,
+    dist: &ComposerDistCoordinate<'_>,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    disposition: Option<&str>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let serve_key = composer_dist_serve_key(&target.cache_path);
+    let filename = dist.filename();
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: &target.fetch_base,
+        format: RepositoryFormat::Composer,
+        source_path: &target.fetch_path,
+        cache_path: &serve_key.cache_key,
+        filename: &filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: ComposerDist {
+            full_name: dist.full_name,
+            version: dist.version,
+        },
+        disposition,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The Virtual dist walk with scan-on-proxy (#4105): `Ok(None)` when no
+/// member scans (the caller keeps its resolver). Otherwise the priority
+/// walk: each scanning Remote member resolves the dist URL from its own
+/// upstream metadata and serves through the gate under its own id, and the
+/// runs of members that do not scan go through the existing resolver.
+async fn serve_scanned_virtual_composer_dist(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    proxy: &crate::services::proxy_service::ProxyService,
+    virtual_id: uuid::Uuid,
+    dist: &ComposerDistCoordinate<'_>,
+    vendor: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_id).await?;
+    let upstream_path = format!(
+        "dist/{}/{}/{}/{}.zip",
+        vendor, dist.package, dist.version, dist.reference
+    );
+    let filename = dist.filename();
+    let (name, version) = (dist.full_name, dist.version);
+    let local_fetch = |member_id: uuid::Uuid, location: crate::storage::StorageLocation| async move {
+        proxy_helpers::local_fetch_by_name_version(
+            &state.db, state, member_id, &location, name, version,
+        )
+        .await
+    };
+    let runs = crate::api::handlers::proxy_scan_archive::UnscannedArchiveRuns {
+        proxy,
+        path: &upstream_path,
+        local_fetch,
+        default_content_type: "application/zip",
+        disposition: Some(&filename),
+        ctx,
+    };
+    let filename = &filename;
+    let scanned = |member: crate::models::repository::Repository, policy| async move {
+        let upstream_url = member.upstream_url.clone().unwrap_or_default();
+        let target = resolve_composer_remote_dist_target(
+            proxy,
+            member.id,
+            &member.key,
+            &upstream_url,
+            dist.full_name,
+            dist.version,
+            dist.reference,
+        )
+        .await?;
+        serve_scanned_composer_dist(
+            state,
+            proxy,
+            (member.id, &member.key),
+            &target,
+            dist,
+            policy,
+            Some(filename),
+            ctx,
+        )
+        .await
+    };
+    Ok(
+        crate::api::handlers::proxy_scan_archive::walk_scanned_archive_members(
+            state, virtual_id, members, runs, scanned,
+        )
+        .await,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4675,5 +4943,200 @@ mod metadata_db_tests {
             archive,
             "the advertised dist.url must serve the published archive bytes"
         );
+    }
+}
+
+/// #4105: scan-on-proxy on Composer dist archives, Remote and Virtual,
+/// through the shared archive scenarios, plus the dist identity rule.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4105 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+
+    const NAME: &str = "dtf/scanned";
+    const REFERENCE: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn zip_of(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            for (name, data) in entries {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, data.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// A VCS zipball (`{top}/composer.json`) whose manifest names
+    /// `declared`. The random description keeps every digest unique.
+    fn zipball(declared: &str, version: Option<&str>) -> Vec<u8> {
+        let mut manifest = serde_json::json!({
+            "name": declared,
+            "description": uuid::Uuid::new_v4().to_string(),
+        });
+        if let Some(v) = version {
+            manifest["version"] = serde_json::Value::String(v.to_string());
+        }
+        zip_of(&[
+            ("dtf-scanned-0123456/composer.json", manifest.to_string()),
+            ("dtf-scanned-0123456/src/X.php", "<?php\n".to_string()),
+        ])
+    }
+
+    fn case(mock: &str) -> ArchiveCase {
+        let metadata = serde_json::json!({
+            "packages": { NAME: [{
+                "name": NAME,
+                "version": "1.0.0",
+                "dist": {
+                    "type": "zip",
+                    "url": format!("{mock}/zipball/dtf-scanned-1.0.0.zip"),
+                    "reference": REFERENCE,
+                },
+            }]},
+        });
+        let body = zipball(NAME, None);
+        ArchiveCase {
+            format: "composer",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/dist/{NAME}/1.0.0/{REFERENCE}.zip")),
+            package_path: "/zipball/dtf-scanned-1.0.0.zip".to_string(),
+            // The metadata the Remote arm reads the real dist URL from, and
+            // the synthesized `dist/` path the unscanned Virtual resolver
+            // fetches from a member.
+            extra: vec![
+                (
+                    format!("/p2/{NAME}.json"),
+                    metadata.to_string().into_bytes(),
+                ),
+                (format!("/dist/{NAME}/1.0.0/{REFERENCE}.zip"), body.clone()),
+            ],
+            body,
+            recorded_path: format!("dist/{NAME}/1.0.0/{REFERENCE}.zip"),
+            file: "scanned-1.0.0.zip".to_string(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/dist/{NAME}/1.0.0%3Fx/{REFERENCE}.zip"),
+                format!("/{key}/dist/{NAME}/1.0.0/{REFERENCE}%3Bx.zip"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn a_dist_that_names_the_requested_package_is_graded_on_its_contents() {
+        let wrapped = Bytes::from(zipball(NAME, None));
+        assert_eq!(
+            composer_dist_identity(NAME, "1.0.0", &wrapped),
+            ArchiveIdentity::ContentGraded
+        );
+        // Names compare ignoring case; a declared version may carry a `v`.
+        let declared = Bytes::from(zipball("DTF/Scanned", Some("v1.0.0")));
+        assert_eq!(
+            composer_dist_identity(NAME, "1.0.0", &declared),
+            ArchiveIdentity::ContentGraded
+        );
+        // `composer archive` output: the manifest at the root, and a nested
+        // fixture package that is never consulted.
+        let root = Bytes::from(zip_of(&[
+            ("composer.json", format!("{{\"name\":\"{NAME}\"}}")),
+            (
+                "tests/fixture/composer.json",
+                "{\"name\":\"other/pkg\"}".to_string(),
+            ),
+        ]));
+        assert_eq!(
+            composer_dist_identity(NAME, "1.0.0", &root),
+            ArchiveIdentity::ContentGraded
+        );
+    }
+
+    #[test]
+    fn a_dist_that_is_not_the_requested_package_is_unestablished() {
+        let other = Bytes::from(zipball("other/pkg", None));
+        assert!(matches!(
+            composer_dist_identity(NAME, "1.0.0", &other),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        let version = Bytes::from(zipball(NAME, Some("2.0.0")));
+        assert!(matches!(
+            composer_dist_identity(NAME, "1.0.0", &version),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        // Only a nested manifest: nothing names the package itself.
+        let nested = Bytes::from(zip_of(&[
+            ("a/composer.json", format!("{{\"name\":\"{NAME}\"}}")),
+            ("b/x.php", "<?php\n".to_string()),
+        ]));
+        for bytes in [
+            nested,
+            Bytes::from_static(b"not a zip"),
+            Bytes::from(zip_of(&[("x/composer.json", "not json".to_string())])),
+            Bytes::from(zip_of(&[("composer.json", "{}".to_string())])),
+        ] {
+            assert!(matches!(
+                composer_dist_identity(NAME, "1.0.0", &bytes),
+                ArchiveIdentity::Unreadable(_)
+            ));
+        }
+    }
+}
+
+/// #4365 item 1: Composer decides by route (every file on the `dist/` route
+/// is a package); the cache key is the content-addressed dist key.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn composer_dist_serve_key_table() {
+        for (name, version, reference, shasum, key) in [
+            ("a/b", "1.0.0", "ref", None, "dist/a/b/1.0.0/ref.zip"),
+            ("a/b", "1.0.0", "ref", Some("abc"), "dist/a/b/abc.zip"),
+        ] {
+            let got = composer_dist_serve_key(&composer_dist_cache_path(
+                name, version, reference, shasum,
+            ));
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
+        }
     }
 }

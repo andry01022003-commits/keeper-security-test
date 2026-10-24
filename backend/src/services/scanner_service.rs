@@ -1185,6 +1185,75 @@ pub(crate) mod test_scan_job_suffix {
     }
 }
 
+/// One extraction job handed to a [`WorkspaceExtractor`] by
+/// [`ScanWorkspace::prepare_with`] (#1429).
+pub(crate) struct WorkspaceExtraction<'a> {
+    /// The job directory. It exists, was created for this job alone, and is
+    /// owned by the job's [`WorkspaceGuard`]: the extractor writes only
+    /// beneath it and never removes it.
+    pub workspace: &'a Path,
+    pub artifact: &'a Artifact,
+    pub content: &'a Bytes,
+    /// Set when the job is cancelled (see [`WorkspaceGuard::cancel_flag`]).
+    /// An in-process extractor running on a blocking task checks it per entry;
+    /// one that runs a child process relies on `kill_on_drop` instead.
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// The pluggable extraction step of the shared scan-workspace lifecycle
+/// (#1429).
+///
+/// [`ScanWorkspace::prepare_with`] owns everything around extraction: the
+/// per-job directory name (#4668), its creation, the [`WorkspaceGuard`] that
+/// removes it on every exit including cancellation (#3565), cleanup when the
+/// extractor fails, and the check that the scan root stays inside the
+/// workspace. The extractor only turns the artifact bytes into a tree under
+/// [`WorkspaceExtraction::workspace`] and says which directory the engine
+/// scans. Workspace hardening therefore lives in one place, whatever the
+/// artifact's layout: the archive formats ([`StagedArtifactExtractor`]) and
+/// the Incus rootfs images (`incus_scanner::IncusRootfsExtractor`) both ride
+/// it.
+#[async_trait]
+pub(crate) trait WorkspaceExtractor: Send + Sync {
+    /// Stage and extract the artifact under `job.workspace`, returning the
+    /// directory to scan: a path joined onto `job.workspace`, or one
+    /// relative to it. Anything that resolves outside the workspace is
+    /// refused.
+    async fn extract(&self, job: WorkspaceExtraction<'_>) -> Result<PathBuf>;
+}
+
+/// A workspace built by [`ScanWorkspace::prepare_with`]: the guard that owns
+/// the job directory, and the directory inside it the engine scans.
+#[derive(Debug)]
+pub(crate) struct PreparedWorkspace {
+    pub guard: WorkspaceGuard,
+    pub scan_root: PathBuf,
+}
+
+/// The default extractor, used by [`ScanWorkspace::prepare_pinned`]: stage the
+/// artifact, unpack it when it is one of the [`ScanWorkspace::is_archive`]
+/// formats (falling back to the raw file when that fails), and materialise the
+/// component pin. The scan root is the workspace itself, so the engine sees
+/// the extracted tree and the control files together.
+pub(crate) struct StagedArtifactExtractor<'p> {
+    pub pin: Option<&'p ExpectedComponent>,
+}
+
+#[async_trait]
+impl WorkspaceExtractor for StagedArtifactExtractor<'_> {
+    async fn extract(&self, job: WorkspaceExtraction<'_>) -> Result<PathBuf> {
+        ScanWorkspace::stage_artifact(
+            job.workspace,
+            job.cancel,
+            job.artifact,
+            job.content,
+            self.pin,
+        )
+        .await?;
+        Ok(job.workspace.to_path_buf())
+    }
+}
+
 /// Shared scan workspace utilities for scanners that need to write artifact
 /// content to disk, optionally extract archives, and clean up after scanning.
 pub(crate) struct ScanWorkspace;
@@ -1250,6 +1319,9 @@ impl ScanWorkspace {
     ///
     /// `pin: None` (every hosted upload scan and legacy caller) behaves exactly
     /// as before: no file is fabricated.
+    ///
+    /// The workspace lifecycle is [`Self::prepare_with`]'s; this is that
+    /// lifecycle with the [`StagedArtifactExtractor`].
     pub async fn prepare_pinned(
         base: &str,
         prefix: Option<&str>,
@@ -1257,6 +1329,36 @@ impl ScanWorkspace {
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
     ) -> Result<WorkspaceGuard> {
+        let prepared = Self::prepare_with(
+            base,
+            prefix,
+            artifact,
+            content,
+            &StagedArtifactExtractor { pin },
+        )
+        .await?;
+        Ok(prepared.guard)
+    }
+
+    /// The shared scan-workspace lifecycle with a pluggable extraction step
+    /// (#1429).
+    ///
+    /// Creates this job's directory ([`Self::job_workspace_dir`], unique per
+    /// call), hands its ownership to a [`WorkspaceGuard`] before anything is
+    /// written, runs `extractor`, and checks that the scan root it returns is
+    /// inside the workspace. Every failure after the directory exists, from
+    /// the extractor or from that check, removes the directory before the
+    /// error is returned; a future dropped mid-extraction (the wall-clock
+    /// budget, #3565) removes it through the guard's `Drop`. On success the
+    /// guard passes to the caller, who calls [`WorkspaceGuard::cleanup`] when
+    /// the scan is done.
+    pub async fn prepare_with<E: WorkspaceExtractor + ?Sized>(
+        base: &str,
+        prefix: Option<&str>,
+        artifact: &Artifact,
+        content: &Bytes,
+        extractor: &E,
+    ) -> Result<PreparedWorkspace> {
         let workspace = Self::job_workspace_dir(base, prefix, artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
@@ -1265,8 +1367,74 @@ impl ScanWorkspace {
         // The directory exists from here on, so ownership passes to the guard:
         // every later exit removes it, including the wall-clock timeout that
         // drops this future mid-extraction (#3565).
-        let workspace = WorkspaceGuard::new(workspace);
+        let mut workspace = WorkspaceGuard::new(workspace);
 
+        let extracted = extractor
+            .extract(WorkspaceExtraction {
+                workspace: &workspace,
+                artifact,
+                content,
+                cancel: workspace.cancel_flag(),
+            })
+            .await
+            .and_then(|root| Self::confine_scan_root(&workspace, root));
+        match extracted {
+            Ok(scan_root) => Ok(PreparedWorkspace {
+                guard: workspace,
+                scan_root,
+            }),
+            Err(e) => {
+                workspace.cleanup().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Resolve an extractor's scan root against `workspace` and refuse one
+    /// that is not inside it. Lexical: a `..` component below the workspace
+    /// is refused outright rather than resolved, so neither a crafted layout
+    /// nor an extractor bug can point the engine (or the adapter upload,
+    /// which tars the scan root) at a directory this job does not own.
+    ///
+    /// A root the extractor built by joining onto `workspace` is taken as is,
+    /// so a relative `SCAN_WORKSPACE_PATH` (allowed for object-store
+    /// backends) is not joined onto itself a second time, and only the part
+    /// below the workspace is checked, so a base path that itself spells a
+    /// `..` keeps working.
+    fn confine_scan_root(workspace: &Path, root: PathBuf) -> Result<PathBuf> {
+        let root = if root.is_absolute() || root.starts_with(workspace) {
+            root
+        } else {
+            workspace.join(root)
+        };
+        let inside = root.strip_prefix(workspace).is_ok_and(|below| {
+            below.components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        });
+        if !inside {
+            return Err(AppError::Internal(format!(
+                "Scan root {} is outside the scan workspace {}",
+                root.display(),
+                workspace.display()
+            )));
+        }
+        Ok(root)
+    }
+
+    /// The [`StagedArtifactExtractor`] body: write the artifact into
+    /// `workspace`, extract it when it is an archive, and write the component
+    /// pin.
+    async fn stage_artifact(
+        workspace: &Path,
+        cancel: Arc<AtomicBool>,
+        artifact: &Artifact,
+        content: &Bytes,
+        pin: Option<&ExpectedComponent>,
+    ) -> Result<()> {
         // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
         // control files, the archive is unpacked into a dedicated subdirectory
         // instead of the workspace root, so the archive's namespace and ours
@@ -1301,9 +1469,7 @@ impl ScanWorkspace {
             })?;
 
         if Self::is_archive(original_filename) {
-            if let Err(e) =
-                Self::extract_archive(&artifact_path, &extract_root, workspace.cancel_flag()).await
-            {
+            if let Err(e) = Self::extract_archive(&artifact_path, &extract_root, cancel).await {
                 warn!(
                     "Failed to extract archive {}: {}. Cleaning partial output and scanning raw file instead.",
                     artifact.name, e
@@ -1326,10 +1492,10 @@ impl ScanWorkspace {
         }
 
         if let Some(pin) = pin {
-            Self::write_component_pin(&workspace, &extract_root, pin).await?;
+            Self::write_component_pin(workspace, &extract_root, pin).await?;
         }
 
-        Ok(workspace)
+        Ok(())
     }
 
     /// Write the ecosystem-native metadata file that makes the CVE engine
@@ -10833,6 +10999,305 @@ mod tests {
         assert!(
             path.exists(),
             "a cleaned-up guard must not remove a directory it no longer owns"
+        );
+    }
+
+    /// #1429: an extractor plugged into the shared lifecycle with
+    /// [`ScanWorkspace::prepare_with`]. Each behaviour is chosen per test.
+    enum ProbeExtractorStep {
+        /// Write a file, then return this scan root.
+        Root(PathBuf),
+        /// Write a file, then fail.
+        Fail,
+        /// Write a file, then never finish (the scan's budget cancels it).
+        Hang,
+    }
+
+    struct ProbeExtractor {
+        step: ProbeExtractorStep,
+        /// The workspace the lifecycle handed over, recorded for the test.
+        seen: Mutex<Option<(PathBuf, bool)>>,
+    }
+
+    impl ProbeExtractor {
+        fn new(step: ProbeExtractorStep) -> Self {
+            Self {
+                step,
+                seen: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceExtractor for ProbeExtractor {
+        async fn extract(&self, job: WorkspaceExtraction<'_>) -> Result<PathBuf> {
+            let fresh = std::fs::read_dir(job.workspace)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            *self.seen.lock().unwrap() = Some((job.workspace.to_path_buf(), fresh));
+            let tree = job.workspace.join("rootfs/etc");
+            tokio::fs::create_dir_all(&tree)
+                .await
+                .expect("extract tree");
+            tokio::fs::write(tree.join("os-release"), job.content)
+                .await
+                .expect("extract file");
+            match &self.step {
+                ProbeExtractorStep::Root(root) => Ok(root.clone()),
+                ProbeExtractorStep::Fail => {
+                    Err(AppError::Internal("probe extraction failed".to_string()))
+                }
+                ProbeExtractorStep::Hang => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    unreachable!("the budget cancels the extraction first")
+                }
+            }
+        }
+    }
+
+    /// #1429: the lifecycle hands the extractor this job's own directory
+    /// (the #4668 per-job name), already created and empty, and returns the
+    /// extractor's scan root with the guard that owns the directory.
+    #[tokio::test]
+    async fn prepare_with_hands_the_extractor_a_fresh_job_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("image.bin", "application/octet-stream", "image.bin");
+        let content = Bytes::from_static(b"ID=debian\n");
+
+        test_scan_job_suffix::fix("hook-job");
+        let expected =
+            ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), Some("probe"), &artifact);
+        let extractor = ProbeExtractor::new(ProbeExtractorStep::Root(PathBuf::from("rootfs")));
+
+        let mut prepared = ScanWorkspace::prepare_with(
+            base.to_str().unwrap(),
+            Some("probe"),
+            &artifact,
+            &content,
+            &extractor,
+        )
+        .await
+        .expect("prepare_with");
+
+        let (seen, fresh) = extractor
+            .seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("extractor ran");
+        assert_eq!(
+            seen, expected,
+            "the extractor must get this job's directory"
+        );
+        assert!(
+            fresh,
+            "the job directory must exist and be empty when extraction starts"
+        );
+        assert_eq!(&*prepared.guard, expected.as_path());
+        assert_eq!(
+            prepared.scan_root,
+            expected.join("rootfs"),
+            "a relative scan root resolves inside the workspace"
+        );
+        assert!(prepared.scan_root.join("etc/os-release").exists());
+
+        prepared.guard.cleanup().await;
+        assert!(!expected.exists(), "cleanup must remove the job directory");
+    }
+
+    /// #1429: a failed extraction removes everything it wrote, and the job
+    /// directory itself, before the error reaches the caller. One place does
+    /// this for every extractor, so it cannot drift between scanners.
+    #[tokio::test]
+    async fn prepare_with_removes_the_workspace_when_the_extractor_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("image.bin", "application/octet-stream", "image.bin");
+        let content = Bytes::from_static(b"ID=debian\n");
+
+        test_scan_job_suffix::fix("failing-job");
+        let path =
+            ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), Some("probe"), &artifact);
+        let extractor = ProbeExtractor::new(ProbeExtractorStep::Fail);
+
+        let err = ScanWorkspace::prepare_with(
+            base.to_str().unwrap(),
+            Some("probe"),
+            &artifact,
+            &content,
+            &extractor,
+        )
+        .await
+        .expect_err("the extractor's failure must propagate");
+        assert!(
+            err.to_string().contains("probe extraction failed"),
+            "got: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "the job directory must be gone before the error is returned: {}",
+            path.display()
+        );
+    }
+
+    /// #1429: a scan root outside the job directory is refused, whether it
+    /// is absolute or climbs out with `..`, and the workspace is removed.
+    /// The engine (and the adapter upload, which tars the scan root) must
+    /// never be pointed at a directory this job does not own.
+    #[tokio::test]
+    async fn prepare_with_refuses_a_scan_root_outside_the_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("image.bin", "application/octet-stream", "image.bin");
+        let content = Bytes::from_static(b"ID=debian\n");
+
+        for (label, root) in [
+            ("absolute", tmp.path().to_path_buf()),
+            ("relative climb", PathBuf::from("rootfs/../../elsewhere")),
+            ("sibling job", base.join("other-job")),
+        ] {
+            test_scan_job_suffix::fix("escaping-job");
+            let path =
+                ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), Some("probe"), &artifact);
+            let extractor = ProbeExtractor::new(ProbeExtractorStep::Root(root));
+            let err = ScanWorkspace::prepare_with(
+                base.to_str().unwrap(),
+                Some("probe"),
+                &artifact,
+                &content,
+                &extractor,
+            )
+            .await
+            .expect_err(label);
+            assert!(
+                err.to_string().contains("outside the scan workspace"),
+                "{label}: got {err}"
+            );
+            assert!(!path.exists(), "{label}: the workspace must be removed");
+        }
+    }
+
+    /// #1429: the scan-root check works on the path the extractor builds
+    /// from the workspace it was handed, whatever form the base takes. A
+    /// relative `SCAN_WORKSPACE_PATH` (accepted for object-store backends)
+    /// must not be joined onto itself, and a base that itself contains `..`
+    /// must not fail every scan; only a climb below the workspace is refused.
+    #[test]
+    fn confine_scan_root_accepts_roots_built_from_any_workspace_form() {
+        for workspace in [
+            Path::new("scan-workspace/incus-a-job"),
+            Path::new("/data/../scan-workspace/incus-a-job"),
+            Path::new("/scan-workspace/incus-a-job"),
+        ] {
+            let built = workspace.join("rootfs");
+            assert_eq!(
+                ScanWorkspace::confine_scan_root(workspace, built.clone()).unwrap(),
+                built,
+                "{}: a joined root is taken as is",
+                workspace.display()
+            );
+            assert_eq!(
+                ScanWorkspace::confine_scan_root(workspace, workspace.to_path_buf()).unwrap(),
+                workspace,
+                "{}: the workspace itself is a valid scan root",
+                workspace.display()
+            );
+            assert_eq!(
+                ScanWorkspace::confine_scan_root(workspace, PathBuf::from("backup/rootfs"))
+                    .unwrap(),
+                workspace.join("backup/rootfs"),
+                "{}: a relative root resolves under the workspace",
+                workspace.display()
+            );
+            assert!(
+                ScanWorkspace::confine_scan_root(workspace, workspace.join("rootfs/../../x"))
+                    .is_err(),
+                "{}: a climb below the workspace is refused",
+                workspace.display()
+            );
+        }
+    }
+
+    /// #1429 with #3565: an extraction cancelled by the scan's wall-clock
+    /// budget leaves nothing behind, whichever extractor was running.
+    #[tokio::test]
+    async fn prepare_with_removes_the_workspace_when_extraction_is_cancelled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("image.bin", "application/octet-stream", "image.bin");
+        let content = Bytes::from_static(b"ID=debian\n");
+
+        test_scan_job_suffix::fix("hanging-job");
+        let path =
+            ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), Some("probe"), &artifact);
+        let extractor = ProbeExtractor::new(ProbeExtractorStep::Hang);
+
+        let prepare = ScanWorkspace::prepare_with(
+            base.to_str().unwrap(),
+            Some("probe"),
+            &artifact,
+            &content,
+            &extractor,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), prepare)
+                .await
+                .is_err(),
+            "the budget must expire before the extraction completes"
+        );
+        assert!(
+            extractor.seen.lock().unwrap().is_some(),
+            "the extraction must have started"
+        );
+        assert!(
+            wait_until_gone(&path).await,
+            "a cancelled extraction must not leak {}",
+            path.display()
+        );
+    }
+
+    /// #1429: `prepare_pinned` rides the same lifecycle, so a failed pin
+    /// write removes the workspace before the error is returned rather than
+    /// leaving it to the guard's background removal.
+    #[tokio::test]
+    async fn prepare_pinned_failure_removes_the_workspace_before_returning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact = test_helpers::make_test_artifact(
+            "rack-2.0.7.gem",
+            "application/octet-stream",
+            "rack-2.0.7.gem",
+        );
+        let content = Bytes::from_static(b"not a real gem");
+        let pin = ExpectedComponent::new(ComponentEcosystem::RubyGems, "rack", "2.0.7");
+
+        test_scan_job_suffix::fix("pinned-failure-job");
+        let path = ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), None, &artifact);
+        std::fs::create_dir_all(path.join(SCAN_PIN_SUBDIR).join(GEMFILE_LOCK_NAME))
+            .expect("obstruct the pin path");
+
+        let err = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await
+        .expect_err("the obstructed pin write must fail");
+        assert!(
+            err.to_string()
+                .contains("Failed to write scan component pin"),
+            "got: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "the workspace must be gone when the error is returned"
         );
     }
 

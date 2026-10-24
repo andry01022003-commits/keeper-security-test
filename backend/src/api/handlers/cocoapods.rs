@@ -396,6 +396,12 @@ async fn download_pod(
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
 
     let filename = pod_file.trim_start_matches('/');
+    // #4365 item 3 (#4109): on a proxying repository the file name is joined
+    // into the upstream path and keys the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
 
     // Parse the pod path to extract name and version
     let full_path = format!("pods/{}", filename);
@@ -425,6 +431,23 @@ async fn download_pod(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // #4109: scan-on-proxy routes the pod archive through the inline
+            // scan-and-block gate INSTEAD of the streaming paths below: the
+            // Remote arm when this repository scans, the Virtual walk when
+            // any Remote member scans. Repositories that have not opted in
+            // are unchanged.
+            if let Some(served) = serve_scanned_pod_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                filename,
+                (&path_info.name, &path_info.version),
+                &ctx,
+            )
+            .await?
+            {
+                return served;
+            }
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -868,6 +891,153 @@ fn build_cocoapods_metadata(podspec: &PodSpec, filename: &str) -> serde_json::Va
         "podspec": serde_json::to_value(podspec).unwrap_or_default(),
         "filename": filename,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy for pod archives (#4109, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied pod archive
+/// (#4365 item 1): every file on the pod route is a package, cached under
+/// the `pods/{file}` path the streaming arm commits to.
+fn pod_serve_key(filename: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!("pods/{filename}"))
+}
+
+/// The CocoaPods half of the generic gate: a pod archive must be the pod
+/// version the request names (#4109).
+struct PodArchive<'a> {
+    name: &'a str,
+    version: &'a str,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for PodArchive<'_> {
+    const LABEL: &'static str = "cocoapods pod archive";
+    const CONTENT_TYPE: &'static str = "application/octet-stream";
+
+    fn requested(&self) -> String {
+        format!("{} {}", self.name, self.version)
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        pod_archive_identity(self.name, self.version, bytes)
+    }
+}
+
+/// What a pod archive says about itself (#4109): the pod's own
+/// `{name}.podspec.json`, at the archive root or one directory down, must
+/// declare the requested name and version. The bundled scanner has no
+/// CocoaPods advisory data, so an archive that agrees is graded on its
+/// contents (a vendored package of an ecosystem it does grade).
+fn pod_archive_identity(
+    name: &str,
+    version: &str,
+    bytes: &Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{read_tar_gz_entry, ArchiveIdentity};
+    let spec_name = format!("{name}.podspec.json").to_ascii_lowercase();
+    let manifest = read_tar_gz_entry(bytes, |path| {
+        let path = path.strip_prefix("./").unwrap_or(path);
+        path.components().count() <= 2
+            && path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().to_ascii_lowercase() == spec_name)
+    });
+    let body = match manifest {
+        Ok(Some(body)) => body,
+        Ok(None) => return ArchiveIdentity::Unreadable(format!("no top-level {spec_name}")),
+        Err(e) => return ArchiveIdentity::Unreadable(e),
+    };
+    let Ok(spec) = serde_json::from_slice::<PodSpec>(&body) else {
+        return ArchiveIdentity::Unreadable("podspec.json does not parse".to_string());
+    };
+    if !spec.name.eq_ignore_ascii_case(name) || spec.version.trim() != version {
+        return ArchiveIdentity::Disagrees(format!(
+            "podspec declares {} {}",
+            spec.name, spec.version
+        ));
+    }
+    ArchiveIdentity::ContentGraded
+}
+
+/// Inline scan-and-block for one pod archive from one Remote repository
+/// (#4109).
+async fn serve_scanned_pod_archive(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    filename: &str,
+    (name, version): (&str, &str),
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let serve_key = pod_serve_key(filename);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: crate::models::repository::RepositoryFormat::Cocoapods,
+        source_path: &serve_key.cache_key,
+        cache_path: &serve_key.cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: PodArchive { name, version },
+        disposition: None,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of the pod route (#4109): `Ok(None)` when nothing
+/// scans, so the caller keeps its untouched path.
+async fn serve_scanned_pod_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    filename: &str,
+    (name, version): (&str, &str),
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let serve_key = pod_serve_key(filename);
+    let route = ScannedRoute {
+        upstream_path: &serve_key.cache_key,
+        lookup: LocalLookup::NameVersion { name, version },
+        default_content_type: "application/octet-stream",
+        virtual_disposition: None,
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        false,
+        ctx,
+        |(id, key, upstream_url), policy, _disposition| async move {
+            serve_scanned_pod_archive(
+                state,
+                proxy,
+                (id, &key, &upstream_url),
+                filename,
+                (name, version),
+                policy,
+                ctx,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -2065,5 +2235,158 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "5.8.0");
         assert_eq!(row.versions, vec!["5.8.0".to_string()]);
         assert_eq!(row.description.as_deref(), Some("elegant networking"));
+    }
+}
+
+/// #4109: scan-on-proxy on CocoaPods pod archives, Remote and Virtual,
+/// through the shared archive scenarios, plus the pod identity rule.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4109 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+
+    const FILE: &str = "DtfScanned-1.0.0.tar.gz";
+
+    fn tar_gz(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, data.as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn pod(name: &str, version: &str) -> Vec<u8> {
+        tar_gz(&[
+            (
+                &format!("{name}.podspec.json"),
+                serde_json::json!({
+                    "name": name,
+                    "version": version,
+                    "summary": uuid::Uuid::new_v4().to_string(),
+                })
+                .to_string(),
+            ),
+            ("Sources/Dtf.swift", "struct Dtf {}\n".to_string()),
+        ])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        ArchiveCase {
+            format: "cocoapods",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/pods/{FILE}")),
+            package_path: format!("/pods/{FILE}"),
+            extra: Vec::new(),
+            body: pod("DtfScanned", "1.0.0"),
+            recorded_path: format!("pods/{FILE}"),
+            file: FILE.to_string(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/pods/{FILE}%3Fx"),
+                format!("/{key}/pods/{FILE}%23x"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn a_pod_whose_podspec_is_the_request_is_graded() {
+        let bytes = Bytes::from(pod("DtfScanned", "1.0.0"));
+        assert_eq!(
+            pod_archive_identity("DtfScanned", "1.0.0", &bytes),
+            ArchiveIdentity::ContentGraded
+        );
+        let wrapped = Bytes::from(tar_gz(&[(
+            "DtfScanned-1.0.0/DtfScanned.podspec.json",
+            "{\"name\":\"DtfScanned\",\"version\":\"1.0.0\"}".to_string(),
+        )]));
+        assert_eq!(
+            pod_archive_identity("DtfScanned", "1.0.0", &wrapped),
+            ArchiveIdentity::ContentGraded
+        );
+    }
+
+    #[test]
+    fn a_pod_that_is_not_the_request_is_unestablished() {
+        assert!(matches!(
+            pod_archive_identity(
+                "DtfScanned",
+                "1.0.0",
+                &Bytes::from(pod("DtfScanned", "2.0.0"))
+            ),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        let deep = Bytes::from(tar_gz(&[(
+            "a/b/DtfScanned.podspec.json",
+            "{\"name\":\"DtfScanned\",\"version\":\"1.0.0\"}".to_string(),
+        )]));
+        for bytes in [
+            deep,
+            Bytes::from(pod("Other", "1.0.0")),
+            Bytes::from_static(b"not a tarball"),
+        ] {
+            assert!(matches!(
+                pod_archive_identity("DtfScanned", "1.0.0", &bytes),
+                ArchiveIdentity::Unreadable(_)
+            ));
+        }
+    }
+}
+
+/// #4365 item 1: CocoaPods decides by route (every pod archive is a
+/// package); the cache key is `pods/{file}`.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn pod_serve_key_table() {
+        let got = pod_serve_key("AFNetworking-2.5.1.tar.gz");
+        assert_eq!(got.cache_key, "pods/AFNetworking-2.5.1.tar.gz");
+        assert!(got.scannable);
     }
 }

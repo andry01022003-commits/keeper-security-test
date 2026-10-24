@@ -24,10 +24,12 @@
 //! wire path on purpose: it is exactly what would leave the process, and
 //! changing it later would silently change existing filters.
 //!
-//! Upstream contact made outside `ProxyService` is not filtered in this first
-//! slice: the npm `/-/` passthroughs (search, attestations, ping), npm audit,
-//! the curation upstream sync, change feeds and the admin `test-upstream`
-//! probe.
+//! Upstream contact made outside `ProxyService` is filtered where it names a
+//! path: the npm `/-/` passthroughs (search, attestations, ping, and the rest
+//! of the meta namespace) and npm audit apply the filter to the wire path they
+//! would send (`-/v1/search?text=...`, `-/npm/v1/security/advisories/bulk`)
+//! through [`upstream_allows`] since 1.12.0 (#840). Not filtered yet: the
+//! curation upstream sync, change feeds and the admin `test-upstream` probe.
 //!
 //! # Enforcement
 //!
@@ -429,6 +431,24 @@ pub async fn ensure_upstream_allowed(
         );
     }
     decision
+}
+
+/// [`ensure_upstream_allowed`] as a yes/no for callers that contact the
+/// upstream outside `ProxyService` (#840: the npm `/-/` passthroughs and npm
+/// audit). A refused path is `Ok(false)`; a failure to read the filter is an
+/// error, never an admission, as on the proxy path.
+pub async fn upstream_allows(
+    db: &PgPool,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+) -> Result<bool> {
+    match ensure_upstream_allowed(db, repo_id, repo_key, upstream_url, fetch_path).await {
+        Ok(()) => Ok(true),
+        Err(AppError::NotFound(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(ak_test_shard = "services-2")]

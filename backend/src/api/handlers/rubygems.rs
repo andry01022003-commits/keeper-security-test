@@ -220,6 +220,12 @@ async fn download_gem(
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
     let filename = gem_file.trim_start_matches('/');
+    // #4365 item 3 (#4104): on a proxying repository the file name is joined
+    // into the upstream path and keys the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[filename],
+    )?;
 
     let artifact =
         match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
@@ -257,6 +263,26 @@ async fn download_gem(
                     false
                 };
 
+                // #4104: scan-on-proxy routes the gem through the inline
+                // scan-and-block gate INSTEAD of the streaming path below:
+                // the Remote arm when this repository scans, the Virtual
+                // walk when any Remote member scans (stricter of virtual and
+                // member policy). The shadowing guard above already decided
+                // whether Remote members may serve at all; with the proxy
+                // suppressed none can, so no gate is owed.
+                if let Some(served) = serve_scanned_gem_download(
+                    &state,
+                    auth.as_ref(),
+                    &repo,
+                    filename,
+                    &ctx,
+                    suppress_upstream,
+                )
+                .await?
+                {
+                    return served;
+                }
+
                 if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
                     &state,
                     auth.as_ref(),
@@ -286,6 +312,139 @@ async fn download_gem(
         "application/octet-stream",
         Some(filename),
         &ctx,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy for `.gem` downloads (#4104, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied gem (#4365
+/// item 1): every file on the gem download route is a package, cached under
+/// the `gems/{file}` path the streaming arm commits to.
+fn gem_serve_key(filename: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&format!("gems/{filename}"))
+}
+
+/// The RubyGems half of the generic gate: a `.gem` must be the gem its file
+/// name names (#4104), the same `{name}-{version}.gem` coordinate the hosted
+/// pin uses (#3603).
+struct ProxiedGem;
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ProxiedGem {
+    const LABEL: &'static str = "rubygems gem";
+    const CONTENT_TYPE: &'static str = "application/octet-stream";
+
+    fn requested(&self) -> String {
+        "the gem file name's name and version".to_string()
+    }
+
+    fn identity(
+        &self,
+        filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        gem_identity(filename, bytes)
+    }
+}
+
+/// What a proxied `.gem` says about itself (#4104). The coordinate comes
+/// from the REQUESTED file name (`{name}-{version}(-{platform}).gem`) and
+/// must be the one the gem's own `metadata.gz` gemspec declares; it is then
+/// the scan's pin (`Gemfile.lock`, #3603), so the engine must grade exactly
+/// that gem. A file name that is not a gem coordinate, bytes that are not a
+/// readable gem, or a gemspec naming another gem are not the gem requested.
+fn gem_identity(
+    filename: &str,
+    bytes: &Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+    use crate::services::scanner_service::{hosted_upload_pin, pin_agrees_with_content};
+    let Some((name, version)) = crate::formats::rubygems::coordinates_from_gem_filename(filename)
+    else {
+        return ArchiveIdentity::Unreadable("file name is not a gem coordinate".to_string());
+    };
+    match hosted_upload_pin("rubygems", filename, &name, Some(&version)) {
+        Some(pin) if pin_agrees_with_content(bytes, &pin, filename) => ArchiveIdentity::Pinned(pin),
+        Some(_) => {
+            ArchiveIdentity::Disagrees(format!("the gemspec does not declare {name} {version}"))
+        }
+        None => ArchiveIdentity::Unreadable(format!("{name} {version} cannot be pinned")),
+    }
+}
+
+/// Inline scan-and-block for one `.gem` from one Remote repository (#4104).
+async fn serve_scanned_gem(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    filename: &str,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    disposition: Option<&str>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let serve_key = gem_serve_key(filename);
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Rubygems,
+        source_path: &serve_key.cache_key,
+        cache_path: &serve_key.cache_key,
+        filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: ProxiedGem,
+        disposition,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The scan-on-proxy arms of the gem download route (#4104): `Ok(None)` when
+/// nothing scans, so the caller keeps its untouched streaming path (see
+/// [`crate::api::handlers::proxy_scan_archive::serve_scanned_package_download`]).
+async fn serve_scanned_gem_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    suppress_upstream: bool,
+) -> Result<Option<Result<Response, Response>>, Response> {
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    let serve_key = gem_serve_key(filename);
+    let route = crate::api::handlers::proxy_scan_archive::ScannedRoute {
+        upstream_path: &serve_key.cache_key,
+        lookup: crate::api::handlers::proxy_scan_archive::LocalLookup::PathSuffix(filename),
+        default_content_type: "application/octet-stream",
+        virtual_disposition: Some(filename),
+    };
+    crate::api::handlers::proxy_scan_archive::serve_scanned_package_download(
+        state,
+        auth,
+        repo,
+        route,
+        suppress_upstream,
+        ctx,
+        |(id, key, upstream_url), policy, disposition| async move {
+            serve_scanned_gem(
+                state,
+                proxy,
+                (id, &key, &upstream_url),
+                filename,
+                policy,
+                disposition.as_deref(),
+                ctx,
+            )
+            .await
+        },
     )
     .await
 }
@@ -2975,5 +3134,155 @@ mod db_cov_tests {
         .await;
         rig.cleanup(&fx.pool).await;
         fx.teardown().await;
+    }
+}
+
+/// #4104: scan-on-proxy on `.gem` downloads, Remote and Virtual, through the
+/// shared archive scenarios, plus the gem identity rule.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod scan_on_proxy_4104 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
+
+    const FILE: &str = "dtf-scanned-1.0.0.gem";
+
+    /// A real `.gem` (plain tar with a gzipped gemspec `metadata.gz`) whose
+    /// gemspec declares `name` `version`. The random summary keeps every
+    /// fixture's digest unique.
+    fn gem(name: &str, version: &str) -> Vec<u8> {
+        let yaml = format!(
+            "--- !ruby/object:Gem::Specification\nname: {name}\nversion: !ruby/object:Gem::Version\n  version: {version}\nsummary: {}\n",
+            uuid::Uuid::new_v4()
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, yaml.as_bytes()).unwrap();
+        let metadata_gz = gz.finish().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("metadata.gz").unwrap();
+        header.set_size(metadata_gz.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &metadata_gz[..]).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        ArchiveCase {
+            format: "rubygems",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/gems/{FILE}")),
+            package_path: format!("/gems/{FILE}"),
+            extra: Vec::new(),
+            body: gem("dtf-scanned", "1.0.0"),
+            recorded_path: format!("gems/{FILE}"),
+            file: FILE.to_string(),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/gems/{FILE}%3Fx"),
+                format!("/{key}/gems/{FILE}%23x"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn a_gem_that_declares_its_file_name_is_pinned_as_itself() {
+        let bytes = Bytes::from(gem("dtf-scanned", "1.0.0"));
+        match gem_identity(FILE, &bytes) {
+            ArchiveIdentity::Pinned(pin) => {
+                assert_eq!(
+                    (pin.name.as_str(), pin.version.as_str()),
+                    ("dtf-scanned", "1.0.0")
+                );
+            }
+            other => panic!("expected a pin, got {other:?}"),
+        }
+        // A platform gem declares the bare version; the platform suffix is
+        // not part of the coordinate.
+        let native = Bytes::from(gem("dtf-native", "1.10.0"));
+        assert!(matches!(
+            gem_identity("dtf-native-1.10.0-x86_64-linux.gem", &native),
+            ArchiveIdentity::Pinned(_)
+        ));
+    }
+
+    #[test]
+    fn a_gem_that_is_not_its_file_name_is_unestablished() {
+        let liar = Bytes::from(gem("dtf-scanned", "0.9.0"));
+        assert!(matches!(
+            gem_identity(FILE, &liar),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        let other = Bytes::from(gem("rack", "1.0.0"));
+        assert!(matches!(
+            gem_identity(FILE, &other),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        assert!(matches!(
+            gem_identity(FILE, &Bytes::from_static(b"not a gem")),
+            ArchiveIdentity::Disagrees(_) | ArchiveIdentity::Unreadable(_)
+        ));
+        assert!(matches!(
+            gem_identity("README", &liar),
+            ArchiveIdentity::Unreadable(_)
+        ));
+    }
+}
+
+/// #4365 item 1: RubyGems decides by route (every file on the gem download
+/// route is a package); the cache key is `gems/{file}`.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn gem_serve_key_table() {
+        for (file, key) in [
+            ("rack-2.0.7.gem", "gems/rack-2.0.7.gem"),
+            (
+                "nokogiri-1.10.0-x86_64-linux.gem",
+                "gems/nokogiri-1.10.0-x86_64-linux.gem",
+            ),
+        ] {
+            let got = gem_serve_key(file);
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
+        }
     }
 }

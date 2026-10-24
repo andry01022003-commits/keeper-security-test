@@ -112,13 +112,15 @@ impl HttpPopularitySource {
     }
 
     async fn fetch_json(&self, url: &str) -> Option<serde_json::Value> {
-        let resp = match self.client.get(url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(url, error = %e, "popularity lookup failed");
-                return None;
-            }
-        };
+        // Through `send_upstream` (#3954), like every other upstream call.
+        let resp =
+            match crate::services::upstream_tracing::send_upstream(self.client.get(url)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(url, error = %e, "popularity lookup failed");
+                    return None;
+                }
+            };
         if !resp.status().is_success() {
             tracing::debug!(url, status = %resp.status(), "popularity lookup non-success");
             return None;
@@ -480,6 +482,43 @@ mod tests {
         assert_eq!(
             source.downloads("npm", "lodash").await,
             PopularityResult::Unknown
+        );
+    }
+
+    /// #3954: a popularity lookup goes through `send_upstream`, so it exports
+    /// a `CLIENT` span with an integer status. Before, it used a bare
+    /// `.send()` and exported no span.
+    #[tokio::test]
+    async fn lookup_exports_a_client_span_3954() {
+        use crate::services::upstream_tracing::exported_upstream_client_spans;
+        use crate::testing::otel::{otel_subscriber, ExportedSpans};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/downloads/point/last-month/lodash"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"downloads": 42})),
+            )
+            .mount(&server)
+            .await;
+        let source = HttpPopularitySource::new().with_base_urls(&server.uri(), &server.uri());
+
+        let exported = ExportedSpans::default();
+        let result = {
+            let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+            source.downloads("npm", "lodash").await
+        };
+
+        assert_eq!(result, PopularityResult::Known(42));
+        assert_eq!(
+            exported_upstream_client_spans(&exported, "GET"),
+            vec![(
+                "GET".to_string(),
+                format!("{}/downloads/point/last-month/lodash", server.uri()),
+                200
+            )]
         );
     }
 }

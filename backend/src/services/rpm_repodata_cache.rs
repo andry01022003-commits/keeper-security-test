@@ -56,21 +56,27 @@
 //! oldest-render-first. Each repository/root keeps at most
 //! [`RPM_REPODATA_CACHE_MAX_MEMBER_SETS`] member sets (a hosted repository has
 //! exactly one), so the worst case is still `MAX_ENTRIES` rendered sets and one
-//! virtual cannot crowd every other root out of the cache. Follow-ups tracked on
-//! #2521: a durable cross-replica object store for prebuilt revisions and the
+//! virtual cannot crowd every other root out of the cache. The mechanism
+//! (fingerprint check, single-flight, bounds, metrics) lives in the
+//! format-agnostic [`super::repo_metadata_revision_cache`] (#4174); this
+//! module keeps the RPM types and limits. Follow-ups tracked on #2521 and
+//! #4544: a durable cross-replica object store for prebuilt revisions and the
 //! same treatment for the PyPI/Helm/Composer root indexes.
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+
+use super::repo_metadata_revision_cache::{
+    CachedRender, Fingerprint, RepoMetadataRevisionCache, RevisionCacheConfig,
+};
 
 /// Soft cap on cached roots. Each repository/root holds exactly one entry
 /// (its current revision), so this bounds the number of distinct RPM roots
@@ -91,24 +97,27 @@ pub const RPM_REPODATA_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// sets re-renders rather than evicting other repositories.
 pub const RPM_REPODATA_CACHE_MAX_MEMBER_SETS: usize = 4;
 
-/// Cache key: serving repository id, relative metadata root, and the sorted
-/// authorized member-id set the render describes (#4346).
-type CacheKey = (Uuid, String, Vec<Uuid>);
-
 /// Identity of the repository state a rendered set was built from.
 ///
-/// * `repo_ids` — the sorted set of repositories the render covers (one id
+/// * `repo_ids`: the sorted set of repositories the render covers (one id
 ///   for hosted repos, the member ids for virtual repos), so a virtual
 ///   membership change rotates the fingerprint even when counts collide.
-/// * `live_rpm_count` — live `.rpm` rows across `repo_ids`; moves on upload,
+///   It is also the cache partition (#4346).
+/// * `live_rpm_count`: live `.rpm` rows across `repo_ids`; moves on upload,
 ///   delete and promotion.
-/// * `latest_update` — `MAX(updated_at)` over those rows; moves on upload
+/// * `latest_update`: `MAX(updated_at)` over those rows; moves on upload
 ///   and on any row-touching mutation. `None` for an empty repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepodataFingerprint {
     pub repo_ids: Vec<Uuid>,
     pub live_rpm_count: i64,
     pub latest_update: Option<DateTime<Utc>>,
+}
+
+impl Fingerprint for RepodataFingerprint {
+    fn partition(&self) -> Vec<Uuid> {
+        self.repo_ids.clone()
+    }
 }
 
 /// One immutable rendered repodata set: the manifest plus the compressed
@@ -141,10 +150,18 @@ impl RenderedRepodata {
     }
 }
 
-struct CacheEntry {
-    fingerprint: RepodataFingerprint,
-    rendered: Arc<RenderedRepodata>,
-    rendered_at: Instant,
+impl CachedRender for RenderedRepodata {
+    fn weight_bytes(&self) -> usize {
+        self.total_bytes()
+    }
+
+    fn cacheable(&self) -> bool {
+        self.cacheable
+    }
+
+    fn valid_until(&self) -> Option<Instant> {
+        self.valid_until
+    }
 }
 
 /// How long an incomplete (non-`cacheable`) render is served before the
@@ -154,20 +171,10 @@ struct CacheEntry {
 pub const INCOMPLETE_RENDER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Fingerprint-validated, single-flight cache of rendered RPM repodata sets,
-/// keyed by the serving repository's id, relative metadata root and the
-/// caller-authorized member set (#4346).
-pub struct RpmRepodataCache {
-    entries: RwLock<HashMap<CacheKey, CacheEntry>>,
-    /// Fixed stripes bound lock memory even for concurrent arbitrary empty roots.
-    /// A repository/root always selects the same stripe, whatever the member
-    /// set (#4346); collisions only serialize.
-    render_locks: Vec<Mutex<()>>,
-    /// Number of full renders performed. Observability + the test hook that
-    /// proves warm requests do not rebuild.
-    renders: AtomicU64,
-    max_entries: usize,
-    max_bytes: usize,
-}
+/// keyed by the serving repository's id, relative metadata root (the scope)
+/// and the caller-authorized member set (the partition, #4346). The
+/// mechanism is the shared [`RepoMetadataRevisionCache`] (#4174).
+pub type RpmRepodataCache = RepoMetadataRevisionCache<RepodataFingerprint, RenderedRepodata>;
 
 impl Default for RpmRepodataCache {
     fn default() -> Self {
@@ -181,20 +188,15 @@ impl RpmRepodataCache {
     }
 
     pub fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
-        Self {
-            entries: RwLock::new(HashMap::new()),
-            render_locks: (0..RPM_REPODATA_CACHE_MAX_ENTRIES)
-                .map(|_| Mutex::new(()))
-                .collect(),
-            renders: AtomicU64::new(0),
-            max_entries: max_entries.max(1),
+        Self::with_config(RevisionCacheConfig {
+            format: "rpm",
+            scope_kind: "root",
+            max_entries,
             max_bytes,
-        }
-    }
-
-    /// Total full renders performed since startup.
-    pub fn renders(&self) -> u64 {
-        self.renders.load(Ordering::Relaxed)
+            max_partitions_per_scope: RPM_REPODATA_CACHE_MAX_MEMBER_SETS,
+            lock_stripes: RPM_REPODATA_CACHE_MAX_ENTRIES,
+            incomplete_ttl: INCOMPLETE_RENDER_TTL,
+        })
     }
 
     /// The cached set for `repo_id`, but only when it was rendered from
@@ -213,19 +215,7 @@ impl RpmRepodataCache {
         root: &str,
         fingerprint: &RepodataFingerprint,
     ) -> Option<Arc<RenderedRepodata>> {
-        let entries = self.entries.read().await;
-        let entry = entries.get(&(repo_id, root.to_owned(), fingerprint.repo_ids.clone()))?;
-        let fresh = (entry.rendered.cacheable
-            || entry.rendered_at.elapsed() < INCOMPLETE_RENDER_TTL)
-            && entry
-                .rendered
-                .valid_until
-                .is_none_or(|t| Instant::now() < t);
-        if entry.fingerprint == *fingerprint && fresh {
-            Some(entry.rendered.clone())
-        } else {
-            None
-        }
+        self.lookup_scoped(repo_id, root, fingerprint).await
     }
 
     /// Serve the set for `(repo_id, fingerprint)`, rendering at most once per
@@ -261,87 +251,8 @@ impl RpmRepodataCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<RenderedRepodata, E>>,
     {
-        if let Some(hit) = self.lookup_at(repo_id, root, &fingerprint).await {
-            return Ok(hit);
-        }
-        let key = (repo_id, root.to_owned(), fingerprint.repo_ids.clone());
-        let lock = self.render_lock(repo_id, root);
-        let _guard = lock.lock().await;
-        // Re-check: the leader that held the lock may have rendered exactly
-        // this state while we waited.
-        if let Some(hit) = self.lookup_at(repo_id, root, &fingerprint).await {
-            return Ok(hit);
-        }
-        let rendered = Arc::new(render().await?);
-        self.renders.fetch_add(1, Ordering::Relaxed);
-        self.insert(key, fingerprint, rendered.clone()).await;
-        Ok(rendered)
-    }
-
-    /// The single-flight lock for a repository/root. Deliberately NOT keyed
-    /// by the member set (#4346): renders of different member sets of one
-    /// root serialize, so a caller who can vary its authorized set (e.g. by
-    /// minting repository-scoped tokens) cannot drive concurrent full renders
-    /// of one repository.
-    fn render_lock(&self, repo_id: Uuid, root: &str) -> &Mutex<()> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (repo_id, root).hash(&mut hasher);
-        &self.render_locks[hasher.finish() as usize % self.render_locks.len()]
-    }
-
-    async fn insert(
-        &self,
-        key: CacheKey,
-        fingerprint: RepodataFingerprint,
-        rendered: Arc<RenderedRepodata>,
-    ) {
-        let mut entries = self.entries.write().await;
-        // Per-root member-set cap (#4346): evict the oldest other member set
-        // of this repository/root before adding a new one.
-        loop {
-            let same_root: Vec<(&CacheKey, &CacheEntry)> = entries
-                .iter()
-                .filter(|(k, _)| k.0 == key.0 && k.1 == key.1 && k.2 != key.2)
-                .collect();
-            if same_root.len() < RPM_REPODATA_CACHE_MAX_MEMBER_SETS {
-                break;
-            }
-            let Some(oldest) = same_root
-                .iter()
-                .max_by_key(|(_, e)| e.rendered_at.elapsed())
-                .map(|(k, _)| (*k).clone())
-            else {
-                break;
-            };
-            entries.remove(&oldest);
-        }
-        entries.insert(
-            key,
-            CacheEntry {
-                fingerprint,
-                rendered,
-                rendered_at: Instant::now(),
-            },
-        );
-        // Enforce the entry cap and the byte budget, oldest render first. The
-        // just-inserted entry is the newest, so it survives unless it is the
-        // only one left — a single over-budget repository still gets cached.
-        loop {
-            let over_entries = entries.len() > self.max_entries;
-            let total: usize = entries.values().map(|e| e.rendered.total_bytes()).sum();
-            let over_bytes = total > self.max_bytes && entries.len() > 1;
-            if !over_entries && !over_bytes {
-                break;
-            }
-            let Some(oldest) = entries
-                .iter()
-                .max_by_key(|(_, e)| e.rendered_at.elapsed())
-                .map(|(id, _)| id.clone())
-            else {
-                break;
-            };
-            entries.remove(&oldest);
-        }
+        self.get_or_render_scoped(repo_id, root, fingerprint, render)
+            .await
     }
 }
 
@@ -807,6 +718,82 @@ mod tests {
             max_in_flight.load(Ordering::SeqCst),
             1,
             "renders of one root must not overlap across member sets"
+        );
+    }
+
+    /// The RPM cache reports through the shared revision-cache metrics
+    /// (#4174): a burst of cold requests for one root state is one
+    /// `ak_repo_metadata_regenerations_total{format="rpm",scope="root"}`
+    /// sample, and the repeat request is a hit.
+    #[tokio::test]
+    async fn rpm_renders_report_shared_regeneration_metric_4174() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let cache = Arc::new(RpmRepodataCache::new());
+        let repo = Uuid::new_v4();
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    cache
+                        .get_or_render_at::<(), _, _>(
+                            repo,
+                            "el9",
+                            fp(3, 100, vec![repo]),
+                            || async {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                Ok(rendered("v1"))
+                            },
+                        )
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        cache
+            .get_or_render_at::<(), _, _>(repo, "el9", fp(3, 100, vec![repo]), || async {
+                Ok(rendered("v2"))
+            })
+            .await
+            .unwrap();
+
+        // One snapshot: a `DebuggingRecorder` snapshot resets counters.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counter = |name: &str, label: (&str, &str)| -> u64 {
+            snapshot
+                .iter()
+                .filter(|(key, ..)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "format" && l.value() == "rpm")
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == label.0 && l.value() == label.1)
+                })
+                .map(|(.., value)| match value {
+                    DebugValue::Counter(n) => *n,
+                    other => panic!("expected a counter, got {other:?}"),
+                })
+                .sum()
+        };
+        assert_eq!(
+            counter("ak_repo_metadata_regenerations_total", ("scope", "root")),
+            1,
+            "20 cold requests for one state are one regeneration"
+        );
+        assert_eq!(
+            counter("ak_repo_metadata_cache_requests_total", ("result", "hit")),
+            1
         );
     }
 }

@@ -969,6 +969,19 @@ async fn repodata_repo_ids(
     Ok(ids)
 }
 
+/// The rows a repodata render describes, in its deterministic total order
+/// (#2636). `$1` is the repository id set, `$2` the root prefix.
+const REPODATA_ARTIFACTS_SQL: &str = r#"
+        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.storage_key, a.updated_at, am.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = ANY($1) AND a.is_deleted = false
+          AND a.path LIKE '%.rpm'
+          AND starts_with(a.path, $2)
+        ORDER BY a.name, a.version, a.path, a.id
+        "#;
+
 /// Collect the RPM artifacts a repodata response should describe, in a
 /// deterministic total order (`ORDER BY name, version, path, id`) so
 /// unchanged state always renders byte-identical documents (#2636).
@@ -980,28 +993,18 @@ async fn collect_repodata_artifacts(
     collect_repodata_artifacts_at(db, repo_ids, "").await
 }
 
+#[cfg(test)]
 async fn collect_repodata_artifacts_at(
     db: &sqlx::PgPool,
     repo_ids: &[uuid::Uuid],
     prefix: &str,
 ) -> Result<Vec<RpmArtifact>, Response> {
-    sqlx::query_as::<_, RpmArtifact>(
-        r#"
-        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.storage_key, a.updated_at, am.metadata
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = ANY($1) AND a.is_deleted = false
-          AND a.path LIKE '%.rpm'
-          AND starts_with(a.path, $2)
-        ORDER BY a.name, a.version, a.path, a.id
-        "#,
-    )
-    .bind(repo_ids)
-    .bind(prefix)
-    .fetch_all(db)
-    .await
-    .map_err(super::db_err)
+    sqlx::query_as::<_, RpmArtifact>(REPODATA_ARTIFACTS_SQL)
+        .bind(repo_ids)
+        .bind(prefix)
+        .fetch_all(db)
+        .await
+        .map_err(super::db_err)
 }
 
 /// The current [`RepodataFingerprint`] for `repo_ids`: one aggregate query
@@ -1088,29 +1091,188 @@ async fn cached_repodata_at(
     state
         .rpm_repodata_cache
         .get_or_render_at(repo.id, root, fingerprint, || async move {
-            let mut artifacts =
-                collect_repodata_artifacts_at(&render_state.db, &ids, &prefix).await?;
-            let heal_complete = heal_rpm_repodata_info(&render_state, &mut artifacts).await;
-            let valid_until = earliest_retry_deadline(&artifacts);
-            let mut rendered =
-                tokio::task::spawn_blocking(move || render_repodata_at(&artifacts, &prefix))
-                    .await
-                    .map_err(|e| {
-                        error!(error = %e, "RPM repodata render task failed");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to render repository metadata",
-                        )
-                            .into_response()
-                    })?;
-            // A render missing some packages' dependency data (transient heal
-            // failure) is served but not cached: the fingerprint would not
-            // move again, so caching it would pin the gap (#3801).
-            rendered.cacheable = heal_complete;
-            rendered.valid_until = valid_until;
-            Ok(rendered)
+            render_repodata_streamed(
+                &render_state,
+                &ids,
+                &prefix,
+                RPM_REPODATA_RENDER_BATCH_BYTES,
+            )
+            .await
+            .map(|(rendered, _)| rendered)
         })
         .await
+}
+
+/// Metadata JSON held in memory at once by a repodata render (#4544). Rows
+/// stream from one consistent snapshot and are rendered in batches of about
+/// this many bytes of metadata, so peak memory follows the batch, not the
+/// root: a root of 2,500 packages with 2.5 GB of file-list metadata used to
+/// load all of it (plus every uncompressed document) before the first byte
+/// was gzipped. A single package larger than the budget is its own batch.
+const RPM_REPODATA_RENDER_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// What a streamed render did, for tests and the render log line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RenderStats {
+    packages: usize,
+    batches: usize,
+    /// Largest batch by estimated metadata bytes.
+    max_batch_bytes: usize,
+    /// Most rows in one batch.
+    max_batch_rows: usize,
+}
+
+/// Render the repodata set for the live `.rpm` rows of `repo_ids` under
+/// `prefix` without holding the whole catalogue in memory (#4544).
+///
+/// One `REPEATABLE READ` read-only transaction gives the count (the
+/// `packages=` attribute every document opens with) and the row stream the
+/// same snapshot, so the documents agree with each other exactly as the
+/// single-query render did. Rows are accumulated until `batch_bytes` of
+/// metadata, then healed (#3801), appended to the three gzip streams off the
+/// async runtime and dropped. The bytes are identical to
+/// [`render_repodata_at`] over the same rows, and the uncompressed documents
+/// to the ones the whole-catalogue render built.
+///
+/// The transaction stays open for the whole render, heal included, so on a
+/// large root it holds back the vacuum horizon (its snapshot xmin) for that
+/// long, like any long-running read. It is read-only and takes no row locks;
+/// rows changed meanwhile are reclaimed by the first vacuum after it ends.
+async fn render_repodata_streamed(
+    state: &SharedState,
+    repo_ids: &[uuid::Uuid],
+    prefix: &str,
+    batch_bytes: usize,
+) -> Result<(RenderedRepodata, RenderStats), Response> {
+    use futures::TryStreamExt;
+
+    let render_failed = |e: tokio::task::JoinError| {
+        error!(error = %e, "RPM repodata render task failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to render repository metadata",
+        )
+            .into_response()
+    };
+
+    let mut tx = state.db.begin().await.map_err(super::db_err)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(super::db_err)?;
+    let (count,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM artifacts a
+        WHERE a.repository_id = ANY($1) AND a.is_deleted = false
+          AND a.path LIKE '%.rpm'
+          AND starts_with(a.path, $2)
+        "#,
+    )
+    .bind(repo_ids)
+    .bind(prefix)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(super::db_err)?;
+
+    let mut writer = Some(RepodataWriter::new(
+        usize::try_from(count).unwrap_or(0),
+        prefix,
+    ));
+    let mut stats = RenderStats::default();
+    let mut heal_complete = true;
+    let mut valid_until: Option<std::time::Instant> = None;
+    let mut batch: Vec<RpmArtifact> = Vec::new();
+    let mut held = 0usize;
+    {
+        let mut rows = sqlx::query_as::<_, RpmArtifact>(REPODATA_ARTIFACTS_SQL)
+            .bind(repo_ids)
+            .bind(prefix)
+            .fetch(&mut *tx);
+        loop {
+            let row = rows.try_next().await.map_err(super::db_err)?;
+            let done = row.is_none();
+            if let Some(row) = row {
+                held += row.metadata.as_ref().map_or(0, json_weight);
+                batch.push(row);
+            }
+            if batch.is_empty() {
+                // Only reachable at the end of the stream.
+                break;
+            }
+            if !done && held < batch_bytes {
+                continue;
+            }
+            let mut rows_now = std::mem::take(&mut batch);
+            stats.batches += 1;
+            stats.packages += rows_now.len();
+            stats.max_batch_bytes = stats.max_batch_bytes.max(held);
+            stats.max_batch_rows = stats.max_batch_rows.max(rows_now.len());
+            held = 0;
+            heal_complete &= heal_rpm_repodata_info(state, &mut rows_now).await;
+            valid_until = match (valid_until, earliest_retry_deadline(&rows_now)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let mut w = writer.take().expect("writer present between batches");
+            writer = Some(
+                tokio::task::spawn_blocking(move || {
+                    w.push_batch(&rows_now);
+                    w
+                })
+                .await
+                .map_err(render_failed)?,
+            );
+            if done {
+                break;
+            }
+        }
+    }
+    // Read-only: ending the transaction releases the snapshot.
+    let _ = tx.rollback().await;
+    if i64::try_from(stats.packages).ok() != Some(count) {
+        // One snapshot answers both queries, so this cannot happen; if it
+        // ever does, refuse the render rather than serve documents whose
+        // `packages=` disagrees with their contents.
+        error!(
+            counted = count,
+            streamed = stats.packages,
+            "RPM repodata render: row count changed within one snapshot"
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to render repository metadata",
+        )
+            .into_response());
+    }
+
+    let w = writer.take().expect("writer present after the last batch");
+    let mut rendered = tokio::task::spawn_blocking(move || w.finish())
+        .await
+        .map_err(render_failed)?;
+    // A render missing some packages' dependency data (transient heal
+    // failure) is served but not cached: the fingerprint would not move
+    // again, so caching it would pin the gap (#3801).
+    rendered.cacheable = heal_complete;
+    rendered.valid_until = valid_until;
+    Ok((rendered, stats))
+}
+
+/// Approximate in-memory weight of a metadata document: its string and key
+/// bytes plus a fixed cost per value. Only used to size render batches.
+fn json_weight(value: &serde_json::Value) -> usize {
+    const NODE: usize = 16;
+    match value {
+        serde_json::Value::String(s) => NODE + s.len(),
+        serde_json::Value::Array(items) => NODE + items.iter().map(json_weight).sum::<usize>(),
+        serde_json::Value::Object(map) => {
+            NODE + map
+                .iter()
+                .map(|(k, v)| k.len() + json_weight(v))
+                .sum::<usize>()
+        }
+        _ => NODE,
+    }
 }
 
 /// Whether a render of `root` may take a slot in the shared, bounded
@@ -1558,47 +1720,207 @@ fn render_repodata(artifacts: &[RpmArtifact]) -> RenderedRepodata {
 }
 
 fn render_repodata_at(artifacts: &[RpmArtifact], prefix: &str) -> RenderedRepodata {
-    // Generate primary.xml content and compute both the compressed (gzipped)
-    // and uncompressed (open) sha256 + sizes. DNF/createrepo clients expect a
-    // top-level <revision> plus per-<data> <open-checksum>/<open-size> elements
-    // (#1780); omitting them causes stricter clients to reject the metadata.
-    // The stored repodata blocks are deserialized once per render and shared
-    // by the three generators.
-    let infos = repodata_infos(artifacts);
-    let primary_xml = generate_primary_xml_with(artifacts, &infos, prefix);
-    let primary_open_sha256 = sha256_hex(primary_xml.as_bytes());
-    let primary_open_size = primary_xml.len();
-    let primary_gz = gzip_bytes(primary_xml.as_bytes());
-    let primary_sha256 = sha256_hex(&primary_gz);
+    let mut writer = RepodataWriter::new(artifacts.len(), prefix);
+    writer.push_batch(artifacts);
+    writer.finish()
+}
 
-    let filelists_xml = generate_filelists_xml_with(artifacts, &infos);
-    let filelists_open_sha256 = sha256_hex(filelists_xml.as_bytes());
-    let filelists_open_size = filelists_xml.len();
-    let filelists_gz = gzip_bytes(filelists_xml.as_bytes());
-    let filelists_sha256 = sha256_hex(&filelists_gz);
+/// Uncompressed bytes a document buffers before it starts compressing
+/// (#4544). A document that stays under this is gzipped in one call, exactly
+/// as the whole-catalogue render did, so typical repositories keep
+/// byte-identical compressed files across the upgrade (and across replicas
+/// of mixed versions during a rolling one). Past it the buffer is handed to
+/// the encoder and later writes stream through: the zlib-rs backend's output
+/// depends on how its input is split, so a document that large gets new
+/// (still deterministic) compressed bytes, which only the repositories that
+/// could not render before reach.
+const RPM_REPODATA_DOC_SPILL_BYTES: usize = 32 * 1024 * 1024;
 
-    let other_xml = generate_other_xml_with(artifacts, &infos);
-    let other_open_sha256 = sha256_hex(other_xml.as_bytes());
-    let other_open_size = other_xml.len();
-    let other_gz = gzip_bytes(other_xml.as_bytes());
-    let other_sha256 = sha256_hex(&other_gz);
+/// One compressed index document being written: the uncompressed bytes
+/// buffered so far (up to [`RPM_REPODATA_DOC_SPILL_BYTES`]) or the gzip
+/// stream they spilled into, plus the running checksum and size of the
+/// uncompressed (open) bytes. A render therefore never materialises a large
+/// uncompressed document (#4544).
+struct XmlDocStream {
+    pending: Vec<u8>,
+    gz: Option<GzEncoder<Vec<u8>>>,
+    open_sha256: Sha256,
+    open_size: usize,
+    spill_bytes: usize,
+}
 
-    let updateinfo_xml = generate_updateinfo_xml();
-    let updateinfo_open_sha256 = sha256_hex(updateinfo_xml.as_bytes());
-    let updateinfo_open_size = updateinfo_xml.len();
-    let updateinfo_gz = gzip_bytes(updateinfo_xml.as_bytes());
-    let updateinfo_sha256 = sha256_hex(&updateinfo_gz);
+/// A finished [`XmlDocStream`]: the gzipped bytes and the four values
+/// `repomd.xml` advertises for them.
+struct FinishedDoc {
+    gz: Vec<u8>,
+    sha256: String,
+    open_sha256: String,
+    open_size: usize,
+}
 
-    // #2636: the metadata epoch is derived from repository *state*, never from
-    // the clock. `repomd.xml` and `repomd.xml.asc` render this document
-    // independently, one request apart, and the client verifies the signature
-    // from the second render against the bytes of the first. A `now()` here
-    // makes those two renders disagree whenever the requests straddle a second
-    // boundary — a BAD signature on a repo nobody touched. See the
-    // `metadata_epoch` module docs; Debian's `Release`/`Release.gpg` pair has
-    // the same defect (#2652).
-    let timestamp = metadata_epoch(artifacts.iter().map(|a| a.updated_at)).timestamp();
+impl XmlDocStream {
+    fn new(spill_bytes: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            gz: None,
+            open_sha256: Sha256::new(),
+            open_size: 0,
+            spill_bytes,
+        }
+    }
 
+    fn write(&mut self, xml: &str) {
+        self.open_sha256.update(xml.as_bytes());
+        self.open_size += xml.len();
+        match self.gz.as_mut() {
+            Some(gz) => gz.write_all(xml.as_bytes()).expect("gzip write failed"),
+            None => {
+                self.pending.extend_from_slice(xml.as_bytes());
+                if self.pending.len() > self.spill_bytes {
+                    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+                    gz.write_all(&self.pending).expect("gzip write failed");
+                    self.pending = Vec::new();
+                    self.gz = Some(gz);
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> FinishedDoc {
+        let gz = match self.gz {
+            Some(gz) => gz.finish().expect("gzip finish failed"),
+            None => gzip_bytes(&self.pending),
+        };
+        FinishedDoc {
+            sha256: sha256_hex(&gz),
+            open_sha256: format!("{:x}", self.open_sha256.finalize()),
+            open_size: self.open_size,
+            gz,
+        }
+    }
+}
+
+/// Incremental writer for one repodata set (#4544). The package count is
+/// fixed up front (it is the `packages=` attribute of each document's
+/// opening element); packages are then appended in batches, each document
+/// gzipped and hashed as it grows, and [`RepodataWriter::finish`] closes the
+/// documents and builds the `repomd.xml` that describes them. Every package
+/// is one write to each document whatever the batching, so the output is a
+/// pure function of the rows (#2636); the uncompressed documents are exactly
+/// what the whole-slice generators build, and a document under
+/// [`RPM_REPODATA_DOC_SPILL_BYTES`] compresses to exactly the same bytes.
+struct RepodataWriter {
+    prefix: String,
+    primary: XmlDocStream,
+    filelists: XmlDocStream,
+    other: XmlDocStream,
+    /// Most recent `updated_at` seen: the metadata epoch (#2636).
+    latest_update: Option<chrono::DateTime<chrono::Utc>>,
+    /// Scratch buffer reused for each package's elements.
+    scratch: String,
+}
+
+impl RepodataWriter {
+    fn new(packages: usize, prefix: &str) -> Self {
+        Self::with_spill(packages, prefix, RPM_REPODATA_DOC_SPILL_BYTES)
+    }
+
+    fn with_spill(packages: usize, prefix: &str, spill_bytes: usize) -> Self {
+        let mut writer = Self {
+            prefix: prefix.to_string(),
+            primary: XmlDocStream::new(spill_bytes),
+            filelists: XmlDocStream::new(spill_bytes),
+            other: XmlDocStream::new(spill_bytes),
+            latest_update: None,
+            scratch: String::new(),
+        };
+        writer.primary.write(&primary_xml_header(packages));
+        writer.filelists.write(&filelists_xml_header(packages));
+        writer.other.write(&other_xml_header(packages));
+        writer
+    }
+
+    /// Append `artifacts` (already in the render order) to all three
+    /// documents. The stored repodata blocks are deserialized once per
+    /// batch and shared by the three generators.
+    fn push_batch(&mut self, artifacts: &[RpmArtifact]) {
+        let infos = repodata_infos(artifacts);
+        for (artifact, info) in artifacts.iter().zip(&infos) {
+            self.scratch.clear();
+            push_primary_package(&mut self.scratch, artifact, info, &self.prefix);
+            self.primary.write(&self.scratch);
+            self.scratch.clear();
+            push_filelists_package(&mut self.scratch, artifact, info);
+            self.filelists.write(&self.scratch);
+            self.scratch.clear();
+            push_other_package(&mut self.scratch, artifact, info);
+            self.other.write(&self.scratch);
+        }
+        self.latest_update =
+            metadata_epoch_max(self.latest_update, artifacts.iter().map(|a| a.updated_at));
+    }
+
+    fn finish(mut self) -> RenderedRepodata {
+        self.primary.write("</metadata>\n");
+        self.filelists.write("</filelists>\n");
+        self.other.write("</otherdata>\n");
+        let primary = self.primary.finish();
+        let filelists = self.filelists.finish();
+        let other = self.other.finish();
+
+        let updateinfo_xml = generate_updateinfo_xml();
+        let updateinfo_open_sha256 = sha256_hex(updateinfo_xml.as_bytes());
+        let updateinfo_open_size = updateinfo_xml.len();
+        let updateinfo_gz = gzip_bytes(updateinfo_xml.as_bytes());
+        let updateinfo_sha256 = sha256_hex(&updateinfo_gz);
+
+        // #2636: the metadata epoch is derived from repository *state*, never
+        // from the clock. `repomd.xml` and `repomd.xml.asc` render this
+        // document independently, one request apart, and the client verifies
+        // the signature from the second render against the bytes of the
+        // first. See the `metadata_epoch` module docs.
+        let timestamp = metadata_epoch(self.latest_update).timestamp();
+        let repomd_xml = repomd_document(
+            timestamp,
+            [&primary, &filelists, &other],
+            &updateinfo_gz,
+            &updateinfo_sha256,
+            &updateinfo_open_sha256,
+            updateinfo_open_size,
+        );
+        let (primary_gz, filelists_gz, other_gz) = (primary.gz, filelists.gz, other.gz);
+        RenderedRepodata {
+            repomd_xml: Bytes::from(repomd_xml),
+            primary_gz: Bytes::from(primary_gz),
+            filelists_gz: Bytes::from(filelists_gz),
+            other_gz: Bytes::from(other_gz),
+            cacheable: true,
+            valid_until: None,
+        }
+    }
+}
+
+/// `repomd.xml` for one rendered set: the checksums and sizes of the
+/// primary, filelists and other documents (in that order) and of
+/// `updateinfo.xml.gz`.
+fn repomd_document(
+    timestamp: i64,
+    [primary, filelists, other]: [&FinishedDoc; 3],
+    updateinfo_gz: &[u8],
+    updateinfo_sha256: &str,
+    updateinfo_open_sha256: &str,
+    updateinfo_open_size: usize,
+) -> String {
+    let (primary_sha256, primary_open_sha256, primary_open_size) =
+        (&primary.sha256, &primary.open_sha256, primary.open_size);
+    let (filelists_sha256, filelists_open_sha256, filelists_open_size) = (
+        &filelists.sha256,
+        &filelists.open_sha256,
+        filelists.open_size,
+    );
+    let (other_sha256, other_open_sha256, other_open_size) =
+        (&other.sha256, &other.open_sha256, other.open_size);
+    let (primary_gz, filelists_gz, other_gz) = (&primary.gz, &filelists.gz, &other.gz);
     let repomd_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
@@ -1656,14 +1978,15 @@ fn render_repodata_at(artifacts: &[RpmArtifact], prefix: &str) -> RenderedRepoda
         updateinfo_open_size = updateinfo_open_size,
     );
 
-    RenderedRepodata {
-        repomd_xml: Bytes::from(repomd_xml),
-        primary_gz: Bytes::from(primary_gz),
-        filelists_gz: Bytes::from(filelists_gz),
-        other_gz: Bytes::from(other_gz),
-        cacheable: true,
-        valid_until: None,
-    }
+    repomd_xml
+}
+
+/// The later of `current` and the newest of `more`.
+fn metadata_epoch_max(
+    current: Option<chrono::DateTime<chrono::Utc>>,
+    more: impl Iterator<Item = chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    current.into_iter().chain(more).max()
 }
 
 /// Test-facing shim retaining the original `repomd.xml`-only signature; the
@@ -2790,202 +3113,217 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
 /// `primary.xml` for `artifacts`; `prefix` is the metadata root (`""` at
 /// depth zero, `"<root>/"` otherwise) that every `<location href>` is made
 /// relative to (#4216).
+#[cfg(test)]
 fn generate_primary_xml_with(
     artifacts: &[RpmArtifact],
     infos: &[Option<crate::formats::rpm::RpmRepodataInfo>],
     prefix: &str,
 ) -> String {
-    let mut xml = format!(
+    let mut xml = primary_xml_header(artifacts.len());
+    for (artifact, info) in artifacts.iter().zip(infos) {
+        push_primary_package(&mut xml, artifact, info, prefix);
+    }
+    xml.push_str("</metadata>\n");
+    xml
+}
+
+/// The opening of `primary.xml` for a document listing `packages` packages.
+fn primary_xml_header(packages: usize) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="{}">
 "#,
-        artifacts.len()
-    );
+        packages
+    )
+}
 
-    for (artifact, info) in artifacts.iter().zip(infos) {
-        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+/// Append one package's `primary.xml` element. Shared by the whole-slice generator
+/// and the streaming render (#4544), so both emit the same bytes.
+fn push_primary_package(
+    xml: &mut String,
+    artifact: &RpmArtifact,
+    info: &Option<crate::formats::rpm::RpmRepodataInfo>,
+    prefix: &str,
+) {
+    let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
 
-        // Extract metadata from artifact_metadata if available, else parse filename
-        let (name, version, release, arch, summary) = if let Some(ref meta) = artifact.metadata {
-            (
-                meta.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&artifact.name)
-                    .to_string(),
-                meta.get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0")
-                    .to_string(),
-                meta.get("release")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("1")
-                    .to_string(),
-                meta.get("arch")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("noarch")
-                    .to_string(),
-                meta.get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            )
-        } else if let Some((n, v, r, a)) = parse_rpm_filename(filename) {
-            (n, v, r, a, String::new())
-        } else {
-            (
-                artifact.name.clone(),
-                artifact.version.clone().unwrap_or_else(|| "0".to_string()),
-                "1".to_string(),
-                "noarch".to_string(),
-                String::new(),
-            )
-        };
-
-        // Header-derived fields recorded at upload time (#2588). Blank when the
-        // artifact predates header extraction or the header was unparseable.
-        let meta_str = |key: &str| -> String {
-            artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get(key))
+    // Extract metadata from artifact_metadata if available, else parse filename
+    let (name, version, release, arch, summary) = if let Some(ref meta) = artifact.metadata {
+        (
+            meta.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&artifact.name)
+                .to_string(),
+            meta.get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            meta.get("release")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1")
+                .to_string(),
+            meta.get("arch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("noarch")
+                .to_string(),
+            meta.get("summary")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
-                .to_string()
-        };
-        let description = meta_str("description");
-        let url = meta_str("url");
-        let license = meta_str("license");
-        let source_rpm = meta_str("source_rpm");
+                .to_string(),
+        )
+    } else if let Some((n, v, r, a)) = parse_rpm_filename(filename) {
+        (n, v, r, a, String::new())
+    } else {
+        (
+            artifact.name.clone(),
+            artifact.version.clone().unwrap_or_else(|| "0".to_string()),
+            "1".to_string(),
+            "noarch".to_string(),
+            String::new(),
+        )
+    };
 
-        // The hosted RPM route serves packages under `packages/<file>` (see the
-        // `/rpm/{repo}/{path}` handler). Artifacts uploaded through the native
-        // RPM PUT already carry a `packages/`-prefixed path, but ones pushed via
-        // the generic upload flow are stored at their bare path. Emit a location
-        // that always matches the download route so both upload paths resolve.
-        let location = if !prefix.is_empty() {
-            rpm_layout::location_href(
-                artifact
-                    .path
-                    .strip_prefix(prefix)
-                    .expect("query scoped to root"),
-            )
-        } else if artifact.path.starts_with("packages/") {
-            artifact.path.clone()
-        } else {
-            build_rpm_artifact_path(filename)
-        };
+    // Header-derived fields recorded at upload time (#2588). Blank when the
+    // artifact predates header extraction or the header was unparseable.
+    let meta_str = |key: &str| -> String {
+        artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let description = meta_str("description");
+    let url = meta_str("url");
+    let license = meta_str("license");
+    let source_rpm = meta_str("source_rpm");
 
-        // Header-derived repodata block (#3801): dependencies, file list,
-        // sizes, header range. Absent only for packages whose header could
-        // not be parsed at upload and has not been healed since.
-        // Header-derived block, deserialized once per render.
-        let info = info.as_ref();
-        let epoch = info.and_then(|i| i.epoch).unwrap_or(0);
-        let group = meta_str("group");
+    // The hosted RPM route serves packages under `packages/<file>` (see the
+    // `/rpm/{repo}/{path}` handler). Artifacts uploaded through the native
+    // RPM PUT already carry a `packages/`-prefixed path, but ones pushed via
+    // the generic upload flow are stored at their bare path. Emit a location
+    // that always matches the download route so both upload paths resolve.
+    let location = if !prefix.is_empty() {
+        rpm_layout::location_href(
+            artifact
+                .path
+                .strip_prefix(prefix)
+                .expect("query scoped to root"),
+        )
+    } else if artifact.path.starts_with("packages/") {
+        artifact.path.clone()
+    } else {
+        build_rpm_artifact_path(filename)
+    };
 
-        // Element order is createrepo_c's: name, arch, version, checksum,
-        // summary, description, packager, url, time, size, location, format.
-        xml.push_str("  <package type=\"rpm\">\n");
-        xml.push_str(&format!("    <name>{}</name>\n", xml_escape(&name)));
-        xml.push_str(&format!("    <arch>{}</arch>\n", xml_escape(&arch)));
-        xml.push_str(&format!(
-            "    <version epoch=\"{epoch}\" ver=\"{}\" rel=\"{}\"/>\n",
-            xml_escape(&version),
-            xml_escape(&release),
-        ));
-        xml.push_str(&format!(
-            "    <checksum type=\"sha256\" pkgid=\"YES\">{}</checksum>\n",
-            artifact.checksum_sha256
-        ));
-        xml.push_str(&format!(
-            "    <summary>{}</summary>\n",
-            xml_escape(&summary)
-        ));
-        xml.push_str(&format!(
-            "    <description>{}</description>\n",
-            xml_escape(&description)
-        ));
-        // createrepo_c writes <packager>, <url>, <rpm:vendor>, <rpm:group>
-        // and <rpm:buildhost> even when the header has no value (empty).
-        let packager = info.and_then(|i| i.packager.as_deref()).unwrap_or("");
-        xml.push_str(&format!(
-            "    <packager>{}</packager>\n",
-            xml_escape(packager)
-        ));
-        xml.push_str(&format!("    <url>{}</url>\n", xml_escape(&url)));
-        xml.push_str(&format!(
-            "    <time file=\"{}\" build=\"{}\"/>\n",
-            artifact.updated_at.timestamp(),
-            info.and_then(|i| i.build_time).unwrap_or(0)
-        ));
-        let installed = info.and_then(|i| i.installed_size).unwrap_or(0);
-        match info.and_then(|i| i.archive_size) {
-            Some(archive) => xml.push_str(&format!(
-                "    <size package=\"{}\" installed=\"{installed}\" archive=\"{archive}\"/>\n",
-                artifact.size_bytes
-            )),
-            None => xml.push_str(&format!(
-                "    <size package=\"{}\" installed=\"{installed}\"/>\n",
-                artifact.size_bytes
-            )),
-        }
-        xml.push_str(&format!(
-            "    <location href=\"{}\"/>\n",
-            xml_escape(&location)
-        ));
+    // Header-derived repodata block (#3801): dependencies, file list,
+    // sizes, header range. Absent only for packages whose header could
+    // not be parsed at upload and has not been healed since.
+    // Header-derived block, deserialized once per render.
+    let info = info.as_ref();
+    let epoch = info.and_then(|i| i.epoch).unwrap_or(0);
+    let group = meta_str("group");
 
-        xml.push_str("    <format>\n");
-        xml.push_str(&format!(
-            "      <rpm:license>{}</rpm:license>\n",
-            xml_escape(&license)
-        ));
-        let vendor = info.and_then(|i| i.vendor.as_deref()).unwrap_or("");
-        xml.push_str(&format!(
-            "      <rpm:vendor>{}</rpm:vendor>\n",
-            xml_escape(vendor)
-        ));
-        xml.push_str(&format!(
-            "      <rpm:group>{}</rpm:group>\n",
-            xml_escape(&group)
-        ));
-        let buildhost = info.and_then(|i| i.buildhost.as_deref()).unwrap_or("");
-        xml.push_str(&format!(
-            "      <rpm:buildhost>{}</rpm:buildhost>\n",
-            xml_escape(buildhost)
-        ));
-        xml.push_str(&format!(
-            "      <rpm:sourcerpm>{}</rpm:sourcerpm>\n",
-            xml_escape(&source_rpm)
-        ));
-        if let Some(i) = info {
-            xml.push_str(&format!(
-                "      <rpm:header-range start=\"{}\" end=\"{}\"/>\n",
-                i.header_start, i.header_end
-            ));
-            push_rpm_entry_list(&mut xml, "rpm:provides", &i.provides);
-            push_rpm_entry_list(&mut xml, "rpm:requires", &i.requires);
-            push_rpm_entry_list(&mut xml, "rpm:conflicts", &i.conflicts);
-            push_rpm_entry_list(&mut xml, "rpm:obsoletes", &i.obsoletes);
-            push_rpm_entry_list(&mut xml, "rpm:suggests", &i.suggests);
-            push_rpm_entry_list(&mut xml, "rpm:enhances", &i.enhances);
-            push_rpm_entry_list(&mut xml, "rpm:recommends", &i.recommends);
-            push_rpm_entry_list(&mut xml, "rpm:supplements", &i.supplements);
-            // Only "primary" files (`/etc/*`, `*bin/*`, `/usr/lib/sendmail`)
-            // go here, as createrepo_c does; the full list is filelists.xml.
-            push_rpm_file_list(
-                &mut xml,
-                "      ",
-                i.files
-                    .iter()
-                    .filter(|f| crate::formats::rpm::is_primary_file(&f.path)),
-            );
-        }
-        xml.push_str("    </format>\n");
-        xml.push_str("  </package>\n");
+    // Element order is createrepo_c's: name, arch, version, checksum,
+    // summary, description, packager, url, time, size, location, format.
+    xml.push_str("  <package type=\"rpm\">\n");
+    xml.push_str(&format!("    <name>{}</name>\n", xml_escape(&name)));
+    xml.push_str(&format!("    <arch>{}</arch>\n", xml_escape(&arch)));
+    xml.push_str(&format!(
+        "    <version epoch=\"{epoch}\" ver=\"{}\" rel=\"{}\"/>\n",
+        xml_escape(&version),
+        xml_escape(&release),
+    ));
+    xml.push_str(&format!(
+        "    <checksum type=\"sha256\" pkgid=\"YES\">{}</checksum>\n",
+        artifact.checksum_sha256
+    ));
+    xml.push_str(&format!(
+        "    <summary>{}</summary>\n",
+        xml_escape(&summary)
+    ));
+    xml.push_str(&format!(
+        "    <description>{}</description>\n",
+        xml_escape(&description)
+    ));
+    // createrepo_c writes <packager>, <url>, <rpm:vendor>, <rpm:group>
+    // and <rpm:buildhost> even when the header has no value (empty).
+    let packager = info.and_then(|i| i.packager.as_deref()).unwrap_or("");
+    xml.push_str(&format!(
+        "    <packager>{}</packager>\n",
+        xml_escape(packager)
+    ));
+    xml.push_str(&format!("    <url>{}</url>\n", xml_escape(&url)));
+    xml.push_str(&format!(
+        "    <time file=\"{}\" build=\"{}\"/>\n",
+        artifact.updated_at.timestamp(),
+        info.and_then(|i| i.build_time).unwrap_or(0)
+    ));
+    let installed = info.and_then(|i| i.installed_size).unwrap_or(0);
+    match info.and_then(|i| i.archive_size) {
+        Some(archive) => xml.push_str(&format!(
+            "    <size package=\"{}\" installed=\"{installed}\" archive=\"{archive}\"/>\n",
+            artifact.size_bytes
+        )),
+        None => xml.push_str(&format!(
+            "    <size package=\"{}\" installed=\"{installed}\"/>\n",
+            artifact.size_bytes
+        )),
     }
+    xml.push_str(&format!(
+        "    <location href=\"{}\"/>\n",
+        xml_escape(&location)
+    ));
 
-    xml.push_str("</metadata>\n");
-    xml
+    xml.push_str("    <format>\n");
+    xml.push_str(&format!(
+        "      <rpm:license>{}</rpm:license>\n",
+        xml_escape(&license)
+    ));
+    let vendor = info.and_then(|i| i.vendor.as_deref()).unwrap_or("");
+    xml.push_str(&format!(
+        "      <rpm:vendor>{}</rpm:vendor>\n",
+        xml_escape(vendor)
+    ));
+    xml.push_str(&format!(
+        "      <rpm:group>{}</rpm:group>\n",
+        xml_escape(&group)
+    ));
+    let buildhost = info.and_then(|i| i.buildhost.as_deref()).unwrap_or("");
+    xml.push_str(&format!(
+        "      <rpm:buildhost>{}</rpm:buildhost>\n",
+        xml_escape(buildhost)
+    ));
+    xml.push_str(&format!(
+        "      <rpm:sourcerpm>{}</rpm:sourcerpm>\n",
+        xml_escape(&source_rpm)
+    ));
+    if let Some(i) = info {
+        xml.push_str(&format!(
+            "      <rpm:header-range start=\"{}\" end=\"{}\"/>\n",
+            i.header_start, i.header_end
+        ));
+        push_rpm_entry_list(xml, "rpm:provides", &i.provides);
+        push_rpm_entry_list(xml, "rpm:requires", &i.requires);
+        push_rpm_entry_list(xml, "rpm:conflicts", &i.conflicts);
+        push_rpm_entry_list(xml, "rpm:obsoletes", &i.obsoletes);
+        push_rpm_entry_list(xml, "rpm:suggests", &i.suggests);
+        push_rpm_entry_list(xml, "rpm:enhances", &i.enhances);
+        push_rpm_entry_list(xml, "rpm:recommends", &i.recommends);
+        push_rpm_entry_list(xml, "rpm:supplements", &i.supplements);
+        // Only "primary" files (`/etc/*`, `*bin/*`, `/usr/lib/sendmail`)
+        // go here, as createrepo_c does; the full list is filelists.xml.
+        push_rpm_file_list(
+            xml,
+            "      ",
+            i.files
+                .iter()
+                .filter(|f| crate::formats::rpm::is_primary_file(&f.path)),
+        );
+    }
+    xml.push_str("    </format>\n");
+    xml.push_str("  </package>\n");
 }
 
 pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
@@ -2996,67 +3334,80 @@ fn generate_filelists_xml_with(
     artifacts: &[RpmArtifact],
     infos: &[Option<crate::formats::rpm::RpmRepodataInfo>],
 ) -> String {
-    let mut xml = format!(
+    let mut xml = filelists_xml_header(artifacts.len());
+    for (artifact, info) in artifacts.iter().zip(infos) {
+        push_filelists_package(&mut xml, artifact, info);
+    }
+    xml.push_str("</filelists>\n");
+    xml
+}
+
+/// The opening of `filelists.xml` for a document listing `packages` packages.
+fn filelists_xml_header(packages: usize) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="{}">
 "#,
-        artifacts.len()
-    );
+        packages
+    )
+}
 
-    for (artifact, info) in artifacts.iter().zip(infos) {
-        let (name, version, release, arch) = if let Some(ref meta) = artifact.metadata {
+/// Append one package's `filelists.xml` element. Shared by the whole-slice generator
+/// and the streaming render (#4544), so both emit the same bytes.
+fn push_filelists_package(
+    xml: &mut String,
+    artifact: &RpmArtifact,
+    info: &Option<crate::formats::rpm::RpmRepodataInfo>,
+) {
+    let (name, version, release, arch) = if let Some(ref meta) = artifact.metadata {
+        (
+            meta.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&artifact.name)
+                .to_string(),
+            meta.get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            meta.get("release")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1")
+                .to_string(),
+            meta.get("arch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("noarch")
+                .to_string(),
+        )
+    } else {
+        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+        parse_rpm_filename(filename).unwrap_or_else(|| {
             (
-                meta.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&artifact.name)
-                    .to_string(),
-                meta.get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0")
-                    .to_string(),
-                meta.get("release")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("1")
-                    .to_string(),
-                meta.get("arch")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("noarch")
-                    .to_string(),
+                artifact.name.clone(),
+                artifact.version.clone().unwrap_or_else(|| "0".to_string()),
+                "1".to_string(),
+                "noarch".to_string(),
             )
-        } else {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            parse_rpm_filename(filename).unwrap_or_else(|| {
-                (
-                    artifact.name.clone(),
-                    artifact.version.clone().unwrap_or_else(|| "0".to_string()),
-                    "1".to_string(),
-                    "noarch".to_string(),
-                )
-            })
-        };
+        })
+    };
 
-        let info = info.as_ref();
-        xml.push_str(&format!(
-            r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
+    let info = info.as_ref();
+    xml.push_str(&format!(
+        r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
     <version epoch="{epoch}" ver="{version}" rel="{release}"/>
 "#,
-            checksum = artifact.checksum_sha256,
-            name = xml_escape(&name),
-            arch = xml_escape(&arch),
-            epoch = info.and_then(|i| i.epoch).unwrap_or(0),
-            version = xml_escape(&version),
-            release = xml_escape(&release),
-        ));
-        // The complete file list (#3801), so file requirements outside the
-        // primary set (`/usr/share/...`, `/usr/lib64/...`) resolve too.
-        if let Some(i) = info {
-            push_rpm_file_list(&mut xml, "    ", i.files.iter());
-        }
-        xml.push_str("  </package>\n");
+        checksum = artifact.checksum_sha256,
+        name = xml_escape(&name),
+        arch = xml_escape(&arch),
+        epoch = info.and_then(|i| i.epoch).unwrap_or(0),
+        version = xml_escape(&version),
+        release = xml_escape(&release),
+    ));
+    // The complete file list (#3801), so file requirements outside the
+    // primary set (`/usr/share/...`, `/usr/lib64/...`) resolve too.
+    if let Some(i) = info {
+        push_rpm_file_list(xml, "    ", i.files.iter());
     }
-
-    xml.push_str("</filelists>\n");
-    xml
+    xml.push_str("  </package>\n");
 }
 
 pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
@@ -3067,71 +3418,84 @@ fn generate_other_xml_with(
     artifacts: &[RpmArtifact],
     infos: &[Option<crate::formats::rpm::RpmRepodataInfo>],
 ) -> String {
-    let mut xml = format!(
+    let mut xml = other_xml_header(artifacts.len());
+    for (artifact, info) in artifacts.iter().zip(infos) {
+        push_other_package(&mut xml, artifact, info);
+    }
+    xml.push_str("</otherdata>\n");
+    xml
+}
+
+/// The opening of `other.xml` for a document listing `packages` packages.
+fn other_xml_header(packages: usize) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <otherdata xmlns="http://linux.duke.edu/metadata/other" packages="{}">
 "#,
-        artifacts.len()
-    );
+        packages
+    )
+}
 
-    for (artifact, info) in artifacts.iter().zip(infos) {
-        let (name, version, release) = if let Some(ref meta) = artifact.metadata {
-            (
-                meta.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&artifact.name)
-                    .to_string(),
-                meta.get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0")
-                    .to_string(),
-                meta.get("release")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("1")
-                    .to_string(),
-            )
-        } else {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            let parsed = parse_rpm_filename(filename);
-            (
-                parsed
-                    .as_ref()
-                    .map(|p| p.0.clone())
-                    .unwrap_or_else(|| artifact.name.clone()),
-                parsed
-                    .as_ref()
-                    .map(|p| p.1.clone())
-                    .unwrap_or_else(|| artifact.version.clone().unwrap_or_else(|| "0".to_string())),
-                parsed
-                    .as_ref()
-                    .map(|p| p.2.clone())
-                    .unwrap_or_else(|| "1".to_string()),
-            )
-        };
+/// Append one package's `other.xml` element. Shared by the whole-slice generator
+/// and the streaming render (#4544), so both emit the same bytes.
+fn push_other_package(
+    xml: &mut String,
+    artifact: &RpmArtifact,
+    info: &Option<crate::formats::rpm::RpmRepodataInfo>,
+) {
+    let (name, version, release) = if let Some(ref meta) = artifact.metadata {
+        (
+            meta.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&artifact.name)
+                .to_string(),
+            meta.get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            meta.get("release")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1")
+                .to_string(),
+        )
+    } else {
+        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+        let parsed = parse_rpm_filename(filename);
+        (
+            parsed
+                .as_ref()
+                .map(|p| p.0.clone())
+                .unwrap_or_else(|| artifact.name.clone()),
+            parsed
+                .as_ref()
+                .map(|p| p.1.clone())
+                .unwrap_or_else(|| artifact.version.clone().unwrap_or_else(|| "0".to_string())),
+            parsed
+                .as_ref()
+                .map(|p| p.2.clone())
+                .unwrap_or_else(|| "1".to_string()),
+        )
+    };
 
-        xml.push_str(&format!(
-            r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
+    xml.push_str(&format!(
+        r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
     <version epoch="{epoch}" ver="{version}" rel="{release}"/>
   </package>
 "#,
-            checksum = artifact.checksum_sha256,
-            name = xml_escape(&name),
-            arch = xml_escape(
-                artifact
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("arch"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("noarch")
-            ),
-            epoch = info.as_ref().and_then(|i| i.epoch).unwrap_or(0),
-            version = xml_escape(&version),
-            release = xml_escape(&release),
-        ));
-    }
-
-    xml.push_str("</otherdata>\n");
-    xml
+        checksum = artifact.checksum_sha256,
+        name = xml_escape(&name),
+        arch = xml_escape(
+            artifact
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("arch"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("noarch")
+        ),
+        epoch = info.as_ref().and_then(|i| i.epoch).unwrap_or(0),
+        version = xml_escape(&version),
+        release = xml_escape(&release),
+    ));
 }
 
 /// The header-derived repodata block recorded for `artifact` at upload (or
@@ -3144,7 +3508,9 @@ fn rpm_repodata_info(artifact: &RpmArtifact) -> Option<crate::formats::rpm::RpmR
     {
         return None;
     }
-    serde_json::from_value(value.clone()).ok()
+    // Deserialize from the borrowed value: cloning a package's block first
+    // doubled its footprint for the length of the render (#4544).
+    <crate::formats::rpm::RpmRepodataInfo as serde::Deserialize>::deserialize(value).ok()
 }
 
 /// Serialize one `<rpm:provides>`/`<rpm:requires>`/... list in
@@ -6802,6 +7168,156 @@ mod repodata_deps_tests {
             .filter(|l| !l.starts_with("<location ") && !l.starts_with("<time "))
             .map(str::to_string)
             .collect()
+    }
+
+    /// `n` copies of the deps fixture under distinct paths and times, in
+    /// the render order.
+    fn deps_artifacts(n: i64) -> Vec<RpmArtifact> {
+        (0..n)
+            .map(|i| RpmArtifact {
+                path: format!("packages/ak-deps-test-1.5-{i}.noarch.rpm"),
+                updated_at: chrono::DateTime::from_timestamp(1_700_000_000 + i, 0)
+                    .expect("valid timestamp"),
+                ..deps_artifact()
+            })
+            .collect()
+    }
+
+    /// #4544: the streamed documents are the bytes of the whole-slice
+    /// generators gzipped in one call (as 1.11 served them) while they stay
+    /// under the spill size, `repomd.xml` advertises their checksums and
+    /// open sizes, and the batch size never changes a byte (#2636). Past the
+    /// spill size the documents still decompress to the same bytes and stay
+    /// a pure function of the rows.
+    #[test]
+    fn batched_render_matches_whole_slice_render_4544() {
+        use std::io::Read;
+        let gunzip = |gz: &[u8]| {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(gz)
+                .read_to_end(&mut out)
+                .expect("gunzip");
+            out
+        };
+        let artifacts = deps_artifacts(7);
+        let infos = repodata_infos(&artifacts);
+        let whole = render_repodata_at(&artifacts, "");
+        let repomd = String::from_utf8(whole.repomd_xml.to_vec()).expect("utf8");
+        for (gz, xml) in [
+            (
+                &whole.primary_gz,
+                generate_primary_xml_with(&artifacts, &infos, ""),
+            ),
+            (
+                &whole.filelists_gz,
+                generate_filelists_xml_with(&artifacts, &infos),
+            ),
+            (&whole.other_gz, generate_other_xml_with(&artifacts, &infos)),
+        ] {
+            assert_eq!(gunzip(gz), xml.as_bytes());
+            assert_eq!(*gz, gzip_bytes(xml.as_bytes()), "unspilled: as 1.11");
+            assert!(repomd.contains(&sha256_hex(gz)), "{repomd}");
+            assert!(repomd.contains(&sha256_hex(xml.as_bytes())), "{repomd}");
+            assert!(
+                repomd.contains(&format!("<open-size>{}</open-size>", xml.len())),
+                "{repomd}"
+            );
+        }
+        for size in [1, 2, 3, 7] {
+            let mut writer = RepodataWriter::new(artifacts.len(), "");
+            for chunk in artifacts.chunks(size) {
+                writer.push_batch(chunk);
+            }
+            assert_eq!(writer.finish(), whole, "batches of {size}");
+        }
+        // A tiny spill size forces every document through the streaming
+        // encoder: same uncompressed bytes, deterministic across batchings.
+        let spilled = |size: usize| {
+            let mut writer = RepodataWriter::with_spill(artifacts.len(), "", 1);
+            for chunk in artifacts.chunks(size) {
+                writer.push_batch(chunk);
+            }
+            writer.finish()
+        };
+        let first = spilled(1);
+        assert_eq!(spilled(3), first);
+        assert_eq!(gunzip(&first.filelists_gz), gunzip(&whole.filelists_gz));
+        assert_eq!(gunzip(&first.primary_gz), gunzip(&whole.primary_gz));
+        assert!(
+            repomd.contains("<revision>1700000006</revision>"),
+            "{repomd}"
+        );
+    }
+
+    /// #4544: the request-path render reads the root as a stream and holds
+    /// one batch of metadata at a time (the OOM was every row's metadata
+    /// plus every uncompressed document in memory at once), and its bytes
+    /// are those of the in-memory render of the same rows.
+    #[tokio::test]
+    async fn streamed_render_holds_one_batch_and_matches_in_memory_render_4544() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let meta = deps_artifact().metadata.expect("fixture metadata");
+        for i in 0..6 {
+            let (id,): (uuid::Uuid,) = sqlx::query_as(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by) \
+                 VALUES ($1, $2, 'ak-deps-test', '1.5-3', $3, $4, 'application/x-rpm', $5, $6) \
+                 RETURNING id",
+            )
+            .bind(f.repo_id)
+            .bind(format!("packages/ak-deps-test-1.5-{i}.noarch.rpm"))
+            .bind(DEPS_RPM.len() as i64)
+            .bind(sha256_hex(DEPS_RPM))
+            .bind(format!(
+                "rpm/{}/ak-deps-test-1.5-{i}.noarch.rpm",
+                f.repo_key
+            ))
+            .bind(f.user_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("insert artifact");
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'rpm', $2)",
+            )
+            .bind(id)
+            .bind(&meta)
+            .execute(&f.pool)
+            .await
+            .expect("insert metadata");
+        }
+
+        let budget = json_weight(&meta) * 2;
+        let (streamed, stats) = render_repodata_streamed(&f.state, &[f.repo_id], "", budget)
+            .await
+            .expect("streamed render");
+        assert_eq!(stats.packages, 6);
+        assert_eq!(stats.batches, 3, "{stats:?}");
+        assert_eq!(stats.max_batch_rows, 2, "{stats:?}");
+        assert!(stats.max_batch_bytes <= budget, "{stats:?}");
+
+        let rows = collect_repodata_artifacts(&f.pool, &[f.repo_id])
+            .await
+            .expect("collect rows");
+        assert_eq!(streamed, render_repodata_at(&rows, ""));
+        let primary = {
+            use std::io::Read;
+            let mut xml = String::new();
+            flate2::read::GzDecoder::new(&streamed.primary_gz[..])
+                .read_to_string(&mut xml)
+                .expect("gunzip");
+            xml
+        };
+        assert!(primary.contains(r#"packages="6""#), "{primary}");
+        assert_eq!(primary.matches("<package ").count(), 6);
+
+        // An empty budget still makes progress: one package per batch.
+        let (_, stats) = render_repodata_streamed(&f.state, &[f.repo_id], "", 0)
+            .await
+            .expect("streamed render");
+        assert_eq!((stats.batches, stats.max_batch_rows), (6, 1));
     }
 
     /// Well-formedness: dnf/libsolv reject a document that does not parse.

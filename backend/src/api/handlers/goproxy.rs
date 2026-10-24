@@ -211,6 +211,13 @@ async fn handle_get(
 ) -> Result<Response, Response> {
     let repo = resolve_go_repo(&state.db, &repo_key).await?;
     let request = parse_path(&path)?;
+    // #4365 item 3 (#4103): on a proxying repository the module and version
+    // are joined into the upstream path of every operation, with only a
+    // suffix after the version (`.mod`, `.info`, `.zip`). A `?` there moves
+    // that suffix into the upstream query, so `v1.0.0.zip%3F.mod` would fetch
+    // the module zip and serve it on the unscanned `.mod` route. Refused
+    // before anything is fetched or cached.
+    reject_ambiguous_go_request(&repo, &request)?;
 
     match request {
         GoProxyRequest::List { module } => {
@@ -229,6 +236,27 @@ async fn handle_get(
             latest_version(&state, auth.as_ref(), &repo, &module).await
         }
         GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
+    }
+}
+
+/// The client-derived segments of a parsed request that a proxying (Remote
+/// or Virtual) repository joins into an upstream path (#4365 item 3), as a
+/// `400` when one is ambiguous. `sumdb/` requests have their own host
+/// allowlist and are not joined onto the repository's upstream.
+#[allow(clippy::result_large_err)]
+fn reject_ambiguous_go_request(repo: &RepoInfo, request: &GoProxyRequest) -> Result<(), Response> {
+    let proxied =
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual;
+    match request {
+        GoProxyRequest::List { module } | GoProxyRequest::Latest { module } => {
+            proxy_helpers::reject_ambiguous_client_segments(proxied, &[module])
+        }
+        GoProxyRequest::Info { module, version }
+        | GoProxyRequest::Mod { module, version }
+        | GoProxyRequest::Zip { module, version } => {
+            proxy_helpers::reject_ambiguous_client_segments(proxied, &[module, version])
+        }
+        GoProxyRequest::SumDb { .. } => Ok(()),
     }
 }
 
@@ -1348,6 +1376,29 @@ async fn download_zip(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = build_go_upstream_path(module, version, "zip");
+                    // #4103: scan-on-proxy routes the module zip through the
+                    // inline scan-and-block gate (buffered capped fetch,
+                    // digest-keyed verdict) INSTEAD of the streaming path
+                    // below. Same cache key. Repositories that have not opted
+                    // in keep the untouched streaming path.
+                    if let Some(policy) =
+                        proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                    {
+                        let zip = GoZipCoordinate {
+                            module,
+                            version,
+                            serve_key: go_zip_serve_key(module, version),
+                        };
+                        return serve_scanned_go_zip(
+                            state,
+                            proxy,
+                            (repo.id, &repo.key, upstream_url),
+                            &zip,
+                            policy,
+                            ctx,
+                        )
+                        .await;
+                    }
                     // #895: stream large module .zip; default Content-Type
                     // matches the buffered handler's prior fallback so the
                     // Go toolchain still sees `application/zip` when
@@ -1409,8 +1460,36 @@ async fn download_zip(
                     allowed.push(member);
                 }
 
-                let db = state.db.clone();
                 let upstream_path = build_go_upstream_path(module, version, "zip");
+                // #4103: a member with scan-on-proxy on (stricter of virtual
+                // and member policy) serves only through the inline gate. The
+                // age-gated members excluded above stay excluded.
+                if let Some(proxy) = state.proxy_service.as_deref() {
+                    let zip = GoZipCoordinate {
+                        module,
+                        version,
+                        serve_key: go_zip_serve_key(module, version),
+                    };
+                    if let Some(served) = serve_scanned_virtual_go_zip(
+                        state,
+                        proxy,
+                        repo.id,
+                        allowed.clone(),
+                        &zip,
+                        ctx,
+                    )
+                    .await
+                    {
+                        return match served {
+                            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                                Err(blocked_response.unwrap_or(resp))
+                            }
+                            other => other,
+                        };
+                    }
+                }
+
+                let db = state.db.clone();
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
                 let result = proxy_helpers::resolve_virtual_download_from_members(
@@ -1477,6 +1556,190 @@ async fn download_zip(
         .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Scan-on-proxy for module zips (#4103, on the #4098 generic gate)
+// ---------------------------------------------------------------------------
+
+/// The canonical `(cache_key, scannable)` decision for a proxied module zip
+/// (#4365 item 1): every `.zip` on this route is a package, cached under the
+/// `{module}/@v/{version}.zip` path the streaming arm commits to.
+fn go_zip_serve_key(module: &str, version: &str) -> crate::services::proxy_service::ProxyServeKey {
+    crate::services::proxy_service::route_package_serve_key(&build_go_upstream_path(
+        module, version, "zip",
+    ))
+}
+
+/// The `module@version` one zip request asks for, as the route decoded it.
+struct GoZipCoordinate<'a> {
+    module: &'a str,
+    version: &'a str,
+    serve_key: crate::services::proxy_service::ProxyServeKey,
+}
+
+impl GoZipCoordinate<'_> {
+    /// The file name the gate names the scan, the block body and the 423
+    /// after: the request's last path segment.
+    fn filename(&self) -> String {
+        format!("{}.zip", encode_module_path(self.version))
+    }
+}
+
+/// The Go half of the generic gate: a module zip must be the module the
+/// request names (#4103).
+struct GoModuleZip<'a> {
+    module: &'a str,
+    version: &'a str,
+}
+
+impl crate::api::handlers::proxy_scan_archive::ArchiveKind for GoModuleZip<'_> {
+    const LABEL: &'static str = "go module zip";
+    const CONTENT_TYPE: &'static str = "application/zip";
+
+    fn requested(&self) -> String {
+        format!("{}@{}", self.module, self.version)
+    }
+
+    fn identity(
+        &self,
+        _filename: &str,
+        bytes: &Bytes,
+    ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+        go_zip_identity(self.module, self.version, bytes)
+    }
+}
+
+/// What a module zip says about itself (#4103). The module zip format puts
+/// every file under `{module}@{version}/` (the `go` command refuses a zip
+/// that does not), and a module's own `go.mod`, when it has one, declares
+/// its path. A zip with an entry outside that prefix, or whose `go.mod`
+/// names another module, is not the module the request names. The scanner
+/// has no Go pin, so a zip that agrees is graded on its contents (the
+/// `go.mod` requirements and anything else the engine catalogs).
+fn go_zip_identity(
+    module: &str,
+    version: &str,
+    bytes: &Bytes,
+) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+    use crate::api::handlers::proxy_scan_archive::{
+        read_zip_entry, zip_entry_names, ArchiveIdentity,
+    };
+    let Some(names) = zip_entry_names(bytes) else {
+        return ArchiveIdentity::Unreadable("not a readable module zip".to_string());
+    };
+    let prefix = format!("{module}@{version}/");
+    if names.is_empty() {
+        return ArchiveIdentity::Unreadable("empty module zip".to_string());
+    }
+    if let Some(stray) = names.iter().find(|n| !n.starts_with(&prefix)) {
+        return ArchiveIdentity::Disagrees(format!("entry {stray:?} is not under {prefix}"));
+    }
+    match read_zip_entry(bytes, &format!("{prefix}go.mod")) {
+        Err(e) => ArchiveIdentity::Unreadable(e),
+        Ok(None) => ArchiveIdentity::ContentGraded,
+        Ok(Some(body)) => match go_mod_module_path(&body) {
+            Some(declared) if declared == module => ArchiveIdentity::ContentGraded,
+            Some(declared) => {
+                ArchiveIdentity::Disagrees(format!("go.mod declares module {declared}"))
+            }
+            None => ArchiveIdentity::Unreadable("go.mod declares no module path".to_string()),
+        },
+    }
+}
+
+/// The module path a `go.mod` declares: the first `module` directive, with a
+/// trailing `//` comment and surrounding quotes removed.
+fn go_mod_module_path(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("module")?;
+        if !rest.starts_with([' ', '\t', '"']) {
+            return None;
+        }
+        let value = rest.split("//").next().unwrap_or(rest).trim();
+        let value = value.trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Inline scan-and-block for one module zip from one Remote repository
+/// (#4103): the generic gate ([`proxy_helpers::serve_scanned_proxy_file`])
+/// with the Go identity rule.
+async fn serve_scanned_go_zip(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    zip: &GoZipCoordinate<'_>,
+    (action, severity_gate): proxy_helpers::MemberScanPolicy,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let filename = zip.filename();
+    let req = proxy_helpers::ScannedProxyRequest {
+        repo_id,
+        repo_key,
+        fetch_base: upstream_url,
+        format: RepositoryFormat::Go,
+        source_path: &zip.serve_key.cache_key,
+        cache_path: &zip.serve_key.cache_key,
+        filename: &filename,
+        action,
+        severity_gate,
+        ctx: Some(ctx),
+    };
+    let file = crate::api::handlers::proxy_scan_archive::ScannedArchive {
+        proxy,
+        kind: GoModuleZip {
+            module: zip.module,
+            version: zip.version,
+        },
+        disposition: None,
+    };
+    proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The Virtual module-zip walk with scan-on-proxy (#4103): `None` when no
+/// member scans (the caller keeps its resolver), otherwise the priority walk
+/// with each scanning Remote member served through [`serve_scanned_go_zip`].
+async fn serve_scanned_virtual_go_zip(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    virtual_id: uuid::Uuid,
+    members: Vec<crate::models::repository::Repository>,
+    zip: &GoZipCoordinate<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Option<Result<Response, Response>> {
+    let (module, version) = (zip.module, zip.version);
+    let local_fetch = |member_id: uuid::Uuid, location: crate::storage::StorageLocation| async move {
+        proxy_helpers::local_fetch_by_name_version_and_suffix(
+            &state.db, state, member_id, &location, module, version, "%.zip",
+        )
+        .await
+    };
+    let runs = crate::api::handlers::proxy_scan_archive::UnscannedArchiveRuns {
+        proxy,
+        path: &zip.serve_key.cache_key,
+        local_fetch,
+        default_content_type: "application/zip",
+        disposition: None,
+        ctx,
+    };
+    let scanned = |member: crate::models::repository::Repository, policy| async move {
+        let upstream_url = member.upstream_url.clone().unwrap_or_default();
+        serve_scanned_go_zip(
+            state,
+            proxy,
+            (member.id, &member.key, &upstream_url),
+            zip,
+            policy,
+            ctx,
+        )
+        .await
+    };
+    crate::api::handlers::proxy_scan_archive::walk_scanned_archive_members(
+        state, virtual_id, members, runs, scanned,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -4042,6 +4305,204 @@ mod catalog_registration_tests {
                 expect_scan,
                 "scan_on_upload={on_upload}: {scans} scans"
             );
+        }
+    }
+}
+
+/// #4103: scan-on-proxy on Go module zips, Remote and Virtual, through the
+/// shared archive scenarios, plus the Go identity rule.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod scan_on_proxy_4103 {
+    use super::*;
+    use crate::api::handlers::proxy_scan_archive::test_support::{archive_scan_suite, ArchiveCase};
+    use crate::api::handlers::proxy_scan_archive::{self, ArchiveIdentity};
+
+    const MODULE: &str = "example.com/dtf/Scanned";
+    const VERSION: &str = "v1.0.0";
+
+    fn zip_of(entries: &[(&str, String)]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            for (name, data) in entries {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, data.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// A real module zip for `module@version` whose `go.mod` declares
+    /// `declared`. The random comment keeps every fixture's digest unique.
+    fn module_zip(module: &str, version: &str, declared: &str) -> Vec<u8> {
+        zip_of(&[
+            (
+                &format!("{module}@{version}/go.mod"),
+                format!("module {declared} // {}\n\ngo 1.21\n", uuid::Uuid::new_v4()),
+            ),
+            (
+                &format!("{module}@{version}/x.go"),
+                "package x\n".to_string(),
+            ),
+        ])
+    }
+
+    fn case(_mock: &str) -> ArchiveCase {
+        let upstream = build_go_upstream_path(MODULE, VERSION, "zip");
+        ArchiveCase {
+            format: "go",
+            router: super::router,
+            uri: Box::new(|key| format!("/{key}/{}/@v/{VERSION}.zip", encode_module_path(MODULE))),
+            package_path: format!("/{upstream}"),
+            extra: Vec::new(),
+            body: module_zip(MODULE, VERSION, MODULE),
+            recorded_path: upstream,
+            file: format!("{VERSION}.zip"),
+        }
+    }
+
+    archive_scan_suite!(case);
+
+    /// #4365 item 3: a `?` in the version moves the route's suffix into the
+    /// upstream query, so `v1.0.0.zip%3F.mod` asked the upstream for the
+    /// module zip on the unscanned `.mod` (and `.info`) route and served it,
+    /// even while the zip route withheld the same bytes. Refused with 400 on
+    /// every operation of a proxying repository, before any upstream fetch.
+    #[tokio::test]
+    async fn a_query_smuggled_into_the_version_is_refused() {
+        let Some(rig) = proxy_scan_archive::test_support::Rig::new(case, Some("fail_closed")).await
+        else {
+            return;
+        };
+        let module = encode_module_path(MODULE);
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for op in [
+                format!("@v/{VERSION}.zip%3F.mod"),
+                format!("@v/{VERSION}.zip%3F.info"),
+                format!("@v/{VERSION}.zip%3Fx.zip"),
+                format!("@v/{VERSION}.zip%23.mod"),
+                format!("@v/{VERSION}.zip%3B.mod"),
+            ] {
+                let (status, body, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(format!("/{key}/{module}/{op}")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{key} {op}");
+                assert_ne!(&body[..], &rig.case.body[..], "{key} {op}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        // The well-formed zip route still answers through the gate.
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED);
+        rig.teardown().await;
+    }
+
+    #[test]
+    fn a_zip_that_is_the_requested_module_is_graded_on_its_contents() {
+        let zip = Bytes::from(module_zip(MODULE, VERSION, MODULE));
+        assert_eq!(
+            go_zip_identity(MODULE, VERSION, &zip),
+            ArchiveIdentity::ContentGraded
+        );
+        // A pre-modules zip has no go.mod; the prefix still has to hold.
+        let legacy = Bytes::from(zip_of(&[(
+            &format!("{MODULE}@{VERSION}/x.go"),
+            "package x\n".to_string(),
+        )]));
+        assert_eq!(
+            go_zip_identity(MODULE, VERSION, &legacy),
+            ArchiveIdentity::ContentGraded
+        );
+        // A quoted module path with a trailing comment is the same module.
+        let quoted = Bytes::from(zip_of(&[(
+            &format!("{MODULE}@{VERSION}/go.mod"),
+            format!("// header\nmodule \"{MODULE}\" // c\n"),
+        )]));
+        assert_eq!(
+            go_zip_identity(MODULE, VERSION, &quoted),
+            ArchiveIdentity::ContentGraded
+        );
+    }
+
+    #[test]
+    fn a_zip_that_is_not_the_requested_module_is_unestablished() {
+        // go.mod names another module.
+        let other = Bytes::from(module_zip(MODULE, VERSION, "example.com/other"));
+        assert!(matches!(
+            go_zip_identity(MODULE, VERSION, &other),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        // Files of another version (the version lives only in the prefix).
+        let wrong_version = Bytes::from(module_zip(MODULE, "v2.0.0", MODULE));
+        assert!(matches!(
+            go_zip_identity(MODULE, VERSION, &wrong_version),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        // One stray entry outside the prefix is enough.
+        let stray = Bytes::from(zip_of(&[
+            (
+                &format!("{MODULE}@{VERSION}/go.mod"),
+                format!("module {MODULE}\n"),
+            ),
+            ("other@v1.0.0/x.go", "package x\n".to_string()),
+        ]));
+        assert!(matches!(
+            go_zip_identity(MODULE, VERSION, &stray),
+            ArchiveIdentity::Disagrees(_)
+        ));
+        // Not a zip, an empty zip, a go.mod with no module directive.
+        for bytes in [
+            Bytes::from_static(b"not a zip"),
+            Bytes::from(zip_of(&[])),
+            Bytes::from(zip_of(&[(
+                &format!("{MODULE}@{VERSION}/go.mod"),
+                "go 1.21\n".to_string(),
+            )])),
+        ] {
+            assert!(matches!(
+                go_zip_identity(MODULE, VERSION, &bytes),
+                ArchiveIdentity::Unreadable(_)
+            ));
+        }
+    }
+}
+
+/// #4365 item 1: Go decides by route (every `.zip` on the zip route is a
+/// package); the cache key is the encoded `{module}/@v/{version}.zip` path.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod serve_key_4365_tests {
+    use super::*;
+
+    #[test]
+    fn go_zip_serve_key_table() {
+        for (module, version, key) in [
+            (
+                "golang.org/x/text",
+                "v0.3.0",
+                "golang.org/x/text/@v/v0.3.0.zip",
+            ),
+            (
+                "github.com/Azure/go-sdk",
+                "v1.2.3-RC1",
+                "github.com/!azure/go-sdk/@v/v1.2.3-!r!c1.zip",
+            ),
+        ] {
+            let got = go_zip_serve_key(module, version);
+            assert_eq!(got.cache_key, key);
+            assert!(got.scannable);
         }
     }
 }

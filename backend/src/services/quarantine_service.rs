@@ -733,6 +733,39 @@ pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()>
     enforce_scan_policy_gate(db, artifact_id, repository_id).await
 }
 
+/// The fields [`enforce_download_gate_for_row`] needs, read by the caller in
+/// the same statement that resolved the artifact (#4181).
+#[derive(Debug, Clone)]
+pub struct DownloadGateRow<'a> {
+    pub artifact_id: Uuid,
+    /// The artifact's owning repository.
+    pub repository_id: Uuid,
+    pub quarantine_status: Option<&'a str>,
+    pub quarantine_until: Option<DateTime<Utc>>,
+    /// Whether any enabled scan policy (repository-specific or global)
+    /// applies to `repository_id`: the predicate
+    /// `PolicyService::evaluate_artifact` loads its policies with. A caller
+    /// that cannot tell must pass `true`.
+    pub scan_policy_applies: bool,
+}
+
+/// [`enforce_download_gate`] for a caller that already holds the artifact's
+/// quarantine fields and knows whether a scan policy applies, so the common
+/// download (no hold, no scan policy) costs no further statement (#4181).
+///
+/// Same decision, same order, same responses: the quarantine state first
+/// (409 quarantined / 403 rejected, see [`check_download_allowed`]), then the
+/// scan-policy gate. Skipping the policy evaluation when no enabled policy
+/// applies is exactly what `evaluate_artifact` does itself (it answers
+/// `allowed` for an empty policy set), only without the round trip.
+pub async fn enforce_download_gate_for_row(db: &PgPool, row: &DownloadGateRow<'_>) -> Result<()> {
+    check_download_allowed(row.quarantine_status, row.quarantine_until, Utc::now())?;
+    if !row.scan_policy_applies {
+        return Ok(());
+    }
+    enforce_scan_policy_gate(db, row.artifact_id, row.repository_id).await
+}
+
 /// The scan-policy half of [`enforce_download_gate`], for callers that have
 /// ALREADY applied the quarantine half from a row they hold (#3220).
 ///

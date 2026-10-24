@@ -594,6 +594,7 @@ pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
     (274, "idx_scan_results_dedup_local"),
     (281, "idx_proxy_dl_stats_repo_path"),
     (283, "idx_proxy_dl_stats_ip"),
+    (297, "idx_proxy_dl_stats_checksum"),
 ];
 
 /// The index names from `table` whose migration version is not in

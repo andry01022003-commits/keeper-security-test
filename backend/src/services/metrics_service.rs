@@ -3,9 +3,22 @@
 //! HTTP request instrumentation lives in `crate::api::middleware::metrics`.
 //! This module provides helpers for recording domain-specific metrics such as
 //! artifact uploads/downloads, security scans, backups, and storage gauges.
+//!
+//! The `metrics` facade can fan out to more than one recorder: `/metrics` is
+//! always served from the Prometheus recorder, and when OTLP metrics export is
+//! configured an OTel recorder is installed alongside it (#4337, see
+//! [`install_otel_recorder`]). The handle returned by [`init_metrics`] keeps
+//! rendering the Prometheus half.
+
+use std::sync::Mutex;
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+
+/// The OpenTelemetry recorder handed over by `telemetry::init_tracing`, waiting
+/// for [`init_metrics`] to install it beside the Prometheus recorder.
+static PENDING_OTEL_RECORDER: Mutex<Option<Box<dyn metrics::Recorder + Send + Sync>>> =
+    Mutex::new(None);
 
 /// Name of the HTTP request latency histogram recorded by
 /// `crate::api::middleware::metrics`.
@@ -40,10 +53,53 @@ pub fn prometheus_builder() -> PrometheusBuilder {
 }
 
 /// Initialize the Prometheus metrics recorder and return the handle for rendering.
+///
+/// When OTLP metrics export is configured, `telemetry::init_tracing` (which
+/// `main` runs first) has handed an OpenTelemetry recorder to
+/// [`install_otel_recorder`]; the global recorder is then a fan-out of the
+/// Prometheus recorder and that one, so `/metrics` reports exactly what it
+/// does without OTLP. The `metrics` facade accepts one global recorder per
+/// process, which is why both halves are installed here, once, rather than the
+/// OTel half being added later.
 pub fn init_metrics() -> PrometheusHandle {
-    prometheus_builder()
-        .install_recorder()
-        .expect("failed to install Prometheus recorder")
+    let otel = PENDING_OTEL_RECORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (recorder, handle) = build_global_recorder(otel);
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus recorder");
+    handle
+}
+
+/// The recorder [`init_metrics`] installs: the Prometheus recorder alone, or a
+/// fan-out of it and `otel`.
+pub(crate) fn build_global_recorder(
+    otel: Option<Box<dyn metrics::Recorder + Send + Sync>>,
+) -> (Box<dyn metrics::Recorder + Sync>, PrometheusHandle) {
+    let prometheus = prometheus_builder().build_recorder();
+    let handle = prometheus.handle();
+    let recorder: Box<dyn metrics::Recorder + Sync> = match otel {
+        Some(otel) => Box::new(
+            metrics_util::layers::FanoutBuilder::default()
+                .add_recorder(prometheus)
+                .add_recorder(otel)
+                .build(),
+        ),
+        None => Box::new(prometheus),
+    };
+    (recorder, handle)
+}
+
+/// Hand the OpenTelemetry `metrics` recorder to [`init_metrics`] (#4337).
+///
+/// Called by `telemetry::init_tracing` when OTLP metrics export is enabled,
+/// which `main` does before it calls [`init_metrics`] (the recorder must be in
+/// place before the startup pool connect records anything, #4828). Nothing is
+/// recorded to OTLP until [`init_metrics`] has installed the fan-out.
+pub fn install_otel_recorder(otel: impl metrics::Recorder + Send + Sync + 'static) {
+    *PENDING_OTEL_RECORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(otel));
 }
 
 /// Count one HTTP connection closed because the client did not deliver a
@@ -716,6 +772,54 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
     .increment(1);
 }
 
+/// Why a proxy-cache publish failed (#4319). A bounded label set: the class
+/// says which step of the publish refused, not what the error text was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyCachePublishFailure {
+    /// Writing the body to the backend failed: the buffered `put`, or the
+    /// streaming `put_stream` into the staging key, for a reason on the
+    /// storage side (an upstream error or the per-object ceiling is not
+    /// counted, the backend did nothing wrong there).
+    PutFailed,
+    /// The backend refused the server-side copy from the staging key onto the
+    /// live key (the GCS S3-compatible API answering 411 before #3737 was
+    /// this class).
+    CopyRejected,
+    /// The copy reported success but the live key does not hold the staged
+    /// bytes: a different size, or the ETag of an empty object (#4630).
+    PublishMismatch,
+    /// The body landed but the metadata sidecar that commits it could not be
+    /// written, so the entry reads as a miss.
+    CommitFailed,
+}
+
+impl ProxyCachePublishFailure {
+    /// The `class` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PutFailed => "put_failed",
+            Self::CopyRejected => "copy_rejected",
+            Self::PublishMismatch => "publish_mismatch",
+            Self::CommitFailed => "commit_failed",
+        }
+    }
+}
+
+/// Record a proxy-cache publish that failed (#4319), labelled by the storage
+/// backend the proxy cache runs on and the failure class. The body was still
+/// served to the client; only the cache write was lost, so before this a
+/// backend that silently refused every cache write showed up in the logs
+/// only. Alert on `sum by (backend, class)
+/// (rate(ak_proxy_cache_publish_failures_total[5m])) > 0`.
+pub fn record_proxy_cache_publish_failure(backend: &'static str, class: ProxyCachePublishFailure) {
+    counter!(
+        "ak_proxy_cache_publish_failures_total",
+        "backend" => backend,
+        "class" => class.as_str()
+    )
+    .increment(1);
+}
+
 /// Record a proxy serve that kept a cached body because upstream answered a
 /// definitive 404/410 and the repository's `on_upstream_not_found` policy is
 /// `keep` (#4640). The counter is the observable signal that a served body no
@@ -724,6 +828,33 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
 pub fn record_proxy_kept_on_upstream_not_found(repo_key: &str) {
     counter!(
         "ak_proxy_kept_on_upstream_not_found_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
+/// Entries and bytes the per-Remote proxy-cache cap evicted (#4660). A
+/// steady rate means the cap is smaller than the repository's working set and
+/// clients are refetching what it evicts.
+pub fn record_proxy_cache_cap_evictions(repo_key: &str, entries: u64, bytes: u64) {
+    counter!(
+        "ak_proxy_cache_cap_evicted_entries_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(entries);
+    counter!(
+        "ak_proxy_cache_cap_evicted_bytes_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(bytes);
+}
+
+/// An eviction run for the per-Remote proxy-cache cap could not get the cache
+/// under its cap, so the repository refuses new cache fills for a while
+/// (#4660). Any increment needs attention: storage is refusing deletes.
+pub fn record_proxy_cache_cap_refusing(repo_key: &str) {
+    counter!(
+        "ak_proxy_cache_cap_refusing_total",
         "repository" => repo_key.to_string()
     )
     .increment(1);

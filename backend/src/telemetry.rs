@@ -1,18 +1,25 @@
 //! Telemetry initialization: tracing subscriber with optional OpenTelemetry export.
 //!
-//! When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an OTLP span exporter is added
-//! alongside the existing stdout fmt layer. When unset, behavior is identical
-//! to the previous stdout-only setup.
+//! When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an OTLP span exporter
+//! (`tracing-opentelemetry`) is added alongside the existing stdout fmt layer,
+//! and log records (`otel_logs`) and metric measurements (`otel_metrics`, a
+//! `metrics` recorder) can be exported to the same collector as well (#4337).
+//! When unset, behavior is identical to the previous stdout-only setup.
+//!
+//! The OpenTelemetry-standard `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER`
+//! / `OTEL_LOGS_EXPORTER` variables pick the signals: traces are exported
+//! unless set to `none`, logs and metrics only when set to `otlp` (see
+//! [`SignalExporter`]).
 //!
 //! The transport protocol is selected via the standard `OTEL_EXPORTER_OTLP_PROTOCOL`
 //! environment variable:
 //!   - `grpc` (default) -- gRPC over HTTP/2 using tonic
 //!   - `http/protobuf`  -- HTTP/1.1 with binary protobuf bodies using the
 //!     blocking reqwest client (see the `opentelemetry-otlp` feature note in
-//!     the workspace `Cargo.toml`). Two sites must not see an async client:
-//!     `BatchSpanProcessor` exports from a dedicated thread with no Tokio
-//!     runtime, and exporter construction runs inside `#[tokio::main]` --
-//!     otlp builds the blocking client via `std::thread::spawn(…).join()`,
+//!     the workspace `Cargo.toml`). Span and log batches are driven from a
+//!     dedicated thread with no Tokio runtime, so those exporters must not use
+//!     an async client, and exporter construction runs inside `#[tokio::main]`
+//!     -- otlp builds the blocking client via `std::thread::spawn(…).join()`,
 //!     so it is never constructed on the runtime either.
 //!
 //! The diagnostics stdout format is selected via `LOG_FORMAT`:
@@ -30,9 +37,11 @@
 
 mod db_spans;
 mod json_log;
+mod otel_logs;
+mod otel_metrics;
 
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -166,6 +175,182 @@ enum OtlpProtocol {
     HttpProtobuf,
 }
 
+/// Which OTLP signals are exported, from the OpenTelemetry-standard
+/// `OTEL_<SIGNAL>_EXPORTER` variables (#4337).
+///
+/// | Variable | unset | `otlp` | `none` |
+/// |---|---|---|---|
+/// | `OTEL_TRACES_EXPORTER`  | exported | exported | not exported |
+/// | `OTEL_LOGS_EXPORTER`    | not exported | exported | not exported |
+/// | `OTEL_METRICS_EXPORTER` | not exported | exported | not exported |
+///
+/// Traces keep the behaviour they had before #4337: setting
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` exports them. Logs and metrics are opt-in on
+/// top of that. The OpenTelemetry specification defaults every signal to
+/// `otlp`, but a deployment that already points the endpoint at a
+/// traces-only backend (Tempo, Jaeger) would start sending it two signals it
+/// rejects on upgrade, and stdout logging would be duplicated into the
+/// collector without anyone asking for it. Any other value (`console`,
+/// `prometheus`, a typo) is not supported: it keeps the signal's default and
+/// is reported by [`SignalExporter::unsupported`] so startup can warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SignalExporter {
+    traces: bool,
+    metrics: bool,
+    logs: bool,
+}
+
+/// One `OTEL_<SIGNAL>_EXPORTER` value, parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalSetting {
+    Unset,
+    Otlp,
+    None,
+    Unsupported,
+}
+
+impl SignalSetting {
+    /// Parse a raw value: case-insensitive, surrounding whitespace ignored, an
+    /// empty value is the same as unset.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") => Self::Unset,
+            Some(v) if v.eq_ignore_ascii_case("otlp") => Self::Otlp,
+            Some(v) if v.eq_ignore_ascii_case("none") => Self::None,
+            Some(_) => Self::Unsupported,
+        }
+    }
+
+    /// Whether the signal is exported, given its default when unset.
+    fn enabled(self, default: bool) -> bool {
+        match self {
+            Self::Otlp => true,
+            Self::None => false,
+            Self::Unset | Self::Unsupported => default,
+        }
+    }
+}
+
+/// Variable names, in the order [`SignalExporter::from_values`] takes them.
+const SIGNAL_EXPORTER_VARS: [&str; 3] = [
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+];
+
+impl SignalExporter {
+    /// Resolve the three signals from their raw variable values (traces,
+    /// metrics, logs).
+    fn from_values(traces: Option<&str>, metrics: Option<&str>, logs: Option<&str>) -> Self {
+        Self {
+            traces: SignalSetting::parse(traces).enabled(true),
+            metrics: SignalSetting::parse(metrics).enabled(false),
+            logs: SignalSetting::parse(logs).enabled(false),
+        }
+    }
+
+    fn from_env() -> Self {
+        let [traces, metrics, logs] = SIGNAL_EXPORTER_VARS.map(|v| std::env::var(v).ok());
+        Self::from_values(traces.as_deref(), metrics.as_deref(), logs.as_deref())
+    }
+
+    /// The `OTEL_<SIGNAL>_EXPORTER` variables set to a value other than
+    /// `otlp` or `none`, with that value, for a startup warning.
+    fn unsupported() -> Vec<(&'static str, String)> {
+        SIGNAL_EXPORTER_VARS
+            .into_iter()
+            .filter_map(|var| {
+                let value = std::env::var(var).ok()?;
+                (SignalSetting::parse(Some(&value)) == SignalSetting::Unsupported)
+                    .then_some((var, value))
+            })
+            .collect()
+    }
+
+    /// The enabled signals, for the startup log line.
+    fn names(self) -> String {
+        let mut names = Vec::new();
+        if self.traces {
+            names.push("traces");
+        }
+        if self.metrics {
+            names.push("metrics");
+        }
+        if self.logs {
+            names.push("logs");
+        }
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(",")
+        }
+    }
+}
+
+/// An OTLP signal other than traces, for [`signal_endpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OtlpSignal {
+    Logs,
+    Metrics,
+}
+
+impl OtlpSignal {
+    /// The per-signal endpoint variable of the OpenTelemetry specification.
+    fn endpoint_var(self) -> &'static str {
+        match self {
+            Self::Logs => "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            Self::Metrics => "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        }
+    }
+
+    /// The OTLP/HTTP path of the signal.
+    fn http_path(self) -> &'static str {
+        match self {
+            Self::Logs => "/v1/logs",
+            Self::Metrics => "/v1/metrics",
+        }
+    }
+}
+
+/// The endpoint the logs or metrics exporter is built with.
+///
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is handed to the span exporter verbatim, and
+/// a programmatic endpoint is never extended with a signal path by
+/// `opentelemetry-otlp`. For http/protobuf deployments therefore set it to the
+/// full traces URL (`http://collector:4318/v1/traces`); reusing that URL for
+/// logs and metrics would post them to the traces path, which a collector
+/// rejects. So, in order:
+///
+/// 1. `OTEL_EXPORTER_OTLP_{LOGS,METRICS}_ENDPOINT`, when set, verbatim;
+/// 2. gRPC: the shared endpoint (one service serves every signal);
+/// 3. http/protobuf: the shared endpoint with a trailing `/v1/traces`
+///    replaced by the signal's path, or the signal's path appended when the
+///    endpoint does not end in `/v1/traces`.
+fn signal_endpoint(
+    protocol: OtlpProtocol,
+    endpoint: &str,
+    signal: OtlpSignal,
+    signal_override: Option<&str>,
+) -> String {
+    if let Some(explicit) = signal_override.map(str::trim).filter(|v| !v.is_empty()) {
+        return explicit.to_owned();
+    }
+    match protocol {
+        OtlpProtocol::Grpc => endpoint.to_owned(),
+        OtlpProtocol::HttpProtobuf => {
+            let base = endpoint.trim_end_matches('/');
+            let base = base.strip_suffix("/v1/traces").unwrap_or(base);
+            format!("{base}{}", signal.http_path())
+        }
+    }
+}
+
+/// [`signal_endpoint`] with the per-signal override read from the environment.
+fn signal_endpoint_from_env(protocol: OtlpProtocol, endpoint: &str, signal: OtlpSignal) -> String {
+    let explicit = std::env::var(signal.endpoint_var()).ok();
+    signal_endpoint(protocol, endpoint, signal, explicit.as_deref())
+}
+
 impl OtlpProtocol {
     /// Parse a protocol value string. Defaults to gRPC for unrecognised values,
     /// matching the OTel spec default.
@@ -194,28 +379,106 @@ impl OtlpProtocol {
 
 /// Build the OTel resource describing this service.
 fn build_otel_resource(service_name: &str) -> Resource {
-    Resource::builder()
-        .with_attributes([
-            KeyValue::new("service.name", service_name.to_owned()),
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_owned()),
-        ])
-        .build()
+    let mut attributes = vec![
+        KeyValue::new("service.name", service_name.to_owned()),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_owned()),
+    ];
+    if let Some(instance) = service_instance_id(
+        std::env::var("OTEL_RESOURCE_ATTRIBUTES").ok().as_deref(),
+        std::env::var("HOSTNAME").ok().as_deref(),
+    ) {
+        attributes.push(KeyValue::new("service.instance.id", instance));
+    }
+    Resource::builder().with_attributes(attributes).build()
 }
 
-/// Build an OTLP span exporter for the given protocol and endpoint.
-fn build_span_exporter(protocol: OtlpProtocol, endpoint: &str) -> SpanExporter {
-    match protocol {
+/// The `service.instance.id` resource attribute, shared by every signal.
+///
+/// Metrics pushed over OTLP carry no scrape `instance` label, so without this
+/// the cumulative series of two replicas would collide in the collector (#4337).
+/// `None` when `OTEL_RESOURCE_ATTRIBUTES` already sets it (the SDK's
+/// environment detector supplies it then, and an explicit attribute here
+/// would override the operator's value). Otherwise `HOSTNAME` (the pod name
+/// under Kubernetes, the container id under Docker), or a random UUID when
+/// that is unset.
+fn service_instance_id(
+    resource_attributes: Option<&str>,
+    hostname: Option<&str>,
+) -> Option<String> {
+    let set_by_operator = resource_attributes.is_some_and(|attrs| {
+        attrs
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .any(|(key, _)| key.trim() == "service.instance.id")
+    });
+    if set_by_operator {
+        return None;
+    }
+    Some(
+        hostname
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+    )
+}
+
+/// Build an OTLP span exporter for the given protocol and endpoint. Fails
+/// soft like [`build_metric_exporter`] (#4931): before 1.12.0 an unparseable
+/// endpoint panicked at startup.
+fn build_span_exporter(protocol: OtlpProtocol, endpoint: &str) -> Option<SpanExporter> {
+    let built = match protocol {
         OtlpProtocol::Grpc => SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
-            .build()
-            .expect("Failed to create OTLP gRPC span exporter"),
+            .build(),
         OtlpProtocol::HttpProtobuf => SpanExporter::builder()
             .with_http()
             .with_endpoint(endpoint)
-            .build()
-            .expect("Failed to create OTLP HTTP/protobuf span exporter"),
-    }
+            .build(),
+    };
+    built
+        .inspect_err(|e| eprintln!("OTLP span export disabled, exporter for {endpoint}: {e}"))
+        .ok()
+}
+
+/// Build an OTLP metric exporter for the given protocol and endpoint.
+///
+/// Fails soft: an exporter that cannot be built (an unparseable endpoint) is
+/// reported and the signal stays off, rather than aborting startup. An
+/// unreachable collector is not a build error; connections are made lazily.
+fn build_metric_exporter(protocol: OtlpProtocol, endpoint: &str) -> Option<MetricExporter> {
+    let built = match protocol {
+        OtlpProtocol::Grpc => MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build(),
+        OtlpProtocol::HttpProtobuf => MetricExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build(),
+    };
+    built
+        .inspect_err(|e| eprintln!("OTLP metric export disabled, exporter for {endpoint}: {e}"))
+        .ok()
+}
+
+/// Build an OTLP log exporter for the given protocol and endpoint. Fails soft
+/// like [`build_metric_exporter`].
+fn build_log_exporter(protocol: OtlpProtocol, endpoint: &str) -> Option<LogExporter> {
+    let built = match protocol {
+        OtlpProtocol::Grpc => LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build(),
+        OtlpProtocol::HttpProtobuf => LogExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build(),
+    };
+    built
+        .inspect_err(|e| eprintln!("OTLP log export disabled, exporter for {endpoint}: {e}"))
+        .ok()
 }
 
 /// Trace sampler, selected by the OpenTelemetry-standard
@@ -360,24 +623,26 @@ fn build_sampler(choice: SamplerChoice, ratio: f64) -> opentelemetry_sdk::trace:
 /// Initialize the tracing subscriber.
 ///
 /// Returns an optional guard that must be held for the lifetime of the
-/// application to ensure spans are flushed on shutdown.
+/// application to ensure spans, log records and metric measurements are
+/// flushed on shutdown.
 pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<OtelGuard> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        "artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info".into()
-    });
     let log_format = LogFormat::from_env();
     let log_ansi = LogAnsi::from_env().resolve_from_env();
 
-    match otel_endpoint {
+    match otel_endpoint_if_set(otel_endpoint) {
         Some(endpoint) => {
             let protocol = OtlpProtocol::from_env();
-            let guard = init_with_otel(
+            let requested = SignalExporter::from_env();
+            let (db_query_spans, unsupported_db_query_spans) = db_spans::DbQuerySpans::from_env();
+            let (guard, signals) = init_with_otel(
                 endpoint,
                 service_name,
-                env_filter,
+                subscriber_filters(rust_log_filter, db_query_spans),
                 protocol,
                 log_format,
                 log_ansi,
+                requested,
+                db_query_spans,
             );
             // Log the resolved sampler: a typo in OTEL_TRACES_SAMPLER falls
             // back to the default rather than failing startup, so the only way
@@ -388,20 +653,38 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
                 otel_endpoint = endpoint,
                 service_name,
                 protocol = protocol.name(),
+                signals = signals.names(),
                 log_format = log_format.name(),
                 log_ansi,
                 sampler = sampler_choice.name(),
+                db_query_spans = db_query_spans.name(),
                 sampler_ratio = sampler_choice
                     .uses_ratio()
                     .then(sampler_ratio_from_env)
                     .map(tracing::field::display),
                 "OpenTelemetry tracing enabled"
             );
+            for (var, value) in SignalExporter::unsupported() {
+                tracing::warn!(
+                    variable = var,
+                    value = %value,
+                    "unsupported OTel exporter value, only `otlp` and `none` are recognised; \
+                     the signal keeps its default"
+                );
+            }
+            if let Some(value) = unsupported_db_query_spans {
+                tracing::warn!(
+                    variable = db_spans::DB_QUERY_SPANS_VAR,
+                    value = %value,
+                    "unsupported DB_QUERY_SPANS value, only `log`, `all` and `off` are \
+                     recognised; DB spans follow RUST_LOG"
+                );
+            }
             Some(guard)
         }
         None => {
             tracing_subscriber::registry()
-                .with(env_filter)
+                .with(rust_log_filter())
                 .with(build_fmt_layer(log_format, log_ansi))
                 .init();
             None
@@ -409,51 +692,250 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
     }
 }
 
-/// Guard that shuts down the OTel tracer provider on drop,
-/// flushing any pending spans.
-pub struct OtelGuard {
-    provider: opentelemetry_sdk::trace::SdkTracerProvider,
+/// The OTLP endpoint to export to, if any. An empty or blank
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` counts as unset (#4931): before 1.12.0 it
+/// turned the OTel path on with an endpoint nothing could be sent to.
+fn otel_endpoint_if_set(endpoint: Option<&str>) -> Option<&str> {
+    endpoint.map(str::trim).filter(|e| !e.is_empty())
 }
 
-impl Drop for OtelGuard {
-    fn drop(&mut self) {
-        if let Err(e) = self.provider.shutdown() {
-            eprintln!("Failed to shutdown OTel tracer provider: {e:?}");
+/// The filter used when `RUST_LOG` is unset or invalid.
+const DEFAULT_RUST_LOG: &str = "artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info";
+
+/// The `RUST_LOG` filter, or [`DEFAULT_RUST_LOG`].
+fn rust_log_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_RUST_LOG.into())
+}
+
+/// The filters of the OTLP-path subscriber (#3954).
+///
+/// With DB spans following `RUST_LOG` (the default) there is one global
+/// filter, `RUST_LOG`, exactly as before. With `DB_QUERY_SPANS=all` the
+/// global filter is `RUST_LOG` plus [`db_spans::ALL_QUERIES_DIRECTIVE`], so
+/// the DB span layer sees every statement, and `RUST_LOG` itself becomes the
+/// per-layer filter of the stdout layer and of the OTel log layer, so neither
+/// shows a statement `RUST_LOG` did not ask for. The span export layer needs
+/// none: the only events the extra directive admits are `sqlx::query`
+/// events, which [`db_spans::otel_export_layer`] already drops.
+struct SubscriberFilters {
+    global: EnvFilter,
+    stdout: Option<EnvFilter>,
+    exported_logs: Option<EnvFilter>,
+}
+
+/// Build the [`SubscriberFilters`] for `db_query_spans`; `rust_log` builds a
+/// fresh `RUST_LOG` filter (an `EnvFilter` is not `Clone`).
+fn subscriber_filters(
+    rust_log: impl Fn() -> EnvFilter,
+    db_query_spans: db_spans::DbQuerySpans,
+) -> SubscriberFilters {
+    if db_query_spans.needs_per_layer_log_filters() {
+        let all_queries = db_spans::ALL_QUERIES_DIRECTIVE
+            .parse()
+            .expect("the all-queries directive is valid");
+        SubscriberFilters {
+            global: rust_log().add_directive(all_queries),
+            stdout: Some(rust_log()),
+            exported_logs: Some(rust_log()),
+        }
+    } else {
+        SubscriberFilters {
+            global: rust_log(),
+            stdout: None,
+            exported_logs: None,
         }
     }
 }
 
+/// The stdout layer of the OTLP-path subscriber, under its global filter.
+type FmtLayer = Box<
+    dyn Layer<tracing_subscriber::layer::Layered<EnvFilter, tracing_subscriber::Registry>>
+        + Send
+        + Sync,
+>;
+
+/// The OTLP-path subscriber: `filters`, the stdout layer, the OTel log layer
+/// (when logs are exported), the span export layer and, when `db_tracer` is
+/// given, the DB span layer.
+fn otel_path_subscriber(
+    filters: SubscriberFilters,
+    fmt_layer: FmtLayer,
+    log_layer: Option<otel_logs::OtelLogLayer>,
+    tracer: opentelemetry_sdk::trace::SdkTracer,
+    db_tracer: Option<opentelemetry_sdk::trace::SdkTracer>,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    let SubscriberFilters {
+        global,
+        stdout,
+        exported_logs,
+    } = filters;
+    tracing_subscriber::registry()
+        .with(global)
+        .with(fmt_layer.with_filter(stdout))
+        .with(layer_or_identity(
+            log_layer.map(|layer| layer.with_filter(exported_logs)),
+        ))
+        // sqlx's per-statement events carry SQL text and stay out of the OTel
+        // export; stdout and the DB span layer below still see them (#4455).
+        .with(db_spans::otel_export_layer(tracer))
+        // Per-query DB `CLIENT` spans from sqlx's `sqlx::query` events (#4455).
+        .with(layer_or_identity(
+            db_tracer.map(db_spans::DbQuerySpanLayer::new),
+        ))
+}
+
+/// `layer`, or a layer that does nothing.
+///
+/// Not `Option<L>`: tracing-subscriber's `Layer` impl for `Option` does not
+/// forward `on_register_dispatch`, and both the OTel log layer and the DB
+/// span layer use the dispatch to look up the enclosing span's OTel context.
+/// In an `Option` the DB span layer exports nothing at all, and the log layer
+/// only keeps its trace ids because the SDK falls back to the active OTel
+/// context.
+fn layer_or_identity<S, L>(layer: Option<L>) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    L: Layer<S> + Send + Sync + 'static,
+{
+    match layer {
+        Some(layer) => layer.boxed(),
+        None => tracing_subscriber::layer::Identity::new().boxed(),
+    }
+}
+
+/// Guard that shuts the OTel providers down on drop, flushing any pending
+/// spans, log records and metric measurements.
+pub struct OtelGuard {
+    provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider>,
+    /// Kept alive here so the [`PeriodicReader`] it owns keeps pushing
+    /// measurements to the collector for the lifetime of the process.
+    ///
+    /// [`PeriodicReader`]: opentelemetry_sdk::metrics::PeriodicReader
+    _meter_provider: Option<otel_metrics::MetricsGuard>,
+}
+
+impl Drop for OtelGuard {
+    /// Shut the three providers down at the same time (#4931). Each flush waits
+    /// up to a few seconds for an unreachable collector; one after the other
+    /// they took about 15 s, longer than the 10 s a container runtime grants
+    /// before `SIGKILL`, so the final flush was lost. Concurrently the wait is
+    /// that of the slowest one.
+    fn drop(&mut self) {
+        let meter_provider = self._meter_provider.take();
+        let provider = &self.provider;
+        let logger_provider = self.logger_provider.as_ref();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if let Err(e) = provider.shutdown() {
+                    eprintln!("Failed to shutdown OTel tracer provider: {e:?}");
+                }
+            });
+            if let Some(logger_provider) = logger_provider {
+                scope.spawn(move || {
+                    if let Err(e) = logger_provider.shutdown() {
+                        eprintln!("Failed to shutdown OTel logger provider: {e:?}");
+                    }
+                });
+            }
+            if let Some(meter_provider) = meter_provider {
+                // Dropping the guard shuts the meter provider down.
+                scope.spawn(move || drop(meter_provider));
+            }
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn init_with_otel(
     endpoint: &str,
     service_name: &str,
-    env_filter: EnvFilter,
+    filters: SubscriberFilters,
     protocol: OtlpProtocol,
     log_format: LogFormat,
     log_ansi: bool,
-) -> OtelGuard {
+    requested: SignalExporter,
+    db_query_spans: db_spans::DbQuerySpans,
+) -> (OtelGuard, SignalExporter) {
     use opentelemetry::trace::TracerProvider;
-    use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
 
-    let exporter = build_span_exporter(protocol, endpoint);
+    let mut signals = requested;
+
     let resource = build_otel_resource(service_name);
 
-    let sampler_choice = SamplerChoice::from_env();
-    let sampler_ratio = sampler_ratio_from_env();
+    // Metrics (#4337). The recorder is handed to `metrics_service`, which
+    // installs it together with the Prometheus recorder when `main` calls
+    // `init_metrics`; the guard owns the provider for the process lifetime.
+    let metrics_exporter = signals
+        .metrics
+        .then(|| {
+            let endpoint = signal_endpoint_from_env(protocol, endpoint, OtlpSignal::Metrics);
+            build_metric_exporter(protocol, &endpoint)
+        })
+        .flatten();
+    signals.metrics = metrics_exporter.is_some();
+    let meter_provider = metrics_exporter.map(|exporter| {
+        let (recorder, provider) =
+            otel_metrics::build_otel_metrics_recorder(exporter, resource.clone());
+        crate::services::metrics_service::install_otel_recorder(recorder);
+        otel_metrics::MetricsGuard::new(provider)
+    });
 
-    let provider = SdkTracerProvider::builder()
-        .with_resource(resource)
-        .with_sampler(build_sampler(sampler_choice, sampler_ratio))
-        .with_span_processor(BatchSpanProcessor::builder(exporter).build())
-        .build();
+    // ── Traces ──────────────────────────────────────────────────────────
+    let span_exporter = signals
+        .traces
+        .then(|| build_span_exporter(protocol, endpoint))
+        .flatten();
+    signals.traces = span_exporter.is_some();
+    let provider = span_exporter.map(|exporter| {
+        use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
 
-    let tracer = provider.tracer("artifact-keeper");
-    // sqlx's per-statement events carry SQL text and stay out of the OTel
-    // export; stdout and the DB span layer below still see them (#4455).
-    let otel_layer = db_spans::otel_export_layer(tracer);
-    // Per-query DB `CLIENT` spans from sqlx's `sqlx::query` events (#4455).
-    // It sees what the filter above lets through: slow statements by default,
-    // every statement with `sqlx::query=debug`.
-    let db_span_layer = db_spans::DbQuerySpanLayer::new(provider.tracer("artifact-keeper"));
+        let sampler_choice = SamplerChoice::from_env();
+        let sampler_ratio = sampler_ratio_from_env();
+        SdkTracerProvider::builder()
+            .with_resource(resource.clone())
+            .with_sampler(build_sampler(sampler_choice, sampler_ratio))
+            .with_span_processor(BatchSpanProcessor::builder(exporter).build())
+            .build()
+    });
+
+    // The tracer provider always exists for the subscriber's layers (the SDK's
+    // default is a no-op provider when traces are disabled); the guard holds
+    // the export-backed one when traces are on.
+    let tracer_provider = provider.clone().unwrap_or_default();
+
+    let tracer = tracer_provider.tracer("artifact-keeper");
+    // The DB span layer sees what the global filter lets through: slow
+    // statements by default, every statement with `sqlx::query=debug` or
+    // `DB_QUERY_SPANS=all` (#3954); none with `DB_QUERY_SPANS=off`.
+    let db_tracer = db_query_spans
+        .enabled()
+        .then(|| tracer_provider.tracer("artifact-keeper"));
+
+    // Logs (#4337). The batch processor's queue is bounded
+    // (OTEL_BLRP_MAX_QUEUE_SIZE, 2048 by default) and drops records when the
+    // collector cannot keep up, so a slow or unreachable collector never
+    // blocks the thread that logged.
+    let log_exporter = signals
+        .logs
+        .then(|| {
+            let endpoint = signal_endpoint_from_env(protocol, endpoint, OtlpSignal::Logs);
+            build_log_exporter(protocol, &endpoint)
+        })
+        .flatten();
+    signals.logs = log_exporter.is_some();
+    let (logger_provider, log_layer) = match log_exporter {
+        Some(exporter) => {
+            use opentelemetry::logs::LoggerProvider as _;
+            let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+                .with_resource(resource.clone())
+                .with_batch_exporter(exporter)
+                .build();
+            let layer = otel_logs::OtelLogLayer::new(provider.logger("artifact-keeper"));
+            (Some(provider), Some(layer))
+        }
+        None => (None, None),
+    };
 
     // Install the W3C Trace Context propagator globally.
     //
@@ -468,14 +950,21 @@ fn init_with_otel(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(build_fmt_layer(log_format, log_ansi))
-        .with(otel_layer)
-        .with(db_span_layer)
-        .init();
+    otel_path_subscriber(
+        filters,
+        build_fmt_layer(log_format, log_ansi),
+        log_layer,
+        tracer,
+        db_tracer,
+    )
+    .init();
 
-    OtelGuard { provider }
+    let guard = OtelGuard {
+        provider: provider.unwrap_or_default(),
+        logger_provider,
+        _meter_provider: meter_provider,
+    };
+    (guard, signals)
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -745,6 +1234,175 @@ mod tests {
         type Writer = Capture;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
+        }
+    }
+
+    // ── DB_QUERY_SPANS (#3954) ──────────────────────────────────────────
+
+    /// Run one request's worth of events through the production OTLP-path
+    /// subscriber with `RUST_LOG=rust_log` and `mode`: a statement at sqlx's
+    /// per-statement level (DEBUG) inside an `http_request` span, plus an
+    /// INFO and a DEBUG line from a crate the filter keeps at INFO. Returns the
+    /// stdout text and the exported spans.
+    fn run_db_query_spans(
+        rust_log: &'static str,
+        mode: db_spans::DbQuerySpans,
+    ) -> (String, crate::testing::otel::ExportedSpans) {
+        let capture = Capture::default();
+        let exported = crate::testing::otel::ExportedSpans::default();
+        let subscriber = otel_path_subscriber(
+            subscriber_filters(|| EnvFilter::new(rust_log), mode),
+            build_fmt_layer_with_writer(LogFormat::Text, false, capture.clone()),
+            None,
+            exported.tracer(),
+            mode.enabled().then(|| exported.tracer()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::info_span!("http_request");
+            let _entered = request.enter();
+            tracing::event!(
+                target: "sqlx::query",
+                tracing::Level::DEBUG,
+                summary = "SELECT id FROM …",
+                db.statement = "SELECT id FROM repositories WHERE key = $1",
+                rows_affected = 0u64,
+                rows_returned = 1u64,
+                elapsed_secs = 0.002,
+            );
+            tracing::info!(target: "other_crate", "kept at info");
+            tracing::debug!(target: "other_crate", "dropped at debug");
+        });
+        (capture.text(), exported)
+    }
+
+    const DEFAULT_FILTER_WITH_OTHER_AT_INFO: &str =
+        "artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info,other_crate=info";
+
+    #[test]
+    fn all_mode_exports_every_statement_without_logging_it() {
+        let (stdout, exported) = run_db_query_spans(
+            DEFAULT_FILTER_WITH_OTHER_AT_INFO,
+            db_spans::DbQuerySpans::All,
+        );
+        assert_eq!(
+            exported.named("SELECT repositories").len(),
+            1,
+            "with DB_QUERY_SPANS=all a DEBUG statement becomes a DB span"
+        );
+        assert!(
+            !stdout.contains("SELECT"),
+            "stdout must still follow RUST_LOG (sqlx::query=info): {stdout}"
+        );
+        assert!(stdout.contains("kept at info"), "{stdout}");
+        assert!(!stdout.contains("dropped at debug"), "{stdout}");
+        assert_eq!(exported.named("http_request").len(), 1);
+    }
+
+    #[test]
+    fn log_mode_keeps_the_rust_log_coupling() {
+        let (stdout, exported) = run_db_query_spans(
+            DEFAULT_FILTER_WITH_OTHER_AT_INFO,
+            db_spans::DbQuerySpans::Log,
+        );
+        assert!(exported.named("SELECT repositories").is_empty());
+        assert!(!stdout.contains("SELECT"), "{stdout}");
+
+        let (stdout, exported) = run_db_query_spans(
+            "artifact_keeper_backend=info,sqlx::query=debug,other_crate=info",
+            db_spans::DbQuerySpans::Log,
+        );
+        assert_eq!(exported.named("SELECT repositories").len(), 1);
+        assert!(stdout.contains("SELECT"), "{stdout}");
+    }
+
+    #[test]
+    fn off_mode_exports_no_db_spans() {
+        let (stdout, exported) = run_db_query_spans(
+            "artifact_keeper_backend=info,sqlx::query=debug,other_crate=info",
+            db_spans::DbQuerySpans::Off,
+        );
+        assert!(exported.named("SELECT repositories").is_empty());
+        assert!(stdout.contains("SELECT"), "stdout is unaffected: {stdout}");
+    }
+
+    /// A log record exported through the production subscriber carries the
+    /// trace and span id of the span it was emitted under (the layer is not
+    /// wrapped in an `Option`, see [`layer_or_identity`]).
+    #[test]
+    fn exported_log_records_carry_the_trace_context() {
+        use opentelemetry::logs::LoggerProvider as _;
+        use opentelemetry::trace::TraceContextExt as _;
+        use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+
+        let log_exporter = InMemoryLogExporter::default();
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(log_exporter.clone())
+            .build();
+        let exported = crate::testing::otel::ExportedSpans::default();
+        let subscriber = otel_path_subscriber(
+            subscriber_filters(
+                || EnvFilter::new(DEFAULT_RUST_LOG),
+                db_spans::DbQuerySpans::Log,
+            ),
+            build_fmt_layer_with_writer(LogFormat::Text, false, Capture::default()),
+            Some(otel_logs::OtelLogLayer::new(logger_provider.logger("test"))),
+            exported.tracer(),
+            Some(exported.tracer()),
+        );
+        let mut ids = None;
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("http_request");
+            let _entered = span.enter();
+            let cx = tracing_opentelemetry::OpenTelemetrySpanExt::context(&span);
+            let sc = cx.span().span_context().clone();
+            ids = Some((sc.trace_id(), sc.span_id()));
+            tracing::info!("Request completed");
+        });
+        logger_provider.force_flush().expect("flush");
+        let records = log_exporter.get_emitted_logs().expect("emitted logs");
+        let (trace_id, span_id) = ids.expect("span ids");
+        assert_eq!(records.len(), 1);
+        let trace = records[0]
+            .record
+            .trace_context()
+            .expect("the record carries the enclosing span's trace context");
+        assert_eq!(trace.trace_id, trace_id);
+        assert_eq!(trace.span_id, span_id);
+    }
+
+    #[test]
+    fn db_query_spans_values_parse() {
+        use db_spans::DbQuerySpans as M;
+        assert_eq!(M::parse(None), Some(M::Log));
+        assert_eq!(M::parse(Some("")), Some(M::Log));
+        assert_eq!(M::parse(Some(" LOG ")), Some(M::Log));
+        assert_eq!(M::parse(Some("all")), Some(M::All));
+        assert_eq!(M::parse(Some("Off")), Some(M::Off));
+        assert_eq!(M::parse(Some("debug")), None);
+        for mode in [M::Log, M::All, M::Off] {
+            assert_eq!(M::parse(Some(mode.name())), Some(mode));
+        }
+    }
+
+    /// `DB_QUERY_SPANS` from the environment: a recognised value is used, and
+    /// an unsupported one falls back to `log` and is handed back for the
+    /// startup warning.
+    #[test]
+    fn db_query_spans_from_env_falls_back_to_log_on_an_unsupported_value() {
+        use db_spans::DbQuerySpans as M;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(db_spans::DB_QUERY_SPANS_VAR).ok();
+
+        std::env::remove_var(db_spans::DB_QUERY_SPANS_VAR);
+        assert_eq!(M::from_env(), (M::Log, None));
+        std::env::set_var(db_spans::DB_QUERY_SPANS_VAR, "ALL");
+        assert_eq!(M::from_env(), (M::All, None));
+        std::env::set_var(db_spans::DB_QUERY_SPANS_VAR, "verbose");
+        assert_eq!(M::from_env(), (M::Log, Some("verbose".to_string())));
+
+        match previous {
+            Some(value) => std::env::set_var(db_spans::DB_QUERY_SPANS_VAR, value),
+            None => std::env::remove_var(db_spans::DB_QUERY_SPANS_VAR),
         }
     }
 
@@ -1068,7 +1726,7 @@ mod tests {
     async fn test_build_span_exporter_grpc() {
         // Builds an exporter configured for gRPC. The exporter is created
         // successfully even without a running collector (connection is lazy).
-        let _exporter = build_span_exporter(OtlpProtocol::Grpc, "http://localhost:4317");
+        assert!(build_span_exporter(OtlpProtocol::Grpc, "http://localhost:4317").is_some());
     }
 
     #[tokio::test]
@@ -1083,7 +1741,7 @@ mod tests {
         // documented priority order, so the build always succeeds and the old
         // assertion could never fail. What actually matters is which client is
         // selected, which the regression test below pins down.
-        let _exporter = build_span_exporter(OtlpProtocol::HttpProtobuf, "http://localhost:4318");
+        assert!(build_span_exporter(OtlpProtocol::HttpProtobuf, "http://localhost:4318").is_some());
     }
 
     #[test]
@@ -1117,7 +1775,8 @@ mod tests {
 
         let outcome = std::thread::spawn(|| {
             let exporter =
-                build_span_exporter(OtlpProtocol::HttpProtobuf, "http://127.0.0.1:1/v1/traces");
+                build_span_exporter(OtlpProtocol::HttpProtobuf, "http://127.0.0.1:1/v1/traces")
+                    .expect("a valid endpoint builds");
             let _ = futures::executor::block_on(exporter.export(Vec::new()));
         })
         .join();
@@ -1127,6 +1786,327 @@ mod tests {
             "HTTP/protobuf export panicked on a thread with no Tokio reactor; \
              the exporter must use the blocking reqwest client because \
              BatchSpanProcessor exports from a dedicated thread"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "services-2")]
+#[cfg(test)]
+mod otlp_signal_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // ── OTEL_<SIGNAL>_EXPORTER ──────────────────────────────────────────
+
+    #[test]
+    fn only_traces_are_exported_by_default() {
+        let signals = SignalExporter::from_values(None, None, None);
+        assert_eq!(
+            signals,
+            SignalExporter {
+                traces: true,
+                metrics: false,
+                logs: false
+            }
+        );
+        assert_eq!(signals.names(), "traces");
+    }
+
+    #[test]
+    fn otlp_opts_logs_and_metrics_in() {
+        let signals = SignalExporter::from_values(None, Some("otlp"), Some(" OTLP "));
+        assert!(signals.traces && signals.metrics && signals.logs);
+        assert_eq!(signals.names(), "traces,metrics,logs");
+    }
+
+    #[test]
+    fn none_turns_a_signal_off() {
+        let signals = SignalExporter::from_values(Some("None"), Some("none"), Some("otlp"));
+        assert!(!signals.traces && !signals.metrics && signals.logs);
+        let off = SignalExporter::from_values(Some("none"), None, None);
+        assert_eq!(off.names(), "none");
+    }
+
+    #[test]
+    fn unsupported_and_empty_values_keep_the_default() {
+        for value in ["", "  ", "console", "prometheus", "otlpp"] {
+            let signals = SignalExporter::from_values(Some(value), Some(value), Some(value));
+            assert!(signals.traces, "{value:?} must leave traces on");
+            assert!(!signals.metrics, "{value:?} must not turn metrics on");
+            assert!(!signals.logs, "{value:?} must not turn logs on");
+        }
+        assert_eq!(
+            SignalSetting::parse(Some("console")),
+            SignalSetting::Unsupported
+        );
+        assert_eq!(SignalSetting::parse(Some("")), SignalSetting::Unset);
+    }
+
+    // ── per-signal endpoints ────────────────────────────────────────────
+
+    #[test]
+    fn http_endpoints_swap_the_traces_path_for_the_signal_path() {
+        let traces = "http://collector:4318/v1/traces";
+        assert_eq!(
+            signal_endpoint(OtlpProtocol::HttpProtobuf, traces, OtlpSignal::Logs, None),
+            "http://collector:4318/v1/logs"
+        );
+        assert_eq!(
+            signal_endpoint(
+                OtlpProtocol::HttpProtobuf,
+                "http://gw/otlp/v1/traces/",
+                OtlpSignal::Metrics,
+                None
+            ),
+            "http://gw/otlp/v1/metrics"
+        );
+        assert_eq!(
+            signal_endpoint(
+                OtlpProtocol::HttpProtobuf,
+                "http://collector:4318/",
+                OtlpSignal::Metrics,
+                None
+            ),
+            "http://collector:4318/v1/metrics"
+        );
+    }
+
+    #[test]
+    fn grpc_endpoints_are_shared() {
+        assert_eq!(
+            signal_endpoint(
+                OtlpProtocol::Grpc,
+                "http://collector:4317",
+                OtlpSignal::Logs,
+                None
+            ),
+            "http://collector:4317"
+        );
+    }
+
+    #[test]
+    fn a_per_signal_endpoint_wins_verbatim() {
+        for protocol in [OtlpProtocol::Grpc, OtlpProtocol::HttpProtobuf] {
+            assert_eq!(
+                signal_endpoint(
+                    protocol,
+                    "http://collector:4318/v1/traces",
+                    OtlpSignal::Logs,
+                    Some("http://loki:3100/otlp/v1/logs"),
+                ),
+                "http://loki:3100/otlp/v1/logs"
+            );
+        }
+        // An empty override is ignored.
+        assert_eq!(
+            signal_endpoint(
+                OtlpProtocol::Grpc,
+                "http://c:4317",
+                OtlpSignal::Metrics,
+                Some(" ")
+            ),
+            "http://c:4317"
+        );
+    }
+
+    // ── resource ────────────────────────────────────────────────────────
+
+    #[test]
+    fn instance_id_comes_from_hostname_unless_the_operator_set_one() {
+        assert_eq!(
+            service_instance_id(None, Some("ak-backend-7f9c")).as_deref(),
+            Some("ak-backend-7f9c")
+        );
+        assert_eq!(
+            service_instance_id(
+                Some("deployment.environment=prod, service.instance.id=replica-2"),
+                Some("ak-backend-7f9c")
+            ),
+            None
+        );
+        let generated = service_instance_id(Some("deployment.environment=prod"), Some(" "))
+            .expect("generated id");
+        assert!(uuid::Uuid::parse_str(&generated).is_ok(), "{generated}");
+    }
+
+    #[test]
+    fn every_signal_shares_service_name_version_and_instance() {
+        let resource = build_otel_resource("artifact-keeper-test");
+        let get = |key: &'static str| resource.get(&opentelemetry::Key::from_static_str(key));
+        assert_eq!(
+            get("service.name"),
+            Some(opentelemetry::Value::from("artifact-keeper-test"))
+        );
+        assert_eq!(
+            get("service.version"),
+            Some(opentelemetry::Value::from(env!("CARGO_PKG_VERSION")))
+        );
+        assert!(get("service.instance.id").is_some());
+    }
+
+    // ── no collector ────────────────────────────────────────────────────
+
+    /// With nothing listening, logging never blocks the caller (the batch
+    /// queue is bounded and drops), and shutdown returns within the SDK's
+    /// bounded timeouts instead of hanging the process on exit.
+    #[test]
+    fn an_unreachable_collector_blocks_neither_logging_nor_shutdown() {
+        use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
+
+        for (protocol, endpoint) in [
+            (OtlpProtocol::HttpProtobuf, "http://127.0.0.1:1/v1/traces"),
+            (OtlpProtocol::Grpc, "http://127.0.0.1:1"),
+        ] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _rt = runtime.enter();
+            let exporter = build_log_exporter(
+                protocol,
+                &signal_endpoint(protocol, endpoint, OtlpSignal::Logs, None),
+            )
+            .expect("an unreachable endpoint still builds");
+            let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+                .with_batch_exporter(exporter)
+                .build();
+            let logger = provider.logger("test");
+
+            let started = Instant::now();
+            for i in 0..10_000 {
+                let mut record = logger.create_log_record();
+                record.set_body(format!("record {i}").into());
+                logger.emit(record);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{protocol:?}: emitting with no collector took {:?}",
+                started.elapsed()
+            );
+
+            let started = Instant::now();
+            let _ = provider.shutdown();
+            assert!(
+                started.elapsed() < Duration::from_secs(40),
+                "{protocol:?}: log shutdown took {:?}",
+                started.elapsed()
+            );
+
+            let metric_exporter = build_metric_exporter(
+                protocol,
+                &signal_endpoint(protocol, endpoint, OtlpSignal::Metrics, None),
+            )
+            .expect("an unreachable endpoint still builds");
+            let (recorder, meter_provider) = otel_metrics::build_otel_metrics_recorder(
+                metric_exporter,
+                build_otel_resource("test"),
+            );
+            metrics::with_local_recorder(&recorder, || {
+                metrics::counter!("ak_uploads_total").increment(1);
+            });
+            let started = Instant::now();
+            drop(otel_metrics::MetricsGuard::new(meter_provider));
+            assert!(
+                started.elapsed() < Duration::from_secs(40),
+                "{protocol:?}: meter shutdown took {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_endpoint_turns_the_signal_off_instead_of_panicking() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _rt = runtime.enter();
+        assert!(build_log_exporter(OtlpProtocol::HttpProtobuf, "not a url").is_none());
+        assert!(build_metric_exporter(OtlpProtocol::HttpProtobuf, "not a url").is_none());
+        // #4931: the span exporter panicked here before 1.12.0.
+        assert!(build_span_exporter(OtlpProtocol::HttpProtobuf, "not a url").is_none());
+    }
+
+    /// #4931: an empty or blank endpoint is the same as no endpoint, so the
+    /// OTel path is not entered with nothing to export to.
+    #[test]
+    fn an_empty_endpoint_counts_as_unset() {
+        assert_eq!(otel_endpoint_if_set(None), None);
+        assert_eq!(otel_endpoint_if_set(Some("")), None);
+        assert_eq!(otel_endpoint_if_set(Some("  ")), None);
+        assert_eq!(
+            otel_endpoint_if_set(Some(" http://collector:4317 ")),
+            Some("http://collector:4317")
+        );
+    }
+
+    /// A collector that accepts connections and never answers: every export
+    /// and every shutdown flush waits for its full timeout.
+    fn hanging_collector() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, format!("http://{addr}/v1/traces"))
+    }
+
+    /// #4931: the guard flushes the three signals at the same time, so a
+    /// collector that never answers delays exit by the slowest flush, not by
+    /// the sum of three. Sequentially this took three flush timeouts (about
+    /// 15 s), past a container runtime's 10 s stop grace.
+    #[test]
+    fn shutdown_flushes_the_signals_concurrently() {
+        use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+
+        let (_listener, endpoint) = hanging_collector();
+        let protocol = OtlpProtocol::HttpProtobuf;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _rt = runtime.enter();
+
+        let span_exporter = build_span_exporter(protocol, &endpoint).unwrap();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(span_exporter)
+            .build();
+        provider.tracer("test").in_span("pending", |_| {});
+
+        let log_exporter = build_log_exporter(
+            protocol,
+            &signal_endpoint(protocol, &endpoint, OtlpSignal::Logs, None),
+        )
+        .unwrap();
+        let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_batch_exporter(log_exporter)
+            .build();
+        let logger = logger_provider.logger("test");
+        let mut record = logger.create_log_record();
+        record.set_body("pending".into());
+        logger.emit(record);
+
+        let metric_exporter = build_metric_exporter(
+            protocol,
+            &signal_endpoint(protocol, &endpoint, OtlpSignal::Metrics, None),
+        )
+        .unwrap();
+        let (recorder, meter_provider) =
+            otel_metrics::build_otel_metrics_recorder(metric_exporter, build_otel_resource("test"));
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("ak_uploads_total").increment(1);
+        });
+
+        // One signal alone, for the bound below.
+        let (_single_listener, single_endpoint) = hanging_collector();
+        let single = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(build_span_exporter(protocol, &single_endpoint).unwrap())
+            .build();
+        single.tracer("test").in_span("pending", |_| {});
+        let started = Instant::now();
+        let _ = single.shutdown();
+        let one_flush = started.elapsed();
+
+        let guard = OtelGuard {
+            provider,
+            logger_provider: Some(logger_provider),
+            _meter_provider: Some(otel_metrics::MetricsGuard::new(meter_provider)),
+        };
+        let started = Instant::now();
+        drop(guard);
+        let all_three = started.elapsed();
+        assert!(
+            all_three < one_flush * 2,
+            "three flushes took {all_three:?}, one alone {one_flush:?}: they ran one after another"
         );
     }
 }
