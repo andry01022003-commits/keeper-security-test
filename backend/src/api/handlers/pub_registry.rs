@@ -466,6 +466,12 @@ async fn download_archive(
             "Invalid archive path: expected .tar.gz extension",
         )
     })?;
+    // #4365 item 3 (#4107): on a proxying repository the name and version
+    // are joined into the upstream path and key the proxy cache.
+    proxy_helpers::reject_ambiguous_client_segments(
+        repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual,
+        &[pkg_name, version],
+    )?;
 
     let artifact = sqlx::query!(
         r#"
@@ -2696,6 +2702,42 @@ mod scan_on_proxy_4107 {
     }
 
     archive_scan_suite!(case);
+
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [
+                format!("/{key}/packages/{NAME}/versions/1.0.0%3Fx.tar.gz"),
+                format!("/{key}/packages/{NAME}%3B/versions/1.0.0.tar.gz"),
+            ] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
 
     #[test]
     fn an_archive_that_declares_the_requested_version_is_graded() {

@@ -265,7 +265,7 @@ have no core proxy path to gate.
 | `helm` | `helm` | accepted | |
 | `rpm` | `rpm` | accepted | |
 | `debian` | `debian` | accepted | |
-| `conan` | `conan` | enforced | The `.tgz` recipe and package archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`), Remote and Virtual, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). `conanfile.py`, manifests, `conaninfo.txt`, revision lists and search are not gated. |
+| `conan` | `conan` | enforced | Every recipe and package file except `conanfile.py`, `conanmanifest.txt` and `conaninfo.txt`, Remote and Virtual: the `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`, `conan_package.tgz`) and any other file name, graded on their contents (see [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)). A file that is not a gzipped tar (a zstd `.tzst`, a Conan 2 metadata file) is inconclusive: `423` under `fail_closed`. The three metadata files, revision lists and search are not gated. |
 | `cargo` | `cargo` | enforced | `.crate` downloads, Remote and Virtual. |
 | `generic` | `generic`, `github`, `mise`, `aqua` | accepted | |
 | `conda` | `conda` | enforced | `.conda` and `.tar.bz2` package downloads, Remote and Virtual, including the `/t/<token>/` URL forms. A `.sigs` attestation sidecar follows its package: a stored verdict that blocks the package refuses the sidecar too. Channel indexes (repodata in every encoding, channeldata, shards) are not gated. |

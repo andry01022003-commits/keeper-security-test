@@ -419,14 +419,6 @@ pub(crate) fn read_zip_entry(bytes: &Bytes, entry: &str) -> Result<Option<Vec<u8
     .map_err(|e| e.to_string())
 }
 
-/// Shared DB-backed scenarios for the archive formats' scan-on-proxy suites
-/// (#4097). Holds no tests itself; each format's suite drives these with its
-/// own route and fixture, so the per-format suites stay a few lines each.
-///
-/// The state carries NO scanner service, so a first-pull scan is
-/// inconclusive (fail-closed 423, fail-open served `pending`); clean and
-/// vulnerable outcomes come from verdicts seeded for the content digest, the
-/// same way the Cargo, npm and PyPI suites drive the gate.
 /// The first entry of a gzipped tar whose path `matches`, read under the
 /// identity caps: `Ok(None)` when none matches (every header was walked, so
 /// the bytes are a readable gzipped tar), `Err` when they are not one or a cap
@@ -445,6 +437,14 @@ pub(crate) fn read_tar_gz_entry(
     .map_err(|e| e.to_string())
 }
 
+/// Shared DB-backed scenarios for the archive formats' scan-on-proxy suites
+/// (#4097). Holds no tests itself; each format's suite drives these with its
+/// own route and fixture, so the per-format suites stay a few lines each.
+///
+/// The state carries NO scanner service, so a first-pull scan is
+/// inconclusive (fail-closed 423, fail-open served `pending`); clean and
+/// vulnerable outcomes come from verdicts seeded for the content digest, the
+/// same way the Cargo, npm and PyPI suites drive the gate.
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 pub(crate) mod test_support {

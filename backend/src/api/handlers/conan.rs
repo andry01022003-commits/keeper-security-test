@@ -4212,15 +4212,21 @@ fn build_package_upstream_path(
 // Scan-on-proxy for recipe and package archives (#4108, on the #4098 gate)
 // ---------------------------------------------------------------------------
 
+/// The recipe and package files a Conan client reads as metadata, which
+/// stream unscanned on a scanning repository (#4108). Matched exactly: the
+/// client always asks for these spellings.
+const CONAN_METADATA_FILES: &[&str] = &["conanfile.py", "conanmanifest.txt", "conaninfo.txt"];
+
 /// The canonical `(cache_key, scannable)` decision for a proxied Conan file
-/// (#4365 item 1): the `.tgz` archives (`conan_export.tgz`,
-/// `conan_sources.tgz`, `conan_package.tgz`) are what the gate must see;
-/// `conanfile.py`, `conanmanifest.txt`, `conaninfo.txt` and the other text
-/// files are metadata and stream as before. Cached under the upstream path
-/// the streaming arm commits to.
+/// (#4365 item 1). Like the Maven control, everything except a short
+/// metadata allowlist ([`CONAN_METADATA_FILES`]) goes through the gate: the
+/// `.tgz` archives (`conan_export.tgz`, `conan_sources.tgz`,
+/// `conan_package.tgz`), and also any other file name, so an archive under
+/// another name (a zstd `.tzst`, an upstream's own layout) is never streamed
+/// unscanned. Cached under the upstream path the streaming arm commits to.
 fn conan_file_serve_key(upstream_path: &str) -> crate::services::proxy_service::ProxyServeKey {
     crate::services::proxy_service::proxy_serve_key(upstream_path, |file| {
-        file.to_ascii_lowercase().ends_with(".tgz")
+        !CONAN_METADATA_FILES.contains(&file)
     })
 }
 
@@ -4303,6 +4309,13 @@ async fn serve_scanned_conan_file_download(
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Option<Result<Response, Response>>, Response> {
     use crate::api::handlers::proxy_scan_archive::{LocalLookup, ScannedRoute};
+    // #4365 item 3: on a proxying repository the reference and file path are
+    // the upstream path and key the proxy cache, so an ambiguous one is a
+    // 400 before anything is fetched, scanned or not.
+    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+        crate::services::proxy_service::reject_ambiguous_client_path(upstream_path, false)
+            .map_err(IntoResponse::into_response)?;
+    }
     let serve_key = conan_file_serve_key(upstream_path);
     if !serve_key.scannable {
         return Ok(None);
@@ -12474,6 +12487,73 @@ mod scan_on_proxy_4108 {
 
     archive_scan_suite!(case);
 
+    /// #4365 item 3: an ambiguous segment on a proxying repository is a 400
+    /// before anything is fetched or cached.
+    #[tokio::test]
+    async fn an_ambiguous_segment_is_refused() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        for key in [rig.fx.repo_key.clone(), rig.virtual_key.clone()] {
+            for uri in [format!("/{key}/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/packages/{PKG}/revisions/{REV}/files/conan_package.tgz%3Fx"), format!("/{key}/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/files/conanfile.py%3Fx")] {
+                let (status, _, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+                    crate::api::handlers::test_db_helpers::router_anon(
+                        super::router(),
+                        rig.state.clone(),
+                    ),
+                    crate::api::handlers::test_db_helpers::get(uri.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+        assert_eq!(
+            rig.package_fetches().await,
+            0,
+            "nothing reached the upstream"
+        );
+        rig.teardown().await;
+    }
+
+    /// An archive under a name outside the metadata allowlist (a zstd
+    /// `.tzst`) goes through the gate like a `.tgz`: under `fail_closed` the
+    /// bytes, which are not a gzipped tar, are withheld and never streamed.
+    #[tokio::test]
+    async fn an_archive_under_another_name_is_gated() {
+        let Some(rig) = crate::api::handlers::proxy_scan_archive::test_support::Rig::new(
+            case,
+            Some("fail_closed"),
+        )
+        .await
+        else {
+            return;
+        };
+        let tzst = format!(
+            "/{}/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/packages/{PKG}/revisions/{REV}/files/conan_package.tzst",
+            rig.fx.repo_key
+        );
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/v2/conans/dtfscan/1.0.0/_/_/revisions/{REV}/packages/{PKG}/revisions/{REV}/files/conan_package.tzst"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"(zstd frame)".to_vec()))
+            .mount(&rig.server)
+            .await;
+        let (status, body, _) = crate::api::handlers::test_db_helpers::send_with_headers(
+            crate::api::handlers::test_db_helpers::router_anon(super::router(), rig.state.clone()),
+            crate::api::handlers::test_db_helpers::get(tzst),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_ne!(&body[..], b"(zstd frame)");
+        rig.teardown().await;
+    }
+
     #[test]
     fn only_a_readable_gzipped_tar_is_graded() {
         let ok = Bytes::from(tar_gz(&[("conanfile.txt", "[requires]\n".to_string())]));
@@ -12503,6 +12583,11 @@ mod serve_key_4365_tests {
             ("conanmanifest.txt", false),
             ("conaninfo.txt", false),
             ("conan_package.tgz;x", true),
+            // Anything outside the metadata allowlist is gated, as on Maven.
+            ("conan_package.tzst", true),
+            ("conan_sources.tar.gz", true),
+            ("metadata/logs/build.log", true),
+            ("ConanFile.py", true),
         ] {
             let got = conan_file_serve_key(&format!("{base}/{file}"));
             assert_eq!(got.scannable, scannable, "{file}");
