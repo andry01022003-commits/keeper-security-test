@@ -1,7 +1,8 @@
 # Scanner workspace: ISO9660 live media and the shared squashfs path (design note)
 
 **Date**: 2026-10-23
-**Status**: Proposed, for maintainer review before #1966 is implemented
+**Status**: Proposed, for maintainer review before #1966 is implemented. Nothing
+here is decided; the open questions at the end need an answer first.
 **Issues**: #1966 (ISO rootfs inventory), #1429 (incus on the shared workspace lifecycle)
 **Depends on**: the `ScanWorkspace::prepare_with` extractor hook (#1429, PR #4925)
 
@@ -10,6 +11,12 @@ scan path is new supply-chain and memory-exhaustion surface. This note settles
 the open choices before code is written: which reader parses the ISO, what
 extracts the embedded squashfs, which budgets bound each layer, how deep
 nesting may go, and what the scan reports when it cannot get a rootfs.
+
+The maintainer's plan on #1966 named `backhand` for squashfs and an ISO crate
+under the shared mid-stream extraction budget. This note recommends the
+opposite on both counts (the shipped `unsquashfs` with selective extraction,
+and an in-tree locator rather than an ISO crate). Those are recommendations
+for review, not decisions, and are listed as open questions at the end.
 
 ## Where the code stands after #1429
 
@@ -33,7 +40,7 @@ changes for it.
 
 ## What a live ISO looks like
 
-Measured with `xorriso -as mkisofs` (the tool Debian live-build and most
+Measured with `xorriso -as mkisofs` 1.5.8 (the tool Debian live-build and most
 distribution media builders use) on a tree holding `live/filesystem.squashfs`:
 
 | Build flags | ISO9660 name | Rock Ridge `NM` |
@@ -43,8 +50,9 @@ distribution media builders use) on a tree holding `live/filesystem.squashfs`:
 
 So the plain ISO9660 name is only reliable on level 3 media (the layout the
 #1966 reporter shows). Any reader we use must read Rock Ridge `NM` entries, or
-the locator silently misses level 1 media. Joliet is not needed: every media
-builder that writes Joliet also writes Rock Ridge.
+the locator silently misses level 1 media. Joliet is not needed: the Linux
+live media builders that write Joliet also write Rock Ridge, and media with
+Joliet only (Windows) carries no Linux rootfs to find.
 
 Known rootfs locations to probe, all at depth 2 from the ISO root:
 
@@ -55,7 +63,7 @@ Known rootfs locations to probe, all at depth 2 from the ISO root:
 | Ubuntu 22.10 and later | `casper/minimal.squashfs`, `casper/minimal.standard.squashfs`, `casper/minimal.standard.live.squashfs` | layered: each layer is a diff over the previous one |
 | Fedora, RHEL family | `LiveOS/squashfs.img` | older media nest an ext4 `LiveOS/rootfs.img` inside the squashfs |
 
-## Decision 1: the ISO reader
+## Choice 1: the ISO reader
 
 Options considered:
 
@@ -97,7 +105,7 @@ it is the only maintained candidate with Rock Ridge support, and its
 allocation-free reader suits the memory constraints below. `cdfs` should not
 be taken while its library and FUSE binary share one dependency list.
 
-## Decision 2: the squashfs extractor
+## Choice 2: the squashfs extractor
 
 `backhand` 0.25.5 (MIT OR Apache-2.0, ~300k downloads, MSRV 1.90, below our
 1.98 pin) versus the shipped `unsquashfs`.
@@ -118,33 +126,40 @@ small, known set of paths:
 
 - `etc/os-release`, `usr/lib/os-release` (on Debian the first is a symlink to
   the second)
-- `var/lib/dpkg/status`, `var/lib/dpkg/status.d/`, `var/lib/dpkg/info/*.list`
-  and `*.md5sums`
+- `var/lib/dpkg/` (`status`, `status.d/`, and the `info/*.list` and
+  `*.md5sums` files)
 - `var/lib/rpm/`, `usr/lib/sysimage/rpm/`
 - `lib/apk/db/installed`
 
-`unsquashfs -d <dest> -follow-symlinks <image> <paths...>` extracts only those
-(following the os-release symlink inside the image, not on the host), so the
-extracted tree is a few MiB for a full desktop image, whatever the image
-claims. A 2 GiB squashfs bomb never gets the chance to write more than the
+`unsquashfs -d <dest> -follow-symlinks <image> <paths...>`, with the flags the
+incus path already passes (`-no-xattrs -quiet -no-progress`), extracts only
+those (following the os-release symlink inside the image, not on the host), so
+the extracted tree is the package DB alone (tens of MiB for a full desktop
+image, most of it `var/lib/dpkg/info/`), whatever the image claims. A 2 GiB squashfs bomb never gets the chance to write more than the
 package DB paths it names. Checked locally with `unsquashfs` 4.6.1 against an
 image holding a 5 MB blob, an `etc/os-release -> ../usr/lib/os-release`
 symlink and a dpkg `status`: the output was the symlink, its target and the
 status file (8 KiB), and a requested path the image lacks
-(`lib/apk/db/installed`) was a warning with exit 0, so one path list serves
-every distribution. Extract paths take wildcards by default, which covers
-`var/lib/dpkg/info/*.list`.
+(`lib/apk/db/installed`) was a warning with exit 0 (with `-no-xattrs`; without
+it a non-root run on an image carrying `security.selinux` xattrs exits 2), so
+one path list serves every distribution. `-follow-symlinks` implies
+`-no-wildcards` (a glob such as `var/lib/dpkg/info/*.list` is then reported as
+"can't be resolved" and skipped), so the path list names directories, not
+globs: a directory extract path brings its whole subtree, which for
+`var/lib/dpkg/` includes `info/`. The listing below bounds what that subtree
+may hold.
 
 A crafted image can still make one named path enormous (a 50 GiB
 `var/lib/dpkg/status` of zeros compresses to almost nothing). So the
 extraction is preceded by a listing of the same paths (`unsquashfs -lls
 -follow-symlinks <image> <paths...>`), which reads only the directory and
 inode tables and reports each file's declared size; the scan refuses before
-extracting if the declared total exceeds a small cap (256 MiB is far above
-any real package DB set). The declared size is what `unsquashfs` writes, so
-the listing is an exact pre-check, not an estimate. The existing post-extraction guard still runs over
-the result. This is the change that makes the "shared mid-stream extraction
-budget" moot for squashfs: there is no stream large enough to need it.
+extracting if the declared total exceeds a small cap (256 MiB is far above any
+real package DB set). The declared size is what `unsquashfs` writes, so the
+listing is an exact pre-check, not an estimate. The existing post-extraction
+guard still runs over the result. This is the change that makes the "shared
+mid-stream extraction budget" moot for squashfs: there is no stream large
+enough to need it.
 
 The cost is coverage: language packages and binaries inside the image (Go
 build info, Python site-packages, JARs) are not inventoried. For #1966's use
@@ -156,7 +171,7 @@ under a hard mid-stream budget. That is a separate decision, and it should
 move incus at the same time so the two image paths keep sharing one squashfs
 extractor (the reason #1429 and #1966 were paired).
 
-## Decision 3: budgets and memory ceilings
+## Choice 3: budgets and memory ceilings
 
 - **Input**: the ISO is already in memory as the artifact's `Bytes` when the
   scanner runs (every scanner receives the full artifact). The locator works
@@ -173,7 +188,7 @@ extractor (the reason #1429 and #1966 were paired).
 - **Locator reads**: bounded by construction (fixed path list, two directory
   extents per path, 1 MiB per extent, capped system-use bytes per record).
 
-## Decision 4: nesting depth
+## Choice 4: nesting depth
 
 Two container layers, fixed: the ISO, then one squashfs (or, for layered
 Ubuntu media, an ordered list of squashfs layers extracted into the same
@@ -183,15 +198,15 @@ they understand. An ext4 `rootfs.img` inside a Fedora `squashfs.img` is not
 mounted or parsed: the scan reports it (below) rather than adding an ext4
 reader.
 
-Open question for the maintainer: support layered Ubuntu media in the first
-PR (extract `minimal`, then `minimal.standard`, then
+Open question for the maintainer (repeated at the end): support layered
+Ubuntu media in the first PR (extract `minimal`, then `minimal.standard`, then
 `minimal.standard.live`, later layers overwriting earlier files; overlay
 whiteouts are character devices that the non-root extractor skips, which is
 harmless for the package DB because each layer's `dpkg/status` is a whole
 file), or ship single-squashfs media first and report layered media as
 unsupported.
 
-## Decision 5: failure reporting
+## Choice 5: failure reporting
 
 The bug class #1966 is about is a scan that returns zero packages and reads
 as clean. Every way the ISO path can fail to produce a rootfs must therefore
@@ -209,6 +224,20 @@ surface:
 `from_trivy_report`); the extractor only has to hand the engines a rootfs.
 `inventory_status` keeps its current meaning (`complete`, `partial`,
 `failed` persistence of what was cataloged).
+
+## Open questions for the maintainer
+
+1. **Squashfs extractor.** The plan on #1966 named `backhand`. This note
+   recommends keeping `unsquashfs` with selective extraction and a listing
+   pre-check (Choice 2), and keeping `backhand` for a possible full-rootfs
+   mode. Which one #1966 uses is the maintainer's call.
+2. **ISO reader.** The plan on #1966 named an ISO crate under the shared
+   mid-stream extraction budget. This note recommends an in-tree locator with
+   `hadris-iso` as the crate if one is preferred (Choice 1). Also the
+   maintainer's call.
+3. **Layered Ubuntu media.** Support the `minimal`, `minimal.standard`,
+   `minimal.standard.live` layer stack in the first PR, or report layered
+   media as unsupported until a follow-up (Choice 4). Left open.
 
 ## Testing and fuzzing
 
