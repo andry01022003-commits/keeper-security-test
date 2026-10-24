@@ -339,6 +339,15 @@ have no core proxy path to gate.
   database it ships covers either ecosystem, so a pod or Swift package is
   only ever `vulnerable` for something of another ecosystem inside it (a
   vendored `Gemfile.lock`, `package-lock.json`, a jar).
+- **Hex is not gated.** `hex` stays `accepted` (#4106): the scan workspace
+  does not unpack a Hex tarball (an uncompressed outer tar around
+  `contents.tar.gz`), so wiring the gate would grade bytes nothing read.
+- **Only bytes fetched through the repository are gated.** A CocoaPods
+  Remote proxying the CocoaPods CDN serves podspecs whose `source` names a
+  git repository or an outside URL, and the client fetches the pod from
+  there, not through the `pods/` route; the same holds for a Composer
+  package installed from `source` (a VCS checkout) instead of its `dist`,
+  and for a Go client whose `GOPROXY` falls back to `direct`.
 - **Go modules, Composer packages and Conan references are not graded as
   themselves.** A module zip, a dist archive or a Conan archive is graded on what it contains (see
   [Archive formats graded on their contents](#archive-formats-graded-on-their-contents)).
