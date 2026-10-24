@@ -42,14 +42,15 @@ An upload hold that lapses changes what a channel lists with no write at all.
 The earliest pending `quarantine_until` of each channel is kept, and the
 first read after it rebuilds the names whose hold lapsed.
 
-Rebuilds announce themselves on the shared cache-invalidation channel
-(`ak_cache_invalidation_v1`, event `conda_repodata_invalidated`) so other
-replicas free the superseded documents early. Correctness does not depend on
-the event: every replica checks the revision on every request. During a
-rolling upgrade a 1.11.x replica does not know the event and answers it with
-the conservative cache flush it applies to any payload it cannot parse; that
-costs those replicas a refill of their authorization caches per conda write
-until they are upgraded.
+Rebuilds announce themselves to the other replicas on their own
+notification channel (`ak_conda_repodata_invalidation_v1`, event
+`conda_repodata_invalidated`, the same listener connection as
+`ak_cache_invalidation_v1`) so they free the superseded documents early.
+Correctness does not depend on the event: every replica checks the revision
+on every request. The channel is separate so that 1.11.x replicas, which do
+not listen on it, are not affected during a rolling upgrade: on the shared
+channel they would answer every unknown event with a conservative flush of
+their authorization caches.
 
 ## Backfill of existing channels
 

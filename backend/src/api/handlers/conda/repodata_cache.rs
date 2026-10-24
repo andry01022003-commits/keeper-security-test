@@ -18,10 +18,10 @@
 //! the revision was read, so the bytes kept under a revision are the bytes
 //! that revision describes.
 //!
-//! Other replicas learn of a rebuild through the shared invalidation channel
-//! ([`crate::services::cache_invalidation`]) and drop their entries for the
-//! subdir; that frees memory early, while the per-request revision check is
-//! what keeps every replica correct.
+//! Other replicas learn of a rebuild through the conda invalidation channel
+//! ([`crate::services::cache_invalidation::CONDA_REPODATA_INVALIDATION_CHANNEL`])
+//! and drop their entries for the subdir; that frees memory early, while the
+//! per-request revision check is what keeps every replica correct.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;

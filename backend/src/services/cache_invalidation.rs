@@ -59,6 +59,16 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// to a `_v2` channel without confusing old replicas during a rolling deploy.
 pub const CACHE_INVALIDATION_CHANNEL: &str = "ak_cache_invalidation_v1";
 
+/// Channel of [`InvalidationEvent::CondaRepodataInvalidated`] (#4174), same
+/// envelope, same listener. Kept off [`CACHE_INVALIDATION_CHANNEL`] because a
+/// replica that does not know an event answers it with
+/// [`conservative_flush_all`]: during a rolling upgrade every conda rebuild
+/// (each upload and each backfill batch) would make every 1.11.x replica
+/// drop its authorization caches and re-run bcrypt per API token. Older
+/// replicas do not listen here. Missing the event costs nothing but memory,
+/// since every conda read checks the subdir revision.
+pub const CONDA_REPODATA_INVALIDATION_CHANNEL: &str = "ak_conda_repodata_invalidation_v1";
+
 /// Payload schema version expected inside each notification envelope.
 pub const CACHE_INVALIDATION_VERSION: u8 = 1;
 
@@ -108,7 +118,8 @@ pub enum InvalidationEvent {
     /// on it: every conda read checks the subdir revision first, so a missed
     /// event only keeps a superseded entry in memory until it is evicted.
     ///
-    /// Emitted by the rebuild transaction in `handlers/conda/shard_store.rs`.
+    /// Emitted by the rebuild transaction in `handlers/conda/shard_store.rs`
+    /// on [`CONDA_REPODATA_INVALIDATION_CHANNEL`], not on the shared one.
     CondaRepodataInvalidated { repo_id: Uuid, subdirs: Vec<String> },
 }
 
@@ -506,7 +517,13 @@ async fn connect_and_flush(
             return None;
         }
     };
-    if let Err(e) = listener.listen(CACHE_INVALIDATION_CHANNEL).await {
+    if let Err(e) = listener
+        .listen_all([
+            CACHE_INVALIDATION_CHANNEL,
+            CONDA_REPODATA_INVALIDATION_CHANNEL,
+        ])
+        .await
+    {
         tracing::warn!(error = %e, "cache-invalidation LISTEN failed");
         return None;
     }

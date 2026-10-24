@@ -13,7 +13,7 @@
 //!   per-repository advisory lock: it reads only the rows of the dirty names,
 //!   rewrites only the shards whose bytes changed, deletes the marks it saw
 //!   (a mark set again meanwhile survives), bumps the revision of every
-//!   subdir it touched and announces the change on the shared invalidation
+//!   subdir it touched and announces the change on the conda invalidation
 //!   channel. The conda write paths call it right after their write; every
 //!   reader calls it, through [`subdir_state`], before it serves, so nothing
 //!   built from an older catalog state is ever served after the catalog moved.
@@ -395,7 +395,7 @@ async fn rebuild_keys(
     let payload =
         crate::services::cache_invalidation::conda_repodata_invalidation_payload(repo_id, &touched);
     sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(crate::services::cache_invalidation::CACHE_INVALIDATION_CHANNEL)
+        .bind(crate::services::cache_invalidation::CONDA_REPODATA_INVALIDATION_CHANNEL)
         .bind(payload)
         .execute(&mut **tx)
         .await?;

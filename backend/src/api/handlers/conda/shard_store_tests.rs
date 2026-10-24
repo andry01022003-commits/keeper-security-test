@@ -454,3 +454,194 @@ fn conda_invalidation_payload_round_trips_4174() {
         }
     );
 }
+
+/// #4173: the dirty mark is part of the writer's own transaction (visible to
+/// it before commit, to nobody else, and gone with a rollback), and once a
+/// write elsewhere commits, the superseded shard's address is never served
+/// again, even though no conda code path ran after the write.
+#[tokio::test]
+async fn the_mark_rides_the_writers_transaction_and_old_addresses_go_4173() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let kept = upload(&fx, "noarch", "tx-a", "1.0").await;
+    let pulled = upload(&fx, "noarch", "tx-a", "2.0").await;
+    let (_, index, _) = get(&fx, "noarch/repodata_shards.msgpack.zst").await;
+    let old_address = hex::encode(decode_index(&index).remove("tx-a").unwrap());
+    assert_eq!(dirty_count(&fx).await, 0);
+
+    let withdraw = "UPDATE artifacts SET quarantine_status = 'rejected' \
+                     WHERE repository_id = $1 AND path = $2";
+    let mut tx = fx.pool.begin().await.unwrap();
+    sqlx::query(withdraw)
+        .bind(fx.repo_id)
+        .bind(format!("noarch/{pulled}"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let inside: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conda_shard_dirty WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert!(inside > 0, "marked inside the writer's transaction");
+    assert_eq!(dirty_count(&fx).await, 0, "invisible before commit");
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        dirty_count(&fx).await,
+        0,
+        "a rolled back write leaves no mark"
+    );
+
+    sqlx::query(withdraw)
+        .bind(fx.repo_id)
+        .bind(format!("noarch/{pulled}"))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let (status, _, _) = get(&fx, &format!("noarch/shards/{old_address}.msgpack.zst")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the shard that still listed the withdrawn build is not served"
+    );
+    assert_eq!(shard_of(&fx, "noarch", "tx-a").await.unwrap(), vec![kept]);
+}
+
+/// #4174: a virtual's merged documents follow a membership change and a
+/// write in a member made outside the conda routes, with no conda rebuild
+/// in between.
+#[tokio::test]
+async fn a_virtual_follows_membership_and_member_writes_4174() {
+    let Some(first) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let pool = first.pool.clone();
+    let (second_id, second_key, second_dir) = tdh::create_repo(&pool, "local", "conda").await;
+    tdh::grant_repo_access(&pool, second_id, first.user_id).await;
+    let second = tdh::Fixture {
+        pool: pool.clone(),
+        user_id: first.user_id,
+        username: first.username.clone(),
+        repo_id: second_id,
+        repo_key: second_key,
+        state: tdh::build_state(pool.clone(), second_dir.to_str().unwrap()),
+        storage_dir: second_dir,
+    };
+    let (virtual_id, virtual_key, virtual_dir) = tdh::create_repo(&pool, "virtual", "conda").await;
+    tdh::grant_repo_access(&pool, virtual_id, first.user_id).await;
+    let add_member = |member: uuid::Uuid, priority: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    add_member(first.repo_id, 1).await;
+    let in_first = upload(&first, "noarch", "vf-a", "1.0").await;
+    let in_second = upload(&second, "noarch", "vf-b", "1.0").await;
+    let virt = tdh::Fixture {
+        pool: pool.clone(),
+        user_id: first.user_id,
+        username: first.username.clone(),
+        repo_id: virtual_id,
+        repo_key: virtual_key,
+        state: tdh::build_state(pool.clone(), virtual_dir.to_str().unwrap()),
+        storage_dir: virtual_dir,
+    };
+    let listed = |body: bytes::Bytes| -> Vec<String> {
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut out: Vec<String> = doc["packages"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    };
+    let (status, body, _) = get(&virt, "noarch/repodata.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed(body), vec![in_first.clone()]);
+    assert_eq!(shard_of(&virt, "noarch", "vf-b").await, None);
+
+    add_member(second.repo_id, 2).await;
+    let (_, body, _) = get(&virt, "noarch/repodata.json").await;
+    let mut both = vec![in_first.clone(), in_second.clone()];
+    both.sort();
+    assert_eq!(listed(body), both, "the new member is merged");
+    assert_eq!(
+        shard_of(&virt, "noarch", "vf-b").await.unwrap(),
+        vec![in_second.clone()]
+    );
+
+    sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'rejected' \
+          WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(second.repo_id)
+    .bind(format!("noarch/{in_second}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (_, body, _) = get(&virt, "noarch/repodata.json").await;
+    assert_eq!(listed(body), vec![in_first.clone()], "the withdrawal shows");
+    assert_eq!(shard_of(&virt, "noarch", "vf-b").await, None);
+}
+
+/// #4174: a rebuild is announced on the conda channel only. On the shared
+/// channel a 1.11.x replica, which does not know the event, would answer each
+/// one with a conservative flush of its authorization caches.
+#[tokio::test]
+async fn rebuilds_are_announced_off_the_shared_channel_4174() {
+    use crate::services::cache_invalidation::{
+        CACHE_INVALIDATION_CHANNEL, CONDA_REPODATA_INVALIDATION_CHANNEL,
+    };
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let mut shared = sqlx::postgres::PgListener::connect_with(&fx.pool)
+        .await
+        .unwrap();
+    shared.listen(CACHE_INVALIDATION_CHANNEL).await.unwrap();
+    let mut conda = sqlx::postgres::PgListener::connect_with(&fx.pool)
+        .await
+        .unwrap();
+    conda
+        .listen(CONDA_REPODATA_INVALIDATION_CHANNEL)
+        .await
+        .unwrap();
+
+    upload(&fx, "noarch", "chan-a", "1.0").await;
+
+    let repo = fx.repo_id.to_string();
+    let mut announced = false;
+    while let Ok(Ok(n)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), conda.recv()).await
+    {
+        if n.payload().contains(&repo) {
+            assert!(n.payload().contains("conda_repodata_invalidated"));
+            announced = true;
+            break;
+        }
+    }
+    assert!(announced, "the rebuild is announced on the conda channel");
+    while let Ok(Ok(n)) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), shared.recv()).await
+    {
+        assert!(
+            !n.payload().contains("conda_repodata_invalidated"),
+            "conda event on the shared channel: {}",
+            n.payload()
+        );
+    }
+}
