@@ -5080,6 +5080,7 @@ mod tests {
         let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(
             &crate::storage::StorageLocation { backend, path },
         );
+        // GC's orphan-key claim journals a key it is deleting this way.
         sqlx::query(
             "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path) \
              VALUES ($1, $2, $3)",
@@ -5089,7 +5090,7 @@ mod tests {
         .bind(&scope.path)
         .execute(&f.pool)
         .await
-        .expect("fresh gc lease");
+        .expect("gc delete lease");
 
         let (second_session, second_temp_path) =
             stage_completable_session_in(&f, storage.clone(), payload, "gc/second.bin").await;

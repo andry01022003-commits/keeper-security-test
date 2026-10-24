@@ -556,22 +556,13 @@ pub(crate) enum CasKeyGuard {
 /// lease has not lapsed yet.
 pub(crate) const CAS_COMMIT_GC_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The GC journal lease window: `oci_gc_candidates` rows recorded within it are
-/// claims a GC pass is working through, older rows are left for the candidate
-/// sweep. The sweep reads the same `BLOB_GC_MIN_AGE_SECS` setting
-/// (`Config::blob_gc_min_age_secs`, clamped the same way); this side reads it
-/// directly because the upload services carry no `Config`.
-fn gc_journal_lease_secs() -> i64 {
-    static SECS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *SECS.get_or_init(|| {
-        use crate::services::storage_gc_service as gc;
-        let raw = std::env::var("BLOB_GC_MIN_AGE_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(gc::MIN_BLOB_AGE_SECS);
-        gc::clamp_min_blob_age_secs(raw) as i64
-    })
-}
+/// How long after a storage GC pass took an `oci_gc_candidates` row as a lease
+/// (`leased_at`, migration 301) the upload commit guard assumes its delete may
+/// still be in flight (#4980). GC deletes a claimed key right after claiming it,
+/// so a lease older than this belongs to a delete that failed or a pass that
+/// stopped; the candidate sweep retries those with a fresh re-check. The same
+/// 15 minutes the OCI blob sweep's delete claim lasts.
+const GC_DELETE_LEASE_SQL: &str = "INTERVAL '15 minutes'";
 
 /// Make an upload's commit visible to storage GC before it trusts the bytes
 /// under `storage_key` (#4980). Call it first in the transaction that inserts
@@ -590,13 +581,17 @@ fn gc_journal_lease_secs() -> i64 {
 ///   after this upload's row, and its pre-delete re-check sees the row and
 ///   keeps the object;
 /// * a candidate sweep skips the locked row, or re-checks after this commit;
-/// * a GC claim that journaled before this point left a fresh row, which is
-///   reported as [`CasKeyGuard::Collecting`]: its delete may not have run yet
-///   and its re-check may already have passed, so the upload must not commit.
+/// * a GC claim that journaled or leased the row before this point stamped
+///   its `leased_at` (migration 301), which is reported as
+///   [`CasKeyGuard::Collecting`] for 15 minutes: its delete may not have run
+///   yet and its re-check may already have passed, so the upload must not
+///   commit.
 ///
 /// A slot this upload created is deleted again in the same transaction, so a
-/// commit leaves no journal row behind; an older row (a failed delete past its
-/// lease) is left to the candidate sweep, which re-checks after this commit.
+/// commit leaves no journal row behind. A row that is not leased (a candidate a
+/// repository delete recorded, waiting out `BLOB_GC_MIN_AGE_SECS`) or whose
+/// lease is older (a failed delete) is left to the candidate sweep, which
+/// re-checks after this commit and keeps the object.
 /// The presence check then runs while the slot is held: GC can no longer
 /// start a delete this commit does not see, and no delete is in flight, so an
 /// object present now stays. It asks [`StorageBackend::exists_at_exact_key`],
@@ -617,21 +612,21 @@ pub(crate) async fn guard_cas_key_for_commit(
 ) -> Result<CasKeyGuard> {
     let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
     let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
-    let (id, inserted, fresh): (i64, bool, bool) = sqlx::query_as(
+    let sql = format!(
         "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path) \
          VALUES ($1, $2, $3) \
          ON CONFLICT (storage_backend, storage_path, storage_key) \
              DO UPDATE SET recorded_at = oci_gc_candidates.recorded_at \
          RETURNING id, (xmax = 0) AS inserted, \
-                   recorded_at >= NOW() - make_interval(secs => $4::BIGINT) AS fresh",
-    )
-    .bind(storage_key)
-    .bind(&scope.backend)
-    .bind(&scope.path)
-    .bind(gc_journal_lease_secs())
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(db_err)?;
+                   COALESCE(leased_at >= NOW() - {GC_DELETE_LEASE_SQL}, false) AS leased"
+    );
+    let (id, inserted, leased): (i64, bool, bool) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(storage_key)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
     if inserted {
         // Ours: keep the slot locked until commit, but leave no row.
         sqlx::query("DELETE FROM oci_gc_candidates WHERE id = $1")
@@ -639,7 +634,7 @@ pub(crate) async fn guard_cas_key_for_commit(
             .execute(&mut *conn)
             .await
             .map_err(db_err)?;
-    } else if fresh {
+    } else if leased {
         return Ok(CasKeyGuard::Collecting);
     }
     match storage.exists_at_exact_key(storage_key).await {
@@ -6984,23 +6979,32 @@ mod gc_commit_guard_tests {
         assert_eq!(rows, 1);
     }
 
-    /// A GC lease that does not end (a failed delete whose journal row is
-    /// still fresh) refuses the upload with a retryable 503 and commits
-    /// nothing, rather than trusting an object that may yet be deleted.
+    /// A GC lease that does not end within the wait (here the candidate
+    /// sweep's shape: a recorded candidate whose `recorded_at` the sweep moved
+    /// to now, and no delete follows) refuses the upload with a retryable 503
+    /// and commits nothing, rather than trusting an object that may yet be
+    /// deleted.
     #[tokio::test]
     async fn upload_against_a_fresh_gc_lease_is_refused_retryably_4980() {
         let Some(r) = setup().await else {
             return;
         };
         sqlx::query(
-            "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path) \
-             VALUES ($1, $2, '')",
+            "INSERT INTO oci_gc_candidates \
+                 (storage_key, storage_backend, storage_path, source_repository_id, recorded_at) \
+             VALUES ($1, $2, '', $3, NOW() - INTERVAL '2 days')",
         )
         .bind(&r.key)
         .bind(BACKEND)
+        .bind(Uuid::new_v4())
         .execute(&r.fx.pool)
         .await
-        .expect("fresh journal lease");
+        .expect("recorded candidate");
+        sqlx::query("UPDATE oci_gc_candidates SET recorded_at = NOW() WHERE storage_key = $1")
+            .bind(&r.key)
+            .execute(&r.fx.pool)
+            .await
+            .expect("the sweep's lease");
         let result = ArtifactService::new(r.fx.pool.clone(), r.storage.clone())
             .upload_with_sync_options(
                 r.fx.repo_id,
@@ -7069,6 +7073,53 @@ mod gc_commit_guard_tests {
         r.fx.teardown().await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(journal, 1, "the stale row is left for the candidate sweep");
+    }
+
+    /// CONTROL: a candidate a repository delete just recorded is only waiting
+    /// out its grace window; it is not a delete in flight and must not hold up
+    /// uploads of the same content (deleting a repository and pushing its
+    /// content again elsewhere is routine).
+    #[tokio::test]
+    async fn freshly_recorded_repo_delete_candidate_does_not_block_an_upload_4980() {
+        let Some(r) = setup().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates \
+                 (storage_key, storage_backend, storage_path, source_repository_id) \
+             VALUES ($1, $2, '', $3)",
+        )
+        .bind(&r.key)
+        .bind(BACKEND)
+        .bind(Uuid::new_v4())
+        .execute(&r.fx.pool)
+        .await
+        .expect("recorded candidate");
+        let started = std::time::Instant::now();
+        let result = ArtifactService::new(r.fx.pool.clone(), r.storage.clone())
+            .upload_with_sync_options(
+                r.fx.repo_id,
+                "new/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                r.data.clone(),
+                Some(r.fx.user_id),
+                false,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&r.key)
+            .execute(&r.fx.pool)
+            .await
+            .expect("cleanup");
+        r.fx.teardown().await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a waiting candidate must not make the upload wait: {elapsed:?}"
+        );
     }
 
     /// CONTROL: an ordinary upload leaves no journal row behind.
