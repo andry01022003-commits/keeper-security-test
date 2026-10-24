@@ -255,6 +255,11 @@ pub enum AuditAction {
     /// An admin ran the source-free Debian package backfill (#4740),
     /// re-registering imported `.deb` rows from their stored control members.
     DebianBackfillRun,
+    /// The scan-on-proxy gate refused a proxied download with `403
+    /// scan_blocked` (#4777). Aggregated per (digest, principal, repository)
+    /// per minute so a CI loop retrying a blocked pull writes at most two
+    /// rows a minute per replica; see [`record_proxy_scan_blocked`].
+    ProxyScanBlocked,
 }
 
 impl AuditAction {
@@ -362,6 +367,7 @@ impl AuditAction {
             AuditAction::DeviceTokenRejected => "DEVICE_TOKEN_REJECTED",
             AuditAction::DeviceAuthorizationExpired => "DEVICE_AUTHORIZATION_EXPIRED",
             AuditAction::DebianBackfillRun => "DEBIAN_BACKFILL_RUN",
+            AuditAction::ProxyScanBlocked => "PROXY_SCAN_BLOCKED",
         }
     }
 }
@@ -1399,6 +1405,336 @@ macro_rules! audit_log {
                 .resource($resource_id),
         )
     };
+}
+
+// ---------------------------------------------------------------------------
+// PROXY_SCAN_BLOCKED (#4777): one audit trail entry per refused proxied pull,
+// aggregated so a client retrying a blocked pull cannot flood the table.
+// ---------------------------------------------------------------------------
+
+/// The aggregation window for `PROXY_SCAN_BLOCKED`.
+pub const PROXY_SCAN_BLOCK_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound on the (digest, principal, repository) keys the aggregator
+/// tracks. Past it, expired windows are dropped first; if none have expired
+/// the new key is still recorded (a row is never lost to the bound), it just
+/// is not aggregated.
+const PROXY_SCAN_BLOCK_MAX_KEYS: usize = 10_000;
+
+/// What one refused pull should write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockAdmission {
+    /// First block of this key in a window: write a row now (`attempts: 1`).
+    Write,
+    /// A repeat inside the window: count it. `schedule_flush` is true for the
+    /// first repeat, whose caller schedules the window's summary row.
+    Suppress { schedule_flush: bool },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockWindow {
+    started: std::time::Instant,
+    suppressed: u64,
+}
+
+/// Per-replica aggregation state for `PROXY_SCAN_BLOCKED`, keyed by
+/// (digest, principal, repository). Pure apart from the clock it is given.
+#[derive(Debug, Default)]
+pub(crate) struct BlockAggregator {
+    windows: std::collections::HashMap<(String, String, Uuid), BlockWindow>,
+}
+
+impl BlockAggregator {
+    pub(crate) fn admit(
+        &mut self,
+        key: (String, String, Uuid),
+        now: std::time::Instant,
+    ) -> BlockAdmission {
+        if let Some(w) = self.windows.get_mut(&key) {
+            if now.duration_since(w.started) < PROXY_SCAN_BLOCK_WINDOW {
+                w.suppressed += 1;
+                return BlockAdmission::Suppress {
+                    schedule_flush: w.suppressed == 1,
+                };
+            }
+        }
+        if self.windows.len() >= PROXY_SCAN_BLOCK_MAX_KEYS {
+            self.windows
+                .retain(|_, w| now.duration_since(w.started) < PROXY_SCAN_BLOCK_WINDOW);
+        }
+        if self.windows.len() < PROXY_SCAN_BLOCK_MAX_KEYS || self.windows.contains_key(&key) {
+            self.windows.insert(
+                key,
+                BlockWindow {
+                    started: now,
+                    suppressed: 0,
+                },
+            );
+        }
+        BlockAdmission::Write
+    }
+
+    /// Close a window: the repeats it absorbed, for its summary row. The key
+    /// is forgotten, so the next block starts a new window with a fresh row.
+    pub(crate) fn take_suppressed(&mut self, key: &(String, String, Uuid)) -> u64 {
+        self.windows.remove(key).map(|w| w.suppressed).unwrap_or(0)
+    }
+}
+
+fn block_aggregator() -> &'static std::sync::Mutex<BlockAggregator> {
+    static AGG: std::sync::OnceLock<std::sync::Mutex<BlockAggregator>> = std::sync::OnceLock::new();
+    AGG.get_or_init(Default::default)
+}
+
+/// One refused proxied pull, as the gate saw it.
+#[derive(Debug, Clone)]
+pub struct ProxyScanBlockEvent {
+    pub repository_id: Uuid,
+    /// The requested file as the gate named it in the 403 body.
+    pub path: String,
+    pub checksum_sha256: String,
+}
+
+/// The request principal of the in-flight request, for attribution: the
+/// username the auth middleware recorded (`None` for an anonymous pull) and
+/// the authorization-grade client IP. Captured before any detached task,
+/// which would not inherit the request's task-locals.
+#[derive(Debug, Clone)]
+struct BlockPrincipal {
+    username: Option<String>,
+    ip: Option<IpAddr>,
+    correlation_id: Option<String>,
+}
+
+impl BlockPrincipal {
+    fn current() -> Self {
+        Self {
+            username: crate::api::middleware::request_span::recorded_user(),
+            ip: crate::api::middleware::client_ip::current_verified_client_ip(),
+            correlation_id: crate::api::middleware::tracing::current_correlation_id()
+                .map(crate::api::middleware::tracing::CorrelationId::into_string),
+        }
+    }
+
+    /// The aggregation key's principal: the username, or for an anonymous
+    /// pull the client address (one CI runner's loop is one key).
+    fn key(&self) -> String {
+        match (&self.username, self.ip) {
+            (Some(u), _) => format!("user:{u}"),
+            (None, Some(ip)) => format!("anonymous:{ip}"),
+            (None, None) => "anonymous".to_string(),
+        }
+    }
+}
+
+/// Record a `PROXY_SCAN_BLOCKED` audit entry for a refused proxied pull
+/// (#4777), aggregated per (digest, principal, repository) per
+/// [`PROXY_SCAN_BLOCK_WINDOW`] on this replica.
+///
+/// The first block of a key in a window writes a row at once (`attempts: 1`).
+/// Repeats inside the window are counted, and one summary row with their
+/// count (`attempts: n`, `aggregated: true`) is written when the window
+/// closes. A client retrying a blocked pull in a loop therefore writes at most
+/// two rows a minute per replica, however fast it retries.
+///
+/// Fire and forget: the write runs detached so the 403 is never delayed, and
+/// a failed write is logged, never surfaced to the client. Must be called on
+/// the request's own task so the principal can be read.
+pub fn record_proxy_scan_blocked(db: &PgPool, event: ProxyScanBlockEvent) {
+    let principal = BlockPrincipal::current();
+    let key = (
+        event.checksum_sha256.clone(),
+        principal.key(),
+        event.repository_id,
+    );
+    let admission = match block_aggregator().lock() {
+        Ok(mut agg) => agg.admit(key.clone(), std::time::Instant::now()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .admit(key.clone(), std::time::Instant::now()),
+    };
+    let db = db.clone();
+    match admission {
+        BlockAdmission::Write => {
+            tokio::spawn(async move {
+                write_proxy_scan_blocked(&db, &event, &principal, 1, false).await;
+            });
+        }
+        BlockAdmission::Suppress {
+            schedule_flush: true,
+        } => {
+            tokio::spawn(async move {
+                tokio::time::sleep(PROXY_SCAN_BLOCK_WINDOW).await;
+                let repeats = match block_aggregator().lock() {
+                    Ok(mut agg) => agg.take_suppressed(&key),
+                    Err(poisoned) => poisoned.into_inner().take_suppressed(&key),
+                };
+                if repeats > 0 {
+                    write_proxy_scan_blocked(&db, &event, &principal, repeats, true).await;
+                }
+            });
+        }
+        BlockAdmission::Suppress { .. } => {}
+    }
+}
+
+async fn write_proxy_scan_blocked(
+    db: &PgPool,
+    event: &ProxyScanBlockEvent,
+    principal: &BlockPrincipal,
+    attempts: u64,
+    aggregated: bool,
+) {
+    #[derive(sqlx::FromRow)]
+    struct Context {
+        repository_key: Option<String>,
+        user_id: Option<Uuid>,
+        verdict: Option<String>,
+        max_severity: Option<String>,
+        findings_count: Option<i32>,
+        scanned_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let ctx: Option<Context> = sqlx::query_as(
+        r#"
+        SELECT (SELECT key FROM repositories WHERE id = $1) AS repository_key,
+               (SELECT id FROM users WHERE username = $2 LIMIT 1) AS user_id,
+               psr.verdict, psr.max_severity, psr.findings_count, psr.scanned_at
+          FROM (SELECT 1) one
+          LEFT JOIN proxy_scan_results psr
+            ON psr.checksum_sha256 = $3 AND psr.scan_type = $4
+        "#,
+    )
+    .bind(event.repository_id)
+    .bind(principal.username.as_deref())
+    .bind(&event.checksum_sha256)
+    .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "PROXY_SCAN_BLOCKED context lookup failed; recording without it");
+        None
+    });
+    let ctx = ctx.unwrap_or(Context {
+        repository_key: None,
+        user_id: None,
+        verdict: None,
+        max_severity: None,
+        findings_count: None,
+        scanned_at: None,
+    });
+    let details = serde_json::json!({
+        "repository": ctx.repository_key,
+        "repository_id": event.repository_id,
+        "path": event.path,
+        "checksum_sha256": event.checksum_sha256,
+        "verdict": ctx.verdict.as_deref().unwrap_or("vulnerable"),
+        "max_severity": ctx.max_severity,
+        "findings_count": ctx.findings_count,
+        "scanned_at": ctx.scanned_at,
+        "principal": principal.username,
+        "anonymous": principal.username.is_none(),
+        "attempts": attempts,
+        "aggregated": aggregated,
+        "window_seconds": PROXY_SCAN_BLOCK_WINDOW.as_secs(),
+    });
+    let mut entry = AuditEntry::new(AuditAction::ProxyScanBlocked, ResourceType::Repository)
+        .resource(event.repository_id)
+        .details(details);
+    if let Some(name) = ctx.repository_key {
+        entry = entry.resource_name(name);
+    }
+    if let Some(user_id) = ctx.user_id {
+        entry = entry.user(user_id);
+    }
+    if let Some(username) = principal.username.clone() {
+        entry = entry.actor_name(username);
+    }
+    // The detached task does not inherit the request's task-locals, so the
+    // address and correlation id captured on the request are set explicitly.
+    if let Some(ip) = principal.ip {
+        entry = entry.ip(ip);
+    }
+    if let Some(cid) = principal.correlation_id.as_deref() {
+        entry = entry.correlation(cid);
+    }
+    if let Err(e) = AuditService::new(db.clone()).log(entry).await {
+        tracing::warn!(
+            repository_id = %event.repository_id, digest = %event.checksum_sha256, error = %e,
+            "failed to record the PROXY_SCAN_BLOCKED audit entry"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod proxy_scan_blocked_4777_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn key(digest: &str, who: &str) -> (String, String, Uuid) {
+        (digest.to_string(), who.to_string(), Uuid::nil())
+    }
+
+    /// A retry loop inside one window writes one row now and schedules one
+    /// summary; a new window writes again. Another digest or principal is
+    /// its own key.
+    #[test]
+    fn aggregation_writes_once_per_window_and_counts_repeats() {
+        let mut agg = BlockAggregator::default();
+        let t0 = Instant::now();
+        let k = key("d1", "user:ci");
+        assert_eq!(agg.admit(k.clone(), t0), BlockAdmission::Write);
+        assert_eq!(
+            agg.admit(k.clone(), t0 + Duration::from_secs(1)),
+            BlockAdmission::Suppress {
+                schedule_flush: true
+            }
+        );
+        for i in 2..50 {
+            assert_eq!(
+                agg.admit(k.clone(), t0 + Duration::from_millis(1000 + i)),
+                BlockAdmission::Suppress {
+                    schedule_flush: false
+                }
+            );
+        }
+        assert_eq!(agg.admit(key("d2", "user:ci"), t0), BlockAdmission::Write);
+        assert_eq!(
+            agg.admit(key("d1", "user:other"), t0),
+            BlockAdmission::Write
+        );
+        assert_eq!(agg.take_suppressed(&k), 49);
+        assert_eq!(agg.take_suppressed(&k), 0, "a closed window is forgotten");
+        assert_eq!(
+            agg.admit(k.clone(), t0 + Duration::from_secs(61)),
+            BlockAdmission::Write
+        );
+        // An expired window that was never flushed also restarts.
+        let k3 = key("d3", "anonymous:10.0.0.1");
+        assert_eq!(agg.admit(k3.clone(), t0), BlockAdmission::Write);
+        assert_eq!(
+            agg.admit(k3, t0 + PROXY_SCAN_BLOCK_WINDOW),
+            BlockAdmission::Write
+        );
+    }
+
+    #[test]
+    fn principal_key_prefers_the_username_then_the_address() {
+        let p = |u: Option<&str>, ip: Option<&str>| BlockPrincipal {
+            username: u.map(str::to_string),
+            ip: ip.map(|s| s.parse().unwrap()),
+            correlation_id: None,
+        };
+        assert_eq!(p(Some("ci"), Some("10.0.0.1")).key(), "user:ci");
+        assert_eq!(p(None, Some("10.0.0.1")).key(), "anonymous:10.0.0.1");
+        assert_eq!(p(None, None).key(), "anonymous");
+    }
+
+    #[test]
+    fn action_string_is_stable() {
+        assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
+        assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
+    }
 }
 
 #[cfg(ak_test_shard = "services-1")]
