@@ -103,7 +103,10 @@ pub(crate) struct SubdirDocs {
     /// JLAP footer hashes.
     pub json: Prepared,
     pub zst: Prepared,
-    pub bz2: Prepared,
+    /// Rendered from `zst` by the first `.bz2` request of the revision and
+    /// kept with it (#4882): bzip2 is the slowest encoding by far and the
+    /// one modern clients ask for least.
+    pub bz2: tokio::sync::OnceCell<Prepared>,
     pub current: Prepared,
     pub run_exports: Prepared,
     pub jlap: Prepared,
@@ -113,7 +116,7 @@ impl CachedRender for SubdirDocs {
     fn weight_bytes(&self) -> usize {
         self.json.weight()
             + self.zst.weight()
-            + self.bz2.weight()
+            + self.bz2.get().map_or(0, Prepared::weight)
             + self.current.weight()
             + self.run_exports.weight()
             + self.jlap.weight()
@@ -169,6 +172,157 @@ pub(crate) fn channel_cache() -> &'static DocCache {
     })
 }
 
+/// Default of [`REGEN_CONCURRENCY_ENV`].
+const DEFAULT_REGEN_CONCURRENCY: usize = 2;
+/// Process-wide bound on concurrent hosted conda renders (#4176).
+pub(crate) const REGEN_CONCURRENCY_ENV: &str = "AK_CONDA_REGEN_CONCURRENCY";
+/// Default of [`REGEN_WAIT_ENV`], seconds.
+const DEFAULT_REGEN_WAIT_SECS: u64 = 30;
+/// How long a request waits for a render before it is answered 503 (#4176).
+pub(crate) const REGEN_WAIT_ENV: &str = "AK_CONDA_REGEN_WAIT_SECS";
+/// `Retry-After` of that 503, seconds: a render of a large subdir takes
+/// seconds, so an immediate retry would only queue again.
+const REGEN_RETRY_AFTER_SECS: u64 = 5;
+
+/// Parse [`REGEN_CONCURRENCY_ENV`]: a positive integer, else the default.
+pub(crate) fn parse_regen_concurrency(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_REGEN_CONCURRENCY,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    value = v,
+                    default = DEFAULT_REGEN_CONCURRENCY,
+                    "{REGEN_CONCURRENCY_ENV} is not a positive integer; using the default"
+                );
+                DEFAULT_REGEN_CONCURRENCY
+            }
+        },
+    }
+}
+
+/// Parse [`REGEN_WAIT_ENV`]: seconds, `0` for no bound, else the default.
+pub(crate) fn parse_regen_wait(raw: Option<&str>) -> Option<Duration> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(Duration::from_secs(DEFAULT_REGEN_WAIT_SECS)),
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(Duration::from_secs(n)),
+            Err(_) => {
+                tracing::warn!(
+                    value = v,
+                    default = DEFAULT_REGEN_WAIT_SECS,
+                    "{REGEN_WAIT_ENV} is not a number of seconds; using the default"
+                );
+                Some(Duration::from_secs(DEFAULT_REGEN_WAIT_SECS))
+            }
+        },
+    }
+}
+
+/// Bounds how many hosted conda renders run at once in this process, so a
+/// fleet refreshing many subdirs cannot pin every core on JSON encoding and
+/// compression (#4176). Per-subdir single flight comes from the revision
+/// cache; this is the cap across subdirs and repositories.
+pub(crate) struct RegenGate {
+    permits: tokio::sync::Semaphore,
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// Most renders seen running at once (tests and diagnostics).
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl RegenGate {
+    pub(crate) fn new(concurrency: usize) -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(concurrency.max(1)),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Run `work` once a permit is free.
+    pub(crate) async fn run<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        use std::sync::atomic::Ordering;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("the regeneration semaphore is never closed");
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        metrics::gauge!("ak_conda_repodata_regenerations_in_flight").increment(1.0);
+        struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                metrics::gauge!("ak_conda_repodata_regenerations_in_flight").decrement(1.0);
+            }
+        }
+        let _done = Done(&self.in_flight);
+        work.await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The process's [`RegenGate`], sized by [`REGEN_CONCURRENCY_ENV`].
+pub(crate) fn regen_gate() -> &'static RegenGate {
+    static GATE: OnceLock<RegenGate> = OnceLock::new();
+    GATE.get_or_init(|| {
+        RegenGate::new(parse_regen_concurrency(
+            std::env::var(REGEN_CONCURRENCY_ENV).ok().as_deref(),
+        ))
+    })
+}
+
+fn regen_wait() -> Option<Duration> {
+    static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
+    *WAIT.get_or_init(|| parse_regen_wait(std::env::var(REGEN_WAIT_ENV).ok().as_deref()))
+}
+
+/// The 503 a request gets when its document is not ready within the wait.
+fn regen_busy() -> Response {
+    metrics::counter!("ak_conda_repodata_requests_shed_total").increment(1);
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Conda channel metadata is being regenerated; retry shortly",
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(REGEN_RETRY_AFTER_SECS),
+    );
+    response
+}
+
+/// Wait at most `wait` for `work`, which runs as its own task: a request
+/// that gives up (503 with `Retry-After`) leaves the rebuild or render
+/// running, and its result is kept for the requests that follow.
+pub(crate) async fn bounded_by<T: Send + 'static>(
+    wait: Option<Duration>,
+    work: impl std::future::Future<Output = Result<T, Response>> + Send + 'static,
+) -> Result<T, Response> {
+    let task = tokio::spawn(work);
+    let joined = match wait {
+        Some(wait) => match tokio::time::timeout(wait, task).await {
+            Ok(joined) => joined,
+            Err(_) => return Err(regen_busy()),
+        },
+        None => task.await,
+    };
+    joined.map_err(render_failed)?
+}
+
+async fn bounded<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T, Response>> + Send + 'static,
+) -> Result<T, Response> {
+    bounded_by(regen_wait(), work).await
+}
+
 /// Scope of a repository's `channeldata.json` entry.
 const CHANNEL_SCOPE: &str = "";
 
@@ -205,47 +359,92 @@ pub(crate) async fn hosted_subdir_docs(
 ) -> Result<Arc<SubdirDocs>, Response> {
     super::validate_read_subdir(subdir)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
-    let state = shard_store::subdir_state(db, repo_id, subdir).await?;
-    let subdir_owned = subdir.to_string();
-    subdir_cache()
-        .get_or_render_scoped(repo_id, subdir, Revision(state.revision), || {
-            render_subdir_docs(db.clone(), repo_id, subdir_owned, state.now)
-        })
-        .await
+    let db = db.clone();
+    let subdir = subdir.to_string();
+    bounded(async move {
+        let state = shard_store::subdir_state(&db, repo_id, &subdir).await?;
+        if state.backfilled && state.revision == 0 {
+            // No row has ever named this subdir (every write and the
+            // backfill give a named subdir a revision): its documents are
+            // empty, so they cost no catalog walk, no permit and no cache
+            // entry. Requests for made-up subdirs cannot evict real ones.
+            return empty_subdir_docs(&subdir).map(Arc::new);
+        }
+        subdir_cache()
+            .get_or_render_scoped(repo_id, &subdir, Revision(state.revision), || {
+                regen_gate().run(render_subdir_docs(
+                    db.clone(),
+                    repo_id,
+                    subdir.clone(),
+                    state.now,
+                ))
+            })
+            .await
+    })
+    .await
 }
 
-/// Render every document of a hosted subdir from one catalog walk, deciding
-/// visibility at `now`.
+/// The documents of a subdir no row has ever named.
+fn empty_subdir_docs(subdir: &str) -> Result<SubdirDocs, Response> {
+    let rendered = super::repodata_render::render_empty(subdir)?;
+    let jlap = super::build_bootstrap_jlap(&rendered.json);
+    Ok(SubdirDocs {
+        json: Prepared::new(rendered.json),
+        zst: Prepared::new(rendered.zst),
+        bz2: tokio::sync::OnceCell::new(),
+        current: Prepared::new(rendered.current),
+        run_exports: Prepared::new(rendered.run_exports),
+        jlap: Prepared::new(jlap),
+    })
+}
+
+/// `docs` with its `.bz2` rendering made (#4882): rendered from the kept
+/// zstd document by the first request that asks, under the regeneration
+/// gate and wait, then kept for the revision's lifetime. Single-stream
+/// bzip2 at level 9, the bytes 1.11 served.
+pub(crate) async fn with_bz2(docs: Arc<SubdirDocs>) -> Result<Arc<SubdirDocs>, Response> {
+    if docs.bz2.initialized() {
+        return Ok(docs);
+    }
+    bounded(async move {
+        docs.bz2
+            .get_or_try_init(|| {
+                regen_gate().run(async {
+                    let zst = docs.zst.body.clone();
+                    let body = tokio::task::spawn_blocking(move || {
+                        super::RepodataEncoding::Bz2.transcode_zst(&zst)
+                    })
+                    .await
+                    .map_err(render_failed)??;
+                    Ok::<_, Response>(Prepared::new(body))
+                })
+            })
+            .await?;
+        Ok(docs)
+    })
+    .await
+}
+
+/// Render every document of a hosted subdir with one cursor walk of the
+/// catalog ([`super::repodata_render`]), deciding visibility at `now`.
 async fn render_subdir_docs(
     db: PgPool,
     repo_id: Uuid,
     subdir: String,
     now: DateTime<Utc>,
 ) -> Result<SubdirDocs, Response> {
-    let all = super::list_conda_artifacts_at(&db, repo_id, now).await?;
     let removed = super::list_removed_artifacts_at(&db, repo_id, &subdir, now).await?;
-    tokio::task::spawn_blocking(move || -> Result<SubdirDocs, Response> {
-        let in_subdir = super::artifacts_for_subdir(&all, &subdir);
-        let full = super::repodata_document(&in_subdir, &subdir, false, &removed);
-        let current = super::repodata_document(&in_subdir, &subdir, true, &removed);
-        let run_exports = super::run_exports_document(&in_subdir, &subdir);
-        let json = serde_json::to_vec_pretty(&full).map_err(render_failed)?;
-        let zst = super::RepodataEncoding::Zst.encode(&full)?;
-        let bz2 = super::RepodataEncoding::Bz2.encode(&full)?;
-        let jlap = super::build_bootstrap_jlap(&json);
-        Ok(SubdirDocs {
-            json: Prepared::new(json),
-            zst: Prepared::new(zst),
-            bz2: Prepared::new(bz2),
-            current: Prepared::new(serde_json::to_vec_pretty(&current).map_err(render_failed)?),
-            run_exports: Prepared::new(
-                serde_json::to_vec_pretty(&run_exports).map_err(render_failed)?,
-            ),
-            jlap: Prepared::new(jlap),
-        })
+    let rendered =
+        super::repodata_render::render_subdir(&db, repo_id, &subdir, now, &removed).await?;
+    let jlap = super::build_bootstrap_jlap(&rendered.json);
+    Ok(SubdirDocs {
+        json: Prepared::new(rendered.json),
+        zst: Prepared::new(rendered.zst),
+        bz2: tokio::sync::OnceCell::new(),
+        current: Prepared::new(rendered.current),
+        run_exports: Prepared::new(rendered.run_exports),
+        jlap: Prepared::new(jlap),
     })
-    .await
-    .map_err(render_failed)?
 }
 
 /// The CEP-16 shard index of hosted `(repo_id, subdir)`, serialised from the
@@ -256,20 +455,24 @@ pub(crate) async fn hosted_shard_index(
     repo_id: Uuid,
     subdir: &str,
 ) -> Result<Option<Arc<Prepared>>, Response> {
-    let state = shard_store::subdir_state(db, repo_id, subdir).await?;
-    if !state.backfilled {
-        return Ok(None);
-    }
-    let subdir_owned = subdir.to_string();
-    shard_index_cache()
-        .get_or_render_scoped(repo_id, subdir, Revision(state.revision), || async move {
-            let shards = shard_store::stored_index(db, repo_id, &subdir_owned).await?;
-            let body =
-                super::serialize_msgpack_zst(&super::build_sharded_index(&subdir_owned, &shards))?;
-            Ok::<_, Response>(Prepared::new(body))
-        })
-        .await
-        .map(Some)
+    let db = db.clone();
+    let subdir = subdir.to_string();
+    bounded(async move {
+        let state = shard_store::subdir_state(&db, repo_id, &subdir).await?;
+        if !state.backfilled {
+            return Ok(None);
+        }
+        shard_index_cache()
+            .get_or_render_scoped(repo_id, &subdir, Revision(state.revision), || async {
+                let shards = shard_store::stored_index(&db, repo_id, &subdir).await?;
+                let body =
+                    super::serialize_msgpack_zst(&super::build_sharded_index(&subdir, &shards))?;
+                Ok::<_, Response>(Prepared::new(body))
+            })
+            .await
+            .map(Some)
+    })
+    .await
 }
 
 /// The stored shard at `address` of hosted `(repo_id, subdir)`. `Ok(None)`
@@ -295,16 +498,17 @@ pub(crate) async fn hosted_channeldata(
     db: &PgPool,
     repo_id: Uuid,
 ) -> Result<Arc<Prepared>, Response> {
-    let state = shard_store::repo_state(db, repo_id).await?;
-    channel_cache()
-        .get_or_render_scoped(
-            repo_id,
-            CHANNEL_SCOPE,
-            Revision(state.revision),
-            || async move {
-                let body = super::render_hosted_channeldata(db, repo_id, state.now).await?;
-                Ok::<_, Response>(Prepared::new(body))
-            },
-        )
-        .await
+    let db = db.clone();
+    bounded(async move {
+        let state = shard_store::repo_state(&db, repo_id).await?;
+        channel_cache()
+            .get_or_render_scoped(repo_id, CHANNEL_SCOPE, Revision(state.revision), || {
+                regen_gate().run(async {
+                    let body = super::render_hosted_channeldata(&db, repo_id, state.now).await?;
+                    Ok::<_, Response>(Prepared::new(body))
+                })
+            })
+            .await
+    })
+    .await
 }
