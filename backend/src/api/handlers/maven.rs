@@ -1085,24 +1085,31 @@ async fn maven_remote_stream(
             upstream_url,
             RepositoryFormat::Maven,
         );
-        let result = proxy
-            .fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
+        // #4573: the cached `.sha1` is read alongside the content open, not
+        // after it (the #3982/#4289 rule), and from the cache only.
+        let (result, sha1) = tokio::join!(
+            proxy.fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
                 &gated_repo,
                 path,
                 path,
                 crate::services::proxy_service::CommitDigestAlgorithm::Sha1,
                 digest,
-            )
-            .await
-            .map_err(IntoResponse::into_response)?;
-        return proxy_helpers::build_streaming_response_with_disposition(
+            ),
+            cached_maven_sha1(proxy, repo_key, path),
+        );
+        let result = result.map_err(IntoResponse::into_response)?;
+        let mut response = proxy_helpers::build_streaming_response_with_disposition(
             result,
             content_type_for_path(path),
             None,
         )
         .map_err(|e| {
             AppError::Internal(format!("failed to build response: {}", e)).into_response()
-        });
+        })?;
+        if response.status() == StatusCode::OK {
+            insert_maven_checksum_headers(response.headers_mut(), sha1.as_deref(), None);
+        }
+        return Ok(response);
     }
     proxy_helpers::proxy_fetch_streaming_with_format(
         proxy,
@@ -1351,10 +1358,104 @@ pub(crate) fn scanned_jvm_archive_response(
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, body.bytes.len().to_string())
         .header("X-Checksum-SHA256", &body.digest);
+    // #4573: the buffered bytes are what the client stores, so their SHA-1 and
+    // MD5 are exact. Not for a content-coded body: the client verifies the
+    // decoded file, and these would be digests of the coding.
+    if body.content_encoding.is_none() {
+        builder = builder
+            .header(
+                MAVEN_CHECKSUM_SHA1_HEADER,
+                compute_checksum(&body.bytes, ChecksumType::Sha1),
+            )
+            .header(
+                MAVEN_CHECKSUM_MD5_HEADER,
+                compute_checksum(&body.bytes, ChecksumType::Md5),
+            );
+    }
     if let Some(enc) = body.content_encoding {
         builder = builder.header(axum::http::header::CONTENT_ENCODING, enc);
     }
     builder.body(Body::from(body.bytes)).unwrap()
+}
+
+/// Maven Resolver's "Remote Included" checksum headers (#4573). A download
+/// response that carries one lets the client skip its separate `.sha1` (or
+/// `.md5`) request; Maven Central sends both.
+const MAVEN_CHECKSUM_SHA1_HEADER: &str = "X-Checksum-SHA1";
+const MAVEN_CHECKSUM_MD5_HEADER: &str = "X-Checksum-MD5";
+
+/// Add the #4573 checksum headers to a Maven download response. A value that
+/// is not lowercase hex of the algorithm's length is dropped, so a malformed
+/// stored or upstream checksum is never forwarded as a header the client
+/// would then fail the download on.
+fn insert_maven_checksum_headers(
+    headers: &mut axum::http::HeaderMap,
+    sha1: Option<&str>,
+    md5: Option<&str>,
+) {
+    fn is_hex_of_len(value: &str, len: usize) -> bool {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+    for (name, value, len) in [
+        (MAVEN_CHECKSUM_SHA1_HEADER, sha1, 40),
+        (MAVEN_CHECKSUM_MD5_HEADER, md5, 32),
+    ] {
+        if let Some(value) = value.filter(|v| is_hex_of_len(v, len)) {
+            if let Ok(value) = axum::http::HeaderValue::from_str(value) {
+                headers.insert(name, value);
+            }
+        }
+    }
+}
+
+/// The SHA-1 a Remote repository already holds for `path`: its cached `.sha1`
+/// sidecar, read from the proxy cache only (#4573). Never contacts the
+/// upstream, so a warm serve does not wait on an upstream round trip for a
+/// header, and an absent, expired or unparseable sidecar is `None` (the client
+/// then requests the `.sha1` itself, as before).
+///
+/// Only for a released package asset ([`maven_sha1_sidecar_gate_applies`]):
+/// such a body was committed only after it matched this very sidecar
+/// (GHSA-qxv7-p3mq-88fv), so the two agree. A `-SNAPSHOT` asset is mutable and
+/// its cached sidecar may describe an older deploy.
+async fn cached_maven_sha1(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_key: &str,
+    path: &str,
+) -> Option<String> {
+    if !maven_sha1_sidecar_gate_applies(path) {
+        return None;
+    }
+    let cached = proxy
+        .get_cached_artifact_by_path(repo_key, &format!("{path}.sha1"))
+        .await
+        .ok()
+        .flatten()?;
+    match parse_maven_sha1_sidecar(&cached.content)? {
+        crate::services::proxy_service::CacheCommitDigest::Sha1Hex(hex) => Some(hex),
+        _ => None,
+    }
+}
+
+/// The stored SHA-1 and MD5 of a hosted artifact row (#4573), for a virtual
+/// repository's serve from a hosted member. `None` when the row is gone or
+/// the lookup fails: the header is an optimisation, never a reason to fail
+/// the download.
+async fn hosted_maven_checksums(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+) -> Option<(Option<String>, Option<String>)> {
+    sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT checksum_sha1, checksum_md5 FROM artifacts WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
 }
 
 /// A Remote repository (a Virtual's member on the walk) a Maven file is
@@ -3242,16 +3343,31 @@ async fn serve_artifact(
 
                 // Only the winning member's result reaches here, so this counts once;
                 // proxy-member and row-less legacy serves carry `None` (#1278).
-                if let Some(artifact_id) = result.artifact_id {
-                    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx)
+                let hosted_checksums = match result.artifact_id {
+                    Some(artifact_id) => {
+                        crate::services::artifact_service::record_download(
+                            &state.db,
+                            artifact_id,
+                            ctx,
+                        )
                         .await;
-                }
+                        hosted_maven_checksums(&state.db, artifact_id).await
+                    }
+                    None => None,
+                };
 
-                return proxy_helpers::stream_fetch_result(
-                    result,
-                    content_type_for_path(path),
-                    None,
-                );
+                let mut response =
+                    proxy_helpers::stream_fetch_result(result, content_type_for_path(path), None)?;
+                // #4573: a hosted member's serve carries the checksums its
+                // own hosted route sends.
+                if let (Some((sha1, md5)), StatusCode::OK) = (hosted_checksums, response.status()) {
+                    insert_maven_checksum_headers(
+                        response.headers_mut(),
+                        sha1.as_deref(),
+                        md5.as_deref(),
+                    );
+                }
+                return Ok(response);
             }
 
             // Legacy hosted fallback for repositories populated before Maven
@@ -9442,6 +9558,176 @@ mod tests {
              sidecar entry forced an upstream refetch ({} new requests)",
             requests_after - requests_before
         );
+    }
+
+    /// #4573: a Remote repository's jar download carries `X-Checksum-SHA1`
+    /// once the `.sha1` is cached, so Maven Resolver skips its separate
+    /// `.sha1` request. Before, only the hosted route sent it; a proxied jar
+    /// carried no checksum header Resolver reads.
+    #[tokio::test]
+    async fn test_remote_jar_download_carries_cached_sha1_header_4573() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const JAR: &str = "com/example/lib/4.5/lib-4.5.jar";
+        const JAR_BODY: &[u8] = b"jar-bytes-4573";
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/java-archive")
+                    .set_body_bytes(JAR_BODY.to_vec()),
+            )
+            .mount(&mock)
+            .await;
+        let sha1_hex = hex::encode(sha1::Sha1::digest(JAR_BODY));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}.sha1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(sha1_hex.clone()),
+            )
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        tdh::publish_repo(&pool, remote_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let get_jar = || async {
+            let resp = download(
+                State(state.clone()),
+                Extension(None),
+                Path((remote_key.clone(), JAR.to_string())),
+                axum::http::HeaderMap::new(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GET {remote_key}/{JAR} must proxy 200, got {e:?}"));
+            assert_eq!(resp.status(), StatusCode::OK);
+            let sha1 = resp
+                .headers()
+                .get("x-checksum-sha1")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+            assert_eq!(&body[..], JAR_BODY);
+            sha1
+        };
+
+        // Cold GET: commits the jar and, through the digest gate, caches its
+        // `.sha1`.
+        let _ = get_jar().await;
+        tdh::await_proxy_sidecar(&dir.join(format!(
+            "proxy-cache/{remote_key}/{JAR}/__cache_meta__.json"
+        )))
+        .await;
+        tdh::await_proxy_sidecar(&dir.join(format!(
+            "proxy-cache/{remote_key}/{JAR}.sha1/__cache_meta__.json"
+        )))
+        .await;
+        let requests_before = mock.received_requests().await.map(|r| r.len()).unwrap_or(0);
+
+        let warm = get_jar().await;
+        let requests_after = mock.received_requests().await.map(|r| r.len()).unwrap_or(0);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            warm.as_deref(),
+            Some(sha1_hex.as_str()),
+            "a warm Remote jar must carry the SHA-1 of its cached `.sha1`"
+        );
+        assert_eq!(
+            requests_after, requests_before,
+            "the header is read from the cache, never fetched upstream"
+        );
+    }
+
+    #[test]
+    fn test_maven_checksum_headers_drop_malformed_values_4573() {
+        let mut headers = axum::http::HeaderMap::new();
+        insert_maven_checksum_headers(
+            &mut headers,
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            Some("d41d8cd98f00b204e9800998ecf8427e"),
+        );
+        assert_eq!(
+            headers.get("x-checksum-sha1").unwrap(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert_eq!(
+            headers.get("x-checksum-md5").unwrap(),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        insert_maven_checksum_headers(
+            &mut headers,
+            // Upper case, wrong length, and a header-splitting attempt.
+            Some("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"),
+            Some("d41d8cd98f00b204e9800998ecf8427e\r\nx-evil: 1"),
+        );
+        assert!(headers.is_empty());
+        insert_maven_checksum_headers(&mut headers, Some("abc"), None);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_scanned_jvm_archive_response_carries_sha1_and_md5_4573() {
+        let bytes = Bytes::from_static(b"scanned-jar-4573");
+        let response = scanned_jvm_archive_response(
+            "application/java-archive",
+            proxy_helpers::ScannedProxyBody {
+                bytes: bytes.clone(),
+                content_type: None,
+                content_encoding: None,
+                digest: compute_checksum(&bytes, ChecksumType::Sha256),
+            },
+        );
+        assert_eq!(
+            response.headers().get("x-checksum-sha1").unwrap(),
+            compute_checksum(&bytes, ChecksumType::Sha1).as_str()
+        );
+        assert_eq!(
+            response.headers().get("x-checksum-md5").unwrap(),
+            compute_checksum(&bytes, ChecksumType::Md5).as_str()
+        );
+
+        // A content-coded body: the digests would describe the coding.
+        let coded = scanned_jvm_archive_response(
+            "application/java-archive",
+            proxy_helpers::ScannedProxyBody {
+                bytes: bytes.clone(),
+                content_type: None,
+                content_encoding: Some("gzip".to_string()),
+                digest: compute_checksum(&bytes, ChecksumType::Sha256),
+            },
+        );
+        assert!(coded.headers().get("x-checksum-sha1").is_none());
+        assert!(coded.headers().get("x-checksum-md5").is_none());
     }
 
     /// #3778: a warm Maven proxy GET must not require synchronous PostgreSQL

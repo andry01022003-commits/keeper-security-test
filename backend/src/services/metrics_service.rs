@@ -772,6 +772,54 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
     .increment(1);
 }
 
+/// Why a proxy-cache publish failed (#4319). A bounded label set: the class
+/// says which step of the publish refused, not what the error text was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyCachePublishFailure {
+    /// Writing the body to the backend failed: the buffered `put`, or the
+    /// streaming `put_stream` into the staging key, for a reason on the
+    /// storage side (an upstream error or the per-object ceiling is not
+    /// counted, the backend did nothing wrong there).
+    PutFailed,
+    /// The backend refused the server-side copy from the staging key onto the
+    /// live key (the GCS S3-compatible API answering 411 before #3737 was
+    /// this class).
+    CopyRejected,
+    /// The copy reported success but the live key does not hold the staged
+    /// bytes: a different size, or the ETag of an empty object (#4630).
+    PublishMismatch,
+    /// The body landed but the metadata sidecar that commits it could not be
+    /// written, so the entry reads as a miss.
+    CommitFailed,
+}
+
+impl ProxyCachePublishFailure {
+    /// The `class` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PutFailed => "put_failed",
+            Self::CopyRejected => "copy_rejected",
+            Self::PublishMismatch => "publish_mismatch",
+            Self::CommitFailed => "commit_failed",
+        }
+    }
+}
+
+/// Record a proxy-cache publish that failed (#4319), labelled by the storage
+/// backend the proxy cache runs on and the failure class. The body was still
+/// served to the client; only the cache write was lost, so before this a
+/// backend that silently refused every cache write showed up in the logs
+/// only. Alert on `sum by (backend, class)
+/// (rate(ak_proxy_cache_publish_failures_total[5m])) > 0`.
+pub fn record_proxy_cache_publish_failure(backend: &'static str, class: ProxyCachePublishFailure) {
+    counter!(
+        "ak_proxy_cache_publish_failures_total",
+        "backend" => backend,
+        "class" => class.as_str()
+    )
+    .increment(1);
+}
+
 /// Record a proxy serve that kept a cached body because upstream answered a
 /// definitive 404/410 and the repository's `on_upstream_not_found` policy is
 /// `keep` (#4640). The counter is the observable signal that a served body no

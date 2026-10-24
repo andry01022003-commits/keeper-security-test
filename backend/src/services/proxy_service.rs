@@ -28,7 +28,7 @@ use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
 use crate::services::metrics_service::{
-    record_proxy_cache_lookup, record_proxy_stale_if_error_response,
+    record_proxy_cache_lookup, record_proxy_stale_if_error_response, ProxyCachePublishFailure,
 };
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
@@ -1736,6 +1736,24 @@ async fn discard_staging(storage: &StorageService, staging_key: &str) {
     }
 }
 
+/// Count a failed proxy-cache publish against the backend the cache runs on
+/// (#4319), next to the `warn` that already logs it.
+fn count_publish_failure(storage: &StorageService, class: ProxyCachePublishFailure) {
+    crate::services::metrics_service::record_proxy_cache_publish_failure(
+        storage.backend_kind(),
+        class,
+    );
+}
+
+/// Whether a failed `put_stream` into the staging key is the storage side's
+/// failure (#4319). The tee forwards an upstream body error as `BadGateway`
+/// and abandons the cache half under the per-object ceiling (#2928) with a
+/// `Validation` error; `put_stream` returns either one unchanged, and neither
+/// says anything about the backend.
+fn put_stream_failure_is_storage_side(error: &AppError) -> bool {
+    !matches!(error, AppError::BadGateway(_) | AppError::Validation(_))
+}
+
 /// Best-effort removal of an object a publish just landed on the LIVE cache
 /// key and that must not be served (#4630).
 ///
@@ -2659,7 +2677,10 @@ impl CachePersister {
         // #1618 S9: body → sidecar write ordering. Store content first so we
         // can read the backend's ETag back for the integrity-revalidation
         // pin (#1051).
-        self.storage.put(cache_key, content.clone()).await?;
+        if let Err(e) = self.storage.put(cache_key, content.clone()).await {
+            count_publish_failure(&self.storage, ProxyCachePublishFailure::PutFailed);
+            return Err(e);
+        }
 
         // #1618 S9 / #1051: best-effort capture of the backend's ETag right
         // after the PUT so the fast path can re-HEAD on each hit and reject
@@ -2690,9 +2711,14 @@ impl CachePersister {
 
         // #1618 S9: sidecar written second, after the content object above.
         let metadata_json = serde_json::to_vec(&metadata)?;
-        self.storage
+        if let Err(e) = self
+            .storage
             .put(metadata_key, Bytes::from(metadata_json))
-            .await?;
+            .await
+        {
+            count_publish_failure(&self.storage, ProxyCachePublishFailure::CommitFailed);
+            return Err(e);
+        }
         invalidate_proxy_metadata_lru(metadata_key).await;
 
         // Proxy-cached content is intentionally NOT recorded in the
@@ -2995,6 +3021,10 @@ impl CachePersister {
                                  not caching (no metadata sidecar) so the next request refetches \
                                  upstream"
                             );
+                            count_publish_failure(
+                                &storage_clone,
+                                ProxyCachePublishFailure::CopyRejected,
+                            );
                             discard_staging(&storage_clone, &staging_key).await;
                             return;
                         }
@@ -3041,6 +3071,10 @@ impl CachePersister {
                                     "published proxy-cache object does not have the size that \
                                      was staged; not caching (no metadata sidecar) and dropping \
                                      the live key so the next request refetches upstream"
+                                );
+                                count_publish_failure(
+                                    &storage_clone,
+                                    ProxyCachePublishFailure::PublishMismatch,
                                 );
                                 // Unlike every other reject arm here, this one
                                 // runs AFTER a `copy()` that reported success,
@@ -3111,6 +3145,10 @@ impl CachePersister {
                                  object; not caching (no metadata sidecar) and dropping the \
                                  live key so the next request refetches upstream (#4630)"
                             );
+                            count_publish_failure(
+                                &storage_clone,
+                                ProxyCachePublishFailure::PublishMismatch,
+                            );
                             discard_bad_publish(&storage_clone, &cache_key_for_writer).await;
                             return;
                         }
@@ -3146,6 +3184,10 @@ impl CachePersister {
                                         metadata_key = %metadata_key,
                                         error = %e,
                                         "proxy cache metadata sidecar write failed; cache will refetch next request"
+                                    );
+                                    count_publish_failure(
+                                        &storage_clone,
+                                        ProxyCachePublishFailure::CommitFailed,
                                     );
                                 } else {
                                     invalidate_proxy_metadata_lru(&metadata_key).await;
@@ -3242,6 +3284,9 @@ impl CachePersister {
                         error = %e,
                         "proxy cache put_stream failed; cache will refetch next request"
                     );
+                    if put_stream_failure_is_storage_side(&e) {
+                        count_publish_failure(&storage_clone, ProxyCachePublishFailure::PutFailed);
+                    }
                     // May leave a partial staging object; cache_key is untouched.
                     discard_staging(&storage_clone, &staging_key).await;
                 }
@@ -15021,6 +15066,139 @@ mod tests {
         let deletes = backend.deletes.lock().await;
         assert_eq!(deletes.len(), 1, "the staging object must be discarded");
         assert!(deletes[0].starts_with(TEE_STAGING_KEY_PREFIX));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4319: every publish failure the writer logs is also counted, labelled
+    // by backend and failure class; a body the writer abandons for an
+    // upstream reason is not a publish failure and is not counted.
+    // -----------------------------------------------------------------------
+
+    /// Drive one streaming cache write of `upstream` through `backend` on a
+    /// current-thread runtime and return the `ak_proxy_cache_publish_failures_total`
+    /// series it recorded, as `(class, value)` pairs for the `custom` backend
+    /// a [`RealStorageService::new`] handle reports.
+    fn publish_failures_4319(
+        backend: Arc<TeeRecordingBackend>,
+        upstream: Vec<Result<Bytes>>,
+        expected_len: Option<u64>,
+    ) -> Vec<(&'static str, u64)> {
+        let (_, counters) = crate::services::metrics_service::capture_counters_async(|| async {
+            let storage = Arc::new(RealStorageService::new(backend.clone()));
+            let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+                Box::pin(futures::stream::iter(upstream)),
+                "cache-key".to_string(),
+                format!(
+                    "proxy-cache/tee-4319-{}/__cache_meta__.json",
+                    Uuid::new_v4()
+                ),
+                template(),
+                expected_len,
+                None,
+            );
+            while let Some(chunk) = client.next().await {
+                if chunk.is_err() {
+                    break;
+                }
+            }
+            // The writer runs on this runtime; give it its publish tail.
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        [
+            "put_failed",
+            "copy_rejected",
+            "publish_mismatch",
+            "commit_failed",
+        ]
+        .into_iter()
+        .map(|class| {
+            (
+                class,
+                counters.get(
+                    "ak_proxy_cache_publish_failures_total",
+                    &[("backend", "custom"), ("class", class)],
+                ),
+            )
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect()
+    }
+
+    fn eleven_bytes() -> Vec<Result<Bytes>> {
+        vec![Ok(Bytes::from_static(b"first-chunk"))]
+    }
+
+    #[test]
+    fn test_rejected_publish_copy_is_counted_4319() {
+        assert_eq!(
+            publish_failures_4319(
+                TeeRecordingBackend::copy_failing(),
+                eleven_bytes(),
+                Some(11)
+            ),
+            vec![("copy_rejected", 1)]
+        );
+    }
+
+    #[test]
+    fn test_failed_staging_write_is_counted_4319() {
+        assert_eq!(
+            publish_failures_4319(TeeRecordingBackend::failing(), eleven_bytes(), Some(11)),
+            vec![("put_failed", 1)]
+        );
+    }
+
+    #[test]
+    fn test_publish_that_lands_short_is_counted_4319() {
+        assert_eq!(
+            publish_failures_4319(
+                TeeRecordingBackend::publish_lands_truncated(3),
+                eleven_bytes(),
+                Some(11)
+            ),
+            vec![("publish_mismatch", 1)]
+        );
+    }
+
+    #[test]
+    fn test_clean_publish_counts_nothing_4319() {
+        assert_eq!(
+            publish_failures_4319(TeeRecordingBackend::ok(), eleven_bytes(), Some(11)),
+            vec![]
+        );
+    }
+
+    /// An upstream that fails mid-body takes the writer down its
+    /// `put_stream` error arm too, but the backend did nothing wrong: not a
+    /// publish failure.
+    #[test]
+    fn test_upstream_failure_is_not_a_publish_failure_4319() {
+        assert_eq!(
+            publish_failures_4319(
+                TeeRecordingBackend::ok(),
+                vec![
+                    Ok(Bytes::from_static(b"first")),
+                    Err(AppError::BadGateway("connection reset".into())),
+                ],
+                Some(11)
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_put_stream_failure_classification_4319() {
+        assert!(!put_stream_failure_is_storage_side(&AppError::BadGateway(
+            "upstream".into()
+        )));
+        assert!(!put_stream_failure_is_storage_side(&AppError::Validation(
+            "ceiling".into()
+        )));
+        assert!(put_stream_failure_is_storage_side(&AppError::Storage(
+            "disk full".into()
+        )));
     }
 
     // -----------------------------------------------------------------------
