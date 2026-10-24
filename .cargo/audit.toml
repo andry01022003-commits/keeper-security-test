@@ -45,4 +45,17 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+
+    # crypto-bigint timing variability (RUSTSEC-2026-0387, patched only in
+    # >= 0.7.6). The 0.7.x copy (via kryptering under bergshamra) is on 0.7.6.
+    # The other copy, 0.5.5, comes from elliptic-curve 0.13, which pgp 0.14
+    # and bergshamra 0.5 both require, and the 0.5 line has no patched
+    # release. Even the latest pgp (0.21) still requires elliptic-curve 0.13,
+    # so no update removes it today. Exposure is low: the signing keys the
+    # backend generates are RSA or Ed25519, which do not use this crate, and
+    # bergshamra only verifies SAML signatures with IdP public keys.
+    # cargo-audit ignores by id, so this also covers the 0.7.x copy: keep it
+    # at >= 0.7.6. Remove once `cargo tree -i crypto-bigint@0.5.5` prints
+    # nothing (#4940).
+    "RUSTSEC-2026-0387",
 ]
