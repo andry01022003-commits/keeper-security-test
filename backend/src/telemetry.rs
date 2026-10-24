@@ -1384,6 +1384,28 @@ mod tests {
         }
     }
 
+    /// `DB_QUERY_SPANS` from the environment: a recognised value is used, and
+    /// an unsupported one falls back to `log` and is handed back for the
+    /// startup warning.
+    #[test]
+    fn db_query_spans_from_env_falls_back_to_log_on_an_unsupported_value() {
+        use db_spans::DbQuerySpans as M;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(db_spans::DB_QUERY_SPANS_VAR).ok();
+
+        std::env::remove_var(db_spans::DB_QUERY_SPANS_VAR);
+        assert_eq!(M::from_env(), (M::Log, None));
+        std::env::set_var(db_spans::DB_QUERY_SPANS_VAR, "ALL");
+        assert_eq!(M::from_env(), (M::All, None));
+        std::env::set_var(db_spans::DB_QUERY_SPANS_VAR, "verbose");
+        assert_eq!(M::from_env(), (M::Log, Some("verbose".to_string())));
+
+        match previous {
+            Some(value) => std::env::set_var(db_spans::DB_QUERY_SPANS_VAR, value),
+            None => std::env::remove_var(db_spans::DB_QUERY_SPANS_VAR),
+        }
+    }
+
     /// Emit, under `layer`, the events of one request the way production does:
     /// the `http_request` span from the real span builder, the correlation ID
     /// recorded onto it, an inner span carrying its own `uri`, and the

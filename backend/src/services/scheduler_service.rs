@@ -4320,6 +4320,102 @@ mod tests {
         );
     }
 
+    /// #3954: a curation index fetch that fails keeps its failure handling
+    /// through `send_upstream`. An upstream answering 503 and an upstream that
+    /// refuses the connection each fail their own repo (named in the cycle's
+    /// error, left unstamped so the next tick retries), and each exports an
+    /// error `CLIENT` span: `error.type` is the status for the 503 and
+    /// `connect` for the refused connection.
+    #[tokio::test]
+    async fn test_curation_sync_fetch_failures_keep_retry_and_export_error_spans_3954() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down/repodata/repomd.xml"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            format!("http://{}/gone", listener.local_addr().expect("addr"))
+        };
+
+        let mut ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+        ids.sort();
+        let [down_id, refused_id] = ids;
+        let down_remote =
+            seed_rpm_curation_pair(&pool, down_id, &format!("{}/down", server.uri())).await;
+        let refused_remote = seed_rpm_curation_pair(&pool, refused_id, &refused).await;
+
+        let exported = ExportedSpans::default();
+        let result = {
+            let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+            run_curation_sync_cycle_for(&pool, Some(&ids), None).await
+        };
+        let down_stamped = curation_last_synced_at(&pool, down_id).await;
+        let refused_stamped = curation_last_synced_at(&pool, refused_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![down_id, refused_id, down_remote, refused_remote])
+            .execute(&pool)
+            .await;
+
+        let err = result
+            .expect_err("failed index fetches fail the cycle")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "staging repo {down_id}: repomd.xml fetch failed: 503"
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "staging repo {refused_id}: repomd.xml fetch error"
+            )),
+            "{err}"
+        );
+        assert!(down_stamped.is_none(), "the 503 repo stays unstamped");
+        assert!(
+            refused_stamped.is_none(),
+            "the refused repo stays unstamped"
+        );
+
+        let spans = exported.named("GET");
+        assert_eq!(spans.len(), 2, "one CLIENT span per failed fetch");
+        let error_type = |url: String| {
+            let span = spans
+                .iter()
+                .find(|s| attr(s, "url.full") == Some(opentelemetry::Value::from(url.clone())))
+                .unwrap_or_else(|| panic!("no span for {url}"));
+            assert!(
+                matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+                "{url}: {:?}",
+                span.status
+            );
+            (
+                attr(span, "http.response.status_code"),
+                attr(span, "error.type"),
+            )
+        };
+        assert_eq!(
+            error_type(format!("{}/down/repodata/repomd.xml", server.uri())),
+            (
+                Some(opentelemetry::Value::I64(503)),
+                Some(opentelemetry::Value::from("503"))
+            )
+        );
+        assert_eq!(
+            error_type(format!("{refused}/repodata/repomd.xml")),
+            (None, Some(opentelemetry::Value::from("connect")))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // #4451 — the scheduled summary and cleanup metric count proxy-cache
     // evictions, not just artifacts
