@@ -511,7 +511,7 @@ have no core proxy path to gate.
   (a `.dsc`, a `repodata/` path, a `.asc` file) streams unscanned. Alpine
   file names and branches come from the client's request, and an RPM's
   release from its own header.
-- **Debian and RPM rows in a Remote repository.** As for NuGet, an
+- **Debian, RPM and Alpine rows in a Remote repository.** As for NuGet, an
   `artifacts` row a Remote repository holds for a package path (from
   replication or a publish into the remote) is served from storage without
   the gate.

@@ -4054,6 +4054,20 @@ mod scan_on_proxy_4113 {
     use crate::api::handlers::proxy_scan_archive::ArchiveIdentity;
     use crate::api::handlers::test_db_helpers as tdh;
 
+    /// The pin the gate grades `apk()` as, on the `v3.19` branch.
+    fn pin() -> Option<crate::services::scanner_service::ExpectedComponent> {
+        crate::services::scanner_service::ExpectedComponent::os_package(
+            crate::services::scanner_service::ComponentEcosystem::Alpine,
+            "libdtf",
+            "1.0-r0",
+            crate::services::scanner_service::OsPackageContext {
+                release: crate::services::scanner_service::OsRelease::new("alpine", "3.19")?,
+                arch: "x86_64".to_string(),
+                source: Some("dtf".to_string()),
+            },
+        )
+    }
+
     const FILE: &str = "libdtf-1.0-r0.apk";
     const DIR: &str = "v3.19/main/x86_64";
 
@@ -4077,6 +4091,7 @@ mod scan_on_proxy_4113 {
             body: apk(),
             recorded_path: path,
             file: FILE.to_string(),
+            pin: pin(),
         }
     }
 
@@ -4108,6 +4123,39 @@ mod scan_on_proxy_4113 {
             0,
             "nothing reached the upstream"
         );
+        rig.teardown().await;
+    }
+
+    /// A Remote's own `artifacts` row whose blob is unreadable falls through
+    /// to a re-fetch from upstream; that re-fetch goes through the gate, so
+    /// under `fail_closed` with no verdict it is 423, never the bytes.
+    #[tokio::test]
+    async fn a_refetch_for_an_unreadable_cached_row_is_gated() {
+        let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, 'libdtf', '1.0-r0', 4, $3, $4, $5, $6)",
+        )
+        .bind(rig.fx.repo_id)
+        .bind(format!("{DIR}/{FILE}"))
+        .bind("0".repeat(64))
+        .bind(APK_CONTENT_TYPE)
+        .bind(format!("missing/{}", uuid::Uuid::new_v4()))
+        .bind(rig.fx.user_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("seed a row whose blob is missing");
+        let (status, body, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED, "the re-fetch is gated");
+        assert_ne!(&body[..], &rig.case.body[..]);
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await;
         rig.teardown().await;
     }
 
