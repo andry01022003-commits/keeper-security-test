@@ -178,6 +178,21 @@ impl<F: Fingerprint, V: CachedRender> RepoMetadataRevisionCache<F, V> {
         self.renders.load(Ordering::Relaxed)
     }
 
+    /// Drop every cached partition of `(repo_id, scope)`. For a consumer
+    /// told by another replica that the scope moved: the fingerprint check
+    /// would refuse the entry anyway, this frees its memory now.
+    pub async fn invalidate_scope(&self, repo_id: Uuid, scope: &str) {
+        self.entries
+            .write()
+            .await
+            .retain(|key, _| !(key.0 == repo_id && key.1 == scope));
+    }
+
+    /// Drop every cached entry of `repo_id`, whatever its scope.
+    pub async fn invalidate_repo(&self, repo_id: Uuid) {
+        self.entries.write().await.retain(|key, _| key.0 != repo_id);
+    }
+
     /// The cached set for `(repo_id, scope)`, but only when it was rendered
     /// from exactly the state `fingerprint` describes and is still fresh.
     pub async fn lookup_scoped(

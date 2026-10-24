@@ -1194,6 +1194,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             state.upstream_feed_status.clone(),
         );
 
+    // #4173: fill the stored CEP-16 shards of conda channels that held
+    // packages before the shard tables existed, in bounded, resumable
+    // batches. Exits once every repository is done. Detached deliberately:
+    // lifecycle is governed by the shutdown token.
+    artifact_keeper_backend::api::handlers::conda::spawn_conda_shard_backfill(
+        db_pool.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),

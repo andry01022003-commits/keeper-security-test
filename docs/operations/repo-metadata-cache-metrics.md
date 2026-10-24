@@ -1,10 +1,13 @@
 # Repository metadata cache metrics
 
 Whole-repository metadata documents (RPM `repomd.xml` and the
-`primary`/`filelists`/`other` indexes today, conda `repodata.json` next) are
-rendered once per repository state and served from an in-process cache. Each
-request checks a cheap fingerprint of the repository state (one aggregate
-query); when it matches, the cached bytes are served, and when it does not,
+`primary`/`filelists`/`other` indexes; hosted conda `repodata.json` with its
+encodings, `current_repodata.json`, `run_exports.json`, the JLAP bootstrap,
+the CEP-16 shard index and `channeldata.json`) are rendered once per
+repository state and served from an in-process cache. Each request checks a
+cheap fingerprint of the repository state (RPM: one aggregate query; conda:
+the subdir revision, see [conda-hosted-repodata.md](conda-hosted-repodata.md));
+when it matches, the cached bytes are served, and when it does not,
 one request renders while concurrent requests for the same state wait for
 that render instead of starting their own (#2521, #4174).
 
@@ -17,11 +20,14 @@ The backend exports these series on `/metrics` (and
 | `ak_repo_metadata_regeneration_seconds` | summary | `format` | the same render, observing its duration |
 | `ak_repo_metadata_cache_requests_total` | counter | `format`, `result` | a metadata request is answered |
 
-- `format` is the package format (`rpm`).
+- `format` is the package format (`rpm`, `conda`).
 - `scope` is the kind of unit a render covers: `root` for RPM (the
   repository, or one metadata root of a repository with a positive
-  `repodata_depth`, see [rpm-repodata-depth.md](../rpm-repodata-depth.md)).
-  It names the kind, not the root, so the number of series stays bounded.
+  `repodata_depth`, see [rpm-repodata-depth.md](../rpm-repodata-depth.md));
+  for conda `subdir` (every repodata document of one subdir, rendered
+  together), `shard_index` (one subdir's CEP-16 shard index) and `channel`
+  (`channeldata.json`). It names the kind, not the root or subdir, so the
+  number of series stays bounded.
 - `result` is `hit` (served from the cache), `coalesced` (waited for another
   request's render of the same state) or `miss` (this request rendered).
 

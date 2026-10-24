@@ -102,6 +102,14 @@ pub enum InvalidationEvent {
     ///
     /// Emitted application-side by [`notify_upstream_filter_changed`].
     UpstreamFilterChanged { repo_id: Uuid },
+    /// A hosted conda repository's shards and revisions were rebuilt for
+    /// `subdirs` (#4174). Each replica drops its kept repodata documents,
+    /// shard indexes and channeldata for them. Correctness does not depend
+    /// on it: every conda read checks the subdir revision first, so a missed
+    /// event only keeps a superseded entry in memory until it is evicted.
+    ///
+    /// Emitted by the rebuild transaction in `handlers/conda/shard_store.rs`.
+    CondaRepodataInvalidated { repo_id: Uuid, subdirs: Vec<String> },
 }
 
 /// Versioned wrapper matching the exact JSON the triggers emit.
@@ -179,6 +187,9 @@ pub async fn apply_invalidation_event(
         }
         InvalidationEvent::UpstreamFilterChanged { repo_id } => {
             crate::services::upstream_filter::invalidate_cached_filter(*repo_id).await;
+        }
+        InvalidationEvent::CondaRepodataInvalidated { repo_id, subdirs } => {
+            crate::api::handlers::conda::invalidate_cached_repodata(*repo_id, subdirs).await;
         }
     }
 }
@@ -346,6 +357,27 @@ pub async fn notify_npm_packument_invalidated(pool: &PgPool, repo_keys: &[String
                  other replicas converge via stale-while-revalidate"
             );
         }
+    }
+}
+
+/// Serialize one [`InvalidationEvent::CondaRepodataInvalidated`] envelope.
+/// A repository rebuilds a bounded batch of keys per transaction, so the
+/// subdir list stays far below the NOTIFY payload limit; a list that would
+/// not fit is truncated to an empty one, which the receiver reads as "every
+/// subdir of the repository".
+pub fn conda_repodata_invalidation_payload(repo_id: Uuid, subdirs: &[String]) -> String {
+    let payload = |subdirs: Vec<String>| {
+        serde_json::to_string(&InvalidationEnvelope {
+            v: CACHE_INVALIDATION_VERSION,
+            event: InvalidationEvent::CondaRepodataInvalidated { repo_id, subdirs },
+        })
+        .expect("conda repodata invalidation envelope must serialize")
+    };
+    let full = payload(subdirs.to_vec());
+    if full.len() <= NOTIFY_PAYLOAD_SOFT_MAX_BYTES {
+        full
+    } else {
+        payload(Vec::new())
     }
 }
 

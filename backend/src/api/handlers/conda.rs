@@ -65,7 +65,23 @@ use crate::services::signing_service::SigningService;
 mod current_repodata;
 mod merge_gate;
 mod package_gate;
+mod repodata_cache;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod revision_router_tests;
+mod shard_store;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod shard_store_tests;
 mod virtual_merge;
+
+pub use shard_store::spawn_backfill as spawn_conda_shard_backfill;
+
+/// Drop this process's kept documents of `repo_id`'s `subdirs` (every subdir
+/// when empty): the cross-replica half of a shard rebuild (#4174).
+pub async fn invalidate_cached_repodata(repo_id: uuid::Uuid, subdirs: &[String]) {
+    repodata_cache::invalidate_local(repo_id, subdirs).await;
+}
 
 // ---------------------------------------------------------------------------
 // CEP-26: Conda naming constraints
@@ -425,6 +441,45 @@ async fn cacheable_response_coded(
         builder = builder.header(CONTENT_ENCODING, encoding);
     }
     builder.body(Body::from(body)).unwrap()
+}
+
+/// Serve a document kept by the revision cache (#4174): its precomputed ETag,
+/// a 304 when the client holds it, and for JSON a gzip rendering made once
+/// per kept document rather than once per request. Same headers as
+/// [`cacheable_response_coded`] for an identity body.
+async fn prepared_response(
+    doc: &repodata_cache::Prepared,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Response {
+    use crate::api::handlers::cache_headers;
+
+    if let Some(not_modified) = check_conditional_request(headers, &doc.etag) {
+        return not_modified;
+    }
+    if content_type == "application/json" && accepts_gzip(headers) {
+        if let Some(compressed) = doc.gzip().await {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, content_type)
+                .header(CONTENT_ENCODING, "gzip")
+                .header(CONTENT_LENGTH, compressed.len().to_string())
+                .header(ETAG, &doc.etag)
+                .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
+                .header("Vary", "Accept-Encoding")
+                .body(Body::from(compressed))
+                .unwrap();
+        }
+        tracing::warn!("conda gzip offload failed; serving uncompressed body");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, doc.body.len().to_string())
+        .header(ETAG, &doc.etag)
+        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
+        .body(Body::from(doc.body.clone()))
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,6 +1234,17 @@ async fn list_conda_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
 ) -> Result<Vec<CondaArtifact>, Response> {
+    list_conda_artifacts_at(db, repo_id, chrono::Utc::now()).await
+}
+
+/// [`list_conda_artifacts`] with visibility decided at `now`. The revision
+/// cache passes the database instant its revision was read at (#4174), so a
+/// render never disagrees with the hold-expiry check about which holds lapsed.
+async fn list_conda_artifacts_at(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<CondaArtifact>, Response> {
     let rows = sqlx::query_as::<_, CondaArtifactRow>(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -1202,7 +1268,6 @@ async fn list_conda_artifacts(
     // bz2/zst/sig encodings, JLAP, CEP-16 shards, run_exports, channeldata)
     // is built from THIS listing, so the withdrawal filter lives here and
     // only here — one predicate, no per-endpoint copies to drift.
-    let now = chrono::Utc::now();
     Ok(rows
         .into_iter()
         .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
@@ -1522,7 +1587,18 @@ async fn channeldata_json(
         }
     }
 
-    let artifacts = list_conda_artifacts(&state.db, repo.id).await?;
+    // Kept under the repository's revision (#4174).
+    let doc = repodata_cache::hosted_channeldata(&state.db, repo.id).await?;
+    Ok(prepared_response(&doc, "application/json", &headers).await)
+}
+
+/// The hosted `channeldata.json` of `repo_id`, visibility decided at `now`.
+async fn render_hosted_channeldata(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, Response> {
+    let artifacts = list_conda_artifacts_at(db, repo_id, now).await?;
 
     // Query for the latest version of each package (ordered by created_at DESC,
     // so the first row per name is the latest).
@@ -1534,9 +1610,9 @@ async fn channeldata_json(
             WHERE a.repository_id = $1 AND a.is_deleted = false
             ORDER BY a.name, a.created_at DESC
             "#,
-            repo.id
+            repo_id
         )
-        .fetch_all(&state.db)
+        .fetch_all(db)
         .await
         .map_err(|e| {
             tracing::error!("Database error querying channeldata: {}", e);
@@ -1608,11 +1684,9 @@ async fn channeldata_json(
 
     let channeldata = build_channeldata_json(&packages_json);
 
-    let body = serde_json::to_string_pretty(&channeldata)
+    Ok(serde_json::to_string_pretty(&channeldata)
         .unwrap()
-        .into_bytes();
-
-    Ok(cacheable_response(body, "application/json", &headers).await)
+        .into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -1820,12 +1894,17 @@ async fn run_exports_json(
         }
         _ => {}
     }
-    let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
-    let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
+    // Rendered with the subdir's other documents and kept under its
+    // revision (#4174).
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir).await?;
+    Ok(prepared_response(&docs.run_exports, "application/json", &headers).await)
+}
 
+/// The hosted `run_exports.json` document of `subdir` from its rows.
+fn run_exports_document(subdir_artifacts: &[&CondaArtifact], subdir: &str) -> serde_json::Value {
     let mut packages = serde_json::Map::new();
 
-    for artifact in &subdir_artifacts {
+    for artifact in subdir_artifacts {
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
         if !is_conda_package(filename) {
             continue;
@@ -1839,13 +1918,10 @@ async fn run_exports_json(
         );
     }
 
-    let response = serde_json::json!({
+    serde_json::json!({
         "info": { "subdir": subdir },
         "packages": packages,
-    });
-
-    let body = serde_json::to_vec_pretty(&response).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers).await)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2580,9 +2656,14 @@ async fn serve_repodata(
         }
     }
 
-    let repodata = build_repodata(&state.db, repo.id, subdir, false).await?;
-    let body = encoding.encode(&repodata)?;
-    Ok(cacheable_response(body, ct, headers).await)
+    // Hosted: every encoding is kept under the subdir's revision (#4174).
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, subdir).await?;
+    let doc = match encoding {
+        RepodataEncoding::Json => &docs.json,
+        RepodataEncoding::Zst => &docs.zst,
+        RepodataEncoding::Bz2 => &docs.bz2,
+    };
+    Ok(prepared_response(doc, ct, headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -2683,10 +2764,13 @@ async fn repodata_json_sig(
                 .await?
         }
         _ => {
-            let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
-            // Use pretty-printed JSON to match what repodata_json() serves,
-            // so clients can verify the signature against the downloaded repodata.
-            Bytes::from(serde_json::to_vec_pretty(&repodata).unwrap())
+            // The kept `repodata.json` bytes (#4174), so clients can verify
+            // the signature against the downloaded repodata.
+            repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir)
+                .await?
+                .json
+                .body
+                .clone()
         }
     };
 
@@ -2789,17 +2873,10 @@ async fn repodata_json_jlap(
         )
             .into_response());
     }
-    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
-
-    // Serialize repodata identically to how repodata_json serves it
-    let json_bytes = serde_json::to_string_pretty(&repodata)
-        .unwrap()
-        .into_bytes();
-
-    // Build the JLAP file
-    let jlap_body = build_bootstrap_jlap(&json_bytes);
-
-    let etag = compute_etag(&jlap_body);
+    // The bootstrap JLAP of the kept `repodata.json` (#4174).
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir).await?;
+    let jlap_body = docs.jlap.body.clone();
+    let etag = docs.jlap.etag.clone();
 
     // Check for conditional request
     if let Some(not_modified) = check_conditional_request(&headers, &etag) {
@@ -2954,13 +3031,8 @@ async fn current_repodata_json(
         }
         _ => {}
     }
-    let repodata = build_repodata(&state.db, repo.id, &subdir, true).await?;
-
-    let body = serde_json::to_string_pretty(&repodata)
-        .unwrap()
-        .into_bytes();
-
-    Ok(cacheable_response(body, "application/json", &headers).await)
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir).await?;
+    Ok(prepared_response(&docs.current, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -3653,10 +3725,21 @@ async fn serve_remote_shard(
     }
 }
 
+/// A hosted shard a virtual's merged index lists.
+enum HostedShard {
+    /// Built for this merge from the members' rows: the name more than one
+    /// hosted member publishes, or any name of a member whose stored shards
+    /// are not complete yet.
+    Built(Vec<u8>),
+    /// The stored shard (#4173) of the one hosted member that publishes the
+    /// name, fetched by address when it is requested.
+    Stored(uuid::Uuid),
+}
+
 /// Where the shard a virtual's merged index lists under a name comes from.
 enum VirtualShardSource {
-    /// The hosted members' shard for the name, built from their rows.
-    Hosted(Vec<u8>),
+    /// The hosted members' shard for the name.
+    Hosted(HostedShard),
     /// The remote member at this position of [`MergedShardIndex::remotes`].
     Remote(usize),
 }
@@ -3771,13 +3854,33 @@ async fn build_virtual_shard_index(
         .filter(|m| m.repo_type != RepositoryType::Remote)
         .map(|m| m.id)
         .collect();
-    let hosted = hosted_shards(&state.db, &hosted_ids, subdir).await?;
-    // The hosted shards (by address) are the hosted generation.
-    key.part(&(hosted.len() as u64).to_le_bytes());
-    for (name, shard) in &hosted {
-        key.part(name.as_bytes()).part(&shard_address(shard));
-    }
+    // The hosted generation: with every hosted member's shards stored
+    // (#4173), the members' subdir revisions, and the shards are read from
+    // the stored maps only when the merge runs; otherwise the shards built
+    // from the members' rows, by address, as before.
+    let hosted_source = match hosted_member_revisions(&state.db, &hosted_ids, subdir).await? {
+        Some((revisions, now)) => {
+            key.part(b"stored-shards");
+            key.part(&(revisions.len() as u64).to_le_bytes());
+            for (id, revision) in &revisions {
+                key.part(id.as_bytes()).part(&revision.to_le_bytes());
+            }
+            HostedShardSource::Stored {
+                ids: hosted_ids.clone(),
+                now,
+            }
+        }
+        None => {
+            let hosted = hosted_shards(&state.db, &hosted_ids, subdir).await?;
+            key.part(&(hosted.len() as u64).to_le_bytes());
+            for (name, shard) in &hosted {
+                key.part(name.as_bytes()).part(&shard_address(shard));
+            }
+            HostedShardSource::Built(hosted)
+        }
+    };
 
+    let db = state.db.clone();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
     let subdir = subdir.to_string();
@@ -3793,8 +3896,22 @@ async fn build_virtual_shard_index(
                 let subdir = subdir.as_str();
                 let mut shards: BTreeMap<String, Vec<u8>> = BTreeMap::new();
                 let mut sources: HashMap<String, VirtualShardSource> = HashMap::new();
-                for (name, shard) in hosted {
-                    shards.insert(name.clone(), shard_address(&shard).to_vec());
+                let hosted = match hosted_source {
+                    HostedShardSource::Built(built) => built
+                        .into_iter()
+                        .map(|(name, shard)| {
+                            (
+                                name,
+                                (shard_address(&shard).to_vec(), HostedShard::Built(shard)),
+                            )
+                        })
+                        .collect(),
+                    HostedShardSource::Stored { ids, now } => {
+                        stored_hosted_shards(&db, &ids, subdir, now).await?
+                    }
+                };
+                for (name, (address, shard)) in hosted {
+                    shards.insert(name.clone(), address);
                     sources.insert(name, VirtualShardSource::Hosted(shard));
                 }
                 let mut merged = MergedShardIndex {
@@ -3963,6 +4080,82 @@ async fn build_virtual_shard_index(
         )
         .await
         .map_err(merge_gate::SharedResponse::into_response)
+}
+
+/// The hosted part of a virtual's shard merge, as read before the merge runs.
+enum HostedShardSource {
+    /// Shards built from the members' rows (some member's stored shards are
+    /// not complete).
+    Built(BTreeMap<String, Vec<u8>>),
+    /// Every member's shards are stored; read them when the merge runs.
+    Stored {
+        ids: Vec<uuid::Uuid>,
+        now: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// The subdir revision of every hosted member in `ids` (#4173), after
+/// rebuilding what is dirty, with the database instant of the last check;
+/// `None` when a member's stored shards are not complete yet.
+async fn hosted_member_revisions(
+    db: &sqlx::PgPool,
+    ids: &[uuid::Uuid],
+    subdir: &str,
+) -> Result<Option<(Vec<(uuid::Uuid, i64)>, chrono::DateTime<chrono::Utc>)>, Response> {
+    let mut revisions = Vec::with_capacity(ids.len());
+    let mut now = chrono::Utc::now();
+    for id in ids {
+        let state = shard_store::subdir_state(db, *id, subdir).await?;
+        if !state.backfilled {
+            return Ok(None);
+        }
+        now = state.now;
+        revisions.push((*id, state.revision));
+    }
+    Ok(Some((revisions, now)))
+}
+
+/// The hosted shards of a virtual's members `ids` (priority order) from
+/// their stored shard maps: a name one member publishes is that member's
+/// stored shard; a name several publish is merged from their rows,
+/// first-writer-wins per filename, as [`hosted_shards`] merges.
+async fn stored_hosted_shards(
+    db: &sqlx::PgPool,
+    ids: &[uuid::Uuid],
+    subdir: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<BTreeMap<String, (Vec<u8>, HostedShard)>, Response> {
+    let indexes = shard_store::member_indexes(db, ids, subdir).await?;
+    let mut out: BTreeMap<String, (Vec<u8>, HostedShard)> = indexes
+        .single
+        .into_iter()
+        .map(|(name, (position, address))| (name, (address, HostedShard::Stored(ids[position]))))
+        .collect();
+    if indexes.shared.is_empty() {
+        return Ok(out);
+    }
+    let names: Vec<String> = indexes.shared.iter().cloned().collect();
+    let per_member = shard_store::member_rows_for_names(db, ids, &names, now).await?;
+    let mut seen = HashSet::new();
+    let mut merged: Vec<&CondaArtifact> = Vec::new();
+    for artifacts in &per_member {
+        for artifact in artifacts_for_subdir(artifacts, subdir) {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            if is_conda_package(filename) && seen.insert(filename) {
+                merged.push(artifact);
+            }
+        }
+    }
+    for (name, artifacts) in group_artifacts_by_name(&merged) {
+        if indexes.shared.contains(&name) {
+            let shard = encode_shard(&build_shard(subdir, &artifacts))?;
+            out.insert(
+                name,
+                (shard_address(&shard).to_vec(), HostedShard::Built(shard)),
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Serve a virtual channel's merged shard index under its member-failure
@@ -4378,7 +4571,17 @@ async fn serve_virtual_shard(
         return Err(shard_not_found());
     };
     let position = match merged.sources.get(&name) {
-        Some(VirtualShardSource::Hosted(shard)) => return Ok(shard_response(shard.clone())),
+        Some(VirtualShardSource::Hosted(HostedShard::Built(shard))) => {
+            return Ok(shard_response(shard.clone()))
+        }
+        Some(VirtualShardSource::Hosted(HostedShard::Stored(member))) => {
+            return match shard_store::stored_shard(&state.db, *member, subdir, &address).await? {
+                Some(shard) => Ok(shard_response(shard)),
+                // The member rebuilt the shard since the merge: its revision
+                // moved, so the next request merges again.
+                None => Err(shard_not_found()),
+            };
+        }
         Some(VirtualShardSource::Remote(position)) => *position,
         None => {
             return Err(virtual_merge::internal_error(format!(
@@ -4481,7 +4684,12 @@ async fn sharded_repodata_index(
     if repo.repo_type == RepositoryType::Remote {
         return serve_remote_shard_index(&state, &repo, &subdir, &headers).await;
     }
-    // Hosted: built from the repository's own rows, which are authoritative.
+    // Hosted: serialised from the stored shard map (#4173), kept under the
+    // subdir's revision. Until the repository's backfill has finished, built
+    // from its rows as before.
+    if let Some(doc) = repodata_cache::hosted_shard_index(&state.db, repo.id, &subdir).await? {
+        return Ok(prepared_response(&doc, CEP16_CONTENT_TYPE, &headers).await);
+    }
     let shards = hosted_shards(&state.db, &[repo.id], &subdir).await?;
     let body = encode_hosted_shard_index(&subdir, &shards)?;
     Ok(cacheable_response(body, CEP16_CONTENT_TYPE, &headers).await)
@@ -4504,10 +4712,18 @@ async fn sharded_repodata_shard(
     if repo.repo_type == RepositoryType::Remote {
         return serve_remote_shard(&state, &repo, &subdir, &hash_hex).await;
     }
-    match find_hosted_shard(
-        hosted_shards(&state.db, &[repo.id], &subdir).await?,
-        &hash_hex,
-    ) {
+    // Hosted: a lookup of the stored shard by its address (#4173), checked
+    // against the address before it is served (#4829). Until the
+    // repository's backfill has finished, found by rebuilding as before.
+    let address = hex::decode(&hash_hex).map_err(virtual_merge::internal_error)?;
+    let found = match repodata_cache::hosted_shard(&state.db, repo.id, &subdir, &address).await? {
+        Some(stored) => stored,
+        None => find_hosted_shard(
+            hosted_shards(&state.db, &[repo.id], &subdir).await?,
+            &hash_hex,
+        ),
+    };
+    match found {
         Some(shard) => Ok(shard_response(shard)),
         None => Err(shard_not_found()),
     }
@@ -4794,10 +5010,21 @@ fn encode_shard(shard: &serde_json::Value) -> Result<Vec<u8>, Response> {
 ///
 /// Uses runtime query (not compile-time macro) to avoid needing a live
 /// database connection or sqlx-offline cache update.
+#[cfg(test)]
 async fn list_removed_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
     subdir: &str,
+) -> Result<Vec<String>, Response> {
+    list_removed_artifacts_at(db, repo_id, subdir, chrono::Utc::now()).await
+}
+
+/// [`list_removed_artifacts`] with withdrawal decided at `now`.
+async fn list_removed_artifacts_at(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    subdir: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<String>, Response> {
     /// `(path, is_deleted, quarantine_status, quarantine_until)` — the
     /// soft-delete flag plus the quarantine pair [`is_withdrawn`] reads.
@@ -4822,7 +5049,6 @@ async fn list_removed_artifacts(
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
-    let now = chrono::Utc::now();
     let prefix = format!("{}/", subdir);
     Ok(rows
         .into_iter()
@@ -4841,13 +5067,16 @@ async fn list_removed_artifacts(
         .collect())
 }
 
-/// Build repodata.json for a given subdir from the database.
+/// Build repodata.json for a given subdir from the database. The serving
+/// path renders through [`repodata_cache`]; this is the one-shot form the
+/// tests compare against.
 ///
 /// When `latest_only` is true, only the most recent version of each package
 /// is included (for current_repodata.json).
 ///
 /// No `base_url` is written: packages live beside the document, which is
 /// CEP-15's default (#4580, see [`build_repodata_envelope`]).
+#[cfg(test)]
 async fn build_repodata(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
@@ -4860,11 +5089,29 @@ async fn build_repodata(
 
     let all_artifacts = list_conda_artifacts(db, repo_id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, subdir);
+    // Collect filenames of soft-deleted packages for the "removed" array
+    let removed = list_removed_artifacts(db, repo_id, subdir).await?;
+    Ok(repodata_document(
+        &subdir_artifacts,
+        subdir,
+        latest_only,
+        &removed,
+    ))
+}
 
+/// The `repodata.json` document of `subdir` from its rows (newest first) and
+/// the filenames of its `removed` array. Pure, so the revision cache renders
+/// every encoding and `current_repodata.json` from one catalog walk (#4174).
+fn repodata_document(
+    subdir_artifacts: &[&CondaArtifact],
+    subdir: &str,
+    latest_only: bool,
+    removed: &[String],
+) -> serde_json::Value {
     // If latest_only, keep only the latest version per package name
     let filtered: Vec<&CondaArtifact> = if latest_only {
         let mut latest: BTreeMap<String, &CondaArtifact> = BTreeMap::new();
-        for a in &subdir_artifacts {
+        for a in subdir_artifacts {
             let pkg_name = a
                 .metadata
                 .as_ref()
@@ -4877,7 +5124,7 @@ async fn build_repodata(
         }
         latest.into_values().collect()
     } else {
-        subdir_artifacts
+        subdir_artifacts.to_vec()
     };
 
     let mut packages = serde_json::Map::new();
@@ -4898,15 +5145,12 @@ async fn build_repodata(
         }
     }
 
-    // Collect filenames of soft-deleted packages for the "removed" array
-    let removed = list_removed_artifacts(db, repo_id, subdir).await?;
-
-    Ok(build_repodata_envelope(
+    build_repodata_envelope(
         subdir,
         &packages,
         &packages_conda,
         &serde_json::json!(removed),
-    ))
+    )
 }
 
 /// The package name a conda filename carries: `<name>-<version>-<build>` plus
@@ -5239,7 +5483,7 @@ async fn build_virtual_package_document<E, M>(
     merge: M,
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response>
 where
-    E: Fn(&CondaArtifact, &str, &str) -> serde_json::Value,
+    E: Fn(&CondaArtifact, &str, &str) -> serde_json::Value + Send + 'static,
     M: FnOnce(
             &str,
             &str,
@@ -5279,35 +5523,24 @@ where
     )
     .await?;
 
-    let mut hosted = Vec::new();
-    for member in members
+    // The hosted generation is each hosted member's subdir revision (#4174):
+    // an upload, delete, withdrawal, lapsed hold or metadata edit moves it,
+    // and so the key. The members' records are read only when the merge
+    // runs, not on every request.
+    let hosted_ids: Vec<uuid::Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-    {
-        let artifacts = list_conda_artifacts(&state.db, member.id).await?;
-        for artifact in artifacts_for_subdir(&artifacts, subdir) {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            if !is_conda_package(filename) {
-                continue;
-            }
-            let record = entry(artifact, filename, subdir);
-            hosted.push(virtual_merge::HostedRecord {
-                filename: filename.to_string(),
-                is_v2: is_conda_v2(filename),
-                record: serde_json::value::to_raw_value(&record)
-                    .map_err(virtual_merge::internal_error)?,
-            });
-        }
-    }
-    // The hosted records as merged ARE the hosted generation: an upload,
-    // delete, withdrawal or metadata edit changes them, and so the key.
-    key.part(&(hosted.len() as u64).to_le_bytes());
-    for h in &hosted {
-        key.part(h.filename.as_bytes())
-            .part(&[u8::from(h.is_v2)])
-            .part(h.record.get().as_bytes());
+        .map(|m| m.id)
+        .collect();
+    let mut hosted_now = chrono::Utc::now();
+    key.part(&(hosted_ids.len() as u64).to_le_bytes());
+    for id in &hosted_ids {
+        let state = shard_store::subdir_state(&state.db, *id, subdir).await?;
+        hosted_now = state.now;
+        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
     }
 
+    let db = state.db.clone();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
     let subdir = subdir.to_string();
@@ -5319,6 +5552,23 @@ where
             Some(format!("{virtual_repo_id}/{document}")),
             move |doc| merge_validators_fresh(validate_proxy, doc),
             move |mut account| async move {
+                let mut hosted = Vec::new();
+                for id in &hosted_ids {
+                    let artifacts = list_conda_artifacts_at(&db, *id, hosted_now).await?;
+                    for artifact in artifacts_for_subdir(&artifacts, &subdir) {
+                        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+                        if !is_conda_package(filename) {
+                            continue;
+                        }
+                        let record = entry(artifact, filename, &subdir);
+                        hosted.push(virtual_merge::HostedRecord {
+                            filename: filename.to_string(),
+                            is_v2: is_conda_v2(filename),
+                            record: serde_json::value::to_raw_value(&record)
+                                .map_err(virtual_merge::internal_error)?,
+                        });
+                    }
+                }
                 let (documents, mut failed) = virtual_merge::fetch_remote_members(
                     proxy.as_deref(),
                     &members,
@@ -5507,40 +5757,22 @@ async fn build_virtual_channeldata(
     )
     .await?;
 
-    let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for member in members
+    // The hosted generation is each hosted member's repository revision
+    // (#4174); the members' entries are read only when the merge runs.
+    let hosted_ids: Vec<uuid::Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-    {
-        let artifacts = list_conda_artifacts(&state.db, member.id).await?;
-        for artifact in &artifacts {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            if !is_conda_package(filename) {
-                continue;
-            }
-            let pkg_name = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| artifact.name.clone());
-            if !seen.insert(pkg_name.clone()) {
-                continue;
-            }
-            let entry =
-                build_channeldata_entry(artifact.version.as_deref(), artifact.metadata.as_ref());
-            hosted.push((
-                pkg_name,
-                serde_json::value::to_raw_value(&entry).map_err(virtual_merge::internal_error)?,
-            ));
-        }
-    }
-    key.part(&(hosted.len() as u64).to_le_bytes());
-    for (name, entry) in &hosted {
-        key.part(name.as_bytes()).part(entry.get().as_bytes());
+        .map(|m| m.id)
+        .collect();
+    let mut hosted_now = chrono::Utc::now();
+    key.part(&(hosted_ids.len() as u64).to_le_bytes());
+    for id in &hosted_ids {
+        let state = shard_store::repo_state(&state.db, *id).await?;
+        hosted_now = state.now;
+        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
     }
 
+    let db = state.db.clone();
     let virtual_repo_key = virtual_repo_key.to_string();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
@@ -5551,6 +5783,35 @@ async fn build_virtual_channeldata(
             Some(format!("{virtual_repo_id}/channeldata.json")),
             move |doc| merge_validators_fresh(validate_proxy, doc),
             move |mut account| async move {
+                let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for id in &hosted_ids {
+                    let artifacts = list_conda_artifacts_at(&db, *id, hosted_now).await?;
+                    for artifact in &artifacts {
+                        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+                        if !is_conda_package(filename) {
+                            continue;
+                        }
+                        let pkg_name = artifact
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| artifact.name.clone());
+                        if !seen.insert(pkg_name.clone()) {
+                            continue;
+                        }
+                        let entry = build_channeldata_entry(
+                            artifact.version.as_deref(),
+                            artifact.metadata.as_ref(),
+                        );
+                        hosted.push((
+                            pkg_name,
+                            serde_json::value::to_raw_value(&entry)
+                                .map_err(virtual_merge::internal_error)?,
+                        ));
+                    }
+                }
                 // A member whose upstream publishes no channeldata.json (404)
                 // contributes no entries; only a real failure (5xx, timeout,
                 // cap, parse) fails the merge (#4601).
@@ -7017,6 +7278,9 @@ async fn withdraw_package(
         crate::services::quarantine_service::quarantine_now(&state.db, artifact_id, reason.clone())
             .await
             .map_err(|e| e.into_response())?;
+    // #4173: the hold marked the package's shard dirty in its own
+    // transaction; rebuild it now so it leaves the shard and every encoding.
+    materialise_after_write(&state, repo.id, &subdir).await;
 
     let reason_supplied = reason.is_some();
     let reason_text = reason.unwrap_or_else(|| "Withdrawn by administrator".to_string());
@@ -7086,6 +7350,20 @@ async fn withdraw_package(
             .unwrap(),
         ))
         .unwrap())
+}
+
+/// Rebuild the shards a conda write just marked dirty (#4173). Best-effort:
+/// the marks are durable, so a failure only moves the rebuild to the next
+/// reader of the subdir.
+async fn materialise_after_write(state: &SharedState, repo_id: uuid::Uuid, subdir: &str) {
+    if let Err(e) = shard_store::materialise(&state.db, repo_id, Some(subdir)).await {
+        tracing::warn!(
+            repo_id = %repo_id,
+            subdir,
+            error = %e,
+            "conda shard rebuild after a write failed; the next read rebuilds it"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9558,6 +9836,12 @@ async fn store_conda_package(
     )
     .execute(&state.db)
     .await;
+
+    // #4173: the catalog triggers marked this package's shard dirty with
+    // each write above; rebuild it (and the subdir's revision) now, so the
+    // next reader finds it built. A failure here is not the upload's: the
+    // mark stays and the next reader of the subdir rebuilds it.
+    materialise_after_write(state, repo.id, subdir).await;
 
     count_conda_install_script_findings(&repo.key, &install_scripts);
     record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
