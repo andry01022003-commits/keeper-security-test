@@ -461,7 +461,12 @@ impl SessionFamilyCache {
         }
     }
 
+    /// Evict down to a low-water mark (three quarters of the bound), not just
+    /// below the bound: otherwise a map held near capacity by fresh revoked
+    /// verdicts would pay a full O(n) sweep under the write lock on every new
+    /// family instead of once per quarter of the capacity.
     fn make_room(&mut self, now: Instant, ttl: std::time::Duration) {
+        let low_water = self.max_entries - self.max_entries / 4;
         self.entries.retain(|_, &mut (revoked, at)| {
             let age = now.saturating_duration_since(at);
             if revoked {
@@ -470,10 +475,10 @@ impl SessionFamilyCache {
                 age < ttl
             }
         });
-        if self.entries.len() >= self.max_entries {
+        if self.entries.len() >= low_water {
             self.entries.retain(|_, &mut (revoked, _)| revoked);
         }
-        if self.entries.len() >= self.max_entries {
+        if self.entries.len() >= low_water {
             self.entries.clear();
         }
     }
@@ -10737,6 +10742,19 @@ mod tests {
         full.record(Uuid::new_v4(), true, t0, ttl);
         full.record(Uuid::new_v4(), true, t0, ttl);
         assert!(full.entries.len() <= 2);
+
+        // Held near capacity by fresh revocations, one sweep frees a quarter
+        // of the bound, so the next inserts do not each sweep again.
+        let mut busy = SessionFamilyCache::new(8);
+        for _ in 0..8 {
+            busy.record(Uuid::new_v4(), true, t0, ttl);
+        }
+        busy.record(Uuid::new_v4(), true, t0, ttl);
+        assert!(
+            busy.entries.len() <= 8 - 8 / 4,
+            "one eviction leaves headroom, len {}",
+            busy.entries.len()
+        );
     }
 
     #[test]
