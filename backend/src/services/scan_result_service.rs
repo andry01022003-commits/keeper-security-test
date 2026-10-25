@@ -4253,6 +4253,28 @@ mod tests {
     }
 
     #[test]
+    fn score_recalc_retries_only_concurrency_conflicts_5006() {
+        let msg = |m: &str| AppError::Database(m.to_string());
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: could not serialize access due to concurrent update"
+        )));
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: deadlock detected"
+        )));
+        assert!(!is_score_recalc_conflict(&msg(
+            "error returned from database: relation \"x\" does not exist"
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::Sqlx(
+            sqlx::Error::RowNotFound
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::NotFound("x".into())));
+        assert_eq!(
+            score_recalc_lock_key(Uuid::nil()),
+            "repo-security-score:00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
     fn assessed_or_found_is_never_unrated_4336() {
         let failed_only = ScoreCoverage {
             artifacts: 1,
@@ -5741,6 +5763,58 @@ mod tests {
             assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
             assert!(r1.is_ok(), "first recalculation failed: {:?}", r1.err());
             assert!(r2.is_ok(), "second recalculation failed: {:?}", r2.err());
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #5006: a recalculation whose upsert loses to a concurrent write of
+        /// the score row (40001 under REPEATABLE READ) is retried with a fresh
+        /// snapshot instead of returning the error.
+        #[tokio::test]
+        async fn recalculation_retries_a_serialization_failure_5006() {
+            let Some(pool) = crate::testing::try_pool_with(6).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            svc.recalculate_score(repo_id).await.expect("recalculate");
+
+            // A concurrent writer updates the score row and holds it.
+            let mut writer = pool.begin().await.expect("begin writer");
+            let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *writer)
+                .await
+                .expect("writer pid");
+            sqlx::query("UPDATE repo_security_scores SET score = 0 WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&mut *writer)
+                .await
+                .expect("update score row");
+
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-50061"), "t", "lib")],
+            )
+            .await;
+            let recalc = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[writer_pid], &[]).await;
+            writer.commit().await.expect("commit writer");
+
+            let score = recalc
+                .await
+                .expect("join")
+                .expect("the serialization failure is retried");
+            assert_eq!(score.medium_count, 1);
+            assert_eq!(score.status(), GradeStatus::Rated);
+            let stored = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(stored.score, score.score, "the retried score is stored");
+            assert_ne!(stored.score, 0);
             cleanup_repo(&pool, repo_id).await;
         }
 
