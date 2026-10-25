@@ -3185,12 +3185,34 @@ struct UpstreamShardIndexInfo {
     info: rattler_conda_types::ShardedSubdirInfo,
 }
 
+/// What an upstream publishes as its CEP-16 shard index for a subdir.
+enum UpstreamShardIndex<T> {
+    Found(T),
+    /// The upstream answers 404: it publishes no shard index for the subdir,
+    /// so a remote serves shards synthesised from its repodata (#4178).
+    NotPublished,
+    /// The upstream's index is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`]
+    /// (#4612): no index this channel can use, so clients use
+    /// `repodata.json`.
+    TooLarge,
+}
+
+impl<T> UpstreamShardIndex<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> UpstreamShardIndex<U> {
+        match self {
+            Self::Found(t) => UpstreamShardIndex::Found(f(t)),
+            Self::NotPublished => UpstreamShardIndex::NotPublished,
+            Self::TooLarge => UpstreamShardIndex::TooLarge,
+        }
+    }
+}
+
 /// Fetch and decode `{subdir}/repodata_shards.msgpack.zst` from a remote
 /// repository's upstream through the proxy cache (capped and budgeted, like a
-/// virtual member's repodata). `Ok(None)`: the upstream answers 404, i.e. it
-/// does not publish CEP-16 for this subdir (negative-cached by the proxy), or
-/// its index is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`] (#4612, logged);
-/// either way the client uses `repodata.json`. Any other failure is reported
+/// virtual member's repodata). [`UpstreamShardIndex::NotPublished`]: the
+/// upstream answers 404, i.e. it does not publish CEP-16 for this subdir
+/// (negative-cached by the proxy); [`UpstreamShardIndex::TooLarge`]: its index
+/// is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`] (#4612, logged). Any other failure is reported
 /// as that repository's [`virtual_merge::MemberFailure`], so the virtual merge
 /// can apply its member-failure policy to it.
 async fn fetch_upstream_shard_document<T>(
@@ -3199,7 +3221,7 @@ async fn fetch_upstream_shard_document<T>(
     repo_key: &str,
     upstream_url: &str,
     subdir: &str,
-) -> Result<Option<CheckedShardDocument<T>>, virtual_merge::MemberFailure>
+) -> Result<UpstreamShardIndex<CheckedShardDocument<T>>, virtual_merge::MemberFailure>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
@@ -3243,9 +3265,11 @@ where
                 "upstream CEP-16 shard index exceeds the shard-index ceiling; serving no \
                  shard index for it so clients use repodata.json"
             );
-            return Ok(None);
+            return Ok(UpstreamShardIndex::TooLarge);
         }
-        Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
+        Err(response) if response.status() == StatusCode::NOT_FOUND => {
+            return Ok(UpstreamShardIndex::NotPublished)
+        }
         Err(response) => {
             return Err(fail(
                 "fetch",
@@ -3270,7 +3294,7 @@ where
     .await
     .map_err(|e| fail("decode", format!("decoder task failed: {e}")))?
     .map_err(|e| fail("decode", format!("{path}: {e}")))?;
-    Ok(Some(decoded))
+    Ok(UpstreamShardIndex::Found(decoded))
 }
 
 /// An upstream CEP-16 document and the SHA-256 of the bytes it was decoded
@@ -3280,8 +3304,8 @@ struct CheckedShardDocument<T> {
     checksum: String,
 }
 
-/// The full upstream shard index of a remote repository. `Ok(None)`: the
-/// upstream publishes none for `subdir`. An index whose shards cannot be
+/// The full upstream shard index of a remote repository, or why there is
+/// none for `subdir`. An index whose shards cannot be
 /// located (`shards_base_url` does not resolve) is a decode failure here
 /// rather than a shard fetch that can never succeed later.
 async fn fetch_upstream_shard_index(
@@ -3290,7 +3314,8 @@ async fn fetch_upstream_shard_index(
     repo_key: &str,
     upstream_url: &str,
     subdir: &str,
-) -> Result<Option<rattler_conda_types::ShardedRepodata>, virtual_merge::MemberFailure> {
+) -> Result<UpstreamShardIndex<rattler_conda_types::ShardedRepodata>, virtual_merge::MemberFailure>
+{
     Ok(
         fetch_upstream_shard_index_checked(proxy, repo_id, repo_key, upstream_url, subdir)
             .await?
@@ -3306,10 +3331,10 @@ async fn fetch_upstream_shard_index_checked(
     upstream_url: &str,
     subdir: &str,
 ) -> Result<
-    Option<CheckedShardDocument<rattler_conda_types::ShardedRepodata>>,
+    UpstreamShardIndex<CheckedShardDocument<rattler_conda_types::ShardedRepodata>>,
     virtual_merge::MemberFailure,
 > {
-    let Some(index) = fetch_upstream_shard_document::<rattler_conda_types::ShardedRepodata>(
+    let index = match fetch_upstream_shard_document::<rattler_conda_types::ShardedRepodata>(
         proxy,
         repo_id,
         repo_key,
@@ -3317,8 +3342,10 @@ async fn fetch_upstream_shard_index_checked(
         subdir,
     )
     .await?
-    else {
-        return Ok(None);
+    {
+        UpstreamShardIndex::Found(index) => index,
+        UpstreamShardIndex::NotPublished => return Ok(UpstreamShardIndex::NotPublished),
+        UpstreamShardIndex::TooLarge => return Ok(UpstreamShardIndex::TooLarge),
     };
     resolve_shards_base(upstream_url, subdir, &index.document.info.shards_base_url).map_err(
         |reason| virtual_merge::MemberFailure {
@@ -3327,22 +3354,19 @@ async fn fetch_upstream_shard_index_checked(
             reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
         },
     )?;
-    Ok(Some(index))
+    Ok(UpstreamShardIndex::Found(index))
 }
 
 /// Where a remote repository's upstream keeps its shards, from the `info`
-/// block of its shard index alone. `Ok(None)`: the upstream publishes none.
+/// block of its shard index alone, or why there is none.
 async fn fetch_upstream_shards_base(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
     subdir: &str,
-) -> Result<Option<url::Url>, virtual_merge::MemberFailure> {
-    let Some(CheckedShardDocument {
-        document: UpstreamShardIndexInfo { info },
-        ..
-    }) = fetch_upstream_shard_document::<UpstreamShardIndexInfo>(
+) -> Result<UpstreamShardIndex<url::Url>, virtual_merge::MemberFailure> {
+    let info = match fetch_upstream_shard_document::<UpstreamShardIndexInfo>(
         proxy,
         repo_id,
         repo_key,
@@ -3350,11 +3374,16 @@ async fn fetch_upstream_shards_base(
         subdir,
     )
     .await?
-    else {
-        return Ok(None);
+    {
+        UpstreamShardIndex::Found(CheckedShardDocument {
+            document: UpstreamShardIndexInfo { info },
+            ..
+        }) => info,
+        UpstreamShardIndex::NotPublished => return Ok(UpstreamShardIndex::NotPublished),
+        UpstreamShardIndex::TooLarge => return Ok(UpstreamShardIndex::TooLarge),
     };
     resolve_shards_base(upstream_url, subdir, &info.shards_base_url)
-        .map(Some)
+        .map(UpstreamShardIndex::Found)
         .map_err(|reason| virtual_merge::MemberFailure {
             member: repo_key.to_string(),
             kind: "decode",
@@ -3579,28 +3608,30 @@ async fn serve_remote_shard_index(
 ) -> Result<Response, Response> {
     let (proxy, upstream_url) = remote_upstream(state, repo)?;
     let document = format!("{subdir}/{SHARD_INDEX_FILE}");
-    let upstream =
-        match fetch_upstream_shard_index(proxy, repo.id, &repo.key, upstream_url, subdir).await {
-            Ok(Some(upstream)) => upstream,
-            Ok(None) => {
-                // No upstream shard index: the shards synthesised from the
-                // cached upstream repodata (#4178).
-                return match shard_synth::synthesized_index(
-                    &state.db,
-                    proxy,
-                    repo.id,
-                    &repo.key,
-                    upstream_url,
-                    subdir,
-                )
-                .await?
-                {
-                    Some(doc) => Ok(prepared_response(&doc, CEP16_CONTENT_TYPE, headers).await),
-                    None => Err(no_upstream_shard_index(&repo.key, subdir)),
-                };
-            }
-            Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
-        };
+    let upstream = match fetch_upstream_shard_index(proxy, repo.id, &repo.key, upstream_url, subdir)
+        .await
+    {
+        Ok(UpstreamShardIndex::Found(upstream)) => upstream,
+        Ok(UpstreamShardIndex::TooLarge) => return Err(no_upstream_shard_index(&repo.key, subdir)),
+        Ok(UpstreamShardIndex::NotPublished) => {
+            // No upstream shard index: the shards synthesised from the
+            // cached upstream repodata (#4178).
+            return match shard_synth::synthesized_index(
+                &state.db,
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                subdir,
+            )
+            .await?
+            {
+                Some(doc) => Ok(prepared_response(&doc, CEP16_CONTENT_TYPE, headers).await),
+                None => Err(no_upstream_shard_index(&repo.key, subdir)),
+            };
+        }
+        Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
+    };
     let index = build_sharded_index_with_info(
         shard_index_info(subdir, Some(&upstream.info)),
         upstream
@@ -3623,8 +3654,9 @@ async fn serve_remote_shard(
     let document = format!("{subdir}/shards/{hash_hex}.msgpack.zst");
     let shards_base =
         match fetch_upstream_shards_base(proxy, repo.id, &repo.key, upstream_url, subdir).await {
-            Ok(Some(base)) => base,
-            Ok(None) => {
+            Ok(UpstreamShardIndex::Found(base)) => base,
+            Ok(UpstreamShardIndex::TooLarge) => return Err(shard_not_found()),
+            Ok(UpstreamShardIndex::NotPublished) => {
                 // No upstream shard index: a shard synthesised from the cached
                 // upstream repodata (#4178), checked against its address
                 // before it is served (#4829).
@@ -3885,7 +3917,23 @@ async fn build_virtual_shard_index(
                         )
                         .await
                         {
-                            Ok(Some(checked)) => {
+                            Ok(UpstreamShardIndex::TooLarge) => {
+                                // Not kept: no validator. As for a member
+                                // without an index, the virtual has none.
+                                return Ok(merge_gate::MergedDocument::new(
+                                    Vec::new(),
+                                    Vec::new(),
+                                    None,
+                                    Vec::new(),
+                                    false,
+                                    merge_gate::MergeStats::default(),
+                                    false,
+                                )
+                                .with_shard_index(
+                                    VirtualShardIndex::MemberWithoutShards(member.key.clone()),
+                                ));
+                            }
+                            Ok(UpstreamShardIndex::Found(checked)) => {
                                 // Kept only while the member's cache entry is
                                 // fresh and holds the bytes just read.
                                 match proxy.fresh_cache_validator(&member.key, &index_path).await {
@@ -3933,61 +3981,65 @@ async fn build_virtual_shard_index(
                             // synthesised from its cached upstream repodata
                             // (#4178), kept while that cache entry is fresh
                             // and holds the document they were built from.
-                            Ok(None) => match shard_synth::member_shards(
-                                &db,
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                subdir,
-                            )
-                            .await
-                            {
-                                Ok(Some((shards, source))) => {
-                                    match proxy
-                                        .fresh_cache_validator(&member.key, &source.path)
-                                        .await
-                                    {
-                                        Some(current) if current == source.sha256 => {
-                                            validators.push(merge_gate::MemberValidator {
-                                                member: member.key.clone(),
-                                                path: source.path.clone(),
-                                                checksum: current,
-                                            });
+                            Ok(UpstreamShardIndex::NotPublished) => {
+                                match shard_synth::member_shards(
+                                    &db,
+                                    proxy,
+                                    member.id,
+                                    &member.key,
+                                    upstream_url,
+                                    subdir,
+                                )
+                                .await
+                                {
+                                    Ok(Some((shards, source))) => {
+                                        match proxy
+                                            .fresh_cache_validator(&member.key, &source.path)
+                                            .await
+                                        {
+                                            Some(current) if current == source.sha256 => {
+                                                validators.push(merge_gate::MemberValidator {
+                                                    member: member.key.clone(),
+                                                    path: source.path.clone(),
+                                                    checksum: current,
+                                                });
+                                            }
+                                            _ => all_validated = false,
                                         }
-                                        _ => all_validated = false,
+                                        (shards.into_iter().collect(), None)
                                     }
-                                    (shards.into_iter().collect(), None)
-                                }
-                                Ok(None) => {
-                                    // Not kept: the member's 404 carries no
-                                    // validator.
-                                    return Ok(merge_gate::MergedDocument::new(
-                                        Vec::new(),
-                                        Vec::new(),
-                                        None,
-                                        Vec::new(),
-                                        false,
-                                        merge_gate::MergeStats::default(),
-                                        false,
-                                    )
-                                    .with_shard_index(VirtualShardIndex::MemberWithoutShards(
-                                        member.key.clone(),
-                                    )));
-                                }
-                                Err(response) => {
-                                    merged.failed.push(virtual_merge::MemberFailure {
-                                        member: member.key.clone(),
-                                        kind: "fetch",
-                                        reason: format!(
+                                    Ok(None) => {
+                                        // Not kept: the member's 404 carries no
+                                        // validator.
+                                        return Ok(merge_gate::MergedDocument::new(
+                                            Vec::new(),
+                                            Vec::new(),
+                                            None,
+                                            Vec::new(),
+                                            false,
+                                            merge_gate::MergeStats::default(),
+                                            false,
+                                        )
+                                        .with_shard_index(
+                                            VirtualShardIndex::MemberWithoutShards(
+                                                member.key.clone(),
+                                            ),
+                                        ));
+                                    }
+                                    Err(response) => {
+                                        merged.failed.push(virtual_merge::MemberFailure {
+                                            member: member.key.clone(),
+                                            kind: "fetch",
+                                            reason: format!(
                                             "shards could not be synthesised from its upstream \
                                              repodata: {}",
                                             response.status()
                                         ),
-                                    });
-                                    continue;
+                                        });
+                                        continue;
+                                    }
                                 }
-                            },
+                            }
                             Err(failure) => {
                                 merged.failed.push(failure);
                                 continue;
@@ -25035,6 +25087,15 @@ mod cep16_proxy_tests {
         };
         let server = MockServer::start().await;
         mount_bytes(&server, INDEX, vec![0x5a; 65 * 1024 * 1024]).await;
+        // The upstream does publish an index (too large to use), so no
+        // shards are synthesised from its repodata (#4178 covers only an
+        // upstream that publishes none).
+        mount_bytes(
+            &server,
+            "/noarch/repodata.json",
+            serde_json::to_vec(&upstream_repodata("noarch", &["rich-13.0-pyh_0.conda"])).unwrap(),
+        )
+        .await;
         let (state, _cache) = state_with_proxy_cache(&pool);
         let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
         let (remote_status, remote_body) = tdh::send(
