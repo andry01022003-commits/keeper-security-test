@@ -73,6 +73,39 @@ pub(crate) fn stable_lock_key(scan_type: &str) -> i32 {
     hash as i32
 }
 
+/// Attempts [`ScanResultService::recalculate_score`] makes before it returns
+/// a serialization failure (#5006). An attempt that found the repository's
+/// lock busy also counts, so this also bounds how long one call waits behind
+/// other recalculations of the same repository.
+const SCORE_RECALC_MAX_ATTEMPTS: u32 = 8;
+
+/// Advisory-lock key text serializing score recalculations per repository
+/// (#5006). Hashed server-side with `hashtextextended(..., 0)`; the
+/// `repo-security-score:` namespace keeps it apart from the other text-keyed
+/// advisory locks.
+fn score_recalc_lock_key(repository_id: Uuid) -> String {
+    format!("repo-security-score:{repository_id}")
+}
+
+/// Whether a failed score recalculation lost a race with a concurrent writer
+/// and is safe to run again: a serialization failure (`40001`) or a deadlock
+/// (`40P01`). The recalculation commits atomically, so a retry never leaves a
+/// partial row. The stringified form is matched too, for statements whose
+/// error is flattened to `AppError::Database`.
+fn is_score_recalc_conflict(err: &AppError) -> bool {
+    match err {
+        AppError::Sqlx(e) => matches!(
+            e.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("40001" | "40P01")
+        ),
+        AppError::Database(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("could not serialize access") || lower.contains("deadlock detected")
+        }
+        _ => false,
+    }
+}
+
 /// Fold a 128-bit artifact UUID down to a single 32-bit key, used as the
 /// first key of the per-`(artifact_id, scan_type)` advisory lock in
 /// [`ScanResultService::prepare_scan_placeholder`] (#1935).
@@ -2184,7 +2217,53 @@ impl ScanResultService {
     // -----------------------------------------------------------------------
 
     /// Recalculate and materialize the security score for a repository.
+    ///
+    /// Recalculations of one repository are serialized (#5006). Every caller
+    /// (scan completion, the delete refresher, triage changes, the ingest
+    /// handler) goes through here, and two scans of one repository often
+    /// finish together. Each attempt runs under a per-repository
+    /// transaction-scoped advisory lock, and an attempt that hits a
+    /// serialization failure is retried, so the stored score always comes
+    /// from a snapshot that includes every recalculation committed before it.
+    /// Before #5006 the loser of such a race returned 40001, and the winner's
+    /// score, computed before the loser's scan had committed, stayed until
+    /// the next scan or delete in the repository.
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        let mut attempt = 1;
+        loop {
+            let last = attempt >= SCORE_RECALC_MAX_ATTEMPTS;
+            match self.recalculate_score_once(repository_id, last).await {
+                Ok(Some(score)) => return Ok(score),
+                // Another recalculation held the lock; it has finished now.
+                Ok(None) => {}
+                Err(err) if !last && is_score_recalc_conflict(&err) => {
+                    let jitter: f64 = rand::random();
+                    let base_ms = 20 * u64::from(attempt);
+                    let jitter_ms = (base_ms as f64 * jitter).round() as u64;
+                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+                    tracing::debug!(
+                        %repository_id,
+                        attempt,
+                        "security score recalculation hit a serialization conflict; retrying"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+            attempt += 1;
+        }
+    }
+
+    /// One attempt of [`Self::recalculate_score`]. Returns `Ok(None)` when
+    /// another recalculation of the repository held the lock: this attempt
+    /// waited for it to finish and gave up its snapshot, which predates that
+    /// recalculation's commit, so the caller starts over with a fresh one.
+    /// With `wait_for_lock` the attempt waits for the lock and computes in
+    /// any case (the last attempt).
+    async fn recalculate_score_once(
+        &self,
+        repository_id: Uuid,
+        wait_for_lock: bool,
+    ) -> Result<Option<RepoSecurityScore>> {
         // Wrap the three sequential queries (counts, last_scan_at, upsert)
         // in a single REPEATABLE READ transaction so all three statements
         // observe the same snapshot. The default sqlx transaction is
@@ -2206,6 +2285,34 @@ impl ScanResultService {
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // #5006: serialize recalculations of this repository. Under
+        // REPEATABLE READ the snapshot is taken when the first statement
+        // starts, which is the lock statement itself, so an attempt that had
+        // to wait for the lock would read from before the holder's commit.
+        // Take the lock without waiting; when it is busy, wait for the holder
+        // to finish and start over with a fresh snapshot.
+        let lock_key = score_recalc_lock_key(repository_id);
+        if wait_for_lock {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&lock_key)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            let acquired: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !acquired {
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
 
         // #4338: the shared definition of open vulnerabilities by severity
         // (latest completed scan per (artifact, scan type), one per
@@ -2385,14 +2492,13 @@ impl ScanResultService {
             has_uncataloged_scan,
         )
         .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .await?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // The upsert and the commit keep the typed error so a serialization
+        // failure is recognized and retried (#5006).
+        tx.commit().await?;
 
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Get the current security score for a repository.
@@ -3670,6 +3776,28 @@ mod tests {
     // lines (`tx.begin`, `&mut *tx`, `tx.commit`) are exercised.
     // =======================================================================
 
+    #[test]
+    fn score_recalc_retries_only_concurrency_conflicts_5006() {
+        let msg = |m: &str| AppError::Database(m.to_string());
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: could not serialize access due to concurrent update"
+        )));
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: deadlock detected"
+        )));
+        assert!(!is_score_recalc_conflict(&msg(
+            "error returned from database: relation \"x\" does not exist"
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::Sqlx(
+            sqlx::Error::RowNotFound
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::NotFound("x".into())));
+        assert_eq!(
+            score_recalc_lock_key(Uuid::nil()),
+            "repo-security-score:00000000-0000-0000-0000-000000000000"
+        );
+    }
+
     mod db {
         use super::*;
         use crate::api::handlers::test_db_helpers as db_helpers;
@@ -4812,6 +4940,198 @@ mod tests {
             cleanup_repo(&pool, empty_repo).await;
         }
 
+        /// Poll until a backend other than `exclude` is waiting on a lock held
+        /// by one of `holders`, and return its pid (#5006).
+        async fn wait_for_blocked_backend_5006(
+            pool: &PgPool,
+            holders: &[i32],
+            exclude: &[i32],
+        ) -> i32 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let pid: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_stat_activity \
+                     WHERE pg_blocking_pids(pid) && $1::int4[] AND NOT (pid = ANY($2::int4[])) \
+                     LIMIT 1",
+                )
+                .bind(holders)
+                .bind(exclude)
+                .fetch_optional(pool)
+                .await
+                .expect("poll pg_stat_activity");
+                if let Some(pid) = pid {
+                    return pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no recalculation blocked behind {holders:?} within 15 s"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// #5006: two scans of one repository complete together, and the
+        /// final score reflects both. Recalculation R1 takes its snapshot
+        /// after the jar's scan but before the archive's rescan has committed
+        /// and is held at its upsert (a row lock on the score row stands in
+        /// for the slow part of R1); the archive's rescan then completes and
+        /// its recalculation R2 starts. Before the fix R1 committed its stale
+        /// score and R2 failed with 40001, so the repository kept the F floor
+        /// of the superseded uncataloged scan. Now R2 waits for R1 and
+        /// recomputes from a fresh snapshot.
+        #[tokio::test]
+        async fn concurrent_recalculations_keep_every_completed_scan_5006() {
+            let Some(pool) = crate::testing::try_pool_with(8).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            // A typed repository, so an uncataloged archive floors the grade.
+            sqlx::query("UPDATE repositories SET format = 'maven' WHERE id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("make the repository typed");
+
+            // An archive no scanner could catalog floors the grade to F.
+            let (archive, _) = insert_test_artifact(&pool, repo_id, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_id, "grype")
+                .await
+                .expect("create");
+            svc.complete_scan(
+                s.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("test"),
+                chrono::Utc::now(),
+                "not_cataloged",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("complete not_cataloged");
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            let before = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert!(before.has_uncataloged_scan, "archive not cataloged yet");
+            assert_eq!(before.grade, "F", "the uncataloged archive floors to F");
+
+            // Hold the score row so R1 stops at its upsert after its reads.
+            let mut blocker = pool.begin().await.expect("begin blocker");
+            let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *blocker)
+                .await
+                .expect("blocker pid");
+            sqlx::query("SELECT 1 FROM repo_security_scores WHERE repository_id = $1 FOR UPDATE")
+                .bind(repo_id)
+                .execute(&mut *blocker)
+                .await
+                .expect("lock score row");
+
+            // First scan completion: the jar, cataloged with one finding.
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-5006"), "t", "lib")],
+            )
+            .await;
+            let r1 = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            let r1_pid = wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
+
+            // Second scan completion: the archive's rescan catalogs it clean.
+            seed_scan_4338(&svc, archive, repo_id, "grype", &[]).await;
+            let r2 = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[blocker_pid, r1_pid], &[r1_pid]).await;
+
+            blocker.commit().await.expect("release score row");
+            let r1 = r1.await.expect("join r1");
+            let r2 = r2.await.expect("join r2");
+
+            let score = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert!(
+                !score.has_uncataloged_scan,
+                "the stored score must count the archive's completed rescan"
+            );
+            assert_eq!(
+                (score.total_findings, score.medium_count),
+                (1, 1),
+                "the jar's finding is counted"
+            );
+            let real = Grade::from_score(score.score).as_char().to_string();
+            assert_ne!(real, "F");
+            assert_eq!(score.grade, real, "the stale F floor is gone");
+            assert!(r1.is_ok(), "first recalculation failed: {:?}", r1.err());
+            assert!(r2.is_ok(), "second recalculation failed: {:?}", r2.err());
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #5006: a recalculation whose upsert loses to a concurrent write of
+        /// the score row (40001 under REPEATABLE READ) is retried with a fresh
+        /// snapshot instead of returning the error.
+        #[tokio::test]
+        async fn recalculation_retries_a_serialization_failure_5006() {
+            let Some(pool) = crate::testing::try_pool_with(6).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            svc.recalculate_score(repo_id).await.expect("recalculate");
+
+            // A concurrent writer updates the score row and holds it.
+            let mut writer = pool.begin().await.expect("begin writer");
+            let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *writer)
+                .await
+                .expect("writer pid");
+            sqlx::query("UPDATE repo_security_scores SET score = 0 WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&mut *writer)
+                .await
+                .expect("update score row");
+
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-50061"), "t", "lib")],
+            )
+            .await;
+            let recalc = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[writer_pid], &[]).await;
+            writer.commit().await.expect("commit writer");
+
+            let score = recalc
+                .await
+                .expect("join")
+                .expect("the serialization failure is retried");
+            assert_eq!(score.medium_count, 1);
+            assert_eq!(
+                score.grade,
+                Grade::from_score(score.score).as_char().to_string()
+            );
+            let stored = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(stored.score, score.score, "the retried score is stored");
+            assert_ne!(stored.score, 0);
+            cleanup_repo(&pool, repo_id).await;
+        }
         /// #4036 fail-closed: a repo whose LATEST completed scan is
         /// `scan_completeness='not_cataloged'` (a cataloging scanner enumerated
         /// NO components from a package-archive artifact whose format expects
