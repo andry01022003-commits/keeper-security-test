@@ -15,18 +15,22 @@ Since 1.12.0 the table is also what the registry reads (#1683, third slice):
   exception: a manifest whose rows went to the trash only through tag
   deletes still resolves while an index that references it is live under the
   image, so the untagged child of a tagged index keeps pulling. A tagged
-  manifest with no row yet (pushed by a pre-1.11 replica, before the next
-  reconcile) is served from its tag and counted in
-  `ak_oci_manifest_reads_without_row_total`. A Virtual repository resolves a
+  manifest with no row yet is served from its tag and counted in
+  `ak_oci_manifest_reads_without_row_total`; the read does not write the row,
+  the next reconcile adds it. 1.11 writes the row in the same transaction as
+  the tag, so this only happens for a manifest committed before 1.11 whose
+  row the backfill could not add (its body unreadable or not matching its
+  digest, counted in `ak_oci_manifests_reconcile_failures_total`), or while a
+  replica older than 1.11 still takes pushes. A Virtual repository resolves a
   hosted member's digest through the member's row first.
-- **The referrers API** lists a referrer while the repository records it and
-  its referrers edge is attached. Removing a manifest's record (its last tag
-  deleted, a delete by digest, a reconcile removal) detaches its referrers, so
-  `GET /v2/<name>/referrers/<digest>` of a deleted subject lists nothing. The
-  referrer manifests themselves stay (they have their own tags and rows), and
-  re-pushing the subject does not re-attach them; pushing a referrer again
-  does. A referrer pushed for a subject that was never pushed is listed, as
-  the distribution spec allows.
+- **The referrers API** lists a referrer while the repository records the
+  referrer itself; a referrer that was deleted, or whose row the reconcile
+  removed, is not listed. The listing follows the referrer, not the subject:
+  the distribution spec lists every manifest whose `subject` names the digest
+  and lets referrers be pushed before their subject, so a referrer is listed
+  whether its subject was never pushed, was deleted, or was deleted and pushed
+  again. Deleting a subject does not delete its signatures or SBOMs; delete
+  them by digest when they should go too.
 - **Storage GC** keeps an `oci-manifests/<digest>` object while any repository
   on its backend records the digest, in the orphan-key sweep, the recorded
   candidate sweep and the pre-delete re-check. The tag and tagged-index-edge
@@ -104,7 +108,7 @@ reconcile. In a mixed fleet:
 | Expired by a lifecycle policy | 404 | 404 (per-image trash check; row removed by the next reconcile) |
 | Untagged child of a tagged index, its own tag deleted | 404 | 200 |
 | Child of an untagged index that still pulls by digest | 404 once its own tag was deleted, and a 1.11 GC run may reclaim its object and layers | 200, kept by GC |
-| Tagged, pushed by a pre-1.11 replica, no row yet | 200 | 200 (served from the tag until the reconcile adds the row) |
+| Tagged, no row yet (a pre-1.11 manifest the backfill could not record) | 200 | 200 (served from the tag until the reconcile adds the row) |
 
 The reconcile never removes a row a 1.11 replica has just written: the 1.11
 push writes the row and its tag in one transaction and refreshes
@@ -112,9 +116,24 @@ push writes the row and its tag in one transaction and refreshes
 removal it does make is of a manifest a 1.11 replica already answers 404 for.
 
 Storage GC is a singleton across replicas, so during the upgrade a 1.11
-replica may win a GC run. A 1.11 GC run uses the old predicate and can reclaim
-the child of an untagged index (the last row of the table above). Finish the
-rollout, or keep storage GC off the 1.11 replicas, before relying on it.
+replica may win a scheduled GC run. A 1.11 GC run uses the old predicate and
+can reclaim the child of an untagged index (the "child of an untagged index"
+row above): its manifest object once the child's trashed `artifacts` rows
+pass `GC_TRASH_RETENTION_DAYS`, and its layers once a live blob pass
+(`BLOB_GC_ENABLED=true`) prunes the child's blob refs. There is no switch that
+turns the scheduled GC off on one replica, so while 1.11 replicas run:
+
+- leave `BLOB_GC_ENABLED` unset on the 1.11 replicas (the default: the blob
+  pass dry-runs and prunes no blob refs);
+- set `GC_TRASH_RETENTION_DAYS` on the 1.11 replicas to more days than the
+  rollout takes (the shipped default `0` reaps trashed rows on the next run);
+- do not call the admin storage-GC endpoints on a 1.11 replica.
+
+A delete served by a 1.11 replica also still runs the 1.11 unwind: deleting
+the last tag of an index that a tagged index of indexes references drops the
+middle index's child edges, so its children lose their rows at the next
+reconcile and their blob protection. Avoid deleting nested index tags until
+the rollout is finished.
 
 ## Schedule
 

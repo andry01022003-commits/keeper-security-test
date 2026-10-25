@@ -16,8 +16,13 @@ as a clean response under its original digest (#3919, #4323).
   VS Code extensions and sbt.
 - Incus image downloads, checked against the `X-Checksum-Sha256` the
   response advertises (a mismatch aborts the transfer before its last bytes).
+- OCI blob pulls (`GET /v2/<name>/blobs/<digest>`) served from a hosted
+  repository's stored blobs or a Virtual's hosted member, checked against the
+  blob's digest (`Docker-Content-Digest`). The error body is the OCI error
+  shape, `{"errors": [{"code": "STORED_OBJECT_INTEGRITY", ...}]}`. Blobs
+  streamed from an upstream on a proxy miss are not checked.
 
-Not yet covered: OCI blob pulls and the Maven, npm, PyPI, Cargo, NuGet and
+Not yet covered: the Maven, npm, PyPI, Cargo, NuGet and
 Helm hosted download handlers, which read storage through their own paths. Protobuf commit bundles are never
 checked, because their recorded digest is a commit digest, not the digest of
 the stored bundle.

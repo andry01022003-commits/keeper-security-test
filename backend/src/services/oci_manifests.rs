@@ -27,8 +27,7 @@
 //!
 //! Readers (#1683, third slice): manifest GET/HEAD/DELETE by digest on a
 //! hosted repository resolve through [`content_type_of`], the referrers API
-//! lists only referrers that have a row (and a removed subject's referrers
-//! are detached, [`detach_referrers_in_tx`]), and the storage GC
+//! lists only referrers that have a row, and the storage GC
 //! keeps an `oci-manifests/<digest>` object while any repository on its
 //! backend records the digest. The #1681 content-addressable fallback that
 //! inferred existence from edge rows is gone. A 1.11 replica in the same
@@ -212,14 +211,17 @@ pub(crate) async fn lock_in_tx(
 /// edge kept because the parent is still tagged, #1642) still exists by the
 /// registry's rules — it is pullable through the parent — so its row stays.
 ///
-/// When the row goes, the manifest's referrers are detached from it
-/// ([`detach_referrers_in_tx`]).
+/// The referrers of a removed manifest are left alone: the referrers API
+/// lists a manifest whose `subject` names the digest for as long as that
+/// referrer itself exists, whether or not the subject does (the distribution
+/// spec lets referrers be pushed before their subject), so re-pushing a
+/// deleted subject lists its referrers again.
 pub(crate) async fn delete_in_tx(
     conn: &mut sqlx::PgConnection,
     repo_id: Uuid,
     digest: &str,
 ) -> Result<(), sqlx::Error> {
-    let removed = sqlx::query(
+    sqlx::query(
         r#"
         DELETE FROM oci_manifests om
         WHERE om.repository_id = $1
@@ -232,33 +234,6 @@ pub(crate) async fn delete_in_tx(
     )
     .bind(repo_id)
     .bind(digest)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    if removed > 0 {
-        detach_referrers_in_tx(conn, repo_id, digest).await?;
-    }
-    Ok(())
-}
-
-/// Drop the referrers edges (`oci_manifest_subjects`) that point at a
-/// manifest whose record is being removed (#1683): `GET .../referrers/<digest>`
-/// of a deleted subject then lists nothing, as a client deleting an image
-/// expects of its signatures and SBOMs. The referrer manifests themselves are
-/// untouched (they keep their own tags and rows). A referrer pushed for a
-/// subject that was never pushed is still listed, as the distribution spec
-/// allows, because only a removal detaches. Re-pushing the subject does not
-/// re-attach old referrers; pushing a referrer again does.
-pub(crate) async fn detach_referrers_in_tx(
-    conn: &mut sqlx::PgConnection,
-    repo_id: Uuid,
-    subject_digest: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND subject_digest = $2",
-    )
-    .bind(repo_id)
-    .bind(subject_digest)
     .execute(conn)
     .await?;
     Ok(())
@@ -956,9 +931,6 @@ async fn remove_if_still_stale(db: &PgPool, repo_id: Uuid, digest: &str) -> sqlx
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    if removed > 0 {
-        detach_referrers_in_tx(&mut tx, repo_id, digest).await?;
-    }
     tx.commit().await?;
     Ok(removed > 0)
 }

@@ -3900,13 +3900,16 @@ pub async fn resolve_virtual_manifest(
         // pull's image name, for the Remote-path helpers below (#3023).
         let member_repo = oci_repo_info_from_member(member, image_name);
         let (local, refetched) = if is_digest_ref {
-            // #1683: a hosted member records the manifests it holds in
-            // `oci_manifests`, so an untagged manifest it still serves by
-            // digest (the child of a tagged index whose own tag is gone)
-            // resolves through the Virtual too. A member's tag row is the
-            // fallback (a Remote member's cache, or a row not yet recorded).
+            // #1683: a hosted member resolves a digest exactly as a direct
+            // pull of the member does ([`resolve_hosted_digest`]: its
+            // `oci_manifests` row, scoped to the image name), so an untagged
+            // manifest it still serves by digest (the child of a tagged index
+            // whose own tag is gone) resolves through the Virtual too, and one
+            // deleted by digest under the image does not. A member's tag row
+            // is the fallback (a Remote member's cache, or a row not yet
+            // recorded).
             let recorded = if stores_own_manifests(&member_repo.repo_type) {
-                crate::services::oci_manifests::content_type_of(&state.db, member.id, reference)
+                resolve_hosted_digest(state, &member_repo, reference)
                     .await
                     .ok()
                     .flatten()
@@ -5007,7 +5010,7 @@ fn build_oci_streaming_proxy_response_with_range(
         }
         // The upstream's bytes in transit, served unverified exactly like the
         // unranged arm below; the stored-object verifier (#4323) is for the
-        // local `oci_blobs` serves, which use `ranged_stream_response_advertised`.
+        // local `oci_blobs` serves (`serve_stored_blob`).
         return match crate::api::handlers::repositories::ranged_stream_response(
             Some(range),
             total,
@@ -6267,6 +6270,59 @@ async fn handle_head_blob(
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
 }
 
+/// Serve a stored `oci_blobs` object (the CAS hit and a Virtual's local
+/// member), verifying its bytes against the digest the pull advertises
+/// (#4323), as the generic download route does: a whole-object pull of a
+/// small blob that does not hash to its digest is answered `502
+/// STORED_OBJECT_INTEGRITY` with no body, a larger one is cut short before
+/// its last chunk, so a client never receives a complete-looking corrupt
+/// layer. A range pull is served unverified (only the whole object can be
+/// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off.
+async fn serve_stored_blob(
+    range_header: Option<&str>,
+    total: u64,
+    stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    digest: &str,
+    repo_key: &str,
+) -> Response {
+    let base_headers = vec![
+        (
+            axum::http::header::HeaderName::from_static("docker-content-digest"),
+            digest.to_string(),
+        ),
+        (CONTENT_TYPE, "application/octet-stream".to_string()),
+    ];
+    let verify = crate::storage::verify::serve_verification_enabled()
+        .then(|| crate::storage::verify::advertised_sha256(&base_headers))
+        .flatten()
+        .map(
+            |expected_sha256| crate::api::handlers::repositories::ServeVerification {
+                expected_sha256,
+                label: format!("{repo_key} blob {digest}"),
+            },
+        );
+    match crate::api::handlers::repositories::ranged_stream_response_checked(
+        range_header,
+        total,
+        stream,
+        base_headers,
+        verify,
+        false,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(crate::error::AppError::CodedBadGateway { code, message }) => {
+            oci_error(StatusCode::BAD_GATEWAY, code, &message)
+        }
+        Err(e) => oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
 async fn handle_get_blob(
     state: &SharedState,
     headers: &HeaderMap,
@@ -6386,26 +6442,14 @@ async fn handle_get_blob(
                     // #3586: range-aware streaming so an interrupted pull can
                     // resume (OCI Distribution Spec "resumable pull"). The
                     // window is sliced at chunk boundaries, never buffered.
-                    let base_headers = vec![
-                        (
-                            axum::http::header::HeaderName::from_static("docker-content-digest"),
-                            digest.to_string(),
-                        ),
-                        (CONTENT_TYPE, "application/octet-stream".to_string()),
-                    ];
-                    return match crate::api::handlers::repositories::ranged_stream_response_advertised(
+                    return serve_stored_blob(
                         range_header,
                         b.size_bytes.max(0) as u64,
                         stream,
-                        base_headers,
-                    ) {
-                        Ok(resp) => resp,
-                        Err(e) => oci_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "INTERNAL_ERROR",
-                            &e.to_string(),
-                        ),
-                    };
+                        digest,
+                        &repo.key,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get_stream failed - will proxy from upstream: {}", e);
@@ -6459,28 +6503,14 @@ async fn handle_get_blob(
                     // Stream rather than buffer the resolved member blob. (#1528)
                     match storage.get_stream(&storage_key).await {
                         Ok(stream) => {
-                            let base_headers = vec![
-                                (
-                                    axum::http::header::HeaderName::from_static(
-                                        "docker-content-digest",
-                                    ),
-                                    digest.to_string(),
-                                ),
-                                (CONTENT_TYPE, "application/octet-stream".to_string()),
-                            ];
-                            match crate::api::handlers::repositories::ranged_stream_response_advertised(
+                            serve_stored_blob(
                                 range_header,
                                 size_bytes.max(0) as u64,
                                 stream,
-                                base_headers,
-                            ) {
-                                Ok(resp) => resp,
-                                Err(e) => oci_error(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "INTERNAL_ERROR",
-                                    &e.to_string(),
-                                ),
-                            }
+                                digest,
+                                &member.key,
+                            )
+                            .await
                         }
                         Err(e) => {
                             warn!("Storage error streaming virtual blob {}: {}", digest, e);
@@ -13321,11 +13351,11 @@ pub(crate) fn build_referrers_index(
 /// `oci_manifests` (#1683): a referrer is listed while the repository records
 /// it (`subject_digest` on its row, through `idx_oci_manifests_subject`) and
 /// its referrers edge (`oci_manifest_subjects`, which carries the descriptor
-/// fields) is attached. A referrer the reconcile retired is not listed, and
-/// the referrers of a subject whose record was removed (its last tag deleted,
-/// a delete by digest, a lifecycle expiry) were detached with it
-/// (`oci_manifests::detach_referrers_in_tx`). A referrer pushed for a subject
-/// that was never pushed is listed, as the distribution spec allows.
+/// fields) is attached. A referrer the reconcile retired is not listed. The
+/// listing follows the referrer, not the subject: the distribution spec lists
+/// every manifest whose `subject` names the digest and lets referrers be
+/// pushed before their subject, so a referrer is listed whether the subject
+/// was never pushed, was deleted, or was deleted and pushed again.
 const REFERRERS_SQL: &str = r#"
     SELECT s.manifest_digest, s.media_type, s.artifact_type, s.size_bytes, s.annotations
     FROM oci_manifests om
@@ -18920,17 +18950,12 @@ mod blob_pull_streaming_tests {
         );
     }
 
-    /// #4323: a blob whose stored bytes no longer hash to the digest the pull
-    /// advertises must not complete. The status is already 200 when the
-    /// stream ends, so the body is cut short with an error and the client
-    /// sees a truncated transfer instead of a corrupt layer.
-    ///
-    /// FAILS ON MAIN: the plain `ranged_stream_response` streams the corrupt
-    /// bytes to the end.
-    #[tokio::test]
-    async fn get_blob_aborts_a_body_that_does_not_match_its_digest_4323() {
+    /// Pull a blob whose stored object is `pushed` with one byte flipped, and
+    /// return the status and the collected body (`Err` when the body stream
+    /// aborted).
+    async fn pull_corrupt_blob(pushed: Vec<u8>) -> (StatusCode, Result<Bytes, String>) {
         let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
-            return;
+            return (StatusCode::OK, Err("no database".to_string()));
         };
         sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
             .bind(fx.repo_id)
@@ -18945,12 +18970,12 @@ mod blob_pull_streaming_tests {
             .state
             .storage_for_repo(&location)
             .expect("resolve storage");
-        let pushed = b"the layer the client pushed".to_vec();
         let digest = compute_sha256(&pushed);
         let blob_key = format!("oci-blobs/{digest}");
-        // Same length, different bytes: bit rot in the stored object.
-        let corrupt = b"the layer the client pushes".to_vec();
-        assert_eq!(corrupt.len(), pushed.len());
+        // Same length, one byte different: bit rot in the stored object.
+        let mut corrupt = pushed.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x01;
         storage
             .put(&blob_key, bytes::Bytes::from(corrupt))
             .await
@@ -18975,14 +19000,59 @@ mod blob_pull_streaming_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.expect("oneshot");
-        let collected = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await;
-
+        let status = resp.status();
+        let collected = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024)
+            .await
+            .map_err(|e| e.to_string());
         fx.teardown().await;
+        (status, collected)
+    }
 
+    /// #4323: a small blob whose stored bytes no longer hash to the digest the
+    /// pull advertises is refused before any byte is sent: `502
+    /// STORED_OBJECT_INTEGRITY`, the generic download route's answer.
+    ///
+    /// FAILS ON MAIN: the plain `ranged_stream_response` serves the corrupt
+    /// bytes as a complete `200`.
+    #[tokio::test]
+    async fn get_blob_refuses_a_small_corrupt_blob_with_502_4323() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let pushed = b"the layer the client pushed".to_vec();
+        let (status, collected) = pull_corrupt_blob(pushed.clone()).await;
+        let body = collected.expect("a 502 has a complete error body");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(crate::storage::verify::STORED_OBJECT_INTEGRITY_CODE),
+            "error body: {text}"
+        );
+        assert!(
+            !body
+                .windows(pushed.len() - 1)
+                .any(|w| w == &pushed[..pushed.len() - 1]),
+            "no blob bytes in the error body"
+        );
+    }
+
+    /// #4323: a blob too large to verify before the headers is cut short
+    /// before its last chunk, so the client sees a truncated transfer, never
+    /// a complete corrupt layer.
+    ///
+    /// FAILS ON MAIN: the corrupt bytes stream to the end.
+    #[tokio::test]
+    async fn get_blob_aborts_a_large_corrupt_blob_4323() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let size = crate::storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES as usize + 64 * 1024;
+        let pushed: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let (status, collected) = pull_corrupt_blob(pushed).await;
+        assert_eq!(status, StatusCode::OK, "the status is sent before the end");
         assert!(
             collected.is_err(),
-            "a corrupt blob must not be served to completion: got {:?}",
-            collected.map(|b| String::from_utf8_lossy(&b).into_owned())
+            "a corrupt blob must not be served to completion"
         );
     }
 }
@@ -22062,6 +22132,105 @@ mod manifest_digest_db_tests {
         );
     }
 
+    /// #1683: a Virtual resolves a hosted member's digest the way a direct
+    /// pull of the member does. The untagged child of a tagged index (its own
+    /// tag deleted) resolves through the Virtual, and a child deleted by
+    /// digest under the image does not, although its row stays while the
+    /// tagged index references it.
+    #[tokio::test]
+    async fn virtual_digest_resolution_follows_the_member_1683() {
+        let Some((fx, auth)) = readers_fixture().await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make member public");
+        let kept = put_manifest(
+            &fx,
+            &auth,
+            "app",
+            "kept",
+            OCI_IMAGE_CT,
+            image_manifest("virtual-kept"),
+        )
+        .await;
+        let gone = put_manifest(
+            &fx,
+            &auth,
+            "app",
+            "gone",
+            OCI_IMAGE_CT,
+            image_manifest("virtual-gone"),
+        )
+        .await;
+        put_manifest(
+            &fx,
+            &auth,
+            "app",
+            "v1",
+            OCI_INDEX_CT,
+            index_manifest(&[&kept, &gone]),
+        )
+        .await;
+        let kept_tag_delete = manifest_status(&fx, &auth, Method::DELETE, "app", "kept").await;
+        let gone_digest_delete = manifest_status(&fx, &auth, Method::DELETE, "app", &gone).await;
+        let gone_row = crate::services::oci_manifests::content_type_of(&fx.pool, fx.repo_id, &gone)
+            .await
+            .expect("row lookup");
+
+        let virtual_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'virtual', 'docker'::repository_format, true)",
+        )
+        .bind(virtual_id)
+        .bind(format!("oci-virt-1683-{}", &virtual_id.to_string()[..8]))
+        .bind(format!("/tmp/oci-virt-1683-{virtual_id}"))
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual repo");
+        tdh::link_virtual_member(&fx.pool, virtual_id, fx.repo_id, 1).await;
+
+        let via_virtual = |digest: String| {
+            let state = fx.state.clone();
+            async move {
+                resolve_virtual_manifest(&state, None, virtual_id, "app", &digest, None)
+                    .await
+                    .map(|(d, ..)| d)
+            }
+        };
+        let kept_virtual = via_virtual(kept.clone()).await;
+        let gone_virtual = via_virtual(gone.clone()).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        readers_cleanup(&fx).await;
+
+        assert_eq!(kept_tag_delete, StatusCode::ACCEPTED);
+        assert_eq!(gone_digest_delete, StatusCode::ACCEPTED);
+        assert!(
+            gone_row.is_some(),
+            "the deleted child keeps its row while the tagged index references it"
+        );
+        assert_eq!(
+            kept_virtual,
+            Some(kept),
+            "the untagged child of a tagged index resolves through the Virtual"
+        );
+        assert_eq!(
+            gone_virtual, None,
+            "a child deleted by digest under the image does not"
+        );
+    }
+
     /// #4525 is unchanged: a child deleted BY DIGEST under the image answers
     /// 404 there, even while a tagged index still references it.
     #[tokio::test]
@@ -22107,14 +22276,13 @@ mod manifest_digest_db_tests {
         assert_eq!(get, StatusCode::NOT_FOUND);
     }
 
-    /// #1683: the referrers of a subject whose record is removed (its last tag
-    /// deleted) are no longer listed; the referrer itself still pulls by
-    /// digest. A referrer whose subject was never pushed is still listed.
-    ///
-    /// FAILS ON MAIN: `GET .../referrers/<subject>` keeps listing the
-    /// referrer after the subject is gone.
+    /// #1683: the referrers listing keys on the referrer's own record, not on
+    /// the subject's. Deleting the subject's last tag leaves its signature
+    /// listed (the signature still exists and names the subject), pushing the
+    /// subject again keeps it listed, a referrer whose subject was never pushed
+    /// is listed, and deleting the referrer itself unlists it.
     #[tokio::test]
-    async fn referrers_of_a_deleted_subject_are_gone_1683() {
+    async fn referrers_follow_the_referrer_not_the_subject_1683() {
         let Some((fx, auth)) = readers_fixture().await else {
             return;
         };
@@ -22152,23 +22320,47 @@ mod manifest_digest_db_tests {
 
         let before = referrers(subject.clone()).await;
         let deleted = manifest_status(&fx, &auth, Method::DELETE, "app", "v1").await;
-        let after = referrers(subject.clone()).await;
+        let after_delete = referrers(subject.clone()).await;
         let sig_get = manifest_status(&fx, &auth, Method::GET, "app", &sig_digest).await;
+        let repushed = put_manifest(
+            &fx,
+            &auth,
+            "app",
+            "v1",
+            OCI_IMAGE_CT,
+            image_manifest("subject"),
+        )
+        .await;
+        let after_repush = referrers(subject.clone()).await;
         let orphan = referrers(never_pushed).await;
+        let sig_deleted = manifest_status(&fx, &auth, Method::DELETE, "app", &sig_digest).await;
+        let after_sig_delete = referrers(subject.clone()).await;
         readers_cleanup(&fx).await;
 
         assert_eq!(before, (StatusCode::OK, 1));
         assert_eq!(deleted, StatusCode::ACCEPTED);
         assert_eq!(
-            after,
-            (StatusCode::OK, 0),
-            "a deleted subject lists no referrers"
+            after_delete,
+            (StatusCode::OK, 1),
+            "the signature still exists and names the subject"
         );
         assert_eq!(sig_get, StatusCode::OK, "the referrer itself is untouched");
+        assert_eq!(repushed, subject);
+        assert_eq!(
+            after_repush,
+            (StatusCode::OK, 1),
+            "a re-pushed subject lists its referrers"
+        );
         assert_eq!(
             orphan,
             (StatusCode::OK, 1),
             "a never-pushed subject still lists its referrer"
+        );
+        assert_eq!(sig_deleted, StatusCode::ACCEPTED);
+        assert_eq!(
+            after_sig_delete,
+            (StatusCode::OK, 0),
+            "a deleted referrer is not listed"
         );
     }
 
