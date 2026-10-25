@@ -1,7 +1,10 @@
 //! Tests of CEP-16 shards synthesised for a Remote conda repository whose
 //! upstream publishes no shard index (#4178).
 
-use super::shard_synth::{self, for_each_record, shards_of_partition, spill_document};
+use super::shard_synth::{
+    self, for_each_record, for_each_record_capped, shards_of_partition, shards_of_partition_capped,
+    spill_document, spill_document_in, SynthError,
+};
 use super::tests::{cleanup_conda_repo, insert_public_remote_conda_repo, state_with_proxy_cache};
 use super::virtual_channel_tests::upstream_record;
 use super::{shard_address, RepodataEncoding};
@@ -141,6 +144,150 @@ fn shards_group_a_name_across_sections_and_encodings_4178() {
         .conda_packages
         .keys()
         .any(|k| k.to_string() == "a-2.0-0.conda"));
+}
+
+/// #4178, hostile upstream: a record whose `name` is not the package its
+/// filename names lands in the shard of the name it carries (what a solver
+/// reading the upstream `repodata.json` would see) and leaves the other
+/// name's shard as it was; a filename listed twice keeps its last record,
+/// as a JSON parser of the document would; a record with no name is skipped.
+#[test]
+fn a_mismatched_or_duplicate_record_cannot_reach_another_names_shard_4178() {
+    let honest = repodata("noarch", &["numpy-1.0-0.tar.bz2"], &[]);
+    let honest_shards = {
+        let (parts, _) = spill_document(
+            serde_json::to_vec(&honest).unwrap().into(),
+            None,
+            RepodataEncoding::Json,
+        )
+        .unwrap();
+        let mut all = Vec::new();
+        for p in &parts.paths {
+            all.extend(shards_of_partition(p).unwrap());
+        }
+        all
+    };
+    let mut evil = upstream_record("noarch", "numpy-9.9-0.tar.bz2");
+    evil["name"] = "evil".into();
+    let mut first = upstream_record("noarch", "dup-1.0-0.tar.bz2");
+    first["build"] = "first".into();
+    let mut last = upstream_record("noarch", "dup-1.0-0.tar.bz2");
+    last["build"] = "last".into();
+    let mut nameless = upstream_record("noarch", "anon-1.0-0.tar.bz2");
+    nameless.as_object_mut().unwrap().remove("name");
+    let numpy = upstream_record("noarch", "numpy-1.0-0.tar.bz2");
+    // Written by hand: a JSON object with a duplicate key.
+    let doc = format!(
+        "{{\"info\":{{\"subdir\":\"noarch\"}},\"packages\":{{\
+         \"numpy-1.0-0.tar.bz2\":{numpy},\"numpy-9.9-0.tar.bz2\":{evil},\
+         \"dup-1.0-0.tar.bz2\":{first},\"dup-1.0-0.tar.bz2\":{last},\
+         \"anon-1.0-0.tar.bz2\":{nameless}}},\"packages.conda\":{{}}}}"
+    );
+    let (parts, records) =
+        spill_document(doc.into_bytes().into(), None, RepodataEncoding::Json).unwrap();
+    assert_eq!(records, 4, "the nameless record is skipped");
+    let mut shards = Vec::new();
+    for p in &parts.paths {
+        shards.extend(shards_of_partition(p).unwrap());
+    }
+    shards.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        shards.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(),
+        ["dup", "evil", "numpy"]
+    );
+    let numpy_shard = shards.iter().find(|s| s.0 == "numpy").unwrap();
+    assert_eq!(
+        numpy_shard, &honest_shards[0],
+        "numpy's shard is byte for byte the one an honest document gives"
+    );
+    let evil_shard = decode_shard(&shards.iter().find(|s| s.0 == "evil").unwrap().1);
+    assert_eq!(evil_shard.packages.len(), 1);
+    let dup = decode_shard(&shards.iter().find(|s| s.0 == "dup").unwrap().1);
+    assert_eq!(dup.packages.len(), 1);
+    assert_eq!(dup.packages.values().next().unwrap().build, "last");
+}
+
+/// #4178, hostile upstream: a document that decodes past the ceiling, one
+/// enormous record, or one name whose records pass the per-name bound is
+/// refused as an upstream failure before it is held, rather than parsed
+/// into memory.
+#[test]
+fn an_oversized_upstream_document_is_refused_as_an_upstream_failure_4178() {
+    let doc = repodata("noarch", &["a-1.0-0.tar.bz2", "b-1.0-0.tar.bz2"], &[]);
+    let bytes = serde_json::to_vec(&doc).unwrap();
+    // A decompression bomb: valid JSON whitespace past the decoded ceiling.
+    let mut bomb = b"{\"packages\":".to_vec();
+    bomb.extend(std::iter::repeat_n(b' ', 4 * 1024 * 1024));
+    bomb.extend_from_slice(b"{}}");
+    let err = for_each_record_capped(bomb.as_slice(), 1024 * 1024, u64::MAX / 2, |_, _, _| Ok(()))
+        .unwrap_err();
+    assert!(err.contains("ceiling"), "{err}");
+    // One record past the record bound (its depends list is 2 MiB).
+    let mut big = upstream_record("noarch", "huge-1.0-0.tar.bz2");
+    big["depends"] = serde_json::Value::Array(
+        (0..200_000)
+            .map(|i| format!("dep{i} >=1"))
+            .map(Into::into)
+            .collect(),
+    );
+    let huge = serde_json::to_vec(&serde_json::json!({
+        "packages": {"huge-1.0-0.tar.bz2": big},
+    }))
+    .unwrap();
+    assert!(huge.len() > 2 * 1024 * 1024);
+    let err = for_each_record_capped(huge.as_slice(), u64::MAX / 2, 1024 * 1024, |_, _, _| Ok(()))
+        .unwrap_err();
+    assert!(err.contains("record exceeds"), "{err}");
+    // The default bounds admit a real-sized document.
+    assert_eq!(
+        for_each_record(bytes.as_slice(), |_, _, _| Ok(())).unwrap(),
+        2
+    );
+    // One name past the per-name bound.
+    let (parts, _) = spill_document(huge.into(), None, RepodataEncoding::Json).unwrap();
+    let mut refused = 0;
+    for p in &parts.paths {
+        match shards_of_partition_capped(p, 1024 * 1024) {
+            Ok(_) => {}
+            Err(SynthError::Upstream(e)) => {
+                assert!(e.contains("one package name"), "{e}");
+                refused += 1;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(refused, 1);
+}
+
+/// #4178: a temporary directory that cannot hold the spill files (here not
+/// a directory at all, as for a read-only or missing `TMPDIR`) is a local
+/// failure, not an upstream one, and leaves nothing behind.
+#[test]
+fn an_unusable_temporary_directory_is_a_local_failure_4178() {
+    let doc = repodata("noarch", &["a-1.0-0.tar.bz2"], &[]);
+    let not_a_dir = tempfile::NamedTempFile::new().unwrap();
+    match spill_document_in(
+        not_a_dir.path(),
+        serde_json::to_vec(&doc).unwrap().into(),
+        None,
+        RepodataEncoding::Json,
+    ) {
+        Err(SynthError::Local(e)) => assert!(e.contains("spill directory"), "{e}"),
+        Err(e) => panic!("expected a local failure, got {e}"),
+        Ok(_) => panic!("spilled into a file"),
+    }
+    // The partitions of a successful spill are removed with their handle.
+    let parent = tempfile::tempdir().unwrap();
+    let (parts, _) = spill_document_in(
+        parent.path(),
+        serde_json::to_vec(&doc).unwrap().into(),
+        None,
+        RepodataEncoding::Json,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    drop(parts);
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
 }
 
 /// #4178 acceptance: a remote whose upstream has no shard index serves a

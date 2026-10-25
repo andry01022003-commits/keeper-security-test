@@ -161,8 +161,8 @@ include that member instead of dropping to `repodata.json` for everyone.
 
   | Document | Compressed | Records | Names | Shard bytes | Peak RSS |
   |---|---|---|---|---|---|
-  | `noarch/repodata.json.zst` | 29 MB | 387,290 | 23,959 | 36 MB | 143 MB |
-  | `linux-64/repodata.json.zst` | 59 MB | 799,318 | 14,173 | 68 MB | 208 MB |
+  | `noarch/repodata.json.zst` | 29 MB | 387,298 | 23,959 | 36 MB | 97 MiB |
+  | `linux-64/repodata.json.zst` | 59 MB | 799,329 | 14,173 | 68 MB | 143 MiB |
 
   The compressed document itself (under the 128 MiB metadata ceiling) is held
   while it is read, as for any proxied metadata read. An upstream that
@@ -183,6 +183,23 @@ include that member instead of dropping to `repodata.json` for everyone.
   and rebuild it. A stale index is not served: the request waits for the
   rebuild like any other render (`AK_CONDA_REGEN_CONCURRENCY`,
   `AK_CONDA_REGEN_WAIT_SECS`, then `503` with `Retry-After`).
+- **Bounds.** The decoded document is refused past
+  `CONDA_VIRTUAL_MEMBER_MAX_DECODED_BYTES` (1 GiB by default, the virtual
+  merge's member ceiling), one record past 16 MiB, and one package name whose
+  records pass 64 MiB (conda-forge's largest record is about 5 KB and its
+  largest name, `awscli` on linux-64, about 7 MB). A refused or unparseable
+  upstream document answers `502`; nothing is stored and the subdir stays
+  stale, so no index is served from it.
+- **Temporary space.** The spill files take about the decoded size of the
+  document (about 460 MB for conda-forge linux-64) under `TMPDIR` while the
+  rebuild runs, in a directory named `ak-conda-shard-synth-*` that is removed
+  when the rebuild ends, fails or panics (a process killed outright leaves it
+  behind). A full, read-only or missing `TMPDIR` fails the rebuild with `500`
+  and an error log naming the spill files; nothing is stored.
+- An upstream that does publish a shard index, but one past the 64 MiB
+  shard-index ceiling (#4612), is not synthesised: its shard index keeps
+  answering `404` and a virtual with that member serves none for the subdir,
+  so clients use `repodata.json`.
 - A subdir the upstream publishes no `repodata.json` for at all still answers
   `404` on the shard index, and keeps a virtual off CEP-16 for that subdir.
 
