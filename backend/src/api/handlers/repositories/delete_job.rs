@@ -1430,6 +1430,66 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #4311: a repository delete journals the object of a manifest the
+    /// repository knows only through its `oci_manifests` record (no tag, no
+    /// index edge, no artifacts row), so storage GC's candidate sweep can
+    /// reclaim it once the record cascades away instead of the object leaking.
+    #[tokio::test]
+    async fn a_delete_journals_a_manifest_known_only_through_oci_manifests_4311() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                Uuid::new_v4().as_bytes()
+            ))
+        );
+        sqlx::query(
+            "INSERT INTO oci_manifests (repository_id, digest, content_type, size_bytes) \
+             VALUES ($1, $2, 'application/vnd.oci.image.manifest.v1+json', 42)",
+        )
+        .bind(fx.repo_id)
+        .bind(&digest)
+        .execute(&fx.pool)
+        .await
+        .expect("untagged manifest record");
+        let repo = fx
+            .state
+            .create_repository_service()
+            .get_by_id(fx.repo_id)
+            .await
+            .unwrap();
+        let (job, _) = enqueue(&fx.pool, &repo, fx.user_id).await.unwrap();
+        let done = run_to_completion(&fx.state, job.id).await;
+        assert_eq!(done.status, "completed", "{done:?}");
+        let key = format!(
+            "{}{digest}",
+            crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX
+        );
+        let journaled: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT source_repository_id FROM oci_gc_candidates WHERE storage_key = $1",
+        )
+        .bind(&key)
+        .fetch_optional(&fx.pool)
+        .await
+        .unwrap();
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        assert_eq!(
+            journaled,
+            Some(Some(fx.repo_id)),
+            "the manifest object is a waiting GC candidate after the delete"
+        );
+    }
+
     /// The status endpoint shows a job only to its requester and to admins.
     #[tokio::test]
     async fn status_is_visible_to_the_requester_and_admins_only_4311() {

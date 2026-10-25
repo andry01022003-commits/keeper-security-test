@@ -4729,6 +4729,13 @@ pub(crate) async fn record_oci_gc_candidates(
             SELECT '{manifest}' || omr.parent_digest FROM oci_manifest_refs omr
              WHERE omr.repository_id = $1
             UNION
+            -- #4311: a manifest known only through its `oci_manifests` record
+            -- (an untagged image no index points at, overwritten tag history)
+            -- has no artifacts row, tag or edge; without this arm its object
+            -- leaks once the repository's rows cascade away.
+            SELECT '{manifest}' || om.digest FROM oci_manifests om
+             WHERE om.repository_id = $1
+            UNION
             -- #3851: a final blob object this repository's abandoned push
             -- wrote (journaled, but its `oci_blobs` row never landed). The
             -- repository delete leaves it in place on a shared-namespace
