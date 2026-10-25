@@ -282,6 +282,9 @@ pub(crate) struct UnscannedArchiveRuns<'a, L> {
     pub proxy: &'a ProxyService,
     /// The path the member resolver fetches and caches under.
     pub path: &'a str,
+    /// Absolute upstream URLs for Remote members whose download URL cannot be
+    /// derived from `member.upstream_url` + `path` (#3952), keyed by member id.
+    pub member_fetch_urls: &'a std::collections::HashMap<uuid::Uuid, String>,
     pub local_fetch: L,
     pub default_content_type: &'a str,
     pub disposition: Option<&'a str>,
@@ -314,10 +317,11 @@ where
 {
     let runs = &runs;
     let unscanned_run = |run: Vec<Repository>| async move {
-        match proxy_helpers::resolve_virtual_download_from_members(
+        match proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
             run,
             Some(runs.proxy),
             runs.path,
+            runs.member_fetch_urls,
             Some(runs.ctx),
             &runs.local_fetch,
         )
@@ -473,9 +477,11 @@ where
             }
         }
     };
+    let no_fetch_urls = std::collections::HashMap::new();
     let runs = UnscannedArchiveRuns {
         proxy,
         path: route.upstream_path,
+        member_fetch_urls: &no_fetch_urls,
         local_fetch,
         default_content_type: route.default_content_type,
         disposition: route.virtual_disposition,

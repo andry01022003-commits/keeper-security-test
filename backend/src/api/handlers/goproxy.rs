@@ -1723,9 +1723,11 @@ async fn serve_scanned_virtual_go_zip(
         )
         .await
     };
+    let no_fetch_urls = std::collections::HashMap::new();
     let runs = crate::api::handlers::proxy_scan_archive::UnscannedArchiveRuns {
         proxy,
         path: &zip.serve_key.cache_key,
+        member_fetch_urls: &no_fetch_urls,
         local_fetch,
         default_content_type: "application/zip",
         disposition: None,
