@@ -1,4 +1,4 @@
--- 303_repository_delete_jobs.sql
+-- 304_repository_delete_jobs.sql
 -- #4311: `DELETE /api/v1/repositories/{key}` records a job here and answers
 -- 202; a background worker deletes the repository's rows in bounded batches
 -- and reclaims its storage, under a row claim (claim_token / claim_expires_at)
