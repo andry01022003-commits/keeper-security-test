@@ -1130,8 +1130,16 @@ async fn complete_session_commit(
             };
         if let Some(scope) = admission.denied_by {
             // Drop `tx` (rolls back). The stored blob is content-addressed;
-            // if this upload orphaned it, storage GC reclaims it.
+            // when this completion wrote it, hand it to storage GC's
+            // candidate sweep (#4990), which deletes it unless a row
+            // references it by the end of its grace window.
             drop(tx);
+            if !content_exists {
+                state
+                    .create_artifact_service(storage.clone())
+                    .journal_unreferenced_upload_object(session.repository_id, &storage_key)
+                    .await;
+            }
             let message = scope.exceeded_message();
             UploadService::fail_committing(&state.db, &session, &message.to_lowercase()).await;
             return Err(map_err(StatusCode::INSUFFICIENT_STORAGE, message));
@@ -1182,8 +1190,16 @@ async fn complete_session_commit(
         Ok(None) => {
             // Same response and lease handling as the gate's own 409: the
             // write becomes legal once the occupying artifact is deleted, so
-            // the session stays retryable.
+            // the session stays retryable. An object this completion wrote
+            // goes to storage GC's candidate sweep meanwhile (#4990); a retry
+            // that commits makes it referenced again.
             drop(tx);
+            if !content_exists {
+                state
+                    .create_artifact_service(storage.clone())
+                    .journal_unreferenced_upload_object(session.repository_id, &storage_key)
+                    .await;
+            }
             UploadService::release_commit_lease(&state.db, &session).await;
             return Err(crate::error::AppError::Conflict(
                 "Artifact version already exists and is immutable".to_string(),
@@ -6767,6 +6783,67 @@ mod tests {
             "trusted replication keeps its exemption"
         );
         f.teardown().await;
+    }
+
+    /// #4990: a chunked completion that wrote its content-addressed object and
+    /// was then denied by the quota hands the object to storage GC's
+    /// candidate sweep (a waiting candidate, no lease) instead of leaving it
+    /// with no record.
+    #[tokio::test]
+    async fn chunked_quota_denial_hands_the_written_object_to_gc_4990() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let user = tdh::make_auth(f.user_id, &f.username);
+        let payload = format!("bytes the quota refuses {}", Uuid::new_v4()).into_bytes();
+        let (status, session) =
+            create_session_as(&f, &user, "quota/orphan.bin", &payload, false).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let session = session.unwrap();
+        let chunk = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .body(axum::body::Body::from(payload.clone()))
+            .unwrap();
+        let (status, _) = tdh::send(
+            upload_router_with_auth(f.state.clone(), user.clone()),
+            chunk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (status, _) = tdh::send(
+            upload_router_with_auth(f.state.clone(), user.clone()),
+            complete_req(session.parse().unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&{
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&payload))
+        });
+        let journal: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT source_repository_id, leased_at IS NOT NULL FROM oci_gc_candidates \
+             WHERE storage_key = $1",
+        )
+        .bind(&key)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+        assert_eq!(journal, Some((Some(f.repo_id), false)));
     }
 
     /// A chunked upload into a repository with the upload quarantine enabled

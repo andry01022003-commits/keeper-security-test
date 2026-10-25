@@ -1306,6 +1306,178 @@ mod tests {
         assert_eq!(read, "hello chunked world");
     }
 
+    /// A fixture whose repository sits on the in-memory "cloud" backend
+    /// (native streaming), so the completion assembles on the backend and the
+    /// stream parsers read the staged chunks.
+    async fn cloud_fixture(
+        format: &str,
+    ) -> Option<(tdh::Fixture, std::sync::Arc<tdh::MemStorage>)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", format).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("cloud backend");
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        Some((
+            tdh::Fixture {
+                pool,
+                user_id,
+                username,
+                repo_id,
+                repo_key,
+                storage_dir,
+                state,
+            },
+            mem,
+        ))
+    }
+
+    /// #1846 on a native-streaming backend: the POM and the npm tarball are
+    /// parsed from the staged chunks (no local assembly), the artifacts are
+    /// indexed, and a refused tarball leaves neither its content-addressed
+    /// object nor its assembled staging object behind.
+    #[tokio::test]
+    async fn stream_parsers_read_the_staged_chunks_on_object_storage_1846() {
+        let Some((f, mem)) = cloud_fixture("npm").await else {
+            return;
+        };
+        let path = "cloud-pkg/1.0.0/cloud-pkg-1.0.0.tgz";
+        let (status, body) = f
+            .chunked_upload(
+                path,
+                &npm_tgz("cloud-pkg", "1.0.0"),
+                serde_json::json!({}),
+                false,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, packument) = body_text(
+            f.router_with_auth(crate::api::handlers::npm::router()),
+            format!("/{}/cloud-pkg", f.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "packument: {packument}");
+        assert!(packument.contains("\"1.0.0\""), "{packument}");
+
+        let refused_path = "cloud-pkg/2.0.0/cloud-pkg-2.0.0.tgz";
+        let refused = npm_tgz("someone-else", "2.0.0");
+        let (status, body) = f
+            .chunked_upload(refused_path, &refused, serde_json::json!({}), false)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM upload_sessions WHERE repository_id = $1 AND artifact_path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(refused_path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("refused session");
+        let cas_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&{
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&refused))
+            });
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert!(
+                !objects.contains_key(&cas_key),
+                "a refused package stores nothing"
+            );
+            assert!(
+                !objects.contains_key(&crate::services::upload_service::staged_assembly_key(
+                    session_id
+                )),
+                "the assembled staging object is deleted"
+            );
+        }
+        f.teardown().await;
+
+        let Some((f, _mem)) = cloud_fixture("maven").await else {
+            return;
+        };
+        let pom = br#"<project><modelVersion>4.0.0</modelVersion><groupId>com.acme.cloud</groupId><artifactId>lib</artifactId><version>0.9</version><description>parsed from the staged chunks</description></project>"#;
+        let pom_path = "com/acme/cloud/lib/0.9/lib-0.9.pom";
+        let (status, body) = f
+            .chunked_upload(pom_path, pom, serde_json::json!({}), false)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (pom_id, name, ..) = row(&f, pom_path).await;
+        assert_eq!(name, "lib");
+        let description: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'description' FROM artifact_metadata \
+             WHERE artifact_id = $1 AND format = 'maven'",
+        )
+        .bind(pom_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("maven metadata");
+        assert_eq!(
+            description.as_deref(),
+            Some("parsed from the staged chunks")
+        );
+        f.teardown().await;
+    }
+
+    /// #1846: an artifact the chunked flow committed into a format repository
+    /// before this change (a generic row named after its file, with no format
+    /// metadata, under the content-addressed key) stays downloadable through
+    /// the format's own route.
+    #[tokio::test]
+    async fn rows_committed_before_the_dispatch_stay_downloadable_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let bytes = format!("pre-1846 chunked jar {}", Uuid::new_v4()).into_bytes();
+        let sha = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&bytes))
+        };
+        let key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&sha);
+        let storage = f
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: f.storage_dir.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        storage.put(&key, Bytes::from(bytes.clone())).await.unwrap();
+        let path = "com/acme/old/old/1.0/old-1.0.jar";
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'old-1.0.jar', '1.0', $3, $4, 'application/octet-stream', $5)",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .bind(bytes.len() as i64)
+        .bind(&sha)
+        .bind(&key)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, body) = tdh::send(
+            f.router_with_auth(crate::api::handlers::maven::router()),
+            tdh::get(format!("/{}/{path}", f.repo_key)),
+        )
+        .await;
+        f.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), bytes.as_slice());
+    }
+
     #[test]
     fn npm_identity_helpers_1846() {
         use std::path::Path;

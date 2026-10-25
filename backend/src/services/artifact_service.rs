@@ -1238,7 +1238,11 @@ impl ArtifactService {
     /// Record `storage_key`, written by an upload into `repository_id` whose
     /// row did not commit, as a storage GC candidate (#3916). Best-effort: a
     /// failure only leaves the object as it was before this hand-off existed.
-    async fn journal_unreferenced_upload_object(&self, repository_id: Uuid, storage_key: &str) {
+    pub(crate) async fn journal_unreferenced_upload_object(
+        &self,
+        repository_id: Uuid,
+        storage_key: &str,
+    ) {
         let Ok(repo) = self.repo_service.get_by_id(repository_id).await else {
             return;
         };
