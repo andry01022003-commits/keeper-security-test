@@ -204,6 +204,56 @@ pub(crate) async fn lock_in_tx(
     Ok(())
 }
 
+/// After `DELETE /v2/<name>/manifests/<digest>` has removed the image's tags
+/// and trashed its manifest rows (#1683): forget the manifest even when a
+/// live index still references it, once nothing else in the repository holds
+/// it (no tag under any image name, no live manifest-shaped `artifacts` row).
+/// [`delete_in_tx`] keeps the row of a live index's child, which is right for
+/// a tag delete, but a delete by digest names the manifest itself, and the
+/// spec answers 404 for it afterwards. Without this, a child pushed only
+/// under a tag and then deleted by digest stayed pullable through its row
+/// while its index was tagged. The index's edge and the child's blob refs
+/// stay (the tagged index still names it), exactly as on 1.11.
+const FORGET_AFTER_DIGEST_DELETE_SQL: &str = concat!(
+    r#"
+    DELETE FROM oci_manifests om
+    WHERE om.repository_id = $1
+      AND om.digest = $2
+      AND NOT EXISTS (
+            SELECT 1 FROM oci_tags ot
+            WHERE ot.repository_id = $1 AND ot.manifest_digest = $2
+      )
+      AND NOT (
+            $2 LIKE 'sha256:%'
+            AND EXISTS (
+                SELECT 1 FROM artifacts a
+                WHERE a.repository_id = $1
+                  AND a.is_deleted = false
+                  AND a.checksum_sha256 = SUBSTRING($2 FROM 8)::bpchar
+                  AND "#,
+    crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+    r#"
+            )
+      )
+    "#
+);
+
+/// See [`FORGET_AFTER_DIGEST_DELETE_SQL`]. Runs in the delete's transaction,
+/// after its `artifacts` soft-delete; the row was locked by [`lock_in_tx`]
+/// earlier in the same transaction, so the #4441 lock order holds.
+pub(crate) async fn forget_after_digest_delete_in_tx(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    digest: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(FORGET_AFTER_DIGEST_DELETE_SQL)
+        .bind(repo_id)
+        .bind(digest)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Forget a deleted manifest (see [`delete_removes_record`]). Runs inside the
 /// caller's transaction, after its tag rows and stale index edges are gone.
 ///
@@ -1671,10 +1721,11 @@ mod tests {
     }
 
     /// Deleting a child manifest by digest while its parent index is still
-    /// tagged keeps the child's row: the kept parent->child edge means it still
-    /// exists (pullable through the parent, #1642).
+    /// tagged forgets the child (#1683: the readers answer 404 for it, so its
+    /// row goes with it), while the tagged index's edge to it stays, as the
+    /// index still names it (#1642).
     #[tokio::test]
-    async fn delete_by_digest_keeps_child_of_live_index() {
+    async fn delete_by_digest_forgets_child_of_live_index_1683() {
         let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -1698,11 +1749,17 @@ mod tests {
 
         delete(&fx.pool, fx.repo_id, &child_digest, &child_digest, true).await;
         let row = manifest_row(&fx.pool, fx.repo_id, &child_digest).await;
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_manifest_refs WHERE repository_id = $1 AND child_digest = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&child_digest)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count edges");
         fx.teardown().await;
-        assert!(
-            row.is_some(),
-            "a child of a still-tagged index still exists"
-        );
+        assert_eq!(row, None, "a child deleted by digest is forgotten");
+        assert_eq!(edges, 1, "the tagged index's edge to it stays");
     }
 
     /// The backfill records pre-existing manifests across several keyset pages:

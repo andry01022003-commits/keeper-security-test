@@ -107,6 +107,7 @@ reconcile. In a mixed fleet:
 | Same, after a GC run pruned its refs | 404 | 404 (row retired in that GC run) |
 | Expired by a lifecycle policy | 404 | 404 (per-image trash check; row removed by the next reconcile) |
 | Untagged child of a tagged index, its own tag deleted | 404 | 200 |
+| Child of a tagged index, deleted by digest | 404 | 404 (its row is removed by the delete; the index's edge stays) |
 | Child of an untagged index that still pulls by digest | 404 once its own tag was deleted, and a 1.11 GC run may reclaim its object and layers | 200, kept by GC |
 | Tagged, no row yet (a pre-1.11 manifest the backfill could not record) | 200 | 200 (served from the tag until the reconcile adds the row) |
 

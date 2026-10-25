@@ -14067,6 +14067,10 @@ pub(crate) async fn delete_oci_manifest_and_artifacts(
     let mut tx = pool.begin().await?;
     delete_oci_manifest_content_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
     soft_delete_manifest_artifacts_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
+    if scope == OciIndexDeleteScope::ContentAddressed {
+        crate::services::oci_manifests::forget_after_digest_delete_in_tx(&mut tx, repo_id, digest)
+            .await?;
+    }
     tx.commit().await
 }
 
@@ -22132,13 +22136,17 @@ mod manifest_digest_db_tests {
         );
     }
 
-    /// #1683: a Virtual resolves a hosted member's digest the way a direct
-    /// pull of the member does. The untagged child of a tagged index (its own
-    /// tag deleted) resolves through the Virtual, and a child deleted by
-    /// digest under the image does not, although its row stays while the
-    /// tagged index references it.
+    /// #1683: a child pushed only under a tag and then deleted BY DIGEST
+    /// answers 404, directly and through a Virtual, although its tagged index
+    /// still references it; its record is forgotten. The untagged child of
+    /// the same index whose tag (not digest) was deleted keeps resolving,
+    /// directly and through the Virtual.
+    ///
+    /// FAILS WITHOUT `forget_after_digest_delete_in_tx`: the deleted child
+    /// kept its row (child of a live index) and, having no by-digest marker
+    /// row, resolved through its live ancestor: 200 after a delete.
     #[tokio::test]
-    async fn virtual_digest_resolution_follows_the_member_1683() {
+    async fn a_tag_pushed_child_deleted_by_digest_answers_404_1683() {
         let Some((fx, auth)) = readers_fixture().await else {
             return;
         };
@@ -22179,6 +22187,8 @@ mod manifest_digest_db_tests {
         let gone_row = crate::services::oci_manifests::content_type_of(&fx.pool, fx.repo_id, &gone)
             .await
             .expect("row lookup");
+        let gone_get = manifest_status(&fx, &auth, Method::GET, "app", &gone).await;
+        let kept_get = manifest_status(&fx, &auth, Method::GET, "app", &kept).await;
 
         let virtual_id = Uuid::new_v4();
         sqlx::query(
@@ -22216,10 +22226,9 @@ mod manifest_digest_db_tests {
 
         assert_eq!(kept_tag_delete, StatusCode::ACCEPTED);
         assert_eq!(gone_digest_delete, StatusCode::ACCEPTED);
-        assert!(
-            gone_row.is_some(),
-            "the deleted child keeps its row while the tagged index references it"
-        );
+        assert_eq!(gone_row, None, "a delete by digest forgets the manifest");
+        assert_eq!(gone_get, StatusCode::NOT_FOUND, "deleted by digest: 404");
+        assert_eq!(kept_get, StatusCode::OK, "tag deleted, index live: 200");
         assert_eq!(
             kept_virtual,
             Some(kept),
