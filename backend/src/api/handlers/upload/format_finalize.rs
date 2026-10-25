@@ -163,13 +163,16 @@ pub(crate) fn native_target(
         }
         RepositoryFormat::Npm => {
             // `{package}/{version}/{file}.tgz`, the layout the native publish
-            // writes and the tarball route resolves.
+            // writes and the tarball route resolves. The registry URL layout
+            // `{package}/-/{file}.tgz` names no version in the path; such an
+            // upload keeps the generic behaviour, as before.
             if !artifact_path.ends_with(".tgz") {
                 return None;
             }
             let package =
                 crate::api::handlers::npm::npm_package_name_from_artifact_path(artifact_path)?;
-            let version = super::version_from_artifact_path(artifact_path)?;
+            let version = super::version_from_artifact_path(artifact_path)
+                .filter(|version| *version != "-")?;
             Some(target(
                 (package.to_string(), version.to_string()),
                 FinalizeInput::Stream,
@@ -431,9 +434,7 @@ async fn stage_npm(target: &NativeTarget, source: FinalizeSource<'_>) -> Result<
     let reader = BlockingStreamReader::spawn(source_stream(source).await?);
     let package_json = crate::util::bounded_archive::with_ingest_extraction_async(|| {
         tokio::task::spawn_blocking(move || {
-            crate::util::bounded_archive::read_metadata_from_tar_gz(reader, |path| {
-                path.file_name().is_some_and(|n| n == "package.json")
-            })
+            crate::util::bounded_archive::read_metadata_from_tar_gz(reader, is_root_package_json)
         })
     })
     .await
@@ -443,27 +444,67 @@ async fn stage_npm(target: &NativeTarget, source: FinalizeSource<'_>) -> Result<
     .ok_or_else(|| "npm tarball has no package.json".to_string())?;
     let version_data: serde_json::Value = serde_json::from_slice(&package_json)
         .map_err(|e| format!("npm tarball package.json is not valid JSON: {e}"))?;
-    let declared_name = version_data.get("name").and_then(|v| v.as_str());
+    let declared_name = version_data
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim);
     let declared_version = version_data.get("version").and_then(|v| v.as_str());
-    if declared_name != Some(target.name.as_str()) {
+    // npm names are lowercase by construction; a legacy mixed-case name is
+    // compared case-insensitively, as the tarball identity check of the npm
+    // proxy does (#3003).
+    if !declared_name.is_some_and(|name| name.eq_ignore_ascii_case(&target.name)) {
         return Err(format!(
             "npm tarball package.json names package {:?}, but the upload path names {:?}",
             declared_name.unwrap_or(""),
             target.name
         ));
     }
-    if declared_version != Some(target.version.as_str()) {
+    if declared_version.map(clean_npm_version) != Some(clean_npm_version(&target.version)) {
         return Err(format!(
             "npm tarball package.json declares version {:?}, but the upload path names {:?}",
             declared_version.unwrap_or(""),
             target.version
         ));
     }
+    // The version document carries the identity npm publishes it under (the
+    // path's), not a `v`-prefixed or mixed-case spelling from the file.
+    let mut version_data = version_data;
+    if let Some(doc) = version_data.as_object_mut() {
+        doc.insert("name".to_string(), target.name.clone().into());
+        doc.insert("version".to_string(), target.version.clone().into());
+    }
     Ok(StagedNpm {
         package_name: target.name.clone(),
         version: target.version.clone(),
         version_data,
     })
+}
+
+/// The tarball's root `package.json`: `package/package.json` as `npm pack`
+/// writes it, or the same file under another top-level directory. A nested
+/// one (a bundled dependency's, or a `dist/cjs/package.json` type marker)
+/// does not describe the package.
+fn is_root_package_json(path: &std::path::Path) -> bool {
+    let mut components = path
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir));
+    matches!(
+        (components.next(), components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), Some(std::path::Component::Normal(file)), None)
+            if file == "package.json"
+    )
+}
+
+/// A version as npm normalizes it when it publishes (`semver.clean`):
+/// surrounding whitespace, a leading `=` or `v`, and build metadata dropped.
+/// The tarball keeps the `package.json` as written, the path carries the
+/// published version.
+fn clean_npm_version(version: &str) -> &str {
+    let version = version
+        .trim()
+        .trim_start_matches(['=', 'v', 'V'])
+        .trim_start();
+    version.split('+').next().unwrap_or(version)
 }
 
 /// The PyPI identity gate and content analysis the native upload runs: the
@@ -1266,6 +1307,79 @@ mod tests {
     }
 
     #[test]
+    fn npm_identity_helpers_1846() {
+        use std::path::Path;
+        assert!(is_root_package_json(Path::new("package/package.json")));
+        assert!(is_root_package_json(Path::new("./package/package.json")));
+        assert!(is_root_package_json(Path::new("my-lib-1.0.0/package.json")));
+        assert!(!is_root_package_json(Path::new("package.json")));
+        assert!(!is_root_package_json(Path::new(
+            "package/node_modules/dep/package.json"
+        )));
+        assert!(!is_root_package_json(Path::new(
+            "package/dist/cjs/package.json"
+        )));
+        assert_eq!(clean_npm_version("1.2.3"), "1.2.3");
+        assert_eq!(clean_npm_version(" v1.2.3 "), "1.2.3");
+        assert_eq!(clean_npm_version("=1.2.3"), "1.2.3");
+        assert_eq!(clean_npm_version("1.2.3+build.7"), "1.2.3");
+        assert_eq!(clean_npm_version("1.2.3-beta.1"), "1.2.3-beta.1");
+    }
+
+    /// #1846: a legitimate tarball is not refused for what npm itself
+    /// accepts: a bundled dependency's `package.json` ahead of the root one in
+    /// tar order, a `v`-prefixed version in `package.json`, a mixed-case
+    /// name. And an upload under the registry URL layout `{pkg}/-/{file}`
+    /// keeps the generic behaviour instead of a 400.
+    #[tokio::test]
+    async fn chunked_npm_tarballs_npm_accepts_are_not_refused_1846() {
+        let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let root = serde_json::json!({ "name": "Bundler-Pkg", "version": "v3.0.0" }).to_string();
+        let nested = serde_json::json!({ "name": "dep", "version": "9.9.9" }).to_string();
+        let tarball = tgz(&[
+            ("package/node_modules/dep/package.json", nested.as_bytes()),
+            ("package/dist/cjs/package.json", br#"{"type":"commonjs"}"#),
+            ("package/package.json", root.as_bytes()),
+        ]);
+        let path = "bundler-pkg/3.0.0/bundler-pkg-3.0.0.tgz";
+        let (status, body) = f
+            .chunked_upload(path, &tarball, serde_json::json!({}), false)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (_, name, version, _) = row(&f, path).await;
+        assert_eq!(name, "bundler-pkg");
+        assert_eq!(version.as_deref(), Some("3.0.0"));
+        let (status, packument) = body_text(
+            f.router_with_auth(crate::api::handlers::npm::router()),
+            format!("/{}/bundler-pkg", f.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "packument: {packument}");
+        let doc: serde_json::Value = serde_json::from_str(&packument).unwrap();
+        assert_eq!(doc["versions"]["3.0.0"]["version"], "3.0.0", "{packument}");
+        assert_eq!(
+            doc["versions"]["3.0.0"]["name"], "bundler-pkg",
+            "{packument}"
+        );
+
+        let dash = "dash-pkg/-/dash-pkg-1.0.0.tgz";
+        let (status, body) = f
+            .chunked_upload(
+                dash,
+                &npm_tgz("dash-pkg", "1.0.0"),
+                serde_json::json!({}),
+                false,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (_, name, ..) = row(&f, dash).await;
+        assert_eq!(name, "dash-pkg-1.0.0.tgz", "generic row, as before");
+        f.teardown().await;
+    }
+
+    #[test]
     fn native_target_table_1846() {
         use RepositoryFormat as F;
         let t = |f: &F, p: &str| native_target(f, p).map(|t| (t.name, t.version, t.input));
@@ -1284,6 +1398,9 @@ mod tests {
             Some(("@scope/pkg".into(), "1.2.3".into(), FinalizeInput::Stream))
         );
         assert_eq!(t(&F::Npm, "pkg/1.2.3/README.md"), None);
+        // The registry URL layout names no version: generic, as before.
+        assert_eq!(t(&F::Npm, "pkg/-/pkg-1.2.3.tgz"), None);
+        assert_eq!(t(&F::Npm, "@scope/pkg/-/pkg-1.2.3.tgz"), None);
         assert_eq!(
             t(&F::Pypi, "anything/My_Pkg-1.0-py3-none-any.whl"),
             Some(("my-pkg".into(), "1.0".into(), FinalizeInput::LocalFile))

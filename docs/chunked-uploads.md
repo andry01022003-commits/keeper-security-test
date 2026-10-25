@@ -18,7 +18,7 @@ nothing is stored; the session is failed.
 | Format | Paths indexed | What the completion derives | Index it appears in |
 |---|---|---|---|
 | Maven, Gradle | any GAV path except checksum sidecars and `maven-metadata.xml` | name = artifactId, version from the path; for a `.pom`, the POM's name, description, URL and dependencies | generated `maven-metadata.xml`, grouped `groupId:artifactId` listings |
-| npm | `{package}/{version}/{file}.tgz` (scoped: `@scope/name/...`) | the tarball's `package.json`, which must name the same package and version as the path | the packument (`GET /npm/{repo}/{package}`), with `package.json` as the version document |
+| npm | `{package}/{version}/{file}.tgz` (scoped: `@scope/name/...`); the registry URL layout `{package}/-/{file}.tgz` stays generic | the tarball's root `package.json`, which must name the same package and version as the path (compared as npm normalizes them: case-insensitive name, version without a leading `v` or build metadata) | the packument (`GET /npm/{repo}/{package}`), with `package.json` as the version document |
 | PyPI | a wheel or sdist file name (`name-version-...whl`, `name-version.tar.gz`) | the archive's `METADATA` or `PKG-INFO`, which must name the same project and version as the file name, plus the content analysis twine uploads get | `/simple/{project}/` with `data-requires-python` |
 | RPM | `name-version-release.arch.rpm` | the header metadata, install scriptlets, catalog entry under the NEVRA name | `repodata/primary.xml.gz` |
 | Incus, LXC | `{product}/{version}/{file}` | image metadata (arch, os, release) | `streams/v1/images.json` |
@@ -31,6 +31,10 @@ from the session or the path.
 A trusted replication session (an administrator or service account sending the
 replication header with source metadata) keeps the metadata the source
 instance sent instead.
+
+Like the native routes, the completion applies the repository's upload
+quarantine hold (when enabled) and its storage quota; only a trusted
+replication session is exempt from the quota.
 
 The artifact keeps the content-addressed storage key every chunked upload
 uses. Format download routes read the key from the artifact row, so artifacts
@@ -59,3 +63,10 @@ respond-async`, and its body is the session status. Poll that location:
 | `in_progress` | a retryable failure released the lease (storage or database briefly unavailable, identical content being collected by storage GC); repeat the completion request |
 
 Without the header the completion answers in the request, as before.
+
+The background commit runs on the replica that accepted the request. It does
+not survive a restart of that replica: the session then stays `committing`
+until its completion lease lapses (six hours after the last renewal), after
+which the same completion request can be sent again; the staged chunks are
+kept until then. A `Prefer` header without `respond-async` (or with an
+unrecognised preference) is ignored and the completion answers in the request.

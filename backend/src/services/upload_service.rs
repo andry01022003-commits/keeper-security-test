@@ -174,13 +174,13 @@ pub fn staged_chunk_key(session_id: Uuid, chunk_index: i32) -> String {
     format!("{}/{chunk_index:08}", staging_prefix(session_id))
 }
 
+/// Content type a session records when its creator names none.
+pub const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
 /// Storage key of the single object a streamed completion assembles the staged
 /// chunks into (#3916). It lives in the session's staging namespace, distinct
 /// from every [`staged_chunk_key`], so the normal purge (and its reaper
 /// backstop) reclaims it along with the chunks.
-/// Content type a session records when its creator names none.
-pub const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
-
 pub fn staged_assembly_key(session_id: Uuid) -> String {
     format!("{}/assembled", staging_prefix(session_id))
 }
