@@ -23,6 +23,9 @@ index documents from the catalog on every request (#4172).
   when it matches; concurrent requests for a new revision share one render.
   `repodata.json` is unchanged from 1.11; since #4175 `.zst` and `.bz2`
   decompress to exactly those bytes (1.11 compressed a compact rendering).
+  The pretty document is about 35 % larger uncompressed; compressed, `.zst`
+  grows about 4 % and `.bz2` under 1 % (measured on 30,000 and 387,000
+  conda-forge noarch records).
 - **The last N `repodata.json` revisions and a JLAP** (#4175), see
   [JLAP](#jlap-incremental-repodata) below.
 
