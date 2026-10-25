@@ -293,7 +293,13 @@ async fn create_session(
     // and drive one DB row per chunk. Skipped for peer replication so artifacts
     // that legitimately predate a quota change can still replicate; the
     // `max_upload_size` cap inside `create_session` still applies in that case.
-    if !is_replication {
+    // Only a TRUSTED replication session (admin or service account) is
+    // exempt: the replication header alone is client-set.
+    if !super::repositories::replication_exemption_trusted(
+        is_replication,
+        auth.is_admin,
+        auth.is_service_account,
+    ) {
         let denied_by = state
             .create_repository_service()
             .quota_preflight(repo_id, req.total_size)
@@ -886,7 +892,9 @@ async fn complete_session_commit(
         Ok(tx) => tx,
         Err(e) => return Err(release_after_precommit_failure(&state.db, &session, e).await),
     };
-    if !is_replication_request {
+    // Only a TRUSTED replication session keeps the exemption: the replication
+    // header alone is client-set.
+    if !replication_trusted {
         let admission =
             match crate::services::repository_service::RepositoryService::new(state.db.clone())
                 .check_quota_locked(
@@ -979,6 +987,17 @@ async fn complete_session_commit(
         .await;
         return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
+
+    // The upload-time quarantine hold every native upload route applies
+    // (`finalize_upload`, Maven, npm), so an artifact pushed through the
+    // chunked flow is held exactly as one pushed through its format's own
+    // route. Chunked uploads only reach hosted repositories.
+    crate::services::quarantine_service::apply_upload_hold_hosted(
+        &state.db,
+        session.repository_id,
+        artifact_id,
+    )
+    .await;
 
     // A natively finalized format records the document derived from the
     // bytes below; a client-supplied one is not written first, so none of its
@@ -5947,5 +5966,139 @@ mod tests {
             .execute(&f.pool)
             .await;
         f.teardown().await;
+    }
+
+    /// Create a session for `payload` at `path` in the fixture repository as
+    /// `auth`, optionally with the replication header. Returns the status and
+    /// the session id (when created).
+    async fn create_session_as(
+        f: &tdh::Fixture,
+        auth: &AuthExtension,
+        path: &str,
+        payload: &[u8],
+        replication: bool,
+    ) -> (StatusCode, Option<String>) {
+        use sha2::{Digest, Sha256};
+        let body = serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": path,
+            "total_size": payload.len() as i64,
+            "checksum_sha256": hex::encode(Sha256::digest(payload)),
+        });
+        let mut req = tdh::post(
+            "/".to_string(),
+            "application/json",
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        );
+        if replication {
+            req.headers_mut().insert(
+                "x-artifact-keeper-replication",
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
+        let (status, resp) =
+            tdh::send(upload_router_with_auth(f.state.clone(), auth.clone()), req).await;
+        let id = serde_json::from_slice::<serde_json::Value>(&resp)
+            .ok()
+            .and_then(|v| v["session_id"].as_str().map(str::to_string));
+        (status, id)
+    }
+
+    /// The replication header alone does not exempt a chunked upload from the
+    /// repository quota: only a trusted replication session (an administrator
+    /// or service account) keeps that exemption, at session create and at the
+    /// locked admission on completion.
+    #[tokio::test]
+    async fn only_trusted_replication_skips_the_chunked_quota() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let user = tdh::make_auth(f.user_id, &f.username);
+        let payload = b"bytes over the repository quota";
+
+        // Completion: the session was created under the quota; the quota then
+        // shrinks, and the completion carries the replication header.
+        let (status, session) =
+            create_session_as(&f, &user, "quota/late.bin", payload, false).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let session = session.unwrap();
+        let chunk = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .body(axum::body::Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, _) = tdh::send(
+            upload_router_with_auth(f.state.clone(), user.clone()),
+            chunk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        sqlx::query("UPDATE repositories SET quota_bytes = 1 WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let mut complete = complete_req(session.parse().unwrap());
+        complete.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(
+            upload_router_with_auth(f.state.clone(), user.clone()),
+            complete,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "an untrusted replication header must not skip the locked quota admission: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Create: refused for the untrusted caller, admitted for an admin.
+        let (status, _) = create_session_as(&f, &user, "quota/early.bin", payload, true).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an untrusted replication header must not skip the create-time quota check"
+        );
+        let admin = tdh::admin_auth(f.user_id, &f.username);
+        let (status, _) = create_session_as(&f, &admin, "quota/peer.bin", payload, true).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "trusted replication keeps its exemption"
+        );
+        f.teardown().await;
+    }
+
+    /// A chunked upload into a repository with the upload quarantine enabled
+    /// is held, as an upload through any native route is.
+    #[tokio::test]
+    async fn chunked_upload_gets_the_upload_quarantine_hold() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::enable_proxy_quarantine(&f.pool, f.repo_id, 60).await;
+        let path = "held/thing-1.0.bin";
+        let (status, body) = f
+            .chunked_upload(path, b"bytes to hold", serde_json::json!({}), false)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let held: Option<String> = sqlx::query_scalar(
+            "SELECT quarantine_status FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        crate::services::quarantine_service::invalidate_config_cache(f.repo_id);
+        f.teardown().await;
+        assert_eq!(held.as_deref(), Some("quarantined"));
     }
 }
