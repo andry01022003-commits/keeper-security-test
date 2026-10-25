@@ -44,10 +44,17 @@ of its POM (`g/a/v/a-v.pom`):
 
 The date is read from the proxy cache entry when the POM is already cached
 (no upstream request), else from one upstream read of the POM, and is kept in
-memory per repository for an hour. A version whose POM is missing or carries
-no parseable `Last-Modified` has no publish time and is withheld (the same
-rule every format follows). If your upstream sends no `Last-Modified`, use
-`first_seen`.
+memory per repository and upstream for a day. A version whose POM carries
+no parseable `Last-Modified` has no publish time and is withheld with the
+`451` (the same rule every format follows). If your upstream sends no
+`Last-Modified`, use `first_seen`.
+
+A version whose POM the upstream does not have (`404` or `410`) answers a
+plain `404` and records no review, as an ungated Remote would: nothing is
+served either way, and a resolver that tries several repositories in turn
+moves on to the next one. When the upstream cannot be read to date a version
+(a `5xx`, a timeout), the download answers `503 age_gate_unavailable` (fail
+closed, retryable) and records no review.
 
 Not used, and why:
 

@@ -58,18 +58,21 @@ pub struct MavenGateTarget {
     pub group_id: String,
     pub artifact_id: String,
     pub version: String,
+    /// The version directory exactly as the request spelled it (normalized
+    /// as the proxy cache keys it). The POM that dates the version is read
+    /// from this directory, never from a path rebuilt out of `group_id`: a
+    /// request whose group segments contain a `.` would otherwise fetch its
+    /// bytes from one upstream directory and be dated by another's POM.
+    pub version_dir: String,
 }
 
 impl MavenGateTarget {
-    /// Repository path of this version's POM, whose `Last-Modified` dates it.
+    /// Repository path of this version's POM, whose `Last-Modified` dates it:
+    /// the POM in the same upstream directory the requested file comes from.
     pub fn pom_path(&self) -> String {
         format!(
-            "{}/{}/{}/{}-{}.pom",
-            self.group_id.replace('.', "/"),
-            self.artifact_id,
-            self.version,
-            self.artifact_id,
-            self.version
+            "{}/{}-{}.pom",
+            self.version_dir, self.artifact_id, self.version
         )
     }
 }
@@ -102,11 +105,13 @@ pub fn gate_target(path: &str) -> Option<MavenGateTarget> {
     if coords.version.ends_with("-SNAPSHOT") {
         return None;
     }
+    let (version_dir, _) = base.rsplit_once('/')?;
     Some(MavenGateTarget {
         package: format!("{}:{}", coords.group_id, coords.artifact_id),
         group_id: coords.group_id,
         artifact_id: coords.artifact_id,
         version: coords.version,
+        version_dir: version_dir.to_string(),
     })
 }
 
@@ -126,36 +131,36 @@ pub fn parse_last_updated(value: &str) -> Option<DateTime<Utc>> {
 }
 
 /// Process-local memo of resolved publish times, keyed by (repository,
-/// package, version). A released Maven version's POM never changes, so its
-/// date is stable; the bound and TTL only cap memory and pick up an upstream
-/// repoint (the cache key includes the repository, and the proxy cache entry
-/// the date was read from is per repository too).
+/// upstream base URL, POM path). A released Maven version's POM never
+/// changes, so its date is stable; the key carries the upstream so a repointed
+/// Remote never reuses a date read from its previous upstream, and the bound
+/// and TTL only cap memory.
 static PUBLISH_TIMES: Lazy<MokaCache<(Uuid, String, String), DateTime<Utc>>> = Lazy::new(|| {
     MokaCache::builder()
         .max_capacity(100_000)
-        .time_to_live(Duration::from_secs(3600))
+        .time_to_live(Duration::from_secs(24 * 3600))
         .build()
 });
 
 pub async fn memo_publish_time(
     repo_id: Uuid,
-    package: &str,
-    version: &str,
+    upstream_url: &str,
+    target: &MavenGateTarget,
 ) -> Option<DateTime<Utc>> {
     PUBLISH_TIMES
-        .get(&(repo_id, package.to_string(), version.to_string()))
+        .get(&(repo_id, upstream_url.to_string(), target.pom_path()))
         .await
 }
 
 pub async fn remember_publish_time(
     repo_id: Uuid,
-    package: &str,
-    version: &str,
+    upstream_url: &str,
+    target: &MavenGateTarget,
     published: DateTime<Utc>,
 ) {
     PUBLISH_TIMES
         .insert(
-            (repo_id, package.to_string(), version.to_string()),
+            (repo_id, upstream_url.to_string(), target.pom_path()),
             published,
         )
         .await;
@@ -163,10 +168,11 @@ pub async fn remember_publish_time(
 
 /// Most POMs one listing will fetch to date its versions. A
 /// `groupId:artifactId` updated inside the gate window with more undated
-/// versions than this has the oldest ones (by Maven version order) withheld
-/// from that listing until they are dated; downloads still decide each
-/// version on its own POM. Every fetched date is cached, so the next listing
-/// continues where this one stopped.
+/// versions than this has the oldest undated ones (by Maven version order)
+/// withheld from that listing until they are dated; downloads still decide
+/// each version on its own POM. Already dated versions cost no probe and
+/// every fetched date is remembered, so the next listing probes the next
+/// undated versions and continues where this one stopped.
 pub const LISTING_MAX_POM_PROBES: usize = 64;
 
 /// How many POMs a listing fetches at once.
@@ -264,6 +270,7 @@ mod tests {
         assert_eq!(jar.package, "com.example:widget");
         assert_eq!(jar.version, "2.0.0");
         assert_eq!(jar.pom_path(), "com/example/widget/2.0.0/widget-2.0.0.pom");
+        assert_eq!(jar.version_dir, "com/example/widget/2.0.0");
         for p in [
             "com/example/widget/2.0.0/widget-2.0.0.pom",
             "com/example/widget/2.0.0/widget-2.0.0.jar.sha1",
@@ -276,6 +283,16 @@ mod tests {
         ] {
             assert_eq!(gate_target(p), Some(jar.clone()), "{p}");
         }
+    }
+
+    #[test]
+    fn gate_target_dates_by_the_pom_in_the_requested_directory() {
+        // A `.` inside a group segment names a different upstream directory
+        // than the dotted groupId rebuilt with `/`; the POM must come from the
+        // directory the bytes come from.
+        let t = gate_target("com.example/widget/2.0.0/widget-2.0.0.jar").unwrap();
+        assert_eq!(t.package, "com.example:widget");
+        assert_eq!(t.pom_path(), "com.example/widget/2.0.0/widget-2.0.0.pom");
     }
 
     #[test]
