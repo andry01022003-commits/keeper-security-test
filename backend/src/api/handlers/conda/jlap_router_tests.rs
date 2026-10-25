@@ -245,3 +245,102 @@ async fn a_withdrawal_reaches_the_jlap_tail_by_range_request_4175() {
     .await;
     assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
 }
+
+/// #4175: every write that changes what `repodata.json` lists (an admin
+/// hold, its release, a soft delete, a hard delete, a reject, an upload)
+/// reaches the JLAP tail at the same moment: after each one, applying the
+/// JLAP's patches to the document a client held before gives exactly the
+/// `repodata.json` served now, and the package is listed in one exactly when
+/// it is listed in the other. The writes are plain catalog statements, as
+/// the paths outside the conda handlers make them.
+#[tokio::test]
+async fn every_visibility_change_reaches_the_jlap_tail_4175() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    upload(&fx, "noarch", "jv-base", "1.0").await;
+    let held = upload(&fx, "noarch", "jv-held", "1.0").await;
+    let gone = upload(&fx, "noarch", "jv-gone", "1.0").await;
+    let erased = upload(&fx, "noarch", "jv-erased", "1.0").await;
+    let path = |f: &str| format!("noarch/{f}");
+    let steps: Vec<(&str, &'static str, String, bool)> = vec![
+        (
+            "admin hold",
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL \
+              WHERE repository_id = $1 AND path = $2",
+            held.clone(),
+            false,
+        ),
+        (
+            "release",
+            "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL \
+              WHERE repository_id = $1 AND path = $2",
+            held.clone(),
+            true,
+        ),
+        (
+            "soft delete",
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+            gone.clone(),
+            false,
+        ),
+        (
+            "hard delete",
+            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2",
+            erased.clone(),
+            false,
+        ),
+        (
+            "reject",
+            "UPDATE artifacts SET quarantine_status = 'rejected' \
+              WHERE repository_id = $1 AND path = $2",
+            held.clone(),
+            false,
+        ),
+    ];
+    let (_, mut have, _) = get(&fx, "noarch/repodata.json").await;
+    for (what, sql, file, listed) in steps {
+        sqlx::query(sql)
+            .bind(fx.repo_id)
+            .bind(path(&file))
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        // The JLAP first, as a client refreshing from it would.
+        let (status, jlap, _) = get(&fx, "noarch/repodata.jlap").await;
+        assert_eq!(status, StatusCode::OK, "{what}");
+        let read = read_jlap(&jlap, 0, &[]);
+        let (patches, want) = patches_and_latest(&read, true);
+        let (_, now, _) = get(&fx, "noarch/repodata.json").await;
+        assert_eq!(
+            want,
+            blake2b_256(&now),
+            "{what}: the footer names the served document"
+        );
+        let mut doc: Value = serde_json::from_slice(&have).unwrap();
+        for ops in patches_from(&patches, &blake2b_256(&have), &want)
+            .unwrap_or_else(|| panic!("{what}: no patch path from the held document"))
+        {
+            apply(&mut doc, &ops);
+        }
+        assert_eq!(
+            doc,
+            serde_json::from_slice::<Value>(&now).unwrap(),
+            "{what}: the patched document equals repodata.json"
+        );
+        assert_eq!(
+            doc["packages"].get(&file).is_some(),
+            listed,
+            "{what}: {file} listed in the JLAP tail"
+        );
+        have = now;
+    }
+    let added = upload(&fx, "noarch", "jv-late", "1.0").await;
+    let (_, jlap, _) = get(&fx, "noarch/repodata.jlap").await;
+    let (patches, want) = patches_and_latest(&read_jlap(&jlap, 0, &[]), true);
+    let mut doc: Value = serde_json::from_slice(&have).unwrap();
+    for ops in patches_from(&patches, &blake2b_256(&have), &want).unwrap() {
+        apply(&mut doc, &ops);
+    }
+    assert!(doc["packages"].get(&added).is_some(), "upload");
+}
