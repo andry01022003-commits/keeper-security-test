@@ -6447,7 +6447,19 @@ pub async fn delete_repository(
     let auth = require_auth(auth)?;
     auth.require_scope("delete:repositories")?;
     let service = state.create_repository_service();
-    let repo = service.get_by_key(&key).await?;
+    // #4311: the key a delete job renamed away still names its repository
+    // here, so a repeated delete returns the job in flight (or, after a
+    // failed job, starts a new one) instead of answering 404.
+    let repo = match service.get_by_key(&key).await {
+        Ok(repo) => repo,
+        Err(AppError::NotFound(message)) => {
+            match delete_job::repository_awaiting_delete(&state.db, &key).await? {
+                Some(repo_id) => service.get_by_id(repo_id).await?,
+                None => return Err(AppError::NotFound(message)),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     require_repo_access(&auth, repo.id)?;
 
     // Fine-grained permission check: non-admins need "admin" on the target
@@ -6478,10 +6490,12 @@ pub async fn delete_repository(
                 .user(auth.user_id)
                 .resource(repo.id)
                 .actor_name(auth.username.clone())
-                .resource_name(repo.key.clone())
+                // The key the repository had when its delete was first
+                // requested, also for a re-delete after a failed job.
+                .resource_name(job.repository_key.clone())
                 .details_typed(audit_details::RepositoryDetails {
                     actor_id: auth.user_id,
-                    key: repo.key.clone(),
+                    key: job.repository_key.clone(),
                     is_public: repo.is_public,
                     format: Some(derive_format_key(&repo.format)),
                     // The authoritative three-state value. Deriving this from the

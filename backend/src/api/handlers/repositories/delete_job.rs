@@ -53,9 +53,14 @@ const MAX_ATTEMPTS: i32 = 5;
 /// How often each replica looks for pending jobs and lapsed claims.
 const RESUME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Prefix of the key a repository is renamed to while its delete job runs.
+/// `~` is not a legal character of a repository key
+/// (`validate_repository_key`), so no repository can be created under it.
+const DELETING_PREFIX: &str = "~deleting~";
+
 /// The key a repository is renamed to while its delete job runs.
 pub(crate) fn deleting_key(job_id: Uuid) -> String {
-    format!("~deleting~{job_id}")
+    format!("{DELETING_PREFIX}{job_id}")
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -203,6 +208,22 @@ pub(crate) async fn enqueue(
     {
         return Ok((existing, false));
     }
+    // A repository a failed job left renamed keeps the key it had when its
+    // delete was first requested, so the new job still purges that key's
+    // proxy-cache subtree and still answers a `DELETE` of that key.
+    let original_key = if repo.key.starts_with(DELETING_PREFIX) {
+        sqlx::query_scalar::<_, String>(
+            "SELECT repository_key FROM repository_delete_jobs \
+              WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .unwrap_or_else(|| repo.key.clone())
+    } else {
+        repo.key.clone()
+    };
     let insert_sql = format!(
         "INSERT INTO repository_delete_jobs \
              (repository_id, repository_key, storage_backend, storage_path, created_by) \
@@ -212,7 +233,7 @@ pub(crate) async fn enqueue(
     let location = repo.storage_location();
     let job = sqlx::query_as::<_, RepositoryDeleteJobRow>(sqlx::AssertSqlSafe(&*insert_sql))
         .bind(repo.id)
-        .bind(&repo.key)
+        .bind(&original_key)
         .bind(&location.backend)
         .bind(&location.path)
         .bind(requested_by)
@@ -225,8 +246,39 @@ pub(crate) async fn enqueue(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+    // Virtual repositories resolve their members by id, not by key: drop the
+    // repository from every virtual now, as the synchronous delete's cascade
+    // did, so no virtual keeps serving the artifacts the job has not deleted
+    // yet.
+    sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+        .bind(repo.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
     Ok((job, true))
+}
+
+/// The repository a delete job is still working on, or that a failed job
+/// left renamed, under the key it had when its delete was requested. A
+/// repeated `DELETE` of that key then returns the job in flight, or starts a
+/// new one after a failure, instead of answering 404 (#4311). `None` when no
+/// such repository remains (the job completed, or none was ever requested).
+pub(crate) async fn repository_awaiting_delete(
+    db: &PgPool,
+    original_key: &str,
+) -> Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "SELECT j.repository_id FROM repository_delete_jobs j \
+           JOIN repositories r ON r.id = j.repository_id \
+          WHERE j.repository_key = $1 AND r.key = $2 || j.id::text \
+          ORDER BY j.created_at DESC LIMIT 1",
+    )
+    .bind(original_key)
+    .bind(DELETING_PREFIX)
+    .fetch_optional(db)
+    .await
+    .map_err(db_err)
 }
 
 /// Load one job.
@@ -512,6 +564,11 @@ async fn run(
 async fn collect(state: &SharedState, job: &ClaimedJob) -> std::result::Result<(), Stop> {
     let repo_id = job.row.repository_id;
     let location = job.row.location();
+    // The original key is free from the moment the delete was accepted, so a
+    // repository created under it must not find this one's cached upstream
+    // content (#2047). Purge the subtree first, not only at the end of the
+    // job; `cleanup` repeats it for anything cached meanwhile.
+    purge_proxy_cache(state, job).await;
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repositories WHERE id = $1)")
             .bind(repo_id)
@@ -700,6 +757,22 @@ async fn cleanup(state: &SharedState, job: &ClaimedJob) {
         temp_keys,
     )
     .await;
+    purge_proxy_cache(state, job).await;
+}
+
+/// Purge the proxy-cache subtree of the repository's original key, unless a
+/// repository has been created under that key since: what is cached there is
+/// then that repository's own. Best-effort, like the synchronous delete was.
+async fn purge_proxy_cache(state: &SharedState, job: &ClaimedJob) {
+    let key_reused: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repositories WHERE key = $1)")
+            .bind(&job.row.repository_key)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(true);
+    if key_reused {
+        return;
+    }
     if let Some(proxy) = state.proxy_service.as_ref() {
         match proxy.purge_repo_cache(&job.row.repository_key).await {
             Ok(purged) if purged > 0 => tracing::info!(
@@ -1093,6 +1166,267 @@ mod tests {
             .bind(job.id)
             .execute(&fx.pool)
             .await;
+        fx.teardown().await;
+    }
+
+    async fn delete_key(fx: &tdh::Fixture, key: &str) -> (StatusCode, serde_json::Value) {
+        let app = tdh::router_with_auth(super::super::router(), fx.state.clone(), admin(fx));
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{key}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// #4311: a repeated `DELETE` of the key the repository had answers with
+    /// the job in flight instead of 404; after a failed job it starts a new
+    /// one that keeps the original key (whose proxy-cache subtree it purges
+    /// and under which it is audited); once the job completed the key is
+    /// simply gone.
+    #[tokio::test]
+    async fn a_repeated_delete_of_the_original_key_returns_or_restarts_its_job_4311() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        seed(&fx, 3, 0).await;
+        let repo = fx
+            .state
+            .create_repository_service()
+            .get_by_id(fx.repo_id)
+            .await
+            .unwrap();
+        // Recorded but not started, as if its worker had not run yet.
+        let (first, _) = enqueue(&fx.pool, &repo, fx.user_id).await.unwrap();
+
+        let (status, again) = delete_key(&fx, &fx.repo_key).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+        assert_eq!(again["id"], first.id.to_string(), "the job in flight");
+
+        sqlx::query(
+            "UPDATE repository_delete_jobs SET status = 'failed', finished_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(first.id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let (status, restarted) = delete_key(&fx, &fx.repo_key).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{restarted}");
+        let second: Uuid = restarted["id"].as_str().unwrap().parse().unwrap();
+        assert_ne!(second, first.id, "a failed job is followed by a new one");
+        assert_eq!(restarted["repository_key"], fx.repo_key);
+        let finished = run_to_completion(&fx.state, second).await;
+        assert_eq!(finished.status, "completed", "{finished:?}");
+        assert_eq!(finished.repository_key, fx.repo_key);
+
+        let (status, _) = delete_key(&fx, &fx.repo_key).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = ANY($1)")
+            .bind(vec![first.id, second])
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+    }
+
+    /// #4311: the job's own purge (not only the per-key helper) keeps an
+    /// object that an identical upload into another repository on the same
+    /// storage deduplicated against after the job deleted the rows and
+    /// journaled the key.
+    #[tokio::test]
+    async fn the_job_purge_keeps_an_object_another_repository_took_meanwhile_4311() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_a, _, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _, dir_b) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = ANY($1)",
+        )
+        .bind(vec![repo_a, repo_b])
+        .execute(&pool)
+        .await
+        .unwrap();
+        let location = StorageLocation {
+            backend: "s3".to_string(),
+            path: String::new(),
+        };
+        let storage = state.storage_for_repo(&location).unwrap();
+        let service = state.create_artifact_service(storage);
+        let body = bytes::Bytes::from(format!("shared later {}", Uuid::new_v4()));
+        let own = bytes::Bytes::from(format!("only in A {}", Uuid::new_v4()));
+        let key = service
+            .upload(
+                repo_a,
+                "a.bin",
+                "a.bin",
+                None,
+                "application/octet-stream",
+                body.clone(),
+                Some(user_id),
+            )
+            .await
+            .unwrap()
+            .storage_key;
+        let own_key = service
+            .upload(
+                repo_a,
+                "own.bin",
+                "own.bin",
+                None,
+                "application/octet-stream",
+                own,
+                Some(user_id),
+            )
+            .await
+            .unwrap()
+            .storage_key;
+
+        let repo = state
+            .create_repository_service()
+            .get_by_id(repo_a)
+            .await
+            .unwrap();
+        let (job, _) = enqueue(&pool, &repo, user_id).await.unwrap();
+        let claimed = claim(&pool, Some(job.id)).await.unwrap().expect("claimed");
+        let lost = CancellationToken::new();
+        assert!(collect(&state, &claimed).await.is_ok());
+        assert!(delete_rows(&state, &claimed, &lost).await.is_ok());
+
+        let b = service
+            .upload(
+                repo_b,
+                "b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                body.clone(),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(b.storage_key, key, "B deduplicates against A's object");
+
+        assert!(purge(&state, &claimed, &lost).await.is_ok());
+        finish(&pool, &claimed, "completed", None).await;
+        let (kept, own_left) = {
+            let objects = mem.objects.lock().unwrap();
+            (objects.get(&key).cloned(), objects.contains_key(&own_key))
+        };
+        let downloaded = service.download(repo_b, "b.bin", None, None, None).await;
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = ANY($1)")
+            .bind(vec![key.clone(), own_key.clone()])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_b, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        assert_eq!(
+            kept.as_ref(),
+            Some(&body),
+            "B's object must survive A's purge"
+        );
+        assert!(
+            downloaded.is_ok(),
+            "B's artifact must download: {downloaded:?}"
+        );
+        assert!(!own_left, "an object only A held is purged");
+    }
+
+    /// #4311: a job one replica holds the claim on is not claimed by another
+    /// until that claim lapses.
+    #[tokio::test]
+    async fn a_held_claim_is_not_taken_by_another_replica_4311() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let repo = fx
+            .state
+            .create_repository_service()
+            .get_by_id(fx.repo_id)
+            .await
+            .unwrap();
+        let (job, _) = enqueue(&fx.pool, &repo, fx.user_id).await.unwrap();
+        let held = claim(&fx.pool, Some(job.id)).await.unwrap();
+        assert!(held.is_some(), "the first claim takes the job");
+        assert!(
+            claim(&fx.pool, Some(job.id)).await.unwrap().is_none(),
+            "a held claim is not taken over"
+        );
+        assert!(
+            !run_claimable(&fx.state, Some(job.id)).await.unwrap(),
+            "no second worker runs the job"
+        );
+        sqlx::query(
+            "UPDATE repository_delete_jobs SET claim_expires_at = NOW() - INTERVAL '1 second' \
+             WHERE id = $1",
+        )
+        .bind(job.id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let done = run_to_completion(&fx.state, job.id).await;
+        assert_eq!(done.status, "completed", "{done:?}");
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+    }
+
+    /// #4311: a repository being deleted leaves every virtual repository at
+    /// once, as the synchronous delete's cascade made it leave, so no virtual
+    /// serves the artifacts the job has not deleted yet.
+    #[tokio::test]
+    async fn a_deleting_repository_leaves_its_virtuals_at_once_4311() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (virtual_id, _, virtual_dir) = tdh::create_repo(&fx.pool, "virtual", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let repo = fx
+            .state
+            .create_repository_service()
+            .get_by_id(fx.repo_id)
+            .await
+            .unwrap();
+        let (job, _) = enqueue(&fx.pool, &repo, fx.user_id).await.unwrap();
+        let members: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM virtual_repo_members WHERE member_repo_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(members, 0, "the accepted delete removes the membership");
+        run_to_completion(&fx.state, job.id).await;
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
         fx.teardown().await;
     }
 

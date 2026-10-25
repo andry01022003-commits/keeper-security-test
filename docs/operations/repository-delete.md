@@ -10,9 +10,11 @@ balancer timeout in front of the server.
 The request checks the caller's permission (`delete:repositories` scope and
 the repository `admin` action), records the job, and renames the repository to
 `~deleting~<job id>` in the same transaction. From that moment the original key
-no longer resolves (every format route and API call for it answers 404), the
-repository disappears from `GET /api/v1/repositories`, and a new repository can
-be created under the same key. The answer is `202 Accepted`:
+no longer resolves (every format route and API call for it answers 404, except
+a repeated `DELETE`, below), the repository disappears from
+`GET /api/v1/repositories`, it leaves every virtual repository that included it,
+and a new repository can be created under the same key. The answer is
+`202 Accepted`:
 
 ```json
 {
@@ -33,8 +35,10 @@ be created under the same key. The answer is `202 Accepted`:
 }
 ```
 
-`Location` carries the same status URL. A second `DELETE` of the renamed
-repository while its job runs returns the job in flight. The audit event is
+`Location` carries the same status URL. A second `DELETE`, of the original key
+or of the renamed repository, while its job runs returns the job in flight;
+once the job has completed, the original key answers 404 (or names the new
+repository created under it). The audit event is
 written when the delete is requested; the `repository.deleted` webhook event
 is emitted when the job completes.
 
@@ -78,8 +82,13 @@ reached. A step that fails is retried, up to five runs, then the job is marked
    owns), and deletes the object only if none does. The check runs immediately
    before each delete, so an upload of identical content into another
    repository during the delete keeps its object.
-4. **cleanup**: deletes the OCI upload temp objects and the proxy-cache
+4. **cleanup**: deletes the OCI upload temp objects and, again, the proxy-cache
    subtree of the original key.
+
+The proxy-cache subtree of the original key is purged first, when the job
+starts, so a repository created under the freed key does not find the deleted
+repository's cached upstream content. Neither purge runs once a repository has
+been created under that key: what is cached there is then its own.
 
 A key the job keeps or cannot delete stays recorded in `oci_gc_candidates`;
 the storage GC candidate sweep re-checks it after `BLOB_GC_MIN_AGE_SECS` and
@@ -88,9 +97,12 @@ deletes it once nothing references it.
 ## A failed job
 
 A job marked `failed` leaves the repository renamed to `~deleting~<job id>`,
-with whatever rows the job had not yet deleted. Fix the cause named in
-`error_summary` and delete the repository again under that key; the new job
-resumes the work.
+with whatever rows the job had not yet deleted (the rows already deleted have
+their storage keys recorded in `oci_gc_candidates`). Fix the cause named in
+`error_summary` and delete the repository again, under `~deleting~<job id>` or
+under its original key (while no new repository has taken that key); the new
+job keeps the original key and resumes the
+work, including the purge of the keys already recorded.
 
 ## Rolling upgrades
 
