@@ -23418,6 +23418,17 @@ mod tests {
     /// the second, cached fetch is a `hit`).
     #[tokio::test]
     async fn test_buffered_fetch_traces_phase_span_and_cache_outcome() {
+        // This test installs a process-wide tracing subscriber view for the
+        // duration of the fetch. That is only safe when the test harness owns
+        // the process: under a plain parallel `cargo test` other tests race the
+        // global tracing interest cache and make this permanently red. CI and
+        // `cargo nextest` give every test its own process, so run it there and
+        // skip cleanly for local `cargo test` module runs (#4930).
+        if std::env::var_os("NEXTEST_RUN_ID").is_none() {
+            eprintln!("skipping tracing-span test outside cargo-nextest");
+            return;
+        }
+
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::middleware::request_span::{with_request_span, CACHE_OUTCOME_FIELD};
         use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
