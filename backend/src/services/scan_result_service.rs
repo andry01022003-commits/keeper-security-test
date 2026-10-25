@@ -394,6 +394,23 @@ pub(crate) fn legacy_grade_letter(
     }
 }
 
+/// The repository status stored in `grade_status` (#4336): the coverage's
+/// status, except that a repository is never `unrated` (no letter) while
+/// something in it was assessed. An artifact one scanner cataloged and another
+/// failed on counts as failed in the coverage, and the findings of an earlier
+/// completed scan stay counted after a failed rescan; either way the findings
+/// are real, so the repository is `incomplete` and shows their letter.
+pub(crate) fn repository_grade_status(
+    coverage: &ScoreCoverage,
+    any_artifact_assessed: bool,
+    has_findings: bool,
+) -> GradeStatus {
+    match coverage.grade_status() {
+        GradeStatus::Unrated if any_artifact_assessed || has_findings => GradeStatus::Incomplete,
+        status => status,
+    }
+}
+
 /// The letter stored in `rated_grade` (#4336): the score's letter over the
 /// assessed artifacts, `None` when nothing was assessed.
 pub(crate) fn rated_grade_letter(grade: Grade, status: GradeStatus) -> Option<char> {
@@ -2534,13 +2551,14 @@ impl ScanResultService {
         // An artifact is failed if any latest scan failed, else uncataloged if
         // any latest completed scan cataloged nothing, else cataloged when a
         // latest completed scan assessed it (`partial` counted separately).
-        let (artifact_count, failed_count, uncataloged_count, cataloged_count, partial_count): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = sqlx::query_as(
+        let (
+            artifact_count,
+            failed_count,
+            uncataloged_count,
+            cataloged_count,
+            partial_count,
+            assessed_any_count,
+        ): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
             r#"
             WITH latest AS (
                 SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
@@ -2570,7 +2588,8 @@ impl ScanResultService {
                 COUNT(*) FILTER (WHERE failed),
                 COUNT(*) FILTER (WHERE NOT failed AND uncataloged),
                 COUNT(*) FILTER (WHERE NOT failed AND NOT uncataloged AND cataloged),
-                COUNT(*) FILTER (WHERE NOT failed AND NOT uncataloged AND cataloged AND partial)
+                COUNT(*) FILTER (WHERE NOT failed AND NOT uncataloged AND cataloged AND partial),
+                COUNT(*) FILTER (WHERE cataloged)
             FROM per_artifact
             "#,
         )
@@ -2586,7 +2605,11 @@ impl ScanResultService {
             failed: failed_count,
             uncataloged: uncataloged_count,
         };
-        let status = coverage.grade_status();
+        let status = repository_grade_status(
+            &coverage,
+            assessed_any_count > 0,
+            critical + high + medium + low + acknowledged + total > 0,
+        );
         let rated = rated_grade_letter(grade, status);
         let as_i32 = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
 
@@ -4124,6 +4147,40 @@ mod tests {
     }
 
     #[test]
+    fn assessed_or_found_is_never_unrated_4336() {
+        let failed_only = ScoreCoverage {
+            artifacts: 1,
+            scanned: 1,
+            failed: 1,
+            ..ScoreCoverage::default()
+        };
+        assert_eq!(
+            repository_grade_status(&failed_only, false, false),
+            GradeStatus::Unrated
+        );
+        // One scanner cataloged the artifact, another failed on it.
+        assert_eq!(
+            repository_grade_status(&failed_only, true, false),
+            GradeStatus::Incomplete
+        );
+        // Findings of an earlier completed scan, latest rescan failed.
+        assert_eq!(
+            repository_grade_status(&failed_only, false, true),
+            GradeStatus::Incomplete
+        );
+        let rated = ScoreCoverage {
+            artifacts: 1,
+            scanned: 1,
+            cataloged: 1,
+            ..ScoreCoverage::default()
+        };
+        assert_eq!(
+            repository_grade_status(&rated, true, true),
+            GradeStatus::Rated
+        );
+    }
+
+    #[test]
     fn dashboard_tally_counts_status_and_shown_letter_4336() {
         let now = chrono::Utc::now();
         let row = |grade: &str, score: i32, status: Option<&str>, rated: Option<&str>| {
@@ -5464,6 +5521,74 @@ mod tests {
             cleanup_repo(&pool, only_failed).await;
         }
 
+        /// #4336: `incomplete` and `unrated` never hide a finding. A critical
+        /// finding next to an uncataloged archive, a critical finding on an
+        /// artifact another scanner failed on, and a critical finding whose
+        /// rescan failed all show `incomplete` with the finding's letter.
+        #[tokio::test]
+        async fn a_vulnerable_artifact_is_never_hidden_by_the_status_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let (_, want) = compute_security_score(1, 0, 0, 0);
+            let want = want.as_char().to_string();
+            let critical = [(Severity::Critical, Some("CVE-2026-43361"), "t", "lib")];
+
+            // One critical finding and one archive no scanner could catalog.
+            let repo_a = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_a, "jar").await;
+            seed_scan_4338(&svc, jar, repo_a, "grype", &critical).await;
+            let (archive, _) = insert_test_artifact(&pool, repo_a, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_a, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+            let score = svc.recalculate_score(repo_a).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.critical_count, 1);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_a).await;
+
+            // One artifact: grype found the critical, another scanner failed.
+            let repo_b = insert_test_repo(&pool).await;
+            let (img, _) = insert_test_artifact(&pool, repo_b, "img").await;
+            seed_scan_4338(&svc, img, repo_b, "grype", &critical).await;
+            let f = svc
+                .create_scan_result(img, repo_b, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_b).await.expect("recalculate");
+            assert_eq!(score.critical_count, 1);
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_b).await;
+
+            // One artifact: grype found the critical, the grype rescan failed.
+            let repo_c = insert_test_repo(&pool).await;
+            let (lib, _) = insert_test_artifact(&pool, repo_c, "lib").await;
+            seed_scan_4338(&svc, lib, repo_c, "grype", &critical).await;
+            let f = svc
+                .create_scan_result(lib, repo_c, "grype")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_c).await.expect("recalculate");
+            assert_eq!(
+                score.critical_count, 1,
+                "the earlier completed scan still counts"
+            );
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_c).await;
+        }
+
         /// #4336: for every repository that is `rated`, the letter shown is
         /// exactly the one the pre-#4336 code computed (the legacy `grade`,
         /// which carried no floor for these), over a fixture set of severity
@@ -5489,6 +5614,13 @@ mod tests {
                 (0, 0, 0, 50),
                 (5, 0, 0, 0),
                 (3, 4, 2, 1),
+                // Letter boundaries the mixes above do not hit: 74 (C top),
+                // 49 (D top), 25 (D bottom), 24 (F top), 91 (A).
+                (1, 0, 0, 1),
+                (2, 0, 0, 1),
+                (3, 0, 0, 0),
+                (3, 0, 0, 1),
+                (0, 0, 3, 0),
             ];
             for (i, &(c, h, m, l)) in fixtures.iter().enumerate() {
                 let repo_id = insert_test_repo(&pool).await;

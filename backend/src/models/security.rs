@@ -232,7 +232,9 @@ impl Grade {
 /// * `incomplete`: something was assessed, and something was not, or only
 ///   in part: a failed scan, an uncataloged archive, or a `partial` scan.
 /// * `unrated`: nothing was assessed. A repository with no scans, or whose
-///   every scan failed or cataloged nothing, has no grade letter at all.
+///   every scan failed or cataloged nothing, has no grade letter at all. A
+///   repository with findings is never `unrated`
+///   (`scan_result_service::repository_grade_status`).
 ///
 /// The same three values describe one scan row
 /// ([`scan_grade_status`]). A scanner that could only read part of an

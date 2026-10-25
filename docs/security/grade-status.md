@@ -38,8 +38,8 @@ not applicable) are in `artifacts` but not in `scanned`.
 | `grade_status` | When |
 |---|---|
 | `rated` | At least one artifact assessed, and every scanned artifact fully assessed (`cataloged > 0`, `failed = uncataloged = partial = 0`). |
-| `incomplete` | Something assessed (`cataloged > 0`) and something not, or only in part (`failed`, `uncataloged` or `partial` above zero). The letter covers the assessed artifacts. |
-| `unrated` | Nothing assessed (`cataloged = 0`): no scans at all, or every scan failed or cataloged nothing. No letter. |
+| `incomplete` | Something assessed (`cataloged > 0`) and something not, or only in part (`failed`, `uncataloged` or `partial` above zero). The letter covers the assessed artifacts. Also every repository with findings, or with an artifact some scanner cataloged, that the counts alone would call `unrated`: an artifact one scanner cataloged and another failed on counts as `failed`, and the findings of an earlier completed scan still count after a failed rescan. Findings always come with their letter. |
+| `unrated` | Nothing assessed (`cataloged = 0`, no artifact cataloged by any scanner and no findings): no scans at all, or every scan failed or cataloged nothing. No letter. |
 
 For a `rated` repository the letter is exactly the one earlier releases
 showed. Deleting an artifact recalculates its repository's score, so removing
