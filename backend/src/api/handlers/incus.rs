@@ -1068,7 +1068,8 @@ async fn download_image(
             checksum,
         ),
     ];
-    crate::api::handlers::repositories::ranged_stream_response(
+    // #4323: verified against the advertised `X-Checksum-Sha256`.
+    crate::api::handlers::repositories::ranged_stream_response_advertised(
         range_header,
         size_bytes.max(0) as u64,
         stream,

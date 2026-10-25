@@ -57,6 +57,16 @@ with bounded memory):
   which is verified and then copied server-side to the content-addressed key.
 - OCI/Docker blob uploads, which are staged under `oci-uploads/` on the
   repository's backend.
+- Maven deploys (`PUT /maven/{key}/{path}`: jars, POMs, checksum sidecars,
+  `maven-metadata.xml`) into S3-, GCS- and Azure-backed repositories (#4990).
+  The body streams into a `generic-upload-staging/<uuid>` object on the
+  repository's backend, with SHA-256, SHA-1 and MD5 computed on the way, and
+  is copied server-side to its Maven key once the publish holds its lock; a
+  POM is read back from the staging object for its metadata.
+
+Whether a repository's uploads stage on its backend is decided by the
+backend's native streaming capability (S3, GCS and Azure have it), the same
+capability the chunked completion uses, not by the backend's name.
 
 **Spool one full-size file per in-flight upload:**
 
@@ -71,8 +81,11 @@ with bounded memory):
   path up front and spool only `.rpm` packages.
 - **Chunked upload completion that must assemble locally.** This is the case
   for a filesystem-backed repository, for every backend that has no native
-  streaming upload, and for formats that need the body as a file (`.rpm` in an
-  RPM repository and Incus/Debian native finalize). The staged chunks are
+  streaming upload, and for formats whose finalize reads the body as a file
+  (`.rpm` in an RPM repository, a wheel or sdist in a PyPI repository, and
+  Incus/Debian packages; see `docs/chunked-uploads.md`). A Maven POM and an npm
+  tarball are read from the staged chunks instead and need no local file. The
+  staged chunks are
   reassembled into one file on the replica handling
   `PUT /api/v1/uploads/{id}/complete`, verified, and then written to the
   backend, so each concurrent completion needs the full artifact size. On
@@ -81,7 +94,8 @@ with bounded memory):
 - Incus/LXC image uploads (monolithic and chunked).
 - Git LFS object uploads (`PUT /lfs/{key}/objects/{oid}`), up to `MAX_UPLOAD_SIZE` each.
 - Format-native publish routes that stream to staging: Ansible, Chef, Helm,
-  JetBrains, Maven, NuGet, Pub, PyPI, Swift and Terraform.
+  JetBrains, NuGet, Pub, PyPI, Swift and Terraform, and Maven into a
+  filesystem-backed repository.
 
 Other format-native publish routes (npm, Cargo, Debian, RubyGems and similar)
 read the request body into memory instead of onto disk, bounded by

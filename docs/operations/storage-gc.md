@@ -43,6 +43,50 @@ A key that gained a reference between the two steps (for example a re-upload
 of the same content into another repository) is kept, and its record is
 dropped. That is counted in `ak_storage_gc_deletes_skipped_live_total`.
 
+Uploads honour the same record (#4980). An upload whose content is already
+stored skips the write, and one that writes does so before its row commits, so
+a GC delete could otherwise land between the upload's write (or its check that
+the object exists) and its commit, leaving a live row without its object. The
+transaction that commits an upload's row (generic, native and chunked uploads
+that go through the shared upload service or the chunked completion) therefore
+first takes the key's `oci_gc_candidates` slot and checks that the object is
+stored:
+
+- While GC holds the record as a lease for a delete it is running (it took
+  the record in the last 15 minutes; the `leased_at` column, migration 302),
+  the delete may still land, so the upload waits for it for up to 5 seconds.
+  GC deletes right after its claim, so the wait normally ends quickly. A
+  record a repository delete wrote, which only waits out
+  `BLOB_GC_MIN_AGE_SECS`, is not a lease and does not hold uploads up.
+- If the object is gone, the upload writes it again from the bytes it still
+  holds (the request body, its staged copy, or a body the deduplication left
+  unread) and re-checks. An upload that streamed its body straight to the
+  final key no longer holds it and answers `503` instead. A chunked completion
+  releases its lease and answers `503`; retrying the completion writes the
+  object again from the staged chunks.
+- If the lease outlives the wait, which happens when a GC delete failed less
+  than 15 minutes ago, the upload is answered `503 SERVICE_UNAVAILABLE`
+  ("retry the upload") and commits nothing. A retry after the lease ages out
+  succeeds; the candidate sweep later re-checks the record and keeps the
+  object.
+
+A repository delete hands its objects to the same record and re-checks
+references before each delete (#4311): every storage key the deleted
+repository's rows named is recorded in `oci_gc_candidates` (with the
+repository as `source_repository_id`, so it reads as a waiting candidate, not a
+lease), and the delete job then takes each key's slot as a lease, checks
+whether any other repository on the same storage still references the key, and
+deletes the object only if none does. An upload of identical content into
+another repository that committed before that check keeps the object; one that
+reaches its commit while the lease is fresh waits for the delete to finish and
+writes its bytes again. A key the job keeps, or fails to delete, stays recorded
+for the candidate sweep. See `docs/operations/repository-delete.md`.
+
+The slot is held only for the commit and a HEAD of the object, never across a
+write. Uploads of identical content take the same slot, so their commits run
+one after another (each waiting on a database connection meanwhile). Format handlers that write their own content-addressed rows outside the
+shared upload service are not covered yet.
+
 That re-check consults every reference table, which is wider than the
 soft-deleted-key scan alone. In particular an object that an `artifact_versions`
 row still names is kept: when the newest revision of an artifact in a

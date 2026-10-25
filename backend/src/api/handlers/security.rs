@@ -51,6 +51,8 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Dashboard
         .route("/dashboard", get(get_dashboard))
+        // Cross-repository proxy-blocked content (#4777)
+        .route("/proxy-blocked", get(list_proxy_blocked))
         // Scores
         .route("/scores", get(get_all_scores))
         // Scan configs
@@ -101,8 +103,59 @@ pub struct DashboardResponse {
     pub critical_findings: i64,
     pub high_findings: i64,
     pub policy_violations_blocked: i64,
+    /// Distinct proxied digests that a repository's proxy scan gate refuses
+    /// right now (#4777). Also counted in `policy_violations_blocked`, which
+    /// keeps its meaning (hosted rejections plus these). The rows behind it
+    /// are `GET /api/v1/security/proxy-blocked`.
+    pub proxy_blocked: i64,
+    /// Repositories whose grade letter, over what was assessed, is A (#4336:
+    /// an `unrated` repository has no letter and is not counted).
     pub repos_grade_a: i64,
+    /// Repositories whose grade letter, over what was assessed, is F. Since
+    /// #4336 a failed scan or an uncataloged archive no longer floors a
+    /// letter to F; those repositories are counted in `repos_incomplete` or
+    /// `repos_unrated` instead.
     pub repos_grade_f: i64,
+    /// Repositories by grade status (#4336); see [`ScoreResponse::grade_status`].
+    pub repos_rated: i64,
+    pub repos_incomplete: i64,
+    pub repos_unrated: i64,
+}
+
+/// What a repository's scans assessed (#4336), counted per live artifact by
+/// the latest scan of each scanner.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScoreCoverageResponse {
+    /// Live (not deleted) artifacts in the repository.
+    pub artifacts: i64,
+    /// Artifacts with at least one finished scan:
+    /// `cataloged + failed + uncataloged`.
+    pub scanned: i64,
+    /// Scanned artifacts that were assessed (`complete` or `partial`).
+    pub cataloged: i64,
+    /// The part of `cataloged` assessed only in part (`partial`).
+    pub partial: i64,
+    /// Scanned artifacts whose latest scan failed.
+    pub failed: i64,
+    /// Scanned artifacts no scanner could catalog (`not_cataloged`).
+    pub uncataloged: i64,
+    /// `(cataloged - partial) / scanned` in whole percent, rounded down;
+    /// `null` when nothing was scanned.
+    pub coverage_pct: Option<i32>,
+}
+
+impl From<crate::models::security::ScoreCoverage> for ScoreCoverageResponse {
+    fn from(c: crate::models::security::ScoreCoverage) -> Self {
+        Self {
+            artifacts: c.artifacts,
+            scanned: c.scanned,
+            cataloged: c.cataloged,
+            partial: c.partial,
+            failed: c.failed,
+            uncataloged: c.uncataloged,
+            coverage_pct: c.coverage_pct(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -110,7 +163,21 @@ pub struct ScoreResponse {
     pub id: Uuid,
     pub repository_id: Uuid,
     pub score: i32,
-    pub grade: String,
+    /// Grade letter over the assessed artifacts (#4336), `null` when the
+    /// repository is `unrated`. Never floored: before 1.12 a failed scan or an
+    /// uncataloged archive forced this to `F`; `grade_status` and `coverage`
+    /// now say what was not assessed.
+    #[schema(example = "B")]
+    pub grade: Option<String>,
+    /// `rated` (everything scanned was fully assessed), `incomplete` (some
+    /// artifacts failed to scan, could not be cataloged, or were assessed only
+    /// in part) or `unrated` (nothing was assessed, including no scans at
+    /// all) (#4336).
+    #[schema(example = "incomplete")]
+    pub grade_status: String,
+    /// The counts behind `grade_status` (#4336). `null` until a 1.12 replica
+    /// has recalculated the score (a row last written by an older replica).
+    pub coverage: Option<ScoreCoverageResponse>,
     pub total_findings: i32,
     pub critical_count: i32,
     pub high_count: i32,
@@ -120,22 +187,18 @@ pub struct ScoreResponse {
     pub last_scan_at: Option<chrono::DateTime<chrono::Utc>>,
     pub calculated_at: chrono::DateTime<chrono::Utc>,
     /// True when the latest applicable scan for this repo errored (#2167).
-    /// The `grade` letter is floored to `F` while this holds. The floor is
-    /// display-only: `score` is unchanged, and quality gates, promotion rules
-    /// and download policies read the numeric score, so clients that must not
-    /// treat the repo as clean should check this flag. Cleared automatically
-    /// once a `completed` rescan supersedes the failed scan.
+    /// Since #4336 the `grade` letter is not floored; `coverage.failed` counts
+    /// the artifacts and `grade_status` is `incomplete` or `unrated`. Cleared
+    /// automatically once a `completed` rescan supersedes the failed scan.
     pub has_failed_scan: bool,
     /// True when the latest completed scan of some artifact in this repo
     /// cataloged NO components although its format expects a catalog
     /// (#4036, #4154): its zero findings mean "nothing was assessed", not
-    /// "clean". The scan row's `scan_completeness_reason` says why. The
-    /// `grade` letter is floored to `F` only for package artifacts (typed
-    /// repositories, and package-shaped archives such as `.whl`/`.jar` in a
-    /// generic one); a plain generic `.zip`/`.tar.gz` sets this flag without
-    /// changing the grade. As with `has_failed_scan`, the floor is display-
-    /// only. Cleared automatically once a `completed` rescan supersedes the
-    /// not-cataloged scan.
+    /// "clean". The scan row's `scan_completeness_reason` says why. Since
+    /// #4336 the `grade` letter is not floored; `coverage.uncataloged` counts
+    /// the artifacts and `grade_status` is `incomplete` or `unrated`. Cleared
+    /// automatically once a `completed` rescan supersedes the not-cataloged
+    /// scan.
     pub has_uncataloged_scan: bool,
 }
 
@@ -335,6 +398,15 @@ pub struct ScanResponse {
     /// Why the scan is not `complete`, when known (e.g. which scanner
     /// cataloged nothing). `None` for complete scans.
     pub scan_completeness_reason: Option<String>,
+    /// What this scan assessed (#4336): `rated` (a completed `complete`
+    /// scan), `incomplete` (completed `partial`: graded on part of the
+    /// artifact) or `unrated` (completed `not_cataloged`, failed, not
+    /// applicable, or not finished). Same vocabulary as the repository's
+    /// `grade_status`.
+    #[schema(example = "rated")]
+    pub grade_status: String,
+    /// Why `grade_status` is not `rated`; `null` when it is.
+    pub grade_status_reason: Option<String>,
     /// Vulnerability database the scan ran against (#3014), distinct from
     /// `scanner_version` (the binary): e.g. `trivy-db-v2`, `grype-db-v6.1.10`,
     /// or `live:osv` / `live:osv+ghsa` for the dependency scanner, which
@@ -386,7 +458,14 @@ impl ScanResponse {
             (true, Some(source_id)) => source_id,
             _ => s.id,
         };
+        let (grade_status, grade_status_reason) = crate::models::security::scan_grade_status(
+            &s.status,
+            &s.scan_completeness,
+            s.scan_completeness_reason.as_deref(),
+        );
         Self {
+            grade_status: grade_status.as_str().to_string(),
+            grade_status_reason,
             id: reported_id,
             artifact_id: s.artifact_id,
             artifact_name,
@@ -542,7 +621,9 @@ impl From<crate::models::security::RepoSecurityScore> for ScoreResponse {
             id: s.id,
             repository_id: s.repository_id,
             score: s.score,
-            grade: s.grade,
+            grade: s.display_grade(),
+            grade_status: s.status().as_str().to_string(),
+            coverage: s.coverage().map(ScoreCoverageResponse::from),
             total_findings: s.total_findings,
             critical_count: s.critical_count,
             high_count: s.high_count,
@@ -876,8 +957,158 @@ async fn get_dashboard(
         critical_findings: summary.critical_findings,
         high_findings: summary.high_findings,
         policy_violations_blocked: summary.policy_violations_blocked,
+        proxy_blocked: summary.proxy_blocked,
         repos_grade_a: summary.repos_grade_a,
         repos_grade_f: summary.repos_grade_f,
+        repos_rated: summary.repos_rated,
+        repos_incomplete: summary.repos_incomplete,
+        repos_unrated: summary.repos_unrated,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-repository proxy-blocked content (#4777)
+// ---------------------------------------------------------------------------
+
+/// Most CVE ids returned per blocked item.
+const PROXY_BLOCKED_MAX_CVES: i64 = 20;
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct ProxyBlockedQuery {
+    /// Only this repository (key).
+    pub repository: Option<String>,
+    /// Only items whose highest severity is at least this
+    /// (`critical`, `high`, `medium`, `low`, `info`). An item whose verdict
+    /// recorded no severity is kept: the gate blocks it under every policy.
+    pub min_severity: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyBlockedItem {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    pub repository_format: String,
+    /// Cached logical path; `sha256:<digest>` for an OCI image manifest.
+    pub path: String,
+    /// The file name the path ends in.
+    pub name: String,
+    pub checksum_sha256: String,
+    pub max_severity: Option<String>,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    /// The recorded CVE ids, most severe first, at most 20. Empty for a
+    /// verdict recorded before per-CVE detail existed.
+    pub cve_ids: Vec<String>,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyBlockedResponse {
+    pub items: Vec<ProxyBlockedItem>,
+    pub pagination: crate::api::dto::Pagination,
+}
+
+/// Whether an item with this stored severity passes a `min_severity` filter.
+fn meets_min_severity(
+    max_severity: Option<&str>,
+    min: Option<crate::models::security::Severity>,
+) -> bool {
+    use crate::models::security::Severity;
+    match (min, max_severity.and_then(Severity::from_str_loose)) {
+        (None, _) => true,
+        // Ungraded: blocked under every gate, so never filtered away.
+        (Some(_), None) => true,
+        (Some(min), Some(s)) => s.meets_threshold(min),
+    }
+}
+
+/// Every proxied path a repository's proxy scan gate refuses right now,
+/// across repositories (#4777): the rows behind the dashboard's
+/// `proxy_blocked`. Who requested them is in the audit log
+/// (`PROXY_SCAN_BLOCKED`, keyed by repository and `checksum_sha256`).
+#[utoipa::path(
+    get,
+    path = "/proxy-blocked",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(ProxyBlockedQuery),
+    responses(
+        (status = 200, description = "Proxied content currently blocked by a scan gate", body = ProxyBlockedResponse),
+        (status = 400, description = "Invalid min_severity", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges (unrestricted credential) required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_proxy_blocked(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ProxyBlockedQuery>,
+) -> Result<Json<ProxyBlockedResponse>> {
+    // Every repository's blocked content: an instance administrator with an
+    // unrestricted credential, like the admin hold queues.
+    auth.require_unscoped_admin("the cross-repository proxy-blocked list")?;
+    let min = match query.min_severity.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => Some(
+            crate::models::security::Severity::from_str_loose(raw).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "invalid min_severity '{raw}'; allowed values are critical, high, medium, low, info"
+                ))
+            })?,
+        ),
+    };
+    let (page, per_page, offset) =
+        crate::api::dto::Pagination::clamp_offset(query.page, query.per_page);
+    let svc = ScanResultService::new(state.db.clone());
+    let entries: Vec<_> = svc
+        .list_blocked_proxy_entries(query.repository.as_deref())
+        .await?
+        .into_iter()
+        .filter(|e| meets_min_severity(e.max_severity.as_deref(), min))
+        .collect();
+    let total = entries.len() as i64;
+    let page_entries: Vec<_> = entries
+        .into_iter()
+        .skip(offset.max(0) as usize)
+        .take(per_page as usize)
+        .collect();
+    let digests: Vec<String> = page_entries
+        .iter()
+        .map(|e| e.checksum_sha256.clone())
+        .collect();
+    let cves = svc.proxy_cve_ids(&digests, PROXY_BLOCKED_MAX_CVES).await?;
+    let items = page_entries
+        .into_iter()
+        .map(|e| ProxyBlockedItem {
+            name: e
+                .path
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(&e.path)
+                .to_string(),
+            cve_ids: cves.get(&e.checksum_sha256).cloned().unwrap_or_default(),
+            repository_id: e.repository_id,
+            repository_key: e.repository_key,
+            repository_format: e.repository_format,
+            path: e.path,
+            checksum_sha256: e.checksum_sha256,
+            max_severity: e.max_severity,
+            findings_count: e.findings_count,
+            critical_count: e.critical_count,
+            high_count: e.high_count,
+            medium_count: e.medium_count,
+            low_count: e.low_count,
+            scanned_at: e.scanned_at,
+        })
+        .collect();
+    Ok(Json(ProxyBlockedResponse {
+        items,
+        pagination: crate::api::dto::Pagination::for_page(page, per_page, total),
     }))
 }
 
@@ -1357,7 +1588,11 @@ pub struct IngestExternalFindingsResponse {
     pub findings_ingested: i32,
     /// Repository security score after `recalculate_score`.
     pub score: i32,
-    pub grade: String,
+    /// Repository grade letter after `recalculate_score`, as
+    /// [`ScoreResponse::grade`]: `null` when the repository is `unrated`.
+    pub grade: Option<String>,
+    /// Repository grade status after `recalculate_score` (#4336).
+    pub grade_status: String,
 }
 
 /// Per-severity counts for the `scan_results` projection, in the order
@@ -1611,7 +1846,8 @@ async fn ingest_external_findings(
             "malicious_ids": summary.malicious_ids,
             "malicious_ids_truncated": summary.malicious_ids_truncated,
             "score": score.score,
-            "grade": score.grade,
+            "grade": score.display_grade(),
+            "grade_status": score.status().as_str(),
         })),
     )
     .await;
@@ -1622,7 +1858,8 @@ async fn ingest_external_findings(
         repository_id,
         findings_ingested: findings.len() as i32,
         score: score.score,
-        grade: score.grade,
+        grade: score.display_grade(),
+        grade_status: score.status().as_str().to_string(),
     }))
 }
 
@@ -1754,6 +1991,8 @@ async fn create_policy(
             body.predicates,
         )
         .await?;
+    // #4288: generated listings stop (or resume) advertising what it decides.
+    crate::services::quarantine_service::invalidate_listing_decisions();
 
     Ok(Json(PolicyResponse::from(p)))
 }
@@ -1822,6 +2061,8 @@ async fn update_policy(
             body.predicates,
         )
         .await?;
+    // #4288: generated listings stop (or resume) advertising what it decides.
+    crate::services::quarantine_service::invalidate_listing_decisions();
 
     Ok(Json(PolicyResponse::from(p)))
 }
@@ -1848,6 +2089,7 @@ async fn delete_policy(
     auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     svc.delete_policy(id).await?;
+    crate::services::quarantine_service::invalidate_listing_decisions();
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
@@ -3196,10 +3438,15 @@ async fn rescan_proxy_cached_path(
         list_repo_scans,
         get_repo_proxy_scans,
         rescan_proxy_cached_path,
+        list_proxy_blocked,
     ),
     components(schemas(
         DashboardResponse,
+        ProxyBlockedQuery,
+        ProxyBlockedItem,
+        ProxyBlockedResponse,
         ScoreResponse,
+        ScoreCoverageResponse,
         TriggerScanRequest,
         TriggerScanResponse,
         ScanListResponse,
@@ -5410,6 +5657,118 @@ mod tests {
         );
     }
 
+    /// #4777: the cross-repository proxy-blocked list names what each
+    /// repository's gate refuses, with its CVE ids most severe first; the
+    /// severity filter and the admin gate apply; the dashboard counts it in
+    /// `proxy_blocked` (and still in `policy_violations_blocked`).
+    #[tokio::test]
+    async fn proxy_blocked_list_and_dashboard_count_4777_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy, \
+                                       block_on_policy_violation, severity_threshold, \
+                                       proxy_scan_action) \
+             VALUES ($1, true, false, true, false, 'high', 'fail_open')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("scan config");
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+                                                size_bytes, checksum_sha256) \
+             VALUES ($1, 'evil/-/evil-1.0.0.tgz', 'k', 'm', 8, $2)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("cache row");
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, findings_count, \
+                                             high_count, medium_count, max_severity) \
+             VALUES ($1, 'grype', 'vulnerable', 2, 1, 1, 'high')",
+        )
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("verdict");
+        for (cve, sev) in [("CVE-2026-0002", "medium"), ("CVE-2026-0001", "high")] {
+            sqlx::query(
+                "INSERT INTO proxy_scan_findings (checksum_sha256, scan_type, cve_id, severity) \
+                 VALUES ($1, 'grype', $2, $3)",
+            )
+            .bind(&digest)
+            .bind(cve)
+            .bind(sev)
+            .execute(&pool)
+            .await
+            .expect("finding");
+        }
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin = tdh::admin_auth(user_id, &username);
+        let list = |auth: AuthExtension, min: Option<&str>| {
+            let state = state.clone();
+            let key = key.clone();
+            let min = min.map(str::to_string);
+            async move {
+                list_proxy_blocked(
+                    State(state),
+                    Extension(auth),
+                    Query(ProxyBlockedQuery {
+                        repository: Some(key),
+                        min_severity: min,
+                        page: None,
+                        per_page: None,
+                    }),
+                )
+                .await
+            }
+        };
+        let all = list(admin.clone(), None).await.expect("list").0;
+        let critical_only = list(admin.clone(), Some("critical")).await.expect("crit").0;
+        let bad = list(admin.clone(), Some("severe")).await;
+        let non_admin = list(tdh::make_auth(user_id, &username), None).await;
+        let dashboard = get_dashboard(State(state.clone()), Extension(admin.clone()))
+            .await
+            .expect("dashboard")
+            .0;
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(all.pagination.total, 1);
+        let item = &all.items[0];
+        assert_eq!(item.repository_key, key);
+        assert_eq!(item.path, "evil/-/evil-1.0.0.tgz");
+        assert_eq!(item.name, "evil-1.0.0.tgz");
+        assert_eq!(item.checksum_sha256, digest);
+        assert_eq!(item.max_severity.as_deref(), Some("high"));
+        assert_eq!(item.cve_ids, vec!["CVE-2026-0001", "CVE-2026-0002"]);
+        assert!(
+            critical_only.items.is_empty(),
+            "a high verdict is below critical"
+        );
+        assert!(matches!(bad, Err(AppError::Validation(_))));
+        assert!(matches!(non_admin, Err(AppError::Authorization(_))));
+        assert!(dashboard.proxy_blocked >= 1);
+        assert!(dashboard.policy_violations_blocked >= dashboard.proxy_blocked);
+    }
+
     /// #4363: an instance administrator's write locks the repository's proxy
     /// scan policy. While locked, a repository administrator can tighten it
     /// but every weakening (record_only, fail_closed -> fail_open, scan off,
@@ -6216,6 +6575,36 @@ mod tests {
             json["scan_completeness_reason"],
             "grype cataloged no components"
         );
+        // #4336: the per-scan grade status, with the reason.
+        assert_eq!(json["grade_status"], "unrated");
+        assert_eq!(json["grade_status_reason"], "grype cataloged no components");
+    }
+
+    /// #4336: a `partial` scan (part of the artifact assessed, as an image
+    /// whose filesystem could only be partly extracted) is `incomplete` with
+    /// its reason; a complete one is `rated` with none; a failed one is
+    /// `unrated`.
+    #[test]
+    fn scan_response_grade_status_4336() {
+        let mut scan = make_scan_result();
+        scan.status = "completed".to_string();
+        scan.scan_completeness = "partial".to_string();
+        scan.scan_completeness_reason = Some("rootfs partly extracted".to_string());
+        let json = serde_json::to_value(scan_result_to_response(scan, None, None)).unwrap();
+        assert_eq!(json["grade_status"], "incomplete");
+        assert_eq!(json["grade_status_reason"], "rootfs partly extracted");
+
+        let mut scan = make_scan_result();
+        scan.status = "completed".to_string();
+        scan.scan_completeness = "complete".to_string();
+        let json = serde_json::to_value(scan_result_to_response(scan, None, None)).unwrap();
+        assert_eq!(json["grade_status"], "rated");
+        assert!(json["grade_status_reason"].is_null());
+
+        let mut scan = make_scan_result();
+        scan.status = "failed".to_string();
+        let json = serde_json::to_value(scan_result_to_response(scan, None, None)).unwrap();
+        assert_eq!(json["grade_status"], "unrated");
     }
 
     fn make_scan_response(artifact_id: Uuid, scan_type: &str, status: &str) -> ScanResponse {
@@ -6369,8 +6758,12 @@ mod tests {
             critical_findings: 5,
             high_findings: 15,
             policy_violations_blocked: 3,
+            proxy_blocked: 0,
             repos_grade_a: 6,
             repos_grade_f: 1,
+            repos_rated: 0,
+            repos_incomplete: 0,
+            repos_unrated: 0,
         };
         assert_eq!(resp.repos_with_scanning, 10);
         assert_eq!(resp.total_scans, 100);
@@ -6391,8 +6784,12 @@ mod tests {
             critical_findings: 0,
             high_findings: 0,
             policy_violations_blocked: 0,
+            proxy_blocked: 0,
             repos_grade_a: 0,
             repos_grade_f: 0,
+            repos_rated: 0,
+            repos_incomplete: 0,
+            repos_unrated: 0,
         };
         assert_eq!(resp.repos_with_scanning, 0);
         assert_eq!(resp.total_findings, 0);
@@ -7019,7 +7416,9 @@ mod tests {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
             score: 85,
-            grade: "A".to_string(),
+            grade: Some("A".to_string()),
+            grade_status: "rated".to_string(),
+            coverage: None,
             total_findings: 5,
             critical_count: 0,
             high_count: 1,
@@ -7032,7 +7431,7 @@ mod tests {
             has_uncataloged_scan: false,
         };
         assert_eq!(resp.score, 85);
-        assert_eq!(resp.grade, "A");
+        assert_eq!(resp.grade.as_deref(), Some("A"));
         assert_eq!(resp.total_findings, 5);
         assert_eq!(resp.acknowledged_count, 1);
     }
@@ -7043,7 +7442,9 @@ mod tests {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
             score: 0,
-            grade: "F".to_string(),
+            grade: Some("F".to_string()),
+            grade_status: "rated".to_string(),
+            coverage: None,
             total_findings: 0,
             critical_count: 0,
             high_count: 0,
@@ -7056,7 +7457,7 @@ mod tests {
             has_uncataloged_scan: false,
         };
         assert_eq!(resp.score, 0);
-        assert_eq!(resp.grade, "F");
+        assert_eq!(resp.grade.as_deref(), Some("F"));
         assert!(resp.last_scan_at.is_none());
     }
 
@@ -7095,7 +7496,9 @@ mod tests {
                 id: Uuid::new_v4(),
                 repository_id: Uuid::new_v4(),
                 score: 92,
-                grade: "A".to_string(),
+                grade: Some("A".to_string()),
+                grade_status: "rated".to_string(),
+                coverage: None,
                 total_findings: 2,
                 critical_count: 0,
                 high_count: 0,
@@ -7152,8 +7555,12 @@ mod tests {
             critical_findings: 1,
             high_findings: 3,
             policy_violations_blocked: 0,
+            proxy_blocked: 0,
             repos_grade_a: 4,
             repos_grade_f: 0,
+            repos_rated: 0,
+            repos_incomplete: 0,
+            repos_unrated: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"repos_with_scanning\":5"));
@@ -7199,7 +7606,9 @@ mod tests {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
             score: 75,
-            grade: "B".to_string(),
+            grade: Some("B".to_string()),
+            grade_status: "rated".to_string(),
+            coverage: None,
             total_findings: 10,
             critical_count: 0,
             high_count: 2,
@@ -7215,6 +7624,52 @@ mod tests {
         assert_eq!(json["score"], 75);
         assert_eq!(json["grade"], "B");
         assert_eq!(json["total_findings"], 10);
+    }
+
+    /// #4336: the score response carries the grade status and coverage, the
+    /// shown letter is never the 1.11 floor, and `unrated` has no letter.
+    #[test]
+    fn score_response_exposes_status_and_coverage_4336() {
+        let now = chrono::Utc::now();
+        let mut row = crate::models::security::RepoSecurityScore {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            score: 80,
+            grade: "F".to_string(),
+            total_findings: 2,
+            critical_count: 0,
+            high_count: 1,
+            medium_count: 1,
+            low_count: 0,
+            acknowledged_count: 0,
+            last_scan_at: Some(now),
+            calculated_at: now,
+            has_failed_scan: false,
+            has_uncataloged_scan: true,
+            grade_status: Some("incomplete".to_string()),
+            rated_grade: Some("B".to_string()),
+            artifact_count: Some(2),
+            scanned_count: Some(2),
+            cataloged_count: Some(1),
+            partial_count: Some(0),
+            failed_count: Some(0),
+            uncataloged_count: Some(1),
+            status_calculated_at: Some(now),
+        };
+        let json = serde_json::to_value(ScoreResponse::from(row.clone())).unwrap();
+        assert_eq!(json["grade"], "B");
+        assert_eq!(json["grade_status"], "incomplete");
+        assert_eq!(json["coverage"]["scanned"], 2);
+        assert_eq!(json["coverage"]["cataloged"], 1);
+        assert_eq!(json["coverage"]["uncataloged"], 1);
+        assert_eq!(json["coverage"]["coverage_pct"], 50);
+
+        row.grade = "A".to_string();
+        row.grade_status = Some("unrated".to_string());
+        row.rated_grade = None;
+        let json = serde_json::to_value(ScoreResponse::from(row)).unwrap();
+        assert_eq!(json["grade_status"], "unrated");
+        assert!(json["grade"].is_null(), "unrated has no letter");
     }
 
     #[test]

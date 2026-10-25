@@ -1,7 +1,8 @@
 //! Age-based quality gate for supported remote proxy registries.
 //!
-//! npm and PyPI support upstream publish time and first-seen policy; Go
-//! supports first-seen policy. Direct Remote repositories are evaluated
+//! npm, PyPI and Maven (#4702, see [`crate::services::age_gate_maven`])
+//! support upstream publish time and first-seen policy; Go supports
+//! first-seen policy. Direct Remote repositories are evaluated
 //! directly. Virtual repositories apply the policy of the Remote member that
 //! supplied metadata or content, while Local members remain ungated.
 
@@ -3198,6 +3199,8 @@ mod tests {
         assert_eq!(format_label(&RepositoryFormat::Yarn), "npm");
         assert_eq!(format_label(&RepositoryFormat::Poetry), "pypi");
         assert_eq!(format_label(&RepositoryFormat::Jupyter), "pypi");
+        assert_eq!(format_label(&RepositoryFormat::Maven), "maven");
+        assert_eq!(format_label(&RepositoryFormat::Gradle), "maven");
         // Anything outside the gate's supported formats collapses to "other"
         // so the metric label set stays bounded.
         assert_eq!(format_label(&RepositoryFormat::Generic), "other");
@@ -4073,14 +4076,24 @@ mod tests {
                 &RepositoryFormat::Vscode,
                 mode
             ));
-            // No registry entry -> not gateable in any mode. NuGet stays
-            // here until its enforcement seam lands.
-            assert!(!AgeGateService::supports_format_mode(
+            // #4702: Maven (and Gradle, same handler) in both modes.
+            assert!(AgeGateService::supports_format_mode(
                 &RepositoryFormat::Maven,
                 mode
             ));
+            assert!(AgeGateService::supports_format_mode(
+                &RepositoryFormat::Gradle,
+                mode
+            ));
+            // No registry entry -> not gateable in any mode. NuGet stays
+            // here until its enforcement seam lands; sbt has its own handler
+            // with no age-gate seam.
             assert!(!AgeGateService::supports_format_mode(
                 &RepositoryFormat::Nuget,
+                mode
+            ));
+            assert!(!AgeGateService::supports_format_mode(
+                &RepositoryFormat::Sbt,
                 mode
             ));
         }

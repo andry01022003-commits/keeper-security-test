@@ -1121,6 +1121,14 @@ fn api_v1_routes(
                     optional_auth_middleware,
                 )),
         )
+        // Repository delete jobs (#4311): GET /repository-deletions/{id}.
+        .nest(
+            "/repository-deletions",
+            handlers::repositories::deletion_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                optional_auth_middleware,
+            )),
+        )
         // The generic download route, `GET /repositories/{key}/download/{path}`,
         // takes the format routes' authentication contract rather than the
         // management API's (#4654): an API token is accepted as the Basic

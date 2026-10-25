@@ -174,6 +174,9 @@ pub fn staged_chunk_key(session_id: Uuid, chunk_index: i32) -> String {
     format!("{}/{chunk_index:08}", staging_prefix(session_id))
 }
 
+/// Content type a session records when its creator names none.
+pub const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
 /// Storage key of the single object a streamed completion assembles the staged
 /// chunks into (#3916). It lives in the session's staging namespace, distinct
 /// from every [`staged_chunk_key`], so the normal purge (and its reaper
@@ -347,7 +350,7 @@ impl UploadService {
         }
 
         let total_chunks = ((p.total_size + chunk_size as i64 - 1) / chunk_size as i64) as i32;
-        let content_type = p.content_type.unwrap_or("application/octet-stream");
+        let content_type = p.content_type.unwrap_or(DEFAULT_CONTENT_TYPE);
         let artifact_name = normalize_optional_metadata(p.artifact_name);
         let artifact_version = normalize_optional_metadata(p.artifact_version);
         let artifact_metadata_format = normalize_optional_metadata(p.artifact_metadata_format);

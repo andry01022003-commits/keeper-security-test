@@ -5802,6 +5802,59 @@ pub async fn update_repository(
     Ok(Json(response))
 }
 
+mod delete_job;
+
+/// `GET /api/v1/repository-deletions/{id}`: status of a repository delete
+/// job (#4311).
+pub fn deletion_router() -> Router<SharedState> {
+    delete_job::router()
+}
+
+/// Start this replica's loop that resumes repository delete jobs (#4311).
+pub fn spawn_repository_delete_resumer(
+    state: SharedState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    delete_job::spawn_resumer(state, shutdown);
+}
+
+/// SQL boolean over the key expression `col`: the key belongs to the
+/// artifact object space a repository-delete purge reclaims. Proxy-cache keys
+/// (owned by the proxy catalog, #3368) and OCI objects (owned by storage GC's
+/// candidate sweep, #1598/#3733) are not.
+fn purgeable_key_sql(col: &str) -> String {
+    format!(
+        "{col} NOT LIKE 'proxy-cache/%' \
+         AND {col} NOT LIKE '{manifest}%' \
+         AND {col} NOT LIKE 'oci-blobs/%'",
+        manifest = crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX,
+    )
+}
+
+/// SQL boolean: a repository other than `repo` still references the object
+/// at `key` on the storage `(backend, path)` (#4833 scope: any repository on
+/// the same cloud backend, one rooted at the same `storage_path` on
+/// filesystem), as a live or trashed artifact, an older revision, or a Maven
+/// row-less object it owns. The exclusivity rule
+/// [`collect_repo_artifact_object_keys`] applies when it collects keys, which
+/// the purge re-applies to each key right before its delete (#4311).
+fn key_held_by_another_repository_sql(key: &str, backend: &str, path: &str, repo: &str) -> String {
+    let arm = |table: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM {table} t JOIN repositories r ON r.id = t.repository_id \
+              WHERE t.storage_key = {key} AND t.repository_id <> {repo} \
+                AND r.storage_backend = {backend} \
+                AND (r.storage_backend <> 'filesystem' OR r.storage_path = {path}))"
+        )
+    };
+    format!(
+        "({} OR {} OR {})",
+        arm("artifacts"),
+        arm("artifact_versions"),
+        arm("maven_flat_object_owner")
+    )
+}
+
 /// Batch size for [`collect_repo_oci_upload_temp_keys`]: the union of a
 /// repository's cleanup-key/session/part storage keys is drained in bounded
 /// chunks of this size instead of one unbounded query, so a repository with a
@@ -6021,6 +6074,12 @@ async fn purge_repo_artifact_objects(
 /// repository's cache. Before the layout was anchored the delete resolved to a
 /// key nothing had written and silently hit nothing; anchoring it makes the
 /// delete land, so the exclusion lands with it.
+///
+/// The delete job (#4311) does not run this whole-repository query: it
+/// journals each batch's keys as it deletes the batch, and the purge applies
+/// the same exclusivity rule ([`key_held_by_another_repository_sql`]) to
+/// each key right before its delete. Kept for the tests that pin the rule.
+#[cfg(test)]
 async fn collect_repo_artifact_object_keys(
     state: &SharedState,
     repo_id: Uuid,
@@ -6088,10 +6147,17 @@ async fn collect_repo_artifact_object_keys(
 /// from a repository's storage backend, given the keys previously gathered by
 /// [`collect_repo_artifact_object_keys`].
 ///
-/// Split out from collection so the delete path can defer this (potentially
-/// O(objects)) work to a background task AFTER a successful DB delete, keeping
-/// the request path bounded (#2776). Never blocks the delete: storage
-/// resolution and per-object failures are logged and swallowed.
+/// Each key is deleted through [`delete_job::purge_key_unless_referenced`]:
+/// journaled in `oci_gc_candidates` and re-checked against every other
+/// repository immediately before its delete, behind the slot the upload
+/// commit guard takes (#4311). The collection's exclusivity verdict is as old
+/// as the collection; an upload of identical content into another repository
+/// committed since then references the key and keeps its object.
+///
+/// Never blocks the delete: storage resolution and per-object failures are
+/// logged and swallowed (a failed key stays journaled for storage GC).
+/// The delete job walks its journal with the same per-key purge.
+#[cfg(test)]
 async fn purge_storage_object_keys(
     state: &SharedState,
     repo_id: Uuid,
@@ -6114,29 +6180,29 @@ async fn purge_storage_object_keys(
     };
 
     let total = keys.len();
-    let mut failed = 0usize;
+    let (mut kept, mut failed) = (0usize, 0usize);
     for key in keys {
-        match storage.delete(&key).await {
-            Ok(()) | Err(AppError::NotFound(_)) => {}
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    repo_id = %repo_id,
-                    storage_key = %key,
-                    error = %e,
-                    "Failed to purge artifact object for repository delete"
-                );
-            }
+        match delete_job::purge_key_unless_referenced(
+            &state.db,
+            storage.as_ref(),
+            location,
+            repo_id,
+            &key,
+        )
+        .await
+        {
+            delete_job::PurgeOutcome::Deleted => {}
+            delete_job::PurgeOutcome::Kept => kept += 1,
+            delete_job::PurgeOutcome::Failed => failed += 1,
         }
     }
-    if total > 0 {
-        tracing::info!(
-            repo_id = %repo_id,
-            purged = total - failed,
-            failed,
-            "Purged artifact storage objects for deleted repository"
-        );
-    }
+    tracing::info!(
+        repo_id = %repo_id,
+        purged = total - kept - failed,
+        kept,
+        failed,
+        "Purged artifact storage objects for deleted repository"
+    );
 }
 
 /// Storage keys of this repository's *row-less* Maven flat objects — checksum
@@ -6349,6 +6415,14 @@ async fn collect_repo_maven_derived_keys(state: &SharedState, repo_id: Uuid) -> 
 }
 
 /// Delete repository
+///
+/// The delete runs as a background job (#4311): the repository is renamed out
+/// of the way at once (its key is free and stops resolving), and a worker
+/// deletes its rows in bounded batches and reclaims its storage under a
+/// cluster-wide claim, so a repository of any size answers well inside a
+/// proxy timeout. Poll the returned job at
+/// `GET /api/v1/repository-deletions/{id}`. A second delete while the job
+/// runs returns the same job.
 #[utoipa::path(
     delete,
     path = "/{key}",
@@ -6359,7 +6433,7 @@ async fn collect_repo_maven_derived_keys(state: &SharedState, repo_id: Uuid) -> 
     ),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Repository deleted"),
+        (status = 202, description = "Delete accepted; the job runs in the background. `Location` is its status", body = delete_job::RepositoryDeleteJobResponse),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Repository not found"),
@@ -6369,11 +6443,23 @@ pub async fn delete_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-) -> Result<()> {
+) -> Result<Response> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete:repositories")?;
     let service = state.create_repository_service();
-    let repo = service.get_by_key(&key).await?;
+    // #4311: the key a delete job renamed away still names its repository
+    // here, so a repeated delete returns the job in flight (or, after a
+    // failed job, starts a new one) instead of answering 404.
+    let repo = match service.get_by_key(&key).await {
+        Ok(repo) => repo,
+        Err(AppError::NotFound(message)) => {
+            match delete_job::repository_awaiting_delete(&state.db, &key).await? {
+                Some(repo_id) => service.get_by_id(repo_id).await?,
+                None => return Err(AppError::NotFound(message)),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     require_repo_access(&auth, repo.id)?;
 
     // Fine-grained permission check: non-admins need "admin" on the target
@@ -6381,122 +6467,12 @@ pub async fn delete_repository(
     // role (`repository-owner`), not only a rule (#4834).
     require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
-    // Gather this repo's in-flight / abandoned OCI upload temp storage keys
-    // BEFORE the repository row is deleted — the journal/session/part rows
-    // CASCADE away with it, so the keys must be captured up front. The actual
-    // storage purge is deferred until AFTER a successful delete (below) so a
-    // failed delete does not prematurely destroy temp objects the surviving
-    // repository may still retry (#1533 GC-LOW-2). Best-effort throughout.
-    let oci_upload_temp_keys = collect_repo_oci_upload_temp_keys(&state, repo.id).await;
-
-    // Collect the storage keys of this repo's committed artifact objects BEFORE
-    // the repository row is deleted (the `artifacts` / `artifact_versions` /
-    // `maven_flat_object_owner` rows CASCADE away with it, after which the
-    // owning keys are no longer derivable — #1551/#2668/#4865). Collection is a
-    // handful of SELECTs; the actual object deletion is deferred below.
-    let location = repo.storage_location();
-    let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
-
-    // The keys the purge spares because another repository on the same
-    // storage still holds them lose their last record of THIS repository's
-    // reference with the cascade below. Hand them to GC's candidate set, whose
-    // sweep deletes each object once no surviving repository references it, so
-    // a key spared for a repository that is deleted next (or concurrently)
-    // cannot leak (#4833). The same hand-off covers this repository's own
-    // revision history (`artifact_versions`), whose rows cascade away just as
-    // the live ones do (#4865). Best-effort, like the OCI hand-off below.
-    if let Err(e) = crate::services::storage_gc_service::record_spared_artifact_gc_candidates(
-        &state.db,
-        repo.id,
-        &location,
-        &artifact_object_keys,
-    )
-    .await
-    {
-        tracing::warn!(
-            repo_id = %repo.id,
-            error = %e,
-            "Failed to record spared artifact objects as GC candidates before repository delete"
-        );
-    }
-
-    // Committed OCI objects are deliberately NOT in `artifact_object_keys`:
-    // they are content-addressed and can be shared cross-repo through
-    // `oci_tags` / `oci_manifest_refs` / `oci_blobs` / `manifest_blob_refs`,
-    // so the artifacts-only exclusivity guard cannot prove any of them
-    // unreferenced and deleting one here would destroy a manifest or layer
-    // another repository still serves (#1598). Reclaiming them is GC's job —
-    // but the delete below CASCADEs away exactly the rows GC scans from, so
-    // without this hand-off the objects become undiscoverable at the moment
-    // they become reclaimable and leak forever (#3733). Record them into the
-    // durable candidate set first; GC re-tests each key against every
-    // surviving repository and deletes only what nothing references.
-    //
-    // Best-effort, like the rest of the storage cleanup: a failure here must
-    // not block the delete (it leaves the pre-#3733 behaviour, a leak, not a
-    // data loss). Recording BEFORE the delete is also safe if the delete then
-    // fails — the repository's own rows still reference every recorded key, so
-    // the sweep drops the candidates untouched.
-    if let Err(e) =
-        crate::services::storage_gc_service::record_oci_gc_candidates(&state.db, repo.id, &location)
-            .await
-    {
-        tracing::warn!(
-            repo_id = %repo.id,
-            error = %e,
-            "Failed to record OCI GC candidates before repository delete; \
-             orphaned OCI objects may be left on storage"
-        );
-    }
-
-    service.delete(repo.id).await?;
-
-    // Storage cleanup is best-effort and O(objects), so it runs OFF the request
-    // path in a background task (#2776): a LARGE repository (many thousands of
-    // stored objects) would otherwise drive O(objects) synchronous storage
-    // round-trips inside the DELETE request and trip the global request-timeout
-    // backstop with a 503 "server overloaded". The task is spawned only after a
-    // *successful* DB delete, preserving the invariant that a failed delete
-    // never destroys objects a surviving repository may still serve or retry
-    // (#1533 GC-LOW-2 / #1551 / #2047). All failures are logged and swallowed.
-    {
-        let state = state.clone();
-        let repo_id = repo.id;
-        let repo_key = repo.key.clone();
-        tokio::spawn(async move {
-            // Committed artifact objects (keys gathered before the delete).
-            purge_storage_object_keys(&state, repo_id, &location, artifact_object_keys).await;
-
-            // In-flight / abandoned OCI upload temp objects (keys gathered
-            // before the delete; the journal/session/part rows have CASCADED
-            // away with the repository row).
-            purge_oci_upload_temp_objects(&state, repo_id, &location, oci_upload_temp_keys).await;
-
-            // Proxy-cache subtree, keyed by the repo KEY and not tracked in
-            // `artifacts` (#1278); left behind, a new repository created with
-            // the same key would serve the deleted repo's stale upstream
-            // content (#2047). The key space is derived from the repo key (not
-            // from now-deleted rows), so purging here — after the DB delete —
-            // is safe. Hosted repos have no proxy cache, so this is a no-op.
-            if let Some(proxy) = state.proxy_service.as_ref() {
-                match proxy.purge_repo_cache(&repo_key).await {
-                    Ok(purged) if purged > 0 => tracing::info!(
-                        repo_id = %repo_id,
-                        repo_key = %repo_key,
-                        purged,
-                        "Purged proxy-cache storage objects for deleted repository"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        repo_id = %repo_id,
-                        repo_key = %repo_key,
-                        error = %e,
-                        "Failed to list proxy-cache objects to purge after repository delete"
-                    ),
-                }
-            }
-        });
-    }
+    // Record the job and rename the repository to `~deleting~<job id>` in one
+    // transaction: from here every lookup by its key misses (no new upload or
+    // read reaches it) and the key can be reused. The rows, the objects
+    // (journaled and re-checked per key, see `delete_job`), the OCI upload
+    // temp objects and the proxy-cache subtree are removed by the job.
+    let (job, created) = delete_job::enqueue(&state.db, &repo, auth.user_id).await?;
 
     // Remove the deleted repo from the in-memory caches. The negative cache is
     // cleared rather than seeded (#3750): the next probe re-confirms the miss
@@ -6504,46 +6480,57 @@ pub async fn delete_repository(
     // lifetime tied to an observed lookup instead of to the delete.
     crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &key).await;
 
-    state.event_bus.emit_repository_event(
-        "repository.deleted",
-        repo.id,
-        Some(auth.username.clone()),
-    );
+    if created {
+        delete_job::spawn_job(state.clone(), job.id);
 
-    // Audit trail (#2366): repository deleted. Best-effort.
-    audit_fire_and_forget(
-        state.db.clone(),
-        AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
-            .user(auth.user_id)
-            .resource(repo.id)
-            .actor_name(auth.username.clone())
-            .resource_name(repo.key.clone())
-            .details_typed(audit_details::RepositoryDetails {
-                actor_id: auth.user_id,
-                key: repo.key.clone(),
-                is_public: repo.is_public,
-                format: Some(derive_format_key(&repo.format)),
-                // The authoritative three-state value. Deriving this from the
-                // `is_public` mirror would record `internal` repositories as
-                // `private` in the audit log -- wrong, and wrong in the
-                // direction that hides a real access change from the reader.
-                visibility: Some(repo.visibility.as_str().to_owned()),
-                age_gate_enabled: None,
-                age_gate_min_age_days: None,
-                age_gate_mode: None,
-                scan_config: None,
-                previous_scan_config: None,
-                scan_config_changed: None,
-                upstream_change: None,
-                project_change: None,
-                allow_public_with_upstream_credentials: None,
-                upstream_auth_change: None,
-                age_gate_change: None,
-            }),
+        // Audit trail (#2366): repository deleted. Best-effort.
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
+                .user(auth.user_id)
+                .resource(repo.id)
+                .actor_name(auth.username.clone())
+                // The key the repository had when its delete was first
+                // requested, also for a re-delete after a failed job.
+                .resource_name(job.repository_key.clone())
+                .details_typed(audit_details::RepositoryDetails {
+                    actor_id: auth.user_id,
+                    key: job.repository_key.clone(),
+                    is_public: repo.is_public,
+                    format: Some(derive_format_key(&repo.format)),
+                    // The authoritative three-state value. Deriving this from the
+                    // `is_public` mirror would record `internal` repositories as
+                    // `private` in the audit log -- wrong, and wrong in the
+                    // direction that hides a real access change from the reader.
+                    visibility: Some(repo.visibility.as_str().to_owned()),
+                    age_gate_enabled: None,
+                    age_gate_min_age_days: None,
+                    age_gate_mode: None,
+                    scan_config: None,
+                    previous_scan_config: None,
+                    scan_config_changed: None,
+                    upstream_change: None,
+                    project_change: None,
+                    allow_public_with_upstream_credentials: None,
+                    upstream_auth_change: None,
+                    age_gate_change: None,
+                }),
+        )
+        .await;
+    }
+
+    let location = delete_job::status_url(job.id);
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(delete_job::RepositoryDeleteJobResponse::from(job)),
     )
-    .await;
-
-    Ok(())
+        .into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&location) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::LOCATION, value);
+    }
+    Ok(response)
 }
 
 // Artifact handlers (nested under repository)
@@ -9851,6 +9838,8 @@ pub async fn list_artifact_versions(
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        ("If-Match" = Option<String>, Header, description = "Compare-and-swap (#4186): write only if the live artifact's ETag (its quoted SHA-256, as the download route and this route's 201 emit) is one of the listed strong entity tags, or `*` for any live artifact. A match replaces the live artifact even on a repository without versioning; a released coordinate (a versioned path) still cannot change bytes. Otherwise 412."),
+        ("If-None-Match" = Option<String>, Header, description = "`*`: create only if the path holds no live artifact, otherwise 412 (#4186). An entity-tag list: refuse with 412 if the live artifact's ETag is listed."),
     ),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer_auth" = [])),
@@ -9858,8 +9847,9 @@ pub async fn list_artifact_versions(
         // 201, not 200: the handler has always returned StatusCode::CREATED
         // (package-manager clients depend on it); the spec must say so or
         // strict generated SDKs treat every successful upload as an error.
-        (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
-        (status = 400, description = "Invalid artifact path, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
+        (status = 201, description = "Artifact uploaded", body = ArtifactResponse,
+            headers(("ETag" = String, description = "Strong entity tag of the stored artifact: its quoted SHA-256"))),
+        (status = 400, description = "Invalid artifact path, the repository is virtual (direct uploads are not accepted), or a malformed `If-Match` / `If-None-Match`", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
@@ -9868,6 +9858,10 @@ pub async fn list_artifact_versions(
             The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`. \
             Delete the artifact first, or enable versioning on the repository (Generic and Mlmodel) to append a revision instead. \
             Of several concurrent uploads to one free path exactly one is answered 201; the others get this 409 (#4832).", body = crate::api::openapi::ErrorResponse),
+        (status = 412, description = "An `If-Match` or `If-None-Match` precondition does not hold against the live artifact (`code: PRECONDITION_FAILED`, #4186). \
+            Evaluated before the body is read and again, with the artifact row locked, when the upload commits: of several conditional uploads against one ETag exactly one succeeds and the others get 412.", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "Storage garbage collection is removing identical content at this moment (`code: SERVICE_UNAVAILABLE`, #4980). \
+            The upload waited up to 5 seconds for the delete to finish and committed nothing; retry the upload.", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
@@ -9894,6 +9888,22 @@ pub async fn upload_artifact(
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+
+    // #4186: refuse a conditional PUT whose precondition already fails
+    // before reading its body. Not authoritative (the publishing transaction
+    // re-evaluates it with the row locked), but it spares a client that lost
+    // a compare-and-swap the upload of a body that would be thrown away.
+    if let Some(precondition) = parse_write_precondition(&headers).map_err(|e| e.into_response())? {
+        let current =
+            crate::services::artifact_service::current_live_checksum(&state.db, repo.id, &path)
+                .await
+                .map_err(|e| e.into_response())?;
+        if !precondition.holds(current.as_deref()) {
+            return Err(
+                crate::services::artifact_service::WritePrecondition::failed(&path).into_response(),
+            );
+        }
+    }
 
     // Stream the request body into staging, computing SHA-256/SHA-1/MD5 in a
     // single pass — the whole artifact is never buffered in memory (#2517).
@@ -9930,15 +9940,142 @@ pub async fn upload_artifact(
     .await
 }
 
-/// A generic upload body after staging: a local scratch file, or an object on
-/// the repository's own backend (#3916).
-enum GenericStagedBody {
+/// Parse the `If-Match` / `If-None-Match` preconditions of a generic write
+/// (#4186). `Ok(None)` for an unconditional write. A header that is present
+/// but not a valid `*` / entity-tag list is a 400: ignoring it would turn the
+/// client's compare-and-swap into a blind overwrite.
+fn parse_write_precondition(
+    headers: &HeaderMap,
+) -> Result<Option<crate::services::artifact_service::WritePrecondition>> {
+    use crate::services::artifact_service::{EntityTagCondition, WritePrecondition};
+    let parse = |name: header::HeaderName| -> Result<Option<EntityTagCondition>> {
+        let values: Vec<&str> = headers
+            .get_all(&name)
+            .iter()
+            .map(|v| v.to_str())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| AppError::Validation(format!("Invalid {name} header")))?;
+        if values.is_empty() {
+            return Ok(None);
+        }
+        // Repeated headers are one comma-separated list (RFC 9110 5.3).
+        EntityTagCondition::parse(&values.join(","))
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::Validation(format!(
+                    "Invalid {name} header: expected * or a list of quoted entity tags"
+                ))
+            })
+    };
+    Ok(WritePrecondition::new(
+        parse(header::IF_MATCH)?,
+        parse(header::IF_NONE_MATCH)?,
+    ))
+}
+
+/// The strong `ETag` of a stored artifact: its recorded SHA-256, quoted
+/// (#4186). The value conditional writes compare against.
+pub(crate) fn artifact_etag(checksum_sha256: &str) -> String {
+    format!("\"{}\"", checksum_sha256.trim())
+}
+
+/// An upload body after staging: a local scratch file, or an object on the
+/// repository's own backend (#3916). Shared by the generic upload routes and
+/// the single-PUT format routes that stage the same way (Maven).
+pub(crate) enum GenericStagedBody {
     Local(proxy_helpers::StagedUpload),
     Backend(proxy_helpers::BackendStagedUpload),
 }
 
+/// How a staged body reaches its final key: re-read from local scratch and
+/// streamed, or copied server-side from the staging object.
+pub(crate) enum StagedWrite {
+    Stream(futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>),
+    Copy(String),
+}
+
+impl StagedWrite {
+    /// Write the staged bytes to `key` on `storage` (the backend the body was
+    /// staged on, for a backend-staged body).
+    pub(crate) async fn write(
+        self,
+        storage: &dyn crate::storage::StorageBackend,
+        key: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Stream(stream) => storage.put_stream(key, stream).await.map(|_| ()),
+            Self::Copy(staged_key) => storage.copy(&staged_key, key).await,
+        }
+    }
+}
+
+/// Whether a single upload into `repo` stages its body on the repository's
+/// own backend instead of local scratch (#3916): the backend must stream
+/// natively (`StorageBackend::supports_streamed_assembly`, S3, GCS and Azure
+/// today), the same capability bit chunked completion keys on. A filesystem
+/// repository and any backend without native streaming spool locally.
+pub(crate) fn stages_on_backend(
+    storage_backend: &str,
+    storage: &dyn crate::storage::StorageBackend,
+) -> bool {
+    storage_backend != "filesystem" && storage.supports_streamed_assembly()
+}
+
 impl GenericStagedBody {
-    fn size_bytes(&self) -> i64 {
+    /// Stage `stream` on the repository's backend at `location` when
+    /// `on_backend`, else in local scratch, computing SHA-256 / SHA-1 / MD5 in
+    /// the same pass either way.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn stage<S, E>(
+        state: &SharedState,
+        location: &crate::storage::StorageLocation,
+        on_backend: bool,
+        stream: S,
+    ) -> std::result::Result<(Self, crate::services::artifact_service::ContentDigests), Response>
+    where
+        S: futures::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
+        E: std::error::Error + 'static,
+    {
+        if on_backend {
+            let (staged, digests) =
+                proxy_helpers::stage_stream_on_backend(state, location, stream).await?;
+            Ok((Self::Backend(staged), digests))
+        } else {
+            let (staged, digests) =
+                proxy_helpers::stage_stream_content_addressed(state, stream).await?;
+            Ok((Self::Local(staged), digests))
+        }
+    }
+
+    /// How the staged bytes reach their final key. Opening a local scratch
+    /// file can fail; a backend copy is prepared without I/O.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn prepare_write(&self) -> std::result::Result<StagedWrite, Response> {
+        Ok(match self {
+            Self::Local(staged) => {
+                StagedWrite::Stream(proxy_helpers::open_staged_upload_stream(staged).await?)
+            }
+            Self::Backend(staged) => StagedWrite::Copy(staged.key().to_string()),
+        })
+    }
+
+    /// Read the whole staged body into memory, for a small document a
+    /// handler parses (a Maven POM). `storage` is the backend the body was
+    /// staged on.
+    pub(crate) async fn read_all(
+        &self,
+        storage: &dyn crate::storage::StorageBackend,
+    ) -> Result<bytes::Bytes> {
+        match self {
+            Self::Local(staged) => tokio::fs::read(staged.path())
+                .await
+                .map(bytes::Bytes::from)
+                .map_err(AppError::from),
+            Self::Backend(staged) => storage.get(staged.key()).await,
+        }
+    }
+
+    pub(crate) fn size_bytes(&self) -> i64 {
         match self {
             Self::Local(staged) => staged.size_bytes(),
             Self::Backend(staged) => staged.size_bytes(),
@@ -9972,7 +10109,7 @@ impl GenericStagedBody {
     }
 
     /// Release the staging copy once the service has consumed it.
-    async fn discard(self) {
+    pub(crate) async fn discard(self) {
         match self {
             Self::Local(staged) => drop(staged),
             Self::Backend(staged) => staged.discard().await,
@@ -9981,9 +10118,9 @@ impl GenericStagedBody {
 }
 
 /// Where a generic upload's body is staged (#3916): on the repository's own
-/// object-storage backend, unless the repository is filesystem-backed or a
-/// downstream consumer reads the body as a local file -- the RPM header parse
-/// (#3801) or a WASM format plugin (#2517 plugin-input decision).
+/// object-storage backend when it streams natively ([`stages_on_backend`]),
+/// unless a downstream consumer reads the body as a local file -- the RPM
+/// header parse (#3801) or a WASM format plugin (#2517 plugin-input decision).
 struct GenericStagingPlan {
     format: crate::models::repository::RepositoryFormat,
     location: Option<crate::storage::StorageLocation>,
@@ -9998,7 +10135,10 @@ impl GenericStagingPlan {
         repo_service: &RepositoryService,
         repo: &crate::models::repository::Repository,
     ) -> std::result::Result<Self, Response> {
-        let object_storage = repo.storage_backend != "filesystem";
+        let storage = state
+            .storage_for_repo(&repo.storage_location())
+            .map_err(|e| e.into_response())?;
+        let object_storage = stages_on_backend(&repo.storage_backend, storage.as_ref());
         let plugin = object_storage && repo_has_wasm_format(state, repo_service, repo).await?;
         Ok(Self {
             format: repo.format.clone(),
@@ -10196,6 +10336,10 @@ async fn persist_generic_staged_upload(
     )
     .map_err(|e| e.into_response())?;
 
+    // #4186: the preconditions travel to the service, which re-evaluates
+    // them with the target row locked in the publishing transaction.
+    let precondition = parse_write_precondition(headers).map_err(|e| e.into_response())?;
+
     // #3801: an `.rpm` pushed into an RPM repository through this generic
     // endpoint gets the same header parse as the native and chunked paths —
     // on the blocking pool, BEFORE anything is stored — so a header over the
@@ -10354,6 +10498,7 @@ async fn persist_generic_staged_upload(
             Some(auth.user_id),
             !is_replication_request(headers),
             None,
+            precondition.as_ref(),
         )
         .await;
     // The staging copy is no longer needed once the service has consumed it,
@@ -10386,8 +10531,10 @@ async fn persist_generic_staged_upload(
         (None, None)
     };
 
+    let etag = artifact_etag(&artifact.checksum_sha256);
     Ok((
         StatusCode::CREATED,
+        [(header::ETAG, etag)],
         Json(ArtifactResponse {
             id: artifact.id,
             repository_key: key,
@@ -10841,6 +10988,7 @@ fn slice_byte_stream(
 /// `base_headers` are applied to the `200` and `206` responses; `416` carries
 /// only `Accept-Ranges` and `Content-Range` (no body). The helper always
 /// advertises `Accept-Ranges: bytes`, so clients know they may resume.
+/// Unverified; see [`ranged_stream_response_advertised`] (#4323).
 pub(crate) fn ranged_stream_response(
     range_header: Option<&str>,
     total: u64,
@@ -10848,6 +10996,65 @@ pub(crate) fn ranged_stream_response(
     base_headers: Vec<(header::HeaderName, String)>,
 ) -> Result<Response> {
     ranged_stream_response_verified(range_header, total, body, base_headers, None)
+}
+
+/// [`ranged_stream_response`] that verifies a whole-object serve against the
+/// SHA-256 the response itself advertises (#4323): `X-Checksum-Sha256`, or a
+/// `sha256:` `Docker-Content-Digest`. Skipped when the response declares a
+/// `Content-Encoding` (the digest then names the decoded bytes) or
+/// `DOWNLOAD_VERIFY_CHECKSUMS=false`. The status is already decided here, so
+/// a mismatch aborts the body before its last chunk; callers that can await
+/// first use [`ranged_stream_response_checked`] to answer a small object's
+/// mismatch with a `502` instead.
+pub(crate) fn ranged_stream_response_advertised(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    base_headers: Vec<(header::HeaderName, String)>,
+) -> Result<Response> {
+    let verify = crate::storage::verify::serve_verification_enabled()
+        .then(|| crate::storage::verify::advertised_sha256(&base_headers))
+        .flatten()
+        .map(|expected_sha256| ServeVerification {
+            expected_sha256,
+            label: format!("sha256:{}", hex::encode(expected_sha256)),
+        });
+    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
+}
+
+/// Whether `range_header` asks for every byte of a `total`-byte object (no
+/// range, an unparseable one, or a satisfiable range covering all of it).
+fn range_is_whole_object(range_header: Option<&str>, total: u64) -> bool {
+    match parse_byte_range(range_header, total) {
+        RangeOutcome::Full => true,
+        RangeOutcome::Satisfiable { start, end } => start == 0 && end + 1 == total,
+        RangeOutcome::Unsatisfiable => false,
+    }
+}
+
+/// [`ranged_stream_response_verified`] that verifies a small whole-object
+/// serve BEFORE the status is chosen (#4323): an object of at most
+/// [`crate::storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES`] that fails
+/// verification is answered `502 STORED_OBJECT_INTEGRITY` with no body, not
+/// a `200` cut short. Larger objects keep the streaming verifier. A HEAD
+/// (`is_head`) reads nothing.
+pub(crate) async fn ranged_stream_response_checked(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    base_headers: Vec<(header::HeaderName, String)>,
+    verify: Option<ServeVerification>,
+    is_head: bool,
+) -> Result<Response> {
+    let (body, verify) = match verify {
+        Some(v) if !is_head && range_is_whole_object(range_header, total) => (
+            crate::storage::verify::verify_before_serve(body, v.expected_sha256, total, v.label)
+                .await?,
+            None,
+        ),
+        other => (body, other),
+    };
+    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
 }
 
 /// What a full-body (`200`) serve should verify the streamed bytes against
@@ -10972,6 +11179,7 @@ async fn download_artifact_version(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", download_filename(path)),
         ),
+        (header::ETAG, artifact_etag(&checksum)),
         (
             header::HeaderName::from_static("x-checksum-sha256"),
             checksum,
@@ -11003,7 +11211,7 @@ async fn download_artifact_version(
         format!("{repo_id}/{path}@{}", stored.revision)
     });
     let body = artifact_service.download_version_stream(&stored).await?;
-    ranged_stream_response_verified(range_header, total, body, base_headers, verify)
+    ranged_stream_response_checked(range_header, total, body, base_headers, verify, is_head).await
 }
 
 /// What the generic download route does with a proxied file of a format whose
@@ -11139,10 +11347,12 @@ async fn generic_route_virtual_refusal(
         ArtifactVersionQuery,
     ),
     responses(
-        (status = 200, description = "Artifact binary content", content_type = "application/octet-stream"),
+        (status = 200, description = "Artifact binary content. A hosted artifact carries `ETag: \"<sha256>\"` (its recorded SHA-256, the value `If-Match` on the generic PUT compares against) and `X-Checksum-Sha256`.", content_type = "application/octet-stream",
+            headers(("ETag" = String, description = "Strong entity tag: the quoted SHA-256 of the artifact"))),
         (status = 302, description = "Redirect to S3 presigned URL"),
         (status = 403, description = "A proxied file of a scan-on-proxy enforced format, in a Remote or Virtual repository that scans on proxy: download it through the format's own route (`error: scan_on_proxy_route_required`)"),
         (status = 404, description = "Artifact not found"),
+        (status = 502, description = "The stored object no longer matches its recorded SHA-256 (`code: STORED_OBJECT_INTEGRITY`, #4323). Objects up to 4 MiB are checked before any byte is sent; a larger corrupted object is aborted before its last bytes instead. Set `DOWNLOAD_VERIFY_CHECKSUMS=false` to turn verification off.", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "The repository's scan-on-proxy configuration could not be read"),
     )
 )]
@@ -11387,6 +11597,8 @@ pub async fn download_artifact(
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{}\"", download_filename(&path)),
                 ),
+                // #4186: the strong ETag conditional writes compare against.
+                (header::ETAG, artifact_etag(&checksum)),
                 (
                     header::HeaderName::from_static("x-checksum-sha256"),
                     checksum,
@@ -11405,8 +11617,15 @@ pub async fn download_artifact(
                 &artifact.checksum_sha256,
                 || format!("{key}/{path}"),
             );
-            let response =
-                ranged_stream_response_verified(range_header, total, body, base_headers, verify)?;
+            let response = ranged_stream_response_checked(
+                range_header,
+                total,
+                body,
+                base_headers,
+                verify,
+                is_head,
+            )
+            .await?;
             Ok(response)
         }
         Err(AppError::NotFound(_)) if repo.repo_type == RepositoryType::Remote => {
@@ -11536,7 +11755,7 @@ pub async fn download_artifact(
             }
             let db = state.db.clone();
             let path_clone = path.clone();
-            let result = proxy_helpers::resolve_virtual_download_from_members(
+            let result = match proxy_helpers::resolve_virtual_download_from_members(
                 members,
                 proxy_for_virtual,
                 &path,
@@ -11552,7 +11771,15 @@ pub async fn download_artifact(
                 },
             )
             .await
-            .map_err(|_| not_found())?;
+            {
+                Ok(result) => result,
+                // #4323: a member whose stored bytes failed verification is
+                // answered as such (502), not as a miss.
+                Err(resp) if crate::storage::verify::is_integrity_failure(&resp) => {
+                    return Ok(resp)
+                }
+                Err(_) => return Err(not_found()),
+            };
 
             // #2398 (sibling of #2394): this arm is only reached when
             // `download_stream` returned NotFound for the virtual repo
@@ -13590,9 +13817,11 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_conda_allowlist,
         set_conda_allowlist,
         delete_conda_allowlist,
+        delete_job::get_repository_deletion,
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
+        delete_job::RepositoryDeleteJobResponse,
         ListRepositoriesQuery,
         CreateRepositoryRequest,
         UpdateRepositoryRequest,
@@ -20275,6 +20504,116 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    /// #3916: a Maven PUT into an object-storage repository stages its body on
+    /// the repository's backend, as a generic PUT does, instead of a local
+    /// scratch file. Proven the same way: local scratch is unusable
+    /// (STORAGE_PATH sits under a regular file). Before the change the jar and
+    /// the POM failed on the scratch spool (503); now both land byte-exact at
+    /// their keys, the POM's metadata is parsed from the staged object, and no
+    /// staging object or tracking row is left.
+    #[tokio::test]
+    async fn maven_put_into_object_storage_repo_needs_no_local_scratch_3916_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mut state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let blocker = std::env::temp_dir().join(format!("ak-3916-mvn-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("freshly built state is unshared")
+            .config
+            .storage_path = blocker.join("storage").to_string_lossy().into_owned();
+        let router = tdh::router_with_auth(
+            crate::api::handlers::maven::router(),
+            state,
+            tdh::admin_auth(user_id, &username),
+        );
+
+        let jar = Bytes::from(vec![7u8; 3 * 1024 * 1024 + 11]);
+        let pom = Bytes::from_static(
+            br#"<project><modelVersion>4.0.0</modelVersion><groupId>com.acme.big</groupId><artifactId>big</artifactId><version>2.0</version><description>staged on the backend</description></project>"#,
+        );
+        for (file, body) in [("big-2.0.jar", &jar), ("big-2.0.pom", &pom)] {
+            let (status, resp) = tdh::send(
+                router.clone(),
+                tdh::put(
+                    format!("/{repo_key}/com/acme/big/big/2.0/{file}"),
+                    body.clone(),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{file}: a Maven PUT into an S3-backed repository must not need local scratch: {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+
+        let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT a.path, a.storage_key, am.metadata FROM artifacts a \
+             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 ORDER BY a.path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("artifact rows");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert_eq!(objects.get(&rows[0].1), Some(&jar), "jar bytes at its key");
+            assert_eq!(objects.get(&rows[1].1), Some(&pom), "POM bytes at its key");
+            assert!(
+                !objects
+                    .keys()
+                    .any(|k| k.starts_with(proxy_helpers::GENERIC_UPLOAD_STAGING_PREFIX)),
+                "no staging object may be left, got {:?}",
+                objects.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            rows[1].2.as_ref().and_then(|m| m.get("description")),
+            Some(&serde_json::json!("staged on the backend")),
+            "the POM is parsed from the staged object"
+        );
+        // The tracking row goes with the staging object (deleted in the
+        // background when a branch drops its handle).
+        let mut tracked = 1_i64;
+        for _ in 0..50 {
+            tracked = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM generic_upload_staging WHERE storage_path = $1",
+            )
+            .bind(&repo_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count staging rows");
+            if tracked == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            tracked, 0,
+            "the staging tracking rows must go with the objects"
+        );
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
     /// #3916: both multipart upload routes into an object-storage repository
     /// stage the file field on the repository's backend, like the raw `PUT`,
     /// instead of a local scratch file. Proven the same way: local scratch is
@@ -22632,6 +22971,14 @@ mod tests {
             ok.is_ok(),
             "delete_repository must admit a repository-owner: {ok:?}"
         );
+        // #4311: the delete runs as a job; wait for it.
+        let job_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM repository_delete_jobs WHERE repository_id = $1")
+                .bind(del_id)
+                .fetch_one(&pool)
+                .await
+                .expect("job row");
+        delete_job::run_to_completion(&state(), job_id).await;
         assert!(!row_exists(del_id).await, "owner delete removes the row");
 
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
@@ -25391,10 +25738,26 @@ mod tests {
         Some((status, checksum, body))
     }
 
+    /// Assert the #4323 answer to a corrupted small object: `502
+    /// STORED_OBJECT_INTEGRITY`, no digest header, none of the stored bytes.
+    fn assert_integrity_502_4323(
+        status: axum::http::StatusCode,
+        checksum: Option<String>,
+        body: std::result::Result<Bytes, axum::Error>,
+        what: &str,
+    ) {
+        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{what}");
+        assert!(checksum.is_none(), "{what}: a 502 vouches for no digest");
+        let body = body.expect("the 502 body is complete");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+        assert_eq!(json["code"], "STORED_OBJECT_INTEGRITY", "{what}");
+    }
+
     /// #3919: a stored object whose bytes no longer match the recorded
     /// SHA-256 (one byte flipped on disk) must not be delivered as a complete
-    /// body under the original `X-Checksum-Sha256`. The header is already on
-    /// the wire, so the body is aborted instead of completing.
+    /// body under the original `X-Checksum-Sha256`. #4323: a small object is
+    /// checked before the status is sent, so it is a 502 with none of its
+    /// bytes rather than a 200 whose body is aborted.
     #[tokio::test]
     async fn test_download_corrupted_blob_is_not_served_complete_3919() {
         let Some((status, checksum, body)) =
@@ -25403,12 +25766,7 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(checksum.is_some());
-        assert!(
-            body.is_err(),
-            "a corrupted object must abort the body, not serve it complete: {body:?}"
-        );
+        assert_integrity_502_4323(status, checksum, body, "corrupted");
     }
 
     /// #3919 companion: an intact object with a real recorded SHA-256 still
@@ -25446,11 +25804,8 @@ mod tests {
             else {
                 return;
             };
-            assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT, "{range}");
-            assert!(
-                body.is_err(),
-                "{range}: whole-object 206 must abort: {body:?}"
-            );
+            // #4323: checked before the status, like the 200 path.
+            assert_integrity_502_4323(status, None, body, range);
         }
         let Some((status, _, body)) = download_with_recorded_sha_range_3919(
             b"original-artifact-bytes",
@@ -25482,11 +25837,8 @@ mod tests {
             else {
                 return;
             };
-            assert_eq!(status, axum::http::StatusCode::OK);
-            assert!(
-                body.is_err(),
-                "an oversized object must abort, not serve a clean prefix: {body:?}"
-            );
+            // #4323: a 502, not a clean prefix.
+            assert_integrity_502_4323(status, None, body, "oversized");
         }
     }
 
@@ -25503,8 +25855,7 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
-        assert!(body.is_err(), "{body:?}");
+        assert_integrity_502_4323(status, None, body, "oversized whole range");
     }
 
     #[test]
@@ -26661,15 +27012,30 @@ mod tests {
         let mut auth = tdh::make_auth(fx.user_id, &fx.username);
         auth.is_admin = true;
 
+        // #4311: the request only enqueues the job; the job's repository-row
+        // delete is what the trigger blocks, on every retry until the job is
+        // marked failed.
         let res = delete_repository(
             State(fx.state.clone()),
             Extension(Some(auth)),
             Path(fx.repo_key.clone()),
         )
-        .await;
+        .await
+        .expect("the delete request is accepted");
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let job_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM repository_delete_jobs WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("job row");
+        let job = delete_job::run_to_completion(&fx.state, job_id).await;
+        assert_eq!(job.status, "failed", "{job:?}");
         assert!(
-            res.is_err(),
-            "the repository delete must fail (blocking trigger present)"
+            job.error_summary
+                .as_deref()
+                .is_some_and(|e| e.contains("ph blocked repo delete")),
+            "{job:?}"
         );
 
         assert!(
@@ -26932,6 +27298,208 @@ mod tests {
             .await
             .expect("delete other repo");
         fx.teardown().await;
+    }
+
+    /// #4311: the repository-delete purge decides per key, immediately before
+    /// the delete. Repository A is deleted on a shared cloud namespace while
+    /// repository B, on the same backend, receives an upload of identical
+    /// content after A's keys were collected but before they are purged: the
+    /// upload deduplicates against A's object and commits B's row. The purge
+    /// must keep that object. Before the fix it deleted every key judged
+    /// unshared at collection time, so B's artifact lost its bytes.
+    #[tokio::test]
+    async fn repository_delete_purge_keeps_an_object_uploaded_into_another_repository_meanwhile_4311(
+    ) {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = ANY($1)",
+        )
+        .bind(vec![repo_a, repo_b])
+        .execute(&pool)
+        .await
+        .expect("put both repositories on one bucket");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: String::new(),
+        };
+        let storage = state.storage_for_repo(&location).expect("s3 storage");
+        let body = bytes::Bytes::from(format!("identical bytes {}", Uuid::new_v4()));
+        let service = state.create_artifact_service(storage.clone());
+        let a = service
+            .upload(
+                repo_a,
+                "tool/1.0/tool.bin",
+                "tool.bin",
+                None,
+                "application/octet-stream",
+                body.clone(),
+                Some(user_id),
+            )
+            .await
+            .expect("upload into A");
+        let key = a.storage_key.clone();
+
+        // The delete collects A's keys while A is the only holder ...
+        let collected = collect_repo_artifact_object_keys(&state, repo_a, &location).await;
+        assert!(
+            collected.contains(&key),
+            "A's object is A's alone at collection time"
+        );
+        state
+            .create_repository_service()
+            .delete(repo_a)
+            .await
+            .expect("delete repository A");
+
+        // ... then the same bytes arrive in B, deduplicating against the
+        // object A's purge is about to remove ...
+        let b = service
+            .upload(
+                repo_b,
+                "copy/1.0/copy.bin",
+                "copy.bin",
+                None,
+                "application/octet-stream",
+                body.clone(),
+                Some(user_id),
+            )
+            .await
+            .expect("upload into B");
+        assert_eq!(b.storage_key, key, "content-addressed: one object");
+
+        // ... and A's purge runs.
+        purge_storage_object_keys(&state, repo_a, &location, collected).await;
+
+        let kept = mem.objects.lock().unwrap().get(&key).cloned();
+        let downloaded = service
+            .download(repo_b, "copy/1.0/copy.bin", None, None, None)
+            .await;
+        tdh::cleanup(&pool, repo_b, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        assert_eq!(
+            kept.as_ref(),
+            Some(&body),
+            "the purge must keep an object another repository committed a row for after collection"
+        );
+        assert!(
+            downloaded.is_ok(),
+            "B's artifact must still download: {downloaded:?}"
+        );
+    }
+
+    /// #4311: an object no other repository references is still purged, and
+    /// leaves no journal row behind; one that another repository references
+    /// is kept and its journal row stays for storage GC, without a lease that
+    /// would hold uploads of that content.
+    #[tokio::test]
+    async fn repository_delete_purge_journals_and_rechecks_each_key_4311() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = '' WHERE id = ANY($1)",
+        )
+        .bind(vec![repo_a, repo_b])
+        .execute(&pool)
+        .await
+        .expect("one bucket");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".to_string(),
+            path: String::new(),
+        };
+        let storage = state.storage_for_repo(&location).expect("s3 storage");
+        let service = state.create_artifact_service(storage.clone());
+        let own = bytes::Bytes::from(format!("only in A {}", Uuid::new_v4()));
+        let shared = bytes::Bytes::from(format!("in A and B {}", Uuid::new_v4()));
+        let own_key = service
+            .upload(
+                repo_a,
+                "own.bin",
+                "own.bin",
+                None,
+                "application/octet-stream",
+                own,
+                Some(user_id),
+            )
+            .await
+            .expect("own")
+            .storage_key;
+        let shared_key = service
+            .upload(
+                repo_a,
+                "shared.bin",
+                "shared.bin",
+                None,
+                "application/octet-stream",
+                shared.clone(),
+                Some(user_id),
+            )
+            .await
+            .expect("shared in A")
+            .storage_key;
+        service
+            .upload(
+                repo_b,
+                "shared.bin",
+                "shared.bin",
+                None,
+                "application/octet-stream",
+                shared,
+                Some(user_id),
+            )
+            .await
+            .expect("shared in B");
+        state
+            .create_repository_service()
+            .delete(repo_a)
+            .await
+            .expect("delete A");
+
+        let keys: std::collections::BTreeSet<String> =
+            [own_key.clone(), shared_key.clone()].into_iter().collect();
+        purge_storage_object_keys(&state, repo_a, &location, keys).await;
+
+        let (own_left, shared_left) = {
+            let objects = mem.objects.lock().unwrap();
+            (
+                objects.contains_key(&own_key),
+                objects.contains_key(&shared_key),
+            )
+        };
+        let journal: Vec<(String, Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT storage_key, source_repository_id, leased_at IS NOT NULL \
+               FROM oci_gc_candidates WHERE storage_key = ANY($1) ORDER BY storage_key",
+        )
+        .bind(vec![own_key.clone(), shared_key.clone()])
+        .fetch_all(&pool)
+        .await
+        .expect("journal rows");
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE storage_key = ANY($1)")
+            .bind(vec![own_key.clone(), shared_key.clone()])
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_b, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+
+        assert!(!own_left, "an object only A held is purged");
+        assert!(shared_left, "an object B still references is kept");
+        assert_eq!(
+            journal,
+            vec![(shared_key, Some(repo_a), false)],
+            "only the kept key stays journaled, as a waiting candidate (no lease)"
+        );
     }
 
     /// #4833: on `filesystem` every repository roots its own tree, so two
@@ -28057,7 +28625,7 @@ mod tests {
         ] {
             assert!(generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
-        for format in [Generic, Github, Helm, Hex, Debian] {
+        for format in [Generic, Github, Helm, Hex, Cran] {
             assert!(!generic_route_checks_scan_on_proxy(&format), "{format:?}");
         }
     }
@@ -37036,5 +37604,657 @@ mod npm_cached_packument_listing_tests {
             .collect();
         assert_eq!(paths, vec![TARBALL], "{json}");
         assert_eq!(json["pagination"]["total"], 1, "{json}");
+    }
+}
+
+/// #4186 conditional generic writes and #4323 serve-time verification.
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt, it buffers bounded response bodies only to assert on them (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod conditional_put_and_serve_verification_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn sha(body: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(body))
+    }
+
+    fn quoted(body: &[u8]) -> String {
+        format!("\"{}\"", sha(body))
+    }
+
+    fn put_with(uri: String, body: Bytes, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder().method("PUT").uri(uri);
+        for (name, value) in headers {
+            b = b.header(*name, *value);
+        }
+        b.body(Body::from(body)).expect("build PUT")
+    }
+
+    struct Fx {
+        pool: sqlx::PgPool,
+        state: crate::api::SharedState,
+        mem: Arc<tdh::MemStorage>,
+        user_id: Uuid,
+        username: String,
+        repos: Vec<(Uuid, std::path::PathBuf)>,
+    }
+
+    impl Fx {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+            Some(Self {
+                pool,
+                state,
+                mem,
+                user_id,
+                username,
+                repos: Vec::new(),
+            })
+        }
+
+        /// A repository of `repo_type`/`format` on the in-memory s3 backend.
+        async fn repo(
+            &mut self,
+            repo_type: &str,
+            format: &str,
+            versioning: bool,
+        ) -> (Uuid, String) {
+            let (id, key, dir) = tdh::create_repo(&self.pool, repo_type, format).await;
+            sqlx::query(
+                "UPDATE repositories SET storage_backend = 's3', storage_path = key, \
+                 versioning_enabled = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(versioning)
+            .execute(&self.pool)
+            .await
+            .expect("configure repo");
+            self.repos.push((id, dir));
+            (id, key)
+        }
+
+        fn router(&self) -> axum::Router {
+            tdh::router_with_auth(
+                super::router().merge(super::download_router()),
+                self.state.clone(),
+                tdh::admin_auth(self.user_id, &self.username),
+            )
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            path: &str,
+            body: &'static [u8],
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+            tdh::send_with_headers(
+                self.router(),
+                put_with(
+                    format!("/{key}/artifacts/{path}"),
+                    Bytes::from_static(body),
+                    headers,
+                ),
+            )
+            .await
+        }
+
+        /// GET the download route; the body is read only for a 2xx.
+        async fn download(&self, key: &str, path: &str) -> (StatusCode, Option<Bytes>, Bytes) {
+            let resp = tower::ServiceExt::oneshot(
+                self.router(),
+                tdh::get(format!("/{key}/download/{path}")),
+            )
+            .await
+            .expect("oneshot");
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024).await;
+            match body {
+                Ok(b) if status.is_success() => (status, Some(b.clone()), b),
+                Ok(b) => (status, None, b),
+                // A body aborted mid-stream: the status was already sent.
+                Err(_) => (status, None, Bytes::new()),
+            }
+        }
+
+        async fn live_checksum(&self, repo_id: Uuid, path: &str) -> Option<String> {
+            sqlx::query_scalar::<_, String>(
+                "SELECT checksum_sha256 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND NOT is_deleted",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await
+            .expect("live row")
+            .map(|c| c.trim().to_string())
+        }
+
+        /// Overwrite the stored object of `(repo_id, path)` with `bytes`.
+        async fn corrupt(&self, repo_id: Uuid, path: &str, bytes: &'static [u8]) {
+            let key: String = sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_one(&self.pool)
+            .await
+            .expect("storage key");
+            self.mem
+                .objects
+                .lock()
+                .unwrap()
+                .insert(key, Bytes::from_static(bytes));
+        }
+
+        async fn teardown(self) {
+            for (id, dir) in &self.repos {
+                let _ =
+                    sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+                tdh::cleanup_member_repo(&self.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(self.user_id)
+                .execute(&self.pool)
+                .await;
+        }
+    }
+
+    fn code_of(body: &Bytes) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// #4186: `If-None-Match: *` creates only when the path is free; a second
+    /// one is a 412, not the unconditional 409. The 201 carries the ETag.
+    #[tokio::test]
+    async fn if_none_match_star_creates_once_then_412_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+
+        let (first, _, headers) = fx
+            .put(&key, "index.yaml", b"v1", &[("if-none-match", "*")])
+            .await;
+        let (second, body, _) = fx
+            .put(&key, "index.yaml", b"v2", &[("if-none-match", "*")])
+            .await;
+        let current = fx.live_checksum(repo_id, "index.yaml").await;
+        fx.teardown().await;
+
+        assert_eq!(first, StatusCode::CREATED);
+        assert_eq!(
+            headers.get("etag").and_then(|v| v.to_str().ok()),
+            Some(quoted(b"v1").as_str()),
+            "the 201 must carry the new strong ETag"
+        );
+        assert_eq!(
+            second,
+            StatusCode::PRECONDITION_FAILED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(code_of(&body), "PRECONDITION_FAILED");
+        assert_eq!(current.as_deref(), Some(sha(b"v1").as_str()));
+    }
+
+    /// #4186: a matching `If-Match` replaces the live artifact (the
+    /// compare-and-swap an index document needs); a stale one is a 412 and
+    /// leaves the stored bytes alone. The download serves the new ETag.
+    #[tokio::test]
+    async fn if_match_replaces_on_match_and_refuses_stale_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+
+        let (created, _, _) = fx.put(&key, "index.yaml", b"v1", &[]).await;
+        let v1 = quoted(b"v1");
+        let (swapped, swap_body, _) = fx
+            .put(&key, "index.yaml", b"v2", &[("if-match", &v1)])
+            .await;
+        let (stale, stale_body, _) = fx
+            .put(&key, "index.yaml", b"v3", &[("if-match", &v1)])
+            .await;
+        let (dl, bytes, dl_headers) = {
+            let resp = tower::ServiceExt::oneshot(
+                fx.router(),
+                tdh::get(format!("/{key}/download/index.yaml")),
+            )
+            .await
+            .expect("download");
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("body");
+            (status, body, headers)
+        };
+        let candidate: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_gc_candidates WHERE source_repository_id = $1 \
+             AND storage_key = $2",
+        )
+        .bind(repo_id)
+        .bind(
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&sha(
+                b"v1",
+            )),
+        )
+        .fetch_one(&fx.pool)
+        .await
+        .expect("candidates");
+        fx.teardown().await;
+
+        assert_eq!(created, StatusCode::CREATED);
+        assert_eq!(
+            swapped,
+            StatusCode::CREATED,
+            "a matching If-Match must replace: {}",
+            String::from_utf8_lossy(&swap_body)
+        );
+        assert_eq!(
+            stale,
+            StatusCode::PRECONDITION_FAILED,
+            "{}",
+            String::from_utf8_lossy(&stale_body)
+        );
+        assert_eq!(dl, StatusCode::OK);
+        assert_eq!(&bytes[..], b"v2");
+        assert_eq!(
+            dl_headers.get("etag").and_then(|v| v.to_str().ok()),
+            Some(quoted(b"v2").as_str())
+        );
+        assert_eq!(candidate, 1, "the replaced object is handed to storage GC");
+    }
+
+    /// #4186 acceptance: of several conditional PUTs against one ETag exactly
+    /// one wins (2xx) and every other gets 412, and the stored bytes are the
+    /// winner's. Same single-winner shape as #4832.
+    #[tokio::test]
+    async fn racing_if_match_puts_have_one_winner_4186_db() {
+        const RACERS: usize = 8;
+        static BODIES: [&[u8]; RACERS] = [b"r0", b"r1", b"r2", b"r3", b"r4", b"r5", b"r6", b"r7"];
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+        let (created, _, _) = fx.put(&key, "index.yaml", b"base", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        let etag = quoted(b"base");
+
+        let fx = Arc::new(fx);
+        let mut tasks = Vec::new();
+        for body in BODIES {
+            let fx = fx.clone();
+            let key = key.clone();
+            let etag = etag.clone();
+            tasks.push(tokio::spawn(async move {
+                let (status, _, _) = fx
+                    .put(&key, "index.yaml", body, &[("if-match", &etag)])
+                    .await;
+                (status, body)
+            }));
+        }
+        let mut winners = Vec::new();
+        let mut refused = 0;
+        let mut other = Vec::new();
+        for t in tasks {
+            let (status, body) = t.await.expect("racer");
+            match status {
+                StatusCode::CREATED => winners.push(body),
+                StatusCode::PRECONDITION_FAILED => refused += 1,
+                s => other.push(s),
+            }
+        }
+        let current = fx.live_checksum(repo_id, "index.yaml").await;
+        let fx = Arc::into_inner(fx).expect("racers done");
+        fx.teardown().await;
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one winner, other statuses: {other:?}"
+        );
+        assert_eq!(
+            refused,
+            RACERS - 1,
+            "every loser gets 412, other: {other:?}"
+        );
+        assert_eq!(current.as_deref(), Some(sha(winners[0]).as_str()));
+    }
+
+    /// #4186: racing `If-None-Match: *` creates on a free path: one 201, the
+    /// rest 412 (unconditional racers get 409, #4832).
+    #[tokio::test]
+    async fn racing_if_none_match_creates_have_one_winner_4186_db() {
+        const RACERS: usize = 16;
+        static BODIES: [&[u8]; RACERS] = [
+            b"c0", b"c1", b"c2", b"c3", b"c4", b"c5", b"c6", b"c7", b"c8", b"c9", b"ca", b"cb",
+            b"cc", b"cd", b"ce", b"cf",
+        ];
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (_, key) = fx.repo("local", "generic", false).await;
+        let fx = Arc::new(fx);
+        let mut tasks = Vec::new();
+        for body in BODIES {
+            let fx = fx.clone();
+            let key = key.clone();
+            tasks.push(tokio::spawn(async move {
+                fx.put(&key, "lock.json", body, &[("if-none-match", "*")])
+                    .await
+                    .0
+            }));
+        }
+        let mut statuses = Vec::new();
+        for t in tasks {
+            statuses.push(t.await.expect("racer"));
+        }
+        let fx = Arc::into_inner(fx).expect("racers done");
+        fx.teardown().await;
+
+        let created = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count();
+        let refused = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::PRECONDITION_FAILED)
+            .count();
+        assert_eq!((created, refused), (1, RACERS - 1), "{statuses:?}");
+    }
+
+    /// #4186: on a versioning-enabled repository a matched `If-Match` appends
+    /// one revision; racers on the same ETag still get one winner.
+    #[tokio::test]
+    async fn versioned_repo_if_match_racers_append_once_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", true).await;
+        let (created, _, _) = fx.put(&key, "tool/tool.bin", b"rev1", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        let etag = quoted(b"rev1");
+        let fx = Arc::new(fx);
+        let a = {
+            let (fx, key, etag) = (fx.clone(), key.clone(), etag.clone());
+            tokio::spawn(async move {
+                fx.put(&key, "tool/tool.bin", b"rev2-a", &[("if-match", &etag)])
+                    .await
+                    .0
+            })
+        };
+        let b = {
+            let (fx, key, etag) = (fx.clone(), key.clone(), etag.clone());
+            tokio::spawn(async move {
+                fx.put(&key, "tool/tool.bin", b"rev2-b", &[("if-match", &etag)])
+                    .await
+                    .0
+            })
+        };
+        let mut statuses = vec![a.await.expect("a"), b.await.expect("b")];
+        statuses.sort();
+        let revisions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_versions WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind("tool/tool.bin")
+        .fetch_one(&fx.pool)
+        .await
+        .expect("revisions");
+        let fx = Arc::into_inner(fx).expect("racers done");
+        fx.teardown().await;
+
+        assert_eq!(
+            statuses,
+            vec![StatusCode::CREATED, StatusCode::PRECONDITION_FAILED]
+        );
+        assert_eq!(revisions, 2, "one base revision plus exactly one appended");
+    }
+
+    /// #4186 controls: an unconditional second PUT keeps its 409; a matched
+    /// `If-Match` cannot swap a released coordinate (a versioned path) for
+    /// different bytes; a malformed precondition is a 400, not ignored.
+    #[tokio::test]
+    async fn preconditions_keep_the_immutability_rules_4186_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (_, key) = fx.repo("local", "generic", false).await;
+        let (a, _, _) = fx.put(&key, "pkg/1.0/pkg.bin", b"one", &[]).await;
+        let (again, _, _) = fx.put(&key, "pkg/1.0/pkg.bin", b"two", &[]).await;
+        let one = quoted(b"one");
+        let (released, released_body, _) = fx
+            .put(&key, "pkg/1.0/pkg.bin", b"two", &[("if-match", &one)])
+            .await;
+        let (malformed, _, _) = fx
+            .put(&key, "free.bin", b"x", &[("if-match", "not-quoted")])
+            .await;
+        let (stale_on_free, _, _) = fx.put(&key, "free.bin", b"x", &[("if-match", &one)]).await;
+        let (weak, _, _) = fx
+            .put(
+                &key,
+                "pkg/1.0/pkg.bin",
+                b"two",
+                &[("if-match", &format!("W/{one}"))],
+            )
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(a, StatusCode::CREATED);
+        assert_eq!(
+            again,
+            StatusCode::CONFLICT,
+            "unconditional writes are unchanged"
+        );
+        assert_eq!(
+            released,
+            StatusCode::CONFLICT,
+            "a released coordinate stays immutable: {}",
+            String::from_utf8_lossy(&released_body)
+        );
+        assert_eq!(malformed, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            stale_on_free,
+            StatusCode::PRECONDITION_FAILED,
+            "If-Match on an absent artifact fails"
+        );
+        assert_eq!(
+            weak,
+            StatusCode::PRECONDITION_FAILED,
+            "If-Match uses the strong comparison"
+        );
+    }
+
+    /// #4323: a small object whose stored bytes no longer match the record is
+    /// answered `502 STORED_OBJECT_INTEGRITY` on the generic download route,
+    /// with none of its bytes, instead of a `200` cut short.
+    #[tokio::test]
+    async fn corrupted_object_is_a_502_on_the_generic_route_4323_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+        let (created, _, _) = fx.put(&key, "a/1/a.bin", b"intact bytes", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        fx.corrupt(repo_id, "a/1/a.bin", b"rotten bytes").await;
+        let (status, ok_body, err_body) = fx.download(&key, "a/1/a.bin").await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "served {:?}",
+            ok_body.map(|b| String::from_utf8_lossy(&b).into_owned())
+        );
+        assert_eq!(code_of(&err_body), "STORED_OBJECT_INTEGRITY");
+    }
+
+    /// #4323: the shared hosted fetch behind the format-native routes and
+    /// every virtual-member serve verifies too. A mismatch is a terminal
+    /// refusal (`is_member_policy_block_response`), so a virtual repository
+    /// answers 502 instead of serving the corrupt member or falling through
+    /// to the next member's bytes.
+    #[tokio::test]
+    async fn corrupted_member_is_a_terminal_502_through_a_virtual_4323_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (first_id, first_key) = fx.repo("local", "generic", false).await;
+        let (_, second_key) = fx.repo("local", "generic", false).await;
+        let (virtual_id, virtual_key) = fx.repo("virtual", "generic", false).await;
+        tdh::link_virtual_member(&fx.pool, virtual_id, first_id, 1).await;
+        let second_id = fx.repos[1].0;
+        tdh::link_virtual_member(&fx.pool, virtual_id, second_id, 2).await;
+        let (a, _, _) = fx
+            .put(&first_key, "shared/x.bin", b"first member", &[])
+            .await;
+        let (b, _, _) = fx
+            .put(&second_key, "shared/x.bin", b"second member", &[])
+            .await;
+        assert_eq!((a, b), (StatusCode::CREATED, StatusCode::CREATED));
+        fx.corrupt(first_id, "shared/x.bin", b"first membe!").await;
+
+        let direct = crate::api::handlers::proxy_helpers::local_fetch_by_path(
+            &fx.pool,
+            &fx.state,
+            first_id,
+            &crate::storage::StorageLocation {
+                backend: "s3".into(),
+                path: first_key.clone(),
+            },
+            "shared/x.bin",
+        )
+        .await;
+        let direct_status = match &direct {
+            Ok(_) => StatusCode::OK,
+            Err(resp) => resp.status(),
+        };
+        let terminal = direct
+            .as_ref()
+            .err()
+            .is_some_and(crate::api::handlers::proxy_helpers::is_member_policy_block_response);
+        drop(direct);
+        let (via_virtual, served, err_body) = fx.download(&virtual_key, "shared/x.bin").await;
+        fx.teardown().await;
+
+        assert_eq!(direct_status, StatusCode::BAD_GATEWAY);
+        assert!(terminal, "an integrity failure must stop the member walk");
+        assert_eq!(
+            via_virtual,
+            StatusCode::BAD_GATEWAY,
+            "served {:?}",
+            served.map(|b| String::from_utf8_lossy(&b).into_owned())
+        );
+        assert_eq!(code_of(&err_body), "STORED_OBJECT_INTEGRITY");
+    }
+
+    /// #4323: a HEAD answered from the artifact row by the shared hosted fetch
+    /// never reads the body, so it is not verified (it would read up to 4 MiB
+    /// of the object for nothing); the GET of the same corrupted object is the
+    /// 502.
+    #[tokio::test]
+    async fn head_from_the_row_does_not_read_or_verify_the_body_4323_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (repo_id, key) = fx.repo("local", "generic", false).await;
+        let (status, _, _) = fx.put(&key, "h/x.bin", b"head body", &[]).await;
+        assert_eq!(status, StatusCode::CREATED);
+        fx.corrupt(repo_id, "h/x.bin", b"head bodY").await;
+        let location = crate::storage::StorageLocation {
+            backend: "s3".into(),
+            path: key.clone(),
+        };
+        let ctx = |is_head| crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head,
+        };
+        let status_of =
+            |r: &std::result::Result<axum::response::Response, axum::response::Response>| match r {
+                Ok(resp) | Err(resp) => resp.status(),
+            };
+        let head = crate::api::handlers::proxy_helpers::local_fetch_or_redirect(
+            &fx.pool,
+            &fx.state,
+            repo_id,
+            &location,
+            "h/x.bin",
+            &ctx(true),
+        )
+        .await;
+        let get = crate::api::handlers::proxy_helpers::local_fetch_or_redirect(
+            &fx.pool,
+            &fx.state,
+            repo_id,
+            &location,
+            "h/x.bin",
+            &ctx(false),
+        )
+        .await;
+        let (head_status, get_status) = (status_of(&head), status_of(&get));
+        drop((head, get));
+        fx.teardown().await;
+        assert_eq!(head_status, StatusCode::OK, "HEAD is answered from the row");
+        assert_eq!(get_status, StatusCode::BAD_GATEWAY, "GET verifies");
+    }
+
+    /// #4323: `ranged_stream_response_advertised` (Incus images) verifies a
+    /// whole-object serve against the digest its own headers advertise, and
+    /// leaves a content-coded body alone.
+    #[tokio::test]
+    async fn ranged_stream_response_verifies_the_advertised_digest_4323() {
+        use axum::http::header;
+        use futures::StreamExt;
+        let good = b"layer bytes".as_slice();
+        let digest = format!("sha256:{}", sha(good));
+        let serve = |body: &'static [u8], extra: Option<(header::HeaderName, String)>| {
+            let mut headers = vec![(
+                header::HeaderName::from_static("docker-content-digest"),
+                digest.clone(),
+            )];
+            headers.extend(extra);
+            let body = futures::stream::iter(vec![Ok(Bytes::from_static(body))]).boxed();
+            super::ranged_stream_response_advertised(None, good.len() as u64, body, headers)
+                .expect("response")
+        };
+        let read = |resp: axum::response::Response| async move {
+            axum::body::to_bytes(resp.into_body(), 1 << 20).await
+        };
+        assert_eq!(
+            &read(serve(b"layer bytes", None)).await.expect("intact")[..],
+            good
+        );
+        assert!(
+            read(serve(b"layer bytez", None)).await.is_err(),
+            "a corrupt whole-object serve must not complete"
+        );
+        assert!(
+            read(serve(
+                b"layer bytez",
+                Some((header::CONTENT_ENCODING, "gzip".into()))
+            ))
+            .await
+            .is_ok(),
+            "a coded body is not the advertised digest's bytes"
+        );
     }
 }
