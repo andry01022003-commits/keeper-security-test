@@ -156,6 +156,7 @@ pub mod webhook_signing;
 pub mod webhook_signing_keys;
 
 // Observability & lifecycle
+pub mod age_gate_maven;
 pub mod age_gate_service;
 pub mod analytics_service;
 pub mod cpe_candidates;

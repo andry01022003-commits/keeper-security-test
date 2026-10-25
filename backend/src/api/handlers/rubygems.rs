@@ -3179,6 +3179,7 @@ mod scan_on_proxy_4104 {
             body: gem("dtf-scanned", "1.0.0"),
             recorded_path: format!("gems/{FILE}"),
             file: FILE.to_string(),
+            pin: None,
         }
     }
 

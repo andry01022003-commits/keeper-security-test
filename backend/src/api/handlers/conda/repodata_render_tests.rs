@@ -82,10 +82,15 @@ async fn reference(
     let in_subdir = artifacts_for_subdir(&all, subdir);
     let full = repodata_document(&in_subdir, subdir, false, &removed);
     let current = repodata_document(&in_subdir, subdir, true, &removed);
+    let json = serde_json::to_vec_pretty(&full).unwrap();
+    // Every encoding holds the bytes `repodata.json` serves (#4175).
+    let zst = zstd::stream::encode_all(json.as_slice(), 3).unwrap();
+    let mut bz2 = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    std::io::Write::write_all(&mut bz2, &json).unwrap();
     (
-        serde_json::to_vec_pretty(&full).unwrap(),
-        RepodataEncoding::Zst.encode(&full).unwrap(),
-        RepodataEncoding::Bz2.encode(&full).unwrap(),
+        json,
+        zst,
+        bz2.finish().unwrap(),
         serde_json::to_vec_pretty(&current).unwrap(),
         serde_json::to_vec_pretty(&run_exports_document(&in_subdir, subdir)).unwrap(),
     )

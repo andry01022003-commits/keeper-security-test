@@ -2742,6 +2742,7 @@ mod scan_on_proxy_4110 {
             body: archive(),
             recorded_path: "dtf/scanned/1.0.0.zip".to_string(),
             file: "scanned-1.0.0.zip".to_string(),
+            pin: None,
         }
     }
 

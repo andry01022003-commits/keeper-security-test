@@ -868,6 +868,12 @@ impl crate::storage::StorageBackend for MemStorage {
         crate::storage::buffered_put_stream_fallback(self, key, stream).await
     }
 
+    /// Stands in for an S3/GCS/Azure backend, whose uploads stage on the
+    /// backend instead of local scratch (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+
     fn supports_redirect(&self) -> bool {
         self.presign
     }

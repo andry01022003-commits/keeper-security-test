@@ -1959,6 +1959,24 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let url = self.read_url(key, Duration::from_secs(60))?;
+        let response = self.authorized_head(&url).await?;
+        if response.status().is_success() {
+            return Ok(true);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(AppError::Storage(format!(
+            "Azure HEAD for '{}' failed with status {}: {}",
+            key, status, body
+        )))
+    }
+
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.read_url(key, Duration::from_secs(60))?;
@@ -3104,6 +3122,41 @@ mod tests {
                 .await
                 .unwrap(),
             "a primary 404 must still find a legacy migration-path object"
+        );
+    }
+
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/repos/generic/{checksum}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/ab/{checksum}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint_and_path_format(
+            server.uri(),
+            StoragePathFormat::Migration,
+        );
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
         );
     }
 

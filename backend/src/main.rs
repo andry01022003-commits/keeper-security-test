@@ -1095,6 +1095,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
     tracing::info!("Email dispatcher started");
 
+    // #4336: recalculate a repository's grade status and coverage when an
+    // artifact is deleted from it, not only after the next scan.
+    artifact_keeper_backend::services::scan_result_service::spawn_score_refresher(
+        app_state.event_bus.clone(),
+        app_state.db.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
     // into webhook_deliveries. The retry scheduler (every 30s) drives
     // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
@@ -1201,6 +1209,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // lifecycle is governed by the shutdown token.
     artifact_keeper_backend::api::handlers::conda::spawn_conda_shard_backfill(
         db_pool.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #4311: resume repository delete jobs that are pending or whose replica
+    // died mid-delete (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_repository_delete_resumer(
+        state.clone(),
         runtime_shutdown_token.clone(),
     );
 

@@ -318,16 +318,19 @@ pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
 /// archives and Swift source archives (#4109, #4110) are graded on their
 /// contents: the bundled scanner has no advisory data for either ecosystem.
 pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
+    "alpine",       // #4113
     "cargo",        // #4101
     "cocoapods",    // #4109
     "composer",     // #4105
     "conan",        // #4108
     "conda",        // #4585
     "conda_native", // #4585 (the same conda route)
+    "debian",       // #4111
     "go",           // #4103
     "maven",        // #4100 (also serves gradle)
     "nuget",        // #4102 (also serves chocolatey and powershell)
     "pub",          // #4107
+    "rpm",          // #4112
     "rubygems",     // #4104
     "sbt",          // #4100
     "swift",        // #4110
@@ -535,6 +538,19 @@ static CARGO_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
     publish_time_resolver: true,
 };
 
+static MAVEN_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Maven,
+    label: "maven",
+    // A released Maven coordinate is immutable: Maven Central refuses a
+    // redeploy of a release, resolvers cache releases forever, and checksum
+    // sidecars pin the bytes. `-SNAPSHOT` versions are rebuilt by design and
+    // are not age-gated at all (`services::age_gate_maven`).
+    immutable_coordinates: true,
+    // The upstream `Last-Modified` of each version's POM, stamped by the
+    // repository manager at deploy time (#4702; `services::age_gate_maven`).
+    publish_time_resolver: true,
+};
+
 /// Look up the age-gate capability spec for a repository format, collapsing
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
@@ -550,6 +566,10 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
         RepositoryFormat::Vscode => Some(&VSCODE_AGE_GATE_SPEC),
         RepositoryFormat::Cargo => Some(&CARGO_AGE_GATE_SPEC),
+        // Gradle repositories speak the Maven layout through the same
+        // handler. sbt has its own handler with no age-gate seam, so it stays
+        // out (an entry without enforcement would accept a gate it ignores).
+        RepositoryFormat::Maven | RepositoryFormat::Gradle => Some(&MAVEN_AGE_GATE_SPEC),
         _ => None,
     }
 }

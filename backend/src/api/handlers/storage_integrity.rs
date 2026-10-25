@@ -120,12 +120,28 @@ pub async fn run_storage_scrub(
     require_admin(auth.is_admin)?;
 
     let repository_id = match payload.repository.as_deref() {
-        Some(key) => Some(
-            RepositoryService::new(state.db.clone())
-                .get_by_key(key)
-                .await?
-                .id,
-        ),
+        Some(key) => match RepositoryService::new(state.db.clone())
+            .get_by_key(key)
+            .await
+        {
+            Ok(repo) => Some(repo.id),
+            Err(e) => {
+                // #4323: a refused run is audited like any other, so an
+                // admin probing repository keys leaves a trail.
+                let audit = ScrubRunAudit::start(
+                    state.db.clone(),
+                    &auth,
+                    None,
+                    serde_json::json!({ "repair": payload.repair, "repository": key }),
+                )
+                .await;
+                // Audit the lookup's own error (a 404, or a database
+                // failure), then answer it.
+                let refused: Result<ScrubResult> = Err(e);
+                audit.finish(&refused);
+                return refused.map(Json);
+            }
+        },
         None => None,
     };
     let opts = ScrubOptions {
@@ -568,6 +584,55 @@ mod tests {
             .paths
             .paths
             .contains_key("/api/v1/admin/storage-scrub/findings"));
+    }
+
+    /// #4323: a scrub refused for an unknown repository key is audited too
+    /// (started, then failed), not just answered 404.
+    #[tokio::test]
+    async fn scrub_of_an_unknown_repository_is_audited_4323() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth = admin_auth(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp/ak-scrub-unknown-repo");
+        let key = format!("no-such-repo-{}", uuid::Uuid::new_v4());
+        let status = match run_storage_scrub(
+            State(state),
+            Extension(auth.clone()),
+            Json(StorageScrubRequest {
+                repair: false,
+                repository: Some(key.clone()),
+                max_objects: None,
+                max_bytes: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => axum::http::StatusCode::OK,
+            Err(e) => axum::response::IntoResponse::into_response(e).status(),
+        };
+        let mut phases = Vec::new();
+        for _ in 0..50 {
+            phases = sqlx::query_scalar::<_, String>(
+                "SELECT details->>'phase' FROM audit_log \
+                 WHERE action = 'STORAGE_SCRUB_RUN' AND details->'params'->>'repository' = $1 \
+                 ORDER BY created_at",
+            )
+            .bind(&key)
+            .fetch_all(&pool)
+            .await
+            .expect("audit rows");
+            if phases.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(auth.user_id)
+            .execute(&pool)
+            .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(phases, vec!["started".to_string(), "failed".to_string()]);
     }
 
     /// Poll `audit_log` for the phases recorded under `run_id`.

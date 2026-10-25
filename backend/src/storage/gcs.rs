@@ -1826,6 +1826,20 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let url = self.object_metadata_url(key);
+        let response = self.authorized_get(&url).await?;
+        if response.status().is_success() {
+            return Ok(true);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        require_success(response, "GCS exists check failed").await?;
+        unreachable!()
+    }
+
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.object_metadata_url(key);
@@ -3752,6 +3766,41 @@ mod tests {
 
         let backend = mock_backend(&server.uri()).await;
         assert!(!backend.exists("missing.txt").await.unwrap());
+    }
+
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/storage/v1/b/.*/o/repos%2Fgeneric%2Fabcdefabcdef",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/ab%2Fabcdefabcdef"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let backend =
+            mock_backend_with_path_format(&server.uri(), StoragePathFormat::Migration).await;
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
+        );
     }
 
     #[tokio::test]

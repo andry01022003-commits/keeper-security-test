@@ -2,7 +2,7 @@
 
 Whole-repository metadata documents (RPM `repomd.xml` and the
 `primary`/`filelists`/`other` indexes; hosted conda `repodata.json` with its
-encodings, `current_repodata.json`, `run_exports.json`, the JLAP bootstrap,
+encodings, `current_repodata.json`, `run_exports.json`, the stored JLAP,
 the CEP-16 shard index and `channeldata.json`) are rendered once per
 repository state and served from an in-process cache. Each request checks a
 cheap fingerprint of the repository state (RPM: one aggregate query; conda:

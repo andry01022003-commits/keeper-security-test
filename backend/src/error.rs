@@ -178,6 +178,13 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// A conditional write whose `If-Match` / `If-None-Match` precondition
+    /// does not hold against the current state of the target (#4186). Mapped
+    /// to 412 so a compare-and-swap client can tell "someone else wrote first"
+    /// apart from the 409 an unconditional write to an immutable path gets.
+    #[error("Precondition failed: {0}")]
+    PreconditionFailed(String),
+
     #[error("Validation error: {0}")]
     Validation(String),
 
@@ -361,6 +368,7 @@ impl AppError {
             Self::Authorization(_) => (StatusCode::FORBIDDEN, "FORBIDDEN"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+            Self::PreconditionFailed(_) => (StatusCode::PRECONDITION_FAILED, "PRECONDITION_FAILED"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
             Self::CodedValidation { code, .. } => (StatusCode::BAD_REQUEST, code),
             Self::UnprocessableEntity(_) => {
@@ -475,6 +483,7 @@ impl AppError {
             | Self::Authorization(msg)
             | Self::NotFound(msg)
             | Self::Conflict(msg)
+            | Self::PreconditionFailed(msg)
             | Self::Validation(msg)
             | Self::UnprocessableEntity(msg)
             | Self::QuotaExceeded(msg)

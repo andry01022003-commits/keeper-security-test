@@ -2291,6 +2291,7 @@ mod scan_on_proxy_4109 {
             body: pod("DtfScanned", "1.0.0"),
             recorded_path: format!("pods/{FILE}"),
             file: FILE.to_string(),
+            pin: None,
         }
     }
 

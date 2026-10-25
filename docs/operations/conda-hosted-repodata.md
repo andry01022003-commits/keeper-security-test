@@ -15,13 +15,19 @@ index documents from the catalog on every request (#4172).
   (`repodata_shards.msgpack.zst`) is serialised from the stored map.
 - **A revision per subdir** (#4174). Every rebuild of a subdir bumps its
   revision. `repodata.json`, `.zst`, `.bz2`, `current_repodata.json`,
-  `run_exports.json` and the bootstrap `repodata.json.jlap` are rendered
+  `run_exports.json` and `repodata.json.jlap` are rendered
   together from one catalog walk the first time a revision is read, and kept
   in memory under it. `channeldata.json` is kept under the sum of the
   repository's subdir revisions. A request reads the revision (one statement
   against the conda state tables, no catalog rows) and serves the kept bytes
   when it matches; concurrent requests for a new revision share one render.
-  The served bytes are unchanged from 1.11.
+  `repodata.json` is unchanged from 1.11; since #4175 `.zst` and `.bz2`
+  decompress to exactly those bytes (1.11 compressed a compact rendering).
+  The pretty document is about 35 % larger uncompressed; compressed, `.zst`
+  grows about 4 % and `.bz2` under 1 % (measured on 30,000 and 387,000
+  conda-forge noarch records).
+- **The last N `repodata.json` revisions and a JLAP** (#4175), see
+  [JLAP](#jlap-incremental-repodata) below.
 
 The kept documents are per process. Each replica renders a revision once.
 
@@ -30,8 +36,8 @@ The kept documents are per process. Each replica renders a revision once.
 A revision is rendered with one cursor over the repository's live rows
 (only the columns that decide which row each document lists), then the
 listed rows in filename order, 512 at a time, each record written straight
-into the pretty `repodata.json`, `current_repodata.json` and the zstd encoder
-of the compact document (#4176). The render holds its output and one chunk of
+into the pretty `repodata.json` (and on into the zstd encoder, so `.zst`
+holds the same bytes) and `current_repodata.json` (#4176). The render holds its output and one chunk of
 rows, not the row set, so its memory is about the size of the documents it
 produces.
 
@@ -68,6 +74,47 @@ answered `503` with `Retry-After: 5`. The render it was waiting for keeps
 running and serves the requests that follow. See
 [load-shedding.md](load-shedding.md).
 
+## JLAP incremental repodata
+
+`repodata.jlap` (also served as `repodata.json.jlap`, the name 1.11 used;
+conda and rattler request `repodata.jlap`) lets a client that holds an
+older `repodata.json`
+update it with a patch instead of downloading the index again (conda with
+`--experimental=jlap` (conda 23.9 and later, before 26.9, which dropped it), rattler and pixi when the channel has no
+shard index or sharding is disabled). From 1.12.0 a hosted subdir serves a
+real JLAP (#4175); before, it served a file with no patches and every
+client downloaded the whole index anyway.
+
+- Each render of a new revision records its `repodata.json` in
+  `conda_repodata_revisions` (zstd-compressed, with its BLAKE2b-256) and,
+  when the document changed, appends one RFC 6902 patch line from the
+  previous document to the subdir's stored JLAP in `conda_repodata_jlap`.
+  The new line replaces the old footer, so the bytes before it never move,
+  and the BLAKE2b checksum chain continues from the stored bytes. A client's
+  `Range: bytes=<pos>-` request (conda sends the offset of the footer it
+  last saw) is answered `206` with only the new lines; a position past the
+  end is `416` and the client fetches the whole file.
+- `AK_CONDA_JLAP_REVISIONS` (default 8, 1 to 1024) revisions are kept per
+  subdir and the JLAP keeps one patch line fewer. A client that last
+  refreshed more than that many changes ago finds no patch from its hash
+  and downloads `repodata.json`, as it would without JLAP. When the window
+  moves the oldest line is dropped and the IV line takes its chain value:
+  the kept lines' checksums do not change, but their offsets do, so a
+  client's next range request does not verify and it fetches the whole
+  (small) JLAP once, still without downloading the index. A value of 1
+  keeps only the current document: the JLAP names its hash and carries no
+  patches. Storage per subdir is about N compressed copies of its index.
+- A patch is not written when it would have more than 8192 operations (a
+  bulk import): clients holding the older document download the index once.
+- Ordering: the JLAP is recorded inside the render of the revision, before
+  that revision's documents are kept or served, under the JLAP row's lock.
+  The JLAP a replica serves always ends at the `repodata.json` it serves, so
+  a withdrawal is absent from the JLAP tail as soon as it is absent from
+  `repodata.json`. A render that finds a newer revision already recorded
+  (another replica moved on) does not append, so the tail never moves back.
+- Only hosted channels serve a JLAP; Remote and Virtual channels answer 404
+  and clients fetch `repodata.json`.
+
 ## How changes reach them
 
 Database triggers on `artifacts` and `artifact_metadata` record every
@@ -94,6 +141,67 @@ on every request. The channel is separate so that 1.11.x replicas, which do
 not listen on it, are not affected during a rolling upgrade: on the shared
 channel they would answer every unknown event with a conservative flush of
 their authorization caches.
+
+## Remote channels whose upstream has no shard index
+
+A Remote conda repository proxies its upstream's CEP-16 shard index when the
+upstream publishes one. From 1.12.0, when it does not (most private channels
+and older mirrors publish only `repodata.json` and its `.zst`/`.bz2`), the
+remote synthesises the shards itself (#4178), so CEP-16 clients of it fetch
+shards instead of the whole index, and a virtual channel's shard index can
+include that member instead of dropping to `repodata.json` for everyone.
+
+- **Source.** The upstream document the plain `repodata.json` proxy already
+  reads and caches: `repodata.json.zst`, else `.bz2`, else `repodata.json`.
+  It is decoded as a stream and parsed record by record; records are spilled
+  to 64 temporary files (in the process's temporary directory) by package
+  name, and each file is then grouped into shards. The plain JSON of the index
+  is never held. Measured on the reference host with conda-forge documents
+  (debug build, single thread; peak resident set of the whole test process):
+
+  | Document | Compressed | Records | Names | Shard bytes | Peak RSS |
+  |---|---|---|---|---|---|
+  | `noarch/repodata.json.zst` | 29 MB | 387,298 | 23,959 | 36 MB | 97 MiB |
+  | `linux-64/repodata.json.zst` | 59 MB | 799,329 | 14,173 | 68 MB | 143 MiB |
+
+  The compressed document itself (under the 128 MiB metadata ceiling) is held
+  while it is read, as for any proxied metadata read. An upstream that
+  publishes only the plain `repodata.json` is held as fetched, under the same
+  ceiling.
+- **Storage.** The shards go into `conda_shard_index` with
+  `origin = 'synthesized'`, the served revision into
+  `conda_subdir_revisions`, and `conda_synthesized_subdirs` records the
+  upstream document (path and SHA-256) they were built from. A rebuild writes
+  the changed shards, deletes the names the upstream dropped and bumps the
+  revision in one transaction, so a reader sees the old set or the new one.
+  Shards are checked against their address before they are served.
+- **Refresh.** While the proxy cache entry of that document is fresh and
+  still holds the recorded SHA-256, the stored shards are served with no read
+  of the document. Past the entry's TTL (the remote's metadata TTL,
+  `cache_ttl_secs`) the next shard index request fetches it through the
+  proxy: the same bytes change nothing; different bytes mark the subdir stale
+  and rebuild it. A stale index is not served: the request waits for the
+  rebuild like any other render (`AK_CONDA_REGEN_CONCURRENCY`,
+  `AK_CONDA_REGEN_WAIT_SECS`, then `503` with `Retry-After`).
+- **Bounds.** The decoded document is refused past
+  `CONDA_VIRTUAL_MEMBER_MAX_DECODED_BYTES` (1 GiB by default, the virtual
+  merge's member ceiling), one record past 16 MiB, and one package name whose
+  records pass 64 MiB (conda-forge's largest record is about 5 KB and its
+  largest name, `awscli` on linux-64, about 7 MB). A refused or unparseable
+  upstream document answers `502`; nothing is stored and the subdir stays
+  stale, so no index is served from it.
+- **Temporary space.** The spill files take about the decoded size of the
+  document (about 460 MB for conda-forge linux-64) under `TMPDIR` while the
+  rebuild runs, in a directory named `ak-conda-shard-synth-*` that is removed
+  when the rebuild ends, fails or panics (a process killed outright leaves it
+  behind). A full, read-only or missing `TMPDIR` fails the rebuild with `500`
+  and an error log naming the spill files; nothing is stored.
+- An upstream that does publish a shard index, but one past the 64 MiB
+  shard-index ceiling (#4612), is not synthesised: its shard index keeps
+  answering `404` and a virtual with that member serves none for the subdir,
+  so clients use `repodata.json`.
+- A subdir the upstream publishes no `repodata.json` for at all still answers
+  `404` on the shard index, and keeps a virtual off CEP-16 for that subdir.
 
 ## Backfill of existing channels
 
