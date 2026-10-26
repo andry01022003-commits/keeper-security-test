@@ -1895,6 +1895,52 @@ pub fn stream_fetch_result(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
+/// Presigned redirect to the fresh proxy-cache entry at `cache_path`, signed
+/// without reading the cached body (#1018). `Ok(None)` when presigned downloads
+/// are disabled, the request is a `HEAD` (#3209), the backend cannot presign or
+/// the entry is missing or stale: the caller then serves the request itself. A
+/// held (#2075) or origin-refused (#4506) entry is refused as on the fetch paths.
+pub(crate) async fn proxy_cache_fresh_redirect(
+    proxy_service: &ProxyService,
+    state: &AppState,
+    repo_key: &str,
+    cache_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Option<Response>, Response> {
+    if !state.config.presigned_downloads_enabled || ctx.is_head {
+        return Ok(None);
+    }
+    // #1555: the freshness probe reads the cache-meta sidecar, so skip it when
+    // the proxy's own (no-prefix) backend cannot presign anyway.
+    let storage = proxy_service.cache_storage_backend();
+    if !storage.supports_redirect() || !proxy_service.is_cache_fresh(repo_key, cache_path).await {
+        return Ok(None);
+    }
+    let refused = |e| map_proxy_error(repo_key, cache_path, e);
+    proxy_service
+        .cache_quarantine_gate(repo_key, cache_path)
+        .await
+        .map_err(refused)?;
+    proxy_service
+        .cache_origin_policy_gate(repo_key)
+        .await
+        .map_err(refused)?;
+    // Proxy-cache content is stored without the global key prefix, so it is
+    // signed through that same no-prefix backend (#1555).
+    let cache_key =
+        ProxyService::cache_storage_key(proxy_service.cache_scope(), repo_key, cache_path)
+            .map_err(refused)?;
+    let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+    Ok(try_proxy_cache_redirect(
+        storage.as_ref(),
+        &cache_key,
+        /* presigned_enabled = */ true,
+        expiry,
+        /* cache_is_fresh = */ true,
+    )
+    .await)
+}
+
 /// Fetch from upstream via the proxy service, returning a presigned redirect
 /// if the storage backend supports it and presigned downloads are enabled.
 ///
@@ -1933,49 +1979,12 @@ pub async fn proxy_fetch_or_redirect(
     // the next handler that adopts it from re-opening #3181/#3209.
     let presigned_enabled = state.config.presigned_downloads_enabled && !ctx.is_head;
 
-    // Fast path (#1018): if presigned downloads are enabled and the proxy
-    // cache is already fresh, redirect to the signed URL without ever
-    // pulling the cached body into the backend's memory. The freshness
-    // probe is metadata-only (HEAD-equivalent on cloud backends).
-    //
-    // #1555: resolve the no-prefix presign handle FIRST and skip the
-    // freshness probe entirely if we can't redirect (no handle, or the
-    // backend doesn't support redirects). The probe loads the cache-meta
-    // sidecar; on a backend that can't presign it would be a pure wasted
-    // S3 GET, since the slow path below re-reads the same sidecar anyway.
-    if presigned_enabled {
-        let storage = proxy_service.cache_storage_backend();
-        if storage.supports_redirect() && proxy_service.is_cache_fresh(repo_key, path).await {
-            // #2075: a fresh cache entry may still be inside its Package Age
-            // Policy hold window. The buffered/streaming fetch paths enforce
-            // that hold via check_quarantine_until; the presigned-redirect fast
-            // path must gate on it too, or a held object would be handed out as
-            // a 302 on redirect-capable backends. Gate BEFORE signing; a hold
-            // surfaces as the same 409/403 (no redirect, no upstream refetch).
-            if let Err(e) = proxy_service.cache_quarantine_gate(repo_key, path).await {
-                return Err(map_proxy_error(repo_key, path, e));
-            }
-            // #4506: and on the Remote's origin policy, which the fetch paths
-            // enforce the same way.
-            if let Err(e) = proxy_service.cache_origin_policy_gate(repo_key).await {
-                return Err(map_proxy_error(repo_key, path, e));
-            }
-            // proxy-cache content is stored without the global key prefix,
-            // so it must be signed through the proxy's own (no-prefix)
-            // backend, not the prefixed repo handle, or the signed key
-            // 404s in the object store.
-            if let Some(redirect) = try_proxy_cache_redirect(
-                storage.as_ref(),
-                &cache_key,
-                presigned_enabled,
-                expiry,
-                /* cache_is_fresh = */ true,
-            )
-            .await
-            {
-                return Ok(redirect);
-            }
-        }
+    // Fast path (#1018): a fresh cache entry is redirected to without pulling
+    // its body into the backend.
+    if let Some(redirect) =
+        proxy_cache_fresh_redirect(proxy_service, state, repo_key, path, ctx).await?
+    {
+        return Ok(redirect);
     }
 
     // Slow path: cache miss / expired / presigned disabled. The fetch
@@ -13549,6 +13558,59 @@ mod tests {
         );
     }
 
+    /// `proxy_cache_fresh_redirect` signs a fresh entry under the live scope,
+    /// and leaves a `HEAD`, a stale entry and a deployment without presigned
+    /// downloads to the caller.
+    #[tokio::test]
+    async fn proxy_cache_fresh_redirect_signs_only_fresh_presignable_gets() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::download_telemetry::DownloadContext;
+        const REPO_KEY: &str = "tf-proxy";
+        const PATH: &str = "ns/ty/1.0.0/linux/amd64/p.zip";
+        async fn redirect(
+            state: &crate::api::SharedState,
+            path: &str,
+            ctx: &DownloadContext,
+        ) -> Option<Response> {
+            let proxy = state.proxy_service.as_deref().unwrap();
+            proxy_cache_fresh_redirect(proxy, state, REPO_KEY, path, ctx)
+                .await
+                .unwrap()
+        }
+
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let content_key = ProxyService::cache_storage_key(&scope, REPO_KEY, PATH).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, REPO_KEY, PATH).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_str().unwrap();
+        let presigned = tdh::build_state_with_proxy_presigned(pool.clone(), dir, proxy.clone());
+        let unsigned = tdh::build_state_with_proxy(pool, dir, proxy);
+        let head = DownloadContext {
+            is_head: true,
+            ..get_ctx()
+        };
+
+        let signed = redirect(&presigned, PATH, &get_ctx())
+            .await
+            .expect("a fresh entry must be redirected to");
+        let loc = signed.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap();
+        assert!(loc.contains(&content_key), "signed the wrong key: {loc}");
+
+        assert!(redirect(&presigned, PATH, &head).await.is_none());
+        assert!(
+            redirect(&presigned, "ns/ty/2.0.0/linux/amd64/p.zip", &get_ctx())
+                .await
+                .is_none()
+        );
+        assert!(redirect(&unsigned, PATH, &get_ctx()).await.is_none());
+    }
+
     /// `record_proxy_download` (proxy_helpers.rs) persists a catalog placeholder
     /// keyed under the LIVE scope, so the streaming tee's later upsert refines
     /// the same row. A revert to unscoped keys the placeholder under
@@ -18533,6 +18595,7 @@ mod tests {
 
         for fn_name in [
             "pub async fn proxy_fetch_or_redirect(",
+            "pub(crate) async fn proxy_cache_fresh_redirect(",
             // The Virtual streaming resolver's presign moved into this helper
             // (#2069 two-phase refactor); it is where the no-prefix handle is used.
             "async fn try_member_cache_redirect(",
