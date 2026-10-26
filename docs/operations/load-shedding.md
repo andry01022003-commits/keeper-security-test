@@ -23,6 +23,14 @@ instead of a hung or failed connection (#4647).
 3. **In process.** Below the limit, every accepted request runs. When the CPU
    limit is the bottleneck, they all slow down together.
 
+Some expensive work sheds on its own limits inside the process. Virtual conda
+channel merges are capped by `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES` and answer
+`503` with `Retry-After` after `CONDA_VIRTUAL_MERGE_QUEUE_SECS`; a merged
+document that is being rebuilt is served stale for up to
+`CONDA_VIRTUAL_MERGE_MAX_STALE_SECS` instead of making clients wait on the
+rebuild ([Sizing memory for virtual conda
+channels](conda-virtual-merge-memory.md)).
+
 ## Measured behaviour
 
 Debug build on one host, the API listener under a systemd `CPUQuota=20%`.
@@ -75,6 +83,91 @@ health check briefly removed the endpoint.
   backend's `503` and `Retry-After` through rather than turning upstream
   overload into a connection error.
 
+## Conda package downloads under an installer fleet
+
+rattler-based installers (pixi, micromamba, conda with the libmamba solver)
+fetch up to 50 packages at once each, so N installers put up to 50 x N
+package requests in flight. A hosted package request reads the database once
+(#4181) and then streams from storage without holding a connection, so the
+pool only has to cover the lookups, not the transfers.
+
+The lookup takes its connection through a fast-fail gate (#4182): when no
+pooled connection frees up within `CONDA_PACKAGE_DB_WAIT_MS` (default 500),
+the request is answered at once with `503` and `Retry-After: 1` instead of
+queueing until `DATABASE_ACQUIRE_TIMEOUT_SECS` (5 s) runs out. rattler, conda
+and mamba retry a 503, so a shed request costs the installer one short
+back-off rather than a 5 s stall. Shed requests are counted in
+`ak_conda_package_requests_shed_total`; `0` turns the gate off and the pool's
+own acquire timeout applies. Remote and Virtual package requests make further
+database calls after the lookup (cache catalog, member resolution, download
+records) on the normal pool.
+
+Sizing for a fleet. These figures are reasoned from the request path and
+the defaults, not measured: unlike the table under Measured behaviour, no
+fleet run has confirmed them yet. The fleet measurements are tracked in
+#4188; treat the numbers below as a starting point and check them against
+`ak_conda_package_requests_shed_total` and the pool metrics on your own
+deployment.
+
+- **Pool per replica.** A hosted lookup holds a connection for about one
+  round trip (well under 5 ms on a local network), so a pool of 50 serves on
+  the order of 10,000 lookups per second before requests start to queue.
+  Shedding in steady state therefore means something else holds the
+  connections: long transactions, slow storage reads in other handlers, or
+  `DATABASE_MAX_CONNECTIONS` set far below the default.
+- **Postgres `max_connections`.** Keep `DATABASE_MAX_CONNECTIONS` x replicas,
+  plus one surge replica and the connections other clients hold, below the
+  server's limit (see the database connection budget below). For 24
+  installers against two replicas, the defaults (2 x 50 + 50 surge) need a
+  server limit of at least 160; raise `max_connections` or lower
+  `DATABASE_MAX_CONNECTIONS` rather than adding replicas.
+- **Global concurrency.** Every package download holds a
+  `GLOBAL_MAX_CONCURRENCY` permit for the whole transfer. 24 installers x 50
+  fetches is 1,200 transfers, above the default 512 for one replica, so either
+  run three or more replicas or raise the limit on a replica with the CPU and
+  network to serve it.
+- **What to watch.** A sustained non-zero
+  `rate(ak_conda_package_requests_shed_total[5m])` with installs still
+  completing is the gate doing its job under a burst; a rate that does not
+  fall after the burst means the pool is undersized for the load.
+
+## Hosted conda repodata regeneration
+
+The first request for a hosted conda subdir's documents after a change
+renders them once and keeps them (see
+[conda-hosted-repodata.md](conda-hosted-repodata.md)); concurrent requests
+for the same subdir wait for that one render. Across subdirs and
+repositories, `AK_CONDA_REGEN_CONCURRENCY` (default 2) renders run at once
+per process, so a fleet refreshing many subdirs after a bulk publish cannot
+put every core on JSON encoding and compression. A request that has waited
+`AK_CONDA_REGEN_WAIT_SECS` (default 30) for its render is answered `503` with
+`Retry-After: 5`; the render keeps running and its result serves the next
+requests. Those 503s count in `ak_conda_repodata_requests_shed_total`, and
+`ak_conda_repodata_regenerations_in_flight` shows the renders running now.
+`AK_CONDA_REGEN_WAIT_SECS=0` waits as long as the render takes.
+
+## Buffered metadata memory budget
+
+Proxied metadata that has to be held in memory before it is answered (npm
+packuments, the PyPI simple index, Debian `dists`, Helm indexes, VS Code
+gallery queries, conda virtual merges) reserves bytes from one process-wide
+budget, `AK_PROXY_METADATA_BUDGET_BYTES` (default 1 GiB). When the budget is
+held by in-flight requests, a new request waits for room; the callers that
+bound their wait (conda virtual merges, VS Code gallery queries) answer `503`
+with `Retry-After` instead.
+
+The budget is accounted in 4 KiB units: a reservation is rounded up to a
+whole unit, and a single request larger than the whole budget holds all of it
+rather than waiting forever. Any value the platform can address is honoured.
+Before 1.11.5, a value above 4 GiB was silently clamped to 4294967295 bytes
+(#4881), which also capped the default `CONDA_VIRTUAL_MAX_CONCURRENT_MERGES`
+at 3. A blank, non-numeric or zero value falls back to the default; that, or
+a value too large to represent, logs a warning at startup naming the
+configured and effective values. The effective value is in the
+`conda virtual merge gate configured` log line (`budget_bytes`), printed when
+the first virtual conda merge runs. Sizing against the container memory limit
+is in [conda virtual merge memory](conda-virtual-merge-memory.md).
+
 ## Database connection budget
 
 Every replica opens its own pool, so size the fleet against the server
@@ -102,6 +195,12 @@ failures:
 |---|---|
 | `startup` | An initial connect attempt failed at boot. Startup retries up to five times with a jittered 1 to 8 s backoff, so a refusal storm shows several increments before the process exits or recovers. |
 | `request` | A pool acquire timed out while serving a request and the client was answered `503 POOL_EXHAUSTED`. |
+
+The `startup` series is exported once the replica has started serving, so it
+shows how many connect attempts a replica that did come up needed; a replica
+that gave up exits before it can be scraped, and its attempts are in its log.
+Before 1.11.5 the `startup` series was never exported, because the attempts
+were counted before the Prometheus recorder was installed (#4828).
 
 A sustained non-zero `rate(ak_db_pool_connection_failures_total{stage="request"}[5m])`
 means the pool is too small for the load, or the server is refusing new

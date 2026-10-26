@@ -590,6 +590,31 @@ mod tests {
         );
     }
 
+    /// #4828: the test above records through a local recorder, so it cannot
+    /// see that in the binary the startup failures were counted before the
+    /// Prometheus recorder existed and went to the no-op default. Pin the
+    /// order in `main`: the recorder is installed before the pool is built.
+    #[test]
+    fn metrics_recorder_is_installed_before_the_startup_pool_connect_4828() {
+        let main_rs = include_str!("main.rs");
+        let recorder = main_rs
+            .find("metrics_service::init_metrics()")
+            .expect("main installs the Prometheus recorder");
+        let pool = main_rs
+            .find("db::create_pool(")
+            .expect("main builds the database pool");
+        assert!(
+            recorder < pool,
+            "metrics_service::init_metrics() must run before db::create_pool(), \
+             or ak_db_pool_connection_failures_total{{stage=\"startup\"}} is lost"
+        );
+        assert_eq!(
+            main_rs.matches("db::create_pool(").count(),
+            1,
+            "a second pool build in main must be checked against the recorder too"
+        );
+    }
+
     /// #4549: a raised `DATABASE_ACQUIRE_TIMEOUT_SECS` cannot stretch startup
     /// to minutes: no new attempt starts once the next backoff would end past
     /// [`STARTUP_CONNECT_DEADLINE`], so the process fails within about a

@@ -210,6 +210,24 @@ pub trait StorageBackend: Send + Sync {
         self.exists(key).await
     }
 
+    /// Whether an object is stored under exactly `key`, never resolving a
+    /// fallback key.
+    ///
+    /// [`Self::content_already_stored`] answers `false` whenever `exists`
+    /// could match the legacy fallback key, which is the safe answer for a
+    /// write-deduplication hint but not for a presence check that has to be
+    /// exact: the upload commit guard asks this to learn whether a storage GC
+    /// delete removed the canonical object after the upload wrote or
+    /// deduplicated it, and treating "unknown" as "absent" there would rewrite
+    /// every object twice in Artifactory `Migration` path mode (the cost #4893
+    /// removed from the Maven path). Backends whose `exists` never consults
+    /// another key answer exactly as `exists`; the cloud backends override it
+    /// with a HEAD of the canonical key only. Errors carry `exists`'s
+    /// contract: a failure is "unknown", not "absent".
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        self.exists(key).await
+    }
+
     /// Return the storage backend's opaque ETag for `key` if the backend
     /// supports per-object ETags (S3, GCS, Azure). Returns `Ok(None)` when
     /// the backend has no concept of an ETag (filesystem) or when the
@@ -356,6 +374,23 @@ pub trait StorageBackend: Send + Sync {
         key: &str,
         stream: BoxStream<'static, Result<Bytes>>,
     ) -> Result<PutStreamResult>;
+
+    /// Whether [`Self::put_stream`] uploads through the backend's native
+    /// streaming protocol (S3 multipart, GCS resumable, Azure block blob) and
+    /// therefore needs no local scratch file at any point.
+    ///
+    /// A chunked-upload completion uses this to decide whether it can
+    /// reassemble a session's staged chunks **on the backend** — streaming
+    /// them into one staging object, then `copy`ing it to the content-addressed
+    /// key — instead of writing one full-size local file first (#3916).
+    ///
+    /// Filesystem is deliberately `false`: its `put_stream` stages a temp file
+    /// on the same disk before renaming, so routing through it would not
+    /// remove the scratch requirement. Test doubles and backends that buffer
+    /// in memory also stay `false` unless they explicitly opt in.
+    fn supports_streamed_assembly(&self) -> bool {
+        false
+    }
 
     /// Enumerate the keys stored under `prefix` (a key prefix such as
     /// `maven/`), for the admin storage reindex (#1570).

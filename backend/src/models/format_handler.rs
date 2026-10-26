@@ -245,6 +245,16 @@ mod tests {
             "nuget",
             "conda",
             "conda_native",
+            "go",
+            "rubygems",
+            "composer",
+            "pub",
+            "conan",
+            "cocoapods",
+            "swift",
+            "debian",
+            "rpm",
+            "alpine",
         ] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
@@ -252,7 +262,7 @@ mod tests {
                 "{key} gates its proxied downloads"
             );
         }
-        for key in ["go", "generic", "rpm"] {
+        for key in ["helm", "generic", "cran"] {
             assert_eq!(
                 ScanOnProxySupport::for_handler(&FormatHandlerType::Core, key),
                 Accepted,

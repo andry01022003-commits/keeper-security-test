@@ -1732,6 +1732,9 @@ impl RepositoryService {
               AND ({visibility_clause})
               AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($7::uuid IS NULL OR project_id = $7)
+              AND NOT EXISTS (SELECT 1 FROM repository_delete_jobs j
+                               WHERE j.repository_id = repositories.id
+                                 AND j.status IN ('pending', 'running'))
             ORDER BY name
             OFFSET $5
             LIMIT $6
@@ -1765,6 +1768,9 @@ impl RepositoryService {
               AND ({visibility_clause})
               AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($5::uuid IS NULL OR project_id = $5)
+              AND NOT EXISTS (SELECT 1 FROM repository_delete_jobs j
+                               WHERE j.repository_id = repositories.id
+                                 AND j.status IN ('pending', 'running'))
             "#
         );
 

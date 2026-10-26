@@ -300,7 +300,10 @@ impl Resolve for SsrfGuardResolver {
                 crate::services::metrics_service::record_ssrf_block(mode.ssrf_surface());
                 let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "all resolved addresses blocked by SSRF policy",
+                    format!(
+                        "all resolved addresses {}",
+                        crate::services::ssrf_refusal::CONNECT_REFUSAL_PHRASE
+                    ),
                 ));
                 return Err(err);
             }

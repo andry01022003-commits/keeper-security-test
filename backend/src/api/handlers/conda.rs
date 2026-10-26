@@ -10,7 +10,8 @@
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.bz2        - Compressed repodata
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.sig        - Repodata signature (raw bytes)
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.zst        - Compressed repodata (zstd)
-//!   GET  /conda/{repo_key}/{subdir}/repodata.json.jlap       - JLAP incremental updates
+//!   GET  /conda/{repo_key}/{subdir}/repodata.jlap            - JLAP incremental updates
+//!   GET  /conda/{repo_key}/{subdir}/repodata.json.jlap       - the same (1.11 name)
 //!   GET  /conda/{repo_key}/{subdir}/current_repodata.json    - Current (latest) repodata
 //!   GET  /conda/{repo_key}/{subdir}/run_exports.json         - Run exports metadata (CEP-12)
 //!   GET  /conda/{repo_key}/{subdir}/patch_instructions.json  - Repodata patch instructions (remote only)
@@ -26,7 +27,7 @@
 //!   GET  /t/{token}/conda/{repo_key}/...                     - rattler/pixi `--conda-token` layout
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -63,8 +64,37 @@ use crate::services::curation::attestation_verify::{self, cep27};
 use crate::services::signing_service::SigningService;
 
 mod current_repodata;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod jlap_router_tests;
+mod jlap_store;
 mod merge_gate;
+mod package_gate;
+mod repodata_cache;
+mod repodata_render;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod repodata_render_tests;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod revision_router_tests;
+mod shard_store;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod shard_store_tests;
+mod shard_synth;
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod shard_synth_tests;
 mod virtual_merge;
+
+pub use shard_store::spawn_backfill as spawn_conda_shard_backfill;
+
+/// Drop this process's kept documents of `repo_id`'s `subdirs` (every subdir
+/// when empty): the cross-replica half of a shard rebuild (#4174).
+pub async fn invalidate_cached_repodata(repo_id: uuid::Uuid, subdirs: &[String]) {
+    repodata_cache::invalidate_local(repo_id, subdirs).await;
+}
 
 // ---------------------------------------------------------------------------
 // CEP-26: Conda naming constraints
@@ -426,6 +456,45 @@ async fn cacheable_response_coded(
     builder.body(Body::from(body)).unwrap()
 }
 
+/// Serve a document kept by the revision cache (#4174): its precomputed ETag,
+/// a 304 when the client holds it, and for JSON a gzip rendering made once
+/// per kept document rather than once per request. Same headers as
+/// [`cacheable_response_coded`] for an identity body.
+async fn prepared_response(
+    doc: &repodata_cache::Prepared,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Response {
+    use crate::api::handlers::cache_headers;
+
+    if let Some(not_modified) = check_conditional_request(headers, &doc.etag) {
+        return not_modified;
+    }
+    if content_type == "application/json" && accepts_gzip(headers) {
+        if let Some(compressed) = doc.gzip().await {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, content_type)
+                .header(CONTENT_ENCODING, "gzip")
+                .header(CONTENT_LENGTH, compressed.len().to_string())
+                .header(ETAG, &doc.etag)
+                .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
+                .header("Vary", "Accept-Encoding")
+                .body(Body::from(compressed))
+                .unwrap();
+        }
+        tracing::warn!("conda gzip offload failed; serving uncompressed body");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, doc.body.len().to_string())
+        .header(ETAG, &doc.etag)
+        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
+        .body(Body::from(doc.body.clone()))
+        .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // JLAP (JSON Lines And Patches) - incremental repodata updates
 // ---------------------------------------------------------------------------
@@ -442,11 +511,6 @@ async fn cacheable_response_coded(
 //
 // The checksum chain uses BLAKE2b-256 in keyed mode where each line's
 // checksum depends on the previous line's checksum.
-
-/// JLAP patch step limit. If a diff produces more operations than this,
-/// skip the patch (clients will fall back to full download).
-#[allow(dead_code)]
-const JLAP_PATCH_STEPS_LIMIT: usize = 8192;
 
 /// Compute BLAKE2b-256 keyed hash (32-byte digest).
 ///
@@ -481,145 +545,44 @@ fn blake2_256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Generate RFC 6902 JSON Patch operations to transform `old` repodata into `new`.
-///
-/// Only diffs the `packages` and `packages.conda` maps (the volatile parts).
-/// Returns the operations as a JSON array, or None if there are no changes.
-#[allow(dead_code)]
+/// RFC 6902 operations turning `old` repodata into `new`
+/// ([`jlap_store::diff_documents`] over the serialised documents).
+#[cfg(test)]
 fn generate_repodata_patch(
     old: &serde_json::Value,
     new: &serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
-    let mut ops = Vec::new();
-
-    for section in &["packages", "packages.conda"] {
-        let old_map = old.get(section).and_then(|v| v.as_object());
-        let new_map = new.get(section).and_then(|v| v.as_object());
-
-        let old_map = old_map.cloned().unwrap_or_default();
-        let new_map = new_map.cloned().unwrap_or_default();
-
-        // Removed packages
-        for key in old_map.keys() {
-            if !new_map.contains_key(key) {
-                ops.push(serde_json::json!({
-                    "op": "remove",
-                    "path": format!("/{}/{}", section, escape_json_pointer(key)),
-                }));
-            }
-        }
-
-        // Added packages
-        for (key, value) in &new_map {
-            if !old_map.contains_key(key) {
-                ops.push(serde_json::json!({
-                    "op": "add",
-                    "path": format!("/{}/{}", section, escape_json_pointer(key)),
-                    "value": value,
-                }));
-            }
-        }
-
-        // Changed packages
-        for (key, new_value) in &new_map {
-            if let Some(old_value) = old_map.get(key) {
-                if old_value != new_value {
-                    ops.push(serde_json::json!({
-                        "op": "replace",
-                        "path": format!("/{}/{}", section, escape_json_pointer(key)),
-                        "value": new_value,
-                    }));
-                }
-            }
-        }
-    }
-
-    // Also diff the "removed" array
-    let old_removed = old.get("removed");
-    let new_removed = new.get("removed");
-    if old_removed != new_removed {
-        if let Some(nr) = new_removed {
-            ops.push(serde_json::json!({
-                "op": "replace",
-                "path": "/removed",
-                "value": nr,
-            }));
-        }
-    }
-
-    if ops.is_empty() {
-        None
-    } else if ops.len() > JLAP_PATCH_STEPS_LIMIT {
-        tracing::debug!(
-            ops = ops.len(),
-            limit = JLAP_PATCH_STEPS_LIMIT,
-            "JLAP patch too large, skipping"
-        );
-        None
-    } else {
-        Some(ops)
-    }
+    jlap_store::diff_documents(
+        &serde_json::to_vec(old).unwrap(),
+        &serde_json::to_vec(new).unwrap(),
+    )
+    .unwrap()
 }
 
 /// Escape a JSON Pointer token per RFC 6901 (~ -> ~0, / -> ~1).
-#[allow(dead_code)]
 fn escape_json_pointer(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
 
-/// Build a complete JLAP file from a series of patch entries.
-///
-/// Each entry is (from_hash, patch_ops, to_hash). The function constructs
-/// the IV line, patch lines, metadata line, and trailing checksum.
+/// Build a complete JLAP file from a series of patch entries, each
+/// `(from_hash, patch_ops, to_hash)`, starting from the zero IV.
+#[cfg(test)]
 fn build_jlap_file(
     patches: &[([u8; 32], Vec<serde_json::Value>, [u8; 32])],
     latest_hash: &[u8; 32],
 ) -> Vec<u8> {
-    let mut lines: Vec<String> = Vec::new();
-    let iv = [0u8; 32];
-
-    // Line 0: IV (all zeros for a fresh JLAP file)
-    lines.push(hex::encode(iv));
-
-    // Patch lines
-    for (from_hash, ops, to_hash) in patches {
-        let patch_line = serde_json::json!({
-            "from": hex::encode(from_hash),
-            "patch": ops,
-            "to": hex::encode(to_hash),
-        });
-        // Compact JSON, sorted keys
-        lines.push(sorted_compact_json(&patch_line));
+    let mut jlap = jlap_store::Jlap::fresh(*latest_hash);
+    for (from, ops, to) in patches {
+        jlap.append(from, ops.clone(), *to);
     }
-
-    // Metadata line
-    let metadata = serde_json::json!({
-        "latest": hex::encode(latest_hash),
-        "url": "repodata.json",
-    });
-    lines.push(sorted_compact_json(&metadata));
-
-    // Compute checksum chain to produce trailing checksum
-    let mut checksum = iv;
-    for line in &lines[1..] {
-        checksum = blake2_256_keyed(line.as_bytes(), &checksum);
-    }
-
-    // Trailing checksum line
-    lines.push(hex::encode(checksum));
-
-    // Join with newlines, no trailing newline
-    lines.join("\n").into_bytes()
+    jlap.latest = *latest_hash;
+    jlap.render()
 }
 
-/// Build a minimal "bootstrap" JLAP file with no patches.
-///
-/// This tells clients the current repodata hash without providing any
-/// incremental patches. Clients will compare their cached hash against
-/// `latest` and fall back to a full download if they differ.
+/// A JLAP file with no patches naming the hash of `repodata_bytes`: what a
+/// subdir with no stored revision history serves.
 fn build_bootstrap_jlap(repodata_bytes: &[u8]) -> Vec<u8> {
-    let hash = blake2_256(repodata_bytes);
-    build_jlap_file(&[], &hash)
+    jlap_store::bootstrap(repodata_bytes)
 }
 
 /// Serialize a JSON value with sorted keys and compact separators.
@@ -655,7 +618,6 @@ fn sorted_compact_json(value: &serde_json::Value) -> String {
 /// Verify a JLAP file's checksum chain integrity.
 ///
 /// Returns Ok(()) if the chain is valid, Err with a description if not.
-#[allow(dead_code)]
 fn verify_jlap_chain(content: &[u8]) -> Result<(), String> {
     let text = std::str::from_utf8(content).map_err(|e| format!("invalid UTF-8: {}", e))?;
     let lines: Vec<&str> = text.split('\n').collect();
@@ -720,7 +682,10 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/:subdir/repodata.json.zst",
             get(repodata_json_zst),
         )
-        // JLAP incremental repodata updates
+        // JLAP incremental repodata updates. conda and rattler request
+        // `repodata.jlap` (the JLAP specification's name, which conda-forge
+        // serves); `repodata.json.jlap` is the name 1.11 served it under.
+        .route("/:repo_key/:subdir/repodata.jlap", get(repodata_json_jlap))
         .route(
             "/:repo_key/:subdir/repodata.json.jlap",
             get(repodata_json_jlap),
@@ -866,6 +831,10 @@ fn token_routes(conda: &str) -> Router<SharedState> {
         .route(
             &format!("/:token{conda}/:repo_key/:subdir/repodata.json.zst"),
             get(repodata_json_zst_with_token),
+        )
+        .route(
+            &format!("/:token{conda}/:repo_key/:subdir/repodata.jlap"),
+            get(repodata_json_jlap_with_token),
         )
         .route(
             &format!("/:token{conda}/:repo_key/:subdir/repodata.json.jlap"),
@@ -1046,9 +1015,17 @@ async fn download_package_with_token(
     state: State<SharedState>,
     auth: Extension<Option<AuthExtension>>,
     Path((_token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    download_package(state, auth, Path((repo_key, subdir, filename)), ctx).await
+    download_package(
+        state,
+        auth,
+        Path((repo_key, subdir, filename)),
+        headers,
+        ctx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,6 +1147,17 @@ async fn list_conda_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
 ) -> Result<Vec<CondaArtifact>, Response> {
+    list_conda_artifacts_at(db, repo_id, chrono::Utc::now()).await
+}
+
+/// [`list_conda_artifacts`] with visibility decided at `now`. The revision
+/// cache passes the database instant its revision was read at (#4174), so a
+/// render never disagrees with the hold-expiry check about which holds lapsed.
+async fn list_conda_artifacts_at(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<CondaArtifact>, Response> {
     let rows = sqlx::query_as::<_, CondaArtifactRow>(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -1193,7 +1181,6 @@ async fn list_conda_artifacts(
     // bz2/zst/sig encodings, JLAP, CEP-16 shards, run_exports, channeldata)
     // is built from THIS listing, so the withdrawal filter lives here and
     // only here — one predicate, no per-endpoint copies to drift.
-    let now = chrono::Utc::now();
     Ok(rows
         .into_iter()
         .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
@@ -1513,7 +1500,18 @@ async fn channeldata_json(
         }
     }
 
-    let artifacts = list_conda_artifacts(&state.db, repo.id).await?;
+    // Kept under the repository's revision (#4174).
+    let doc = repodata_cache::hosted_channeldata(&state.db, repo.id).await?;
+    Ok(prepared_response(&doc, "application/json", &headers).await)
+}
+
+/// The hosted `channeldata.json` of `repo_id`, visibility decided at `now`.
+async fn render_hosted_channeldata(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>, Response> {
+    let artifacts = list_conda_artifacts_at(db, repo_id, now).await?;
 
     // Query for the latest version of each package (ordered by created_at DESC,
     // so the first row per name is the latest).
@@ -1525,9 +1523,9 @@ async fn channeldata_json(
             WHERE a.repository_id = $1 AND a.is_deleted = false
             ORDER BY a.name, a.created_at DESC
             "#,
-            repo.id
+            repo_id
         )
-        .fetch_all(&state.db)
+        .fetch_all(db)
         .await
         .map_err(|e| {
             tracing::error!("Database error querying channeldata: {}", e);
@@ -1599,11 +1597,9 @@ async fn channeldata_json(
 
     let channeldata = build_channeldata_json(&packages_json);
 
-    let body = serde_json::to_string_pretty(&channeldata)
+    Ok(serde_json::to_string_pretty(&channeldata)
         .unwrap()
-        .into_bytes();
-
-    Ok(cacheable_response(body, "application/json", &headers).await)
+        .into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,12 +1807,18 @@ async fn run_exports_json(
         }
         _ => {}
     }
-    let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
-    let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
+    // Rendered with the subdir's other documents and kept under its
+    // revision (#4174).
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir).await?;
+    Ok(prepared_response(&docs.run_exports, "application/json", &headers).await)
+}
 
+/// The hosted `run_exports.json` document of `subdir` from its rows.
+#[cfg(test)]
+fn run_exports_document(subdir_artifacts: &[&CondaArtifact], subdir: &str) -> serde_json::Value {
     let mut packages = serde_json::Map::new();
 
-    for artifact in &subdir_artifacts {
+    for artifact in subdir_artifacts {
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
         if !is_conda_package(filename) {
             continue;
@@ -1830,13 +1832,10 @@ async fn run_exports_json(
         );
     }
 
-    let response = serde_json::json!({
+    serde_json::json!({
         "info": { "subdir": subdir },
         "packages": packages,
-    });
-
-    let body = serde_json::to_vec_pretty(&response).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers).await)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1883,7 +1882,7 @@ async fn patch_instructions_json(
 // Repodata encoding helpers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepodataEncoding {
     Json,
     Bz2,
@@ -1907,41 +1906,373 @@ impl RepodataEncoding {
         }
     }
 
-    /// Serialize `repodata` in this encoding. The compressed encodings
-    /// serialize straight into the compressor, so the uncompressed document
-    /// (hundreds of MiB for a merged conda-forge subdir) is never held in
-    /// memory next to its compressed form (#4608).
+    /// Serialize `repodata` as compact JSON straight into zstd, returning the
+    /// compressed document and the length of the JSON it holds. This is how
+    /// a merged virtual `repodata.json` is kept; its other encodings are
+    /// derived from it with [`Self::transcode_zst`] (#4879).
     #[allow(clippy::result_large_err)]
-    fn encode<T: serde::Serialize + ?Sized>(&self, repodata: &T) -> Result<Vec<u8>, Response> {
+    fn encode_zst_counted<T: serde::Serialize + ?Sized>(
+        repodata: &T,
+    ) -> Result<(Vec<u8>, usize), Response> {
+        struct Counting<W> {
+            inner: W,
+            written: usize,
+        }
+        impl<W: std::io::Write> std::io::Write for Counting<W> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = self.inner.write(buf)?;
+                self.written += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
         fn failed(e: impl std::fmt::Display) -> Response {
             tracing::error!("repodata encoding error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         }
-        const BUF: usize = 256 * 1024;
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).map_err(failed)?;
+        let mut out = std::io::BufWriter::with_capacity(
+            256 * 1024,
+            Counting {
+                inner: encoder,
+                written: 0,
+            },
+        );
+        serde_json::to_writer(&mut out, repodata).map_err(failed)?;
+        let counting = out.into_inner().map_err(|e| failed(e.error()))?;
+        let plain_len = counting.written;
+        let body = counting.inner.finish().map_err(failed)?;
+        Ok((body, plain_len))
+    }
+
+    /// Re-encode a zstd-compressed JSON document (a kept virtual merge) in
+    /// this encoding, streaming from the decoder into the encoder so the plain
+    /// document is only held when it is the result. CPU-bound: run it on a
+    /// blocking thread (#4879).
+    #[allow(clippy::result_large_err)]
+    fn transcode_zst(&self, zst: &[u8]) -> Result<Vec<u8>, Response> {
+        fn failed(e: impl std::fmt::Display) -> Response {
+            tracing::error!("repodata re-encoding error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        }
         match self {
-            Self::Json => Ok(serde_json::to_vec_pretty(repodata).unwrap()),
+            Self::Zst => Ok(zst.to_vec()),
+            Self::Json => zstd::stream::decode_all(zst).map_err(failed),
             Self::Bz2 => {
-                let mut out = std::io::BufWriter::with_capacity(
-                    BUF,
-                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default()),
-                );
-                serde_json::to_writer(&mut out, repodata).map_err(failed)?;
-                out.into_inner()
-                    .map_err(|e| failed(e.error()))?
-                    .finish()
-                    .map_err(failed)
-            }
-            Self::Zst => {
-                let encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).map_err(failed)?;
-                let mut out = std::io::BufWriter::with_capacity(BUF, encoder);
-                serde_json::to_writer(&mut out, repodata).map_err(failed)?;
-                out.into_inner()
-                    .map_err(|e| failed(e.error()))?
-                    .finish()
-                    .map_err(failed)
+                let mut decoder = zstd::stream::read::Decoder::new(zst).map_err(failed)?;
+                let mut encoder =
+                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                std::io::copy(&mut decoder, &mut encoder).map_err(failed)?;
+                encoder.finish().map_err(failed)
             }
         }
     }
+}
+
+/// The upstream documents a plain `repodata.json` read is built from, most
+/// compact first (#4180).
+///
+/// The plain document is never fetched from upstream: conda-forge's `.json` is
+/// 160-200 MiB for every major subdir, while the same document as `.zst` is
+/// 20-60 MiB. Fetching the compressed representation keeps the buffered
+/// ceiling (`LARGE_METADATA_MAX_BYTES`) on the bytes actually read, and the
+/// plain response is decoded from it as a stream. `.json` stays as the last
+/// resort for an upstream that publishes no compressed encoding.
+const PLAIN_REPODATA_SOURCES: [RepodataEncoding; 3] = [
+    RepodataEncoding::Zst,
+    RepodataEncoding::Bz2,
+    RepodataEncoding::Json,
+];
+
+/// Output chunk size of the plain `repodata.json` transcode (#4180).
+const TRANSCODE_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The file codec that undoes `encoding`, for the shared streaming decoder.
+fn repodata_file_codec(encoding: RepodataEncoding) -> virtual_merge::FileCodec {
+    match encoding {
+        RepodataEncoding::Json => virtual_merge::FileCodec::Plain,
+        RepodataEncoding::Zst => virtual_merge::FileCodec::Zstd,
+        RepodataEncoding::Bz2 => virtual_merge::FileCodec::Bzip2,
+    }
+}
+
+/// Undo the HTTP transfer coding and the file compression of one upstream
+/// repodata document, returning a reader over the plain JSON.
+///
+/// The decoders stream: neither this function nor its caller ever holds the
+/// uncompressed document, which is several hundred MiB for a conda-forge
+/// subdir (#4180).
+fn decoded_repodata_reader(
+    compressed: Bytes,
+    transfer_encoding: Option<&str>,
+    encoding: RepodataEncoding,
+) -> Result<Box<dyn Read + Send>, String> {
+    virtual_merge::decoding_reader(
+        std::io::Cursor::new(compressed),
+        transfer_encoding,
+        repodata_file_codec(encoding),
+    )
+}
+
+/// Read up to [`TRANSCODE_CHUNK_BYTES`] from `reader`; an empty result is EOF.
+fn read_transcode_chunk(reader: &mut (dyn Read + Send)) -> std::io::Result<Vec<u8>> {
+    let mut chunk = Vec::with_capacity(TRANSCODE_CHUNK_BYTES);
+    reader
+        .take(TRANSCODE_CHUNK_BYTES as u64)
+        .read_to_end(&mut chunk)?;
+    Ok(chunk)
+}
+
+/// The ETag of a plain `repodata.json` decoded from an upstream compressed
+/// document (#4180). Derived from the compressed bytes, so it changes exactly
+/// when the upstream document does and costs no decode, but tagged with the
+/// representation: the same bytes served as `.zst` carry the untagged
+/// [`compute_etag`], and two representations must not share a strong ETag.
+fn transcoded_repodata_etag(compressed: &[u8], source: RepodataEncoding) -> String {
+    let etag = compute_etag(compressed);
+    let tag = match source {
+        RepodataEncoding::Zst => "from-zst",
+        RepodataEncoding::Bz2 => "from-bz2",
+        RepodataEncoding::Json => "plain",
+    };
+    format!("{}-{tag}\"", etag.trim_end_matches('"'))
+}
+
+/// The proxy-cache entry a transcode reads, evicted when it does not decode
+/// (#4180), so the next request fetches the upstream document again instead
+/// of failing on the same cached bytes until the entry expires.
+struct TranscodeSource {
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    repo_key: String,
+    path: String,
+}
+
+impl TranscodeSource {
+    async fn evict(&self, reason: &str) {
+        tracing::warn!(
+            repo = %self.repo_key,
+            path = %self.path,
+            reason = %reason,
+            "cached upstream conda repodata does not decode; evicting it (#4180)"
+        );
+        if let Err(e) = self
+            .proxy
+            .invalidate_cache_by_key(&self.repo_key, &self.path)
+            .await
+        {
+            tracing::warn!(
+                repo = %self.repo_key,
+                path = %self.path,
+                error = %e,
+                "evicting undecodable conda repodata from the proxy cache failed"
+            );
+        }
+    }
+}
+
+/// Serve a plain `repodata.json` decoded from an upstream compressed document
+/// (#4180).
+///
+/// The first chunk is decoded before the status is chosen: a body that is not
+/// a valid zstd/bzip2 document, or one that decodes to nothing, answers 502
+/// (and its cache entry is evicted) instead of a 200 with an empty or broken
+/// index. The rest is decoded chunk by chunk on the blocking pool as the
+/// client reads it, so a slow client holds no thread, and a decode failure
+/// past the first chunk aborts the body (the client sees a truncated
+/// transfer, never a short document that looks complete) and evicts the
+/// entry as well.
+///
+/// The caller's buffered-metadata reservation is released when this returns,
+/// i.e. when the body is handed to the response writer, as for every other
+/// buffered metadata serve (#2684): holding it for the whole transfer would
+/// let slow anonymous clients pin the budget every format shares.
+async fn streamed_repodata_response(
+    compressed: Bytes,
+    transfer_encoding: Option<&str>,
+    encoding: RepodataEncoding,
+    headers: &HeaderMap,
+    source: Option<TranscodeSource>,
+) -> Response {
+    let etag = transcoded_repodata_etag(&compressed, encoding);
+    if let Some(not_modified) = check_conditional_request(headers, &etag) {
+        return not_modified;
+    }
+
+    let decoded = decoded_repodata_reader(compressed, transfer_encoding, encoding);
+    let first = tokio::task::spawn_blocking(move || {
+        let mut reader = decoded?;
+        let first = read_transcode_chunk(&mut *reader).map_err(|e| e.to_string())?;
+        if first.is_empty() {
+            return Err("decodes to an empty document".to_string());
+        }
+        Ok((first, reader))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("decoder task failed: {e}")));
+    let (first, reader) = match first {
+        Ok(first) => first,
+        Err(e) => {
+            if let Some(source) = &source {
+                source.evict(&e).await;
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream conda repodata could not be decoded: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let gzip = accepts_gzip(headers);
+    let reader: Box<dyn Read + Send> = {
+        let rest = std::io::Cursor::new(first).chain(reader);
+        if gzip {
+            Box::new(flate2::read::GzEncoder::new(
+                rest,
+                flate2::Compression::default(),
+            ))
+        } else {
+            Box::new(rest)
+        }
+    };
+
+    let body = futures::stream::unfold(Some((reader, source)), |state| async move {
+        let (mut reader, source) = state?;
+        let step = tokio::task::spawn_blocking(move || {
+            let chunk = read_transcode_chunk(&mut *reader);
+            (reader, chunk)
+        })
+        .await;
+        match step {
+            Ok((_, Ok(chunk))) if chunk.is_empty() => None,
+            Ok((reader, Ok(chunk))) => Some((Ok(Bytes::from(chunk)), Some((reader, source)))),
+            Ok((_, Err(e))) => {
+                if let Some(source) = &source {
+                    source.evict(&e.to_string()).await;
+                }
+                Some((Err(e), None))
+            }
+            Err(e) => Some((Err(std::io::Error::other(e)), None)),
+        }
+    });
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, RepodataEncoding::Json.content_type())
+        .header(ETAG, &etag)
+        .header(
+            CACHE_CONTROL,
+            crate::api::handlers::cache_headers::DEFAULT_CACHE_CONTROL,
+        );
+    if gzip {
+        builder = builder
+            .header(CONTENT_ENCODING, "gzip")
+            .header("Vary", "Accept-Encoding");
+    }
+    builder.body(Body::from_stream(body)).unwrap()
+}
+
+/// Proxy a Remote repository's plain `repodata.json` (#4180).
+///
+/// Tries the compressed upstream documents in [`PLAIN_REPODATA_SOURCES`]
+/// through the same capped, budgeted proxy-cache path the compressed endpoints
+/// use, then decodes the winner as a stream. The compressed representation is
+/// what the proxy cache keeps, so a later `.zst`/`.bz2` request and a warm
+/// plain request are both served from it without another upstream read. A
+/// compressed candidate that exceeds the buffered ceiling is a hard failure
+/// (the ceiling is the point of fetching it); only an upstream that publishes
+/// no compressed document at all falls through to the plain streaming path.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_plain_repodata(
+    state: &SharedState,
+    proxy: &Arc<crate::services::proxy_service::ProxyService>,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    subdir: &str,
+    headers: &HeaderMap,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let mut over_cap = None;
+    for source in PLAIN_REPODATA_SOURCES
+        .into_iter()
+        .filter(|source| *source != RepodataEncoding::Json)
+    {
+        let upstream_path = format!("{}/{}", subdir, source.upstream_filename());
+        match proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
+        {
+            Ok(proxy_helpers::CappedMetadataGet::Buffered {
+                content,
+                content_encoding,
+                budget_permit: _budget_permit,
+                ..
+            }) => {
+                // `_budget_permit` is held until the body is handed to the
+                // response writer, as for the compressed endpoints.
+                let evict_from = TranscodeSource {
+                    proxy: Arc::clone(proxy),
+                    repo_key: repo.key.clone(),
+                    path: upstream_path.clone(),
+                };
+                return Ok(streamed_repodata_response(
+                    content,
+                    content_encoding.as_deref(),
+                    source,
+                    headers,
+                    Some(evict_from),
+                )
+                .await);
+            }
+            Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
+                tracing::warn!(
+                    repo = %repo.key,
+                    path = %upstream_path,
+                    "compressed conda repodata exceeds the buffered-metadata ceiling (#4180)"
+                );
+                over_cap = Some(upstream_path);
+            }
+            Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            Err(response) => return Err(response),
+        }
+    }
+
+    if let Some(path) = over_cap {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Upstream conda repodata {path} exceeds the {}-byte compressed metadata ceiling",
+                proxy_helpers::LARGE_METADATA_MAX_BYTES
+            ),
+        )
+            .into_response());
+    }
+
+    // No compressed encoding upstream: stream the plain document instead of
+    // buffering it, so a channel that predates `.zst`/`.bz2` still works
+    // without materialising its index (#4149).
+    let upstream_path = format!("{}/{}", subdir, RepodataEncoding::Json.upstream_filename());
+    let response = proxy_helpers::proxy_fetch_streaming(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        RepodataEncoding::Json.content_type(),
+    )
+    .await?;
+    // #3649: count the proxied serve once the streaming helper resolves, on
+    // the same cache path this fetch commits under.
+    proxy_helpers::record_proxy_download(state, repo.id, &repo.key, &upstream_path, ctx).await;
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -2071,11 +2402,19 @@ async fn serve_repodata(
     // Virtual repos: merge repodata from all members
     if repo.repo_type == RepositoryType::Virtual {
         let merged =
-            build_virtual_repodata(state, auth.as_ref(), repo.id, repo_key, subdir, encoding)
-                .await?;
+            build_virtual_repodata(state, auth.as_ref(), repo.id, repo_key, subdir).await?;
         let document = format!("{subdir}/{}", encoding.upstream_filename());
-        return serve_virtual_merge(&state.db, repo.id, repo_key, &document, merged, ct, headers)
-            .await;
+        return serve_virtual_merge_encoded(
+            &state.db,
+            repo.id,
+            repo_key,
+            &document,
+            merged,
+            Some(encoding),
+            ct,
+            headers,
+        )
+        .await;
     }
 
     // For remote repos, proxy repodata from upstream. Real conda-forge
@@ -2101,31 +2440,13 @@ async fn serve_repodata(
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
                 // #4051: attribute the served index to the upstream patch
-                // generation in effect at serve time, and record it so an
-                // upstream repodata patch revision is visible as a change.
-                //
-                // This MUST run BEFORE the repodata reservation below, never
-                // underneath it. `record_upstream_patch_generation` buffers
-                // through the same budgeted helper, so it reserves a SECOND
-                // slice (8 MiB) of the SAME process-wide buffered-metadata
-                // budget. Taking it while the 128 MiB repodata permit is held
-                // is hold-and-wait: the default budget is 1 GiB, i.e. exactly
-                // eight `LARGE_METADATA_MAX_BYTES` buffers, so eight
-                // concurrent (anonymous, un-rate-limited) repodata requests
-                // reserve the whole budget and then each await bytes only the
-                // others could release — a permanent deadlock of the shared
-                // buffered-metadata path for EVERY format, not just conda
-                // (#4129). Sequencing the two fetches keeps a request to one
-                // reservation at a time: the attribution permit is released
-                // when this call returns, before the repodata permit exists,
-                // and the peak reservation stays 128 MiB rather than 136 MiB.
-                //
-                // The cost of the order is one extra (cached, 8 MiB-capped)
-                // attribution lookup when the repodata fetch then fails, which
-                // is strictly preferable to a liveness hazard on a budget every
-                // format shares.
+                // generation in effect at serve time. This MUST run before the
+                // repodata reservation below: both fetch through the shared
+                // buffered-metadata budget, and taking the attribution's
+                // 8 MiB permit while holding a 128 MiB repodata permit is the
+                // hold-and-wait deadlock of #4129. Sequencing them keeps one
+                // reservation per request.
                 let patch_generation = record_upstream_patch_generation(
                     state,
                     proxy,
@@ -2135,73 +2456,78 @@ async fn serve_repodata(
                     subdir,
                 )
                 .await;
-                // #4149: the buffered read is the COMMON path, but conda-forge's
-                // uncompressed `repodata.json` for every major subdir runs
-                // 160-200 MiB — past the 128 MiB ceiling — and used to die here
-                // with a 502 while the compressed encodings (which fit under
-                // the cap) proxied fine. The ceiling abort is therefore not an
-                // error for this endpoint: fall through to the streaming path,
-                // which tees upstream -> client -> proxy cache without ever
-                // buffering the document, exactly as oversized .deb/.npm
-                // tarballs are served (#3596/#2181). Once the stream commits
-                // the cache entry, subsequent requests take the buffered arm
-                // above again — the ceiling bounds the UPSTREAM read only;
-                // serving a warmed copy from cache was never the problem.
-                let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
-                    proxy,
-                    repo.id,
-                    repo_key,
-                    upstream_url,
-                    &upstream_path,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                )
-                .await?;
-                let mut response = match fetched {
-                    proxy_helpers::CappedMetadataGet::Buffered {
-                        content,
-                        content_encoding,
-                        budget_permit: _budget_permit,
-                        ..
-                    } => {
-                        // `_budget_permit` is held until this function returns,
-                        // i.e. across response construction (including the gzip
-                        // pass) — the window where the buffer is both resident
-                        // and being read. Matches the debian dists path (#2684).
-                        cacheable_response_coded(content, ct, content_encoding.as_deref(), headers)
+                // #4180: a plain `repodata.json` read is built from the
+                // upstream compressed document (`.zst`, then `.bz2`) and
+                // streamed through a decoder, so the buffered ceiling applies
+                // to the 20-60 MiB compressed body instead of the 160-200 MiB
+                // plain one. The compressed `.zst`/`.bz2` endpoints keep
+                // proxying their own upstream document.
+                let mut response = if encoding == RepodataEncoding::Json {
+                    proxy_plain_repodata(state, proxy, &repo, upstream_url, subdir, headers, ctx)
+                        .await?
+                } else {
+                    let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
+                    let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
+                    match fetched {
+                        proxy_helpers::CappedMetadataGet::Buffered {
+                            content,
+                            content_encoding,
+                            budget_permit: _budget_permit,
+                            ..
+                        } => {
+                            // `_budget_permit` is held until this function returns,
+                            // i.e. across response construction (including the gzip
+                            // pass) — the window where the buffer is both resident
+                            // and being read. Matches the debian dists path (#2684).
+                            cacheable_response_coded(
+                                content,
+                                ct,
+                                content_encoding.as_deref(),
+                                headers,
+                            )
                             .await
-                    }
-                    proxy_helpers::CappedMetadataGet::OverCap => {
-                        tracing::info!(
-                            repo = %repo_key,
-                            path = %upstream_path,
-                            "repodata document exceeds the buffered-metadata ceiling; \
-                             serving it via the streaming path (#4149)"
-                        );
-                        let response = proxy_helpers::proxy_fetch_streaming(
-                            proxy,
-                            repo.id,
-                            repo_key,
-                            upstream_url,
-                            &upstream_path,
-                            ct,
-                        )
-                        .await?;
-                        // #3649: count the proxied serve. The streaming helper
-                        // answers a warm cache HIT from storage and a cold MISS
-                        // from upstream through the same call, so recording once
-                        // it resolves counts both — while a 404/502 still counts
-                        // nothing. Keyed on the proxy-cache path this fetch
-                        // commits under, so the count lines up with the catalog
-                        // row the artifact listing renders.
-                        proxy_helpers::record_proxy_download(
-                            state,
-                            repo.id,
-                            repo_key,
-                            &upstream_path,
-                            ctx,
-                        )
-                        .await;
-                        response
+                        }
+                        proxy_helpers::CappedMetadataGet::OverCap => {
+                            tracing::info!(
+                                repo = %repo_key,
+                                path = %upstream_path,
+                                "repodata document exceeds the buffered-metadata ceiling; \
+                                 serving it via the streaming path (#4149)"
+                            );
+                            let response = proxy_helpers::proxy_fetch_streaming(
+                                proxy,
+                                repo.id,
+                                repo_key,
+                                upstream_url,
+                                &upstream_path,
+                                ct,
+                            )
+                            .await?;
+                            // #3649: count the proxied serve. The streaming helper
+                            // answers a warm cache HIT from storage and a cold MISS
+                            // from upstream through the same call, so recording once
+                            // it resolves counts both — while a 404/502 still counts
+                            // nothing. Keyed on the proxy-cache path this fetch
+                            // commits under, so the count lines up with the catalog
+                            // row the artifact listing renders.
+                            proxy_helpers::record_proxy_download(
+                                state,
+                                repo.id,
+                                repo_key,
+                                &upstream_path,
+                                ctx,
+                            )
+                            .await;
+                            response
+                        }
                     }
                 };
                 if let Some(generation) = patch_generation {
@@ -2216,9 +2542,20 @@ async fn serve_repodata(
         }
     }
 
-    let repodata = build_repodata(&state.db, repo.id, subdir, false).await?;
-    let body = encoding.encode(&repodata)?;
-    Ok(cacheable_response(body, ct, headers).await)
+    // Hosted: every encoding is kept under the subdir's revision (#4174).
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, subdir).await?;
+    match encoding {
+        RepodataEncoding::Json => Ok(prepared_response(&docs.json, ct, headers).await),
+        RepodataEncoding::Zst => Ok(prepared_response(&docs.zst, ct, headers).await),
+        RepodataEncoding::Bz2 => {
+            let docs = repodata_cache::with_bz2(docs).await?;
+            let bz2 = docs
+                .bz2
+                .get()
+                .ok_or_else(|| virtual_merge::internal_error("bz2 rendering missing"))?;
+            Ok(prepared_response(bz2, ct, headers).await)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,15 +2639,8 @@ async fn repodata_json_sig(
             .await;
         }
         Some(RepositoryType::Virtual) => {
-            let merged = build_virtual_repodata(
-                &state,
-                auth.as_ref(),
-                repo.id,
-                &repo_key,
-                &subdir,
-                RepodataEncoding::Json,
-            )
-            .await?;
+            let merged =
+                build_virtual_repodata(&state, auth.as_ref(), repo.id, &repo_key, &subdir).await?;
             partial = virtual_merge_failure_policy(
                 &state.db,
                 repo.id,
@@ -2319,13 +2649,20 @@ async fn repodata_json_sig(
                 &merged,
             )
             .await?;
-            merged.body.clone()
+            // The signature covers the bytes `repodata.json` serves: the
+            // `.json` rendering of the merge (#4879).
+            merge_gate::gate_for(repo.id)
+                .rendering(&merged, RepodataEncoding::Json)
+                .await?
         }
         _ => {
-            let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
-            // Use pretty-printed JSON to match what repodata_json() serves,
-            // so clients can verify the signature against the downloaded repodata.
-            Bytes::from(serde_json::to_vec_pretty(&repodata).unwrap())
+            // The kept `repodata.json` bytes (#4174), so clients can verify
+            // the signature against the downloaded repodata.
+            repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir)
+                .await?
+                .json
+                .body
+                .clone()
         }
     };
 
@@ -2388,32 +2725,31 @@ async fn repodata_json_zst(
     .await
 }
 // ---------------------------------------------------------------------------
-// GET /conda/{repo_key}/{subdir}/repodata.json.jlap
+// GET /conda/{repo_key}/{subdir}/repodata.jlap (and repodata.json.jlap)
 // ---------------------------------------------------------------------------
 
 /// Return a JLAP (JSON Lines And Patches) file for incremental repodata updates.
 ///
-/// Conda 23.9+ and mamba clients request this endpoint first to check for
-/// incremental updates. The JLAP file contains a BLAKE2b-256 checksum chain
-/// and RFC 6902 JSON patches that transform old repodata into current.
+/// conda (with `--experimental=jlap`) and rattler request this endpoint to
+/// update a cached `repodata.json` without downloading it again. The file is
+/// the subdir's stored JLAP ([`jlap_store`], #4175): one RFC 6902 patch line
+/// per kept change of the subdir, a footer naming the BLAKE2b-256 of the
+/// `repodata.json` served at the same revision, and the BLAKE2b checksum
+/// chain over every line. It is kept with that revision's documents, so it
+/// never names a document other than the one `repodata.json` serves next to
+/// it.
 ///
-/// Currently serves a "bootstrap" JLAP that communicates the current repodata
-/// hash without patches. Clients compare against their cached hash and fall
-/// back to a full download when no applicable patches exist.
+/// Range requests (`Range: bytes=<pos>-`, what conda sends with the position
+/// of the footer it last saw) are answered `206` with the bytes from there:
+/// new patch lines are appended where the old footer was, so those bytes
+/// are exactly what changed. A position past the end is `416`, which makes
+/// the client fetch the whole file.
 ///
-/// Supports HTTP Range requests (`Accept-Ranges: bytes`) so clients can
-/// fetch only newly appended lines on subsequent requests.
-///
-/// Local repos only (#2915). The bootstrap JLAP's footer advertises `latest` =
-/// the BLAKE2b hash of the document [`build_repodata`] produces from our own DB
-/// rows, and that is only the document `repodata.json` actually serves for a
-/// Local repo. For a Remote repo `repodata.json` serves the UPSTREAM document,
-/// and for a Virtual repo the aggregation of its members' — so the advertised
-/// hash can never match what the client holds, the client concludes its cached
-/// index is stale on every single run, and it refetches the full
-/// `repodata.json` anyway (having paid for a JLAP round trip first). 404ing is
-/// the documented "no JLAP available" signal and sends the client straight to
-/// the full fetch, which is the outcome it would have reached regardless.
+/// Local repos only (#2915). For a Remote repo `repodata.json` serves the
+/// UPSTREAM document, and for a Virtual repo the aggregation of its
+/// members', so a hash of a document we render could never match what the
+/// client holds. 404ing is the documented "no JLAP available" signal and
+/// sends the client straight to the full fetch.
 async fn repodata_json_jlap(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -2428,41 +2764,31 @@ async fn repodata_json_jlap(
         )
             .into_response());
     }
-    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
-
-    // Serialize repodata identically to how repodata_json serves it
-    let json_bytes = serde_json::to_string_pretty(&repodata)
-        .unwrap()
-        .into_bytes();
-
-    // Build the JLAP file
-    let jlap_body = build_bootstrap_jlap(&json_bytes);
-
-    let etag = compute_etag(&jlap_body);
+    // The stored JLAP kept with the subdir's current revision (#4175).
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir).await?;
+    let jlap_body = docs.jlap.body.clone();
+    let etag = docs.jlap.etag.clone();
 
     // Check for conditional request
     if let Some(not_modified) = check_conditional_request(&headers, &etag) {
         return Ok(not_modified);
     }
 
-    // Check for Range request
-    if let Some(range_header) = headers
+    let range = headers
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok())
-    {
-        if let Some(start) = parse_range_start(range_header, jlap_body.len()) {
-            let end = jlap_body.len() - 1;
-            if start > end {
-                // 416 Range Not Satisfiable
-                return Ok(Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header("Content-Range", format!("bytes */{}", jlap_body.len()))
-                    .body(Body::empty())
-                    .unwrap());
-            }
-
-            let slice = &jlap_body[start..=end];
-            return Ok(Response::builder()
+        .and_then(|h| parse_byte_range(h, jlap_body.len()));
+    match range {
+        Some(Err(())) => Ok(Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header("Content-Range", format!("bytes */{}", jlap_body.len()))
+            .header("Accept-Ranges", "bytes")
+            .header(ETAG, &etag)
+            .body(Body::empty())
+            .unwrap()),
+        Some(Ok((start, end))) => {
+            let slice = jlap_body.slice(start..=end);
+            Ok(Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_TYPE, "application/json")
                 .header(CONTENT_LENGTH, slice.len().to_string())
@@ -2473,40 +2799,54 @@ async fn repodata_json_jlap(
                 .header("Accept-Ranges", "bytes")
                 .header(ETAG, &etag)
                 .header(CACHE_CONTROL, "public, max-age=60")
-                .body(Body::from(slice.to_vec()))
-                .unwrap());
+                .body(Body::from(slice))
+                .unwrap())
         }
+        None => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_LENGTH, jlap_body.len().to_string())
+            .header("Accept-Ranges", "bytes")
+            .header(ETAG, &etag)
+            .header(CACHE_CONTROL, "public, max-age=60")
+            .body(Body::from(jlap_body))
+            .unwrap()),
     }
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .header(CONTENT_LENGTH, jlap_body.len().to_string())
-        .header("Accept-Ranges", "bytes")
-        .header(ETAG, &etag)
-        .header(CACHE_CONTROL, "public, max-age=60")
-        .body(Body::from(jlap_body))
-        .unwrap())
 }
 
-/// Parse a `Range: bytes=N-` header and return the start offset.
-fn parse_range_start(range_header: &str, total_len: usize) -> Option<usize> {
-    let range = range_header.strip_prefix("bytes=")?;
-    if let Some(start_str) = range.strip_suffix('-') {
-        let start: usize = start_str.parse().ok()?;
-        if start < total_len {
-            return Some(start);
-        }
+/// Parse a single-range `Range` header (`bytes=N-`, `bytes=N-M` or the
+/// suffix form `bytes=-N`) against a body of `total_len` bytes. `None` when
+/// it is not one byte range (the whole body is served, as RFC 9110 allows),
+/// `Some(Ok((start, end)))` with `end` inclusive, `Some(Err(()))` when no
+/// byte of the body is in range (416).
+fn parse_byte_range(range_header: &str, total_len: usize) -> Option<Result<(usize, usize), ()>> {
+    let range = range_header.trim().strip_prefix("bytes=")?.trim();
+    if range.contains(',') {
+        return None;
     }
-    // Handle "bytes=N-M" format
-    let parts: Vec<&str> = range.splitn(2, '-').collect();
-    if parts.len() == 2 {
-        let start: usize = parts[0].parse().ok()?;
-        if start < total_len {
-            return Some(start);
+    let (first, last) = range.split_once('-')?;
+    let (first, last) = (first.trim(), last.trim());
+    if first.is_empty() {
+        let suffix: usize = last.parse().ok()?;
+        if suffix == 0 || total_len == 0 {
+            return Some(Err(()));
         }
+        return Some(Ok((total_len.saturating_sub(suffix), total_len - 1)));
     }
-    None
+    let start: usize = first.parse().ok()?;
+    let end = if last.is_empty() {
+        usize::MAX
+    } else {
+        let end: usize = last.parse().ok()?;
+        if end < start {
+            return None;
+        }
+        end
+    };
+    if start >= total_len {
+        return Some(Err(()));
+    }
+    Some(Ok((start, end.min(total_len - 1))))
 }
 
 // ---------------------------------------------------------------------------
@@ -2593,13 +2933,8 @@ async fn current_repodata_json(
         }
         _ => {}
     }
-    let repodata = build_repodata(&state.db, repo.id, &subdir, true).await?;
-
-    let body = serde_json::to_string_pretty(&repodata)
-        .unwrap()
-        .into_bytes();
-
-    Ok(cacheable_response(body, "application/json", &headers).await)
+    let docs = repodata_cache::hosted_subdir_docs(&state.db, repo.id, &subdir).await?;
+    Ok(prepared_response(&docs.current, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -2850,12 +3185,34 @@ struct UpstreamShardIndexInfo {
     info: rattler_conda_types::ShardedSubdirInfo,
 }
 
+/// What an upstream publishes as its CEP-16 shard index for a subdir.
+enum UpstreamShardIndex<T> {
+    Found(T),
+    /// The upstream answers 404: it publishes no shard index for the subdir,
+    /// so a remote serves shards synthesised from its repodata (#4178).
+    NotPublished,
+    /// The upstream's index is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`]
+    /// (#4612): no index this channel can use, so clients use
+    /// `repodata.json`.
+    TooLarge,
+}
+
+impl<T> UpstreamShardIndex<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> UpstreamShardIndex<U> {
+        match self {
+            Self::Found(t) => UpstreamShardIndex::Found(f(t)),
+            Self::NotPublished => UpstreamShardIndex::NotPublished,
+            Self::TooLarge => UpstreamShardIndex::TooLarge,
+        }
+    }
+}
+
 /// Fetch and decode `{subdir}/repodata_shards.msgpack.zst` from a remote
 /// repository's upstream through the proxy cache (capped and budgeted, like a
-/// virtual member's repodata). `Ok(None)`: the upstream answers 404, i.e. it
-/// does not publish CEP-16 for this subdir (negative-cached by the proxy), or
-/// its index is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`] (#4612, logged);
-/// either way the client uses `repodata.json`. Any other failure is reported
+/// virtual member's repodata). [`UpstreamShardIndex::NotPublished`]: the
+/// upstream answers 404, i.e. it does not publish CEP-16 for this subdir
+/// (negative-cached by the proxy); [`UpstreamShardIndex::TooLarge`]: its index
+/// is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`] (#4612, logged). Any other failure is reported
 /// as that repository's [`virtual_merge::MemberFailure`], so the virtual merge
 /// can apply its member-failure policy to it.
 async fn fetch_upstream_shard_document<T>(
@@ -2864,7 +3221,7 @@ async fn fetch_upstream_shard_document<T>(
     repo_key: &str,
     upstream_url: &str,
     subdir: &str,
-) -> Result<Option<CheckedShardDocument<T>>, virtual_merge::MemberFailure>
+) -> Result<UpstreamShardIndex<CheckedShardDocument<T>>, virtual_merge::MemberFailure>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
@@ -2908,9 +3265,11 @@ where
                 "upstream CEP-16 shard index exceeds the shard-index ceiling; serving no \
                  shard index for it so clients use repodata.json"
             );
-            return Ok(None);
+            return Ok(UpstreamShardIndex::TooLarge);
         }
-        Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
+        Err(response) if response.status() == StatusCode::NOT_FOUND => {
+            return Ok(UpstreamShardIndex::NotPublished)
+        }
         Err(response) => {
             return Err(fail(
                 "fetch",
@@ -2935,7 +3294,7 @@ where
     .await
     .map_err(|e| fail("decode", format!("decoder task failed: {e}")))?
     .map_err(|e| fail("decode", format!("{path}: {e}")))?;
-    Ok(Some(decoded))
+    Ok(UpstreamShardIndex::Found(decoded))
 }
 
 /// An upstream CEP-16 document and the SHA-256 of the bytes it was decoded
@@ -2945,8 +3304,8 @@ struct CheckedShardDocument<T> {
     checksum: String,
 }
 
-/// The full upstream shard index of a remote repository. `Ok(None)`: the
-/// upstream publishes none for `subdir`. An index whose shards cannot be
+/// The full upstream shard index of a remote repository, or why there is
+/// none for `subdir`. An index whose shards cannot be
 /// located (`shards_base_url` does not resolve) is a decode failure here
 /// rather than a shard fetch that can never succeed later.
 async fn fetch_upstream_shard_index(
@@ -2955,7 +3314,8 @@ async fn fetch_upstream_shard_index(
     repo_key: &str,
     upstream_url: &str,
     subdir: &str,
-) -> Result<Option<rattler_conda_types::ShardedRepodata>, virtual_merge::MemberFailure> {
+) -> Result<UpstreamShardIndex<rattler_conda_types::ShardedRepodata>, virtual_merge::MemberFailure>
+{
     Ok(
         fetch_upstream_shard_index_checked(proxy, repo_id, repo_key, upstream_url, subdir)
             .await?
@@ -2971,10 +3331,10 @@ async fn fetch_upstream_shard_index_checked(
     upstream_url: &str,
     subdir: &str,
 ) -> Result<
-    Option<CheckedShardDocument<rattler_conda_types::ShardedRepodata>>,
+    UpstreamShardIndex<CheckedShardDocument<rattler_conda_types::ShardedRepodata>>,
     virtual_merge::MemberFailure,
 > {
-    let Some(index) = fetch_upstream_shard_document::<rattler_conda_types::ShardedRepodata>(
+    let index = match fetch_upstream_shard_document::<rattler_conda_types::ShardedRepodata>(
         proxy,
         repo_id,
         repo_key,
@@ -2982,8 +3342,10 @@ async fn fetch_upstream_shard_index_checked(
         subdir,
     )
     .await?
-    else {
-        return Ok(None);
+    {
+        UpstreamShardIndex::Found(index) => index,
+        UpstreamShardIndex::NotPublished => return Ok(UpstreamShardIndex::NotPublished),
+        UpstreamShardIndex::TooLarge => return Ok(UpstreamShardIndex::TooLarge),
     };
     resolve_shards_base(upstream_url, subdir, &index.document.info.shards_base_url).map_err(
         |reason| virtual_merge::MemberFailure {
@@ -2992,22 +3354,19 @@ async fn fetch_upstream_shard_index_checked(
             reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
         },
     )?;
-    Ok(Some(index))
+    Ok(UpstreamShardIndex::Found(index))
 }
 
 /// Where a remote repository's upstream keeps its shards, from the `info`
-/// block of its shard index alone. `Ok(None)`: the upstream publishes none.
+/// block of its shard index alone, or why there is none.
 async fn fetch_upstream_shards_base(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
     subdir: &str,
-) -> Result<Option<url::Url>, virtual_merge::MemberFailure> {
-    let Some(CheckedShardDocument {
-        document: UpstreamShardIndexInfo { info },
-        ..
-    }) = fetch_upstream_shard_document::<UpstreamShardIndexInfo>(
+) -> Result<UpstreamShardIndex<url::Url>, virtual_merge::MemberFailure> {
+    let info = match fetch_upstream_shard_document::<UpstreamShardIndexInfo>(
         proxy,
         repo_id,
         repo_key,
@@ -3015,11 +3374,16 @@ async fn fetch_upstream_shards_base(
         subdir,
     )
     .await?
-    else {
-        return Ok(None);
+    {
+        UpstreamShardIndex::Found(CheckedShardDocument {
+            document: UpstreamShardIndexInfo { info },
+            ..
+        }) => info,
+        UpstreamShardIndex::NotPublished => return Ok(UpstreamShardIndex::NotPublished),
+        UpstreamShardIndex::TooLarge => return Ok(UpstreamShardIndex::TooLarge),
     };
     resolve_shards_base(upstream_url, subdir, &info.shards_base_url)
-        .map(Some)
+        .map(UpstreamShardIndex::Found)
         .map_err(|reason| virtual_merge::MemberFailure {
             member: repo_key.to_string(),
             kind: "decode",
@@ -3051,9 +3415,52 @@ fn resolve_shards_base(
     Ok(base)
 }
 
+/// An upstream shard as the proxy holds it, with any transfer coding undone:
+/// the proxy's HTTP client does not decode, so a shard that arrived coded has
+/// to be decoded before it can be verified or served.
+async fn decode_upstream_shard(content: Bytes, coding: Option<String>) -> Result<Bytes, String> {
+    let Some(coding) = coding
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("identity"))
+    else {
+        return Ok(content);
+    };
+    tokio::task::spawn_blocking(move || {
+        virtual_merge::decode_member_document(
+            &content,
+            Some(&coding),
+            virtual_merge::FileCodec::Plain,
+            CEP16_UPSTREAM_SHARD_MAX_BYTES,
+        )
+    })
+    .await
+    .map_err(|e| format!("decoder task failed: {e}"))?
+    .map(Bytes::from)
+}
+
+/// The proxy-cache identity check for the shard at `hash_hex` (#4829): the
+/// body, decoded, hashes to the address. A body that fails is never committed
+/// to the proxy cache, and a cached one that fails is evicted, so one wrong
+/// upstream answer is not pinned under a path the cache treats as immutable.
+fn shard_cache_check(
+    hash_hex: &str,
+) -> impl Fn(Bytes, Option<String>) -> futures::future::BoxFuture<'static, bool> + Send + Sync {
+    let hash_hex = hash_hex.to_string();
+    move |content, coding| {
+        let hash_hex = hash_hex.clone();
+        Box::pin(async move {
+            decode_upstream_shard(content, coding)
+                .await
+                .is_ok_and(|shard| hex::encode(shard_address(&shard)) == hash_hex)
+        })
+    }
+}
+
 /// Fetch one shard of a remote repository's upstream by address through the
 /// proxy cache (immutable: the address is the hash of the bytes) and verify
-/// it. `Ok(None)`: the upstream has no such shard.
+/// it. `Ok(None)`: the upstream has no such shard. Only a shard that hashes
+/// to its address is committed to the proxy cache, and a cached entry that
+/// does not is evicted and fetched again (#4829).
 async fn fetch_upstream_shard(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -3084,6 +3491,7 @@ async fn fetch_upstream_shard(
     let _budget_permit = proxy_helpers::proxy_metadata_budget()
         .reserve(CEP16_UPSTREAM_SHARD_MAX_BYTES)
         .await;
+    let check = shard_cache_check(hash_hex);
     let fetched = proxy_helpers::proxy_fetch_capped_with_cache_key_encoded_format(
         proxy,
         repo_id,
@@ -3093,6 +3501,7 @@ async fn fetch_upstream_shard(
         &cache_path,
         CEP16_UPSTREAM_SHARD_MAX_BYTES,
         RepositoryFormat::Conda,
+        &check,
     )
     .await;
     let proxy_helpers::CachedBody {
@@ -3105,24 +3514,8 @@ async fn fetch_upstream_shard(
         Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
         Err(response) => return Err(response),
     };
-    // The proxy's HTTP client does not undo an upstream transfer coding; a
-    // shard that arrived coded has to be decoded before it can be verified.
-    let shard = match content_encoding
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("identity"))
-    {
-        None => content,
-        Some(coding) => tokio::task::spawn_blocking(move || {
-            virtual_merge::decode_member_document(
-                &content,
-                Some(&coding),
-                virtual_merge::FileCodec::Plain,
-                CEP16_UPSTREAM_SHARD_MAX_BYTES,
-            )
-        })
+    let shard = decode_upstream_shard(content, content_encoding)
         .await
-        .map_err(virtual_merge::internal_error)?
-        .map(Bytes::from)
         .map_err(|e| {
             tracing::warn!(repo = %repo_key, hash = hash_hex, error = %e, "upstream conda shard could not be decoded");
             (
@@ -3130,8 +3523,7 @@ async fn fetch_upstream_shard(
                 "Upstream shard could not be decoded",
             )
                 .into_response()
-        })?,
-    };
+        })?;
     if hex::encode(shard_address(&shard)) != hash_hex {
         tracing::warn!(
             repo = %repo_key,
@@ -3216,12 +3608,30 @@ async fn serve_remote_shard_index(
 ) -> Result<Response, Response> {
     let (proxy, upstream_url) = remote_upstream(state, repo)?;
     let document = format!("{subdir}/{SHARD_INDEX_FILE}");
-    let upstream =
-        match fetch_upstream_shard_index(proxy, repo.id, &repo.key, upstream_url, subdir).await {
-            Ok(Some(upstream)) => upstream,
-            Ok(None) => return Err(no_upstream_shard_index(&repo.key, subdir)),
-            Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
-        };
+    let upstream = match fetch_upstream_shard_index(proxy, repo.id, &repo.key, upstream_url, subdir)
+        .await
+    {
+        Ok(UpstreamShardIndex::Found(upstream)) => upstream,
+        Ok(UpstreamShardIndex::TooLarge) => return Err(no_upstream_shard_index(&repo.key, subdir)),
+        Ok(UpstreamShardIndex::NotPublished) => {
+            // No upstream shard index: the shards synthesised from the
+            // cached upstream repodata (#4178).
+            return match shard_synth::synthesized_index(
+                &state.db,
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                subdir,
+            )
+            .await?
+            {
+                Some(doc) => Ok(prepared_response(&doc, CEP16_CONTENT_TYPE, headers).await),
+                None => Err(no_upstream_shard_index(&repo.key, subdir)),
+            };
+        }
+        Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
+    };
     let index = build_sharded_index_with_info(
         shard_index_info(subdir, Some(&upstream.info)),
         upstream
@@ -3244,8 +3654,19 @@ async fn serve_remote_shard(
     let document = format!("{subdir}/shards/{hash_hex}.msgpack.zst");
     let shards_base =
         match fetch_upstream_shards_base(proxy, repo.id, &repo.key, upstream_url, subdir).await {
-            Ok(Some(base)) => base,
-            Ok(None) => return Err(shard_not_found()),
+            Ok(UpstreamShardIndex::Found(base)) => base,
+            Ok(UpstreamShardIndex::TooLarge) => return Err(shard_not_found()),
+            Ok(UpstreamShardIndex::NotPublished) => {
+                // No upstream shard index: a shard synthesised from the cached
+                // upstream repodata (#4178), checked against its address
+                // before it is served (#4829).
+                let address = hex::decode(hash_hex).map_err(virtual_merge::internal_error)?;
+                return match shard_store::stored_shard(&state.db, repo.id, subdir, &address).await?
+                {
+                    Some(shard) => Ok(shard_response(shard)),
+                    None => Err(shard_not_found()),
+                };
+            }
             Err(failure) => return Err(upstream_failure_response(&repo.key, &document, &failure)),
         };
     match fetch_upstream_shard(
@@ -3264,10 +3685,21 @@ async fn serve_remote_shard(
     }
 }
 
+/// A hosted shard a virtual's merged index lists.
+enum HostedShard {
+    /// Built for this merge from the members' rows: the name more than one
+    /// hosted member publishes, or any name of a member whose stored shards
+    /// are not complete yet.
+    Built(Vec<u8>),
+    /// The stored shard (#4173) of the one hosted member that publishes the
+    /// name, fetched by address when it is requested.
+    Stored(uuid::Uuid),
+}
+
 /// Where the shard a virtual's merged index lists under a name comes from.
 enum VirtualShardSource {
-    /// The hosted members' shard for the name, built from their rows.
-    Hosted(Vec<u8>),
+    /// The hosted members' shard for the name.
+    Hosted(HostedShard),
     /// The remote member at this position of [`MergedShardIndex::remotes`].
     Remote(usize),
 }
@@ -3278,7 +3710,10 @@ struct RemoteShardMember {
     id: uuid::Uuid,
     key: String,
     upstream_url: String,
-    shards_base: url::Url,
+    /// Where the upstream keeps its shards; `None` for a member whose
+    /// upstream has no shard index, whose shards are synthesised and stored
+    /// (#4178).
+    shards_base: Option<url::Url>,
 }
 
 /// A virtual channel's merged shard index, with everything needed to serve
@@ -3382,13 +3817,33 @@ async fn build_virtual_shard_index(
         .filter(|m| m.repo_type != RepositoryType::Remote)
         .map(|m| m.id)
         .collect();
-    let hosted = hosted_shards(&state.db, &hosted_ids, subdir).await?;
-    // The hosted shards (by address) are the hosted generation.
-    key.part(&(hosted.len() as u64).to_le_bytes());
-    for (name, shard) in &hosted {
-        key.part(name.as_bytes()).part(&shard_address(shard));
-    }
+    // The hosted generation: with every hosted member's shards stored
+    // (#4173), the members' subdir revisions, and the shards are read from
+    // the stored maps only when the merge runs; otherwise the shards built
+    // from the members' rows, by address, as before.
+    let hosted_source = match hosted_member_revisions(&state.db, &hosted_ids, subdir).await? {
+        Some((revisions, now)) => {
+            key.part(b"stored-shards");
+            key.part(&(revisions.len() as u64).to_le_bytes());
+            for (id, revision) in &revisions {
+                key.part(id.as_bytes()).part(&revision.to_le_bytes());
+            }
+            HostedShardSource::Stored {
+                ids: hosted_ids.clone(),
+                now,
+            }
+        }
+        None => {
+            let hosted = hosted_shards(&state.db, &hosted_ids, subdir).await?;
+            key.part(&(hosted.len() as u64).to_le_bytes());
+            for (name, shard) in &hosted {
+                key.part(name.as_bytes()).part(&shard_address(shard));
+            }
+            HostedShardSource::Built(hosted)
+        }
+    };
 
+    let db = state.db.clone();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
     let subdir = subdir.to_string();
@@ -3404,8 +3859,22 @@ async fn build_virtual_shard_index(
                 let subdir = subdir.as_str();
                 let mut shards: BTreeMap<String, Vec<u8>> = BTreeMap::new();
                 let mut sources: HashMap<String, VirtualShardSource> = HashMap::new();
-                for (name, shard) in hosted {
-                    shards.insert(name.clone(), shard_address(&shard).to_vec());
+                let hosted = match hosted_source {
+                    HostedShardSource::Built(built) => built
+                        .into_iter()
+                        .map(|(name, shard)| {
+                            (
+                                name,
+                                (shard_address(&shard).to_vec(), HostedShard::Built(shard)),
+                            )
+                        })
+                        .collect(),
+                    HostedShardSource::Stored { ids, now } => {
+                        stored_hosted_shards(&db, &ids, subdir, now).await?
+                    }
+                };
+                for (name, (address, shard)) in hosted {
+                    shards.insert(name.clone(), address);
                     sources.insert(name, VirtualShardSource::Hosted(shard));
                 }
                 let mut merged = MergedShardIndex {
@@ -3438,67 +3907,144 @@ async fn build_virtual_shard_index(
                         });
                         continue;
                     };
-                    let checked = match fetch_upstream_shard_index_checked(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        upstream_url,
-                        subdir,
-                    )
-                    .await
-                    {
-                        Ok(Some(checked)) => checked,
-                        Ok(None) => {
-                            // Not kept: the member's 404 carries no validator.
-                            return Ok(merge_gate::MergedDocument::new(
-                                Vec::new(),
-                                Vec::new(),
-                                None,
-                                Vec::new(),
-                                false,
-                                merge_gate::MergeStats::default(),
-                                false,
-                            )
-                            .with_shard_index(
-                                VirtualShardIndex::MemberWithoutShards(member.key.clone()),
-                            ));
-                        }
-                        Err(failure) => {
-                            merged.failed.push(failure);
-                            continue;
-                        }
-                    };
-                    // Kept only while the member's cache entry is fresh and
-                    // holds the bytes just read.
-                    match proxy.fresh_cache_validator(&member.key, &index_path).await {
-                        Some(current) if current == checked.checksum => {
-                            validators.push(merge_gate::MemberValidator {
-                                member: member.key.clone(),
-                                path: index_path.clone(),
-                                checksum: current,
-                            });
-                        }
-                        _ => all_validated = false,
-                    }
-                    let upstream = checked.document;
-                    let shards_base = match resolve_shards_base(
-                        upstream_url,
-                        subdir,
-                        &upstream.info.shards_base_url,
-                    ) {
-                        Ok(base) => base,
-                        // `fetch_upstream_shard_index_checked` already refused
-                        // an index whose shards cannot be located; kept total
-                        // rather than unwrapped.
-                        Err(reason) => {
-                            merged.failed.push(virtual_merge::MemberFailure {
-                                member: member.key.clone(),
-                                kind: "decode",
-                                reason: format!("{subdir}/{SHARD_INDEX_FILE}: {reason}"),
-                            });
-                            continue;
-                        }
-                    };
+                    let (member_shards, shards_base): (Vec<(String, Vec<u8>)>, Option<url::Url>) =
+                        match fetch_upstream_shard_index_checked(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            subdir,
+                        )
+                        .await
+                        {
+                            Ok(UpstreamShardIndex::TooLarge) => {
+                                // Not kept: no validator. As for a member
+                                // without an index, the virtual has none.
+                                return Ok(merge_gate::MergedDocument::new(
+                                    Vec::new(),
+                                    Vec::new(),
+                                    None,
+                                    Vec::new(),
+                                    false,
+                                    merge_gate::MergeStats::default(),
+                                    false,
+                                )
+                                .with_shard_index(
+                                    VirtualShardIndex::MemberWithoutShards(member.key.clone()),
+                                ));
+                            }
+                            Ok(UpstreamShardIndex::Found(checked)) => {
+                                // Kept only while the member's cache entry is
+                                // fresh and holds the bytes just read.
+                                match proxy.fresh_cache_validator(&member.key, &index_path).await {
+                                    Some(current) if current == checked.checksum => {
+                                        validators.push(merge_gate::MemberValidator {
+                                            member: member.key.clone(),
+                                            path: index_path.clone(),
+                                            checksum: current,
+                                        });
+                                    }
+                                    _ => all_validated = false,
+                                }
+                                let upstream = checked.document;
+                                let shards_base = match resolve_shards_base(
+                                    upstream_url,
+                                    subdir,
+                                    &upstream.info.shards_base_url,
+                                ) {
+                                    Ok(base) => base,
+                                    // `fetch_upstream_shard_index_checked`
+                                    // already refused an index whose shards
+                                    // cannot be located; kept total rather
+                                    // than unwrapped.
+                                    Err(reason) => {
+                                        merged.failed.push(virtual_merge::MemberFailure {
+                                            member: member.key.clone(),
+                                            kind: "decode",
+                                            reason: format!(
+                                                "{subdir}/{SHARD_INDEX_FILE}: {reason}"
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                (
+                                    upstream
+                                        .shards
+                                        .into_iter()
+                                        .map(|(name, hash)| (name, hash.to_vec()))
+                                        .collect(),
+                                    Some(shards_base),
+                                )
+                            }
+                            // No upstream shard index: the member's shards
+                            // synthesised from its cached upstream repodata
+                            // (#4178), kept while that cache entry is fresh
+                            // and holds the document they were built from.
+                            Ok(UpstreamShardIndex::NotPublished) => {
+                                match shard_synth::member_shards(
+                                    &db,
+                                    proxy,
+                                    member.id,
+                                    &member.key,
+                                    upstream_url,
+                                    subdir,
+                                )
+                                .await
+                                {
+                                    Ok(Some((shards, source))) => {
+                                        match proxy
+                                            .fresh_cache_validator(&member.key, &source.path)
+                                            .await
+                                        {
+                                            Some(current) if current == source.sha256 => {
+                                                validators.push(merge_gate::MemberValidator {
+                                                    member: member.key.clone(),
+                                                    path: source.path.clone(),
+                                                    checksum: current,
+                                                });
+                                            }
+                                            _ => all_validated = false,
+                                        }
+                                        (shards.into_iter().collect(), None)
+                                    }
+                                    Ok(None) => {
+                                        // Not kept: the member's 404 carries no
+                                        // validator.
+                                        return Ok(merge_gate::MergedDocument::new(
+                                            Vec::new(),
+                                            Vec::new(),
+                                            None,
+                                            Vec::new(),
+                                            false,
+                                            merge_gate::MergeStats::default(),
+                                            false,
+                                        )
+                                        .with_shard_index(
+                                            VirtualShardIndex::MemberWithoutShards(
+                                                member.key.clone(),
+                                            ),
+                                        ));
+                                    }
+                                    Err(response) => {
+                                        merged.failed.push(virtual_merge::MemberFailure {
+                                            member: member.key.clone(),
+                                            kind: "fetch",
+                                            reason: format!(
+                                            "shards could not be synthesised from its upstream \
+                                             repodata: {}",
+                                            response.status()
+                                        ),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(failure) => {
+                                merged.failed.push(failure);
+                                continue;
+                            }
+                        };
                     let position = merged.remotes.len();
                     merged.remotes.push(RemoteShardMember {
                         id: member.id,
@@ -3507,7 +4053,7 @@ async fn build_virtual_shard_index(
                         shards_base,
                     });
                     let mut member_not_allowed = 0usize;
-                    for (name, hash) in upstream.shards {
+                    for (name, hash) in member_shards {
                         if merged.owned.contains(&name.to_ascii_lowercase()) {
                             dropped.owned += 1;
                             merged.refused.insert(hash.to_vec());
@@ -3574,6 +4120,82 @@ async fn build_virtual_shard_index(
         )
         .await
         .map_err(merge_gate::SharedResponse::into_response)
+}
+
+/// The hosted part of a virtual's shard merge, as read before the merge runs.
+enum HostedShardSource {
+    /// Shards built from the members' rows (some member's stored shards are
+    /// not complete).
+    Built(BTreeMap<String, Vec<u8>>),
+    /// Every member's shards are stored; read them when the merge runs.
+    Stored {
+        ids: Vec<uuid::Uuid>,
+        now: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// The subdir revision of every hosted member in `ids` (#4173), after
+/// rebuilding what is dirty, with the database instant of the last check;
+/// `None` when a member's stored shards are not complete yet.
+async fn hosted_member_revisions(
+    db: &sqlx::PgPool,
+    ids: &[uuid::Uuid],
+    subdir: &str,
+) -> Result<Option<(Vec<(uuid::Uuid, i64)>, chrono::DateTime<chrono::Utc>)>, Response> {
+    let mut revisions = Vec::with_capacity(ids.len());
+    let mut now = chrono::Utc::now();
+    for id in ids {
+        let state = shard_store::subdir_state(db, *id, subdir).await?;
+        if !state.backfilled {
+            return Ok(None);
+        }
+        now = state.now;
+        revisions.push((*id, state.revision));
+    }
+    Ok(Some((revisions, now)))
+}
+
+/// The hosted shards of a virtual's members `ids` (priority order) from
+/// their stored shard maps: a name one member publishes is that member's
+/// stored shard; a name several publish is merged from their rows,
+/// first-writer-wins per filename, as [`hosted_shards`] merges.
+async fn stored_hosted_shards(
+    db: &sqlx::PgPool,
+    ids: &[uuid::Uuid],
+    subdir: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<BTreeMap<String, (Vec<u8>, HostedShard)>, Response> {
+    let indexes = shard_store::member_indexes(db, ids, subdir).await?;
+    let mut out: BTreeMap<String, (Vec<u8>, HostedShard)> = indexes
+        .single
+        .into_iter()
+        .map(|(name, (position, address))| (name, (address, HostedShard::Stored(ids[position]))))
+        .collect();
+    if indexes.shared.is_empty() {
+        return Ok(out);
+    }
+    let names: Vec<String> = indexes.shared.iter().cloned().collect();
+    let per_member = shard_store::member_rows_for_names(db, ids, &names, now).await?;
+    let mut seen = HashSet::new();
+    let mut merged: Vec<&CondaArtifact> = Vec::new();
+    for artifacts in &per_member {
+        for artifact in artifacts_for_subdir(artifacts, subdir) {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            if is_conda_package(filename) && seen.insert(filename) {
+                merged.push(artifact);
+            }
+        }
+    }
+    for (name, artifacts) in group_artifacts_by_name(&merged) {
+        if indexes.shared.contains(&name) {
+            let shard = encode_shard(&build_shard(subdir, &artifacts))?;
+            out.insert(
+                name,
+                (shard_address(&shard).to_vec(), HostedShard::Built(shard)),
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Serve a virtual channel's merged shard index under its member-failure
@@ -3989,7 +4611,17 @@ async fn serve_virtual_shard(
         return Err(shard_not_found());
     };
     let position = match merged.sources.get(&name) {
-        Some(VirtualShardSource::Hosted(shard)) => return Ok(shard_response(shard.clone())),
+        Some(VirtualShardSource::Hosted(HostedShard::Built(shard))) => {
+            return Ok(shard_response(shard.clone()))
+        }
+        Some(VirtualShardSource::Hosted(HostedShard::Stored(member))) => {
+            return match shard_store::stored_shard(&state.db, *member, subdir, &address).await? {
+                Some(shard) => Ok(shard_response(shard)),
+                // The member rebuilt the shard since the merge: its revision
+                // moved, so the next request merges again.
+                None => Err(shard_not_found()),
+            };
+        }
         Some(VirtualShardSource::Remote(position)) => *position,
         None => {
             return Err(virtual_merge::internal_error(format!(
@@ -4012,6 +4644,16 @@ async fn serve_virtual_shard(
         .err()
         .unwrap_or_else(|| virtual_merge::internal_error("strict policy served a failure"))
     };
+    let Some(shards_base) = member.shards_base.as_ref() else {
+        // A member whose shards are synthesised (#4178): the stored shard,
+        // checked against its address (#4829).
+        return match shard_store::stored_shard(&state.db, member.id, subdir, &address).await? {
+            Some(shard) => Ok(shard_response(shard)),
+            // Rebuilt since the merge: the member's validator moved, so the
+            // next request merges again.
+            None => Err(shard_not_found()),
+        };
+    };
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Err(member_failure(
             "fetch",
@@ -4024,7 +4666,7 @@ async fn serve_virtual_shard(
         &member.key,
         &member.upstream_url,
         subdir,
-        &member.shards_base,
+        shards_base,
         hash_hex,
     )
     .await
@@ -4092,7 +4734,12 @@ async fn sharded_repodata_index(
     if repo.repo_type == RepositoryType::Remote {
         return serve_remote_shard_index(&state, &repo, &subdir, &headers).await;
     }
-    // Hosted: built from the repository's own rows, which are authoritative.
+    // Hosted: serialised from the stored shard map (#4173), kept under the
+    // subdir's revision. Until the repository's backfill has finished, built
+    // from its rows as before.
+    if let Some(doc) = repodata_cache::hosted_shard_index(&state.db, repo.id, &subdir).await? {
+        return Ok(prepared_response(&doc, CEP16_CONTENT_TYPE, &headers).await);
+    }
     let shards = hosted_shards(&state.db, &[repo.id], &subdir).await?;
     let body = encode_hosted_shard_index(&subdir, &shards)?;
     Ok(cacheable_response(body, CEP16_CONTENT_TYPE, &headers).await)
@@ -4115,10 +4762,18 @@ async fn sharded_repodata_shard(
     if repo.repo_type == RepositoryType::Remote {
         return serve_remote_shard(&state, &repo, &subdir, &hash_hex).await;
     }
-    match find_hosted_shard(
-        hosted_shards(&state.db, &[repo.id], &subdir).await?,
-        &hash_hex,
-    ) {
+    // Hosted: a lookup of the stored shard by its address (#4173), checked
+    // against the address before it is served (#4829). Until the
+    // repository's backfill has finished, found by rebuilding as before.
+    let address = hex::decode(&hash_hex).map_err(virtual_merge::internal_error)?;
+    let found = match repodata_cache::hosted_shard(&state.db, repo.id, &subdir, &address).await? {
+        Some(stored) => stored,
+        None => find_hosted_shard(
+            hosted_shards(&state.db, &[repo.id], &subdir).await?,
+            &hash_hex,
+        ),
+    };
+    match found {
         Some(shard) => Ok(shard_response(shard)),
         None => Err(shard_not_found()),
     }
@@ -4405,10 +5060,21 @@ fn encode_shard(shard: &serde_json::Value) -> Result<Vec<u8>, Response> {
 ///
 /// Uses runtime query (not compile-time macro) to avoid needing a live
 /// database connection or sqlx-offline cache update.
+#[cfg(test)]
 async fn list_removed_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
     subdir: &str,
+) -> Result<Vec<String>, Response> {
+    list_removed_artifacts_at(db, repo_id, subdir, chrono::Utc::now()).await
+}
+
+/// [`list_removed_artifacts`] with withdrawal decided at `now`.
+async fn list_removed_artifacts_at(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    subdir: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<String>, Response> {
     /// `(path, is_deleted, quarantine_status, quarantine_until)` — the
     /// soft-delete flag plus the quarantine pair [`is_withdrawn`] reads.
@@ -4433,7 +5099,6 @@ async fn list_removed_artifacts(
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
-    let now = chrono::Utc::now();
     let prefix = format!("{}/", subdir);
     Ok(rows
         .into_iter()
@@ -4452,13 +5117,16 @@ async fn list_removed_artifacts(
         .collect())
 }
 
-/// Build repodata.json for a given subdir from the database.
+/// Build repodata.json for a given subdir from the database. The serving
+/// path renders through [`repodata_cache`]; this is the one-shot form the
+/// tests compare against.
 ///
 /// When `latest_only` is true, only the most recent version of each package
 /// is included (for current_repodata.json).
 ///
 /// No `base_url` is written: packages live beside the document, which is
 /// CEP-15's default (#4580, see [`build_repodata_envelope`]).
+#[cfg(test)]
 async fn build_repodata(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
@@ -4471,11 +5139,30 @@ async fn build_repodata(
 
     let all_artifacts = list_conda_artifacts(db, repo_id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, subdir);
+    // Collect filenames of soft-deleted packages for the "removed" array
+    let removed = list_removed_artifacts(db, repo_id, subdir).await?;
+    Ok(repodata_document(
+        &subdir_artifacts,
+        subdir,
+        latest_only,
+        &removed,
+    ))
+}
 
+/// The `repodata.json` document of `subdir` from its rows (newest first) and
+/// the filenames of its `removed` array. Pure, so the revision cache renders
+/// every encoding and `current_repodata.json` from one catalog walk (#4174).
+#[cfg(test)]
+fn repodata_document(
+    subdir_artifacts: &[&CondaArtifact],
+    subdir: &str,
+    latest_only: bool,
+    removed: &[String],
+) -> serde_json::Value {
     // If latest_only, keep only the latest version per package name
     let filtered: Vec<&CondaArtifact> = if latest_only {
         let mut latest: BTreeMap<String, &CondaArtifact> = BTreeMap::new();
-        for a in &subdir_artifacts {
+        for a in subdir_artifacts {
             let pkg_name = a
                 .metadata
                 .as_ref()
@@ -4488,7 +5175,7 @@ async fn build_repodata(
         }
         latest.into_values().collect()
     } else {
-        subdir_artifacts
+        subdir_artifacts.to_vec()
     };
 
     let mut packages = serde_json::Map::new();
@@ -4509,15 +5196,12 @@ async fn build_repodata(
         }
     }
 
-    // Collect filenames of soft-deleted packages for the "removed" array
-    let removed = list_removed_artifacts(db, repo_id, subdir).await?;
-
-    Ok(build_repodata_envelope(
+    build_repodata_envelope(
         subdir,
         &packages,
         &packages_conda,
         &serde_json::json!(removed),
-    ))
+    )
 }
 
 /// The package name a conda filename carries: `<name>-<version>-<build>` plus
@@ -4748,9 +5432,12 @@ async fn merge_validators_fresh(
     true
 }
 
-/// Build merged repodata for a virtual repository, encoded as `encoding`, or
-/// reuse the merge already running or kept for the same inputs
-/// ([`merge_gate`], #4608).
+/// Build merged repodata for a virtual repository, or reuse the merge already
+/// running or kept for the same inputs ([`merge_gate`], #4608).
+///
+/// One merge serves every encoding of the subdir: the merged document is
+/// kept in its canonical zstd encoding and `.json` and `.bz2` are derived
+/// from it on demand ([`merge_gate::MergeGate::rendering`], #4879).
 ///
 /// Hosted (local/staging) members are merged first, then remote members, each
 /// group in member priority order, first-writer-wins per filename; a remote
@@ -4764,7 +5451,6 @@ async fn build_virtual_repodata(
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     subdir: &str,
-    encoding: RepodataEncoding,
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
     build_virtual_package_document(
         state,
@@ -4774,22 +5460,12 @@ async fn build_virtual_repodata(
             virtual_repo_key,
             subdir,
             kind: merge_gate::MergeKind::Repodata,
-            filename: encoding.upstream_filename(),
+            filename: RepodataEncoding::Json.upstream_filename(),
             candidates: virtual_merge::repodata_candidates(subdir),
-            plain_json: matches!(encoding, RepodataEncoding::Json),
+            plain_json: false,
         },
         build_artifact_entry,
-        move |virtual_repo_key, subdir, hosted, remote, owned, allowlist| {
-            virtual_merge::merge_repodata(
-                virtual_repo_key,
-                subdir,
-                hosted,
-                remote,
-                owned,
-                allowlist,
-                encoding,
-            )
-        },
+        virtual_merge::merge_repodata,
     )
     .await
 }
@@ -4838,7 +5514,9 @@ struct VirtualPackageDocument<'a> {
     filename: &'static str,
     /// The upstream files a remote member's document is read from.
     candidates: Vec<(String, virtual_merge::FileCodec)>,
-    /// Whether the merged body is plain JSON (gzip-coded on request).
+    /// Whether the merged body is plain JSON (gzip-coded on request). When it
+    /// is not, it is the canonical zstd encoding of a merged
+    /// `repodata.json`, and its other encodings are derived from it (#4879).
     plain_json: bool,
 }
 
@@ -4856,7 +5534,7 @@ async fn build_virtual_package_document<E, M>(
     merge: M,
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response>
 where
-    E: Fn(&CondaArtifact, &str, &str) -> serde_json::Value,
+    E: Fn(&CondaArtifact, &str, &str) -> serde_json::Value + Send + 'static,
     M: FnOnce(
             &str,
             &str,
@@ -4896,35 +5574,24 @@ where
     )
     .await?;
 
-    let mut hosted = Vec::new();
-    for member in members
+    // The hosted generation is each hosted member's subdir revision (#4174):
+    // an upload, delete, withdrawal, lapsed hold or metadata edit moves it,
+    // and so the key. The members' records are read only when the merge
+    // runs, not on every request.
+    let hosted_ids: Vec<uuid::Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-    {
-        let artifacts = list_conda_artifacts(&state.db, member.id).await?;
-        for artifact in artifacts_for_subdir(&artifacts, subdir) {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            if !is_conda_package(filename) {
-                continue;
-            }
-            let record = entry(artifact, filename, subdir);
-            hosted.push(virtual_merge::HostedRecord {
-                filename: filename.to_string(),
-                is_v2: is_conda_v2(filename),
-                record: serde_json::value::to_raw_value(&record)
-                    .map_err(virtual_merge::internal_error)?,
-            });
-        }
-    }
-    // The hosted records as merged ARE the hosted generation: an upload,
-    // delete, withdrawal or metadata edit changes them, and so the key.
-    key.part(&(hosted.len() as u64).to_le_bytes());
-    for h in &hosted {
-        key.part(h.filename.as_bytes())
-            .part(&[u8::from(h.is_v2)])
-            .part(h.record.get().as_bytes());
+        .map(|m| m.id)
+        .collect();
+    let mut hosted_now = chrono::Utc::now();
+    key.part(&(hosted_ids.len() as u64).to_le_bytes());
+    for id in &hosted_ids {
+        let state = shard_store::subdir_state(&state.db, *id, subdir).await?;
+        hosted_now = state.now;
+        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
     }
 
+    let db = state.db.clone();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
     let subdir = subdir.to_string();
@@ -4936,6 +5603,23 @@ where
             Some(format!("{virtual_repo_id}/{document}")),
             move |doc| merge_validators_fresh(validate_proxy, doc),
             move |mut account| async move {
+                let mut hosted = Vec::new();
+                for id in &hosted_ids {
+                    let artifacts = list_conda_artifacts_at(&db, *id, hosted_now).await?;
+                    for artifact in artifacts_for_subdir(&artifacts, &subdir) {
+                        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+                        if !is_conda_package(filename) {
+                            continue;
+                        }
+                        let record = entry(artifact, filename, &subdir);
+                        hosted.push(virtual_merge::HostedRecord {
+                            filename: filename.to_string(),
+                            is_v2: is_conda_v2(filename),
+                            record: serde_json::value::to_raw_value(&record)
+                                .map_err(virtual_merge::internal_error)?,
+                        });
+                    }
+                }
                 let (documents, mut failed) = virtual_merge::fetch_remote_members(
                     proxy.as_deref(),
                     &members,
@@ -4986,7 +5670,10 @@ where
                     );
                 }
                 failed.extend(parse_failures);
-                let body = body?;
+                let virtual_merge::MergedBody {
+                    bytes: body,
+                    plain_len,
+                } = body?;
                 account.track(
                     body.len()
                         .saturating_sub(merge_gate::merge_output_allowance(
@@ -5000,7 +5687,7 @@ where
                     reserved: account.reserved(),
                     peak_need: account.peak_need(),
                 };
-                Ok(merge_gate::MergedDocument::new(
+                let doc = merge_gate::MergedDocument::new(
                     body,
                     failed,
                     enforced.then_some(dropped.not_allowed),
@@ -5008,7 +5695,12 @@ where
                     all_validated,
                     stats,
                     plain_json,
-                ))
+                );
+                Ok(if plain_json {
+                    doc
+                } else {
+                    doc.with_renderings(plain_len)
+                })
             },
         )
         .await
@@ -5019,10 +5711,12 @@ where
 /// it serves (#4708), or reuse the derivation kept for that merge.
 ///
 /// The derived document inherits the merge's member failures, allowlist
-/// count and member validators, so the failure policy, the
-/// `x-ak-allowlist-dropped` header and cache freshness all follow the merge it
-/// came from; it is keyed by the merged document's ETag, so a new merge is a
-/// new derivation.
+/// count and member validators, so the failure policy and the
+/// `x-ak-allowlist-dropped` header follow the merge it came from. It is keyed
+/// by the merged document's ETag, so a new merge is a new derivation, and it
+/// is valid exactly while that merge is what `repodata.json` serves
+/// (including while that merge is served stale, #4879): its validity is the
+/// merge's, not checked again here.
 async fn build_virtual_current_repodata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -5030,37 +5724,43 @@ async fn build_virtual_current_repodata(
     virtual_repo_key: &str,
     subdir: &str,
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
-    let merged = build_virtual_repodata(
-        state,
-        auth,
-        virtual_repo_id,
-        virtual_repo_key,
-        subdir,
-        RepodataEncoding::Json,
-    )
-    .await?;
+    let merged =
+        build_virtual_repodata(state, auth, virtual_repo_id, virtual_repo_key, subdir).await?;
     let kind = merge_gate::MergeKind::CurrentRepodata;
     let document = format!("{subdir}/current_repodata.json");
     let mut key = merge_gate::MergeKeyBuilder::new(kind);
     key.part(virtual_repo_id.as_bytes())
         .part(document.as_bytes())
         .part(merged.etag.as_bytes());
-    let validate_proxy = state.proxy_service.clone();
     merge_gate::gate_for(virtual_repo_id)
         .get_or_merge(
             kind,
             key.finish(),
             Some(format!("{virtual_repo_id}/{document}")),
-            move |doc| merge_validators_fresh(validate_proxy, doc),
+            |_| async { true },
             move |mut account| async move {
+                // The merged repodata.json is kept zstd-encoded: decode it on
+                // the blocking thread for the derivation only, under this
+                // merge's reservation (never through a rendering, which
+                // would take a second merge slot while this one is held).
+                let plain_len = merged.output_plain_len();
+                account.track(
+                    plain_len.saturating_add(merge_gate::merge_working_set(plain_len, true)),
+                );
                 let input = merged.body.clone();
-                account.track(merge_gate::merge_working_set(input.len(), true));
-                let body = tokio::task::spawn_blocking(move || current_repodata::derive(&input))
-                    .await
-                    .map_err(virtual_merge::internal_error)?
-                    .map_err(virtual_merge::internal_error)?;
+                let zst = merged.has_renderings();
+                let body = tokio::task::spawn_blocking(move || {
+                    if zst {
+                        let json = RepodataEncoding::Json.transcode_zst(&input)?;
+                        current_repodata::derive(&json).map_err(virtual_merge::internal_error)
+                    } else {
+                        current_repodata::derive(&input).map_err(virtual_merge::internal_error)
+                    }
+                })
+                .await
+                .map_err(virtual_merge::internal_error)??;
                 let stats = merge_gate::MergeStats {
-                    decoded_bytes: merged.body.len(),
+                    decoded_bytes: plain_len,
                     output_bytes: body.len(),
                     reserved: account.reserved(),
                     peak_need: account.peak_need(),
@@ -5108,40 +5808,22 @@ async fn build_virtual_channeldata(
     )
     .await?;
 
-    let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for member in members
+    // The hosted generation is each hosted member's repository revision
+    // (#4174); the members' entries are read only when the merge runs.
+    let hosted_ids: Vec<uuid::Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-    {
-        let artifacts = list_conda_artifacts(&state.db, member.id).await?;
-        for artifact in &artifacts {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            if !is_conda_package(filename) {
-                continue;
-            }
-            let pkg_name = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| artifact.name.clone());
-            if !seen.insert(pkg_name.clone()) {
-                continue;
-            }
-            let entry =
-                build_channeldata_entry(artifact.version.as_deref(), artifact.metadata.as_ref());
-            hosted.push((
-                pkg_name,
-                serde_json::value::to_raw_value(&entry).map_err(virtual_merge::internal_error)?,
-            ));
-        }
-    }
-    key.part(&(hosted.len() as u64).to_le_bytes());
-    for (name, entry) in &hosted {
-        key.part(name.as_bytes()).part(entry.get().as_bytes());
+        .map(|m| m.id)
+        .collect();
+    let mut hosted_now = chrono::Utc::now();
+    key.part(&(hosted_ids.len() as u64).to_le_bytes());
+    for id in &hosted_ids {
+        let state = shard_store::repo_state(&state.db, *id).await?;
+        hosted_now = state.now;
+        key.part(id.as_bytes()).part(&state.revision.to_le_bytes());
     }
 
+    let db = state.db.clone();
     let virtual_repo_key = virtual_repo_key.to_string();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
@@ -5152,6 +5834,35 @@ async fn build_virtual_channeldata(
             Some(format!("{virtual_repo_id}/channeldata.json")),
             move |doc| merge_validators_fresh(validate_proxy, doc),
             move |mut account| async move {
+                let mut hosted: Vec<(String, Box<serde_json::value::RawValue>)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for id in &hosted_ids {
+                    let artifacts = list_conda_artifacts_at(&db, *id, hosted_now).await?;
+                    for artifact in &artifacts {
+                        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+                        if !is_conda_package(filename) {
+                            continue;
+                        }
+                        let pkg_name = artifact
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| artifact.name.clone());
+                        if !seen.insert(pkg_name.clone()) {
+                            continue;
+                        }
+                        let entry = build_channeldata_entry(
+                            artifact.version.as_deref(),
+                            artifact.metadata.as_ref(),
+                        );
+                        hosted.push((
+                            pkg_name,
+                            serde_json::value::to_raw_value(&entry)
+                                .map_err(virtual_merge::internal_error)?,
+                        ));
+                    }
+                }
                 // A member whose upstream publishes no channeldata.json (404)
                 // contributes no entries; only a real failure (5xx, timeout,
                 // cap, parse) fails the merge (#4601).
@@ -5253,45 +5964,70 @@ async fn serve_virtual_merge(
     content_type: &str,
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
+    serve_virtual_merge_encoded(
+        db,
+        virtual_repo_id,
+        virtual_repo_key,
+        document,
+        merged,
+        None,
+        content_type,
+        headers,
+    )
+    .await
+}
+
+/// [`serve_virtual_merge`] for one encoding of a merged `repodata.json`
+/// (`None`: the kept body as it is). Each encoding has its own ETag and is
+/// derived from the one merge on first demand (#4879), after the failure
+/// policy and the conditional request are answered, so a strict 502 or a
+/// 304 never costs an encoding. A document served stale while it is rebuilt
+/// carries `Warning: 110`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_virtual_merge_encoded(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    document: &str,
+    merged: std::sync::Arc<merge_gate::MergedDocument>,
+    encoding: Option<RepodataEncoding>,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
     use crate::api::handlers::cache_headers;
 
     let partial =
         virtual_merge_failure_policy(db, virtual_repo_id, virtual_repo_key, document, &merged)
             .await?;
 
+    let etag = merged.etag_for(encoding);
     let not_modified = if partial.is_none() {
-        check_conditional_request(headers, &merged.etag)
+        check_conditional_request(headers, &etag)
     } else {
         None
     };
     let mut response = match not_modified {
         Some(not_modified) => not_modified,
         None => {
-            let gzip = if merged.json && accepts_gzip(headers) {
-                let body = merged.body.clone();
-                merged
-                    .gzip
-                    .get_or_try_init(|| async move {
-                        tokio::task::spawn_blocking(move || Bytes::from(gzip_compress(&body))).await
-                    })
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "conda gzip offload failed; serving uncompressed body"
-                        );
-                    })
-                    .ok()
-                    .cloned()
+            let gate = merge_gate::gate_for(virtual_repo_id);
+            let (body, json) = match encoding {
+                Some(encoding) if merged.has_renderings() => (
+                    gate.rendering(&merged, encoding).await?,
+                    encoding == RepodataEncoding::Json,
+                ),
+                _ => (merged.body.clone(), merged.json),
+            };
+            let gzip = if json && accepts_gzip(headers) {
+                gate.gzip_rendering(&merged, body.clone()).await
             } else {
                 None
             };
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, content_type)
-                .header(ETAG, &merged.etag)
+                .header(ETAG, &etag)
                 .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL);
-            if merged.json {
+            if json {
                 builder = builder.header("Vary", "Accept-Encoding");
             }
             let body = match gzip {
@@ -5299,7 +6035,7 @@ async fn serve_virtual_merge(
                     builder = builder.header(CONTENT_ENCODING, "gzip");
                     gzip
                 }
-                None => merged.body.clone(),
+                None => body,
             };
             builder
                 .header(CONTENT_LENGTH, body.len().to_string())
@@ -5307,6 +6043,12 @@ async fn serve_virtual_merge(
                 .unwrap()
         }
     };
+    if merged.is_stale() {
+        response.headers_mut().insert(
+            axum::http::header::WARNING,
+            axum::http::HeaderValue::from_static("110 - \"Response is Stale\""),
+        );
+    }
     if let Some(missing) = partial {
         virtual_merge::mark_partial(&mut response, &missing);
     }
@@ -5338,15 +6080,384 @@ fn conda_package_content_type(filename: &str) -> &'static str {
     }
 }
 
+/// Everything the package route needs from the database before it can serve
+/// a hosted package, read in ONE statement (#4181): the repository record,
+/// its visibility, the artifact at the requested path with its quarantine
+/// fields, whether any enabled scan policy applies to the repository, and,
+/// for a Remote, the proxy-cache catalog row of the package. Before this the
+/// route issued five sequential statements per hosted GET (resolve, the
+/// `is_public` read, the artifact lookup, the quarantine read and the scan
+/// policy lookup).
+struct PackageLookup {
+    repo: RepoInfo,
+    is_public: bool,
+    artifact: Option<HostedPackageRow>,
+    /// The Remote's catalogued copy of the package (`proxy_cache_artifacts`).
+    cached: Option<PackageValidator>,
+}
+
+/// The hosted artifact row the package route serves.
+struct HostedPackageRow {
+    id: uuid::Uuid,
+    size_bytes: i64,
+    checksum_sha256: String,
+    storage_key: String,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    /// An enabled scan policy (repository-specific or global) applies, so the
+    /// scan-policy half of the download gate has to be evaluated.
+    scan_policy_applies: bool,
+}
+
+const PACKAGE_LOOKUP_SQL: &str = "\
+SELECT r.id, r.key, r.storage_backend, r.storage_path, r.format::TEXT AS format, \
+       r.repo_type::TEXT AS repo_type, r.upstream_url, r.promotion_only, \
+       r.age_gate_enabled, r.age_gate_min_age_days, r.age_gate_mode, \
+       r.curation_enabled, r.curation_default_action, r.is_public, \
+       a.id AS artifact_id, a.size_bytes, a.checksum_sha256, a.storage_key, \
+       a.quarantine_status, a.quarantine_until, a.updated_at AS artifact_updated_at, \
+       (a.id IS NOT NULL AND EXISTS ( \
+           SELECT 1 FROM scan_policies sp \
+            WHERE sp.is_enabled = true \
+              AND (sp.repository_id = r.id OR sp.repository_id IS NULL))) AS scan_policy_applies, \
+       pc.checksum_sha256 AS cached_sha256, pc.size_bytes AS cached_size, \
+       pc.cached_at \
+  FROM repositories r \
+  LEFT JOIN LATERAL ( \
+       SELECT id, size_bytes, checksum_sha256, storage_key, quarantine_status, \
+              quarantine_until, updated_at \
+         FROM artifacts \
+        WHERE repository_id = r.id AND is_deleted = false AND path = $2 \
+        LIMIT 1) a ON true \
+  LEFT JOIN proxy_cache_artifacts pc \
+         ON r.repo_type = 'remote' AND pc.repository_id = r.id AND pc.path = $3 \
+ WHERE r.key = $1";
+
+/// Run [`PACKAGE_LOOKUP_SQL`]. A missing repository is 404 and a repository
+/// of another format 400, exactly as [`resolve_conda_repo`] answers; a
+/// saturated pool is a retryable 503 (`map_db_err`).
+async fn lookup_package(
+    conn: &mut sqlx::PgConnection,
+    repo_key: &str,
+    artifact_path: &str,
+    cache_key: &str,
+) -> Result<PackageLookup, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(PACKAGE_LOOKUP_SQL)
+        .bind(repo_key)
+        .bind(artifact_path)
+        .bind(cache_key)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(crate::api::handlers::error_helpers::map_db_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
+
+    let format: String = row.try_get("format").unwrap_or_default();
+    if !["conda", "conda_native"].contains(&format.to_lowercase().as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Repository '{repo_key}' is not a Conda repository (format: {format})"),
+        )
+            .into_response());
+    }
+    let repo = RepoInfo {
+        id: row.try_get("id").unwrap_or_default(),
+        key: row.try_get("key").unwrap_or_default(),
+        storage_path: row.try_get("storage_path").unwrap_or_default(),
+        storage_backend: row.try_get("storage_backend").unwrap_or_default(),
+        repo_type: row.try_get("repo_type").unwrap_or_default(),
+        format,
+        upstream_url: row.try_get("upstream_url").ok(),
+        promotion_only: row.try_get("promotion_only").unwrap_or(false),
+        age_gate_enabled: row.try_get("age_gate_enabled").unwrap_or(false),
+        age_gate_min_age_days: row.try_get("age_gate_min_age_days").unwrap_or(7),
+        age_gate_mode: row
+            .try_get("age_gate_mode")
+            .unwrap_or_else(|_| "upstream_publish_time".to_string()),
+        curation_enabled: row.try_get("curation_enabled").unwrap_or(false),
+        curation_default_action: row
+            .try_get("curation_default_action")
+            .unwrap_or_else(|_| "allow".to_string()),
+    };
+    let artifact = match row.try_get::<Option<uuid::Uuid>, _>("artifact_id") {
+        Ok(Some(id)) => Some(HostedPackageRow {
+            id,
+            size_bytes: row.try_get("size_bytes").unwrap_or_default(),
+            checksum_sha256: row.try_get("checksum_sha256").unwrap_or_default(),
+            storage_key: row.try_get("storage_key").unwrap_or_default(),
+            quarantine_status: row.try_get("quarantine_status").unwrap_or(None),
+            quarantine_until: row.try_get("quarantine_until").unwrap_or(None),
+            updated_at: row
+                .try_get("artifact_updated_at")
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            // Unreadable means "evaluate the policy", never "skip it".
+            scan_policy_applies: row.try_get("scan_policy_applies").unwrap_or(true),
+        }),
+        _ => None,
+    };
+    let cached = match (
+        row.try_get::<Option<String>, _>("cached_sha256"),
+        row.try_get::<Option<i64>, _>("cached_size"),
+    ) {
+        (Ok(Some(sha256)), Ok(Some(size))) => Some(PackageValidator {
+            sha256,
+            size_bytes: Some(size),
+            last_modified: row.try_get("cached_at").ok(),
+        }),
+        _ => None,
+    };
+    Ok(PackageLookup {
+        is_public: row.try_get("is_public").unwrap_or(false),
+        repo,
+        artifact,
+        cached,
+    })
+}
+
+/// The validator of the bytes a package response carries (#4579): the
+/// content's sha256, which becomes the strong `ETag`, and when known the
+/// time the content was stored, which becomes `Last-Modified`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageValidator {
+    sha256: String,
+    /// The catalogued size. A proxied serve whose `Content-Length` differs
+    /// is not the catalogued copy, so the validator is not applied to it.
+    size_bytes: Option<i64>,
+    last_modified: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PackageValidator {
+    fn etag(&self) -> String {
+        format!("\"{}\"", self.sha256)
+    }
+}
+
+/// `true` when the request's `If-None-Match` names `etag` (or is `*`),
+/// using the weak comparison RFC 9110 prescribes for `If-None-Match`.
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let opaque = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let wanted = opaque(etag);
+    header
+        .split(',')
+        .any(|candidate| candidate.trim() == "*" || opaque(candidate) == wanted)
+}
+
+fn http_date(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+/// Give a `200` package response its validators and answer a conditional
+/// request that matches them with `304 Not Modified` and no body (#4579).
+///
+/// The validator is, in order: `validator` (the hosted artifact or the
+/// catalogued proxy-cache copy the route resolved), the response's own
+/// `X-Checksum-SHA256` (the scan-on-proxy gate's digest of the bytes it
+/// serves), and otherwise the response's existing `ETag`. A 304 is only
+/// answered on a sha256 validator (one of the first two) and when
+/// `allow_not_modified` is set: the caller clears it for a proxied serve that
+/// may be a cold fetch, so dropping the body never cancels a cache fill. A
+/// response that only carries the upstream's `ETag` (the streaming arms of
+/// the scan-on-proxy walk, which may be a cold fetch) is always served in
+/// full. Every gate (access, quarantine, scan policy, holds) has
+/// already run by the time a `200` reaches this point, so a blocked package
+/// is never answered 304.
+fn finish_package_response(
+    request: &HeaderMap,
+    mut response: Response,
+    validator: Option<&PackageValidator>,
+    allow_not_modified: bool,
+) -> Response {
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok());
+    let validator = validator.filter(|v| match (v.size_bytes, content_length) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => true,
+    });
+    let header_digest = response
+        .headers()
+        .get("X-Checksum-SHA256")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let (etag, last_modified, sha_based) = match (validator, header_digest) {
+        (Some(v), _) => (Some(v.etag()), v.last_modified, true),
+        (None, Some(digest)) => (Some(format!("\"{digest}\"")), None, true),
+        (None, None) => (
+            response
+                .headers()
+                .get(ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            None,
+            false,
+        ),
+    };
+    if let Some(etag) = etag.as_deref().filter(|_| sha_based) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(etag) {
+            response.headers_mut().insert(ETAG, value);
+        }
+    }
+    if let Some(at) = last_modified {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&http_date(at)) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LAST_MODIFIED, value);
+        }
+    }
+    let not_modified = match request
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        // RFC 9110 13.2.2: If-None-Match takes precedence; If-Modified-Since
+        // is only evaluated without it.
+        Some(header) => etag
+            .as_deref()
+            .is_some_and(|etag| if_none_match_matches(header, etag)),
+        None => match (
+            last_modified,
+            request
+                .get(axum::http::header::IF_MODIFIED_SINCE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok()),
+        ) {
+            (Some(modified), Some(since)) => modified.timestamp() <= since.timestamp(),
+            _ => false,
+        },
+    };
+    if !not_modified || !allow_not_modified || !sha_based {
+        return response;
+    }
+    let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+    for name in [
+        ETAG,
+        axum::http::header::LAST_MODIFIED,
+        axum::http::header::CACHE_CONTROL,
+        axum::http::header::VARY,
+    ] {
+        if let Some(value) = response.headers().get(&name) {
+            builder = builder.header(name, value.clone());
+        }
+    }
+    // Dropping `response` releases its body stream unread.
+    builder.body(Body::empty()).unwrap()
+}
+
+/// Find the validator of the package a Virtual is about to serve (#4579),
+/// in ONE statement over its (already authorized and filtered) members.
+///
+/// The members are walked in priority order, as the download resolver walks
+/// them: a hosted member without the artifact is a definite miss and is
+/// skipped; the first hosted member that holds it, or the first Remote member
+/// with a catalogued copy, is the one that serves, and its sha256 is the
+/// validator. A Remote member WITHOUT a catalogued copy ahead of that would
+/// go upstream and could serve different bytes, so the walk stops there with
+/// no validator. The second element is the hosted artifact id, which the
+/// caller checks against the artifact the resolver actually served.
+async fn virtual_package_validator(
+    db: &sqlx::PgPool,
+    members: &[crate::models::repository::Repository],
+    artifact_path: &str,
+    cache_key: &str,
+    proxy_enabled: bool,
+) -> Option<(PackageValidator, Option<uuid::Uuid>)> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        member_id: uuid::Uuid,
+        artifact_id: Option<uuid::Uuid>,
+        artifact_sha256: Option<String>,
+        artifact_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+        cached_sha256: Option<String>,
+        cached_size: Option<i64>,
+        cached_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    if members.is_empty() {
+        return None;
+    }
+    let ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT m.id AS member_id, a.id AS artifact_id, a.checksum_sha256 AS artifact_sha256, \
+                a.updated_at AS artifact_updated_at, pc.checksum_sha256 AS cached_sha256, \
+                pc.size_bytes AS cached_size, pc.cached_at \
+           FROM unnest($1::UUID[]) AS m(id) \
+           LEFT JOIN LATERAL ( \
+                SELECT id, checksum_sha256, updated_at FROM artifacts \
+                 WHERE repository_id = m.id AND is_deleted = false AND path = $2 \
+                 LIMIT 1) a ON true \
+           LEFT JOIN proxy_cache_artifacts pc \
+                  ON pc.repository_id = m.id AND pc.path = $3",
+    )
+    .bind(&ids)
+    .bind(artifact_path)
+    .bind(cache_key)
+    .fetch_all(db)
+    .await
+    .ok()?;
+    for member in members {
+        let row = rows.iter().find(|r| r.member_id == member.id)?;
+        if member.repo_type == RepositoryType::Remote {
+            if !proxy_enabled || member.upstream_url.is_none() {
+                continue;
+            }
+            return match (&row.cached_sha256, row.cached_size) {
+                (Some(sha256), Some(size)) => Some((
+                    PackageValidator {
+                        sha256: sha256.clone(),
+                        size_bytes: Some(size),
+                        last_modified: row.cached_at,
+                    },
+                    None,
+                )),
+                _ => None,
+            };
+        }
+        if let (Some(id), Some(sha256)) = (row.artifact_id, &row.artifact_sha256) {
+            return Some((
+                PackageValidator {
+                    sha256: sha256.clone(),
+                    size_bytes: None,
+                    last_modified: row.artifact_updated_at,
+                },
+                Some(id),
+            ));
+        }
+    }
+    None
+}
+
 async fn download_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    request_headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    let artifact_path = build_conda_artifact_path(&subdir, &filename);
+    let serve_key = conda_package_serve_key(&subdir, &filename);
+    let PackageLookup {
+        repo,
+        is_public,
+        artifact,
+        cached,
+    } = {
+        // #4182: the lookup's connection comes through the fast-fail gate, so
+        // a saturated pool sheds this request with 503 + Retry-After instead
+        // of queueing it to the acquire timeout. The connection goes back to
+        // the pool before anything is streamed.
+        let mut conn = package_gate::acquire(&state.db).await?;
+        lookup_package(&mut conn, &repo_key, &artifact_path, &serve_key.cache_key).await?
+    };
 
-    check_read_access(&state.db, auth.clone(), &repo).await?;
+    // Same decision `check_read_access` makes, from the row already read.
+    if !is_public {
+        require_auth_basic(auth.clone(), "conda")?;
+    }
 
     // #4365 item 3: on a proxying repository the subdir and file name are
     // joined into the upstream path and key the proxy cache, so a segment an
@@ -5363,37 +6474,14 @@ async fn download_package(
         return serve_sidecar(&state, auth.as_ref(), &repo, &subdir, &filename, request).await;
     }
 
-    // Look up artifact by path
-    let artifact_path = build_conda_artifact_path(&subdir, &filename);
-
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, size_bytes, checksum_sha256, storage_key
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path = $2
-        LIMIT 1
-        "#,
-        repo.id,
-        artifact_path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Database error looking up package: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
-
+    let not_found = || (StatusCode::NOT_FOUND, "Package not found").into_response();
     let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
+        Some(a) => a,
+        None => {
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let serve_key = conda_package_serve_key(&subdir, &filename);
                     // #4585: with scan-on-proxy on, a package goes through the
                     // inline scan-and-block gate (buffered, cache-first,
                     // digest-keyed verdict) INSTEAD of the streaming path
@@ -5408,7 +6496,10 @@ async fn download_package(
                                 cache_key: &serve_key.cache_key,
                                 ctx: &ctx,
                             };
-                            return serve_scanned_conda_package(
+                            // The gate buffers and commits before it serves, so
+                            // a 304 never cancels a cache fill; its response
+                            // names the digest it served (#4579).
+                            let response = serve_scanned_conda_package(
                                 &state,
                                 proxy,
                                 (repo.id, &repo_key),
@@ -5416,10 +6507,16 @@ async fn download_package(
                                 &target,
                                 policy,
                             )
-                            .await;
+                            .await?;
+                            return Ok(finish_package_response(
+                                &request_headers,
+                                response,
+                                None,
+                                true,
+                            ));
                         }
                     }
-                    let upstream_path = serve_key.cache_key;
+                    let upstream_path = serve_key.cache_key.clone();
                     // #2915 BLOCKER: this is the PACKAGE path, not a metadata
                     // path, and it used to go through the buffered
                     // `proxy_fetch_capped` at the 8 MiB metadata ceiling. Real
@@ -5468,6 +6565,20 @@ async fn download_package(
                             crate::models::repository::RepositoryFormat::Conda,
                         )
                         .await?;
+                    // #4579: a catalogued package is immutable and answers from
+                    // the cache, so it carries its sha256 as the ETag and a
+                    // matching conditional request is a 304. Without a catalog
+                    // row the serve may be the cold fetch that fills the cache,
+                    // whose body must not be dropped.
+                    let response = finish_package_response(
+                        &request_headers,
+                        response,
+                        cached.as_ref(),
+                        cached.is_some(),
+                    );
+                    if response.status() == StatusCode::NOT_MODIFIED {
+                        return Ok(response);
+                    }
                     // #3649: count the proxied serve. The streaming helper answers a warm
                     // cache HIT from storage and a cold MISS from upstream through the same
                     // call, so recording once it resolves counts both -- the cache hit #3649
@@ -5530,7 +6641,14 @@ async fn download_package(
                 if had_members && members.is_empty() {
                     return Err(proxy_helpers::no_accessible_members_response());
                 }
-                let serve_key = conda_package_serve_key(&subdir, &filename);
+                let validator = virtual_package_validator(
+                    &state.db,
+                    &members,
+                    &artifact_path,
+                    &serve_key.cache_key,
+                    proxy_service.is_some(),
+                )
+                .await;
                 let db = state.db.clone();
                 let artifact_path_clone = artifact_path.clone();
                 let local_fetch = |member_id, location| {
@@ -5562,7 +6680,9 @@ async fn download_package(
                     )
                     .await
                     {
-                        return served;
+                        return served.map(|response| {
+                            finish_package_response(&request_headers, response, None, true)
+                        });
                     }
                 }
 
@@ -5575,14 +6695,27 @@ async fn download_package(
                 )
                 .await?;
 
-                return proxy_helpers::stream_fetch_result(
+                // #4579: apply the validator only to the bytes it describes:
+                // a hosted member's serve must be the artifact it names, and a
+                // Remote member's serve must come from a catalogued copy.
+                let validator = validator.filter(|(_, artifact_id)| match artifact_id {
+                    Some(id) => result.artifact_id == Some(*id),
+                    None => result.artifact_id.is_none(),
+                });
+                let response = proxy_helpers::stream_fetch_result(
                     result,
                     conda_package_content_type(&filename),
                     Some(&filename),
-                );
+                )?;
+                return Ok(match validator {
+                    Some((validator, _)) => {
+                        finish_package_response(&request_headers, response, Some(&validator), true)
+                    }
+                    None => finish_package_response(&request_headers, response, None, false),
+                });
             }
 
-            return Err(not_found);
+            return Err(not_found());
         }
     };
 
@@ -5590,10 +6723,37 @@ async fn download_package(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
-        .await
-        .map_err(|e| e.into_response())?;
+    // Quarantine and scan-policy gate before serving, from the row already
+    // read (#4181).
+    crate::services::quarantine_service::enforce_download_gate_for_row(
+        &state.db,
+        &crate::services::quarantine_service::DownloadGateRow {
+            artifact_id: artifact.id,
+            repository_id: repo.id,
+            quarantine_status: artifact.quarantine_status.as_deref(),
+            quarantine_until: artifact.quarantine_until,
+            scan_policy_applies: artifact.scan_policy_applies,
+        },
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
+    // #4579: a matching conditional request is answered before the storage
+    // read, with the validators the 200 would carry.
+    let validator = PackageValidator {
+        sha256: artifact.checksum_sha256.clone(),
+        size_bytes: None,
+        last_modified: Some(artifact.updated_at),
+    };
+    let unread = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+        .body(Body::empty())
+        .unwrap();
+    let probe = finish_package_response(&request_headers, unread, Some(&validator), true);
+    if probe.status() == StatusCode::NOT_MODIFIED {
+        return Ok(probe);
+    }
 
     let stream = storage
         .get_stream(&artifact.storage_key)
@@ -5606,7 +6766,7 @@ async fn download_package(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    Ok(Response::builder()
+    let response = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, conda_package_content_type(&filename))
         .header(
@@ -5616,7 +6776,13 @@ async fn download_package(
         .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
-        .unwrap())
+        .unwrap();
+    Ok(finish_package_response(
+        &request_headers,
+        response,
+        Some(&validator),
+        false,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -6163,6 +7329,9 @@ async fn withdraw_package(
         crate::services::quarantine_service::quarantine_now(&state.db, artifact_id, reason.clone())
             .await
             .map_err(|e| e.into_response())?;
+    // #4173: the hold marked the package's shard dirty in its own
+    // transaction; rebuild it now so it leaves the shard and every encoding.
+    materialise_after_write(&state, repo.id, &subdir).await;
 
     let reason_supplied = reason.is_some();
     let reason_text = reason.unwrap_or_else(|| "Withdrawn by administrator".to_string());
@@ -6232,6 +7401,20 @@ async fn withdraw_package(
             .unwrap(),
         ))
         .unwrap())
+}
+
+/// Rebuild the shards a conda write just marked dirty (#4173). Best-effort:
+/// the marks are durable, so a failure only moves the rebuild to the next
+/// reader of the subdir.
+async fn materialise_after_write(state: &SharedState, repo_id: uuid::Uuid, subdir: &str) {
+    if let Err(e) = shard_store::materialise(&state.db, repo_id, Some(subdir)).await {
+        tracing::warn!(
+            repo_id = %repo_id,
+            subdir,
+            error = %e,
+            "conda shard rebuild after a write failed; the next read rebuilds it"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7404,6 +8587,7 @@ fn attestation_outcome(verified: bool, require_verified: bool) -> &'static str {
 /// stored. With the flag explicitly off the attestation is stored with the
 /// failed record attached, so a trusted/dev deployment opts into a logged,
 /// auditable gap rather than a silent one.
+#[allow(clippy::too_many_arguments)]
 async fn store_attestation(
     state: &SharedState,
     repo: &RepoInfo,
@@ -7412,6 +8596,7 @@ async fn store_attestation(
     filename: &str,
     body: &Bytes,
     user_id: uuid::Uuid,
+    headers: &HeaderMap,
 ) -> Result<Response, Response> {
     // Enforce attestation-specific body size limit (H3)
     if body.len() > ATTESTATION_MAX_BODY_SIZE {
@@ -7424,8 +8609,8 @@ async fn store_attestation(
 
     // Look up the target package
     let artifact_path = build_conda_artifact_path(subdir, filename);
-    let artifact: (uuid::Uuid, String) = sqlx::query_as(
-        "SELECT id, storage_key FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
+    let artifact: (uuid::Uuid, String, i64) = sqlx::query_as(
+        "SELECT id, storage_key, size_bytes FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
     )
     .bind(repo.id)
     .bind(&artifact_path)
@@ -7437,7 +8622,7 @@ async fn store_attestation(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
 
-    let (artifact_id, storage_key) = artifact;
+    let (artifact_id, storage_key, size_bytes) = artifact;
 
     // Parse the attestation (a Sigstore bundle per CEP-27; a bare Statement
     // parses too and is rejected by the verifier with the reason that says
@@ -7584,6 +8769,21 @@ async fn store_attestation(
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
             }
         })?;
+
+    // #4792: the attestation lives in the package's metadata, so a push peer
+    // that already received the package needs it delivered again (the queue
+    // re-arms a finished push of an attested package).
+    if appended.appended {
+        super::queue_push_sync_tasks_for_upload(
+            &state.db,
+            headers,
+            repo.id,
+            artifact_id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await;
+    }
 
     crate::services::metrics_service::record_conda_attestation(repo_key, outcome);
     info!(
@@ -8163,12 +9363,16 @@ async fn put_attestation(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
+    store_attestation(
+        &state, &repo, &repo_key, &subdir, &filename, &body, user_id, &headers,
+    )
+    .await
 }
 
 /// GET /conda/{repo_key}/{subdir}/{filename}/attestation
@@ -8193,6 +9397,7 @@ async fn put_attestation_with_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -8202,7 +9407,10 @@ async fn put_attestation_with_token(
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body, user_id).await
+    store_attestation(
+        &state, &repo, &repo_key, &subdir, &filename, &body, user_id, &headers,
+    )
+    .await
 }
 
 /// GET /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
@@ -8680,6 +9888,12 @@ async fn store_conda_package(
     .execute(&state.db)
     .await;
 
+    // #4173: the catalog triggers marked this package's shard dirty with
+    // each write above; rebuild it (and the subdir's revision) now, so the
+    // next reader finds it built. A failure here is not the upload's: the
+    // mark stays and the next reader of the subdir rebuilds it.
+    materialise_after_write(state, repo.id, subdir).await;
+
     count_conda_install_script_findings(&repo.key, &install_scripts);
     record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
 
@@ -9004,6 +10218,7 @@ fn build_channeldata_json(
 /// proxy and under a `/t/<token>/` prefix alike. The host-relative
 /// `"/conda/<repo>/<subdir>/"` written before resolved against the proxy's
 /// host behind a proxy and dropped the token prefix from token channels.
+#[cfg(test)]
 fn build_repodata_envelope(
     subdir: &str,
     packages: &serde_json::Map<String, serde_json::Value>,
@@ -13151,27 +14366,39 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_range_start_basic() {
-        assert_eq!(parse_range_start("bytes=100-", 1000), Some(100));
-        assert_eq!(parse_range_start("bytes=0-", 1000), Some(0));
-        assert_eq!(parse_range_start("bytes=999-", 1000), Some(999));
+    fn test_parse_byte_range_open_ended() {
+        assert_eq!(parse_byte_range("bytes=100-", 1000), Some(Ok((100, 999))));
+        assert_eq!(parse_byte_range("bytes=0-", 1000), Some(Ok((0, 999))));
+        assert_eq!(parse_byte_range("bytes=999-", 1000), Some(Ok((999, 999))));
     }
 
     #[test]
-    fn test_parse_range_start_beyond_length() {
-        assert_eq!(parse_range_start("bytes=1000-", 1000), None);
-        assert_eq!(parse_range_start("bytes=5000-", 100), None);
+    fn test_parse_byte_range_beyond_length_is_unsatisfiable() {
+        assert_eq!(parse_byte_range("bytes=1000-", 1000), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=5000-", 100), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=0-", 0), Some(Err(())));
     }
 
     #[test]
-    fn test_parse_range_start_with_end() {
-        assert_eq!(parse_range_start("bytes=100-200", 1000), Some(100));
+    fn test_parse_byte_range_with_end_and_suffix() {
+        assert_eq!(
+            parse_byte_range("bytes=100-200", 1000),
+            Some(Ok((100, 200)))
+        );
+        assert_eq!(
+            parse_byte_range("bytes=900-5000", 1000),
+            Some(Ok((900, 999)))
+        );
+        assert_eq!(parse_byte_range("bytes=-10", 1000), Some(Ok((990, 999))));
+        assert_eq!(parse_byte_range("bytes=-5000", 1000), Some(Ok((0, 999))));
     }
 
     #[test]
-    fn test_parse_range_start_invalid() {
-        assert_eq!(parse_range_start("invalid", 1000), None);
-        assert_eq!(parse_range_start("bytes=abc-", 1000), None);
+    fn test_parse_byte_range_invalid() {
+        assert_eq!(parse_byte_range("invalid", 1000), None);
+        assert_eq!(parse_byte_range("bytes=abc-", 1000), None);
+        assert_eq!(parse_byte_range("bytes=200-100", 1000), None);
+        assert_eq!(parse_byte_range("bytes=0-1,5-6", 1000), None);
     }
 
     #[test]
@@ -14076,9 +15303,9 @@ mod tests {
                     let mut at = 0usize;
                     while at < total {
                         let n = REPO_BLOCK.min(total - at);
-                        // The aborted first (buffered) attempt closes the
-                        // socket mid-body; stop writing rather than panic on
-                        // the broken pipe.
+                        // A client that disconnects mid-body (or the test's
+                        // cancelled request) closes the socket; stop writing
+                        // rather than panic on the broken pipe.
                         if sock.write_all(&oversized_repoblock(at, n)).await.is_err() {
                             return;
                         }
@@ -14106,6 +15333,193 @@ mod tests {
             }
         }
         (total, hex::encode(hasher.finalize()))
+    }
+
+    // -----------------------------------------------------------------------
+    // #4180: a plain repodata.json request is decoded from the compressed
+    // upstream document as a stream. These pin the decoder itself; the
+    // route-level tests below pin which upstream document is chosen.
+    // -----------------------------------------------------------------------
+
+    const REPODATA_4180: &[u8] = br#"{"info":{"subdir":"noarch"},"packages":{"demo-1.0-0.tar.bz2":{"name":"demo","version":"1.0","build":"0","build_number":0,"depends":[],"subdir":"noarch"}},"packages.conda":{},"repodata_version":1}"#;
+
+    fn zstd_repodata_4180(json: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(json, 3).expect("zstd fixture")
+    }
+
+    fn bzip2_repodata_4180(json: &[u8]) -> Vec<u8> {
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(json).expect("bzip2 fixture");
+        encoder.finish().expect("bzip2 fixture")
+    }
+
+    async fn drain_repodata_body(body: Body) -> Bytes {
+        use http_body_util::BodyExt;
+        body.collect()
+            .await
+            .expect("collect repodata body")
+            .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_decodes_zstd_exactly_4180() {
+        let compressed = Bytes::from(zstd_repodata_4180(REPODATA_4180));
+        let response = super::streamed_repodata_response(
+            compressed,
+            None,
+            RepodataEncoding::Zst,
+            &HeaderMap::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            drain_repodata_body(response.into_body()).await.as_ref(),
+            REPODATA_4180,
+            "a plain request must serve the decoded upstream document byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_decodes_bzip2_and_gzips_on_request_4180() {
+        let compressed = Bytes::from(bzip2_repodata_4180(REPODATA_4180));
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = super::streamed_repodata_response(
+            compressed,
+            None,
+            RepodataEncoding::Bz2,
+            &headers,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        let body = drain_repodata_body(response.into_body()).await;
+        let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).expect("gunzip");
+        assert_eq!(decoded, REPODATA_4180);
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_honours_if_none_match_4180() {
+        let compressed = Bytes::from(zstd_repodata_4180(REPODATA_4180));
+        let etag = super::transcoded_repodata_etag(&compressed, RepodataEncoding::Zst);
+        assert_ne!(
+            etag,
+            compute_etag(&compressed),
+            "the plain rendering must not share the .zst document's strong ETag"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
+
+        let response = super::streamed_repodata_response(
+            compressed,
+            None,
+            RepodataEncoding::Zst,
+            &headers,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+            Some(etag.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_repodata_rejects_an_invalid_compressed_body_4180() {
+        let response = super::streamed_repodata_response(
+            Bytes::from_static(b"not a zstd frame"),
+            None,
+            RepodataEncoding::Zst,
+            &HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            super::decoded_repodata_reader(Bytes::new(), Some("br"), RepodataEncoding::Json)
+                .is_err()
+        );
+    }
+
+    /// #4180: an upstream that answers 200 with an empty `.zst`/`.bz2` body,
+    /// or a truncated one, must not turn into a 200 plain index that is empty
+    /// or ends early and looks complete.
+    #[tokio::test]
+    async fn streamed_plain_repodata_never_serves_an_empty_or_truncated_index_4180() {
+        for (label, body, encoding) in [
+            ("empty zst", Vec::new(), RepodataEncoding::Zst),
+            ("empty bz2", Vec::new(), RepodataEncoding::Bz2),
+            (
+                "zst of nothing",
+                zstd_repodata_4180(b""),
+                RepodataEncoding::Zst,
+            ),
+            (
+                "bz2 of nothing",
+                bzip2_repodata_4180(b""),
+                RepodataEncoding::Bz2,
+            ),
+        ] {
+            let response = super::streamed_repodata_response(
+                Bytes::from(body),
+                None,
+                encoding,
+                &HeaderMap::new(),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{label}");
+        }
+
+        // Truncated past the first chunk: the status is already sent, so the
+        // body must fail rather than end cleanly short of the document.
+        // Incompressible bytes, so the cut lands well past the first chunk.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let large: Vec<u8> = (0..(super::TRANSCODE_CHUNK_BYTES * 4))
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (x >> 56) as u8
+            })
+            .collect();
+        let compressed = zstd_repodata_4180(&large);
+        let truncated = Bytes::copy_from_slice(&compressed[..compressed.len() / 2]);
+        let response = super::streamed_repodata_response(
+            truncated,
+            None,
+            RepodataEncoding::Zst,
+            &HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        assert!(
+            response.into_body().collect().await.is_err(),
+            "a truncated upstream document must abort the body"
+        );
     }
 
     /// #4149: conda-forge's uncompressed `repodata.json` for every major
@@ -14180,13 +15594,194 @@ mod tests {
             assert_eq!(len, total, "{label} serve must deliver every byte");
             assert_eq!(digest, want_digest, "{label} serve must be byte-identical");
         }
-        // Cold: one aborted buffered attempt plus one full streaming fetch.
-        // Warm: the teed cache entry answers, so the upstream sees NOTHING.
+        // Cold: `.zst` and `.bz2` are not published (404), then one streaming
+        // plain fetch. Warm: the teed plain cache entry answers, so the
+        // upstream sees NOTHING.
         assert_eq!(
-            doc_hits, 2,
-            "expected the cold request's aborted buffered attempt + one \
-             streaming fetch, and NO refetch on the warm request"
+            doc_hits, 1,
+            "expected one cold streaming plain fetch after the compressed \
+             candidates 404, and NO refetch on the warm request"
         );
+    }
+
+    /// #4180: a plain `repodata.json` request must fetch the compressed
+    /// upstream document, decode it byte-for-byte, and keep the compressed
+    /// bytes in the proxy cache so the second request (and a later `.zst`
+    /// request) does not go upstream again.
+    #[tokio::test]
+    async fn plain_repodata_transcodes_upstream_zst_and_is_cached_4180() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(zstd_repodata_4180(REPODATA_4180)),
+            )
+            .mount(&server)
+            .await;
+        // A plain fetch would be the #4149 2xx-if-lucky / 502-if-large path.
+        // Fail it so the transcode path is the only way this test can pass.
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        for label in ["cold", "warm"] {
+            let app = tdh::router_anon(router(), state.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+            assert_eq!(status, StatusCode::OK, "{label} plain repodata serve");
+            assert_eq!(
+                body.as_ref(),
+                REPODATA_4180,
+                "{label} plain repodata must be the decoded upstream .zst"
+            );
+        }
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let hits = |path: &str| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        };
+        let zst_hits = hits("/noarch/repodata.json.zst");
+        let plain_hits = hits("/noarch/repodata.json");
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(zst_hits, 1, "the warm request must be a cache read");
+        assert_eq!(plain_hits, 0, "plain upstream repodata must not be fetched");
+    }
+
+    /// #4180: a cached upstream `.zst` that does not decode must not pin the
+    /// plain index to a 502 until the entry expires. The failing request
+    /// evicts it, and the next one fetches the upstream document again.
+    #[tokio::test]
+    async fn undecodable_cached_zst_is_evicted_and_refetched_4180() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not a zstd frame".to_vec()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(zstd_repodata_4180(REPODATA_4180)),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state.clone());
+        let (first_status, _) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+        let app = tdh::router_anon(router(), state.clone());
+        let (second_status, second_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+        let zst_hits = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests")
+            .iter()
+            .filter(|request| request.url.path() == "/noarch/repodata.json.zst")
+            .count();
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(first_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "the evicted entry must be refetched"
+        );
+        assert_eq!(second_body.as_ref(), REPODATA_4180);
+        assert_eq!(
+            zst_hits, 2,
+            "the undecodable entry must not be served again"
+        );
+    }
+
+    /// #4180: `.zst` is preferred, but a channel that publishes only `.bz2`
+    /// still serves a plain request by decoding it on the fly.
+    #[tokio::test]
+    async fn plain_repodata_falls_back_to_upstream_bz2_4180() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.bz2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(bzip2_repodata_4180(REPODATA_4180)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let hits = |path: &str| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        };
+        let zst_hits = hits("/noarch/repodata.json.zst");
+        let bz2_hits = hits("/noarch/repodata.json.bz2");
+        let plain_hits = hits("/noarch/repodata.json");
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), REPODATA_4180);
+        assert_eq!(
+            zst_hits, 1,
+            "the missing .zst candidate must be tried first"
+        );
+        assert_eq!(bz2_hits, 1);
+        assert_eq!(plain_hits, 0, "plain upstream repodata must not be fetched");
     }
 
     // #4577: a Remote repo proxies its upstream's CEP-16 index. When the
@@ -18421,6 +20016,85 @@ mod attestation_verification_tests {
         fx.teardown().await;
     }
 
+    /// #4792: a CEP-27 attestation is stored in its package's metadata, so a
+    /// push peer that already received the package must get it delivered
+    /// again: the finished push task goes back to pending. An attestation that
+    /// arrives as peer replication must not re-queue. Fails on `main`:
+    /// storing an attestation queued nothing.
+    #[tokio::test]
+    async fn attestation_requeues_delivered_push_4792() {
+        let Some(fx) = key_fixture(vec![format!("acme-ci={COSIGN_PUB}")]).await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "conda-att").await;
+        let artifact_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(fx.repo_id)
+                .bind(format!("noarch/{COSIGN_PKG_NAME}"))
+                .fetch_one(&fx.pool)
+                .await
+                .expect("seeded package");
+        let push_status = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status::TEXT FROM sync_tasks \
+                 WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'push'",
+            )
+            .bind(peer_id)
+            .bind(artifact_id)
+            .fetch_optional(&fx.pool)
+            .await
+            .expect("push task")
+        };
+        // The package already reached the peer.
+        sqlx::query(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, status, completed_at) \
+             VALUES ($1, $2, 'completed', NOW())",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("delivered push");
+
+        // A replicated attestation stores but must not re-queue.
+        let mut req = put_key_attestation(&fx);
+        req.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, _) = tdh::send(write_router(&fx), req).await;
+        let after_replicated = push_status().await;
+
+        // Reset the stored attestation so the client upload appends again.
+        sqlx::query("DELETE FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("reset metadata");
+        let (client_status, body) = tdh::send(write_router(&fx), put_key_attestation(&fx)).await;
+        let after_client = push_status().await;
+
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            client_status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            after_replicated.as_deref(),
+            Some("completed"),
+            "a replicated attestation must not be fanned back out"
+        );
+        assert_eq!(
+            after_client.as_deref(),
+            Some("pending"),
+            "a client attestation must re-deliver the package to the peer"
+        );
+    }
+
     #[tokio::test]
     async fn key_based_attestation_from_an_untrusted_key_is_refused() {
         // A different (valid) key is configured; the bundle's key is not.
@@ -19444,16 +21118,10 @@ mod virtual_channel_tests {
                 validator: None,
             },
         ];
-        let (body, failures, dropped) = virtual_merge::merge_repodata(
-            "virtual",
-            "noarch",
-            &hosted,
-            &remote,
-            &owned,
-            None,
-            RepodataEncoding::Json,
-        );
-        let doc: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        let (body, failures, dropped) =
+            virtual_merge::merge_repodata("virtual", "noarch", &hosted, &remote, &owned, None);
+        let doc: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&body.unwrap().bytes[..]).unwrap()).unwrap();
         let conda = doc["packages.conda"].as_object().unwrap();
         assert_eq!(conda["shared-1.0-0.conda"]["from"], "hosted");
         assert_eq!(conda["rich-13.0-0.conda"]["from"], "remote-a");
@@ -20049,9 +21717,9 @@ mod virtual_channel_tests {
             &remote,
             &Default::default(),
             Some(&allowlist),
-            RepodataEncoding::Json,
         );
-        let merged: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&body.unwrap().bytes[..]).unwrap()).unwrap();
         assert!(failures.is_empty());
         assert_eq!(
             listed(&merged),
@@ -20099,7 +21767,6 @@ mod virtual_channel_tests {
                 &remote,
                 &Default::default(),
                 Some(&allowlist),
-                RepodataEncoding::Json,
             )
             .2
         });
@@ -20235,6 +21902,7 @@ mod virtual_channel_tests {
                 queue_wait: std::time::Duration::from_secs(queue_secs),
                 cache_ttl: std::time::Duration::from_secs(300),
                 cache_max_bytes: 64 * 1024 * 1024,
+                max_stale: std::time::Duration::from_secs(300),
             },
             proxy_helpers::proxy_metadata_budget(),
         );
@@ -20282,8 +21950,9 @@ mod virtual_channel_tests {
     /// #4608: two concurrent requests for the same merged document run ONE
     /// merge (one upstream fetch) and get the same ETag; a later request is
     /// served from the kept merge without merging again, and revalidating
-    /// with that ETag is a 304. A different encoding is a different document;
-    /// channeldata shares the same way.
+    /// with that ETag is a 304. Another encoding of the same subdir is served
+    /// from the same merge (#4879) under its own ETag; channeldata shares the
+    /// same way.
     #[tokio::test]
     async fn concurrent_identical_requests_share_one_merge_and_etag_4608() {
         let Some(pool) = tdh::try_pool().await else {
@@ -20330,7 +21999,10 @@ mod virtual_channel_tests {
         let app = tdh::router_anon(router(), rig.state.clone());
         let (nm_status, nm_body, nm_headers) = tdh::send_with_headers(app, conditional).await;
 
-        let (json_status, json_body, _) = rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (json_status, json_body, json_headers) =
+            rig.get(format!("/{v}/noarch/repodata.json")).await;
+        let (bz2_status, bz2_body, bz2_headers) =
+            rig.get(format!("/{v}/noarch/repodata.json.bz2")).await;
         let merges_after_json = gate.merges_started();
 
         let cd_uri = format!("/{v}/channeldata.json");
@@ -20369,14 +22041,30 @@ mod virtual_channel_tests {
         assert_eq!(etag(&nm_headers), etag(&a.2));
 
         assert_eq!(json_status, StatusCode::OK);
-        assert_eq!(merges_after_json, 2, "another encoding is another document");
+        assert_eq!(bz2_status, StatusCode::OK);
+        assert_eq!(
+            merges_after_json, 1,
+            "#4879: every encoding of a subdir is served from one merge"
+        );
         let json_doc: serde_json::Value = serde_json::from_slice(&json_body).unwrap();
         assert_eq!(json_doc, doc, "every encoding carries the same merge");
+        let mut bz2_json = Vec::new();
+        std::io::Read::read_to_end(
+            &mut bzip2::read::BzDecoder::new(&bz2_body[..]),
+            &mut bz2_json,
+        )
+        .unwrap();
+        assert_eq!(bz2_json, json_body.to_vec(), ".bz2 holds the .json bytes");
+        let tags = [etag(&a.2), etag(&json_headers), etag(&bz2_headers)];
+        assert!(
+            tags[0] != tags[1] && tags[1] != tags[2] && tags[0] != tags[2],
+            "each encoding has its own ETag: {tags:?}"
+        );
 
         assert_eq!(cd_a.0, StatusCode::OK);
         assert_eq!(cd_b.0, StatusCode::OK);
         assert_eq!(
-            merges_after_channeldata, 3,
+            merges_after_channeldata, 2,
             "channeldata: one merge for two requests"
         );
         assert_eq!(channeldata_fetches, 1);
@@ -20483,7 +22171,8 @@ mod virtual_channel_tests {
     }
 
     /// #4608: a merge reserves its decoded member documents and its output
-    /// against the buffered-metadata budget, in every encoding: the first
+    /// against the buffered-metadata budget (one merge for every encoding,
+    /// #4879): the first
     /// merge of a document (size unknown) reserves the whole budget, and the
     /// next merge of it reserves what the first one needed, which still
     /// covers decoded + merged bytes.
@@ -20500,35 +22189,24 @@ mod virtual_channel_tests {
         let _gate = test_gate(&rig, 4, 30);
         let budget = proxy_helpers::proxy_metadata_budget().total_bytes();
 
-        let merge = |encoding: RepodataEncoding| {
+        let merge = || {
             let state = rig.state.clone();
             let (id, key) = (rig.virtual_id, rig.virtual_key.clone());
             async move {
-                build_virtual_repodata(&state, None, id, &key, "noarch", encoding)
+                build_virtual_repodata(&state, None, id, &key, "noarch")
                     .await
-                    .unwrap_or_else(|_| panic!("merge {}", encoding.upstream_filename()))
+                    .unwrap_or_else(|_| panic!("merge repodata.json"))
                     .stats
             }
         };
-        let encodings = [
-            RepodataEncoding::Json,
-            RepodataEncoding::Zst,
-            RepodataEncoding::Bz2,
-        ];
-        let mut first = Vec::new();
-        for encoding in encodings {
-            first.push((encoding.upstream_filename(), merge(encoding).await));
-        }
-        // A new allowlist generation: every document merges again.
+        let first = vec![("repodata.json", merge().await)];
+        // A new allowlist generation: the document merges again.
         set_allowlist(
             &rig,
             serde_json::json!({"enabled": true, "entries": [{"name": "pkg*"}]}),
         )
         .await;
-        let mut second = Vec::new();
-        for encoding in encodings {
-            second.push((encoding.upstream_filename(), merge(encoding).await));
-        }
+        let second = vec![("repodata.json", merge().await)];
         rig.cleanup().await;
 
         for (document, stats) in first {
@@ -22418,6 +24096,194 @@ mod cep16_proxy_tests {
         assert!(String::from_utf8_lossy(&body).contains(&repo_key));
         assert_eq!(shard_status, StatusCode::BAD_GATEWAY);
     }
+
+    // ---------------------------------------------------------------------
+    // #4829: a shard refused for failing its address check is never left in
+    // the proxy cache, where the immutable classification would pin it.
+    // ---------------------------------------------------------------------
+
+    /// Mount `wrong` for `path` for the first `wrong_times` requests and
+    /// `right` after that (wiremock tries mocks in mount order).
+    async fn mount_wrong_then_right(
+        server: &MockServer,
+        path: &str,
+        wrong: Vec<u8>,
+        wrong_times: u64,
+        right: Vec<u8>,
+    ) {
+        Mock::given(method("GET"))
+            .and(wm_path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(wrong),
+            )
+            .up_to_n_times(wrong_times)
+            .mount(server)
+            .await;
+        mount_bytes(server, path, right).await;
+    }
+
+    /// What the proxy cache holds for `cache_path`: the body, and the SHA-256
+    /// the proxy-cache catalogue recorded for it.
+    async fn cached_shard(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        repo_key: &str,
+        cache_path: &str,
+    ) -> (Option<Bytes>, Option<String>) {
+        let body = state
+            .proxy_service
+            .as_deref()
+            .expect("proxy service")
+            .get_cached_artifact_by_path(repo_key, cache_path)
+            .await
+            .expect("proxy cache read")
+            .map(|b| b.content);
+        let checksum: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM proxy_cache_artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(cache_path)
+        .fetch_optional(pool)
+        .await
+        .expect("proxy cache catalogue read");
+        (body, checksum.flatten())
+    }
+
+    /// The upstream answers a shard address with the wrong bytes once and the
+    /// right bytes after. The first request is refused (502) and nothing is
+    /// cached for that address; the next asks the upstream again, serves the
+    /// verified shard and caches it, and the one after is a cache hit.
+    #[tokio::test]
+    async fn remote_shard_refused_for_its_address_is_not_cached_4829() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (shard, hash) = upstream_shard("noarch", &["tzdata-2025b-h78e105d_0.conda"]);
+        let (wrong, _) = upstream_shard("noarch", &["tzdata-2025a-h78e105d_0.conda"]);
+        let server = MockServer::start().await;
+        mount_bytes(
+            &server,
+            INDEX,
+            upstream_index("noarch", "./shards/", &[("tzdata", &hash)]),
+        )
+        .await;
+        let shard_path = format!("/noarch/shards/{hash}.msgpack.zst");
+        mount_wrong_then_right(&server, &shard_path, wrong, 1, shard.clone()).await;
+
+        let (state, _cache_dir) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let get = |uri: String| {
+            let app = tdh::router_anon(router(), state.clone());
+            async move { tdh::send(app, tdh::get(uri)).await }
+        };
+        let cache_path = format!("noarch/shards/{hash}.msgpack.zst");
+
+        let (refused_status, refused_body) = get(shard_uri(&repo_key, &hash)).await;
+        let after_refusal = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+        let (healed_status, healed_body) = get(shard_uri(&repo_key, &hash)).await;
+        let (hit_status, hit_body) = get(shard_uri(&repo_key, &hash)).await;
+        let hits = upstream_hits(&server, &format!("{hash}.msgpack.zst")).await;
+        let after_heal = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            refused_status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            String::from_utf8_lossy(&refused_body)
+        );
+        assert_eq!(
+            after_refusal,
+            (None, None),
+            "a refused shard must not be committed to the proxy cache"
+        );
+        assert_eq!(
+            healed_status,
+            StatusCode::OK,
+            "once the upstream serves the right bytes the shard is served: {}",
+            String::from_utf8_lossy(&healed_body)
+        );
+        assert_eq!(&healed_body[..], &shard[..]);
+        assert_eq!(hit_status, StatusCode::OK);
+        assert_eq!(&hit_body[..], &shard[..]);
+        assert_eq!(
+            hits, 2,
+            "the refused shard is fetched again, the verified one is then a cache hit"
+        );
+        assert_eq!(after_heal.0.as_deref(), Some(&shard[..]));
+        assert_eq!(after_heal.1.as_deref(), Some(hash.as_str()));
+    }
+
+    /// A shard whose wrong bytes are already in the proxy cache (committed by
+    /// a release without the identity check) is evicted on the next request
+    /// and fetched again, so an existing poisoned cache heals by itself.
+    #[tokio::test]
+    async fn remote_shard_poisoned_cache_entry_is_evicted_and_refetched_4829() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (shard, hash) = upstream_shard("noarch", &["rich-13.0-pyh_0.conda"]);
+        let (wrong, wrong_hash) = upstream_shard("noarch", &["rich-12.0-pyh_0.conda"]);
+        let server = MockServer::start().await;
+        mount_bytes(
+            &server,
+            INDEX,
+            upstream_index("noarch", "./shards/", &[("rich", &hash)]),
+        )
+        .await;
+        let shard_path = format!("/noarch/shards/{hash}.msgpack.zst");
+        mount_wrong_then_right(&server, &shard_path, wrong.clone(), 1, shard.clone()).await;
+
+        let (state, _cache_dir) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let cache_path = format!("noarch/shards/{hash}.msgpack.zst");
+        // Poison the cache the way the pre-#4829 fetch did: commit whatever
+        // the upstream answered under the shard's path.
+        let accept_anything =
+            |_: Bytes, _: Option<String>| -> futures::future::BoxFuture<'static, bool> {
+                Box::pin(async { true })
+            };
+        proxy_helpers::proxy_fetch_capped_with_cache_key_encoded_format(
+            state.proxy_service.as_deref().expect("proxy service"),
+            repo_id,
+            &repo_key,
+            &server.uri(),
+            &shard_path[1..],
+            &cache_path,
+            CEP16_UPSTREAM_SHARD_MAX_BYTES,
+            RepositoryFormat::Conda,
+            &accept_anything,
+        )
+        .await
+        .expect("seed the poisoned entry");
+        let poisoned = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(shard_uri(&repo_key, &hash)),
+        )
+        .await;
+        let hits = upstream_hits(&server, &format!("{hash}.msgpack.zst")).await;
+        let healed = cached_shard(&state, &pool, repo_id, &repo_key, &cache_path).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(poisoned.0.as_deref(), Some(&wrong[..]), "fixture: poisoned");
+        assert_eq!(poisoned.1.as_deref(), Some(wrong_hash.as_str()));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a poisoned entry must not keep the shard at 502: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], &shard[..]);
+        assert_eq!(hits, 2, "the poisoned entry is evicted and fetched again");
+        assert_eq!(healed.0.as_deref(), Some(&shard[..]));
+        assert_eq!(healed.1.as_deref(), Some(hash.as_str()));
+    }
     /// #4608: the merged shard index is shared like the other merged
     /// documents: two concurrent requests run one merge and get one ETag, a
     /// later request reuses it, and shard requests through the virtual are
@@ -23089,11 +24955,13 @@ mod cep16_proxy_tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// A remote member that publishes no shard index takes the whole virtual
-    /// off CEP-16 for that subdir (404, so clients fall back), while the
-    /// monolithic merge keeps working.
+    /// #4178: a remote member that publishes no shard index contributes the
+    /// shards synthesised from its upstream repodata, so the virtual's union
+    /// (#4179) still serves CEP-16 for the subdir; the monolithic merge keeps
+    /// working. A remote member with neither (no repodata either) still takes
+    /// the virtual off CEP-16 (404, so clients fall back).
     #[tokio::test]
-    async fn virtual_without_a_sharded_member_falls_back_to_repodata_4577() {
+    async fn virtual_unions_a_member_without_upstream_shards_through_synthesis_4178() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -23110,21 +24978,53 @@ mod cep16_proxy_tests {
         seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
         let v = rig.virtual_key.clone();
         let (idx_status, idx_body, _) = rig.get(format!("/{v}{INDEX}")).await;
-        let (shard_status, _, _) = rig.get(shard_uri(&v, &well_formed_shard_hash())).await;
+        let index = (idx_status == StatusCode::OK).then(|| decode_index(&idx_body));
+        let rich = index
+            .as_ref()
+            .and_then(|i| i.shards.get("rich"))
+            .map(hex::encode);
+        let (shard_status, shard_body, _) = match &rich {
+            Some(hash) => rig.get(shard_uri(&v, hash)).await,
+            None => (StatusCode::NOT_FOUND, Bytes::new(), HeaderMap::new()),
+        };
+        let (unknown_status, _, _) = rig.get(shard_uri(&v, &well_formed_shard_hash())).await;
         let (repodata_status, repodata) = rig.repodata("noarch").await;
+        let (linux_status, _, _) = rig
+            .get(format!("/{v}/linux-64/repodata_shards.msgpack.zst"))
+            .await;
         rig.cleanup().await;
 
-        assert_eq!(idx_status, StatusCode::NOT_FOUND);
-        assert!(
-            String::from_utf8_lossy(&idx_body).contains("repodata.json"),
+        assert_eq!(
+            idx_status,
+            StatusCode::OK,
             "{}",
             String::from_utf8_lossy(&idx_body)
         );
-        assert_eq!(shard_status, StatusCode::NOT_FOUND);
+        let mut names: Vec<&String> = index.as_ref().unwrap().shards.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["acme-core", "rich"]);
+        assert_eq!(shard_status, StatusCode::OK);
+        assert_eq!(
+            hex::encode(shard_address(&shard_body)),
+            rich.unwrap(),
+            "the synthesised shard hashes to its address"
+        );
+        let shard: rattler_conda_types::Shard =
+            rmp_serde::from_slice(&zstd::decode_all(shard_body.as_ref()).unwrap()).unwrap();
+        assert!(shard
+            .conda_packages
+            .keys()
+            .any(|k| k.to_string() == "rich-13.0-pyh_0.conda"));
+        assert_eq!(unknown_status, StatusCode::NOT_FOUND);
         assert_eq!(repodata_status, StatusCode::OK);
         assert_eq!(
             super::virtual_channel_tests::listed(&repodata),
             vec!["acme-core-1.0-0.conda", "rich-13.0-pyh_0.conda"]
+        );
+        assert_eq!(
+            linux_status,
+            StatusCode::NOT_FOUND,
+            "a member with no repodata for the subdir at all keeps the virtual off CEP-16"
         );
     }
 
@@ -23187,6 +25087,15 @@ mod cep16_proxy_tests {
         };
         let server = MockServer::start().await;
         mount_bytes(&server, INDEX, vec![0x5a; 65 * 1024 * 1024]).await;
+        // The upstream does publish an index (too large to use), so no
+        // shards are synthesised from its repodata (#4178 covers only an
+        // upstream that publishes none).
+        mount_bytes(
+            &server,
+            "/noarch/repodata.json",
+            serde_json::to_vec(&upstream_repodata("noarch", &["rich-13.0-pyh_0.conda"])).unwrap(),
+        )
+        .await;
         let (state, _cache) = state_with_proxy_cache(&pool);
         let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
         let (remote_status, remote_body) = tdh::send(
@@ -23671,6 +25580,436 @@ mod upload_body_tests {
             budget.available_bytes(),
             64 * 1024 * 1024,
             "the body's budget is released once the request is done"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod package_conditional_tests {
+    //! #4181 / #4579: the package route resolves a hosted package in one
+    //! statement, carries `ETag` (the sha256) and `Last-Modified` on every
+    //! package response, and answers a matching conditional request with
+    //! `304 Not Modified` and no body on hosted, cached-remote and virtual
+    //! channels, direct and under both token layouts.
+    use super::virtual_channel_tests::VirtualRig;
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FILE: &str = "acme-etag-1.0-0.tar.bz2";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Store `bytes` as the hosted package `noarch/{FILE}` of `repo_id`.
+    async fn seed_hosted_package(state: &SharedState, repo_id: uuid::Uuid, bytes: &[u8]) -> String {
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("repository");
+        let location = crate::storage::StorageLocation {
+            backend: row.get("storage_backend"),
+            path: row.get("storage_path"),
+        };
+        let storage_key = format!("conda/{repo_id}/noarch/{FILE}");
+        state
+            .storage_for_repo(&location)
+            .expect("storage")
+            .put(&storage_key, Bytes::copy_from_slice(bytes))
+            .await
+            .expect("store package");
+        let sha = sha256_hex(bytes);
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'acme-etag', '1.0', $3, $4, 'application/x-tar', $5)",
+        )
+        .bind(repo_id)
+        .bind(format!("noarch/{FILE}"))
+        .bind(bytes.len() as i64)
+        .bind(&sha)
+        .bind(&storage_key)
+        .execute(&state.db)
+        .await
+        .expect("insert hosted package");
+        sha
+    }
+
+    fn app(state: &SharedState) -> axum::Router {
+        tdh::router_anon(
+            axum::Router::new()
+                .nest("/conda", router())
+                .nest("/conda/t", token_router())
+                .nest("/t", rattler_token_router()),
+            state.clone(),
+        )
+    }
+
+    async fn get(
+        state: &SharedState,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        let mut req = axum::http::Request::builder().method("GET").uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        tdh::send_with_headers(app(state), req.body(Body::empty()).unwrap()).await
+    }
+
+    /// The three URL layouts of one package.
+    fn layouts(key: &str) -> [String; 3] {
+        [
+            format!("/conda/{key}/noarch/{FILE}"),
+            format!("/conda/t/some-token/{key}/noarch/{FILE}"),
+            format!("/t/some-token/conda/{key}/noarch/{FILE}"),
+        ]
+    }
+
+    /// Assert the 200 / 304 contract for `key` on every layout: the 200
+    /// carries `ETag: "<sha>"` and `Last-Modified`; the same ETag, a weak
+    /// form of it, a list naming it, and a later `If-Modified-Since` are 304
+    /// with an empty body; a different ETag is a full 200.
+    async fn assert_conditional(state: &SharedState, key: &str, sha: &str, bytes: &[u8]) {
+        let etag = format!("\"{sha}\"");
+        for uri in layouts(key) {
+            let (status, body, headers) = get(state, &uri, &[]).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(&body[..], bytes, "{uri}");
+            assert_eq!(headers[ETAG], etag.as_str(), "{uri}");
+            let last_modified = headers
+                .get(axum::http::header::LAST_MODIFIED)
+                .unwrap_or_else(|| panic!("{uri}: no Last-Modified"))
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            let weak = format!("W/{etag}");
+            let listed = format!("\"other\", {etag}");
+            for inm in [etag.as_str(), weak.as_str(), listed.as_str(), "*"] {
+                let (status, body, headers) = get(state, &uri, &[("if-none-match", inm)]).await;
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_MODIFIED,
+                    "{uri} If-None-Match {inm}"
+                );
+                assert!(body.is_empty(), "{uri}: a 304 has no body");
+                assert_eq!(headers[ETAG], etag.as_str(), "{uri}");
+            }
+            let (status, _, _) = get(
+                state,
+                &uri,
+                &[("if-modified-since", last_modified.as_str())],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{uri} If-Modified-Since");
+
+            let (status, body, _) = get(state, &uri, &[("if-none-match", "\"0000\"")]).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: a stale validator is a full 200"
+            );
+            assert_eq!(&body[..], bytes, "{uri}");
+            // If-None-Match takes precedence over a matching If-Modified-Since.
+            let (status, _, _) = get(
+                state,
+                &uri,
+                &[
+                    ("if-none-match", "\"0000\""),
+                    ("if-modified-since", last_modified.as_str()),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{uri}: If-None-Match wins");
+        }
+    }
+
+    /// Wait for the proxy cache to catalog `path` under `repo_id`.
+    async fn wait_for_catalog(pool: &sqlx::PgPool, repo_id: uuid::Uuid, path: &str) -> String {
+        for _ in 0..100 {
+            let sha: Option<String> = sqlx::query_scalar(
+                "SELECT checksum_sha256 FROM proxy_cache_artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .flatten();
+            if let Some(sha) = sha {
+                return sha;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{path} was never catalogued");
+    }
+
+    #[tokio::test]
+    async fn hosted_remote_and_virtual_packages_answer_304_on_a_matching_validator_4579() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let remote_bytes = b"remote package bytes for the #4579 conditional test".to_vec();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/noarch/{FILE}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"upstream-etag\"")
+                    .set_body_bytes(remote_bytes.clone()),
+            )
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let hosted_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(rig.hosted_id)
+            .fetch_one(&rig.pool)
+            .await
+            .unwrap();
+
+        // Hosted.
+        let hosted_bytes = b"hosted package bytes for the #4579 conditional test".to_vec();
+        let hosted_sha = seed_hosted_package(&rig.state, rig.hosted_id, &hosted_bytes).await;
+        assert_conditional(&rig.state, &hosted_key, &hosted_sha, &hosted_bytes).await;
+        // Virtual, served by its hosted member.
+        assert_conditional(&rig.state, &rig.virtual_key, &hosted_sha, &hosted_bytes).await;
+
+        // Remote: the first GET fills the cache; once catalogued the package
+        // carries its sha256 and revalidates without a body.
+        let (status, body, _) = get(
+            &rig.state,
+            &format!("/conda/{}/noarch/{FILE}", rig.remote_key),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &remote_bytes[..]);
+        let remote_sha =
+            wait_for_catalog(&rig.pool, rig.remote_id, &format!("noarch/{FILE}")).await;
+        assert_eq!(remote_sha, sha256_hex(&remote_bytes));
+        assert_conditional(&rig.state, &rig.remote_key, &remote_sha, &remote_bytes).await;
+
+        // Virtual, served by its cached Remote member once the hosted member
+        // no longer holds the package.
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(rig.hosted_id)
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+        assert_conditional(&rig.state, &rig.virtual_key, &remote_sha, &remote_bytes).await;
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(rig.remote_id)
+            .execute(&rig.pool)
+            .await;
+        rig.cleanup().await;
+    }
+
+    /// A quarantined hosted package is refused before any validator is
+    /// consulted: a conditional request is 409, never a 304.
+    #[tokio::test]
+    async fn a_held_package_is_never_answered_304_4579() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let state = fx.state.clone();
+        let bytes = b"held package".to_vec();
+        let sha = seed_hosted_package(&state, fx.repo_id, &bytes).await;
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NOW() + INTERVAL '1 hour' WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let etag = format!("\"{sha}\"");
+        let (status, _, _) = get(
+            &state,
+            &format!("/conda/{}/noarch/{FILE}", fx.repo_key),
+            &[("if-none-match", etag.as_str())],
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// #4181: a hosted package request reads the database in ONE statement
+    /// before it streams. It used to be five: resolve, visibility, artifact,
+    /// quarantine, scan policy. Counted as pool acquisitions on a pool that
+    /// only this request uses (every statement outside a transaction
+    /// acquires once); a HEAD, so the off-path download record (which a HEAD
+    /// does not write) cannot race the count.
+    #[tokio::test]
+    async fn a_hosted_package_request_issues_one_statement_4181() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let bytes = b"one statement".to_vec();
+        seed_hosted_package(&fx.state, fx.repo_id, &bytes).await;
+
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let counter = acquired.clone();
+        let url = crate::testing::require_db_url().expect("DATABASE_URL");
+        let counted = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .after_release(move |_conn, _meta| {
+                let counter = counter.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("counting pool");
+        let state = tdh::build_state(counted.clone(), fx.storage_dir.to_str().unwrap());
+        let uri = format!("/conda/{}/noarch/{FILE}", fx.repo_key);
+
+        sqlx::query("SELECT 1").execute(&counted).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let before = acquired.load(Ordering::SeqCst);
+        let (status, _, headers) = tdh::send_with_headers(app(&state), tdh::head(uri)).await;
+        // A dropped connection goes back to the pool on a spawned task.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let statements = acquired.load(Ordering::SeqCst) - before;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[CONTENT_LENGTH], bytes.len().to_string().as_str());
+        assert_eq!(statements, 1, "one statement per hosted package request");
+    }
+
+    /// A rejected hosted package is refused before any validator is
+    /// consulted: a conditional request is 403, never a 304.
+    #[tokio::test]
+    async fn a_rejected_package_is_never_answered_304_4579() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let state = fx.state.clone();
+        let bytes = b"rejected package".to_vec();
+        let sha = seed_hosted_package(&state, fx.repo_id, &bytes).await;
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let etag = format!("\"{sha}\"");
+        let (status, _, _) = get(
+            &state,
+            &format!("/conda/{}/noarch/{FILE}", fx.repo_key),
+            &[("if-none-match", etag.as_str())],
+        )
+        .await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A streamed proxy serve that only carries the upstream's `ETag` (the
+    /// scan-on-proxy walk's streaming arms, which may be the cold fetch that
+    /// fills the cache) is never answered 304, even when the caller allows a
+    /// 304 and the request names that `ETag`: dropping the body would cancel
+    /// the cache fill, and the upstream's tag is not the sha256 validator.
+    #[test]
+    fn an_upstream_etag_alone_never_yields_304_4579() {
+        let response = || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(ETAG, "\"upstream-etag\"")
+                .header(CONTENT_LENGTH, "5")
+                .body(Body::from("bytes"))
+                .unwrap()
+        };
+        let mut request = HeaderMap::new();
+        request.insert(
+            axum::http::header::IF_NONE_MATCH,
+            "\"upstream-etag\"".parse().unwrap(),
+        );
+        let served = finish_package_response(&request, response(), None, true);
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers()[ETAG], "\"upstream-etag\"");
+
+        // The scan gate's digest header is a sha256 validator and does 304.
+        let mut digested = response();
+        digested
+            .headers_mut()
+            .insert("X-Checksum-SHA256", "abc".parse().unwrap());
+        request.insert(
+            axum::http::header::IF_NONE_MATCH,
+            "\"abc\"".parse().unwrap(),
+        );
+        let served = finish_package_response(&request, digested, None, true);
+        assert_eq!(served.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(served.headers()[ETAG], "\"abc\"");
+    }
+
+    #[test]
+    fn if_none_match_uses_the_weak_comparison() {
+        assert!(if_none_match_matches("\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("W/\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("\"x\", \"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("*", "\"abc\""));
+        assert!(!if_none_match_matches("\"abcd\"", "\"abc\""));
+        assert!(!if_none_match_matches("", "\"abc\""));
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod package_gate_router_tests {
+    //! #4182: a package request that finds the pool saturated is shed at once
+    //! with 503 + Retry-After instead of queueing to the acquire timeout.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn a_saturated_pool_sheds_package_requests_with_retry_after_4182() {
+        let Some(url) = crate::testing::require_db_url() else {
+            return;
+        };
+        // One connection, and an acquire timeout far beyond the gate's wait:
+        // without the gate the request below would wait the full 10 s.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&url)
+            .await
+            .expect("single-connection pool");
+        let dir = tempfile::tempdir().expect("storage dir");
+        let state = tdh::build_state(pool.clone(), dir.path().to_str().unwrap());
+        let app = || tdh::router_anon(router(), state.clone());
+        let uri = || "/no-such-channel/noarch/pkg-1.0-0.tar.bz2".to_string();
+
+        let held = pool.acquire().await.expect("hold the only connection");
+        let started = std::time::Instant::now();
+        let (status, _, headers) = tdh::send_with_headers(app(), tdh::get(uri())).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[axum::http::header::RETRY_AFTER], "1");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "shed after {elapsed:?}, not at the gate's wait"
+        );
+
+        // A free connection is used as before.
+        drop(held);
+        let (status, _, _) = tdh::send_with_headers(app(), tdh::get(uri())).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the request reaches the lookup"
         );
     }
 }

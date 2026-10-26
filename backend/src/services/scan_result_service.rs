@@ -2,13 +2,14 @@
 
 use std::time::Duration;
 
+use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
-    DashboardSummary, Grade, RawFinding, RawPackage, RepoSecurityScore, ScanFinding, ScanResult,
-    Severity, VulnDbProvenance,
+    DashboardSummary, Grade, GradeStatus, RawFinding, RawPackage, RepoSecurityScore, ScanFinding,
+    ScanResult, ScoreCoverage, Severity, VulnDbProvenance,
 };
 use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
 
@@ -71,6 +72,39 @@ pub(crate) fn stable_lock_key(scan_type: &str) -> i32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash as i32
+}
+
+/// Attempts [`ScanResultService::recalculate_score`] makes before it returns
+/// a serialization failure (#5006). An attempt that found the repository's
+/// lock busy also counts, so this also bounds how long one call waits behind
+/// other recalculations of the same repository.
+const SCORE_RECALC_MAX_ATTEMPTS: u32 = 8;
+
+/// Advisory-lock key text serializing score recalculations per repository
+/// (#5006). Hashed server-side with `hashtextextended(..., 0)`; the
+/// `repo-security-score:` namespace keeps it apart from the other text-keyed
+/// advisory locks.
+fn score_recalc_lock_key(repository_id: Uuid) -> String {
+    format!("repo-security-score:{repository_id}")
+}
+
+/// Whether a failed score recalculation lost a race with a concurrent writer
+/// and is safe to run again: a serialization failure (`40001`) or a deadlock
+/// (`40P01`). The recalculation commits atomically, so a retry never leaves a
+/// partial row. The stringified form is matched too, for statements whose
+/// error is flattened to `AppError::Database`.
+fn is_score_recalc_conflict(err: &AppError) -> bool {
+    match err {
+        AppError::Sqlx(e) => matches!(
+            e.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("40001" | "40P01")
+        ),
+        AppError::Database(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("could not serialize access") || lower.contains("deadlock detected")
+        }
+        _ => false,
+    }
 }
 
 /// Fold a 128-bit artifact UUID down to a single 32-bit key, used as the
@@ -268,19 +302,74 @@ pub(crate) struct ProxyBlockCandidate {
 pub(crate) fn count_blocked_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
     let blocked: std::collections::HashSet<&str> = rows
         .iter()
-        .filter(|r| crate::formats::format_key_enforces_scan_on_proxy(&r.format))
         .filter(|r| {
-            crate::services::scan_config_service::proxy_severity_gate_for_row(
+            proxy_gate_refuses(
+                &r.format,
                 r.block_on_policy_violation,
                 &r.severity_threshold,
                 &r.proxy_scan_action,
+                r.max_severity.as_deref(),
             )
-            .blocks(r.max_severity.as_deref().and_then(Severity::from_str_loose))
         })
         .map(|r| r.checksum_sha256.as_str())
         .collect();
     blocked.len() as i64
 }
+
+/// Whether a repository's proxy scan gate refuses a stored `vulnerable`
+/// verdict: the format's proxy path runs the gate (#4582), and the
+/// repository's severity gate blocks the verdict's highest severity
+/// (record-only never does, a verdict below an opted-in threshold serves).
+/// The one predicate the dashboard count and the blocked listings share
+/// (#4380, #4510, #4777), so they cannot disagree with each other or with the
+/// gate.
+pub(crate) fn proxy_gate_refuses(
+    format: &str,
+    block_on_policy_violation: bool,
+    severity_threshold: &str,
+    proxy_scan_action: &str,
+    max_severity: Option<&str>,
+) -> bool {
+    crate::formats::format_key_enforces_scan_on_proxy(format)
+        && crate::services::scan_config_service::proxy_severity_gate_for_row(
+            block_on_policy_violation,
+            severity_threshold,
+            proxy_scan_action,
+        )
+        .blocks(max_severity.and_then(Severity::from_str_loose))
+}
+
+/// One proxied path whose stored verdict its repository's proxy scan gate
+/// currently refuses (#4510, #4777): a `proxy_cache_artifacts` row (or, for
+/// OCI, an image manifest the repository references) whose digest has a
+/// `vulnerable` verdict newer than the scan TTL that the repository's gate
+/// blocks. Verdicts are shared by digest across repositories; a row is only
+/// listed where THAT repository's settings refuse it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProxyBlockedEntry {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    pub repository_format: String,
+    /// The cached logical path; for an OCI manifest, `sha256:<digest>`.
+    pub path: String,
+    pub checksum_sha256: String,
+    pub max_severity: Option<String>,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+    /// The serving repository's gate settings the row was judged under.
+    pub block_on_policy_violation: bool,
+    pub severity_threshold: String,
+    pub proxy_scan_action: String,
+}
+
+/// Upper bound on the candidate rows one blocked-proxy listing reads. The
+/// candidates are vulnerable verdicts on cached paths, a small set in
+/// practice; the cap only bounds a pathological instance, and is logged.
+pub(crate) const PROXY_BLOCKED_CANDIDATE_CAP: i64 = 50_000;
 
 /// Build a DashboardSummary from raw count values.
 pub(crate) fn build_dashboard_summary(
@@ -299,8 +388,176 @@ pub(crate) fn build_dashboard_summary(
         critical_findings,
         high_findings,
         policy_violations_blocked: 0,
+        proxy_blocked: 0,
         repos_grade_a,
         repos_grade_f,
+        repos_rated: 0,
+        repos_incomplete: 0,
+        repos_unrated: 0,
+    }
+}
+
+/// Columns of `repo_security_scores` every [`RepoSecurityScore`] read selects,
+/// as a literal for `concat!`. Runtime `query_as` (not the macro) so the
+/// #4336 columns need no `.sqlx` regeneration.
+macro_rules! score_columns {
+    () => {
+        "id, repository_id, score, grade, total_findings, \
+         critical_count, high_count, medium_count, low_count, acknowledged_count, \
+         last_scan_at, has_failed_scan, has_uncataloged_scan, calculated_at, \
+         grade_status, rated_grade, artifact_count, scanned_count, cataloged_count, \
+         partial_count, failed_count, uncataloged_count, status_calculated_at"
+    };
+}
+
+/// The grade letter 1.11 replicas read from `repo_security_scores.grade`
+/// (#4336 keeps writing it unchanged): the score's letter, floored to F while
+/// a failed scan (#2167) or a floor-qualifying uncataloged artifact (#4036,
+/// #4154) is unsuperseded. 1.12 reads `grade_status` and `rated_grade`
+/// instead and never shows the floor.
+pub(crate) fn legacy_grade_letter(
+    grade: Grade,
+    has_failed_scan: bool,
+    uncataloged_floors: bool,
+) -> char {
+    if has_failed_scan || uncataloged_floors {
+        'F'
+    } else {
+        grade.as_char()
+    }
+}
+
+/// The repository status stored in `grade_status` (#4336): the coverage's
+/// status, except that a repository is never `unrated` (no letter) while
+/// something in it was assessed. An artifact one scanner cataloged and another
+/// failed on counts as failed in the coverage, and the findings of an earlier
+/// completed scan stay counted after a failed rescan; either way the findings
+/// are real, so the repository is `incomplete` and shows their letter.
+pub(crate) fn repository_grade_status(
+    coverage: &ScoreCoverage,
+    any_artifact_assessed: bool,
+    has_findings: bool,
+) -> GradeStatus {
+    match coverage.grade_status() {
+        GradeStatus::Unrated if any_artifact_assessed || has_findings => GradeStatus::Incomplete,
+        status => status,
+    }
+}
+
+/// The letter stored in `rated_grade` (#4336): the score's letter over the
+/// assessed artifacts, `None` when nothing was assessed.
+pub(crate) fn rated_grade_letter(grade: Grade, status: GradeStatus) -> Option<char> {
+    match status {
+        GradeStatus::Unrated => None,
+        GradeStatus::Rated | GradeStatus::Incomplete => Some(grade.as_char()),
+    }
+}
+
+/// Dashboard counts over the score rows (#4336).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GradeTally {
+    pub grade_a: i64,
+    pub grade_f: i64,
+    pub rated: i64,
+    pub incomplete: i64,
+    pub unrated: i64,
+}
+
+/// Count score rows by status and by displayed letter: the letter tiles count
+/// only rows that have a letter ([`RepoSecurityScore::display_grade`]), so an
+/// `unrated` repository is neither A nor F and an `incomplete` one counts
+/// under its real letter.
+pub(crate) fn tally_grade_rows(rows: impl IntoIterator<Item = RepoSecurityScore>) -> GradeTally {
+    let mut t = GradeTally::default();
+    for row in rows {
+        match row.status() {
+            GradeStatus::Rated => t.rated += 1,
+            GradeStatus::Incomplete => t.incomplete += 1,
+            GradeStatus::Unrated => t.unrated += 1,
+        }
+        match row.display_grade().as_deref() {
+            Some("A") => t.grade_a += 1,
+            Some("F") => t.grade_f += 1,
+            _ => {}
+        }
+    }
+    t
+}
+
+/// How long the score refresher collects `artifact.deleted` events before it
+/// recalculates: a bulk delete of N artifacts in one repository costs one
+/// recalculation, not N.
+const SCORE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Keep a repository's grade status and coverage current when an artifact
+/// leaves it (#4336).
+///
+/// A score was only recalculated after a scan, so deleting the one artifact
+/// that could not be cataloged left the repository `incomplete` until the
+/// next scan. This subscribes to `artifact.deleted` on the in-process bus,
+/// collects the repositories for [`SCORE_REFRESH_DEBOUNCE`], and recalculates
+/// each one that already has a score row (a repository that was never scored
+/// gets none from a delete). Best effort: the bus is at-most-once and
+/// per-replica, so a missed event leaves the score as stale as it was before
+/// this existed, and the next scan corrects it.
+pub fn spawn_score_refresher(
+    event_bus: std::sync::Arc<crate::services::event_bus::EventBus>,
+    db: PgPool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut rx = event_bus.subscribe();
+    tokio::spawn(async move {
+        let mut pending: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut tick = tokio::time::interval(SCORE_REFRESH_DEBOUNCE);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                _ = tick.tick() => {
+                    for repository_id in std::mem::take(&mut pending) {
+                        refresh_existing_score(&db, repository_id).await;
+                    }
+                }
+                recv = rx.recv() => match recv {
+                    Ok(event) => {
+                        if event.event_type == "artifact.deleted" {
+                            if let Some(repository_id) = event.repository_id {
+                                pending.insert(repository_id);
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "score refresher lagged; some deletes were not seen");
+                    }
+                    Err(RecvError::Closed) => break,
+                },
+            }
+        }
+    });
+}
+
+/// Recalculate `repository_id`'s score if it has one; log and move on if not
+/// or on error.
+async fn refresh_existing_score(db: &PgPool, repository_id: Uuid) {
+    let exists: std::result::Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM repo_security_scores WHERE repository_id = $1)",
+    )
+    .bind(repository_id)
+    .fetch_one(db)
+    .await;
+    match exists {
+        Ok(true) => {
+            if let Err(e) = ScanResultService::new(db.clone())
+                .recalculate_score(repository_id)
+                .await
+            {
+                tracing::warn!(%repository_id, error = %e, "score refresh after delete failed");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(%repository_id, error = %e, "score refresh lookup failed"),
     }
 }
 
@@ -2184,7 +2441,53 @@ impl ScanResultService {
     // -----------------------------------------------------------------------
 
     /// Recalculate and materialize the security score for a repository.
+    ///
+    /// Recalculations of one repository are serialized (#5006). Every caller
+    /// (scan completion, the delete refresher, triage changes, the ingest
+    /// handler) goes through here, and two scans of one repository often
+    /// finish together. Each attempt runs under a per-repository
+    /// transaction-scoped advisory lock, and an attempt that hits a
+    /// serialization failure is retried, so the stored score always comes
+    /// from a snapshot that includes every recalculation committed before it.
+    /// Before #5006 the loser of such a race returned 40001, and the winner's
+    /// score, computed before the loser's scan had committed, stayed until
+    /// the next scan or delete in the repository.
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        let mut attempt = 1;
+        loop {
+            let last = attempt >= SCORE_RECALC_MAX_ATTEMPTS;
+            match self.recalculate_score_once(repository_id, last).await {
+                Ok(Some(score)) => return Ok(score),
+                // Another recalculation held the lock; it has finished now.
+                Ok(None) => {}
+                Err(err) if !last && is_score_recalc_conflict(&err) => {
+                    let jitter: f64 = rand::random();
+                    let base_ms = 20 * u64::from(attempt);
+                    let jitter_ms = (base_ms as f64 * jitter).round() as u64;
+                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+                    tracing::debug!(
+                        %repository_id,
+                        attempt,
+                        "security score recalculation hit a serialization conflict; retrying"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+            attempt += 1;
+        }
+    }
+
+    /// One attempt of [`Self::recalculate_score`]. Returns `Ok(None)` when
+    /// another recalculation of the repository held the lock: this attempt
+    /// waited for it to finish and gave up its snapshot, which predates that
+    /// recalculation's commit, so the caller starts over with a fresh one.
+    /// With `wait_for_lock` the attempt waits for the lock and computes in
+    /// any case (the last attempt).
+    async fn recalculate_score_once(
+        &self,
+        repository_id: Uuid,
+        wait_for_lock: bool,
+    ) -> Result<Option<RepoSecurityScore>> {
         // Wrap the three sequential queries (counts, last_scan_at, upsert)
         // in a single REPEATABLE READ transaction so all three statements
         // observe the same snapshot. The default sqlx transaction is
@@ -2206,6 +2509,34 @@ impl ScanResultService {
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // #5006: serialize recalculations of this repository. Under
+        // REPEATABLE READ the snapshot is taken when the first statement
+        // starts, which is the lock statement itself, so an attempt that had
+        // to wait for the lock would read from before the holder's commit.
+        // Take the lock without waiting; when it is busy, wait for the holder
+        // to finish and start over with a fresh snapshot.
+        let lock_key = score_recalc_lock_key(repository_id);
+        if wait_for_lock {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&lock_key)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            let acquired: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !acquired {
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
 
         // #4338: the shared definition of open vulnerabilities by severity
         // (latest completed scan per (artifact, scan type), one per
@@ -2318,19 +2649,76 @@ impl ScanResultService {
             false
         };
 
-        // Grade floor: while a failed scan is unsuperseded, the repo must never
-        // present as clean, so its grade LETTER is forced to F regardless of
-        // the (necessarily incomplete) finding counts from the completed rows.
-        // The floor is display-only: `score` is not changed, and the quality
-        // gates, promotion rules and download policies read the numeric score,
-        // not the letter (#4336 replaces the floors with an explicit status).
-        // #4036: an unsuperseded not-cataloged scan is floored the same way,
-        // narrowed by #4154 to `uncataloged_floors`.
-        let grade_char = if has_failed_scan || uncataloged_floors {
-            'F'
-        } else {
-            grade.as_char()
+        // The legacy letter: 1.11 replicas read `grade` and expect the floor
+        // (#2167, #4036/#4154), so it is written exactly as before. 1.12 reads
+        // the status and the unfloored letter below (#4336).
+        let grade_char = legacy_grade_letter(grade, has_failed_scan, uncataloged_floors);
+
+        // #4336: coverage, per live artifact, from the same latest-row window.
+        // An artifact is failed if any latest scan failed, else uncataloged if
+        // any latest completed scan cataloged nothing, else cataloged when a
+        // latest completed scan assessed it (`partial` counted separately).
+        let (
+            artifact_count,
+            failed_count,
+            uncataloged_count,
+            cataloged_count,
+            partial_count,
+            assessed_any_count,
+        ): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            WITH latest AS (
+                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+                       sr.artifact_id, sr.status, sr.scan_completeness
+                FROM scan_results sr
+                JOIN artifacts a ON a.id = sr.artifact_id
+                WHERE a.repository_id = $1
+                  AND NOT a.is_deleted
+                ORDER BY sr.artifact_id, sr.scan_type,
+                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
+            ),
+            per_artifact AS (
+                SELECT artifact_id,
+                       bool_or(status = 'failed') AS failed,
+                       bool_or(status = 'completed'
+                               AND scan_completeness = 'not_cataloged') AS uncataloged,
+                       bool_or(status = 'completed'
+                               AND scan_completeness IN ('complete', 'partial')) AS cataloged,
+                       bool_or(status = 'completed'
+                               AND scan_completeness = 'partial') AS partial
+                FROM latest
+                GROUP BY artifact_id
+            )
+            SELECT
+                (SELECT COUNT(*) FROM artifacts
+                  WHERE repository_id = $1 AND NOT is_deleted),
+                COUNT(*) FILTER (WHERE failed),
+                COUNT(*) FILTER (WHERE NOT failed AND uncataloged),
+                COUNT(*) FILTER (WHERE NOT failed AND NOT uncataloged AND cataloged),
+                COUNT(*) FILTER (WHERE NOT failed AND NOT uncataloged AND cataloged AND partial),
+                COUNT(*) FILTER (WHERE cataloged)
+            FROM per_artifact
+            "#,
+        )
+        .bind(repository_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let coverage = ScoreCoverage {
+            artifacts: artifact_count,
+            scanned: failed_count + uncataloged_count + cataloged_count,
+            cataloged: cataloged_count,
+            partial: partial_count,
+            failed: failed_count,
+            uncataloged: uncataloged_count,
         };
+        let status = repository_grade_status(
+            &coverage,
+            assessed_any_count > 0,
+            critical + high + medium + low + acknowledged + total > 0,
+        );
+        let rated = rated_grade_letter(grade, status);
+        let as_i32 = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
 
         let last_scan_at = sqlx::query_scalar!(
             r#"
@@ -2344,14 +2732,16 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let result = sqlx::query_as!(
-            RepoSecurityScore,
+        const INSERT: &str = concat!(
             r#"
             INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,
                 critical_count, high_count, medium_count, low_count,
                 acknowledged_count, last_scan_at, has_failed_scan,
-                has_uncataloged_scan, calculated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+                has_uncataloged_scan, calculated_at, grade_status, rated_grade,
+                artifact_count, scanned_count, cataloged_count, partial_count,
+                failed_count, uncataloged_count, status_calculated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(),
+                    $13, $14, $15, $16, $17, $18, $19, $20, NOW())
             ON CONFLICT (repository_id)
             DO UPDATE SET
                 score = EXCLUDED.score,
@@ -2365,75 +2755,75 @@ impl ScanResultService {
                 last_scan_at = EXCLUDED.last_scan_at,
                 has_failed_scan = EXCLUDED.has_failed_scan,
                 has_uncataloged_scan = EXCLUDED.has_uncataloged_scan,
-                calculated_at = NOW()
-            RETURNING id, repository_id, score, grade, total_findings,
-                      critical_count, high_count, medium_count, low_count,
-                      acknowledged_count, last_scan_at, has_failed_scan,
-                      has_uncataloged_scan, calculated_at
-            "#,
-            repository_id,
-            score,
-            grade_char.to_string(),
-            total,
-            critical,
-            high,
-            medium,
-            low,
-            acknowledged,
-            last_scan_at,
-            has_failed_scan,
-            has_uncataloged_scan,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+                calculated_at = NOW(),
+                grade_status = EXCLUDED.grade_status,
+                rated_grade = EXCLUDED.rated_grade,
+                artifact_count = EXCLUDED.artifact_count,
+                scanned_count = EXCLUDED.scanned_count,
+                cataloged_count = EXCLUDED.cataloged_count,
+                partial_count = EXCLUDED.partial_count,
+                failed_count = EXCLUDED.failed_count,
+                uncataloged_count = EXCLUDED.uncataloged_count,
+                status_calculated_at = NOW()
+            RETURNING "#,
+            score_columns!()
+        );
+        let result = sqlx::query_as::<_, RepoSecurityScore>(INSERT)
+            .bind(repository_id)
+            .bind(score)
+            .bind(grade_char.to_string())
+            .bind(total)
+            .bind(critical)
+            .bind(high)
+            .bind(medium)
+            .bind(low)
+            .bind(acknowledged)
+            .bind(last_scan_at)
+            .bind(has_failed_scan)
+            .bind(has_uncataloged_scan)
+            .bind(status.as_str())
+            .bind(rated.map(|c| c.to_string()))
+            .bind(as_i32(coverage.artifacts))
+            .bind(as_i32(coverage.scanned))
+            .bind(as_i32(coverage.cataloged))
+            .bind(as_i32(coverage.partial))
+            .bind(as_i32(coverage.failed))
+            .bind(as_i32(coverage.uncataloged))
+            .fetch_one(&mut *tx)
+            .await?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // The upsert and the commit keep the typed error so a serialization
+        // failure is recognized and retried (#5006).
+        tx.commit().await?;
 
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Get the current security score for a repository.
     pub async fn get_score(&self, repository_id: Uuid) -> Result<Option<RepoSecurityScore>> {
-        let score = sqlx::query_as!(
-            RepoSecurityScore,
-            r#"
-            SELECT id, repository_id, score, grade, total_findings,
-                   critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, has_failed_scan,
-                   has_uncataloged_scan, calculated_at
-            FROM repo_security_scores
-            WHERE repository_id = $1
-            "#,
-            repository_id,
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(score)
+        const SQL: &str = concat!(
+            "SELECT ",
+            score_columns!(),
+            " FROM repo_security_scores WHERE repository_id = $1"
+        );
+        sqlx::query_as::<_, RepoSecurityScore>(SQL)
+            .bind(repository_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Get all repository scores for the leaderboard.
     pub async fn get_all_scores(&self) -> Result<Vec<RepoSecurityScore>> {
-        let scores = sqlx::query_as!(
-            RepoSecurityScore,
-            r#"
-            SELECT id, repository_id, score, grade, total_findings,
-                   critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, has_failed_scan,
-                   has_uncataloged_scan, calculated_at
-            FROM repo_security_scores
-            ORDER BY score ASC, critical_count DESC
-            "#,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(scores)
+        const SQL: &str = concat!(
+            "SELECT ",
+            score_columns!(),
+            " FROM repo_security_scores ORDER BY score ASC, critical_count DESC"
+        );
+        sqlx::query_as::<_, RepoSecurityScore>(SQL)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Get aggregate dashboard summary across all repositories.
@@ -2451,19 +2841,78 @@ impl ScanResultService {
             crate::services::open_findings::FindingScope::All,
         )
         .await?;
-        let (repos_with_scanning, total_scans, repos_grade_a, repos_grade_f): (i64, i64, i64, i64) =
-            sqlx::query_as(
-                r#"
-                SELECT
-                    (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true),
-                    (SELECT COUNT(*) FROM scan_results),
-                    (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A'),
-                    (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F')
-                "#,
-            )
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // #4336: the letter tiles count the unfloored letter of repositories
+        // that have one (`rated_grade`; never an F floor), and the status
+        // tiles count by `grade_status`. A row a 1.11 replica wrote has
+        // neither: its status is derived the way `RepoSecurityScore::status`
+        // does (a floored letter or a fail-closed flag reads `incomplete`),
+        // and its letter is the stored one unless it was floored.
+        let (repos_with_scanning, total_scans): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true),
+                (SELECT COUNT(*) FROM scan_results)
+            "#,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        type Row = (
+            String,
+            i32,
+            bool,
+            bool,
+            Option<String>,
+            Option<String>,
+            chrono::DateTime<Utc>,
+            Option<chrono::DateTime<Utc>>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT grade, score, has_failed_scan, has_uncataloged_scan, grade_status, \
+             rated_grade, calculated_at, status_calculated_at FROM repo_security_scores",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let tally = tally_grade_rows(rows.into_iter().map(
+            |(
+                grade,
+                score,
+                has_failed_scan,
+                has_uncataloged_scan,
+                grade_status,
+                rated_grade,
+                calculated_at,
+                status_calculated_at,
+            )| {
+                RepoSecurityScore {
+                    id: Uuid::nil(),
+                    repository_id: Uuid::nil(),
+                    score,
+                    grade,
+                    total_findings: 0,
+                    critical_count: 0,
+                    high_count: 0,
+                    medium_count: 0,
+                    low_count: 0,
+                    acknowledged_count: 0,
+                    last_scan_at: None,
+                    calculated_at,
+                    has_failed_scan,
+                    has_uncataloged_scan,
+                    grade_status,
+                    rated_grade,
+                    artifact_count: None,
+                    scanned_count: None,
+                    cataloged_count: None,
+                    partial_count: None,
+                    failed_count: None,
+                    uncataloged_count: None,
+                    status_calculated_at,
+                }
+            },
+        ));
+        let (repos_grade_a, repos_grade_f) = (tally.grade_a, tally.grade_f);
 
         let mut out = build_dashboard_summary(
             repos_with_scanning,
@@ -2474,7 +2923,13 @@ impl ScanResultService {
             repos_grade_a,
             repos_grade_f,
         );
-        out.policy_violations_blocked = self.count_policy_violations_blocked().await?;
+        let hosted = self.count_hosted_rejected().await?;
+        let proxy = self.count_proxy_blocked().await?;
+        out.policy_violations_blocked = hosted + proxy;
+        out.proxy_blocked = proxy;
+        out.repos_rated = tally.rated;
+        out.repos_incomplete = tally.incomplete;
+        out.repos_unrated = tally.unrated;
         Ok(out)
     }
 
@@ -2496,14 +2951,25 @@ impl ScanResultService {
     /// A verdict older than the scan TTL is not counted: the gate re-scans it
     /// on the next pull rather than trusting it.
     pub async fn count_policy_violations_blocked(&self) -> Result<i64> {
-        let hosted: i64 = sqlx::query_scalar(
+        Ok(self.count_hosted_rejected().await? + self.count_proxy_blocked().await?)
+    }
+
+    /// Hosted artifacts whose quarantine workflow ended `rejected`: the
+    /// hosted half of `policy_violations_blocked` (#4380).
+    async fn count_hosted_rejected(&self) -> Result<i64> {
+        sqlx::query_scalar(
             "SELECT COUNT(*) FROM artifacts \
              WHERE quarantine_status = 'rejected' AND NOT is_deleted",
         )
         .fetch_one(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
 
+    /// The dashboard's `proxy_blocked` (#4777): distinct proxied digests at
+    /// least one repository's proxy scan gate refuses right now, the same
+    /// set the cross-repository blocked listing pages through.
+    pub async fn count_proxy_blocked(&self) -> Result<i64> {
         let rows: Vec<ProxyBlockCandidate> = sqlx::query_as(
             r#"
             SELECT DISTINCT psr.checksum_sha256, r.format::text AS format,
@@ -2537,7 +3003,110 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(hosted + count_blocked_proxy_digests(&rows))
+        Ok(count_blocked_proxy_digests(&rows))
+    }
+
+    /// The CVE ids recorded for each of `digests` (#4777), most severe
+    /// first, at most `per_digest` each: one statement for a whole page.
+    pub async fn proxy_cve_ids(
+        &self,
+        digests: &[String],
+        per_digest: i64,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if digests.is_empty() {
+            return Ok(Default::default());
+        }
+        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+            r#"
+            SELECT checksum_sha256,
+                   (ARRAY_AGG(cve_id ORDER BY
+                        CASE lower(severity)
+                            WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                            WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                        cve_id))[1:$3::int] AS cve_ids
+              FROM (SELECT DISTINCT checksum_sha256, cve_id, severity
+                      FROM proxy_scan_findings
+                     WHERE checksum_sha256 = ANY($1) AND scan_type = $2) f
+             GROUP BY checksum_sha256
+            "#,
+        )
+        .bind(digests)
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(per_digest)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Every proxied path a repository's proxy scan gate currently refuses
+    /// (#4510, #4777), optionally for one repository, ordered by repository
+    /// key then path. Same candidate set and TTL as
+    /// [`Self::count_policy_violations_blocked`], filtered with
+    /// [`proxy_gate_refuses`], so a listed row is one the gate would refuse.
+    pub async fn list_blocked_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let rows: Vec<ProxyBlockedEntry> = sqlx::query_as(
+            r#"
+            SELECT r.id AS repository_id, r.key AS repository_key,
+                   r.format::text AS repository_format,
+                   cached.path, psr.checksum_sha256, psr.max_severity,
+                   psr.findings_count, psr.critical_count, psr.high_count,
+                   psr.medium_count, psr.low_count, psr.scanned_at,
+                   sc.block_on_policy_violation, sc.severity_threshold,
+                   sc.proxy_scan_action
+            FROM scan_configs sc
+            JOIN repositories r ON r.id = sc.repository_id
+            JOIN LATERAL (
+                SELECT pca.path, pca.checksum_sha256 AS digest
+                  FROM proxy_cache_artifacts pca
+                 WHERE pca.repository_id = sc.repository_id
+                   AND pca.checksum_sha256 IS NOT NULL
+                UNION
+                SELECT DISTINCT mbr.manifest_digest,
+                       REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM manifest_blob_refs mbr
+                 WHERE mbr.repository_id = sc.repository_id
+            ) cached ON true
+            JOIN proxy_scan_results psr
+              ON psr.checksum_sha256 = cached.digest
+             AND psr.scan_type = $1
+             AND psr.verdict = 'vulnerable'
+             AND psr.scanned_at > NOW() - make_interval(days => $2)
+            WHERE sc.scan_on_proxy
+              AND r.repo_type IN ('remote', 'virtual')
+              AND ($3::text IS NULL OR r.key = $3)
+            ORDER BY r.key, cached.path
+            LIMIT $4
+            "#,
+        )
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .bind(repository_key)
+        .bind(PROXY_BLOCKED_CANDIDATE_CAP)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if rows.len() as i64 >= PROXY_BLOCKED_CANDIDATE_CAP {
+            tracing::warn!(
+                cap = PROXY_BLOCKED_CANDIDATE_CAP,
+                "blocked proxy listing reached its candidate cap; later repositories are not listed"
+            );
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                proxy_gate_refuses(
+                    &r.repository_format,
+                    r.block_on_policy_violation,
+                    &r.severity_threshold,
+                    &r.proxy_scan_action,
+                    r.max_severity.as_deref(),
+                )
+            })
+            .collect())
     }
 }
 
@@ -2852,14 +3421,14 @@ mod tests {
 
     /// #4582: a blocking verdict counts only where the format's proxy path
     /// runs the gate. The same high verdict under the same policy is counted
-    /// on a conda remote (gated since #4585) and an OCI alias, and not on an
-    /// rpm or generic remote, which store `scan_on_proxy` but serve unscanned.
+    /// on a conda remote (gated since #4585) and an OCI alias, and not on a
+    /// helm or generic remote, which store `scan_on_proxy` but serve unscanned.
     #[test]
     fn test_count_blocked_proxy_digests_skips_ungated_formats_4582() {
         let blocking = |format: &str, digest: &str| {
             format_block_candidate(format, digest, Some("high"), "fail_open", true, "high")
         };
-        assert_eq!(count_blocked_proxy_digests(&[blocking("rpm", "a")]), 0);
+        assert_eq!(count_blocked_proxy_digests(&[blocking("helm", "a")]), 0);
         assert_eq!(count_blocked_proxy_digests(&[blocking("generic", "a")]), 0);
         assert_eq!(
             count_blocked_proxy_digests(&[blocking("no-such-format", "a")]),
@@ -2874,7 +3443,7 @@ mod tests {
         // A digest an ungated repository also caches is still one blocked
         // digest when a gated repository refuses it.
         assert_eq!(
-            count_blocked_proxy_digests(&[blocking("rpm", "a"), blocking("conda", "a")]),
+            count_blocked_proxy_digests(&[blocking("helm", "a"), blocking("conda", "a")]),
             1
         );
     }
@@ -3669,6 +4238,127 @@ mod tests {
     // migrations, so these tests execute there and the new transaction
     // lines (`tx.begin`, `&mut *tx`, `tx.commit`) are exercised.
     // =======================================================================
+
+    #[test]
+    fn legacy_letter_keeps_the_floor_and_rated_letter_never_floors_4336() {
+        assert_eq!(legacy_grade_letter(Grade::B, false, false), 'B');
+        assert_eq!(legacy_grade_letter(Grade::B, true, false), 'F');
+        assert_eq!(legacy_grade_letter(Grade::A, false, true), 'F');
+        assert_eq!(rated_grade_letter(Grade::B, GradeStatus::Rated), Some('B'));
+        assert_eq!(
+            rated_grade_letter(Grade::B, GradeStatus::Incomplete),
+            Some('B')
+        );
+        assert_eq!(rated_grade_letter(Grade::A, GradeStatus::Unrated), None);
+    }
+
+    #[test]
+    fn score_recalc_retries_only_concurrency_conflicts_5006() {
+        let msg = |m: &str| AppError::Database(m.to_string());
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: could not serialize access due to concurrent update"
+        )));
+        assert!(is_score_recalc_conflict(&msg(
+            "error returned from database: deadlock detected"
+        )));
+        assert!(!is_score_recalc_conflict(&msg(
+            "error returned from database: relation \"x\" does not exist"
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::Sqlx(
+            sqlx::Error::RowNotFound
+        )));
+        assert!(!is_score_recalc_conflict(&AppError::NotFound("x".into())));
+        assert_eq!(
+            score_recalc_lock_key(Uuid::nil()),
+            "repo-security-score:00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn assessed_or_found_is_never_unrated_4336() {
+        let failed_only = ScoreCoverage {
+            artifacts: 1,
+            scanned: 1,
+            failed: 1,
+            ..ScoreCoverage::default()
+        };
+        assert_eq!(
+            repository_grade_status(&failed_only, false, false),
+            GradeStatus::Unrated
+        );
+        // One scanner cataloged the artifact, another failed on it.
+        assert_eq!(
+            repository_grade_status(&failed_only, true, false),
+            GradeStatus::Incomplete
+        );
+        // Findings of an earlier completed scan, latest rescan failed.
+        assert_eq!(
+            repository_grade_status(&failed_only, false, true),
+            GradeStatus::Incomplete
+        );
+        let rated = ScoreCoverage {
+            artifacts: 1,
+            scanned: 1,
+            cataloged: 1,
+            ..ScoreCoverage::default()
+        };
+        assert_eq!(
+            repository_grade_status(&rated, true, true),
+            GradeStatus::Rated
+        );
+    }
+
+    #[test]
+    fn dashboard_tally_counts_status_and_shown_letter_4336() {
+        let now = chrono::Utc::now();
+        let row = |grade: &str, score: i32, status: Option<&str>, rated: Option<&str>| {
+            RepoSecurityScore {
+                id: Uuid::nil(),
+                repository_id: Uuid::nil(),
+                score,
+                grade: grade.to_string(),
+                total_findings: 0,
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+                acknowledged_count: 0,
+                last_scan_at: None,
+                calculated_at: now,
+                has_failed_scan: false,
+                has_uncataloged_scan: false,
+                grade_status: status.map(str::to_string),
+                rated_grade: rated.map(str::to_string),
+                artifact_count: None,
+                scanned_count: None,
+                cataloged_count: None,
+                partial_count: None,
+                failed_count: None,
+                uncataloged_count: None,
+                status_calculated_at: status.map(|_| now),
+            }
+        };
+        let t = tally_grade_rows([
+            row("A", 100, Some("rated"), Some("A")),
+            // Floored for 1.11, shown as its real letter A.
+            row("F", 95, Some("incomplete"), Some("A")),
+            // Nothing assessed: neither A nor F.
+            row("A", 100, Some("unrated"), None),
+            row("F", 10, Some("rated"), Some("F")),
+            // Written by 1.11: legacy floor read back as incomplete, letter B.
+            row("F", 80, None, None),
+        ]);
+        assert_eq!(
+            t,
+            GradeTally {
+                grade_a: 2,
+                grade_f: 1,
+                rated: 2,
+                incomplete: 2,
+                unrated: 1,
+            }
+        );
+    }
 
     mod db {
         use super::*;
@@ -4810,6 +5500,549 @@ mod tests {
                 "a repo with no scan rows must stay grade A"
             );
             cleanup_repo(&pool, empty_repo).await;
+        }
+
+        /// Finish `scan_id` as `completed` with `completeness`.
+        async fn complete_as_4336(svc: &ScanResultService, scan_id: Uuid, completeness: &str) {
+            svc.complete_scan(
+                scan_id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("test"),
+                chrono::Utc::now(),
+                completeness,
+                (completeness != "complete").then_some("test reason"),
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan");
+        }
+
+        async fn soft_delete_4336(pool: &PgPool, artifact_id: Uuid) {
+            sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+                .bind(artifact_id)
+                .execute(pool)
+                .await
+                .expect("soft delete");
+        }
+
+        /// #4336: a failed scan or an uncataloged archive makes the repository
+        /// `incomplete` (something assessed) or `unrated` (nothing assessed)
+        /// with coverage counts, and the shown letter is the one over what was
+        /// assessed, never an F floor. The legacy `grade` column keeps the
+        /// floor for 1.11 replicas. Deleting what was not assessed makes the
+        /// repository `rated` with its real letter; no scans is `unrated`.
+        #[tokio::test]
+        async fn grade_status_and_coverage_replace_the_f_floor_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+
+            // A scannable artifact with one medium finding: score 95, A.
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-4336"), "t", "lib")],
+            )
+            .await;
+            // An archive no scanner could catalog.
+            let (archive, _) = insert_test_artifact(&pool, repo_id, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_id, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            let cov = score.coverage().expect("coverage written");
+            assert_eq!(
+                (
+                    cov.artifacts,
+                    cov.scanned,
+                    cov.cataloged,
+                    cov.uncataloged,
+                    cov.failed
+                ),
+                (2, 2, 1, 1, 0),
+                "coverage 1 of 2"
+            );
+            let real = Grade::from_score(score.score).as_char().to_string();
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+            assert_ne!(score.display_grade().as_deref(), Some("F"));
+
+            // A failed scan on a third artifact: still incomplete, counted.
+            let (img, _) = insert_test_artifact(&pool, repo_id, "img").await;
+            let f = svc
+                .create_scan_result(img, repo_id, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.coverage().unwrap().failed, 1);
+            assert_eq!(score.grade, "F", "1.11 replicas still read the floor");
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+
+            // Remove what was not assessed: rated, with the real letter.
+            soft_delete_4336(&pool, archive).await;
+            soft_delete_4336(&pool, img).await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Rated);
+            assert_eq!(
+                score.grade, real,
+                "rated: the legacy letter is the real one"
+            );
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+            let cov = score.coverage().unwrap();
+            assert_eq!((cov.artifacts, cov.scanned, cov.cataloged), (1, 1, 1));
+            assert_eq!(cov.coverage_pct(), Some(100));
+
+            // The same row read back through get_score and the leaderboard.
+            let read = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(read.status(), GradeStatus::Rated);
+            assert_eq!(read.coverage(), Some(cov));
+            assert!(svc
+                .get_all_scores()
+                .await
+                .expect("all")
+                .iter()
+                .any(|r| r.repository_id == repo_id && r.status() == GradeStatus::Rated));
+            cleanup_repo(&pool, repo_id).await;
+
+            // Nothing assessed: no scans at all, and only a failed scan.
+            let empty = insert_test_repo(&pool).await;
+            let score = svc.recalculate_score(empty).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Unrated);
+            assert_eq!(score.display_grade(), None);
+            assert_eq!(score.grade, "A", "the legacy column is unchanged for 1.11");
+            cleanup_repo(&pool, empty).await;
+
+            let only_failed = insert_test_repo(&pool).await;
+            let (a, _) = insert_test_artifact(&pool, only_failed, "a").await;
+            let f = svc
+                .create_scan_result(a, only_failed, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc
+                .recalculate_score(only_failed)
+                .await
+                .expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Unrated);
+            assert_eq!(score.display_grade(), None);
+            assert_eq!(score.coverage().unwrap().failed, 1);
+            cleanup_repo(&pool, only_failed).await;
+        }
+
+        /// Poll until a backend other than `exclude` is waiting on a lock held
+        /// by one of `holders`, and return its pid (#5006).
+        async fn wait_for_blocked_backend_5006(
+            pool: &PgPool,
+            holders: &[i32],
+            exclude: &[i32],
+        ) -> i32 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let pid: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_stat_activity \
+                     WHERE pg_blocking_pids(pid) && $1::int4[] AND NOT (pid = ANY($2::int4[])) \
+                     LIMIT 1",
+                )
+                .bind(holders)
+                .bind(exclude)
+                .fetch_optional(pool)
+                .await
+                .expect("poll pg_stat_activity");
+                if let Some(pid) = pid {
+                    return pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no recalculation blocked behind {holders:?} within 15 s"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// #5006: two scans of one repository complete together, and the
+        /// final score reflects both. The interleaving is the one the DTF
+        /// tier hit: recalculation R1 takes its snapshot before the jar's scan
+        /// has committed and is held at its upsert (a row lock on the score
+        /// row stands in for the slow part of R1); the jar's scan then
+        /// completes and its recalculation R2 starts. Before the fix R1
+        /// committed the stale score and R2 failed with 40001, so the score
+        /// kept counting the jar as unscanned. Now R2 waits for R1 and
+        /// recomputes from a fresh snapshot.
+        #[tokio::test]
+        async fn concurrent_recalculations_keep_every_completed_scan_5006() {
+            let Some(pool) = crate::testing::try_pool_with(8).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+
+            // First scan completion: an archive no scanner could catalog.
+            let (archive, _) = insert_test_artifact(&pool, repo_id, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_id, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            let before = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(before.status(), GradeStatus::Unrated, "jar not scanned yet");
+
+            // Hold the score row so R1 stops at its upsert after its reads.
+            let mut blocker = pool.begin().await.expect("begin blocker");
+            let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *blocker)
+                .await
+                .expect("blocker pid");
+            sqlx::query("SELECT 1 FROM repo_security_scores WHERE repository_id = $1 FOR UPDATE")
+                .bind(repo_id)
+                .execute(&mut *blocker)
+                .await
+                .expect("lock score row");
+
+            let r1 = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            let r1_pid = wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
+
+            // Second scan completion: the jar, cataloged with one finding.
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-5006"), "t", "lib")],
+            )
+            .await;
+            let r2 = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[blocker_pid, r1_pid], &[r1_pid]).await;
+
+            blocker.commit().await.expect("release score row");
+            let r1 = r1.await.expect("join r1");
+            let r2 = r2.await.expect("join r2");
+
+            let score = svc.get_score(repo_id).await.expect("get").expect("row");
+            let cov = score.coverage().expect("coverage written");
+            assert_eq!(
+                (
+                    cov.artifacts,
+                    cov.scanned,
+                    cov.cataloged,
+                    cov.uncataloged,
+                    cov.failed
+                ),
+                (2, 2, 1, 1, 0),
+                "the stored coverage must count the jar's completed scan"
+            );
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.medium_count, 1, "the jar's finding is counted");
+            let real = Grade::from_score(score.score).as_char().to_string();
+            assert_eq!(score.display_grade().as_deref(), Some(real.as_str()));
+            assert!(r1.is_ok(), "first recalculation failed: {:?}", r1.err());
+            assert!(r2.is_ok(), "second recalculation failed: {:?}", r2.err());
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #5006: a recalculation whose upsert loses to a concurrent write of
+        /// the score row (40001 under REPEATABLE READ) is retried with a fresh
+        /// snapshot instead of returning the error.
+        #[tokio::test]
+        async fn recalculation_retries_a_serialization_failure_5006() {
+            let Some(pool) = crate::testing::try_pool_with(6).await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            svc.recalculate_score(repo_id).await.expect("recalculate");
+
+            // A concurrent writer updates the score row and holds it.
+            let mut writer = pool.begin().await.expect("begin writer");
+            let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *writer)
+                .await
+                .expect("writer pid");
+            sqlx::query("UPDATE repo_security_scores SET score = 0 WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&mut *writer)
+                .await
+                .expect("update score row");
+
+            seed_scan_4338(
+                &svc,
+                jar,
+                repo_id,
+                "grype",
+                &[(Severity::Medium, Some("CVE-2026-50061"), "t", "lib")],
+            )
+            .await;
+            let recalc = tokio::spawn({
+                let svc = ScanResultService::new(pool.clone());
+                async move { svc.recalculate_score(repo_id).await }
+            });
+            wait_for_blocked_backend_5006(&pool, &[writer_pid], &[]).await;
+            writer.commit().await.expect("commit writer");
+
+            let score = recalc
+                .await
+                .expect("join")
+                .expect("the serialization failure is retried");
+            assert_eq!(score.medium_count, 1);
+            assert_eq!(score.status(), GradeStatus::Rated);
+            let stored = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(stored.score, score.score, "the retried score is stored");
+            assert_ne!(stored.score, 0);
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4336: `incomplete` and `unrated` never hide a finding. A critical
+        /// finding next to an uncataloged archive, a critical finding on an
+        /// artifact another scanner failed on, and a critical finding whose
+        /// rescan failed all show `incomplete` with the finding's letter.
+        #[tokio::test]
+        async fn a_vulnerable_artifact_is_never_hidden_by_the_status_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let (_, want) = compute_security_score(1, 0, 0, 0);
+            let want = want.as_char().to_string();
+            let critical = [(Severity::Critical, Some("CVE-2026-43361"), "t", "lib")];
+
+            // One critical finding and one archive no scanner could catalog.
+            let repo_a = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_a, "jar").await;
+            seed_scan_4338(&svc, jar, repo_a, "grype", &critical).await;
+            let (archive, _) = insert_test_artifact(&pool, repo_a, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_a, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+            let score = svc.recalculate_score(repo_a).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.critical_count, 1);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_a).await;
+
+            // One artifact: grype found the critical, another scanner failed.
+            let repo_b = insert_test_repo(&pool).await;
+            let (img, _) = insert_test_artifact(&pool, repo_b, "img").await;
+            seed_scan_4338(&svc, img, repo_b, "grype", &critical).await;
+            let f = svc
+                .create_scan_result(img, repo_b, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_b).await.expect("recalculate");
+            assert_eq!(score.critical_count, 1);
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_b).await;
+
+            // One artifact: grype found the critical, the grype rescan failed.
+            let repo_c = insert_test_repo(&pool).await;
+            let (lib, _) = insert_test_artifact(&pool, repo_c, "lib").await;
+            seed_scan_4338(&svc, lib, repo_c, "grype", &critical).await;
+            let f = svc
+                .create_scan_result(lib, repo_c, "grype")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_c).await.expect("recalculate");
+            assert_eq!(
+                score.critical_count, 1,
+                "the earlier completed scan still counts"
+            );
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+            assert_eq!(score.display_grade().as_deref(), Some(want.as_str()));
+            cleanup_repo(&pool, repo_c).await;
+        }
+
+        /// #4336: for every repository that is `rated`, the letter shown is
+        /// exactly the one the pre-#4336 code computed (the legacy `grade`,
+        /// which carried no floor for these), over a fixture set of severity
+        /// mixes covering every letter boundary.
+        #[tokio::test]
+        async fn rated_letters_match_the_pre_4336_grade_over_a_fixture_set() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            // (critical, high, medium, low)
+            let fixtures: &[(usize, usize, usize, usize)] = &[
+                (0, 0, 0, 0),
+                (0, 0, 0, 1),
+                (0, 1, 0, 0),
+                (0, 1, 0, 1),
+                (1, 0, 0, 0),
+                (0, 0, 2, 3),
+                (0, 2, 1, 0),
+                (1, 2, 5, 10),
+                (2, 0, 0, 0),
+                (0, 0, 10, 0),
+                (0, 0, 0, 50),
+                (5, 0, 0, 0),
+                (3, 4, 2, 1),
+                // Letter boundaries the mixes above do not hit: 74 (C top),
+                // 49 (D top), 25 (D bottom), 24 (F top), 91 (A).
+                (1, 0, 0, 1),
+                (2, 0, 0, 1),
+                (3, 0, 0, 0),
+                (3, 0, 0, 1),
+                (0, 0, 3, 0),
+            ];
+            for (i, &(c, h, m, l)) in fixtures.iter().enumerate() {
+                let repo_id = insert_test_repo(&pool).await;
+                let (aid, _) = insert_test_artifact(&pool, repo_id, &format!("fx{i}")).await;
+                let mut findings: Vec<(Severity, Option<&str>, &str, &str)> = Vec::new();
+                let cves: Vec<String> = (0..c + h + m + l)
+                    .map(|n| format!("CVE-2026-{i:02}{n:03}"))
+                    .collect();
+                let mut n = 0;
+                for (sev, count) in [
+                    (Severity::Critical, c),
+                    (Severity::High, h),
+                    (Severity::Medium, m),
+                    (Severity::Low, l),
+                ] {
+                    for _ in 0..count {
+                        findings.push((sev, Some(cves[n].as_str()), "t", "lib"));
+                        n += 1;
+                    }
+                }
+                seed_scan_4338(&svc, aid, repo_id, "grype", &findings).await;
+                let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+                let (want_score, want_grade) =
+                    compute_security_score(c as i32, h as i32, m as i32, l as i32);
+                assert_eq!(score.score, want_score, "fixture {i}");
+                assert_eq!(score.status(), GradeStatus::Rated, "fixture {i}");
+                assert_eq!(score.grade, want_grade.as_char().to_string(), "fixture {i}");
+                assert_eq!(
+                    score.display_grade(),
+                    Some(want_grade.as_char().to_string()),
+                    "fixture {i}: the shown letter must equal the pre-#4336 letter"
+                );
+                cleanup_repo(&pool, repo_id).await;
+            }
+        }
+
+        /// #4336: a row a 1.11 replica recalculated after 1.12 wrote its
+        /// status (it moves `calculated_at` and floors `grade`, leaving the
+        /// new columns stale) is read from the legacy flags, not the stale
+        /// status.
+        #[tokio::test]
+        async fn a_score_a_1_11_replica_rewrote_is_not_read_as_stale_status_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "a").await;
+            seed_scan_4338(&svc, aid, repo_id, "grype", &[]).await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Rated);
+
+            // What 1.11's upsert writes after a failed rescan.
+            sqlx::query(
+                "UPDATE repo_security_scores SET grade = 'F', has_failed_scan = true, \
+                 calculated_at = NOW() + INTERVAL '1 second' WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("legacy rewrite");
+            let read = svc.get_score(repo_id).await.expect("get").expect("row");
+            assert_eq!(read.status(), GradeStatus::Incomplete);
+            assert!(read.coverage().is_none());
+            assert_eq!(read.display_grade().as_deref(), Some("A"));
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4336: deleting an artifact recalculates its repository's score
+        /// (the refresher listens for `artifact.deleted`), so removing the
+        /// one uncataloged archive makes the repository `rated` without
+        /// waiting for the next scan. A repository with no score row gets
+        /// none from a delete.
+        #[tokio::test]
+        async fn deleting_an_artifact_refreshes_the_score_4336() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (jar, _) = insert_test_artifact(&pool, repo_id, "jar").await;
+            seed_scan_4338(&svc, jar, repo_id, "grype", &[]).await;
+            let (archive, _) = insert_test_artifact(&pool, repo_id, "archive").await;
+            let s = svc
+                .create_scan_result(archive, repo_id, "grype")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "not_cataloged").await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+
+            let unscored = insert_test_repo(&pool).await;
+
+            let bus = std::sync::Arc::new(crate::services::event_bus::EventBus::new(16));
+            let token = tokio_util::sync::CancellationToken::new();
+            spawn_score_refresher(bus.clone(), pool.clone(), token.clone());
+            soft_delete_4336(&pool, archive).await;
+            bus.emit_for_repo("artifact.deleted", archive, repo_id, None);
+            bus.emit_for_repo("artifact.deleted", Uuid::new_v4(), unscored, None);
+
+            let mut status = GradeStatus::Incomplete;
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                status = svc
+                    .get_score(repo_id)
+                    .await
+                    .expect("get")
+                    .expect("row")
+                    .status();
+                if status == GradeStatus::Rated {
+                    break;
+                }
+            }
+            token.cancel();
+            assert_eq!(
+                status,
+                GradeStatus::Rated,
+                "the delete must refresh the score"
+            );
+            assert!(
+                svc.get_score(unscored).await.expect("get").is_none(),
+                "a delete must not create a score row"
+            );
+            cleanup_repo(&pool, repo_id).await;
+            cleanup_repo(&pool, unscored).await;
         }
 
         /// #4036 fail-closed: a repo whose LATEST completed scan is

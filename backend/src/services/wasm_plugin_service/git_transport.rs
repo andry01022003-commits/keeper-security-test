@@ -240,7 +240,8 @@ impl Write for GuardedHttpStream {
 }
 
 /// The error and its causes, without the URL (it may carry credentials).
-/// A connect-time SSRF refusal reads "... blocked by SSRF policy".
+/// A connect-time SSRF refusal reads "... blocked by SSRF policy"; a
+/// redirect refusal reads "... rejected by SSRF policy".
 fn describe(err: &reqwest::Error) -> String {
     let mut msg = String::from(if err.is_timeout() {
         "git HTTP request timeout"

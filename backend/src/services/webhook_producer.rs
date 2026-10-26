@@ -583,6 +583,12 @@ mod tests {
             "test_db_helpers.rs",
             "test-only fixtures that seed rows; not a publish path",
         ),
+        (
+            "repodata_render_tests.rs",
+            "test-only module (handlers/conda): seeds catalog rows of shapes the \
+             upload route cannot produce, to pin the conda cursor render; not a \
+             publish path",
+        ),
     ];
 
     /// What counts as an `artifact.uploaded` producer reference in a handler:

@@ -190,6 +190,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         "Starting Artifact Keeper"
     );
 
+    // Install the Prometheus recorder before anything records a metric.
+    // `db::create_pool` counts failed initial connect attempts in
+    // `ak_db_pool_connection_failures_total{stage="startup"}`; with the
+    // recorder installed later those increments went to the `metrics`
+    // crate's no-op default and were never exported (#4828). The recorder
+    // needs nothing from the database or the rest of startup.
+    let metrics_handle = metrics_service::init_metrics();
+    tracing::info!("Prometheus metrics recorder initialized");
+
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
@@ -400,10 +409,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     };
 
-    // Initialize Prometheus metrics recorder
-    let metrics_handle = metrics_service::init_metrics();
-    tracing::info!("Prometheus metrics recorder initialized");
-
     // Issues #976, #1224: surface the upstream private-IP allowlist at
     // boot so the posture is obvious in startup logs. Metadata IPs
     // remain blocked unconditionally; the validator handles that. The
@@ -503,6 +508,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             String,
             Arc<dyn artifact_keeper_backend::storage::StorageBackend>,
         > = HashMap::new();
+        // A backend that was configured but could not be initialized is
+        // recorded here as well as logged, so a repository on it answers a
+        // 503 naming the backend instead of a bare 500 STORAGE_ERROR (#4530).
+        let mut skipped_backends: HashMap<String, String> = HashMap::new();
 
         // Register the primary backend under its type name if it is not filesystem
         if config.storage_backend != "filesystem" {
@@ -521,7 +530,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 // case and stays silent; a malformed public endpoint is an
                 // operator mistake worth surfacing (#4417).
                 Err(e) if e.to_string().contains("S3_PUBLIC_ENDPOINT") => {
-                    tracing::warn!(error = %e, "Additional S3 storage backend skipped");
+                    // ERROR rather than WARN: the backend is dead until the
+                    // operator fixes its configuration, so it must be
+                    // distinguishable from a cosmetic warning (#4530).
+                    tracing::error!(error = %e, "Additional S3 storage backend skipped");
+                    skipped_backends.insert("s3".to_string(), e.to_string());
                 }
                 Err(_) => {}
             }
@@ -529,27 +542,51 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         if config.storage_backend != "azure" {
             match artifact_keeper_backend::storage::azure::AzureConfig::from_env() {
                 Ok(azure_cfg) => {
-                    if let Ok(azure) =
-                        artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg).await
+                    match artifact_keeper_backend::storage::azure::AzureBackend::new(azure_cfg)
+                        .await
                     {
-                        tracing::info!("Additional Azure storage backend registered");
-                        backends.insert("azure".to_string(), Arc::new(azure));
+                        Ok(azure) => {
+                            tracing::info!("Additional Azure storage backend registered");
+                            backends.insert("azure".to_string(), Arc::new(azure));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Additional Azure storage backend skipped"
+                            );
+                            skipped_backends.insert("azure".to_string(), e.to_string());
+                        }
                     }
                 }
                 Err(e) if e.to_string().contains("AZURE_STORAGE_PUBLIC_ENDPOINT") => {
-                    tracing::warn!(error = %e, "Additional Azure storage backend skipped");
+                    tracing::error!(error = %e, "Additional Azure storage backend skipped");
+                    skipped_backends.insert("azure".to_string(), e.to_string());
                 }
                 Err(_) => {}
             }
         }
         if config.storage_backend != "gcs" {
-            if let Ok(gcs_cfg) = artifact_keeper_backend::storage::gcs::GcsConfig::from_env() {
-                if let Ok(gcs) =
-                    artifact_keeper_backend::storage::gcs::GcsBackend::new(gcs_cfg).await
-                {
-                    tracing::info!("Additional GCS storage backend registered");
-                    backends.insert("gcs".to_string(), Arc::new(gcs));
+            match artifact_keeper_backend::storage::gcs::GcsConfig::from_env() {
+                Ok(gcs_cfg) => {
+                    match artifact_keeper_backend::storage::gcs::GcsBackend::new(gcs_cfg).await {
+                        Ok(gcs) => {
+                            tracing::info!("Additional GCS storage backend registered");
+                            backends.insert("gcs".to_string(), Arc::new(gcs));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Additional GCS storage backend skipped");
+                            skipped_backends.insert("gcs".to_string(), e.to_string());
+                        }
+                    }
                 }
+                // `GCS_BUCKET not set` is the ordinary "not configured" case
+                // and stays silent; any other configuration error means the
+                // operator asked for GCS and its configuration is broken.
+                Err(e) if !e.to_string().contains("GCS_BUCKET not set") => {
+                    tracing::error!(error = %e, "Additional GCS storage backend skipped");
+                    skipped_backends.insert("gcs".to_string(), e.to_string());
+                }
+                Err(_) => {}
             }
         }
 
@@ -559,19 +596,35 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             names
         };
         tracing::info!("Storage backends available: {:?}", available);
+        // The metric is a gauge because the set is fixed for the process
+        // lifetime: a scrape either sees 0 (everything configured works) or
+        // the number of dead backends to alert on (#4530). Set on every start
+        // so 0 is an observed value, not an absent series.
+        metrics::gauge!("ak_storage_backends_skipped").set(skipped_backends.len() as f64);
+        if !skipped_backends.is_empty() {
+            let mut skipped: Vec<String> = skipped_backends.keys().cloned().collect();
+            skipped.sort();
+            tracing::error!(
+                skipped = ?skipped,
+                "Storage backends configured but skipped at startup; repositories on them will \
+                 answer 503 until the configuration is fixed (#4530)"
+            );
+        }
 
-        Arc::new(
-            artifact_keeper_backend::storage::StorageRegistry::new(
-                backends,
-                config.storage_backend.clone(),
-            )
-            // #3368: filesystem locations are rooted at the repository's own
-            // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
-            // writes through a handle rooted at `STORAGE_PATH`. Hand the
-            // registry the global root so reserved bucket-root namespaces
-            // resolve to the same file through either handle.
-            .with_filesystem_bucket_root(&config.storage_path),
+        let mut registry = artifact_keeper_backend::storage::StorageRegistry::new(
+            backends,
+            config.storage_backend.clone(),
         )
+        // #3368: filesystem locations are rooted at the repository's own
+        // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
+        // writes through a handle rooted at `STORAGE_PATH`. Hand the
+        // registry the global root so reserved bucket-root namespaces
+        // resolve to the same file through either handle.
+        .with_filesystem_bucket_root(&config.storage_path);
+        for (name, error) in skipped_backends {
+            registry.record_skipped_backend(name, error);
+        }
+        Arc::new(registry)
     };
 
     // One-shot backfill of oci_manifest_refs for index manifests that
@@ -639,19 +692,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
-    // One-shot backfill of the first-class `oci_manifests` existence table
-    // (#1683 / #4433) for manifests committed before migration 268. Every
-    // push/cache since then records its row inline. Backgrounded: nothing
-    // reads the table yet, the pass is additive and idempotent (no-op once
-    // every manifest has a row), and it reads each body from storage, so it
-    // must not delay the HTTP listener bind. Failures are logged inside and
-    // retried on the next start.
+    // Maintenance of the first-class `oci_manifests` existence table (#1683 /
+    // #4433): at startup the backfill of manifests committed before migration
+    // 268 plus the reconcile that removes rows for manifests no longer
+    // addressable, then the reconcile again every
+    // `OCI_MANIFESTS_RECONCILE_INTERVAL_SECS`. Every push/cache records its
+    // row inline. Backgrounded: nothing reads the table yet, the pass is
+    // idempotent, and it reads bodies from storage, so it must not delay the
+    // HTTP listener bind. Failures are logged inside and retried next pass.
     {
         let db_pool = db_pool.clone();
         let storage_registry = storage_registry.clone();
         tokio::spawn(async move {
-            artifact_keeper_backend::services::oci_manifests::run_backfill(
-                &db_pool,
+            artifact_keeper_backend::services::oci_manifests::run_maintenance(
+                db_pool,
                 storage_registry,
             )
             .await;
@@ -1041,6 +1095,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
     tracing::info!("Email dispatcher started");
 
+    // #4336: recalculate a repository's grade status and coverage when an
+    // artifact is deleted from it, not only after the next scan.
+    artifact_keeper_backend::services::scan_result_service::spawn_score_refresher(
+        app_state.event_bus.clone(),
+        app_state.db.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
     // into webhook_deliveries. The retry scheduler (every 30s) drives
     // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
@@ -1140,6 +1202,22 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             runtime_shutdown_token.clone(),
             state.upstream_feed_status.clone(),
         );
+
+    // #4173: fill the stored CEP-16 shards of conda channels that held
+    // packages before the shard tables existed, in bounded, resumable
+    // batches. Exits once every repository is done. Detached deliberately:
+    // lifecycle is governed by the shutdown token.
+    artifact_keeper_backend::api::handlers::conda::spawn_conda_shard_backfill(
+        db_pool.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #4311: resume repository delete jobs that are pending or whose replica
+    // died mid-delete (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_repository_delete_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
@@ -1986,13 +2064,30 @@ fn build_oidc_bootstrap_request(
 /// admin-API-set values for the rest (#3904); the rule lives in
 /// `services::ldap_env_bootstrap`.
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
+    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
     use artifact_keeper_backend::services::ldap_env_bootstrap::{
         reconcile_ldap_from_env, warn_discarded_fields, LdapEnvOutcome,
     };
 
     let req = match build_ldap_bootstrap_request() {
         Some(r) => r,
-        None => return Ok(()),
+        None => {
+            // LDAP_* is not set: disable any provider the env bootstrap still
+            // manages (#4857, the #2819 OIDC pattern), so the login page
+            // stops offering only an LDAP form for a directory the operator
+            // removed and local login recovers once no enabled provider
+            // remains. Admin-created providers, and env-seeded ones an
+            // administrator re-enabled, are untouched.
+            for name in AuthConfigService::disable_env_managed_ldap(db).await? {
+                tracing::warn!(
+                    "Disabled LDAP provider '{}': it was seeded from LDAP_* environment \
+                     variables that are no longer set. Re-enable it via the admin API to keep \
+                     using it (that also takes manual ownership of it).",
+                    name
+                );
+            }
+            return Ok(());
+        }
     };
     let wanted = req.name.clone();
 

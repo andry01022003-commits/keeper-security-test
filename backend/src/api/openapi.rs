@@ -178,6 +178,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "artifact_presence",
             handlers::artifact_presence::ArtifactPresenceApiDoc::openapi(),
         ),
+        (
+            "proxy_cache_cap",
+            handlers::proxy_cache_cap::ProxyCacheCapApiDoc::openapi(),
+        ),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
         ("banners", handlers::banners::BannersApiDoc::openapi()),
         (
@@ -723,6 +727,27 @@ mod tests {
         assert!(description.contains("response body"), "{description}");
     }
 
+    /// #4832: the direct PUT answers 409 for an occupied immutable path, and
+    /// is the single winner's 201 under concurrent PUTs to one path. The spec
+    /// must document the 409 and its body.
+    #[test]
+    fn test_openapi_artifact_put_documents_409() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+        let (_, item) = paths
+            .iter()
+            .find(|(p, _)| p.ends_with("/repositories/{key}/artifacts/{path}"))
+            .expect("artifact PUT path missing from OpenAPI spec");
+        let description = item["put"]["responses"]["409"]["description"]
+            .as_str()
+            .expect("artifact PUT must document a 409 response");
+        assert!(
+            description.contains("Artifact version already exists and is immutable"),
+            "{description}"
+        );
+        assert!(description.contains("concurrent"), "{description}");
+    }
+
     /// Verify every path documented in the OpenAPI spec has a corresponding
     /// route registered in the handler routers. This catches the class of bug
     /// where a handler is annotated with `#[utoipa::path(...)]` and listed in
@@ -820,6 +845,7 @@ mod tests {
                     include_str!("handlers/repo_tokens.rs"),
                     include_str!("handlers/environments.rs"),
                     include_str!("handlers/artifact_presence.rs"),
+                    include_str!("handlers/proxy_cache_cap.rs"),
                 ],
             ),
             (

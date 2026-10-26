@@ -868,6 +868,12 @@ impl crate::storage::StorageBackend for MemStorage {
         crate::storage::buffered_put_stream_fallback(self, key, stream).await
     }
 
+    /// Stands in for an S3/GCS/Azure backend, whose uploads stage on the
+    /// backend instead of local scratch (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
+    }
+
     fn supports_redirect(&self) -> bool {
         self.presign
     }
@@ -2157,6 +2163,30 @@ pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> V
     .fetch_all(pool)
     .await
     .expect("list queued push sync tasks")
+}
+
+/// [`queued_push_paths`] for an upload that went through
+/// `ArtifactService::finalize_upload`, which queues push sync tasks from a
+/// spawned task, so the row can land after the HTTP response returns.
+/// Polls (up to 5s) until `expected` is queued, then waits a short grace
+/// period and reads again, so a task wrongly queued by a later upload in the
+/// same test still shows up in the result.
+pub async fn queued_push_paths_settled(
+    pool: &PgPool,
+    peer_id: Uuid,
+    repo_id: Uuid,
+    expected: &str,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let queued = queued_push_paths(pool, peer_id, repo_id).await;
+        if queued.iter().any(|p| p == expected) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    queued_push_paths(pool, peer_id, repo_id).await
 }
 
 /// #4725: delete the peer registered by [`subscribe_push_peer`] (and with it

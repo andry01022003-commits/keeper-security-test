@@ -61,6 +61,59 @@ const REARM_SUPERSEDED_PUSH_SQL: &str = r#"
                     OR (d.status <> 'cancelled' AND d.completed_at > st.completed_at)
                 )
           )
+          -- #4792/#4889: format metadata may be attached after the upload is
+          -- already queued (a pacman signature or conda attestation, or the
+          -- NuGet/PyPI/Debian/RPM documents written after finalize). Re-deliver
+          -- whenever a finished push carried a different document, not just
+          -- for the two formats that first exposed the race. `$3` is what the
+          -- push carried (JSON `null` for none); SQL NULL means the caller
+          -- cannot say, and is left to the checks above so a plain re-queue
+          -- does not fan out unchanged metadata.
+          OR EXISTS (
+              SELECT 1
+              FROM artifact_metadata am
+              WHERE am.artifact_id = a.id
+                AND (
+                    -- Pacman's file list is compared on neither side: the
+                    -- claim merges `pacman_file_lists` into what it sends, and
+                    -- a row written by a pre-#4424 replica during a rolling
+                    -- upgrade can still hold `files` in the document itself.
+                    -- Comparing one stripped side with one unstripped side
+                    -- would re-arm that package after every push, forever.
+                    (
+                        $3::jsonb IS NOT NULL
+                        AND (
+                            CASE WHEN r.format::text = 'pacman' AND jsonb_typeof(am.metadata) = 'object'
+                                 THEN am.metadata - 'files'
+                                 ELSE am.metadata
+                            END
+                        ) IS DISTINCT FROM (
+                            CASE WHEN r.format::text = 'pacman' AND jsonb_typeof($3::jsonb) = 'object'
+                                 THEN $3::jsonb - 'files'
+                                 ELSE $3::jsonb
+                            END
+                        )
+                    )
+                    -- A re-queue with an unknown payload keeps the narrower
+                    -- #4792 rule: only the late pacman/conda fields justify a
+                    -- second delivery.
+                    OR (
+                        $3::jsonb IS NULL
+                        AND (
+                            (r.format::text = 'pacman' AND am.metadata ? 'pgpsig')
+                            OR (r.format::text = 'conda' AND am.metadata ? 'attestation')
+                        )
+                    )
+                )
+          )
+          -- #4889: protobuf rewrites its `_labels` index in place. The path is
+          -- a mutable pointer, so a label move after a finished push has to be
+          -- re-delivered even though the repository is not versioned.
+          OR (
+              r.format::text = 'protobuf'
+              AND a.path ~ '/_labels$'
+              AND a.updated_at > COALESCE(st.completed_at, st.created_at)
+          )
       )
 "#;
 
@@ -739,7 +792,7 @@ impl PeerInstanceService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        self.rearm_superseded_push(id, None).await?;
+        self.rearm_superseded_push(id, None, None).await?;
 
         Ok(id)
     }
@@ -808,14 +861,21 @@ impl PeerInstanceService {
         queued
     }
 
+    /// Put a finished push task back to `pending` when the artifact it
+    /// delivered has since changed. `sent_checksum` and `sent_metadata`
+    /// describe what the finished push carried (its content checksum and
+    /// metadata document, JSON `null` for none); `None` means unknown, as for
+    /// a re-queue, which then re-arms whenever the artifact could differ.
     pub async fn rearm_superseded_push(
         &self,
         task_id: Uuid,
         sent_checksum: Option<&str>,
+        sent_metadata: Option<&serde_json::Value>,
     ) -> Result<bool> {
         let result = sqlx::query(REARM_SUPERSEDED_PUSH_SQL)
             .bind(task_id)
             .bind(sent_checksum)
+            .bind(sent_metadata)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2271,9 +2331,233 @@ mod tests {
         .await
         .unwrap();
         assert!(!svc
-            .rearm_superseded_push(task_id, Some(&format!("{:064x}", 1)))
+            .rearm_superseded_push(task_id, Some(&format!("{:064x}", 1)), None)
             .await
             .unwrap());
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
+    /// #4792: a pacman signature lives in the package's metadata. A push that
+    /// finished without it is re-armed once the package is signed; a push that
+    /// carried it (with or without the merged file list), or an unsigned
+    /// package, is left alone.
+    #[tokio::test]
+    async fn rearm_redelivers_pacman_package_signed_after_its_push_4792() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let (repo_id, peer_id, artifact_id, task_id) =
+            completed_push_fixture(&pool, &svc, false).await;
+        sqlx::query("UPDATE repositories SET format = 'pacman' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'pacman', '{\"filename\": \"x\"}')",
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let checksum = format!("{:064x}", 1);
+
+        let unsigned = serde_json::json!({ "filename": "x" });
+        let signed = serde_json::json!({ "filename": "x", "pgpsig": "AAE=" });
+        // As the claim sends it: the file list merged into the document.
+        let signed_with_files =
+            serde_json::json!({ "filename": "x", "pgpsig": "AAE=", "files": ["usr/"] });
+
+        // Unsigned: nothing to re-deliver.
+        assert!(!svc
+            .rearm_superseded_push(task_id, Some(&checksum), Some(&unsigned))
+            .await
+            .unwrap());
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        assert_eq!(push_task_state(&pool, task_id).await.0, "completed");
+
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata || '{\"pgpsig\": \"AAE=\"}' \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The delivered copy already carried the signature.
+        for sent in [&signed, &signed_with_files] {
+            assert!(!svc
+                .rearm_superseded_push(task_id, Some(&checksum), Some(sent))
+                .await
+                .unwrap());
+        }
+        // It went out unsigned (signature attached while in flight).
+        assert!(svc
+            .rearm_superseded_push(task_id, Some(&checksum), Some(&unsigned))
+            .await
+            .unwrap());
+        assert_eq!(
+            push_task_state(&pool, task_id).await,
+            ("pending".to_string(), 0, None)
+        );
+
+        // A re-queue after the signature is attached re-arms a finished push.
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        assert_eq!(push_task_state(&pool, task_id).await.0, "pending");
+
+        // #4889: a document that still holds its file list (written by a
+        // pre-#4424 replica during a rolling upgrade) is sent as stored. With
+        // the re-arm now applying to every pacman push, comparing it against
+        // a stripped copy would re-queue the package after every delivery.
+        let legacy = serde_json::json!({ "filename": "x", "pgpsig": "AAE=", "files": ["usr/"] });
+        sqlx::query("UPDATE artifact_metadata SET metadata = $2 WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .bind(&legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !svc.rearm_superseded_push(task_id, Some(&checksum), Some(&legacy))
+                .await
+                .unwrap(),
+            "an unchanged pacman document with an inline file list must not loop"
+        );
+
+        sqlx::query("DELETE FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
+    /// #4889: NuGet, PyPI, Debian and nested-layout RPM used to write their
+    /// `artifact_metadata` after the push was queued. A worker that finished
+    /// the transfer in that window must be re-armed once the document lands,
+    /// not only for pacman/conda. Fails on `main` for all four formats.
+    #[tokio::test]
+    async fn rearm_redelivers_format_metadata_written_after_push_4889() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let checksum = format!("{:064x}", 1);
+
+        for format in ["nuget", "pypi", "debian", "rpm"] {
+            let (repo_id, peer_id, artifact_id, task_id) =
+                completed_push_fixture(&pool, &svc, false).await;
+            sqlx::query("UPDATE repositories SET format = $2::repository_format WHERE id = $1")
+                .bind(repo_id)
+                .bind(format)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            // Nothing was attached when the push finished.
+            let no_metadata = serde_json::Value::Null;
+            assert!(!svc
+                .rearm_superseded_push(task_id, Some(&checksum), Some(&no_metadata))
+                .await
+                .unwrap());
+
+            // The handler writes metadata immediately after queueing.
+            let metadata = serde_json::json!({ "format": format, "late": true });
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(artifact_id)
+            .bind(format)
+            .bind(&metadata)
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(
+                svc.rearm_superseded_push(task_id, Some(&checksum), Some(&no_metadata))
+                    .await
+                    .unwrap(),
+                "{format} metadata written after the push must trigger a redelivery"
+            );
+            assert_eq!(push_task_state(&pool, task_id).await.0, "pending");
+
+            // The redelivery carries the document; it must not loop forever.
+            sqlx::query(
+                "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+            )
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(!svc
+                .rearm_superseded_push(task_id, Some(&checksum), Some(&metadata))
+                .await
+                .unwrap());
+
+            cleanup_assign(&pool, peer_id, repo_id).await;
+        }
+    }
+
+    /// #4889: a completed push of the protobuf `_labels` index must be
+    /// redelivered when a later label move rewrites the row in place. The
+    /// format is not versioned, so the checksum rule above cannot see it; the
+    /// path-specific `updated_at` check does. Fails on `main`.
+    #[tokio::test]
+    async fn queue_sync_task_rearms_completed_protobuf_labels_push_4889() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let (repo_id, peer_id, artifact_id, task_id) =
+            completed_push_fixture(&pool, &svc, false).await;
+        sqlx::query("UPDATE repositories SET format = 'protobuf' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET path = 'modules/acme/widgets/_labels', \
+             updated_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The index has not moved since the finished push.
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        assert_eq!(push_task_state(&pool, task_id).await.0, "completed");
+
+        // A label move rewrites the row (and its checksum) in place.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $2, updated_at = NOW() WHERE id = $1")
+            .bind(artifact_id)
+            .bind(format!("{:064x}", 2))
+            .execute(&pool)
+            .await
+            .unwrap();
+        svc.queue_sync_task(peer_id, artifact_id, 0).await.unwrap();
+        assert_eq!(
+            push_task_state(&pool, task_id).await,
+            ("pending".to_string(), 0, None),
+            "the moved label index must be sent again"
+        );
+
         cleanup_assign(&pool, peer_id, repo_id).await;
     }
 

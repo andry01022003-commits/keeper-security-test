@@ -287,6 +287,7 @@ impl StorageScrubService {
 
     async fn run_locked(&self, opts: &ScrubOptions) -> Result<ScrubResult> {
         let mut result = ScrubResult::default();
+        self.prune_bookkeeping().await?;
         let scoped = opts.repository_id.is_some();
         let scope = opts
             .repository_id
@@ -352,6 +353,34 @@ impl StorageScrubService {
         self.save_cursors(&scope, art_cursor, blob_cursor, result.cycle_completed)
             .await?;
         Ok(result)
+    }
+
+    /// Drop bookkeeping whose subject no longer exists (#4323): findings for
+    /// an artifact or OCI blob row that was hard-deleted (the findings table
+    /// has no foreign key, so nothing else removes them and they would be
+    /// listed forever), and the resumable cursor of a deleted repository's
+    /// scoped runs. Runs under the scrub lock, once per run; both tables are
+    /// small and the probes are primary-key lookups.
+    async fn prune_bookkeeping(&self) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM storage_scrub_findings f WHERE \
+               (f.object_kind = 'artifact' \
+                 AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.id = f.object_id)) \
+            OR (f.object_kind = 'oci_blob' \
+                 AND NOT EXISTS (SELECT 1 FROM oci_blobs b WHERE b.id = f.object_id))",
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query(
+            "DELETE FROM storage_scrub_state s WHERE s.scope <> $1 \
+             AND NOT EXISTS (SELECT 1 FROM repositories r WHERE r.id::text = s.scope)",
+        )
+        .bind(INSTANCE_SCOPE)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
     }
 
     fn within_budget(&self, result: &ScrubResult, opts: &ScrubOptions) -> bool {
@@ -461,8 +490,11 @@ impl StorageScrubService {
         repair: bool,
         result: &mut ScrubResult,
     ) {
+        // Counted here, once per object, whether or not the check got far
+        // enough to read it: counting inside `scrub_one_inner` as well
+        // double-counted every object whose finding failed to record (#4323).
+        result.objects_checked += 1;
         if let Err(e) = self.scrub_one_inner(kind, t, repair, result).await {
-            result.objects_checked += 1;
             if result.errors.len() < REPORT_SAMPLE_CAP {
                 result.errors.push(format!(
                     "{} {} ({}): {e}",
@@ -483,7 +515,6 @@ impl StorageScrubService {
     ) -> Result<()> {
         let storage = self.storage_registry.backend_for(&t.location())?;
         let (check, len) = Self::check_object(storage.as_ref(), t).await?;
-        result.objects_checked += 1;
         result.bytes_read += len;
 
         let (status, actual_sha, actual_len) = match check {
@@ -524,7 +555,7 @@ impl StorageScrubService {
                 "path-keyed object: reported only (repair needs a content-addressed key)".into(),
             );
         } else if repair {
-            match self.try_repair(kind, t, storage.as_ref()).await {
+            match self.try_repair(kind, t, storage.as_ref(), result).await {
                 Ok(Some(donor)) => {
                     status = "repaired".into();
                     detail = Some(format!("restored from verified copy {donor}"));
@@ -559,11 +590,16 @@ impl StorageScrubService {
     /// it to a temp file while hashing, and write it over the damaged key.
     /// Returns a description of the donor on success, `None` when no copy
     /// verified.
+    ///
+    /// Every byte read here (donor copies, and the re-verification of the
+    /// repaired object) counts toward `bytes_read`, so a repair run honours
+    /// `max_bytes` (#4323).
     async fn try_repair(
         &self,
         kind: ScrubObjectKind,
         t: &ScrubTarget,
         target: &dyn StorageBackend,
+        result: &mut ScrubResult,
     ) -> Result<Option<String>> {
         let Some(expected) = parse_sha256_hex(&t.checksum) else {
             return Ok(None);
@@ -597,9 +633,13 @@ impl StorageScrubService {
             let Ok(source) = self.storage_registry.backend_for(&donor.location()) else {
                 continue;
             };
-            let Ok(Some(spool)) =
-                spool_verified(source.as_ref(), &donor.storage_key, &expected).await
-            else {
+            let (spool, read) =
+                match spool_verified(source.as_ref(), &donor.storage_key, &expected).await {
+                    Ok(spooled) => spooled,
+                    Err(_) => continue,
+                };
+            result.bytes_read += read;
+            let Some(spool) = spool else {
                 continue;
             };
             // Re-check the target row right before writing so a key that was
@@ -615,7 +655,8 @@ impl StorageScrubService {
                 return Ok(None);
             }
             target.put_file(&t.storage_key, spool.path()).await?;
-            let (check, _) = Self::check_object(target, t).await?;
+            let (check, read) = Self::check_object(target, t).await?;
+            result.bytes_read += read;
             if check == ObjectCheck::Intact {
                 return Ok(Some(format!(
                     "{}:{} ({})",
@@ -749,12 +790,13 @@ impl StorageScrubService {
 }
 
 /// Stream `key` from `source` into a temp file while hashing it. Returns the
-/// temp file only when its bytes hash to `expected`; bad bytes are discarded.
+/// temp file only when its bytes hash to `expected` (bad bytes are
+/// discarded), together with the number of bytes read either way.
 async fn spool_verified(
     source: &dyn StorageBackend,
     key: &str,
     expected: &[u8; 32],
-) -> Result<Option<tempfile::NamedTempFile>> {
+) -> Result<(Option<tempfile::NamedTempFile>, u64)> {
     let spool = tempfile::NamedTempFile::new()
         .map_err(|e| AppError::Storage(format!("scrub spool file: {e}")))?;
     let mut file = tokio::fs::File::create(spool.path())
@@ -762,8 +804,10 @@ async fn spool_verified(
         .map_err(|e| AppError::Storage(format!("scrub spool file: {e}")))?;
     let mut stream = source.get_stream(key).await?;
     let mut hasher = Sha256::new();
+    let mut read = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        read += chunk.len() as u64;
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
@@ -774,9 +818,9 @@ async fn spool_verified(
         .map_err(|e| AppError::Storage(format!("scrub spool write: {e}")))?;
     drop(file);
     if hasher.finalize().as_slice() == expected.as_slice() {
-        Ok(Some(spool))
+        Ok((Some(spool), read))
     } else {
-        Ok(None)
+        Ok((None, read))
     }
 }
 
@@ -961,6 +1005,138 @@ mod db_tests {
             .as_deref()
             .unwrap_or_default()
             .contains("path-keyed"));
+    }
+
+    /// #4323: an object whose finding cannot be recorded counts once in
+    /// `objects_checked`, not twice. A trigger scoped to this test's key makes
+    /// the finding insert fail after the object was read.
+    #[tokio::test]
+    async fn scrub_counts_an_object_once_when_its_finding_fails_4323() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let key = format!("scrub-dc-{}", Uuid::new_v4().simple());
+        let func = format!("ak_test_fail_{}", Uuid::new_v4().simple());
+        seed_at(
+            &fx,
+            &key,
+            "dc/bad.bin",
+            b"double-count-original",
+            b"double-count-originaX",
+        )
+        .await;
+        for sql in [
+            format!(
+                "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$BEGIN IF NEW.storage_key = '{key}' THEN RAISE EXCEPTION 'test'; END IF; \
+                 RETURN NEW; END$$"
+            ),
+            format!(
+                "CREATE TRIGGER {func} BEFORE INSERT ON storage_scrub_findings \
+                 FOR EACH ROW EXECUTE FUNCTION {func}()"
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
+                .execute(&fx.pool)
+                .await
+                .expect("install trigger");
+        }
+        let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        let res = svc.run(&opts(&fx, false)).await;
+        for sql in [
+            format!("DROP TRIGGER {func} ON storage_scrub_findings"),
+            format!("DROP FUNCTION {func}()"),
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+        let res = res.expect("scrub run");
+        assert_eq!(res.errors.len(), 1, "{res:?}");
+        assert_eq!(res.objects_checked, 1, "{res:?}");
+    }
+
+    /// #4323: a repair reads the donor copy and re-reads the repaired object;
+    /// both count toward `bytes_read` (and so toward `max_bytes`).
+    #[tokio::test]
+    async fn scrub_repair_reads_count_toward_bytes_read_4323() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let Some(donor_fx) = tdh::Fixture::setup("local", "generic").await else {
+            fx.teardown().await;
+            return;
+        };
+        let original = b"scrub-bytes-read-accounting";
+        let cas = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &sha_hex(original),
+        );
+        seed_at(
+            &fx,
+            &cas,
+            "b/bad.bin",
+            original,
+            b"scrub-bytes-read-accountinX",
+        )
+        .await;
+        seed_at(&donor_fx, &cas, "b/copy.bin", original, original).await;
+        let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        let res = svc.run(&opts(&fx, true)).await.expect("scrub run");
+        fx.teardown().await;
+        donor_fx.teardown().await;
+        assert_eq!(res.repaired, 1, "{res:?}");
+        // At least the target, one donor and the re-verification (a donor
+        // row can be listed more than once by the UNION of its sources).
+        assert!(
+            res.bytes_read >= 3 * original.len() as u64,
+            "target, donor and re-verification reads: {res:?}"
+        );
+    }
+
+    /// #4323: findings of hard-deleted rows and the cursor of a deleted
+    /// repository's scoped runs are removed by the next run.
+    #[tokio::test]
+    async fn scrub_prunes_orphaned_bookkeeping_4323() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let gone_artifact = Uuid::new_v4();
+        let gone_scope = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO storage_scrub_findings (object_kind, object_id, repository_id, \
+                 storage_key, expected_sha256, status) \
+             VALUES ('artifact', $1, $2, 'gone/key', 'x', 'corrupt')",
+        )
+        .bind(gone_artifact)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed finding");
+        sqlx::query("INSERT INTO storage_scrub_state (scope) VALUES ($1)")
+            .bind(&gone_scope)
+            .execute(&fx.pool)
+            .await
+            .expect("seed state");
+        let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        svc.run(&opts(&fx, false)).await.expect("scrub run");
+        let finding = finding_status(&fx.pool, gone_artifact).await;
+        let state: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM storage_scrub_state WHERE scope = $1")
+                .bind(&gone_scope)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count state");
+        let own: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM storage_scrub_state WHERE scope = $1")
+                .bind(fx.repo_id.to_string())
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count own state");
+        fx.teardown().await;
+        assert_eq!(finding, None, "a finding of a hard-deleted row is pruned");
+        assert_eq!(state, 0, "a deleted repository's cursor is pruned");
+        assert_eq!(own, 1, "a live repository's cursor is kept");
     }
 
     /// #3910: a corrupt CONTENT-ADDRESSED object with a verified copy of the

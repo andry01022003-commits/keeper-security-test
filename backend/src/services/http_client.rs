@@ -319,6 +319,21 @@ pub fn large_object_client_builder(allow_http: bool) -> ClientBuilder {
         .https_only(!allow_http)
 }
 
+/// Return a client builder for synchronous server-side copies, such as Azure
+/// Put Blob From URL.
+///
+/// The storage service performs the whole copy before it sends a single
+/// response byte, so read inactivity is the copy's duration. The 30-second
+/// `read_timeout` of [`large_object_client_builder`] therefore aborts any copy
+/// that takes longer, even though the service is still working. This builder
+/// sets no read timeout. The caller MUST bound each request with
+/// [`reqwest::RequestBuilder::timeout`], sized to the bytes being copied.
+pub fn server_side_copy_client_builder(allow_http: bool) -> ClientBuilder {
+    base_client_builder()
+        .connect_timeout(Duration::from_secs(10))
+        .https_only(!allow_http)
+}
+
 /// Build and return a ready-to-use [`reqwest::Client`] with custom CA
 /// certificates and proxy support.
 ///
@@ -434,7 +449,10 @@ fn ssrf_redirect_policy_with(
                 context_label,
             );
             crate::services::metrics_service::record_ssrf_block(surface);
-            return attempt.error("redirect target rejected by SSRF policy");
+            return attempt.error(format!(
+                "redirect target {}",
+                crate::services::ssrf_refusal::REDIRECT_REFUSAL_PHRASE
+            ));
         }
         if attempt.previous().len() >= MAX_REDIRECTS {
             return attempt.error("too many redirects");

@@ -158,6 +158,53 @@ impl ScanConfigService {
         repository_id: Uuid,
         req: &UpsertScanConfigRequest,
     ) -> Result<ScanConfigWrite> {
+        self.upsert_config_inner(repository_id, req, None).await
+    }
+
+    /// [`Self::upsert_config_with_previous`] as an administrator of `tier`,
+    /// honouring the instance lock on the proxy scan policy (#4363, the
+    /// scan-config twin of the age-gate lock from migration 290).
+    ///
+    /// While the lock is on, a repository-tier write may tighten the proxy
+    /// scan policy but not weaken it ([`proxy_policy_weakened`]); it is
+    /// refused with 403 and nothing is written. The check runs under the same
+    /// per-repository advisory lock and row lock as the write, so it cannot
+    /// race an instance administrator's change.
+    ///
+    /// `lock` is the instance administrator's explicit choice: `Some(false)`
+    /// hands the policy back to the repository's administrators, `Some(true)`
+    /// or `None` locks it (an instance write is an instance decision unless it
+    /// says otherwise). A repository-tier write may not touch the lock, so
+    /// `Some(_)` from that tier is refused, and its write leaves the lock as
+    /// it was.
+    pub async fn upsert_config_as(
+        &self,
+        repository_id: Uuid,
+        req: &UpsertScanConfigRequest,
+        tier: crate::services::age_gate_service::ActorTier,
+        lock: Option<bool>,
+    ) -> Result<ScanConfigWrite> {
+        use crate::services::age_gate_service::ActorTier;
+        if tier == ActorTier::Repository && lock.is_some() {
+            return Err(AppError::Authorization(
+                "Only an instance administrator can lock a repository's proxy scan policy \
+                 or hand it back to the repository's administrators."
+                    .to_string(),
+            ));
+        }
+        self.upsert_config_inner(repository_id, req, Some((tier, lock)))
+            .await
+    }
+
+    /// The shared write. `as_tier` is `None` for the tier-less internal
+    /// callers (the lock is neither checked nor changed).
+    async fn upsert_config_inner(
+        &self,
+        repository_id: Uuid,
+        req: &UpsertScanConfigRequest,
+        as_tier: Option<(crate::services::age_gate_service::ActorTier, Option<bool>)>,
+    ) -> Result<ScanConfigWrite> {
+        use crate::services::age_gate_service::ActorTier;
         let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
         let mut tx = self.db.begin().await.map_err(db_err)?;
         sqlx::query(
@@ -183,6 +230,36 @@ impl ScanConfigService {
         .map_err(db_err)?;
 
         let m = merge_scan_config(req, existing.as_ref())?;
+
+        let was_locked: bool = sqlx::query_scalar(
+            "SELECT proxy_scan_instance_locked FROM scan_configs WHERE repository_id = $1",
+        )
+        .bind(repository_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .unwrap_or(false);
+        let now_locked = match as_tier {
+            None => was_locked,
+            Some((ActorTier::Instance, lock)) => lock.unwrap_or(true),
+            Some((ActorTier::Repository, _)) => was_locked,
+        };
+        if was_locked && matches!(as_tier, Some((ActorTier::Repository, _))) {
+            let before = existing
+                .as_ref()
+                .map(MergedScanConfig::of)
+                .unwrap_or_else(MergedScanConfig::defaults);
+            if proxy_policy_weakened(&before, &m) {
+                return Err(AppError::Authorization(
+                    "This repository's proxy scan policy was set by an instance \
+                     administrator. A repository administrator can tighten it, but only an \
+                     instance administrator can turn proxy scanning off, move the proxy scan \
+                     action towards record_only, or loosen its severity threshold."
+                        .to_string(),
+                ));
+            }
+        }
+
         let current: ScanConfig = sqlx::query_as(
             r#"
             INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
@@ -213,12 +290,49 @@ impl ScanConfigService {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        if now_locked != was_locked {
+            sqlx::query(
+                "UPDATE scan_configs SET proxy_scan_instance_locked = $2 WHERE repository_id = $1",
+            )
+            .bind(repository_id)
+            .bind(now_locked)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
         tx.commit().await.map_err(db_err)?;
 
         Ok(ScanConfigWrite {
             previous: existing,
             current,
+            was_locked,
+            now_locked,
         })
+    }
+
+    /// Whether an instance administrator's lock holds this repository's
+    /// proxy scan policy (#4363). `false` when the repository has no config.
+    pub async fn instance_locked(&self, repository_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT proxy_scan_instance_locked FROM scan_configs WHERE repository_id = $1",
+        )
+        .bind(repository_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .unwrap_or(false))
+    }
+
+    /// The repositories whose proxy scan policy is instance-locked (#4363),
+    /// for listings that show the lock beside each config.
+    pub async fn instance_locked_repositories(&self) -> Result<std::collections::HashSet<Uuid>> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT repository_id FROM scan_configs WHERE proxy_scan_instance_locked",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(ids.into_iter().collect())
     }
 
     /// List all scan configurations (for admin overview / filtering).
@@ -326,6 +440,53 @@ impl ScanConfigService {
 pub struct ScanConfigWrite {
     pub previous: Option<ScanConfig>,
     pub current: ScanConfig,
+    /// The instance lock on the proxy scan policy before and after the write
+    /// (#4363).
+    pub was_locked: bool,
+    pub now_locked: bool,
+}
+
+/// Rank of a proxy scan action by how much it enforces: fail_closed also
+/// withholds unscanned bytes, fail_open blocks vulnerable verdicts,
+/// record_only blocks nothing.
+fn proxy_action_rank(action: &str) -> u8 {
+    match ProxyScanAction::from_db(action) {
+        ProxyScanAction::FailClosed => 2,
+        ProxyScanAction::FailOpen => 1,
+        ProxyScanAction::RecordOnly => 0,
+    }
+}
+
+/// Whether replacing `before` with `after` WEAKENS the proxy scan policy
+/// (#4363): turns `scan_on_proxy` off, moves `proxy_scan_action` towards
+/// record_only, or loosens the severity gate (opting into a threshold from
+/// block-on-any, or raising the threshold), using the gate's own
+/// stricter-of-two order ([`ProxySeverityGate::stricter`]).
+///
+/// A policy with `scan_on_proxy` off enforces nothing, so no change from it
+/// weakens anything, as with the age gate's `is_relaxed_by`. Changes outside
+/// the proxy policy (`scan_enabled`, `scan_on_upload`) are not governed by
+/// the lock. Pure so the order is unit-testable.
+///
+/// [`ProxySeverityGate::stricter`]: crate::services::proxy_scan_service::ProxySeverityGate::stricter
+pub(crate) fn proxy_policy_weakened(before: &MergedScanConfig, after: &MergedScanConfig) -> bool {
+    use crate::services::proxy_scan_service::ProxySeverityGate;
+    if !before.scan_on_proxy {
+        return false;
+    }
+    if !after.scan_on_proxy {
+        return true;
+    }
+    if proxy_action_rank(&after.proxy_scan_action) < proxy_action_rank(&before.proxy_scan_action) {
+        return true;
+    }
+    let gate_before = ProxySeverityGate::from_config(
+        before.block_on_policy_violation,
+        &before.severity_threshold,
+    );
+    let gate_after =
+        ProxySeverityGate::from_config(after.block_on_policy_violation, &after.severity_threshold);
+    gate_after != gate_before && ProxySeverityGate::stricter(gate_before, gate_after) == gate_before
 }
 
 /// The six mutable columns of a scan-config write, after merging a partial
@@ -422,6 +583,67 @@ mod tests {
     // -----------------------------------------------------------------------
     // UpsertScanConfigRequest deserialization
     // -----------------------------------------------------------------------
+
+    fn merged(on: bool, action: &str, block: bool, threshold: &str) -> MergedScanConfig {
+        MergedScanConfig {
+            scan_on_proxy: on,
+            proxy_scan_action: action.to_string(),
+            block_on_policy_violation: block,
+            severity_threshold: threshold.to_string(),
+            ..MergedScanConfig::defaults()
+        }
+    }
+
+    /// #4363: what counts as weakening the proxy scan policy.
+    #[test]
+    fn proxy_policy_weakened_follows_the_gate_order() {
+        let any = merged(true, "fail_open", false, "high");
+        let high = merged(true, "fail_open", true, "high");
+        // Turning proxy scanning off, or any move towards record_only.
+        assert!(proxy_policy_weakened(
+            &any,
+            &merged(false, "fail_open", false, "high")
+        ));
+        assert!(proxy_policy_weakened(
+            &any,
+            &merged(true, "record_only", false, "high")
+        ));
+        assert!(proxy_policy_weakened(
+            &merged(true, "fail_closed", false, "high"),
+            &any
+        ));
+        // Opting into a threshold from block-on-any, or raising it.
+        assert!(proxy_policy_weakened(&any, &high));
+        assert!(proxy_policy_weakened(
+            &high,
+            &merged(true, "fail_open", true, "critical")
+        ));
+        // Tightening, and changes the gate does not see, are not weakening.
+        assert!(!proxy_policy_weakened(&high, &any));
+        assert!(!proxy_policy_weakened(
+            &high,
+            &merged(true, "fail_open", true, "low")
+        ));
+        assert!(!proxy_policy_weakened(
+            &any,
+            &merged(true, "fail_closed", false, "high")
+        ));
+        assert!(!proxy_policy_weakened(
+            &any,
+            &merged(true, "fail_open", false, "critical")
+        ));
+        assert!(!proxy_policy_weakened(&any, &any));
+        // A policy that scans nothing on proxy cannot be weakened further.
+        let off = merged(false, "fail_closed", false, "high");
+        assert!(!proxy_policy_weakened(
+            &off,
+            &merged(false, "record_only", true, "critical")
+        ));
+        assert!(!proxy_policy_weakened(
+            &off,
+            &merged(true, "record_only", false, "high")
+        ));
+    }
 
     #[test]
     fn test_upsert_scan_config_request_deserialization() {

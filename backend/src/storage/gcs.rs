@@ -1306,7 +1306,7 @@ impl GcsBackend {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "GCS resumable session abort request failed");
+                tracing::warn!(error = %e.without_url(), "GCS resumable session abort request failed");
             }
         }
     }
@@ -1330,7 +1330,12 @@ impl GcsBackend {
             .header("Content-Range", content_range(0, 0, total))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS resumable status query failed: {}", e)))?;
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "GCS resumable status query failed: {}",
+                    e.without_url()
+                ))
+            })?;
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
@@ -1396,7 +1401,8 @@ impl GcsBackend {
             .map_err(|e| {
                 AppError::ServiceUnavailable(format!(
                     "GCS resumable finalize (range {}) network error: {}",
-                    range, e
+                    range,
+                    e.without_url()
                 ))
             })?;
 
@@ -1481,12 +1487,14 @@ impl GcsBackend {
                     if attempt < CHUNK_MAX_ATTEMPTS {
                         last_err = Some(AppError::ServiceUnavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
-                            range, e
+                            range,
+                            e.without_url()
                         )));
                     } else {
                         return Err(AppError::ServiceUnavailable(format!(
                             "GCS resumable PUT (range {}) network error: {}",
-                            range, e
+                            range,
+                            e.without_url()
                         )));
                     }
                 }
@@ -1818,6 +1826,20 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let url = self.object_metadata_url(key);
+        let response = self.authorized_get(&url).await?;
+        if response.status().is_success() {
+            return Ok(true);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        require_success(response, "GCS exists check failed").await?;
+        unreachable!()
+    }
+
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.object_metadata_url(key);
@@ -1886,6 +1908,13 @@ impl StorageBackend for GcsBackend {
 
     fn supports_redirect(&self) -> bool {
         matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) && self.config.redirect_downloads
+    }
+
+    /// GCS resumable uploads stream from the request body to the bucket
+    /// without a local file, so a chunked completion can assemble straight
+    /// into a staging object (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
     }
 
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_presigned_url"))]
@@ -3739,6 +3768,41 @@ mod tests {
         assert!(!backend.exists("missing.txt").await.unwrap());
     }
 
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/storage/v1/b/.*/o/repos%2Fgeneric%2Fabcdefabcdef",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/ab%2Fabcdefabcdef"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let backend =
+            mock_backend_with_path_format(&server.uri(), StoragePathFormat::Migration).await;
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
+        );
+    }
+
     #[tokio::test]
     async fn test_exists_surfaces_migration_fallback_operational_error() {
         use wiremock::matchers::{method, path_regex};
@@ -4373,5 +4437,29 @@ mod tests {
             "expected storage error mentioning 403, got: {:?}",
             err
         );
+    }
+
+    /// A resumable session URI authorizes uploads to the session by itself,
+    /// so a transport error must not repeat it in the returned message.
+    #[tokio::test]
+    async fn test_resumable_session_errors_omit_the_session_url() {
+        let backend = mock_backend("http://127.0.0.1:0").await;
+        // Port 0 cannot be connected to, so each request fails in transport.
+        let session_url = "http://127.0.0.1:0/upload/storage/v1/b/test-bucket/o?uploadType=resumable&upload_id=session-capability";
+
+        let status_err = backend
+            .query_resumable_offset(session_url, Some(10))
+            .await
+            .expect_err("status query fails");
+        let finalize_err = backend
+            .finalize_resumable(session_url, 10)
+            .await
+            .expect_err("finalize fails");
+        for message in [status_err.to_string(), finalize_err.to_string()] {
+            assert!(
+                !message.contains("upload_id"),
+                "error message must not carry the session URL: {message}"
+            );
+        }
     }
 }

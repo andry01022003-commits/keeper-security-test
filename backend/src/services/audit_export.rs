@@ -100,6 +100,8 @@ impl AuditAction {
             // #4677: the limiter refused the attempt before any credential
             // was checked; a refusal of the caller, not a credential failure.
             AuditAction::LoginRateLimited => Outcome::Denied,
+            // #4777: the scan-on-proxy gate refused the pull.
+            AuditAction::ProxyScanBlocked => Outcome::Denied,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -156,6 +158,7 @@ impl AuditAction {
             | AuditAction::CiOidcGroupBindingReconciled
             | AuditAction::StorageScrubRun
             | AuditAction::StorageReindexRun
+            | AuditAction::DebianBackfillRun
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
             | AuditAction::QuarantineRejected

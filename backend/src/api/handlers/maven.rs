@@ -393,7 +393,24 @@ async fn resolve_snapshot_artifact(
     repo_id: uuid::Uuid,
     snapshot_path: &str,
 ) -> Option<ResolvedSnapshot> {
-    let pattern = snapshot_like_pattern(snapshot_path)?;
+    fetch_snapshot_artifact(db, repo_id, snapshot_path)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`resolve_snapshot_artifact`] that reports a failed query as an error
+/// instead of `None`. A caller that gates on the resolved row (the checksum
+/// gate, #4288 item 2) must not read a database fault as "no artifact here",
+/// or the path would be served without that row's gate.
+async fn fetch_snapshot_artifact(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    snapshot_path: &str,
+) -> Result<Option<ResolvedSnapshot>, sqlx::Error> {
+    let Some(pattern) = snapshot_like_pattern(snapshot_path) else {
+        return Ok(None);
+    };
 
     // Use runtime sqlx::query (not the query! macro) to avoid needing an
     // offline cache entry. The LIKE pattern matches timestamped filenames
@@ -417,16 +434,18 @@ async fn resolve_snapshot_artifact(
     .bind(repo_id)
     .bind(&pattern)
     .fetch_optional(db)
-    .await
-    .ok()??;
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
 
     use sqlx::Row;
-    Some(ResolvedSnapshot {
+    Ok(Some(ResolvedSnapshot {
         id: row.get("id"),
         storage_key: row.get("storage_key"),
         checksum_sha256: row.get("checksum_sha256"),
         path: row.get("path"),
-    })
+    }))
 }
 
 struct ResolvedSnapshot {
@@ -1085,24 +1104,31 @@ async fn maven_remote_stream(
             upstream_url,
             RepositoryFormat::Maven,
         );
-        let result = proxy
-            .fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
+        // #4573: the cached `.sha1` is read alongside the content open, not
+        // after it (the #3982/#4289 rule), and from the cache only.
+        let (result, sha1) = tokio::join!(
+            proxy.fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
                 &gated_repo,
                 path,
                 path,
                 crate::services::proxy_service::CommitDigestAlgorithm::Sha1,
                 digest,
-            )
-            .await
-            .map_err(IntoResponse::into_response)?;
-        return proxy_helpers::build_streaming_response_with_disposition(
+            ),
+            cached_maven_sha1(proxy, repo_key, path),
+        );
+        let result = result.map_err(IntoResponse::into_response)?;
+        let mut response = proxy_helpers::build_streaming_response_with_disposition(
             result,
             content_type_for_path(path),
             None,
         )
         .map_err(|e| {
             AppError::Internal(format!("failed to build response: {}", e)).into_response()
-        });
+        })?;
+        if response.status() == StatusCode::OK {
+            insert_maven_checksum_headers(response.headers_mut(), sha1.as_deref(), None);
+        }
+        return Ok(response);
     }
     proxy_helpers::proxy_fetch_streaming_with_format(
         proxy,
@@ -1198,6 +1224,475 @@ fn maven_curation_target(path: &str) -> Option<(String, Option<String>)> {
             .ok()
             .map(|c| c.version);
     Some((pkg, version))
+}
+
+// ---------------------------------------------------------------------------
+// Publish-age gate (#4702)
+// ---------------------------------------------------------------------------
+//
+// A Remote's age gate (`PUT /api/v1/repositories/{key}/age-gate`) applies to
+// every file of a version (and its checksum and signature sidecars) and to
+// the GA-level `maven-metadata.xml` version list; a Virtual applies the gate
+// of the Remote member a file or listing comes from. The format-specific
+// pieces (which path names which version, the POM `Last-Modified` publish
+// time, the metadata rewrite) live in `services::age_gate_maven`; the policy,
+// the review queue and the 451 refusal are the shared seam every gated format
+// uses (`proxy_helpers::enforce_age_gate`). Hosted members are never gated.
+
+/// Largest POM the gate reads to date a version. A POM is a few KiB; the cap
+/// only bounds the shared metadata budget a listing's probes reserve.
+const MAVEN_AGE_GATE_POM_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// The cheap, struct-derived age-gate inputs of a virtual member. The
+/// `Repository` model carries no mode; Maven supports both, so the mode does
+/// not change applicability, and the authoritative policy is re-read by id
+/// ([`maven_gate_policy`]) before anything is decided.
+fn maven_member_gate_inputs(
+    member: &crate::models::repository::Repository,
+) -> crate::services::age_gate_service::AgeGateRepoParams {
+    crate::services::age_gate_service::AgeGateRepoParams::from_parts(
+        member.id,
+        member.key.clone(),
+        member.repo_type.clone(),
+        member.format.clone(),
+        member.age_gate_enabled,
+        member.age_gate_min_age_days,
+        crate::services::age_gate_service::AgeGateMode::default(),
+        member.upstream_url.clone(),
+    )
+}
+
+/// The authoritative age-gate policy of a repository whose cached inputs say
+/// the gate applies; `None` when it does not. Policy is enforcement input, so
+/// it is read from the database by id rather than trusted from a cached or
+/// defaulted struct (#2264); a failed read fails the request.
+async fn maven_gate_policy(
+    state: &SharedState,
+    inputs: crate::services::age_gate_service::AgeGateRepoParams,
+) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
+    use crate::services::age_gate_service::AgeGateService;
+    if !AgeGateService::is_applicable(&inputs) {
+        return Ok(None);
+    }
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, inputs.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(AgeGateService::gating_requested(&params).then_some(params))
+}
+
+/// Where a gated Remote's bytes come from.
+struct MavenGateUpstream<'a> {
+    proxy: &'a crate::services::proxy_service::ProxyService,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+}
+
+/// What the upstream said about a version's POM when the gate dated it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MavenPomLookup {
+    /// The POM exists (memo, proxy cache entry, or a successful read).
+    Found,
+    /// The upstream answered 404 or 410: it has no such version.
+    Missing,
+    /// The upstream could not be read (5xx, timeout, refusal).
+    Unreachable,
+}
+
+/// A version's upstream publish time and what the upstream said about it:
+/// the upstream `Last-Modified` of the version's POM
+/// (`services::age_gate_maven`). Read, in order, from the in-process memo,
+/// from the proxy cache entry when the POM is already cached (no upstream
+/// contact), else from a direct upstream read of the POM that is not cached
+/// (the gate must not commit a withheld version's files). A failed read is no
+/// evidence, never an admission: the gate then withholds the version.
+async fn maven_pom_publish_time(
+    upstream: &MavenGateUpstream<'_>,
+    repo_id: Uuid,
+    target: &crate::services::age_gate_maven::MavenGateTarget,
+) -> (Option<chrono::DateTime<chrono::Utc>>, MavenPomLookup) {
+    use crate::services::age_gate_maven as gate;
+    if let Some(known) = gate::memo_publish_time(repo_id, upstream.upstream_url, target).await {
+        return (Some(known), MavenPomLookup::Found);
+    }
+    let pom = target.pom_path();
+    let cached = upstream
+        .proxy
+        .get_cache_metadata(upstream.repo_key, &pom)
+        .await
+        .ok()
+        .flatten()
+        .filter(|meta| meta.negative_cached_until.is_none())
+        .and_then(|meta| meta.last_modified)
+        .and_then(|lm| gate::parse_last_modified(&lm));
+    let (published, lookup) = match cached {
+        Some(published) => (Some(published), MavenPomLookup::Found),
+        None => {
+            let remote = proxy_helpers::build_remote_repo_with_format(
+                repo_id,
+                upstream.repo_key,
+                upstream.upstream_url,
+                RepositoryFormat::Maven,
+            );
+            match upstream
+                .proxy
+                .fetch_upstream_direct_dated(&remote, &pom, MAVEN_AGE_GATE_POM_MAX_BYTES)
+                .await
+            {
+                Ok((_, last_modified)) => (
+                    last_modified.and_then(|lm| gate::parse_last_modified(&lm)),
+                    MavenPomLookup::Found,
+                ),
+                Err(AppError::NotFound(_)) => (None, MavenPomLookup::Missing),
+                Err(_) => (None, MavenPomLookup::Unreachable),
+            }
+        }
+    };
+    if let Some(published) = published {
+        gate::remember_publish_time(repo_id, upstream.upstream_url, target, published).await;
+    }
+    (published, lookup)
+}
+
+/// Apply a gated Remote's age gate to one version: `Ok(())` serves, `Err`
+/// is the shared seam's answer (451 `age_gate_blocked`, or a fail-closed
+/// 5xx). Maven has no last-known-good substitution: a client asked for one
+/// version's file, and another version's bytes under that name would be a
+/// different artifact, so a block is always the 451 (as Go does).
+async fn enforce_maven_age_gate(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    upstream: &MavenGateUpstream<'_>,
+    target: &crate::services::age_gate_maven::MavenGateTarget,
+) -> Result<(), Response> {
+    use crate::services::age_gate_service::AgeGateService;
+    let svc = state.age_gate_service.as_deref();
+    let (published, lookup) = maven_pom_publish_time(upstream, params.id, target).await;
+    let exists = lookup == MavenPomLookup::Found;
+    let basis = match svc {
+        Some(svc) => svc
+            .download_basis(params, &target.package, &target.version, published, exists)
+            .await
+            .map_err(|e| e.into_response())?,
+        None => published,
+    };
+    // Undated because the upstream has no such version: the ordinary miss,
+    // with no review to record (nothing is served either way). A resolver
+    // that walks several repositories moves on to the next one on a 404,
+    // and an anonymous probe for random versions creates no review rows.
+    // Undated because the upstream could not be read: fail closed with the
+    // retryable 503, not a 451 and a review for a version nobody has seen.
+    if basis.is_none() && AgeGateService::gating_requested(params) {
+        match lookup {
+            MavenPomLookup::Missing => {
+                return Err(AppError::NotFound("File not found".to_string()).into_response());
+            }
+            MavenPomLookup::Unreachable => {
+                return Err(proxy_helpers::age_gate_unavailable_response(
+                    &params.key,
+                    &target.package,
+                ));
+            }
+            MavenPomLookup::Found => {}
+        }
+    }
+    let blocked =
+        proxy_helpers::enforce_age_gate(svc, params, &target.package, &target.version, basis)
+            .await?;
+    match blocked {
+        None => Ok(()),
+        Some(blocked) => Err(proxy_helpers::age_gate_blocked_response(
+            blocked.review_id,
+            &target.package,
+            &target.version,
+            params.age_gate_min_age_days,
+            basis.map(|b| {
+                crate::services::age_gate_service::AgeGateService::package_age_days(
+                    b,
+                    chrono::Utc::now(),
+                )
+            }),
+        )),
+    }
+}
+
+/// The age gate of a Remote repository for a request `path` (#4702): a no-op
+/// for hosted and virtual repositories, paths that name no gated version, and
+/// repositories without the gate.
+async fn maven_remote_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    path: &str,
+) -> Result<(), Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return Ok(());
+    }
+    let Some(target) = crate::services::age_gate_maven::gate_target(path) else {
+        return Ok(());
+    };
+    let Some(params) = maven_gate_policy(state, proxy_helpers::age_gate_params(repo)).await? else {
+        return Ok(());
+    };
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+    else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            repo_key,
+            &target.package,
+        ));
+    };
+    let upstream = MavenGateUpstream {
+        proxy,
+        repo_key,
+        upstream_url,
+    };
+    enforce_maven_age_gate(state, &params, &upstream, &target).await
+}
+
+/// The age gate of one Virtual member for `path`. `Ok(None)` when the member
+/// may serve it (hosted, no gate, or the version is old enough),
+/// `Ok(Some(resp))` when the member does not serve it: its gate withholds the
+/// version (451), its upstream has no such version (404) or could not be read
+/// to date it (503). `Err` when the gate could not be evaluated (fail
+/// closed).
+async fn maven_member_age_gate(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<Option<Response>, Response> {
+    if member.repo_type != RepositoryType::Remote {
+        return Ok(None);
+    }
+    let Some(target) = crate::services::age_gate_maven::gate_target(path) else {
+        return Ok(None);
+    };
+    let Some(params) = maven_gate_policy(state, maven_member_gate_inputs(member)).await? else {
+        return Ok(None);
+    };
+    let (Some(upstream_url), Some(proxy)) = (
+        member.upstream_url.as_deref(),
+        state.proxy_service.as_deref(),
+    ) else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &member.key,
+            &target.package,
+        ));
+    };
+    let upstream = MavenGateUpstream {
+        proxy,
+        repo_key: &member.key,
+        upstream_url,
+    };
+    match enforce_maven_age_gate(state, &params, &upstream, &target).await {
+        Ok(()) => Ok(None),
+        Err(resp)
+            if matches!(
+                resp.status(),
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+                    | StatusCode::NOT_FOUND
+                    | StatusCode::SERVICE_UNAVAILABLE
+            ) =>
+        {
+            Ok(Some(resp))
+        }
+        Err(resp) => Err(resp),
+    }
+}
+
+/// Keep the most telling refusal of a Virtual's gated members: a 451 (some
+/// member withholds the version) over a 503 (some member could not date it)
+/// over a 404 (some member's upstream has no such version).
+fn keep_maven_age_refusal(current: &mut Option<Response>, new: Response) {
+    let rank = |status: StatusCode| match status {
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => 2,
+        StatusCode::SERVICE_UNAVAILABLE => 1,
+        _ => 0,
+    };
+    match current {
+        Some(kept) if rank(kept.status()) >= rank(new.status()) => {}
+        _ => *current = Some(new),
+    }
+}
+
+/// Drop the Remote members whose age gate withholds `path`'s version, so the
+/// virtual walk never serves it from them (#4702). Returns the members that
+/// may serve it and the first refusal, which the caller answers with when no
+/// remaining member has the file: the client sees the same 451 a direct pull
+/// from that Remote gets, not a 404.
+async fn maven_virtual_age_gate_members(
+    state: &SharedState,
+    members: Vec<crate::models::repository::Repository>,
+    path: &str,
+) -> Result<(Vec<crate::models::repository::Repository>, Option<Response>), Response> {
+    if crate::services::age_gate_maven::gate_target(path).is_none() {
+        return Ok((members, None));
+    }
+    let mut kept = Vec::with_capacity(members.len());
+    let mut refusal = None;
+    for member in members {
+        match maven_member_age_gate(state, &member, path).await? {
+            None => kept.push(member),
+            Some(resp) => keep_maven_age_refusal(&mut refusal, resp),
+        }
+    }
+    Ok((kept, refusal))
+}
+
+/// A virtual walk's answer once age-gated members were dropped: a miss
+/// becomes the gate's 451.
+fn maven_virtual_age_gate_answer(
+    result: Result<Response, Response>,
+    refusal: Option<Response>,
+) -> Result<Response, Response> {
+    match (result, refusal) {
+        (Err(resp), Some(refusal)) if resp.status() == StatusCode::NOT_FOUND => Err(refusal),
+        (result, _) => result,
+    }
+}
+
+/// Withhold versions younger than a gated Remote's minimum age from a GA-level
+/// `maven-metadata.xml` (#4702), so `LATEST`, `RELEASE` and version ranges
+/// never resolve to a version whose download would be refused. Returns the
+/// bytes unchanged when nothing is withheld (the checksum then still matches
+/// the upstream's); the `.sha1` of the metadata is computed from what this
+/// returns, so it always matches the served body.
+///
+/// Dating: `first_seen` uses this server's observations (the listing is the
+/// existence evidence, as for npm and PyPI). `upstream_publish_time` reads
+/// each version's POM `Last-Modified`, except when the document's
+/// `lastUpdated` (the last deploy of any version) is itself older than the
+/// minimum age, which dates every listed version at once. Undated versions
+/// past [`crate::services::age_gate_maven::LISTING_MAX_POM_PROBES`] are
+/// withheld from this listing; downloads decide each version on its own POM.
+async fn maven_filter_listing(
+    state: &SharedState,
+    inputs: crate::services::age_gate_service::AgeGateRepoParams,
+    upstream: &MavenGateUpstream<'_>,
+    path: &str,
+    content: Bytes,
+) -> Result<Bytes, Response> {
+    use crate::services::age_gate_maven as gate;
+    use crate::services::age_gate_service::{AgeGateMode, AgeGateService};
+
+    let Some((group_id, artifact_id)) = parse_metadata_path(path) else {
+        return Ok(content);
+    };
+    let Some(params) = maven_gate_policy(state, inputs).await? else {
+        return Ok(content);
+    };
+    let Some(svc) = state.age_gate_service.as_deref() else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            upstream.repo_key,
+            &format!("{group_id}:{artifact_id}"),
+        ));
+    };
+    let Ok(xml) = std::str::from_utf8(&content) else {
+        return Ok(content);
+    };
+    let Some(doc) = gate::metadata_versions(xml) else {
+        return Ok(content);
+    };
+    if doc.gated_newest_first.is_empty() {
+        return Ok(content);
+    }
+    // The identity is the request path's, never the document's own ids.
+    let package = format!("{group_id}:{artifact_id}");
+
+    let versions: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = match params.age_gate_mode
+    {
+        // `evaluate_versions_batch` substitutes this server's observations.
+        AgeGateMode::FirstSeen => doc
+            .gated_newest_first
+            .iter()
+            .map(|v| (v.clone(), None))
+            .collect(),
+        AgeGateMode::UpstreamPublishTime => {
+            let bound = doc
+                .last_updated
+                .as_deref()
+                .and_then(gate::parse_last_updated);
+            if AgeGateService::meets_age_threshold(
+                bound,
+                params.age_gate_min_age_days,
+                chrono::Utc::now(),
+            ) {
+                doc.gated_newest_first
+                    .iter()
+                    .map(|v| (v.clone(), bound))
+                    .collect()
+            } else {
+                // The directory the document was requested from: each
+                // version's POM is read next to it, as a download of that
+                // version would read it.
+                let metadata_dir = crate::services::proxy_service::normalize_cache_path(path)
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir.to_string())
+                    .unwrap_or_default();
+                let targets: Vec<gate::MavenGateTarget> = doc
+                    .gated_newest_first
+                    .iter()
+                    .map(|version| gate::MavenGateTarget {
+                        package: package.clone(),
+                        group_id: group_id.clone(),
+                        artifact_id: artifact_id.clone(),
+                        version: version.clone(),
+                        version_dir: format!("{metadata_dir}/{version}"),
+                    })
+                    .collect();
+                // Already dated versions cost nothing; the probe budget goes
+                // to the newest undated ones, so successive listings date the
+                // rest instead of re-probing the same newest versions.
+                let mut known: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+                    Vec::with_capacity(targets.len());
+                for target in &targets {
+                    known.push(
+                        gate::memo_publish_time(params.id, upstream.upstream_url, target).await,
+                    );
+                }
+                let undated: Vec<usize> = (0..targets.len())
+                    .filter(|&i| known[i].is_none())
+                    .take(gate::LISTING_MAX_POM_PROBES)
+                    .collect();
+                // Plain loops (no iterator-adapter closures): a closure
+                // returning a future that borrows the proxy is not
+                // provably `Send` for the handler's future.
+                for chunk in undated.chunks(gate::LISTING_POM_CONCURRENCY) {
+                    let mut batch = Vec::with_capacity(chunk.len());
+                    for &i in chunk {
+                        let target = &targets[i];
+                        let repo_id = params.id;
+                        batch.push(async move {
+                            (i, maven_pom_publish_time(upstream, repo_id, target).await.0)
+                        });
+                    }
+                    for (i, published) in futures::future::join_all(batch).await {
+                        known[i] = published;
+                    }
+                }
+                let mut out = Vec::with_capacity(targets.len());
+                for (target, published) in targets.iter().zip(known) {
+                    out.push((target.version.clone(), published));
+                }
+                out
+            }
+        }
+    };
+
+    let blocked = svc
+        .evaluate_versions_batch(&params, &package, &versions)
+        .await
+        .map_err(|e| e.into_response())?;
+    if blocked.is_empty() {
+        return Ok(content);
+    }
+    crate::services::metrics_service::record_age_gate_filtered_metadata(
+        &params.key,
+        crate::services::age_gate_service::format_label(&params.format),
+    );
+    Ok(match gate::filter_metadata_versions(xml, &blocked) {
+        Some(filtered) => Bytes::from(filtered),
+        None => content,
+    })
 }
 
 /// Refuse a Maven/sbt proxy path that the upstream request could read
@@ -1351,10 +1846,104 @@ pub(crate) fn scanned_jvm_archive_response(
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, body.bytes.len().to_string())
         .header("X-Checksum-SHA256", &body.digest);
+    // #4573: the buffered bytes are what the client stores, so their SHA-1 and
+    // MD5 are exact. Not for a content-coded body: the client verifies the
+    // decoded file, and these would be digests of the coding.
+    if body.content_encoding.is_none() {
+        builder = builder
+            .header(
+                MAVEN_CHECKSUM_SHA1_HEADER,
+                compute_checksum(&body.bytes, ChecksumType::Sha1),
+            )
+            .header(
+                MAVEN_CHECKSUM_MD5_HEADER,
+                compute_checksum(&body.bytes, ChecksumType::Md5),
+            );
+    }
     if let Some(enc) = body.content_encoding {
         builder = builder.header(axum::http::header::CONTENT_ENCODING, enc);
     }
     builder.body(Body::from(body.bytes)).unwrap()
+}
+
+/// Maven Resolver's "Remote Included" checksum headers (#4573). A download
+/// response that carries one lets the client skip its separate `.sha1` (or
+/// `.md5`) request; Maven Central sends both.
+const MAVEN_CHECKSUM_SHA1_HEADER: &str = "X-Checksum-SHA1";
+const MAVEN_CHECKSUM_MD5_HEADER: &str = "X-Checksum-MD5";
+
+/// Add the #4573 checksum headers to a Maven download response. A value that
+/// is not lowercase hex of the algorithm's length is dropped, so a malformed
+/// stored or upstream checksum is never forwarded as a header the client
+/// would then fail the download on.
+fn insert_maven_checksum_headers(
+    headers: &mut axum::http::HeaderMap,
+    sha1: Option<&str>,
+    md5: Option<&str>,
+) {
+    fn is_hex_of_len(value: &str, len: usize) -> bool {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+    for (name, value, len) in [
+        (MAVEN_CHECKSUM_SHA1_HEADER, sha1, 40),
+        (MAVEN_CHECKSUM_MD5_HEADER, md5, 32),
+    ] {
+        if let Some(value) = value.filter(|v| is_hex_of_len(v, len)) {
+            if let Ok(value) = axum::http::HeaderValue::from_str(value) {
+                headers.insert(name, value);
+            }
+        }
+    }
+}
+
+/// The SHA-1 a Remote repository already holds for `path`: its cached `.sha1`
+/// sidecar, read from the proxy cache only (#4573). Never contacts the
+/// upstream, so a warm serve does not wait on an upstream round trip for a
+/// header, and an absent, expired or unparseable sidecar is `None` (the client
+/// then requests the `.sha1` itself, as before).
+///
+/// Only for a released package asset ([`maven_sha1_sidecar_gate_applies`]):
+/// such a body was committed only after it matched this very sidecar
+/// (GHSA-qxv7-p3mq-88fv), so the two agree. A `-SNAPSHOT` asset is mutable and
+/// its cached sidecar may describe an older deploy.
+async fn cached_maven_sha1(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_key: &str,
+    path: &str,
+) -> Option<String> {
+    if !maven_sha1_sidecar_gate_applies(path) {
+        return None;
+    }
+    let cached = proxy
+        .get_cached_artifact_by_path(repo_key, &format!("{path}.sha1"))
+        .await
+        .ok()
+        .flatten()?;
+    match parse_maven_sha1_sidecar(&cached.content)? {
+        crate::services::proxy_service::CacheCommitDigest::Sha1Hex(hex) => Some(hex),
+        _ => None,
+    }
+}
+
+/// The stored SHA-1 and MD5 of a hosted artifact row (#4573), for a virtual
+/// repository's serve from a hosted member. `None` when the row is gone or
+/// the lookup fails: the header is an optimisation, never a reason to fail
+/// the download.
+async fn hosted_maven_checksums(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+) -> Option<(Option<String>, Option<String>)> {
+    sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT checksum_sha1, checksum_md5 FROM artifacts WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
 }
 
 /// A Remote repository (a Virtual's member on the walk) a Maven file is
@@ -1812,6 +2401,19 @@ async fn download(
         // which embeds this repository's id and therefore needs no catalog
         // attribution gate — it cannot name another repository's object.
         let key_scheme = crate::storage::StorageKeyScheme::from_env();
+        // #4288 item 2: a checksum names the file it describes, so it gets
+        // that file's download gate. Resolved once, before any stored or
+        // computed checksum is read, so a held artifact's stored sidecar
+        // cannot answer either.
+        let hosted_target = if checksum_compute_eligible(&repo.repo_type) {
+            let target = resolve_checksum_target(&state.db, repo.id, base_path).await?;
+            if let Some(target) = &target {
+                gate_checksum_target(&state.db, target).await?;
+            }
+            target
+        } else {
+            None
+        };
         if checksum_compute_eligible(&repo.repo_type) {
             if let Some(scoped_key) =
                 key_scheme.scoped_read_key(&repo.storage_backend, "maven", repo.id, &path)
@@ -1849,42 +2451,45 @@ async fn download(
         // timestamp-resolved filename before falling through to compute. Same
         // shared-namespace hazard as above: the sidecar key is unanchored, so it
         // is served only to its attributed owner (#2504, #2574).
-        if base_path.contains("-SNAPSHOT") {
-            if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
-                let resolved_sidecar_path =
-                    format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
-                // Repo-scoped candidate first (#2624): physically owned by
-                // this repository, no attribution gate needed.
-                if let Some(scoped_key) = key_scheme.scoped_read_key(
-                    &repo.storage_backend,
-                    "maven",
-                    repo.id,
-                    &resolved_sidecar_path,
-                ) {
-                    if let Ok(content) = storage.get(&scoped_key).await {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(content))
-                            .unwrap());
-                    }
+        //
+        // #4288 item 2: the timestamped row is the one `hosted_target`
+        // resolved and gated above, not a second lookup: a second query could
+        // pick a newer (held) upload, or a different row than the exact-path
+        // one the artifact read serves.
+        if let Some(resolved) = hosted_target.as_ref().filter(|t| t.path != base_path) {
+            let resolved_sidecar_path =
+                format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
+            // Repo-scoped candidate first (#2624): physically owned by
+            // this repository, no attribution gate needed.
+            if let Some(scoped_key) = key_scheme.scoped_read_key(
+                &repo.storage_backend,
+                "maven",
+                repo.id,
+                &resolved_sidecar_path,
+            ) {
+                if let Ok(content) = storage.get(&scoped_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
                 }
-                let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
-                if crate::services::maven_flat_attribution::flat_key_readable(
-                    &state.db,
-                    repo.id,
-                    &repo.storage_backend,
-                    &resolved_checksum_key,
-                )
-                .await
-                {
-                    if let Ok(content) = storage.get(&resolved_checksum_key).await {
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/plain")
-                            .body(Body::from(content))
-                            .unwrap());
-                    }
+            }
+            let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
+            if crate::services::maven_flat_attribution::flat_key_readable(
+                &state.db,
+                repo.id,
+                &repo.storage_backend,
+                &resolved_checksum_key,
+            )
+            .await
+            {
+                if let Ok(content) = storage.get(&resolved_checksum_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
                 }
             }
         }
@@ -1892,15 +2497,10 @@ async fn download(
         // Compute checksum from locally-stored artifact (Local/Staging only).
         // Remote repos cache artifacts in the proxy cache, not the `artifacts`
         // table, so the DB lookup inside serve_computed_checksum always fails.
-        if checksum_compute_eligible(&repo.repo_type) {
-            if let Ok(response) = serve_computed_checksum(
-                &state,
-                repo.id,
-                &repo.storage_location(),
-                base_path,
-                checksum_type,
-            )
-            .await
+        if let Some(target) = &hosted_target {
+            if let Ok(response) =
+                serve_computed_checksum(&state, &repo.storage_location(), target, checksum_type)
+                    .await
             {
                 return Ok(response);
             }
@@ -1908,6 +2508,8 @@ async fn download(
 
         // Fallback: proxy the checksum file from upstream for remote repos
         if repo.repo_type == RepositoryType::Remote {
+            // #4702: a withheld version's checksum answers as its file does.
+            maven_remote_age_gate(&state, &repo, &repo_key, &path).await?;
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
@@ -1951,9 +2553,16 @@ async fn download(
             let members =
                 proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
                     .await?;
+            // #4702: a Remote member whose age gate withholds the version is
+            // skipped; if no other member answers, its 451 is the answer.
+            let mut age_refusal: Option<Response> = None;
 
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
+                    if let Some(refusal) = maven_member_age_gate(&state, member, &path).await? {
+                        keep_maven_age_refusal(&mut age_refusal, refusal);
+                        continue;
+                    }
                     // Remote member: proxy checksum from upstream directly.
                     // serve_computed_checksum always fails — proxy-cached
                     // artifacts are NOT in the `artifacts` table (#1280).
@@ -1985,11 +2594,19 @@ async fn download(
                     }
                 } else if member.repo_type.is_hosted() {
                     // Local/Staging member: compute checksum from stored artifact.
+                    // #4288 item 2: a held artifact's checksum is refused (404)
+                    // and the walk stops there, as the artifact read itself
+                    // stops at a gated member.
+                    let Some(target) =
+                        resolve_checksum_target(&state.db, member.id, base_path).await?
+                    else {
+                        continue;
+                    };
+                    gate_checksum_target(&state.db, &target).await?;
                     if let Ok(response) = serve_computed_checksum(
                         &state,
-                        member.id,
                         &member.storage_location(),
-                        base_path,
+                        &target,
                         checksum_type,
                     )
                     .await
@@ -1997,6 +2614,9 @@ async fn download(
                         return Ok(response);
                     }
                 }
+            }
+            if let Some(refusal) = age_refusal {
+                return Err(refusal);
             }
         }
 
@@ -2052,6 +2672,39 @@ async fn fetch_remote_member_metadata(
         return Ok(None);
     };
     Ok(std::str::from_utf8(&content).ok().map(|s| s.to_string()))
+}
+
+/// [`fetch_remote_member_metadata`] for a GA-level document, with the
+/// member's own age gate applied (#4702): a Virtual lists a young version
+/// only from members that would serve it.
+async fn fetch_remote_member_metadata_gated(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<Option<String>, Response> {
+    let Some(xml) = fetch_remote_member_metadata(state, member, path).await? else {
+        return Ok(None);
+    };
+    let (Some(upstream_url), Some(proxy)) = (
+        member.upstream_url.as_deref(),
+        state.proxy_service.as_deref(),
+    ) else {
+        return Ok(Some(xml));
+    };
+    let upstream = MavenGateUpstream {
+        proxy,
+        repo_key: &member.key,
+        upstream_url,
+    };
+    let filtered = maven_filter_listing(
+        state,
+        maven_member_gate_inputs(member),
+        &upstream,
+        path,
+        Bytes::from(xml),
+    )
+    .await?;
+    Ok(std::str::from_utf8(&filtered).ok().map(|s| s.to_string()))
 }
 
 /// Read a Local/Staging virtual member's stored metadata document at `path`.
@@ -2119,7 +2772,20 @@ async fn fetch_maven_metadata_bytes(
                 RepositoryFormat::Maven,
             )
             .await?;
-            return Ok(content);
+            // #4702: withhold versions the age gate refuses.
+            let upstream = MavenGateUpstream {
+                proxy,
+                repo_key,
+                upstream_url,
+            };
+            return maven_filter_listing(
+                state,
+                proxy_helpers::age_gate_params(repo),
+                &upstream,
+                path,
+                content,
+            )
+            .await;
         }
         return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
     }
@@ -2167,7 +2833,8 @@ async fn fetch_maven_metadata_bytes(
                         let member_docs =
                             futures::future::join_all(chunk.iter().map(|member| async {
                                 if member.repo_type == RepositoryType::Remote {
-                                    fetch_remote_member_metadata(state, member, path).await
+                                    // #4702: each Remote member's own age gate.
+                                    fetch_remote_member_metadata_gated(state, member, path).await
                                 } else {
                                     Ok(generate_metadata_for_artifact(
                                         &state.db,
@@ -2979,6 +3646,9 @@ async fn serve_artifact(
         Some(a) => a,
         None => {
             if repo.repo_type == RepositoryType::Remote {
+                // #4702: the age gate decides before any byte is fetched,
+                // scanned or served.
+                maven_remote_age_gate(state, repo, repo_key, path).await?;
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
@@ -3088,6 +3758,15 @@ async fn serve_artifact(
                 // a retryable server error, not a definitive 404 (#3321).
                 let members =
                     proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+                // #4702: Remote members whose age gate withholds this version
+                // never serve it; when no other member has it, the client gets
+                // that gate's 451. A locally owned GAV disables every Remote
+                // member already, so there is nothing to gate.
+                let (members, age_refusal) = if proxy_for_virtual.is_some() {
+                    maven_virtual_age_gate_members(state, members, path).await?
+                } else {
+                    (members, None)
+                };
 
                 let local_fetch = |member_id: Uuid, location: crate::storage::StorageLocation| {
                     let db = db.clone();
@@ -3227,31 +3906,52 @@ async fn serve_artifact(
                     )
                     .await
                     {
-                        return served;
+                        return maven_virtual_age_gate_answer(served, age_refusal);
                     }
                 }
 
-                let result = proxy_helpers::resolve_virtual_download_from_members(
+                let result = match proxy_helpers::resolve_virtual_download_from_members(
                     members,
                     proxy_for_virtual,
                     path,
                     Some(ctx),
                     local_fetch,
                 )
-                .await?;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(resp) => {
+                        return maven_virtual_age_gate_answer(Err(resp), age_refusal);
+                    }
+                };
 
                 // Only the winning member's result reaches here, so this counts once;
                 // proxy-member and row-less legacy serves carry `None` (#1278).
-                if let Some(artifact_id) = result.artifact_id {
-                    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx)
+                let hosted_checksums = match result.artifact_id {
+                    Some(artifact_id) => {
+                        crate::services::artifact_service::record_download(
+                            &state.db,
+                            artifact_id,
+                            ctx,
+                        )
                         .await;
-                }
+                        hosted_maven_checksums(&state.db, artifact_id).await
+                    }
+                    None => None,
+                };
 
-                return proxy_helpers::stream_fetch_result(
-                    result,
-                    content_type_for_path(path),
-                    None,
-                );
+                let mut response =
+                    proxy_helpers::stream_fetch_result(result, content_type_for_path(path), None)?;
+                // #4573: a hosted member's serve carries the checksums its
+                // own hosted route sends.
+                if let (Some((sha1, md5)), StatusCode::OK) = (hosted_checksums, response.status()) {
+                    insert_maven_checksum_headers(
+                        response.headers_mut(),
+                        sha1.as_deref(),
+                        md5.as_deref(),
+                    );
+                }
+                return Ok(response);
             }
 
             // Legacy hosted fallback for repositories populated before Maven
@@ -3272,7 +3972,20 @@ async fn serve_artifact(
             // under the scoped scheme (checksums, verbatim metadata) live at
             // `maven/{repo.id}/{path}`. The key embeds this repository's id,
             // so it needs no attribution gate.
-            if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
+            //
+            // #4837: scoped keys exist only for uploads this server performed
+            // under the scoped scheme, and every non-row-less one of those also
+            // inserts its `artifacts` row in the same request. A REAL artifact
+            // coordinate reaching this point with no live row therefore has no
+            // publish behind it — it is the object of an upload whose ledger
+            // transaction failed (see `discard_failed_maven_publish`), and the
+            // scoped prefix must not turn that rejected deploy into a 200. Only
+            // the two path classes the scoped read exists for are served here;
+            // published artifacts resolve through their row above.
+            let rowless = is_rowless_maven_path(path);
+            if rowless
+                && (repo.repo_type == RepositoryType::Local
+                    || repo.repo_type == RepositoryType::Staging)
             {
                 if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env()
                     .scoped_read_key(&repo.storage_backend, "maven", repo.id, path)
@@ -3386,13 +4099,28 @@ fn checksum_compute_eligible(repo_type: &str) -> bool {
     repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging
 }
 
-async fn serve_computed_checksum(
-    state: &SharedState,
+/// The hosted artifact row a checksum request describes (#4288 item 2): the
+/// exact path, or for a `-SNAPSHOT` alias the latest timestamped row, the
+/// same resolution the artifact read uses.
+struct ChecksumTarget {
+    id: uuid::Uuid,
+    /// The resolved artifact path: `base_path` itself, or the timestamped
+    /// name a `-SNAPSHOT` alias resolved to.
+    path: String,
+    storage_key: String,
+    checksum_sha256: String,
+}
+
+/// Resolve [`ChecksumTarget`] for `base_path` in a hosted repository.
+/// `Ok(None)` when no live row describes the path (nothing to gate, nothing
+/// to compute). A failed query (exact path or `-SNAPSHOT` alias) is an error,
+/// never `None`, so a database fault cannot let a stored sidecar answer
+/// without its gate.
+async fn resolve_checksum_target(
+    db: &PgPool,
     repo_id: uuid::Uuid,
-    location: &crate::storage::StorageLocation,
     base_path: &str,
-    checksum_type: ChecksumType,
-) -> Result<Response, Response> {
+) -> Result<Option<ChecksumTarget>, Response> {
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, checksum_sha256
@@ -3405,35 +4133,61 @@ async fn serve_computed_checksum(
         repo_id,
         base_path,
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
     .map_err(map_db_err)?;
 
-    // If the exact path was not found and this is a SNAPSHOT request, resolve
-    // the `-SNAPSHOT` filename to the latest timestamped version.
-    let (resolved_storage_key, resolved_sha256) = match artifact {
-        Some(a) => (a.storage_key, a.checksum_sha256),
-        None => {
-            if base_path.contains("-SNAPSHOT") {
-                let resolved = resolve_snapshot_artifact(&state.db, repo_id, base_path)
-                    .await
-                    .ok_or_else(|| {
-                        AppError::NotFound("File not found".to_string()).into_response()
-                    })?;
-                (resolved.storage_key, resolved.checksum_sha256)
-            } else {
-                return Err(AppError::NotFound("File not found".to_string()).into_response());
-            }
-        }
-    };
+    if let Some(a) = artifact {
+        return Ok(Some(ChecksumTarget {
+            id: a.id,
+            path: base_path.to_string(),
+            storage_key: a.storage_key,
+            checksum_sha256: a.checksum_sha256,
+        }));
+    }
+    if !base_path.contains("-SNAPSHOT") {
+        return Ok(None);
+    }
+    Ok(fetch_snapshot_artifact(db, repo_id, base_path)
+        .await
+        .map_err(map_db_err)?
+        .map(|r| ChecksumTarget {
+            id: r.id,
+            path: r.path,
+            storage_key: r.storage_key,
+            checksum_sha256: r.checksum_sha256,
+        }))
+}
 
+/// Apply the described artifact's download gate (quarantine, then scan
+/// policy) to its checksum (#4288 item 2). A refusal answers 404, as if no
+/// checksum existed: the hash of a held artifact is not served, and the 404
+/// says nothing the artifact route does not. A gate that cannot decide
+/// (database error) is that error, never a served checksum.
+async fn gate_checksum_target(db: &PgPool, target: &ChecksumTarget) -> Result<(), Response> {
+    match crate::services::quarantine_service::check_artifact_download(db, target.id).await {
+        Ok(()) => Ok(()),
+        Err(AppError::Conflict(_)) | Err(AppError::Authorization(_)) => {
+            Err(AppError::NotFound("File not found".to_string()).into_response())
+        }
+        Err(e) => Err(e.into_response()),
+    }
+}
+
+/// Serve the checksum of an already resolved and gated [`ChecksumTarget`].
+async fn serve_computed_checksum(
+    state: &SharedState,
+    location: &crate::storage::StorageLocation,
+    target: &ChecksumTarget,
+    checksum_type: ChecksumType,
+) -> Result<Response, Response> {
     // For SHA-256 we already have it stored
     let checksum = match checksum_type {
-        ChecksumType::Sha256 => resolved_sha256,
+        ChecksumType::Sha256 => target.checksum_sha256.clone(),
         _ => {
             let storage = state.storage_for_repo_or_500(location)?;
             let content = storage
-                .get(&resolved_storage_key)
+                .get(&target.storage_key)
                 .await
                 .map_err(map_storage_err)?;
             compute_checksum(&content, checksum_type)
@@ -3482,18 +4236,18 @@ pub(crate) fn maven_version_directory(path: &str) -> Option<&str> {
     path.rfind('/').map(|i| &path[..=i])
 }
 
-fn maven_package_name(coords: &MavenCoordinates) -> String {
+pub(crate) fn maven_package_name(coords: &MavenCoordinates) -> String {
     format!("{}:{}", coords.group_id, coords.artifact_id)
 }
 
-fn maven_package_description(metadata: &serde_json::Value) -> Option<String> {
+pub(crate) fn maven_package_description(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("description")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
 }
 
-fn build_maven_package_catalog_metadata(
+pub(crate) fn build_maven_package_catalog_metadata(
     coords: &MavenCoordinates,
     metadata: &serde_json::Value,
 ) -> serde_json::Value {
@@ -3514,6 +4268,151 @@ fn build_maven_package_catalog_metadata(
 
 fn should_enqueue_maven_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
+}
+
+/// Take the transaction-scoped lock that serialises every decision about the
+/// object at one hosted Maven storage key (#4837).
+///
+/// Two holders exist: the publishing transaction of `upload` (which holds it
+/// across the storage write, so a competing first upload cannot overwrite the
+/// winner's object, #4892) and the cleanup in
+/// [`discard_failed_maven_publish`]. The lock name is the physical object:
+/// backend plus key, plus the repository id on repo-isolated backends
+/// (filesystem), where the same key string in two repositories names two
+/// different objects. A hash collision between two names only serialises two
+/// unrelated publishes; it never lets two holders of one name overlap.
+async fn lock_maven_publish_key(
+    conn: &mut sqlx::PgConnection,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<(), sqlx::Error> {
+    let scope = if crate::storage::registry::backend_is_repo_isolated(storage_backend) {
+        repository_id.to_string()
+    } else {
+        String::new()
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "maven-publish\u{1f}{storage_backend}\u{1f}{scope}\u{1f}{storage_key}"
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Discard the object a hosted Maven upload wrote when the publish it was
+/// written for never commits (#4837).
+///
+/// `upload` now stores the bytes INSIDE the transaction that inserts the
+/// `artifacts` and `artifact_metadata` rows (#4892), while holding
+/// [`lock_maven_publish_key`]. If that transaction fails after the write, or
+/// its commit fails, the client gets an error while the object may stay at
+/// `storage_key`, and the download path's row-less storage fallbacks would
+/// keep serving the rejected deploy, outside the catalog's quarantine, scan,
+/// lifecycle and download accounting.
+///
+/// # Concurrent publishes of the same key
+///
+/// Every upload of one coordinate writes the same key. This cleanup and a
+/// publishing transaction both hold [`lock_maven_publish_key`] for the key:
+///
+/// * The publishing transaction holds the lock across its storage write and
+///   its commit. A competing first upload therefore waits before it can
+///   write, then sees the winner's committed row for an immutable coordinate
+///   and answers 409 without touching the winner's object. There is no
+///   post-write restore window left for a cleanup to race into.
+/// * The cleanup decides under the same lock: a live `artifacts` row naming
+///   the key means a publish has committed, and the object is left alone.
+///   While a publish transaction holds the lock the cleanup waits, and it then
+///   sees that transaction's committed row (or its rollback, in which case the
+///   failed upload runs its own cleanup).
+///
+/// The guarantee: an `artifacts` row that commits always names an object
+/// that was present when it committed, and an object left with no row is
+/// one no publish is still going to claim.
+///
+/// The lock is held across the storage delete, which only happens on this
+/// failure path. A republishable `-SNAPSHOT` overwrite writes its new bytes
+/// to an already-published artifact's key, so the live-row rule also keeps a
+/// failed republish from deleting a published artifact's object.
+///
+/// Best-effort by design: the caller is already returning the failure that
+/// triggered this, and a cleanup error must never replace that response. Any
+/// error before the delete keeps the object (fail closed). The flat-key claim
+/// is released only after the object is gone, in the same locked
+/// transaction: releasing it on a failed delete would let another repository
+/// claim, and then be served, bytes this repository could not reclaim
+/// (#2584). A delete that fails leaves an object with no catalog row, which
+/// the row-driven orphan sweep cannot see, so the warning names the key.
+async fn discard_failed_maven_publish(
+    db: &PgPool,
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+    claim: crate::services::maven_flat_attribution::FlatKeyWriteClaim,
+) {
+    let result: Result<(), String> = async {
+        let mut tx = db.begin().await.map_err(|e| e.to_string())?;
+        lock_maven_publish_key(&mut tx, repository_id, storage_backend, storage_key)
+            .await
+            .map_err(|e| e.to_string())?;
+        // On a repo-isolated backend the same key string in another
+        // repository is a different object, so only this repository's rows
+        // count there. On a shared namespace any live row naming the key
+        // shares the object.
+        let still_published = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM artifacts \
+             WHERE storage_key = $1 AND is_deleted = false \
+               AND (repository_id = $2 OR NOT $3))",
+        )
+        .bind(storage_key)
+        .bind(repository_id)
+        .bind(crate::storage::registry::backend_is_repo_isolated(
+            storage_backend,
+        ))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if still_published {
+            return Ok(());
+        }
+        if let Err(e) = storage.delete(storage_key).await {
+            warn!(
+                error = %e,
+                storage_key = %storage_key,
+                "failed to remove the object of an uncommitted Maven publish; it stays \
+                 unreferenced in storage and needs manual cleanup"
+            );
+            return Ok(());
+        }
+        if let Err(e) = crate::services::maven_flat_attribution::release_flat_key_claim(
+            &mut *tx,
+            claim,
+            repository_id,
+            storage_backend,
+            storage_key,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                storage_key = %storage_key,
+                "failed to release flat-key write claim after a failed Maven publish; \
+                 a later write or the migration-163 backfill will reconcile it"
+            );
+        }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+    .await;
+    if let Err(e) = result {
+        warn!(
+            error = %e,
+            storage_key = %storage_key,
+            "could not settle the object of a failed Maven publish; keeping it"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3583,13 +4482,20 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
-    // Stream the request body to a bounded scratch file, computing
-    // SHA-256/SHA-1/MD5 in one pass — never buffering the artifact in memory
-    // (#2517). All three branches below (checksum sidecar, maven-metadata.xml,
-    // and the artifact itself) store from the staged file. The stager enforces
-    // `max_upload_size_bytes` mid-stream (413 on breach).
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stage the request body, computing SHA-256/SHA-1/MD5 in one pass and
+    // never buffering the artifact in memory (#2517): on the repository's own
+    // backend when it streams natively (S3, GCS, Azure; #3916), so a large jar
+    // needs no local disk, else in a bounded scratch file. All three branches
+    // below (checksum sidecar, maven-metadata.xml, and the artifact itself)
+    // store from the staged body. The stager enforces `max_upload_size_bytes`
+    // mid-stream (413 on breach).
+    let (staged, digests) = super::repositories::GenericStagedBody::stage(
+        &state,
+        &repo.storage_location(),
+        super::repositories::stages_on_backend(&repo.storage_backend, storage.as_ref()),
+        body.into_data_stream(),
+    )
+    .await?;
 
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return.
     // These row-less puts create no artifact row, so attribution is committed
@@ -3600,7 +4506,7 @@ async fn upload(
         // bytes and the attributed owner can never disagree (#2586). Release the
         // freshly-inserted claim if the put itself fails (V3b). The staged
         // stream is opened first so a local scratch-file failure never claims.
-        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+        let write = staged.prepare_write().await?;
         let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
@@ -3609,7 +4515,7 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
-        if let Err(e) = storage.put_stream(&storage_key, stream).await {
+        if let Err(e) = write.write(storage.as_ref(), &storage_key).await {
             release_flat_key_claim_best_effort(
                 &state.db,
                 claim,
@@ -3628,11 +4534,18 @@ async fn upload(
 
     // If this is a maven-metadata.xml upload, just store it. Row-less put: same
     // claim-on-write-success rule as the checksum branch (#2574, V3b).
+    //
+    // #4889 decision: this document deliberately stays row-less and is not
+    // pushed to peers. It is a mutable aggregate of the versions the peer
+    // receives, not a publishable coordinate; giving it an artifact row would
+    // make a generated index look like a release and let one deploy's snapshot
+    // overwrite the peer's own generated view. Peer metadata is regenerated
+    // from the replicated versioned artifacts and converges on its own.
     if MavenHandler::is_metadata(&path) {
         // Row-less metadata put: atomic claim-gate before the write, same as the
         // checksum branch (#2586); release on put failure (V3b). Staged stream
         // opened first so a local scratch-file failure never claims.
-        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+        let write = staged.prepare_write().await?;
         let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
@@ -3641,7 +4554,7 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
-        if let Err(e) = storage.put_stream(&storage_key, stream).await {
+        if let Err(e) = write.write(storage.as_ref(), &storage_key).await {
             release_flat_key_claim_best_effort(
                 &state.db,
                 claim,
@@ -3727,53 +4640,22 @@ async fn upload(
     )
     .await?;
 
-    // Atomically claim the flat key BEFORE writing its bytes so that of two
-    // concurrent first-publishers of the same key exactly one proceeds and the
-    // other is refused (#2586). This runs after coordinate parsing + the
-    // duplicate check, so an invalid/aborted request never claims (V3b); if the
-    // put fails, the freshly-inserted claim is released below. The staged
-    // stream is opened first so a local scratch-file failure never claims.
-    let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
-    let flat_key_claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
-        &state.db,
-        repo.id,
-        &repo.storage_backend,
-        &storage_key,
-    )
-    .await
-    .map_err(|e| e.into_response())?;
-
-    // Store file in object storage regardless of grouping outcome — streamed
-    // from the staged scratch file, not a heap buffer (#2517).
-    if let Err(e) = storage.put_stream(&storage_key, stream).await {
-        release_flat_key_claim_best_effort(
-            &state.db,
-            flat_key_claim,
-            repo.id,
-            &repo.storage_backend,
-            &storage_key,
-        )
-        .await;
-        return Err(map_storage_err(e));
-    }
-
     // Build metadata JSON for this physical Maven file. `parse_metadata` only
     // inspects the body for POM files (small XML); every other maven file (jars,
     // ...) derives its metadata from the coordinates alone. Read the small POM
-    // back from the staged file; skip the read entirely for everything else so a
-    // large artifact is never materialised in memory.
+    // back from the staged file before the publish transaction: a POM that
+    // cannot be read is rejected without writing anything.
     let handler = MavenHandler::new();
     let pom_bytes = if MavenHandler::is_pom(&path) {
-        Bytes::from(
-            tokio::fs::read(staged.path())
-                .await
-                .map_err(|e| proxy_helpers::internal_error("Reading staged POM", e))?,
-        )
+        match staged.read_all(storage.as_ref()).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(proxy_helpers::internal_error("Reading staged POM", e));
+            }
+        }
     } else {
         Bytes::new()
     };
-    // Scratch file no longer needed once the object is stored and any POM read.
-    drop(staged);
     let mut file_metadata =
         crate::formats::FormatHandler::parse_metadata(&handler, &path, &pom_bytes)
             .await
@@ -3808,81 +4690,184 @@ async fn upload(
         file_metadata["classifier"] = serde_json::Value::String(classifier.clone());
     }
 
+    // Atomically claim the flat key BEFORE writing its bytes so a cross-
+    // repository first publish cannot race us (#2586). The claim is re-asserted
+    // inside the publishing transaction below, under the per-key lock, because
+    // a concurrent failed publish's cleanup may have released it in between.
+    let flat_key_claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &storage_key,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
     // The artifact row and its `artifact_metadata` row commit together, as
     // `upload.rs` and `artifact_service.rs` already do for the shared upload
     // path (#3587 review): a metadata write that fails after the row landed
     // would otherwise leave a live artifact with no Maven metadata, and a
     // concurrent republish must never observe the row without it.
-    let mut tx = state.db.begin().await.map_err(map_db_err)?;
-    super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
-        .await?;
-    let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as(
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_sha1, checksum_md5,
-                content_type, storage_key, uploaded_by
+    //
+    // #4837/#4892: the storage write runs INSIDE this transaction, after
+    // `lock_maven_publish_key`. Two first uploads of one immutable coordinate
+    // therefore serialise here, and the second one sees the first one's
+    // committed row under the lock BEFORE its write, so it answers 409
+    // without ever touching the winner's object. The winner writes under the
+    // same lock, so no overlapping upload or failed-publish cleanup can
+    // replace the bytes the row names. Every failure after the write rolls the
+    // row back and runs `discard_failed_maven_publish`, which takes the same
+    // lock and removes the now-unreferenced object.
+    let published: Result<(uuid::Uuid, chrono::DateTime<chrono::Utc>), Response> = async {
+        let mut tx = state.db.begin().await.map_err(map_db_err)?;
+        lock_maven_publish_key(&mut tx, repo.id, &repo.storage_backend, &storage_key)
+            .await
+            .map_err(map_db_err)?;
+        // Decide the race for an immutable coordinate under the lock, BEFORE
+        // the write: every hosted publish of this key holds the lock across
+        // its write and its commit, so a row committed by a competing first
+        // upload is visible here, and the loser answers 409 without touching
+        // the winner's object (#4892). The upsert below keeps its
+        // `WHERE false` guard as the backstop for writers that do not take
+        // this lock.
+        if !republishable {
+            let taken: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false)",
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (repository_id, path) DO UPDATE SET
-                name = EXCLUDED.name,
-                version = EXCLUDED.version,
-                size_bytes = EXCLUDED.size_bytes,
-                checksum_sha256 = EXCLUDED.checksum_sha256,
-                checksum_sha1 = EXCLUDED.checksum_sha1,
-                checksum_md5 = EXCLUDED.checksum_md5,
-                content_type = EXCLUDED.content_type,
-                storage_key = EXCLUDED.storage_key,
-                uploaded_by = EXCLUDED.uploaded_by,
-                is_deleted = false,
-                updated_at = NOW()
-            WHERE $12::boolean
-            RETURNING id, created_at
+            .bind(repo.id)
+            .bind(&path)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+            if taken {
+                return Err(
+                    AppError::Conflict("Artifact already exists".to_string()).into_response()
+                );
+            }
+        }
+        // Re-assert the attribution claim under the lock: a cleanup that ran
+        // between the pre-write claim above and this transaction may have
+        // released it. The row and this claim commit or roll back together.
+        crate::services::maven_flat_attribution::claim_flat_key_for_write_on(
+            &mut tx,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+
+        // Store the file while holding only this key's publish lock. The
+        // repository-wide locks this transaction takes next (the quota
+        // admission's ledger and project rows, and the usage-ledger row the
+        // `artifacts` insert trigger updates) are acquired after the write,
+        // so a slow object write never stalls other uploads into the same
+        // repository or project. The bytes are streamed from the staged
+        // scratch file, not a heap buffer (#2517), or copied server-side from
+        // the staging object on the backend (#3916).
+        staged
+            .prepare_write()
+            .await?
+            .write(storage.as_ref(), &storage_key)
+            .await
+            .map_err(map_storage_err)?;
+
+        super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, &path, size_bytes)
+            .await?;
+        let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as(
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, checksum_sha1, checksum_md5,
+                    content_type, storage_key, uploaded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (repository_id, path) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    version = EXCLUDED.version,
+                    size_bytes = EXCLUDED.size_bytes,
+                    checksum_sha256 = EXCLUDED.checksum_sha256,
+                    checksum_sha1 = EXCLUDED.checksum_sha1,
+                    checksum_md5 = EXCLUDED.checksum_md5,
+                    content_type = EXCLUDED.content_type,
+                    storage_key = EXCLUDED.storage_key,
+                    uploaded_by = EXCLUDED.uploaded_by,
+                    is_deleted = false,
+                    updated_at = NOW()
+                WHERE $12::boolean
+                RETURNING id, created_at
+                "#,
+            )
+            .bind(repo.id)
+            .bind(&path)
+            .bind(&name)
+            .bind(&coords.version)
+            .bind(size_bytes)
+            .bind(&checksum_sha256)
+            .bind(&checksum_sha1)
+            .bind(&checksum_md5)
+            .bind(ct)
+            .bind(&storage_key)
+            .bind(user_id)
+            .bind(republishable)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
+            // row: a concurrent PUT won the race between the duplicate check above
+            // and this statement. Answer it the same 409 the check itself would
+            // have, rather than the 500 the bare INSERT raised (#3587). Hosted
+            // publishes of this key are already decided by the locked check
+            // above (#4892); this guards writers that do not take the lock.
+            .ok_or_else(|| {
+                AppError::Conflict("Artifact already exists".to_string()).into_response()
+            })?;
+
+        // The durable attribution claim for this key was already committed by
+        // the atomic `claim_flat_key_for_write` gate above (before the write),
+        // so it is not re-inserted here. The live `artifacts` row also
+        // attributes the key (resolution layer (a)); the durable claim
+        // additionally keeps ownership after a later soft-delete of the row,
+        // matching the #2504 write guard's soft-delete awareness.
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_metadata (artifact_id, format, metadata)
+            VALUES ($1, 'maven', $2)
+            ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
             "#,
         )
-        .bind(repo.id)
-        .bind(&path)
-        .bind(&name)
-        .bind(&coords.version)
-        .bind(size_bytes)
-        .bind(&checksum_sha256)
-        .bind(&checksum_sha1)
-        .bind(&checksum_md5)
-        .bind(ct)
-        .bind(&storage_key)
-        .bind(user_id)
-        .bind(republishable)
-        .fetch_optional(&mut *tx)
+        .bind(artifact_id)
+        .bind(&file_metadata)
+        .execute(&mut *tx)
         .await
-        .map_err(map_db_err)?
-        // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
-        // row: a concurrent PUT won the race between the duplicate check above
-        // and this statement. Answer it the same 409 the check itself would
-        // have, rather than the 500 the bare INSERT raised (#3587).
-        .ok_or_else(|| AppError::Conflict("Artifact already exists".to_string()).into_response())?;
+        .map_err(map_db_err)?;
 
-    // The durable attribution claim for this key was already committed by the
-    // atomic `claim_flat_key_for_write` gate above (before the put), so it is
-    // not re-inserted here. The live `artifacts` row also attributes the key
-    // (resolution layer (a)); the durable claim additionally keeps ownership
-    // after a later soft-delete of the row, matching the #2504 write guard's
-    // soft-delete awareness.
+        tx.commit().await.map_err(map_db_err)?;
+        Ok((artifact_id, artifact_created))
+    }
+    .await;
+    // The staged body is no longer needed once the publish has settled; the
+    // write above consumed it inside the locked transaction.
+    staged.discard().await;
 
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'maven', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(&file_metadata)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_db_err)?;
-
-    tx.commit().await.map_err(map_db_err)?;
+    let (artifact_id, artifact_created) = match published {
+        Ok(published) => published,
+        Err(response) => {
+            discard_failed_maven_publish(
+                &state.db,
+                &storage,
+                repo.id,
+                &repo.storage_backend,
+                &storage_key,
+                flat_key_claim,
+            )
+            .await;
+            return Err(response);
+        }
+    };
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -5282,6 +6267,66 @@ mod tests {
         assert!(xml.contains("<value>1.0-20260702.120000-1</value>"));
     }
 
+    /// #4889 decision: a client-deployed `maven-metadata.xml` stays row-less
+    /// and is never queued to push peers. Only the versioned files travel; the
+    /// peer regenerates its metadata from those rows (see the snapshot test
+    /// above). This pins the decision so a later change that gives the
+    /// document a row, and so a push, is a deliberate one.
+    #[tokio::test]
+    async fn client_maven_metadata_xml_is_not_pushed_4889() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "maven-4889").await;
+        let router = fx.router_with_auth(super::router());
+        let jar = "org/example/ak/push/lib/1.0/lib-1.0.jar";
+        let metadata = "org/example/ak/push/lib/maven-metadata.xml";
+        let uploads = [
+            (jar, bytes::Bytes::from_static(b"release jar bytes")),
+            (
+                metadata,
+                bytes::Bytes::from_static(
+                    br#"<metadata><groupId>org.example.ak.push</groupId><artifactId>lib</artifactId><versioning><release>1.0</release><versions><version>1.0</version></versions></versioning></metadata>"#,
+                ),
+            ),
+        ];
+        let mut statuses = Vec::new();
+        for (path, body) in uploads {
+            let (status, _) = tdh::send(
+                router.clone(),
+                tdh::put(format!("/{}/{}", fx.repo_key, path), body),
+            )
+            .await;
+            statuses.push(status);
+        }
+
+        let queued = tdh::queued_push_paths_settled(&fx.pool, peer_id, fx.repo_id, jar).await;
+        let metadata_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(metadata)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count metadata rows");
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::CREATED),
+            "both deploys must succeed: {statuses:?}"
+        );
+        assert_eq!(metadata_rows, 0, "maven-metadata.xml must stay row-less");
+        assert_eq!(
+            queued,
+            vec![jar.to_string()],
+            "only the versioned file is pushed; peers regenerate maven-metadata.xml"
+        );
+    }
+
     // ── DB-backed HTTP-level regression tests (no_op without DATABASE_URL) ──
     //
     // These exercise the maven `download` handler end-to-end through the
@@ -6156,6 +7201,741 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    /// Install a BEFORE INSERT OR UPDATE trigger on `artifact_metadata` that
+    /// runs `body` (PL/pgSQL statements) for rows whose metadata mentions
+    /// `artifact_id`, so a test can fail or delay the ledger write of exactly
+    /// one coordinate without touching any other test sharing the database
+    /// (#4837). Returns the SQL that removes it again.
+    async fn install_maven_metadata_fault_4837(
+        pool: &sqlx::PgPool,
+        suffix: &str,
+        artifact_id: &str,
+        declare: &str,
+        body: &str,
+    ) -> String {
+        let func = format!("ak_test_meta_fault_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+             {declare} BEGIN \
+               IF NEW.metadata::text LIKE '%{artifact_id}%' THEN {body} END IF; \
+               RETURN NEW; \
+             END $f$"
+        )))
+        .execute(pool)
+        .await
+        .expect("create fault function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON artifact_metadata \
+             FOR EACH ROW EXECUTE FUNCTION {func}()"
+        )))
+        .execute(pool)
+        .await
+        .expect("create fault trigger");
+        format!(
+            "DROP TRIGGER IF EXISTS {func} ON artifact_metadata; DROP FUNCTION IF EXISTS {func}()"
+        )
+    }
+
+    /// Install a BEFORE INSERT OR UPDATE trigger on `artifacts` that runs
+    /// `body` for the row whose SHA-256 is `checksum_sha256` (#4892). A test
+    /// uses it to park one upload inside its publish transaction -- after the
+    /// upsert and therefore while it holds the per-key publish lock -- without
+    /// delaying any other artifact. Returns the SQL that removes it again.
+    async fn install_maven_artifact_fault_4892(
+        pool: &sqlx::PgPool,
+        suffix: &str,
+        checksum_sha256: &str,
+        body: &str,
+    ) -> String {
+        let func = format!("ak_test_artifact_fault_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger AS $$ \
+             BEGIN \
+               IF NEW.checksum_sha256 = '{checksum_sha256}' THEN {body} END IF; \
+               RETURN NEW; \
+             END; \
+             $$ LANGUAGE plpgsql"
+        )))
+        .execute(pool)
+        .await
+        .expect("create artifact fault function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON artifacts \
+             FOR EACH ROW EXECUTE FUNCTION {func}()"
+        )))
+        .execute(pool)
+        .await
+        .expect("create artifact fault trigger");
+        format!("DROP TRIGGER IF EXISTS {func} ON artifacts; DROP FUNCTION IF EXISTS {func}()")
+    }
+
+    /// #4837 (a): a hosted upload on the repo-scoped key scheme whose ledger
+    /// transaction fails must not leave its bytes downloadable. The object is
+    /// written inside the transaction, so without the cleanup the rollback
+    /// left the jar at `maven/{repo_id}/{path}` and the scoped storage fallback
+    /// served it with a 200 although the client was told the deploy failed.
+    /// The retry with the fault removed is the positive control: it proves
+    /// the key layout the absence check looks at.
+    #[tokio::test]
+    async fn test_failed_hosted_upload_leaves_no_downloadable_object_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let aid = format!("orphan4837x{}", &suffix[..12]);
+        let drop_sql = install_maven_metadata_fault_4837(
+            &pool,
+            &suffix,
+            &aid,
+            "",
+            "RAISE EXCEPTION 'injected artifact_metadata failure (#4837)';",
+        )
+        .await;
+
+        let path = format!("com/example/orphan4837/{aid}/1.0.0/{aid}-1.0.0.jar");
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let jar = bytes::Bytes::from_static(b"rejected-jar-bytes-4837");
+        let (put_status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{path}"), jar.clone()),
+        )
+        .await;
+        for stmt in drop_sql.split("; ") {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
+                .execute(&pool)
+                .await
+                .expect("drop fault");
+        }
+        let object_left = mem.objects.lock().unwrap().contains_key(&scoped_key);
+        let live_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        let (get_status, _) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        // Positive control: with the fault gone the same PUT publishes at the
+        // very key the absence check above looked at.
+        let retry = bytes::Bytes::from_static(b"accepted-jar-bytes-4837");
+        let (retry_status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{path}"), retry.clone()),
+        )
+        .await;
+        let retry_stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let (retry_get, retry_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            put_status.is_server_error(),
+            "the upload whose metadata write failed must fail, got {put_status}"
+        );
+        assert_eq!(live_rows, 0, "the failed upload must leave no live row");
+        assert!(
+            !object_left,
+            "#4837: the failed upload's object must be removed from {scoped_key}"
+        );
+        assert_eq!(
+            get_status,
+            StatusCode::NOT_FOUND,
+            "#4837: the rejected deploy must not be downloadable"
+        );
+        assert_eq!(retry_status, StatusCode::CREATED, "retry must publish");
+        assert_eq!(
+            retry_stored,
+            Some(retry.clone()),
+            "retry lands at the scoped key"
+        );
+        assert_eq!(retry_get, StatusCode::OK);
+        assert_eq!(retry_body, retry);
+    }
+
+    /// #4837 (b): the repo-scoped storage fallback in `serve_artifact` exists
+    /// for the row-less puts only. An object at the scoped key of a real
+    /// artifact coordinate with no `artifacts` row was never published and
+    /// must 404, while a checksum sidecar and a verbatim `maven-metadata.xml`
+    /// at their scoped keys are still served (the controls).
+    #[tokio::test]
+    async fn test_scoped_object_without_row_is_not_served_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let jar_path = "com/example/rowless4837/demo/1.0.0/demo-1.0.0.jar";
+        let pom_path = "com/example/rowless4837/demo/1.0.0/demo-1.0.0.pom";
+        let sha1_path = format!("{jar_path}.sha1");
+        let meta_path = "com/example/rowless4837/demo/maven-metadata.xml";
+        let sha1 = bytes::Bytes::from_static(b"0123456789abcdef0123456789abcdef01234567");
+        let meta = bytes::Bytes::from_static(
+            b"<metadata><groupId>com.example.rowless4837</groupId>\
+              <artifactId>demo</artifactId><versioning><versions>\
+              <version>1.0.0</version></versions></versioning></metadata>",
+        );
+        {
+            let mut objects = mem.objects.lock().unwrap();
+            objects.insert(
+                format!("maven/{repo_id}/{jar_path}"),
+                bytes::Bytes::from_static(b"never-published-jar"),
+            );
+            objects.insert(
+                format!("maven/{repo_id}/{pom_path}"),
+                bytes::Bytes::from_static(b"<project/>"),
+            );
+            objects.insert(format!("maven/{repo_id}/{sha1_path}"), sha1.clone());
+            objects.insert(format!("maven/{repo_id}/{meta_path}"), meta.clone());
+        }
+
+        let (jar_status, _) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{jar_path}"))).await;
+        let (pom_status, _) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{pom_path}"))).await;
+        let (sha1_status, sha1_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{sha1_path}"))).await;
+        let (meta_status, meta_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{meta_path}"))).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            jar_status,
+            StatusCode::NOT_FOUND,
+            "#4837: a scoped jar with no artifacts row was never published"
+        );
+        assert_eq!(
+            pom_status,
+            StatusCode::NOT_FOUND,
+            "#4837: a scoped pom with no artifacts row was never published"
+        );
+        assert_eq!(
+            sha1_status,
+            StatusCode::OK,
+            "scoped checksum sidecar served"
+        );
+        assert_eq!(sha1_body, sha1);
+        assert_eq!(
+            meta_status,
+            StatusCode::OK,
+            "scoped maven-metadata.xml served"
+        );
+        assert_eq!(meta_body, meta);
+    }
+
+    /// #4837 review: the failed-publish cleanup must not destroy the bytes of
+    /// an overlapping first publish of the same coordinate. Both PUTs share
+    /// one storage key. The trigger numbers the metadata writes for this
+    /// artifactId: write 1 sleeps and raises, write 2 sleeps and succeeds.
+    /// PUT 2 starts while PUT 1 is inside its transaction. Since #4892 PUT 2
+    /// waits on the publish lock before it writes, so PUT 1's cleanup can only
+    /// run before PUT 2's write or after PUT 2 commits. The test still guards
+    /// the outcome: the failed publisher must not delete the winner's object
+    /// and the winner must commit a row whose bytes are present.
+    #[tokio::test]
+    async fn test_failed_publish_cleanup_spares_overlapping_publish_4837() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        // Two uploads in flight plus the cleanup: more than the default
+        // three-connection test pool.
+        let Some(pool) = crate::testing::try_pool_with(8).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let aid = format!("race4837x{}", &suffix[..12]);
+        let seq = format!("ak_test_race_seq_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SEQUENCE {seq}")))
+            .execute(&pool)
+            .await
+            .expect("create sequence");
+        let drop_sql = install_maven_metadata_fault_4837(
+            &pool,
+            &suffix,
+            &aid,
+            "DECLARE n bigint;",
+            &format!(
+                "n := nextval('{seq}'); \
+                 IF n = 1 THEN PERFORM pg_sleep(2); \
+                   RAISE EXCEPTION 'injected artifact_metadata failure (first publisher)'; \
+                 ELSIF n = 2 THEN PERFORM pg_sleep(2); END IF;"
+            ),
+        )
+        .await;
+
+        let path = format!("com/example/race4837/{aid}/1.0.0/{aid}-1.0.0.jar");
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let first = bytes::Bytes::from_static(b"first-publisher-bytes-4837");
+        let second = bytes::Bytes::from_static(b"second-publisher-bytes-4837");
+        let put1 = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), first.clone())),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let put2 = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), second.clone())),
+        );
+        let status1 = put1.await.expect("join put 1").expect("put 1").status();
+        let status2 = put2.await.expect("join put 2").expect("put 2").status();
+
+        for stmt in drop_sql.split("; ") {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
+                .execute(&pool)
+                .await
+                .expect("drop fault");
+        }
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SEQUENCE IF EXISTS {seq}"
+        )))
+        .execute(&pool)
+        .await;
+        let stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let live_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            status1.is_server_error(),
+            "the first publisher's metadata write failed, got {status1}"
+        );
+        assert_eq!(
+            status2,
+            StatusCode::CREATED,
+            "the second publisher must win"
+        );
+        assert_eq!(live_rows, 1, "exactly the winner's row is live");
+        assert_eq!(
+            stored,
+            Some(second.clone()),
+            "the failed publisher's cleanup must not delete the winner's object"
+        );
+        assert_eq!(get_status, StatusCode::OK, "the published jar is served");
+        assert_eq!(get_body, second);
+    }
+
+    /// #4892: the publish lock must be taken before the storage write. While a
+    /// concurrent holder owns the lock, an upload may stage its body and claim
+    /// the flat key, but it must not put the object yet: that window is exactly
+    /// where a second upload of an immutable coordinate used to overwrite the
+    /// eventual winner's bytes before losing the row insert.
+    #[tokio::test]
+    async fn test_publish_takes_lock_before_storing_4892() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let Some(pool) = crate::testing::try_pool_with(6).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let path = "com/example/lock4892/demo/1.0.0/demo-1.0.0.jar";
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let jar = bytes::Bytes::from_static(b"locked-before-store-jar-4892");
+        let _ = sqlx::query(
+            "DELETE FROM maven_flat_object_owner \
+             WHERE storage_backend = 's3' AND storage_key = $1",
+        )
+        .bind(&scoped_key)
+        .execute(&pool)
+        .await;
+
+        let mut holder = pool.begin().await.expect("lock holder tx");
+        super::lock_maven_publish_key(&mut holder, repo_id, "s3", &scoped_key)
+            .await
+            .expect("take publish lock");
+        let put = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), jar.clone())),
+        );
+
+        // The pre-transaction claim is the last step before the upload takes
+        // the publish lock. On the fixed ordering the object is still absent
+        // when the claim appears; before #4892 the put had already landed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let claimed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM maven_flat_object_owner \
+                 WHERE storage_backend = 's3' AND storage_key = $1)",
+            )
+            .bind(&scoped_key)
+            .fetch_one(&pool)
+            .await
+            .expect("read claim");
+            if claimed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload never reached its pre-write claim"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Give a pre-#4892 put, which follows the claim directly, time to
+        // land, so the check below does not depend on poll timing. On the
+        // fixed ordering the upload is parked on the lock and stores nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let stored_while_locked = mem.objects.lock().unwrap().contains_key(&scoped_key);
+        holder.commit().await.expect("release publish lock");
+
+        let status = put.await.expect("join put").expect("put").status();
+        let stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let claim_owner: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT repository_id FROM maven_flat_object_owner \
+             WHERE storage_backend = 's3' AND storage_key = $1",
+        )
+        .bind(&scoped_key)
+        .fetch_optional(&pool)
+        .await
+        .expect("read claim");
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            !stored_while_locked,
+            "#4892: the object must not be stored while another holder owns the publish lock"
+        );
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(stored, Some(jar.clone()));
+        assert_eq!(claim_owner, Some(repo_id));
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_body, jar);
+    }
+
+    /// #4892 review: the storage write runs inside the publish transaction, so
+    /// it must come before the repository-wide row locks that transaction
+    /// takes (the usage-ledger row the `artifacts` insert trigger updates, and
+    /// the quota admission's ledger and project rows). Otherwise every hosted
+    /// Maven upload into one repository waits for any other one's object
+    /// write, holding a pool connection while it waits. The test holds the
+    /// repository's ledger row lock and requires the upload to store its
+    /// object anyway, then lets the commit through.
+    #[tokio::test]
+    async fn test_publish_stores_before_repository_ledger_lock_4892() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let Some(pool) = crate::testing::try_pool_with(6).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let path = "com/example/ledger4892/demo/1.0.0/demo-1.0.0.jar";
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let jar = bytes::Bytes::from_static(b"stored-before-ledger-lock-4892");
+
+        sqlx::query(
+            "INSERT INTO repository_usage_ledger (repository_id) VALUES ($1) \
+             ON CONFLICT (repository_id) DO NOTHING",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed ledger row");
+        let mut holder = pool.begin().await.expect("ledger holder tx");
+        sqlx::query("SELECT 1 FROM repository_usage_ledger WHERE repository_id = $1 FOR UPDATE")
+            .bind(repo_id)
+            .execute(&mut *holder)
+            .await
+            .expect("lock ledger row");
+
+        let put = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), jar.clone())),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stored_while_locked = false;
+        while std::time::Instant::now() < deadline {
+            if mem.objects.lock().unwrap().contains_key(&scoped_key) {
+                stored_while_locked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let finished_while_locked = put.is_finished();
+        holder.commit().await.expect("release ledger lock");
+
+        let status = put.await.expect("join put").expect("put").status();
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            stored_while_locked,
+            "the object write must not wait for the repository's usage-ledger row lock"
+        );
+        assert!(
+            !finished_while_locked,
+            "the artifacts insert does take the ledger row lock, so the upload \
+             cannot have committed while the test held it"
+        );
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_body, jar);
+    }
+
+    /// #4892: two concurrent first uploads of one immutable release coordinate.
+    /// The trigger parks the first upload after its upsert -- while it holds the
+    /// publish lock -- and the sequence (non-transactional, so visible before
+    /// commit) tells the test when to start the second. On the pre-fix ordering
+    /// the second upload writes the same key before it blocks on the lock,
+    /// replacing the winner's bytes while still losing the row insert; the
+    /// committed row then names bytes that are not in storage. With the write
+    /// under the lock, the loser never reaches storage at all.
+    #[tokio::test]
+    async fn test_concurrent_first_upload_loser_cannot_replace_winner_bytes_4892() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let Some(pool) = crate::testing::try_pool_with(8).await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let aid = format!("race4892x{}", &suffix[..12]);
+        let seq = format!("ak_test_race_seq_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SEQUENCE {seq}")))
+            .execute(&pool)
+            .await
+            .expect("create sequence");
+
+        let path = format!("com/example/race4892/{aid}/1.0.0/{aid}-1.0.0.jar");
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let first = bytes::Bytes::from_static(b"winner-release-bytes-4892");
+        let second = bytes::Bytes::from_static(b"loser-release-bytes-4892");
+        let first_sha = proxy_helpers::sha256_hex(&first);
+
+        let drop_sql = install_maven_artifact_fault_4892(
+            &pool,
+            &suffix,
+            &first_sha,
+            &format!("PERFORM nextval('{seq}'); PERFORM pg_sleep(4);"),
+        )
+        .await;
+        let _ = sqlx::query(
+            "DELETE FROM maven_flat_object_owner \
+             WHERE storage_backend = 's3' AND storage_key = $1",
+        )
+        .bind(&scoped_key)
+        .execute(&pool)
+        .await;
+
+        let put1 = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), first.clone())),
+        );
+        // Wait until the first upload is inside its upsert, i.e. it holds the
+        // publish lock. The sequence is non-transactional, so `is_called`
+        // flips before the transaction commits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let parked: bool =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT is_called FROM {seq}")))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read race sequence");
+            if parked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first upload never reached its publish upsert"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let put2 = tokio::spawn(
+            router
+                .clone()
+                .oneshot(tdh::put(format!("/{repo_key}/{path}"), second.clone())),
+        );
+        // Pre-fix, the loser stores its bytes during this window, before its
+        // transaction waits for the winner's lock.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        let status1 = put1.await.expect("join put 1").expect("put 1").status();
+        let status2 = put2.await.expect("join put 2").expect("put 2").status();
+
+        for stmt in drop_sql.split("; ") {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
+                .execute(&pool)
+                .await
+                .expect("drop fault");
+        }
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SEQUENCE IF EXISTS {seq}"
+        )))
+        .execute(&pool)
+        .await;
+
+        let stored = mem.objects.lock().unwrap().get(&scoped_key).cloned();
+        let live_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        let row_sha256: Option<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_optional(&pool)
+        .await
+        .expect("read row checksum");
+        let (get_status, get_body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(status1, StatusCode::CREATED, "the first publisher wins");
+        assert_eq!(
+            status2,
+            StatusCode::CONFLICT,
+            "the second publisher is rejected"
+        );
+        assert_eq!(live_rows, 1, "exactly the winner's row is live");
+        assert_eq!(
+            row_sha256.as_deref(),
+            Some(first_sha.as_str()),
+            "the committed row names the winner's checksum"
+        );
+        assert_eq!(
+            stored,
+            Some(first.clone()),
+            "#4892: the loser must not replace the winner's stored bytes"
+        );
+        assert_eq!(get_status, StatusCode::OK, "the published jar is served");
+        assert_eq!(get_body, first);
+    }
+
     /// #3181: `HEAD` on a Maven artifact served from a presigned-redirect
     /// backend must NOT be answered with a 302.
     ///
@@ -6685,6 +8465,14 @@ mod tests {
             insert_maven_artifact_row(&pool, hosted_id, user_id, "com.example.vdl", "counted")
                 .await;
         let path = "com/example/vdl/counted/1.0.0/counted-1.0.0.jar";
+        // The virtual serve verifies the stored bytes against the row (#4323),
+        // so the row records the real digest of the seeded `j`.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
+            .bind(crate::services::artifact_service::ArtifactService::calculate_sha256(b"j"))
+            .bind(artifact_row_id)
+            .execute(&pool)
+            .await
+            .expect("record the real digest");
 
         let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
         state
@@ -6871,6 +8659,268 @@ mod tests {
                 "#4286: GET {route} must be refused while the hosted repository's scan \
                  policy blocks the artifact"
             );
+        }
+    }
+
+    /// #4288 item 2: a hosted artifact's checksums (`.sha1`, `.md5`,
+    /// `.sha256`, stored sidecar or computed, exact path or `-SNAPSHOT`
+    /// alias, direct or through a virtual) get the artifact's own download
+    /// gate. While the artifact is quarantined or blocked by a scan policy
+    /// every checksum answers 404; before and after, each serves 200 with the
+    /// right digest (positive control in the same fixture).
+    #[tokio::test]
+    async fn test_checksums_of_gated_hosted_artifacts_are_404_4288() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (hosted_id, hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        tdh::link_virtual_member(&pool, virtual_id, hosted_id, 1).await;
+        tdh::publish_repo(&pool, hosted_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let jar_path = "com/example/gate4288/lib/1.0/lib-1.0.jar";
+        let snap_path = "com/example/gate4288/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/gate4288/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let jar_bytes = Bytes::from_static(b"gate4288-jar");
+        let snap_bytes = Bytes::from_static(b"gate4288-snap");
+        let jar_id = tdh::seed_artifact_with_checksum(
+            &state,
+            &pool,
+            &hosted,
+            &format!("maven/{jar_path}"),
+            jar_path,
+            "gate4288",
+            "1.0",
+            "application/java-archive",
+            jar_bytes.clone(),
+            user_id,
+            &compute_checksum(&jar_bytes, ChecksumType::Sha256),
+        )
+        .await;
+        let snap_id = tdh::seed_artifact_with_checksum(
+            &state,
+            &pool,
+            &hosted,
+            &format!("maven/{snap_path}"),
+            snap_path,
+            "gate4288",
+            "1.0-SNAPSHOT",
+            "application/java-archive",
+            snap_bytes.clone(),
+            user_id,
+            &compute_checksum(&snap_bytes, ChecksumType::Sha256),
+        )
+        .await;
+        // A stored sidecar for the jar, as a deploy writes it: the stored
+        // read is a separate branch from the computed one.
+        let stored_sha1 = compute_checksum(&jar_bytes, ChecksumType::Sha1);
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            &state,
+            &hosted,
+            &format!("maven/{jar_path}.sha1"),
+            Bytes::from(stored_sha1.clone()),
+        )
+        .await
+        .expect("store the jar's .sha1 sidecar");
+        let app = tdh::router_anon(super::router(), state);
+
+        // (route, digest the route must answer when allowed)
+        let probes = vec![
+            (
+                format!("/{hosted_key}/{jar_path}.sha1"),
+                stored_sha1.clone(),
+            ),
+            (
+                format!("/{hosted_key}/{jar_path}.md5"),
+                compute_checksum(&jar_bytes, ChecksumType::Md5),
+            ),
+            (
+                format!("/{hosted_key}/{jar_path}.sha256"),
+                compute_checksum(&jar_bytes, ChecksumType::Sha256),
+            ),
+            (
+                format!("/{hosted_key}/{snap_alias}.sha1"),
+                compute_checksum(&snap_bytes, ChecksumType::Sha1),
+            ),
+            (
+                format!("/{virtual_key}/{jar_path}.sha1"),
+                compute_checksum(&jar_bytes, ChecksumType::Sha1),
+            ),
+            (
+                format!("/{virtual_key}/{snap_alias}.md5"),
+                compute_checksum(&snap_bytes, ChecksumType::Md5),
+            ),
+        ];
+        let probe = |app: axum::Router| {
+            let probes = probes.clone();
+            async move {
+                let mut out = Vec::new();
+                for (route, digest) in probes {
+                    let (status, body) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+                    out.push((route, status, body == digest.as_bytes()));
+                }
+                out
+            }
+        };
+
+        let before = probe(app.clone()).await;
+        // A permanent hold (admin or scan-policy quarantine): 409 on the
+        // artifact route, so its checksums must not answer either.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL \
+             WHERE id = ANY($1)",
+        )
+        .bind(vec![jar_id, snap_id])
+        .execute(&pool)
+        .await
+        .expect("quarantine both artifacts");
+        let quarantined = probe(app.clone()).await;
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'released' WHERE id = ANY($1)")
+            .bind(vec![jar_id, snap_id])
+            .execute(&pool)
+            .await
+            .expect("release both artifacts");
+        let released = probe(app.clone()).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-4288-maven-{hosted_id}"))
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let blocked = probe(app.clone()).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        let after = probe(app).await;
+
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        for (route, status, matched) in before.iter().chain(released.iter()).chain(after.iter()) {
+            assert!(
+                *status == StatusCode::OK && *matched,
+                "positive control: GET {route} must answer the digest while the artifact \
+                 is downloadable (HTTP {status}, digest matched: {matched})"
+            );
+        }
+        for (phase, results) in [
+            ("quarantined", &quarantined),
+            ("scan-policy blocked", &blocked),
+        ] {
+            for (route, status, _) in results {
+                assert_eq!(
+                    *status,
+                    StatusCode::NOT_FOUND,
+                    "#4288: GET {route} must be 404 while the artifact is {phase}"
+                );
+            }
+        }
+    }
+
+    /// #4288 item 2: a database error while resolving a `-SNAPSHOT` alias to
+    /// its timestamped row is an error, never "no artifact". `None` would let
+    /// a stored sidecar under the alias name (or a later lookup that
+    /// succeeds) answer without the artifact's gate.
+    ///
+    /// The fault is injected on the second statement only: the pool's first
+    /// connection serves the exact-path query, and every later acquire must
+    /// open a new connection, which `after_connect` refuses.
+    #[tokio::test]
+    async fn test_checksum_target_snapshot_lookup_error_fails_closed_4288() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let url = crate::testing::require_db_url().expect("DATABASE_URL");
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let state = tdh::build_state(pool.clone(), repo_dir.to_str().unwrap());
+        let repo = tdh::make_repo_info(repo_id, &repo_key, &repo_dir, "local", None);
+        let snap_path = "com/example/gate4288db/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/gate4288db/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let bytes = Bytes::from_static(b"gate4288-db-fault");
+        tdh::seed_artifact_with_checksum(
+            &state,
+            &pool,
+            &repo,
+            &format!("maven/{snap_path}"),
+            snap_path,
+            "gate4288db",
+            "1.0-SNAPSHOT",
+            "application/java-archive",
+            bytes.clone(),
+            user_id,
+            &compute_checksum(&bytes, ChecksumType::Sha256),
+        )
+        .await;
+
+        // Positive control: on a healthy pool the alias resolves to the
+        // timestamped row.
+        let healthy = resolve_checksum_target(&pool, repo_id, snap_alias).await;
+        let resolved_path = healthy
+            .as_ref()
+            .ok()
+            .and_then(|t| t.as_ref())
+            .map(|t| t.path.clone());
+
+        let connects = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = connects.clone();
+        let faulty = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .after_connect(move |_conn, _meta| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        Ok(())
+                    } else {
+                        Err(sqlx::Error::Protocol("injected fault (#4288)".into()))
+                    }
+                })
+            })
+            .before_acquire(|_conn, _meta| Box::pin(async { Ok(false) }))
+            .connect_lazy(&url)
+            .expect("lazy pool");
+        let faulted = resolve_checksum_target(&faulty, repo_id, snap_alias).await;
+        faulty.close().await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&repo_dir);
+
+        assert_eq!(
+            resolved_path.as_deref(),
+            Some(snap_path),
+            "positive control: the alias must resolve to the timestamped row"
+        );
+        assert!(
+            connects.load(Ordering::SeqCst) >= 2,
+            "the fault must hit the alias lookup, after the exact-path query"
+        );
+        match faulted {
+            Err(resp) => assert!(
+                resp.status().is_server_error(),
+                "a failed alias lookup must be a server error, got {}",
+                resp.status()
+            ),
+            Ok(target) => panic!(
+                "#4288: a failed -SNAPSHOT alias lookup must fail closed, got Ok({:?})",
+                target.map(|t| t.path)
+            ),
         }
     }
 
@@ -8412,6 +10462,176 @@ mod tests {
              sidecar entry forced an upstream refetch ({} new requests)",
             requests_after - requests_before
         );
+    }
+
+    /// #4573: a Remote repository's jar download carries `X-Checksum-SHA1`
+    /// once the `.sha1` is cached, so Maven Resolver skips its separate
+    /// `.sha1` request. Before, only the hosted route sent it; a proxied jar
+    /// carried no checksum header Resolver reads.
+    #[tokio::test]
+    async fn test_remote_jar_download_carries_cached_sha1_header_4573() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const JAR: &str = "com/example/lib/4.5/lib-4.5.jar";
+        const JAR_BODY: &[u8] = b"jar-bytes-4573";
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/java-archive")
+                    .set_body_bytes(JAR_BODY.to_vec()),
+            )
+            .mount(&mock)
+            .await;
+        let sha1_hex = hex::encode(sha1::Sha1::digest(JAR_BODY));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}.sha1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(sha1_hex.clone()),
+            )
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        tdh::publish_repo(&pool, remote_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let get_jar = || async {
+            let resp = download(
+                State(state.clone()),
+                Extension(None),
+                Path((remote_key.clone(), JAR.to_string())),
+                axum::http::HeaderMap::new(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GET {remote_key}/{JAR} must proxy 200, got {e:?}"));
+            assert_eq!(resp.status(), StatusCode::OK);
+            let sha1 = resp
+                .headers()
+                .get("x-checksum-sha1")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+            assert_eq!(&body[..], JAR_BODY);
+            sha1
+        };
+
+        // Cold GET: commits the jar and, through the digest gate, caches its
+        // `.sha1`.
+        let _ = get_jar().await;
+        tdh::await_proxy_sidecar(&dir.join(format!(
+            "proxy-cache/{remote_key}/{JAR}/__cache_meta__.json"
+        )))
+        .await;
+        tdh::await_proxy_sidecar(&dir.join(format!(
+            "proxy-cache/{remote_key}/{JAR}.sha1/__cache_meta__.json"
+        )))
+        .await;
+        let requests_before = mock.received_requests().await.map(|r| r.len()).unwrap_or(0);
+
+        let warm = get_jar().await;
+        let requests_after = mock.received_requests().await.map(|r| r.len()).unwrap_or(0);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            warm.as_deref(),
+            Some(sha1_hex.as_str()),
+            "a warm Remote jar must carry the SHA-1 of its cached `.sha1`"
+        );
+        assert_eq!(
+            requests_after, requests_before,
+            "the header is read from the cache, never fetched upstream"
+        );
+    }
+
+    #[test]
+    fn test_maven_checksum_headers_drop_malformed_values_4573() {
+        let mut headers = axum::http::HeaderMap::new();
+        insert_maven_checksum_headers(
+            &mut headers,
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            Some("d41d8cd98f00b204e9800998ecf8427e"),
+        );
+        assert_eq!(
+            headers.get("x-checksum-sha1").unwrap(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert_eq!(
+            headers.get("x-checksum-md5").unwrap(),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        insert_maven_checksum_headers(
+            &mut headers,
+            // Upper case, wrong length, and a header-splitting attempt.
+            Some("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"),
+            Some("d41d8cd98f00b204e9800998ecf8427e\r\nx-evil: 1"),
+        );
+        assert!(headers.is_empty());
+        insert_maven_checksum_headers(&mut headers, Some("abc"), None);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_scanned_jvm_archive_response_carries_sha1_and_md5_4573() {
+        let bytes = Bytes::from_static(b"scanned-jar-4573");
+        let response = scanned_jvm_archive_response(
+            "application/java-archive",
+            proxy_helpers::ScannedProxyBody {
+                bytes: bytes.clone(),
+                content_type: None,
+                content_encoding: None,
+                digest: compute_checksum(&bytes, ChecksumType::Sha256),
+            },
+        );
+        assert_eq!(
+            response.headers().get("x-checksum-sha1").unwrap(),
+            compute_checksum(&bytes, ChecksumType::Sha1).as_str()
+        );
+        assert_eq!(
+            response.headers().get("x-checksum-md5").unwrap(),
+            compute_checksum(&bytes, ChecksumType::Md5).as_str()
+        );
+
+        // A content-coded body: the digests would describe the coding.
+        let coded = scanned_jvm_archive_response(
+            "application/java-archive",
+            proxy_helpers::ScannedProxyBody {
+                bytes: bytes.clone(),
+                content_type: None,
+                content_encoding: Some("gzip".to_string()),
+                digest: compute_checksum(&bytes, ChecksumType::Sha256),
+            },
+        );
+        assert!(coded.headers().get("x-checksum-sha1").is_none());
+        assert!(coded.headers().get("x-checksum-md5").is_none());
     }
 
     /// #3778: a warm Maven proxy GET must not require synchronous PostgreSQL
@@ -11668,5 +13888,504 @@ mod unreadable_config_route_4365_tests {
         );
         assert_eq!(remote_hits, 0, "refused before any upstream request");
         assert_eq!(virtual_hits, 0, "refused before any upstream request");
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod age_gate_4702_tests {
+    //! #4702: the publish-age gate on Maven Remote and Virtual repositories.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::extract::{Path, State};
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const G: &str = "com/example/agegate";
+    const OLD: &str = "1.0.0";
+    const YOUNG: &str = "2.0.0";
+
+    fn http_date(t: chrono::DateTime<chrono::Utc>) -> String {
+        t.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    }
+
+    fn file(version: &str, ext: &str) -> String {
+        format!("{G}/widget/{version}/widget-{version}.{ext}")
+    }
+
+    /// An upstream with one old (2024) and one young (a day old) version:
+    /// POMs carrying `Last-Modified`, jars, jar `.sha1`s and a GA-level
+    /// `maven-metadata.xml` listing both, whose `lastUpdated` is the young
+    /// deploy (or `last_updated` when given).
+    async fn upstream(last_updated: Option<&str>) -> MockServer {
+        let mock = MockServer::start().await;
+        let young_at = chrono::Utc::now() - chrono::Duration::days(1);
+        for (version, at) in [
+            (
+                OLD,
+                chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            (YOUNG, young_at),
+        ] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{}", file(version, "pom"))))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/xml")
+                        .insert_header("last-modified", http_date(at).as_str())
+                        .set_body_string(format!(
+                            "<project><version>{version}</version></project>"
+                        )),
+                )
+                .mount(&mock)
+                .await;
+            let jar = format!("jar-{version}");
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{}", file(version, "jar"))))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/java-archive")
+                        .insert_header("last-modified", http_date(at).as_str())
+                        .set_body_bytes(jar.clone().into_bytes()),
+                )
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{}.sha1", file(version, "jar"))))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(hex::encode(sha1::Sha1::digest(jar.as_bytes()))),
+                )
+                .mount(&mock)
+                .await;
+        }
+        let lu = last_updated
+            .map(str::to_string)
+            .unwrap_or_else(|| young_at.format("%Y%m%d%H%M%S").to_string());
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{G}/widget/maven-metadata.xml")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  \
+                 <groupId>com.example.agegate</groupId>\n  <artifactId>widget</artifactId>\n  \
+                 <versioning>\n    <latest>{YOUNG}</latest>\n    <release>{YOUNG}</release>\n    \
+                 <versions>\n      <version>{OLD}</version>\n      <version>{YOUNG}</version>\n    \
+                 </versions>\n    <lastUpdated>{lu}</lastUpdated>\n  </versioning>\n</metadata>\n"
+            )))
+            .mount(&mock)
+            .await;
+        mock
+    }
+
+    async fn gated_remote(
+        pool: &PgPool,
+        mock: &MockServer,
+        mode: &str,
+    ) -> (Uuid, String, std::path::PathBuf) {
+        let (id, key, dir) = tdh::create_repo(pool, "remote", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 7, age_gate_mode = $2 WHERE id = $3",
+        )
+        .bind(mock.uri())
+        .bind(mode)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("gate the remote");
+        tdh::publish_repo(pool, id).await;
+        (id, key, dir)
+    }
+
+    async fn get(state: &SharedState, key: &str, path: &str) -> (StatusCode, Bytes) {
+        let resp = match download(
+            State(state.clone()),
+            Extension(None),
+            Path((key.to_string(), path.to_string())),
+            axum::http::HeaderMap::new(),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(r) => r,
+        };
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (status, body)
+    }
+
+    async fn requested(mock: &MockServer, path: &str) -> bool {
+        mock.received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.url.path() == format!("/{path}"))
+    }
+
+    async fn drop_repo(pool: &PgPool, id: Uuid) {
+        let _ = sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+
+    /// A version younger than the gate is refused with the shared 451 on
+    /// its jar, its POM and its `.sha1`, without fetching the jar; the old
+    /// version downloads; the GA metadata lists only the old version, and
+    /// its `.sha1` describes the filtered body.
+    #[tokio::test]
+    async fn remote_gate_refuses_young_files_and_filters_metadata_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let jar = get(&state, &key, &file(YOUNG, "jar")).await;
+        let pom = get(&state, &key, &file(YOUNG, "pom")).await;
+        let sha1 = get(&state, &key, &format!("{}.sha1", file(YOUNG, "jar"))).await;
+        let old = get(&state, &key, &file(OLD, "jar")).await;
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        let meta_sha1 = get(&state, &key, &format!("{G}/widget/maven-metadata.xml.sha1")).await;
+        let missing = get(&state, &key, &file("9.9.9", "jar")).await;
+        let missing_reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1 \
+             AND package_version = '9.9.9'",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(-1);
+        let young_jar_fetched = requested(&mock, &file(YOUNG, "jar")).await;
+        let young_sha1_fetched = requested(&mock, &format!("{}.sha1", file(YOUNG, "jar"))).await;
+        let reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1 \
+             AND package_name = 'com.example.agegate:widget' AND package_version = $2",
+        )
+        .bind(id)
+        .bind(YOUNG)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, id).await;
+
+        for (what, (status, body)) in [("jar", &jar), ("pom", &pom), ("jar.sha1", &sha1)] {
+            assert_eq!(
+                *status,
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                "young {what}: {}",
+                String::from_utf8_lossy(body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(body).expect("451 body is JSON");
+            assert_eq!(json["error"], "age_gate_blocked", "{what}");
+            assert_eq!(json["package"], "com.example.agegate:widget", "{what}");
+            assert_eq!(json["version"], YOUNG, "{what}");
+            assert_eq!(json["min_age_days"], 7, "{what}");
+        }
+        assert!(
+            !young_jar_fetched,
+            "a refused jar must not be fetched upstream"
+        );
+        assert!(
+            !young_sha1_fetched,
+            "a refused checksum must not be fetched upstream"
+        );
+        assert_eq!(reviews, 1, "the refusal records one pending review");
+        assert_eq!(
+            missing.0,
+            StatusCode::NOT_FOUND,
+            "a version the upstream does not have is a plain miss: {}",
+            String::from_utf8_lossy(&missing.1)
+        );
+        assert_eq!(missing_reviews, 0, "a miss records no review");
+
+        assert_eq!(old.0, StatusCode::OK);
+        assert_eq!(&old.1[..], format!("jar-{OLD}").as_bytes());
+
+        assert_eq!(meta.0, StatusCode::OK);
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        let (_, _, versions) = crate::formats::maven::parse_metadata_versions(&xml).unwrap();
+        assert_eq!(versions, vec![OLD.to_string()], "{xml}");
+        assert!(xml.contains(&format!("<latest>{OLD}</latest>")), "{xml}");
+        assert!(xml.contains(&format!("<release>{OLD}</release>")), "{xml}");
+        assert_eq!(meta_sha1.0, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&meta_sha1.1),
+            hex::encode(sha1::Sha1::digest(&meta.1)),
+            "the metadata checksum describes the filtered body"
+        );
+    }
+
+    /// When the GA's `lastUpdated` is older than the gate, every listed
+    /// version is old enough: the listing is served unchanged with no POM
+    /// fetched.
+    #[tokio::test]
+    async fn old_last_updated_lists_everything_without_pom_probes_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(Some("20240102030405")).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        let probed = requested(&mock, &file(OLD, "pom")).await
+            || requested(&mock, &file(YOUNG, "pom")).await;
+        drop_repo(&pool, id).await;
+        assert_eq!(meta.0, StatusCode::OK);
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        assert!(
+            xml.contains(&format!("<version>{YOUNG}</version>")),
+            "{xml}"
+        );
+        assert!(
+            !probed,
+            "no POM fetch when lastUpdated already dates every version"
+        );
+    }
+
+    /// `first_seen`: a version seen for the first time just now is young,
+    /// whatever the upstream claims; the listing records the observation.
+    #[tokio::test]
+    async fn first_seen_mode_withholds_a_newly_seen_version_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "first_seen").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        let old = get(&state, &key, &file(OLD, "jar")).await;
+        let observed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM age_gate_version_observations WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, id).await;
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        let (_, _, versions) = crate::formats::maven::parse_metadata_versions(&xml).unwrap();
+        assert!(
+            versions.is_empty(),
+            "both versions are first seen now: {xml}"
+        );
+        assert_eq!(old.0, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(observed, 2, "the listing observes both versions");
+    }
+
+    /// A Virtual applies its Remote member's gate: the young jar and its
+    /// `.sha1` answer the member's 451, the merged metadata lists only the
+    /// old version, and the old version downloads.
+    #[tokio::test]
+    async fn virtual_applies_the_remote_members_gate_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (remote_id, _remote_key, dir) =
+            gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("member");
+        tdh::publish_repo(&pool, virtual_id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let jar = get(&state, &virtual_key, &file(YOUNG, "jar")).await;
+        let sha1 = get(
+            &state,
+            &virtual_key,
+            &format!("{}.sha1", file(YOUNG, "jar")),
+        )
+        .await;
+        let old = get(&state, &virtual_key, &file(OLD, "jar")).await;
+        let meta = get(
+            &state,
+            &virtual_key,
+            &format!("{G}/widget/maven-metadata.xml"),
+        )
+        .await;
+        let young_jar_fetched = requested(&mock, &file(YOUNG, "jar")).await;
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, virtual_id).await;
+        drop_repo(&pool, remote_id).await;
+
+        assert_eq!(
+            jar.0,
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "{}",
+            String::from_utf8_lossy(&jar.1)
+        );
+        assert_eq!(sha1.0, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert!(!young_jar_fetched);
+        assert_eq!(old.0, StatusCode::OK);
+        assert_eq!(&old.1[..], format!("jar-{OLD}").as_bytes());
+        let xml = String::from_utf8_lossy(&meta.1).to_string();
+        let (_, _, versions) = crate::formats::maven::parse_metadata_versions(&xml).unwrap();
+        assert_eq!(versions, vec![OLD.to_string()], "{xml}");
+    }
+
+    /// A GA with more undated versions than one listing probes: the first
+    /// listing withholds the oldest undated ones, and the next listing probes
+    /// those instead of the already dated newest ones, so it lists them all.
+    #[tokio::test]
+    async fn listing_probe_budget_continues_on_the_next_listing_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = MockServer::start().await;
+        let old = http_date(
+            chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/com/example/agegate/many/.*\.pom$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", old.as_str())
+                    .set_body_string("<project/>"),
+            )
+            .mount(&mock)
+            .await;
+        let total = crate::services::age_gate_maven::LISTING_MAX_POM_PROBES + 6;
+        let versions: Vec<String> = (1..=total).map(|i| format!("1.0.{i}")).collect();
+        let listed: String = versions
+            .iter()
+            .map(|v| format!("<version>{v}</version>"))
+            .collect();
+        let recent = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y%m%d%H%M%S")
+            .to_string();
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{G}/many/maven-metadata.xml")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata><groupId>com.example.agegate</groupId>\
+                 <artifactId>many</artifactId><versioning><latest>1.0.{total}</latest>\
+                 <release>1.0.{total}</release><versions>{listed}</versions>\
+                 <lastUpdated>{recent}</lastUpdated></versioning></metadata>\n"
+            )))
+            .mount(&mock)
+            .await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let path = format!("{G}/many/maven-metadata.xml");
+        let first = get(&state, &key, &path).await;
+        let second = get(&state, &key, &path).await;
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+        drop_repo(&pool, id).await;
+        let count = |body: &Bytes| {
+            let xml = String::from_utf8_lossy(body).to_string();
+            crate::formats::maven::parse_metadata_versions(&xml)
+                .unwrap()
+                .2
+                .len()
+        };
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(
+            count(&first.1),
+            crate::services::age_gate_maven::LISTING_MAX_POM_PROBES,
+            "the first listing dates only its probe budget"
+        );
+        assert_eq!(
+            count(&second.1),
+            total,
+            "the next listing dates the rest: {}",
+            String::from_utf8_lossy(&second.1)
+        );
+    }
+
+    /// A spelling of the young jar's path that does not parse as a Maven
+    /// coordinate (a dot segment) never reaches the upstream.
+    #[tokio::test]
+    async fn dot_segment_spelling_of_a_young_file_is_not_fetched_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let spelled = format!("{G}/widget/{YOUNG}/x/../widget-{YOUNG}.jar");
+        let (status, _) = get(&state, &key, &spelled).await;
+        let fetched = requested(&mock, &file(YOUNG, "jar")).await;
+        drop_repo(&pool, id).await;
+        assert_ne!(status, StatusCode::OK);
+        assert!(!fetched, "the young jar must not be fetched upstream");
+    }
+
+    /// Without the gate nothing changes: the young version downloads and is
+    /// listed (the control for the tests above).
+    #[tokio::test]
+    async fn ungated_remote_serves_everything_4702() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = upstream(None).await;
+        let (id, key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("upstream");
+        tdh::publish_repo(&pool, id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let jar = get(&state, &key, &file(YOUNG, "jar")).await;
+        let meta = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        drop_repo(&pool, id).await;
+        assert_eq!(jar.0, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&meta.1).contains(&format!("<version>{YOUNG}</version>")));
     }
 }

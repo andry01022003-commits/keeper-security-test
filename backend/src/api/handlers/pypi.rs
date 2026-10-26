@@ -2549,7 +2549,9 @@ async fn apply_pypi_download_age_gate(
             .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
             .await
             .ok()
-            .and_then(|times| times.get(&version).copied())
+            .and_then(|times| {
+                crate::services::age_gate_service::pypi_publish_time(&times, &version)
+            })
     } else {
         None
     };
@@ -6432,7 +6434,8 @@ async fn upload(
             digests,
             size_bytes,
             Some(user_id),
-            should_enqueue_pypi_sync_tasks(&headers),
+            // #4889: queue after the metadata write below, not before it.
+            false,
             None,
         )
         .await
@@ -6444,6 +6447,17 @@ async fn upload(
         .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
         .await
         .map_err(|e| e.into_response())?;
+
+    if should_enqueue_pypi_sync_tasks(&headers) {
+        super::queue_push_sync_tasks_now(
+            &state.db,
+            repo.id,
+            artifact.id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await;
+    }
 
     record_pypi_package_analysis(&state, artifact.id, content_analysis).await;
 
@@ -6500,7 +6514,7 @@ async fn upload(
 /// [`Completeness::NotRead`] analysis carrying the reason, because "we could
 /// not read it" is a result the user is entitled to see, and because analysis
 /// must not be able to fail an otherwise-valid upload.
-async fn analyze_pypi_upload(
+pub(crate) async fn analyze_pypi_upload(
     staged_path: std::path::PathBuf,
     filename: String,
 ) -> crate::services::pypi_analysis::PypiAnalysis {
@@ -6529,7 +6543,7 @@ async fn analyze_pypi_upload(
 /// so a failure here must not fail the publish. But a distribution with
 /// nothing in it still records a row, because "we looked and there was
 /// nothing" and "we never looked" have to stay distinguishable (#4047).
-async fn record_pypi_package_analysis(
+pub(crate) async fn record_pypi_package_analysis(
     state: &SharedState,
     artifact_id: uuid::Uuid,
     analysis: crate::services::pypi_analysis::PypiAnalysis,
@@ -6658,7 +6672,7 @@ fn should_enqueue_pypi_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
 }
 
-fn build_pypi_package_catalog_metadata(
+pub(crate) fn build_pypi_package_catalog_metadata(
     filename: &str,
     requires_python: Option<&str>,
 ) -> serde_json::Value {
@@ -6673,7 +6687,7 @@ fn build_pypi_package_catalog_metadata(
 }
 
 /// Determine the Content-Type for a PyPI filename based on its extension.
-fn pypi_content_type(filename: &str) -> &'static str {
+pub(crate) fn pypi_content_type(filename: &str) -> &'static str {
     if filename.ends_with(".whl") || filename.ends_with(".zip") {
         "application/zip"
     } else if filename.ends_with(".tar.gz") {
@@ -6736,7 +6750,7 @@ fn html_escape(s: &str) -> String {
 /// Most trove classifiers kept per distribution (see [`build_upload_pkg_info`]).
 const PYPI_MAX_STORED_CLASSIFIERS: usize = 500;
 
-fn build_upload_pkg_info(
+pub(crate) fn build_upload_pkg_info(
     extracted: Option<PkgInfo>,
     requires_python: Option<&str>,
     summary: Option<&str>,
@@ -14834,6 +14848,10 @@ mod tests {
         let server = MockServer::start().await;
         let wheel_body = b"fake-wheel-bytes";
 
+        // Per-test repo key: `load_cache_metadata` memoises sidecars (including
+        // misses) in a process-global LRU keyed by the storage key (#4814).
+        let repo_key = format!("pypi-remote-4814-{}", uuid::Uuid::new_v4());
+
         // Empty simple-index page → find_upstream_url_for_file returns None →
         // resolve_pypi_remote_fetch_target falls back to simple/{project}/{filename}.
         Mock::given(method("GET"))
@@ -14865,7 +14883,7 @@ mod tests {
         let result = fetch_from_pypi_remote_streaming(
             &proxy,
             repo_id,
-            "pypi-remote",
+            &repo_key,
             &server.uri(),
             &proj("numpy"),
             "numpy-2.0.0-py3-none-any.whl",
@@ -14886,7 +14904,7 @@ mod tests {
         let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
         let metadata_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
             &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
-            "pypi-remote",
+            &repo_key,
             cache_path,
         )
         .expect("metadata key");
@@ -17055,11 +17073,13 @@ mod tests {
         // Empty MissingStorage → streaming probe returns None without errors.
         let proxy = build_proxy_service_no_db();
         let repo_id = uuid::Uuid::new_v4();
+        // Per-test repo key: the sidecar LRU is process-global (#4814).
+        let repo_key = format!("pypi-remote-4814-{}", uuid::Uuid::new_v4());
 
         let result = super::proxy_helpers::proxy_check_cache_streaming(
             &proxy,
             repo_id,
-            "pypi-remote",
+            &repo_key,
             "https://pypi.org/simple",
             "simple/numpy/numpy-2.0.0-py3-none-any.whl",
             RepositoryFormat::Pypi,

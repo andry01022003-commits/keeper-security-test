@@ -451,8 +451,19 @@ fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
 /// and key of the source object, separated by a slash (/). ... The value must
 /// be URL-encoded" (S3 API Reference, UploadPartCopy). Each key segment is
 /// percent-encoded; the `/` separators are structural and stay literal.
+///
+/// The key named has to be the one the object was stored under (#4838).
+/// `object_store` writes each segment through
+/// [`PathPart`](object_store::path::PathPart), so the stored S3 key of
+/// `café a&b~c` is literally `caf%C3%A9 a&b%7Ec`; its own `CopyObject` then
+/// URL-encodes that stored form again for the header. S3 decodes the header
+/// once and looks the result up, so the value is the URL encoding of
+/// [`stored_key_form`], not of the caller's key: encoding the caller's key
+/// decodes to `café a&b~c`, which is not the stored object, and the multipart
+/// copy failed with `NoSuchKey` while a small object's single-request
+/// `CopyObject` succeeded.
 fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
-    let encoded: Vec<String> = full_key
+    let encoded: Vec<String> = stored_key_form(full_key)
         .split('/')
         .map(|segment| urlencoding::encode(segment).into_owned())
         .collect();
@@ -2291,6 +2302,19 @@ impl super::StorageBackend for S3Backend {
         }
     }
 
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists_at_exact_key"))]
+    async fn exists_at_exact_key(&self, key: &str) -> Result<bool> {
+        let path: ObjectPath = self.full_key(key).into();
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to check existence of '{}'", key),
+                &e,
+            )),
+        }
+    }
+
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
@@ -2398,6 +2422,13 @@ impl super::StorageBackend for S3Backend {
 
     fn supports_redirect(&self) -> bool {
         self.redirect_downloads
+    }
+
+    /// S3 multipart uploads stream from the request body to the bucket without
+    /// a local file, so a chunked completion can assemble straight into a
+    /// staging object (#3916).
+    fn supports_streamed_assembly(&self) -> bool {
+        true
     }
 
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_url"))]
@@ -5847,6 +5878,44 @@ mod tests {
         }
     }
 
+    /// #4980: the upload commit guard's presence check never answers from the
+    /// migration fallback key.
+    #[tokio::test]
+    async fn test_exists_at_exact_key_ignores_the_migration_fallback_4980() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/repos/generic/.*"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/ab/abcdef.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("last-modified", "Mon, 06 Jul 2026 22:37:12 GMT")
+                    .insert_header("etag", "\"e\""),
+            )
+            .mount(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.path_format = StoragePathFormat::Migration;
+        let key = format!("repos/generic/{checksum}");
+        assert!(StorageBackendTrait::exists(&backend, &key).await.unwrap());
+        assert!(
+            !StorageBackendTrait::exists_at_exact_key(&backend, &key)
+                .await
+                .unwrap(),
+            "only the canonical key may answer the exact presence check"
+        );
+    }
+
     #[tokio::test]
     async fn test_exists_surfaces_migration_fallback_head_error() {
         use crate::storage::StorageBackend as StorageBackendTrait;
@@ -6724,6 +6793,135 @@ mod tests {
             complete_guard.received_requests().await.len(),
             1,
             "the multipart copy must be completed exactly once"
+        );
+    }
+
+    /// The multipart server-side copy must name the object as it is stored
+    /// (#4838).
+    ///
+    /// object_store writes every key segment through
+    /// [`PathPart`](object_store::path::PathPart), so the S3 key of
+    /// `café a&b~c` is literally `caf%C3%A9 a&b%7Ec`. S3 URL-decodes
+    /// `x-amz-copy-source` once and looks the result up, so the header must
+    /// be the URL encoding of that stored key. Encoding the caller's key
+    /// instead decodes to `café a&b~c`, which is not the stored object, and the
+    /// part copy is `NoSuchKey`, while a small object's single-request
+    /// CopyObject (object_store's own encoding) works.
+    ///
+    /// The fixture models S3: a part copy succeeds only when its header
+    /// decodes to the stored key; any other spelling answers `NoSuchKey`.
+    #[tokio::test]
+    async fn test_large_copy_names_source_in_stored_encoding_4838() {
+        use wiremock::matchers::{header, method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 5 GiB + 1 byte -> two parts, so the copier has to take the
+        // UploadPartCopy path rather than a single CopyObject.
+        let size = 5_u64 * 1024 * 1024 * 1024 + 1;
+        // Non-ASCII, a space, `&` and `~`: object_store stores `é` and `~`
+        // percent-encoded and the space and `&` literal.
+        let source = "maven/r1/com/dtf/uni/1.0/uni-1.0-café a&b~c.jar";
+        let dest = "maven/r1/com/dtf/uni/1.0/uni-1.0-promoted.jar";
+        // The stored key, derived from object_store itself so the assertion
+        // can never drift from what a write actually creates.
+        let stored_key = ObjectPath::from(source).as_ref().to_string();
+        assert!(
+            stored_key.contains("caf%C3%A9 a&b%7Ec"),
+            "precondition: object_store stores the segment percent-encoded: {stored_key}"
+        );
+        // What S3 must receive: the stored key, URL-encoded once more.
+        let stored_source = format!(
+            "test-bucket/{}",
+            stored_key
+                .split('/')
+                .map(|seg| urlencoding::encode(seg).into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(
+            urlencoding::decode(stored_source.trim_start_matches("test-bucket/")).unwrap(),
+            stored_key,
+            "precondition: the expected header decodes to the stored key"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>copy-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        // A part copy that names the source in its stored encoding succeeds;
+        // any other spelling answers NoSuchKey, exactly as S3 does for a copy
+        // source that does not resolve to the object the key names.
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .and(header("x-amz-copy-source", stored_source.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&#34;part-copy-etag&#34;</ETag></CopyPartResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "<Error><Code>NoSuchKey</Code><Message>The specified key does not \
+                 exist.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        let complete_guard = Mock::given(method("POST"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        S3Backend::copy(&backend, source, dest)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "#4838: a >5 GiB copy must name its source '{}', the way the write \
+                     stored it, and S3 must find it: {e}",
+                    stored_source
+                )
+            });
+
+        // The copy completed, and every part named the stored source.
+        assert_eq!(
+            complete_guard.received_requests().await.len(),
+            1,
+            "#4838: the multipart copy must be completed exactly once"
+        );
+        let part_copies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .filter_map(|r| {
+                r.headers
+                    .get("x-amz-copy-source")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(!part_copies.is_empty(), "#4838: no part copy was sent");
+        assert!(
+            part_copies.iter().all(|s| s == &stored_source),
+            "#4838: every part copy must name '{stored_source}', got {part_copies:?}"
         );
     }
 
@@ -8457,5 +8655,72 @@ mod integration_tests {
             copied.len(),
             etag
         );
+    }
+
+    /// #4838 live: a multipart server-side copy must name its source in the
+    /// encoding the object was stored under, proven against a real
+    /// S3-compatible server (MinIO), which is the only place the encoding
+    /// actually has to resolve to an object.
+    ///
+    /// The wiremock suite asserts the request shape; this asserts the server
+    /// accepts it, which is the whole failure mode: a source named with the
+    /// wrong encoding is `NoSuchKey`. The key mixes a non-ASCII character, a
+    /// space, `&` and `~`.
+    ///
+    ///   AK_S3_E2E=1 S3_BUCKET=ak-test S3_REGION=us-east-1 \
+    ///   S3_ENDPOINT=http://127.0.0.1:39164 S3_ACCESS_KEY_ID=... \
+    ///   S3_SECRET_ACCESS_KEY=... cargo test \
+    ///   test_large_copy_names_encoded_source_live_4838 -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_large_copy_names_encoded_source_live_4838() {
+        if std::env::var("AK_S3_E2E").ok().as_deref() != Some("1") {
+            println!("Skipping: set AK_S3_E2E=1 to run");
+            return;
+        }
+
+        // A 6 MiB ceiling makes a 16 MiB source need three ranged part copies,
+        // so the object cannot slip through a single CopyObject.
+        std::env::set_var("S3_MAX_SINGLE_COPY_BYTES", (6u64 * 1024 * 1024).to_string());
+        let config = S3Config::from_env().expect("S3Config::from_env");
+        let backend = S3Backend::new(config).await.expect("S3Backend::new");
+
+        // Non-ASCII, a space, `&` and `~`.
+        let run = uuid::Uuid::new_v4();
+        let source_key = format!("large-copy-4838/uni-1.0-café a&b~c-{run}.jar");
+        let dest_key = format!("large-copy-4838/uni-1.0-promoted-{run}.jar");
+
+        let len = 16 * 1024 * 1024_usize;
+        let content = Bytes::from(
+            (0..len)
+                .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+                .collect::<Vec<u8>>(),
+        );
+        StorageBackendTrait::put(&backend, &source_key, content.clone())
+            .await
+            .expect("seed non-ASCII source object");
+
+        backend
+            .copy(&source_key, &dest_key)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "#4838: a multipart copy of '{}' must name its source the way the \
+                 write stored it and MinIO must find it: {e}",
+                    source_key
+                )
+            });
+
+        let copied = StorageBackendTrait::get(&backend, &dest_key)
+            .await
+            .expect("read copied object");
+        assert!(
+            copied == content,
+            "#4838: destination bytes must equal source bytes"
+        );
+
+        let _ = StorageBackendTrait::delete(&backend, &source_key).await;
+        let _ = StorageBackendTrait::delete(&backend, &dest_key).await;
+        println!("#4838 live encoded multipart copy OK: len={}", copied.len());
     }
 }

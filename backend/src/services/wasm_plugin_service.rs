@@ -1015,7 +1015,9 @@ impl WasmPluginService {
     /// `http(s)` fetches go through `git_transport`, which connects only to
     /// addresses the SSRF policy admits at connect time, so a host that
     /// passed `validate_git_source_url` and then changed its address is not
-    /// fetched from (GHSA-p28r-8m4q-w9pg).
+    /// fetched from (GHSA-p28r-8m4q-w9pg). A redirect hop the policy refuses
+    /// is refused just as firmly, and both refusals answer `400` instead of
+    /// an opaque internal error (#4869).
     async fn clone_repository(&self, url: &str, target: &Path) -> Result<git2::Repository> {
         git_transport::ensure_registered().map_err(AppError::Internal)?;
 
@@ -1029,10 +1031,16 @@ impl WasmPluginService {
 
         result.map_err(|e| {
             let msg = e.to_string();
-            if msg.contains("blocked by SSRF policy") {
+            if crate::services::ssrf_refusal::is_ssrf_refusal(&msg) {
+                // Either refusal counts: the connect-time DNS guard (the
+                // host resolved to an address the policy blocks) and the
+                // per-hop redirect policy (a redirect target the policy
+                // refuses) are the same answer for the caller — a source
+                // the server may not fetch from (#4869).
                 AppError::Validation(format!(
-                    "Plugin git URL: the host resolved to an address that outbound \
-                     requests may not reach (see AK_SSRF_ALLOW_PRIVATE_CIDRS): {msg}"
+                    "Plugin git URL: the host or a redirect target points at an \
+                     address that outbound requests may not reach (see \
+                     AK_SSRF_ALLOW_PRIVATE_CIDRS): {msg}"
                 ))
             } else if msg.contains("not found") || msg.contains("404") {
                 AppError::NotFound(format!("Git repository not found: {}", msg))
@@ -3435,6 +3443,50 @@ timeout_secs = 30
                 .get("user-agent")
                 .is_some_and(|v| v == "git/2.0 (artifact-keeper)")),
             "every git request went through the guarded client"
+        );
+    }
+
+    /// A plugin git source that redirects to an address the SSRF policy
+    /// refuses must be refused like the connect-time refusal: a bad
+    /// request, not an opaque internal error (#4869).
+    ///
+    /// The redirect is aborted before the target is contacted — the point
+    /// of the policy — so the clone fails either way. What matters is HOW
+    /// it fails: the redirect refusal travels as a different phrase than
+    /// the connect-time one ("redirect target rejected by SSRF policy" vs
+    /// "blocked by SSRF policy"), and a mapping that recognized only the
+    /// second one answered 500 where the caller is owed a 400.
+    #[tokio::test]
+    async fn test_clone_of_a_redirect_to_a_blocked_target_is_a_validation_refusal() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plugin.git/info/refs"))
+            .and(query_param("service", "git-upload-pack"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://169.254.169.254/latest/meta-data"),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = clone_only_service();
+        let target = tempfile::tempdir().expect("tempdir");
+        let target_path = target.path().join("repo");
+        // The entry hop is an IP literal, so it is never re-resolved; only
+        // the redirect target is refused.
+        let url = format!("{}/plugin.git", server.uri());
+
+        let outcome = svc.clone_repository(&url, &target_path).await;
+        let Err(err) = outcome else {
+            panic!("a clone of a refused redirect must fail");
+        };
+
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("Plugin git URL")),
+            "the redirect refusal reads like the URL check's: {err:?}"
         );
     }
 }

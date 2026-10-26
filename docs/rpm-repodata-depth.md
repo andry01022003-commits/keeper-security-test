@@ -125,6 +125,15 @@ Use the artifact path/tree or native root metadata when selecting an exact build
 Metadata caches and render locks are bounded and keyed by repository plus root.
 Empty roots are rendered per request and never cached, so requests for made-up
 roots cannot evict the metadata of populated ones.
+A render reads a root's packages from one database snapshot in batches of
+about 32 MiB of stored metadata and compresses each document as it is written,
+so its memory use follows the batch, not the size of the root (#4544). It
+still costs CPU in proportion to the root: the first request after a change
+to a large root can take tens of seconds.
+The snapshot is a read-only transaction that stays open for the whole
+render, so while a large root renders it holds back the vacuum horizon the
+way any long-running query does: rows updated or deleted meanwhile are
+reclaimed by the first vacuum after the render ends.
 Uploads, metadata changes, deletes, restores, and lifecycle cleanup invalidate
 the affected root through its artifact fingerprint without including siblings.
 

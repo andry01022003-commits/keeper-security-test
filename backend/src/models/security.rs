@@ -221,6 +221,144 @@ impl Grade {
     }
 }
 
+/// Whether a grade describes what was assessed (#4336).
+///
+/// Replaces the F floors of #2167, #4091 and #4154: a failed scan or an
+/// archive no scanner could catalog no longer turns a grade letter into an F.
+/// The letter is computed over what was assessed, and this status says how
+/// much that was:
+///
+/// * `rated`: everything scanned was fully assessed (at least one artifact).
+/// * `incomplete`: something was assessed, and something was not, or only
+///   in part: a failed scan, an uncataloged archive, or a `partial` scan.
+/// * `unrated`: nothing was assessed. A repository with no scans, or whose
+///   every scan failed or cataloged nothing, has no grade letter at all. A
+///   repository with findings is never `unrated`
+///   (`scan_result_service::repository_grade_status`).
+///
+/// The same three values describe one scan row
+/// ([`scan_grade_status`]). A scanner that could only read part of an
+/// artifact (for example an image whose root filesystem could not be fully
+/// extracted) records `scan_completeness = 'partial'` with a
+/// `scan_completeness_reason`, which maps to `incomplete` with that reason;
+/// one that could read nothing records `not_cataloged`, which maps to
+/// `unrated`. No new `inventory_status` value is needed for either:
+/// `inventory_status` says whether the SBOM rows were persisted, not what the
+/// scan assessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeStatus {
+    Rated,
+    Incomplete,
+    Unrated,
+}
+
+impl GradeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GradeStatus::Rated => "rated",
+            GradeStatus::Incomplete => "incomplete",
+            GradeStatus::Unrated => "unrated",
+        }
+    }
+
+    /// Parse the stored value. `None` for anything else, including the NULL
+    /// a row last written by a 1.11 replica carries.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "rated" => Some(GradeStatus::Rated),
+            "incomplete" => Some(GradeStatus::Incomplete),
+            "unrated" => Some(GradeStatus::Unrated),
+            _ => None,
+        }
+    }
+}
+
+/// How many of a repository's artifacts were assessed (#4336), by the
+/// latest scan of each scanner for each live artifact.
+///
+/// `scanned = cataloged + failed + uncataloged`: an artifact counts once, as
+/// failed if any latest scan failed, else as uncataloged if any latest
+/// completed scan cataloged nothing, else as cataloged. `partial` is the part
+/// of `cataloged` with a `partial` latest scan. Artifacts with no finished
+/// scan (none yet, pending, running, or every scanner not applicable) are in
+/// `artifacts` but not in `scanned`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScoreCoverage {
+    pub artifacts: i64,
+    pub scanned: i64,
+    pub cataloged: i64,
+    pub partial: i64,
+    pub failed: i64,
+    pub uncataloged: i64,
+}
+
+impl ScoreCoverage {
+    /// The repository status these counts give.
+    pub fn grade_status(&self) -> GradeStatus {
+        if self.cataloged == 0 {
+            GradeStatus::Unrated
+        } else if self.failed > 0 || self.uncataloged > 0 || self.partial > 0 {
+            GradeStatus::Incomplete
+        } else {
+            GradeStatus::Rated
+        }
+    }
+
+    /// Fully assessed share of the scanned artifacts, in whole percent
+    /// (rounded down, so 99.9 % never reads as 100). `None` when nothing was
+    /// scanned.
+    pub fn coverage_pct(&self) -> Option<i32> {
+        if self.scanned <= 0 {
+            return None;
+        }
+        let full = (self.cataloged - self.partial).max(0);
+        Some(((full * 100) / self.scanned) as i32)
+    }
+}
+
+/// The grade status of one scan row (#4336): what the row assessed, from its
+/// `status` and `scan_completeness`, with the reason when it is not `rated`.
+pub fn scan_grade_status(
+    status: &str,
+    completeness: &str,
+    completeness_reason: Option<&str>,
+) -> (GradeStatus, Option<String>) {
+    match status {
+        "completed" => match completeness {
+            "not_cataloged" => (
+                GradeStatus::Unrated,
+                Some(
+                    completeness_reason
+                        .unwrap_or("the scanner cataloged no components")
+                        .to_string(),
+                ),
+            ),
+            "partial" => (
+                GradeStatus::Incomplete,
+                Some(
+                    completeness_reason
+                        .unwrap_or("the scanner assessed part of the artifact")
+                        .to_string(),
+                ),
+            ),
+            _ => (GradeStatus::Rated, None),
+        },
+        "failed" => (
+            GradeStatus::Unrated,
+            Some("the scan failed; see error_message".to_string()),
+        ),
+        "not_applicable" => (
+            GradeStatus::Unrated,
+            Some("the scanner does not apply to this artifact".to_string()),
+        ),
+        _ => (
+            GradeStatus::Unrated,
+            Some("the scan has not finished".to_string()),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Database row structs
 // ---------------------------------------------------------------------------
@@ -360,6 +498,91 @@ pub struct RepoSecurityScore {
     /// plain generic archive sets only this flag. Cleared automatically once
     /// a newer completed scan supersedes the not-cataloged row.
     pub has_uncataloged_scan: bool,
+    /// `rated`, `incomplete` or `unrated` (#4336, migration 303). `None` on a
+    /// row last written by a 1.11 replica; read it through
+    /// [`RepoSecurityScore::status`].
+    #[sqlx(default)]
+    pub grade_status: Option<String>,
+    /// The grade letter over the assessed artifacts, never floored; `None`
+    /// when `unrated` and on a row a 1.11 replica wrote (#4336).
+    #[sqlx(default)]
+    pub rated_grade: Option<String>,
+    /// Coverage counts (#4336); `None` on a row a 1.11 replica wrote. See
+    /// [`ScoreCoverage`].
+    #[sqlx(default)]
+    pub artifact_count: Option<i32>,
+    #[sqlx(default)]
+    pub scanned_count: Option<i32>,
+    #[sqlx(default)]
+    pub cataloged_count: Option<i32>,
+    #[sqlx(default)]
+    pub partial_count: Option<i32>,
+    #[sqlx(default)]
+    pub failed_count: Option<i32>,
+    #[sqlx(default)]
+    pub uncataloged_count: Option<i32>,
+    /// The `calculated_at` the status and coverage above were computed with
+    /// (#4336). A 1.11 replica's recalculation moves `calculated_at` without
+    /// touching them, so a mismatch means they are stale.
+    #[sqlx(default)]
+    pub status_calculated_at: Option<DateTime<Utc>>,
+}
+
+impl RepoSecurityScore {
+    /// Whether the status and coverage columns were computed with this row's
+    /// current `calculated_at` (not left stale by a 1.11 replica).
+    fn status_is_current(&self) -> bool {
+        self.status_calculated_at == Some(self.calculated_at)
+    }
+
+    /// The grade status, read from the row or, for a row last written by a
+    /// 1.11 replica (no status stored, or a stale one), derived from what
+    /// that replica recorded: a floored letter (the stored `grade` differs
+    /// from the score's own letter) or either fail-closed flag means
+    /// `incomplete`.
+    pub fn status(&self) -> GradeStatus {
+        if self.status_is_current() {
+            if let Some(status) = self.grade_status.as_deref().and_then(GradeStatus::parse) {
+                return status;
+            }
+        }
+        let floored = self.grade != Grade::from_score(self.score).as_char().to_string();
+        if floored || self.has_failed_scan || self.has_uncataloged_scan {
+            GradeStatus::Incomplete
+        } else {
+            GradeStatus::Rated
+        }
+    }
+
+    /// The grade letter to show: computed over what was assessed, never an F
+    /// floor; `None` when nothing was assessed (#4336). A 1.11-written row
+    /// gives the score's own letter.
+    pub fn display_grade(&self) -> Option<String> {
+        match self.status() {
+            GradeStatus::Unrated => None,
+            _ => Some(
+                self.rated_grade
+                    .clone()
+                    .filter(|_| self.status_is_current())
+                    .unwrap_or_else(|| Grade::from_score(self.score).as_char().to_string()),
+            ),
+        }
+    }
+
+    /// The stored coverage, `None` on a row a 1.11 replica wrote.
+    pub fn coverage(&self) -> Option<ScoreCoverage> {
+        if !self.status_is_current() {
+            return None;
+        }
+        Some(ScoreCoverage {
+            artifacts: i64::from(self.artifact_count?),
+            scanned: i64::from(self.scanned_count?),
+            cataloged: i64::from(self.cataloged_count?),
+            partial: i64::from(self.partial_count?),
+            failed: i64::from(self.failed_count?),
+            uncataloged: i64::from(self.uncataloged_count?),
+        })
+    }
 }
 
 /// A scan policy that can block downloads based on findings.
@@ -734,8 +957,16 @@ pub struct DashboardSummary {
     pub critical_findings: i64,
     pub high_findings: i64,
     pub policy_violations_blocked: i64,
+    /// Distinct proxied digests a repository's proxy scan gate refuses right
+    /// now (#4777): the proxy half of `policy_violations_blocked`, on its own.
+    pub proxy_blocked: i64,
     pub repos_grade_a: i64,
     pub repos_grade_f: i64,
+    /// Repositories by grade status (#4336). Rows a 1.11 replica wrote count
+    /// by [`RepoSecurityScore::status`]'s fallback.
+    pub repos_rated: i64,
+    pub repos_incomplete: i64,
+    pub repos_unrated: i64,
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -1172,5 +1403,166 @@ mod tests {
         let multibyte = format!("{}é", "a".repeat(VULN_DB_VERSION_MAX_LEN - 1));
         let p = VulnDbProvenance::new(multibyte, None).unwrap();
         assert_eq!(p.version, "a".repeat(VULN_DB_VERSION_MAX_LEN - 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Grade status and coverage (#4336)
+    // -----------------------------------------------------------------------
+
+    fn coverage(cataloged: i64, partial: i64, failed: i64, uncataloged: i64) -> ScoreCoverage {
+        ScoreCoverage {
+            artifacts: cataloged + failed + uncataloged + 1,
+            scanned: cataloged + failed + uncataloged,
+            cataloged,
+            partial,
+            failed,
+            uncataloged,
+        }
+    }
+
+    #[test]
+    fn coverage_gives_the_status() {
+        assert_eq!(coverage(3, 0, 0, 0).grade_status(), GradeStatus::Rated);
+        assert_eq!(coverage(1, 0, 0, 1).grade_status(), GradeStatus::Incomplete);
+        assert_eq!(coverage(1, 0, 1, 0).grade_status(), GradeStatus::Incomplete);
+        assert_eq!(coverage(2, 1, 0, 0).grade_status(), GradeStatus::Incomplete);
+        // Nothing assessed: no scans, only failures, only uncataloged.
+        assert_eq!(coverage(0, 0, 0, 0).grade_status(), GradeStatus::Unrated);
+        assert_eq!(coverage(0, 0, 2, 0).grade_status(), GradeStatus::Unrated);
+        assert_eq!(coverage(0, 0, 0, 1).grade_status(), GradeStatus::Unrated);
+    }
+
+    #[test]
+    fn coverage_pct_counts_fully_assessed_of_scanned() {
+        assert_eq!(coverage(1, 0, 0, 1).coverage_pct(), Some(50));
+        assert_eq!(coverage(3, 1, 0, 0).coverage_pct(), Some(66));
+        assert_eq!(coverage(4, 0, 0, 0).coverage_pct(), Some(100));
+        assert_eq!(coverage(0, 0, 0, 0).coverage_pct(), None);
+    }
+
+    #[test]
+    fn scan_rows_map_onto_the_same_status_vocabulary() {
+        assert_eq!(
+            scan_grade_status("completed", "complete", None),
+            (GradeStatus::Rated, None)
+        );
+        // An extraction that read part of an artifact (W3-D's ISO case) is
+        // recorded `partial` with a reason: incomplete, with that reason.
+        assert_eq!(
+            scan_grade_status("completed", "partial", Some("iso: rootfs partly extracted")),
+            (
+                GradeStatus::Incomplete,
+                Some("iso: rootfs partly extracted".to_string())
+            )
+        );
+        let (status, reason) = scan_grade_status("completed", "not_cataloged", Some("grype: 0"));
+        assert_eq!(status, GradeStatus::Unrated);
+        assert_eq!(reason.as_deref(), Some("grype: 0"));
+        for s in ["failed", "not_applicable", "pending", "running"] {
+            let (status, reason) = scan_grade_status(s, "complete", None);
+            assert_eq!(status, GradeStatus::Unrated, "{s}");
+            assert!(reason.is_some(), "{s}");
+        }
+    }
+
+    #[test]
+    fn grade_status_round_trips() {
+        for s in [
+            GradeStatus::Rated,
+            GradeStatus::Incomplete,
+            GradeStatus::Unrated,
+        ] {
+            assert_eq!(GradeStatus::parse(s.as_str()), Some(s));
+            assert_eq!(
+                serde_json::to_value(s).unwrap(),
+                serde_json::Value::String(s.as_str().to_string())
+            );
+        }
+        assert_eq!(GradeStatus::parse("F"), None);
+    }
+
+    fn score_row(score: i32, grade: &str) -> RepoSecurityScore {
+        let now = Utc::now();
+        RepoSecurityScore {
+            id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            score,
+            grade: grade.to_string(),
+            total_findings: 0,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+            acknowledged_count: 0,
+            last_scan_at: None,
+            calculated_at: now,
+            has_failed_scan: false,
+            has_uncataloged_scan: false,
+            grade_status: None,
+            rated_grade: None,
+            artifact_count: None,
+            scanned_count: None,
+            cataloged_count: None,
+            partial_count: None,
+            failed_count: None,
+            uncataloged_count: None,
+            status_calculated_at: None,
+        }
+    }
+
+    #[test]
+    fn a_current_row_reads_its_stored_status_and_letter() {
+        let mut row = score_row(80, "F");
+        row.has_failed_scan = true;
+        row.grade_status = Some("incomplete".to_string());
+        row.rated_grade = Some("B".to_string());
+        row.artifact_count = Some(2);
+        row.scanned_count = Some(2);
+        row.cataloged_count = Some(1);
+        row.partial_count = Some(0);
+        row.failed_count = Some(1);
+        row.uncataloged_count = Some(0);
+        row.status_calculated_at = Some(row.calculated_at);
+        assert_eq!(row.status(), GradeStatus::Incomplete);
+        // The legacy column still carries the floor for 1.11; the shown letter
+        // does not.
+        assert_eq!(row.grade, "F");
+        assert_eq!(row.display_grade().as_deref(), Some("B"));
+        assert_eq!(row.coverage().unwrap().failed, 1);
+
+        row.grade_status = Some("unrated".to_string());
+        row.rated_grade = None;
+        assert_eq!(row.display_grade(), None);
+    }
+
+    #[test]
+    fn a_row_a_1_11_replica_wrote_is_derived_from_its_flags() {
+        // Inserted by 1.11: no status at all.
+        let clean = score_row(95, "A");
+        assert_eq!(clean.status(), GradeStatus::Rated);
+        assert_eq!(clean.display_grade().as_deref(), Some("A"));
+        assert!(clean.coverage().is_none());
+
+        let mut floored = score_row(80, "F");
+        floored.has_failed_scan = true;
+        assert_eq!(floored.status(), GradeStatus::Incomplete);
+        assert_eq!(floored.display_grade().as_deref(), Some("B"));
+
+        // Recalculated by 1.11 after 1.12 wrote a status: `calculated_at`
+        // moved, the stored status is stale and ignored.
+        let mut stale = score_row(80, "F");
+        stale.has_uncataloged_scan = true;
+        stale.grade_status = Some("rated".to_string());
+        stale.rated_grade = Some("B".to_string());
+        stale.artifact_count = Some(1);
+        stale.scanned_count = Some(1);
+        stale.cataloged_count = Some(1);
+        stale.partial_count = Some(0);
+        stale.failed_count = Some(0);
+        stale.uncataloged_count = Some(0);
+        stale.status_calculated_at = Some(stale.calculated_at - chrono::Duration::seconds(5));
+        assert_eq!(stale.status(), GradeStatus::Incomplete);
+        assert!(stale.coverage().is_none());
+        assert_eq!(stale.display_grade().as_deref(), Some("B"));
     }
 }

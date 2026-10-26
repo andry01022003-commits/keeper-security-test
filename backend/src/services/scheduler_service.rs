@@ -1095,6 +1095,67 @@ pub fn spawn_all(
         });
     }
 
+    // Download statistics retention (#4541): opt-in via
+    // DOWNLOAD_STATS_RETENTION_DAYS. Trims download_statistics and
+    // proxy_download_statistics on one replica at a time; the lease is renewed
+    // for the whole pass and a lost lease stops it between batches (#3502).
+    {
+        use crate::services::download_stats_retention as retention;
+        let days = retention::retention_days_from_env();
+        let every = retention::interval_secs_from_env();
+        tracing::info!("{}", retention::startup_message(days, every));
+        if let Some(days) = days {
+            let db = db.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(jittered_startup_delay(every.min(240))).await;
+                let mut ticker = interval(Duration::from_secs(every));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let Some(lease) =
+                        crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                            &db,
+                            retention::DOWNLOAD_STATS_RETENTION_LEASE_NAME,
+                            retention::DOWNLOAD_STATS_RETENTION_LEASE_TTL_SECS,
+                        )
+                        .await
+                    else {
+                        tracing::debug!(
+                            "Another replica owns the download statistics retention lease"
+                        );
+                        continue;
+                    };
+                    let (renewal, lost) = lease.spawn_renewal_with_cancellation(
+                        db.clone(),
+                        retention::DOWNLOAD_STATS_RETENTION_LEASE_TTL_SECS,
+                    );
+                    match retention::apply_retention(
+                        &db,
+                        Some(days),
+                        retention::DOWNLOAD_STATS_RETENTION_BATCH_SIZE,
+                        Some(&lost),
+                    )
+                    .await
+                    {
+                        Ok(r) => tracing::info!(
+                            retention_days = days,
+                            hosted_rows_deleted = r.hosted_rows_deleted,
+                            proxy_rows_deleted = r.proxy_rows_deleted,
+                            batches = r.batches,
+                            interrupted = r.interrupted,
+                            "Download statistics retention pass"
+                        ),
+                        Err(e) => {
+                            tracing::warn!("Download statistics retention pass failed: {}", e)
+                        }
+                    }
+                    drop(renewal);
+                    lease.release(&db).await;
+                }
+            });
+        }
+    }
+
     // Chunked upload session cleanup + orphaned incus staging sweep (every hour)
     {
         let db = db.clone();
@@ -2108,39 +2169,40 @@ async fn run_curation_sync_cycle_for(
                 }
                 // Fetch repomd.xml as raw bytes so a detached signature can be
                 // verified over the exact content before its checksums are trusted.
-                let repomd_bytes = match repomd_req.send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        #[allow(clippy::disallowed_methods)]
-                        // STREAMING-EXEMPT: capped-metadata (upstream repomd.xml) buffered for signature verify + href parse; not an artifact blob (#1608)
-                        match resp.bytes().await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                record_curation_failure(
-                                    &mut failures,
-                                    *staging_id,
-                                    format_args!("repomd.xml read error: {e}"),
-                                );
-                                continue;
+                let repomd_bytes =
+                    match crate::services::upstream_tracing::send_upstream(repomd_req).await {
+                        Ok(resp) if resp.status().is_success() => {
+                            #[allow(clippy::disallowed_methods)]
+                            // STREAMING-EXEMPT: capped-metadata (upstream repomd.xml) buffered for signature verify + href parse; not an artifact blob (#1608)
+                            match resp.bytes().await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    record_curation_failure(
+                                        &mut failures,
+                                        *staging_id,
+                                        format_args!("repomd.xml read error: {e}"),
+                                    );
+                                    continue;
+                                }
                             }
                         }
-                    }
-                    Ok(resp) => {
-                        record_curation_failure(
-                            &mut failures,
-                            *staging_id,
-                            format_args!("repomd.xml fetch failed: {}", resp.status()),
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        record_curation_failure(
-                            &mut failures,
-                            *staging_id,
-                            format_args!("repomd.xml fetch error: {e}"),
-                        );
-                        continue;
-                    }
-                };
+                        Ok(resp) => {
+                            record_curation_failure(
+                                &mut failures,
+                                *staging_id,
+                                format_args!("repomd.xml fetch failed: {}", resp.status()),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            record_curation_failure(
+                                &mut failures,
+                                *staging_id,
+                                format_args!("repomd.xml fetch error: {e}"),
+                            );
+                            continue;
+                        }
+                    };
 
                 // GPG-verify-before-ingest (#2357 S4): when a trusted key is
                 // configured on the remote, fetch repomd.xml.asc and verify the
@@ -2163,7 +2225,9 @@ async fn run_curation_sync_cycle_for(
                             asc_req =
                                 crate::services::upstream_auth::apply_upstream_auth(asc_req, auth);
                         }
-                        let asc = match asc_req.send().await {
+                        let asc = match crate::services::upstream_tracing::send_upstream(asc_req)
+                            .await
+                        {
                             Ok(resp) if resp.status().is_success() => {
                                 resp.text().await.unwrap_or_default()
                             }
@@ -2236,7 +2300,7 @@ async fn run_curation_sync_cycle_for(
                     primary_req =
                         crate::services::upstream_auth::apply_upstream_auth(primary_req, auth);
                 }
-                match primary_req.send().await {
+                match crate::services::upstream_tracing::send_upstream(primary_req).await {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for checksum-pin + decode; not an artifact blob (#1608)
@@ -2362,7 +2426,7 @@ async fn run_curation_sync_cycle_for(
                     packages_req =
                         crate::services::upstream_auth::apply_upstream_auth(packages_req, auth);
                 }
-                match packages_req.send().await {
+                match crate::services::upstream_tracing::send_upstream(packages_req).await {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
@@ -2386,7 +2450,7 @@ async fn run_curation_sync_cycle_for(
                                 plain_req, auth,
                             );
                         }
-                        match plain_req.send().await {
+                        match crate::services::upstream_tracing::send_upstream(plain_req).await {
                             Ok(resp) if resp.status().is_success() => {
                                 let content = resp.text().await?;
                                 curation_sync::parse_deb_packages_index(&content, "main")
@@ -2841,7 +2905,9 @@ async fn bounded_get_json(
     if let Some(auth) = upstream_auth {
         req = crate::services::upstream_auth::apply_upstream_auth(req, auth);
     }
-    let resp = req.send().await.ok()?;
+    let resp = crate::services::upstream_tracing::send_upstream(req)
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -2873,7 +2939,9 @@ async fn bounded_download(
     if let Some(auth) = upstream_auth {
         req = crate::services::upstream_auth::apply_upstream_auth(req, auth);
     }
-    let resp = req.send().await.ok()?;
+    let resp = crate::services::upstream_tracing::send_upstream(req)
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -4187,6 +4255,165 @@ mod tests {
             .bind(vec![bad_id, good_id, bad_remote, good_remote])
             .execute(&pool)
             .await;
+    }
+
+    /// #3954: the curation sync cycle's upstream index fetches go through
+    /// `send_upstream`, so each exports a `CLIENT` span with an integer
+    /// status. Before, they used a bare `.send()` and exported no span.
+    #[tokio::test]
+    async fn test_curation_sync_fetches_export_client_spans_3954() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_tracing::exported_upstream_client_spans;
+        use crate::testing::otel::{otel_subscriber, ExportedSpans};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        let primary = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" packages="1">
+<package type="rpm"><name>zlib</name><arch>x86_64</arch><version epoch="0" ver="1.3" rel="1.el9"/><checksum type="sha256" pkgid="YES">abc123</checksum><location href="Packages/zlib-1.3-1.el9.x86_64.rpm"/></package>
+</metadata>"#;
+        mount_rpm_upstream(
+            &server,
+            "/spans",
+            "repodata/z-primary.xml.gz",
+            gzip(primary.as_bytes()),
+        )
+        .await;
+        let staging_id = uuid::Uuid::new_v4();
+        let upstream = format!("{}/spans", server.uri());
+        let remote_id = seed_rpm_curation_pair(&pool, staging_id, &upstream).await;
+
+        let exported = ExportedSpans::default();
+        let result = {
+            let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+            run_curation_sync_cycle_for(&pool, Some(&[staging_id]), None).await
+        };
+
+        let _ = sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![staging_id, remote_id])
+            .execute(&pool)
+            .await;
+        result.expect("the sync succeeds");
+
+        let mut spans = exported_upstream_client_spans(&exported, "GET");
+        spans.sort();
+        assert_eq!(
+            spans,
+            vec![
+                (
+                    "GET".to_string(),
+                    format!("{upstream}/repodata/repomd.xml"),
+                    200
+                ),
+                (
+                    "GET".to_string(),
+                    format!("{upstream}/repodata/z-primary.xml.gz"),
+                    200
+                ),
+            ],
+            "one CLIENT span per index fetch, each with an integer status"
+        );
+    }
+
+    /// #3954: a curation index fetch that fails keeps its failure handling
+    /// through `send_upstream`. An upstream answering 503 and an upstream that
+    /// refuses the connection each fail their own repo (named in the cycle's
+    /// error, left unstamped so the next tick retries), and each exports an
+    /// error `CLIENT` span: `error.type` is the status for the 503 and
+    /// `connect` for the refused connection.
+    #[tokio::test]
+    async fn test_curation_sync_fetch_failures_keep_retry_and_export_error_spans_3954() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down/repodata/repomd.xml"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            format!("http://{}/gone", listener.local_addr().expect("addr"))
+        };
+
+        let mut ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+        ids.sort();
+        let [down_id, refused_id] = ids;
+        let down_remote =
+            seed_rpm_curation_pair(&pool, down_id, &format!("{}/down", server.uri())).await;
+        let refused_remote = seed_rpm_curation_pair(&pool, refused_id, &refused).await;
+
+        let exported = ExportedSpans::default();
+        let result = {
+            let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+            run_curation_sync_cycle_for(&pool, Some(&ids), None).await
+        };
+        let down_stamped = curation_last_synced_at(&pool, down_id).await;
+        let refused_stamped = curation_last_synced_at(&pool, refused_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![down_id, refused_id, down_remote, refused_remote])
+            .execute(&pool)
+            .await;
+
+        let err = result
+            .expect_err("failed index fetches fail the cycle")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "staging repo {down_id}: repomd.xml fetch failed: 503"
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "staging repo {refused_id}: repomd.xml fetch error"
+            )),
+            "{err}"
+        );
+        assert!(down_stamped.is_none(), "the 503 repo stays unstamped");
+        assert!(
+            refused_stamped.is_none(),
+            "the refused repo stays unstamped"
+        );
+
+        let spans = exported.named("GET");
+        assert_eq!(spans.len(), 2, "one CLIENT span per failed fetch");
+        let error_type = |url: String| {
+            let span = spans
+                .iter()
+                .find(|s| attr(s, "url.full") == Some(opentelemetry::Value::from(url.clone())))
+                .unwrap_or_else(|| panic!("no span for {url}"));
+            assert!(
+                matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+                "{url}: {:?}",
+                span.status
+            );
+            (
+                attr(span, "http.response.status_code"),
+                attr(span, "error.type"),
+            )
+        };
+        assert_eq!(
+            error_type(format!("{}/down/repodata/repomd.xml", server.uri())),
+            (
+                Some(opentelemetry::Value::I64(503)),
+                Some(opentelemetry::Value::from("503"))
+            )
+        );
+        assert_eq!(
+            error_type(format!("{refused}/repodata/repomd.xml")),
+            (None, Some(opentelemetry::Value::from("connect")))
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -408,10 +408,10 @@ async fn proxied_image_blocked_by_policy_counts_on_dashboard() {
 }
 
 /// #4582: a proxied verdict counts as blocked only on a format whose proxy
-/// path runs the gate. The same high verdict, cached by an rpm Remote and a
+/// path runs the gate. The same high verdict, cached by a helm Remote and a
 /// conda Remote with identical blocking settings (scan-on-proxy, threshold
 /// `high`), adds one to `policy_violations_blocked` through the conda remote
-/// (gated since #4585) and nothing through the rpm remote, which stores
+/// (gated since #4585) and nothing through the helm remote, which stores
 /// `scan_on_proxy` but serves the package unscanned.
 #[tokio::test]
 #[ignore = "requires DATABASE_URL; run with --ignored"]
@@ -474,7 +474,7 @@ async fn proxied_verdict_counts_only_on_a_gated_format_4582() {
             .policy_violations_blocked
     };
     let before = count().await;
-    let rpm = remote_with_cached(&pool, "rpm", &digest).await;
+    let helm = remote_with_cached(&pool, "helm", &digest).await;
     let ungated = count().await;
     let conda = remote_with_cached(&pool, "conda", &digest).await;
     let gated = count().await;
@@ -483,7 +483,7 @@ async fn proxied_verdict_counts_only_on_a_gated_format_4582() {
         .bind(&digest)
         .execute(&pool)
         .await;
-    for repo_id in [rpm, conda] {
+    for repo_id in [helm, conda] {
         let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
             .bind(repo_id)
             .execute(&pool)
@@ -493,7 +493,7 @@ async fn proxied_verdict_counts_only_on_a_gated_format_4582() {
 
     assert_eq!(
         ungated, before,
-        "an rpm remote serves the package unscanned, so it is not blocked"
+        "a helm remote serves the package unscanned, so it is not blocked"
     );
     assert_eq!(
         gated - before,

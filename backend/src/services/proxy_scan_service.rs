@@ -475,6 +475,38 @@ impl ProxyScanService {
         Ok(row)
     }
 
+    /// [`lookup_verdict`](Self::lookup_verdict) plus the coordinate the
+    /// verdict was graded as (`pin_identity`, #4952), in one read, for the
+    /// inline gate's reuse decision. Runtime query (no macro) so this adds no
+    /// offline sqlx data.
+    pub async fn lookup_verdict_with_pin(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<(ProxyScanRow, Option<String>)>> {
+        #[derive(sqlx::FromRow)]
+        struct PinnedRow {
+            #[sqlx(flatten)]
+            row: ProxyScanRow,
+            pin_identity: Option<String>,
+        }
+        let row = sqlx::query_as::<_, PinnedRow>(
+            r#"
+            SELECT checksum_sha256, scan_type, verdict,
+                   findings_count, critical_count, high_count, medium_count, low_count,
+                   max_severity, scanner_version, scanned_at, pin_identity
+            FROM proxy_scan_results
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(row.map(|r| (r.row, r.pin_identity)))
+    }
+
     /// Upsert a verdict keyed on `(checksum_sha256, scan_type)`. A newer scan of
     /// the same bytes (e.g. against a bumped CVE-DB) replaces the prior row.
     /// Leaves `components_cataloged` as it was; the inline gate records through
@@ -689,6 +721,10 @@ impl ProxyScanService {
     /// the engine reported no catalog. The inline gate and the rescan
     /// endpoint record through this. Runtime query (no macro) so this adds
     /// no offline sqlx data.
+    ///
+    /// `pin_identity` is the coordinate the verdict was graded as
+    /// ([`ExpectedComponent::pin_identity`](crate::services::scanner_service::ExpectedComponent::pin_identity)),
+    /// `None` for a scan without one (#4952); it is replaced with the verdict.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_verdict_with_catalog(
         &self,
@@ -704,6 +740,7 @@ impl ProxyScanService {
         scanner_version: Option<&str>,
         repository_id: Option<Uuid>,
         components_cataloged: Option<i32>,
+        pin_identity: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             r#"
@@ -711,9 +748,9 @@ impl ProxyScanService {
                 checksum_sha256, scan_type, verdict,
                 findings_count, critical_count, high_count, medium_count, low_count,
                 max_severity, scanner_version, repository_id, components_cataloged,
-                scanned_at
+                pin_identity, scanned_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
             ON CONFLICT (checksum_sha256, scan_type) DO UPDATE SET
                 verdict = EXCLUDED.verdict,
                 findings_count = EXCLUDED.findings_count,
@@ -725,6 +762,7 @@ impl ProxyScanService {
                 scanner_version = EXCLUDED.scanner_version,
                 repository_id = EXCLUDED.repository_id,
                 components_cataloged = EXCLUDED.components_cataloged,
+                pin_identity = EXCLUDED.pin_identity,
                 scanned_at = now()
             "#,
         )
@@ -740,6 +778,7 @@ impl ProxyScanService {
         .bind(scanner_version)
         .bind(repository_id)
         .bind(components_cataloged)
+        .bind(pin_identity)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

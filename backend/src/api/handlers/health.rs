@@ -26,6 +26,7 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use once_cell::sync::Lazy;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -65,6 +66,26 @@ pub struct HealthResponse {
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
+    /// Storage backends that were configured but skipped at startup because of
+    /// a configuration error (#4530). Empty on a healthy deployment and omitted
+    /// then; a non-empty list makes the overall status `unhealthy` and names
+    /// each backend with the error that skipped it. These are also reported to
+    /// the admin `GET /api/v1/admin/storage-backends` availability list as
+    /// unavailable, so a repository on one of them does not look routable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_storage_backends: Vec<SkippedStorageBackend>,
+}
+
+/// One storage backend that was configured but skipped at startup (#4530).
+#[derive(Serialize, ToSchema)]
+pub struct SkippedStorageBackend {
+    /// Backend name (`s3`, `azure`, `gcs`), the value a repository's
+    /// `storage_backend` names.
+    pub backend: String,
+    /// The configuration error that skipped it, safe to publish: it names the
+    /// environment variable and why its value was refused, never credentials
+    /// (the public-endpoint parser redacts userinfo, #4503).
+    pub error: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -483,12 +504,23 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         .as_ref()
         .is_none_or(|c| c.status == STATUS_HEALTHY);
 
-    let overall_status =
-        if db_check.status == STATUS_HEALTHY && storage_healthy && opensearch_healthy {
-            STATUS_HEALTHY
-        } else {
-            STATUS_UNHEALTHY
-        };
+    // #4530: a backend that was configured but skipped at startup is a
+    // deployment-level degradation even though the primary probe passes. A
+    // repository on the skipped backend fails every request, so the operator
+    // must see it here rather than only in a startup log line.
+    let skipped_storage_backends =
+        skipped_storage_backends(state.storage_registry.skipped_backends());
+    let storage_backends_healthy = skipped_storage_backends.is_empty();
+
+    let overall_status = if db_check.status == STATUS_HEALTHY
+        && storage_healthy
+        && storage_backends_healthy
+        && opensearch_healthy
+    {
+        STATUS_HEALTHY
+    } else {
+        STATUS_UNHEALTHY
+    };
 
     let pool_stats = DbPoolStats {
         max_connections: state.db.options().get_max_connections(),
@@ -528,6 +560,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         db_pool,
         commit,
         dirty,
+        skipped_storage_backends,
     };
 
     let status_code = if overall_status == STATUS_HEALTHY {
@@ -846,6 +879,23 @@ impl Clone for CheckStatus {
             message: self.message.clone(),
         }
     }
+}
+
+/// Build the `/health` list of backends that were configured but skipped at
+/// startup (#4530), sorted by name so the body is stable across scrapes.
+///
+/// Pure (no state or I/O) so the ordering and shape are unit-testable without
+/// a `SharedState`.
+fn skipped_storage_backends(skipped: &HashMap<String, String>) -> Vec<SkippedStorageBackend> {
+    let mut entries: Vec<SkippedStorageBackend> = skipped
+        .iter()
+        .map(|(backend, error)| SkippedStorageBackend {
+            backend: backend.clone(),
+            error: error.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.backend.cmp(&b.backend));
+    entries
 }
 
 /// Verify storage backend connectivity, behind a short-TTL cache.
@@ -1219,7 +1269,8 @@ pub async fn memory_stats() -> impl IntoResponse {
         ReadyzResponse,
         ReadyzChecks,
         ReadyzDependencies,
-        DependencyStatus
+        DependencyStatus,
+        SkippedStorageBackend
     ))
 )]
 pub struct HealthApiDoc;
@@ -1453,6 +1504,7 @@ mod tests {
             db_pool,
             commit,
             dirty,
+            skipped_storage_backends: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"status\":\"healthy\""));
@@ -1482,6 +1534,7 @@ mod tests {
             db_pool: Some(sample_pool_stats()),
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1514,6 +1567,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1536,6 +1590,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1578,6 +1633,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1868,6 +1924,81 @@ mod tests {
         assert!(status.message.unwrap().contains("Unknown backend: ftp"));
     }
 
+    // -----------------------------------------------------------------------
+    // #4530: backends skipped at startup surface on /health
+    // -----------------------------------------------------------------------
+
+    /// A healthy registry produces an EMPTY list, and the field is omitted from
+    /// JSON so nothing changes for a deployment that never skipped a backend.
+    #[test]
+    fn test_skipped_storage_backends_empty_4530() {
+        let entries = skipped_storage_backends(&HashMap::new());
+        assert!(entries.is_empty());
+
+        let response = HealthResponse {
+            status: STATUS_HEALTHY.to_string(),
+            version: "1.0.0".to_string(),
+            demo_mode: false,
+            checks: HealthChecks {
+                database: healthy_check(),
+                storage: healthy_check(),
+                security_scanner: None,
+                opensearch: None,
+                ldap: None,
+            },
+            db_pool: None,
+            commit: None,
+            dirty: None,
+            skipped_storage_backends: entries,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(
+            !json.contains("skipped_storage_backends"),
+            "an empty list must be omitted, got: {json}"
+        );
+    }
+
+    /// A skipped backend is named with its configuration error, and the list is
+    /// sorted by backend name so the body is stable across scrapes.
+    #[test]
+    fn test_skipped_storage_backends_names_and_sorts_4530() {
+        let mut skipped = HashMap::new();
+        skipped.insert(
+            "s3".to_string(),
+            "S3_PUBLIC_ENDPOINT is invalid".to_string(),
+        );
+        skipped.insert("gcs".to_string(), "GCS_PROJECT_ID not set".to_string());
+
+        let entries = skipped_storage_backends(&skipped);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].backend, "gcs");
+        assert_eq!(entries[0].error, "GCS_PROJECT_ID not set");
+        assert_eq!(entries[1].backend, "s3");
+        assert_eq!(entries[1].error, "S3_PUBLIC_ENDPOINT is invalid");
+
+        // And it round-trips through the response JSON that a probe reads.
+        let response = HealthResponse {
+            status: STATUS_UNHEALTHY.to_string(),
+            version: "1.0.0".to_string(),
+            demo_mode: false,
+            checks: HealthChecks {
+                database: healthy_check(),
+                storage: healthy_check(),
+                security_scanner: None,
+                opensearch: None,
+                ldap: None,
+            },
+            db_pool: None,
+            commit: None,
+            dirty: None,
+            skipped_storage_backends: entries,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"skipped_storage_backends\""));
+        assert!(json.contains("\"backend\":\"s3\""));
+        assert!(json.contains("S3_PUBLIC_ENDPOINT is invalid"));
+    }
+
     #[test]
     fn test_db_pool_stats_serialization() {
         let stats = sample_pool_stats();
@@ -1894,6 +2025,7 @@ mod tests {
             db_pool: None,
             commit: Some("abc1234def5678".to_string()),
             dirty: Some(true),
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1917,6 +2049,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            skipped_storage_backends: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();

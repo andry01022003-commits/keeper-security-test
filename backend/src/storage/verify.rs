@@ -210,6 +210,208 @@ pub fn verify_sha256_stream(
     .boxed()
 }
 
+/// Objects up to this size are verified before the response status is sent
+/// (#4323): the body is read and hashed first, so a mismatch is answered with
+/// a clean `502` and no byte of the bad object. A larger object is verified
+/// while it streams ([`verify_sha256_stream`]); a mismatch there can only
+/// abort the transfer, because the `200` and its headers are already on the
+/// wire. Memory per serve stays bounded by this value.
+pub const VERIFY_BEFORE_HEADERS_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Machine-readable `code` of the `502` a failed verification answers with.
+pub const STORED_OBJECT_INTEGRITY_CODE: &str = "STORED_OBJECT_INTEGRITY";
+
+/// Marker in the extensions of a failed-verification response (#4323).
+///
+/// Virtual-member resolution treats an error from a member as "this member
+/// does not have it" unless it is a terminal refusal. A member whose stored
+/// bytes failed verification HOLDS the artifact, so falling through to the
+/// next member would serve different bytes for the same path and hide the
+/// corruption; the marker makes it terminal without also making an
+/// upstream's ordinary `502` terminal.
+#[derive(Debug, Clone, Copy)]
+pub struct IntegrityFailure;
+
+/// Whether `response` is a failed stored-object verification.
+pub fn is_integrity_failure(response: &axum::response::Response) -> bool {
+    response.extensions().get::<IntegrityFailure>().is_some()
+}
+
+/// Whether serve-time verification is on (`DOWNLOAD_VERIFY_CHECKSUMS`,
+/// default true), for serve paths that have no `Config` at hand (#4323). Read
+/// once, with the exact parse `Config::from_env` uses for
+/// `download_verify_checksums`.
+pub fn serve_verification_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(
+            std::env::var("DOWNLOAD_VERIFY_CHECKSUMS").as_deref(),
+            Ok("false" | "0")
+        )
+    });
+    *ENABLED
+}
+
+fn integrity_error(label: &str) -> AppError {
+    AppError::CodedBadGateway {
+        code: STORED_OBJECT_INTEGRITY_CODE,
+        message: format!("The stored object for {label} failed integrity verification"),
+    }
+}
+
+/// The `502` response for a failed verification, carrying [`IntegrityFailure`].
+pub fn integrity_failure_response(label: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut response = integrity_error(label).into_response();
+    response.extensions_mut().insert(IntegrityFailure);
+    response
+}
+
+fn log_mismatch(label: &str, expected: &[u8; 32], expected_len: u64, verdict: &IntegrityVerdict) {
+    if let IntegrityVerdict::Mismatch {
+        actual_sha256,
+        actual_len,
+    } = verdict
+    {
+        tracing::error!(
+            object = %label,
+            expected_sha256 = %hex::encode(expected),
+            actual_sha256 = %actual_sha256,
+            expected_len,
+            actual_len,
+            "stored object failed integrity verification on serve; answering 502"
+        );
+    }
+}
+
+/// Verify `body` against `expected` and `total` for a whole-object serve
+/// (#4323). An object of at most [`VERIFY_BEFORE_HEADERS_MAX_BYTES`] is read
+/// and checked now: a mismatch is an `Err` carrying the `502`
+/// ([`STORED_OBJECT_INTEGRITY_CODE`]) and nothing of the object is served. A
+/// larger object is returned wrapped in [`verify_sha256_stream`].
+pub async fn verify_before_serve(
+    mut body: BoxStream<'static, Result<Bytes>>,
+    expected: [u8; 32],
+    total: u64,
+    label: String,
+) -> Result<BoxStream<'static, Result<Bytes>>> {
+    if total > VERIFY_BEFORE_HEADERS_MAX_BYTES {
+        return Ok(verify_sha256_stream(body, expected, Some(total), label));
+    }
+    let mut hasher = Sha256::new();
+    let mut held = Vec::new();
+    let mut len = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        len += chunk.len() as u64;
+        // Longer than recorded: stop reading, it cannot be intact.
+        if len > total {
+            break;
+        }
+        hasher.update(&chunk);
+        held.push(Ok(chunk));
+    }
+    let verdict = if len > total {
+        IntegrityVerdict::Mismatch {
+            actual_sha256: String::from("(not computed: longer than recorded)"),
+            actual_len: len,
+        }
+    } else {
+        verdict(&expected, Some(total), &hasher.finalize(), len)
+    };
+    if verdict != IntegrityVerdict::Intact {
+        log_mismatch(&label, &expected, total, &verdict);
+        return Err(integrity_error(&label));
+    }
+    Ok(futures::stream::iter(held).boxed())
+}
+
+/// Verify a stored artifact body on a format-native or virtual-member serve
+/// (#4323), from the artifact row's recorded `checksum_sha256`, `path` and
+/// `size_bytes`. Unverified (returned as is) when verification is off, the
+/// recorded value is not a SHA-256, or the path has the protobuf commit
+/// bundle shape whose recorded checksum is not a content digest (the row's
+/// format is not known on these paths, so the shape alone decides). A
+/// mismatch on a small object is the `502` [`integrity_failure_response`].
+pub async fn verify_stored_body(
+    body: BoxStream<'static, Result<Bytes>>,
+    recorded_sha256: &str,
+    path: &str,
+    size_bytes: i64,
+    label: impl FnOnce() -> String,
+) -> std::result::Result<BoxStream<'static, Result<Bytes>>, axum::response::Response> {
+    let Some(expected) = stored_body_expectation(recorded_sha256, path) else {
+        return Ok(body);
+    };
+    let label = label();
+    verify_before_serve(body, expected, size_bytes.max(0) as u64, label.clone())
+        .await
+        .map_err(|e| match e {
+            AppError::CodedBadGateway {
+                code: STORED_OBJECT_INTEGRITY_CODE,
+                ..
+            } => integrity_failure_response(&label),
+            other => {
+                use axum::response::IntoResponse;
+                other.into_response()
+            }
+        })
+}
+
+/// Buffered sibling of [`verify_stored_body`] for a body already in memory.
+#[allow(clippy::result_large_err)]
+pub fn verify_stored_bytes(
+    bytes: &Bytes,
+    recorded_sha256: &str,
+    path: &str,
+    size_bytes: i64,
+    label: impl FnOnce() -> String,
+) -> std::result::Result<(), axum::response::Response> {
+    let Some(expected) = stored_body_expectation(recorded_sha256, path) else {
+        return Ok(());
+    };
+    let total = size_bytes.max(0) as u64;
+    let verdict = verdict(
+        &expected,
+        Some(total),
+        &Sha256::digest(bytes),
+        bytes.len() as u64,
+    );
+    if verdict == IntegrityVerdict::Intact {
+        return Ok(());
+    }
+    let label = label();
+    log_mismatch(&label, &expected, total, &verdict);
+    Err(integrity_failure_response(&label))
+}
+
+fn stored_body_expectation(recorded_sha256: &str, path: &str) -> Option<[u8; 32]> {
+    if !serve_verification_enabled() || !checksum_is_content_digest("protobuf", path) {
+        return None;
+    }
+    parse_sha256_hex(recorded_sha256)
+}
+
+/// The SHA-256 a response's own headers vouch for (#4323): `X-Checksum-Sha256`
+/// or a `sha256:` `Docker-Content-Digest`. `None` when the response declares
+/// a `Content-Encoding` (the digest then names the decoded bytes while the
+/// body is the coded ones) or carries no SHA-256 digest header.
+pub fn advertised_sha256(headers: &[(axum::http::HeaderName, String)]) -> Option<[u8; 32]> {
+    use axum::http::header::CONTENT_ENCODING;
+    if headers.iter().any(|(name, _)| name == CONTENT_ENCODING) {
+        return None;
+    }
+    headers
+        .iter()
+        .find_map(|(name, value)| match name.as_str() {
+            "x-checksum-sha256" => parse_sha256_hex(value),
+            "docker-content-digest" => value
+                .trim()
+                .strip_prefix("sha256:")
+                .and_then(parse_sha256_hex),
+            _ => None,
+        })
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -390,5 +592,66 @@ mod tests {
             verdict(&e, Some(2), &e, 1),
             IntegrityVerdict::Mismatch { actual_len: 1, .. }
         ));
+    }
+    /// #4323: a small object is checked before anything is served, so a
+    /// mismatch is an error (the route's 502), not a stream cut short.
+    #[tokio::test]
+    async fn verify_before_serve_refuses_a_small_mismatch_up_front() {
+        let err = verify_before_serve(chunks(&[b"abd"]), sha(b"abc"), 3, "t".into())
+            .await
+            .err()
+            .expect("mismatch");
+        assert!(
+            matches!(
+                err,
+                AppError::CodedBadGateway {
+                    code: STORED_OBJECT_INTEGRITY_CODE,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let longer = verify_before_serve(chunks(&[b"abc", b"d"]), sha(b"abc"), 3, "t".into()).await;
+        assert!(longer.is_err(), "longer than recorded");
+        let shorter = verify_before_serve(chunks(&[b"ab"]), sha(b"abc"), 3, "t".into()).await;
+        assert!(shorter.is_err(), "shorter than recorded");
+        let ok = verify_before_serve(chunks(&[b"a", b"bc"]), sha(b"abc"), 3, "t".into())
+            .await
+            .expect("intact");
+        let (bytes, err) = collect(ok).await;
+        assert!(err.is_none());
+        assert_eq!(bytes, b"abc");
+    }
+
+    /// Above the limit the object streams through the streaming verifier.
+    #[tokio::test]
+    async fn verify_before_serve_streams_a_large_object() {
+        let total = VERIFY_BEFORE_HEADERS_MAX_BYTES + 1;
+        let s = verify_before_serve(chunks(&[b"x"]), sha(b"x"), total, "t".into())
+            .await
+            .expect("large objects are not read up front");
+        assert!(collect(s).await.1.is_some(), "and still fail at the end");
+    }
+
+    #[test]
+    fn advertised_sha256_reads_the_digest_headers() {
+        use axum::http::{header::CONTENT_ENCODING, HeaderName};
+        let hex = "ab".repeat(32);
+        let x = HeaderName::from_static("x-checksum-sha256");
+        let d = HeaderName::from_static("docker-content-digest");
+        assert!(advertised_sha256(&[(x.clone(), hex.clone())]).is_some());
+        assert!(advertised_sha256(&[(d.clone(), format!("sha256:{hex}"))]).is_some());
+        assert!(advertised_sha256(&[(d.clone(), format!("sha512:{hex}"))]).is_none());
+        assert!(
+            advertised_sha256(&[(x, hex), (CONTENT_ENCODING, "gzip".into())]).is_none(),
+            "a coded body is not what the digest names"
+        );
+    }
+
+    #[test]
+    fn integrity_failure_response_is_marked() {
+        let r = integrity_failure_response("repo/path");
+        assert_eq!(r.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert!(is_integrity_failure(&r));
     }
 }

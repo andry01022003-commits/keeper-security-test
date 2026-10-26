@@ -174,6 +174,7 @@ pub fn router() -> Router<SharedState> {
             get(proxy_get)
                 .post(proxy_post)
                 .put(proxy_put)
+                .patch(proxy_patch)
                 .delete(proxy_delete),
         )
 }
@@ -413,10 +414,10 @@ fn reqwest_to_axum(
     Ok(response)
 }
 
-/// Shared proxy dispatch for all four verbs. Validates the sub-path, resolves
+/// Shared proxy dispatch for all five verbs. Validates the sub-path, resolves
 /// the decrypted remote URL + API key, forwards the request to the remote
 /// instance and streams the response back. `body` is `Some` only for verbs
-/// that carry a request body (POST/PUT); it is attached zero-copy via
+/// that carry a request body (POST/PUT/PATCH); it is attached zero-copy via
 /// [`reqwest::Body::from`] with the caller's content-type (JSON when absent).
 /// The caller's raw query string is appended to the target URL.
 ///
@@ -487,6 +488,35 @@ async fn send_proxy_request(
 // Proxy handlers
 // ---------------------------------------------------------------------------
 
+/// Relay a body-carrying request (POST/PUT/PATCH) to the remote instance.
+///
+/// The three verbs differ only in the upstream method; sharing this entry point
+/// keeps their content-type passthrough and body handling identical instead of
+/// letting a newly added verb drift (#4795).
+#[allow(clippy::too_many_arguments)]
+async fn relay_with_body(
+    state: SharedState,
+    auth: AuthExtension,
+    id: Uuid,
+    path: String,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    method: reqwest::Method,
+) -> Result<Response> {
+    send_proxy_request(
+        &state,
+        &auth,
+        id,
+        &path,
+        query.as_deref(),
+        method,
+        headers.get(header::CONTENT_TYPE),
+        Some(body),
+    )
+    .await
+}
+
 /// Proxy a GET request to a remote instance
 #[utoipa::path(
     get,
@@ -545,15 +575,15 @@ async fn proxy_post(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    send_proxy_request(
-        &state,
-        &auth,
+    relay_with_body(
+        state,
+        auth,
         id,
-        &path,
-        query.as_deref(),
+        path,
+        query,
+        headers,
+        body,
         reqwest::Method::POST,
-        headers.get(header::CONTENT_TYPE),
-        Some(body),
     )
     .await
 }
@@ -582,15 +612,52 @@ async fn proxy_put(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    send_proxy_request(
-        &state,
-        &auth,
+    relay_with_body(
+        state,
+        auth,
         id,
-        &path,
-        query.as_deref(),
+        path,
+        query,
+        headers,
+        body,
         reqwest::Method::PUT,
-        headers.get(header::CONTENT_TYPE),
-        Some(body),
+    )
+    .await
+}
+
+/// Proxy a PATCH request to a remote instance
+#[utoipa::path(
+    patch,
+    path = "/{id}/proxy/{path}",
+    context_path = "/api/v1/instances",
+    tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Remote instance ID"),
+        ("path" = String, Path, description = "Sub-path to proxy"),
+    ),
+    request_body(content = inline(String), content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "Proxied response"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn proxy_patch(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path((id, path)): Path<(Uuid, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response> {
+    relay_with_body(
+        state,
+        auth,
+        id,
+        path,
+        query,
+        headers,
+        body,
+        reqwest::Method::PATCH,
     )
     .await
 }
@@ -638,6 +705,7 @@ async fn proxy_delete(
         proxy_get,
         proxy_post,
         proxy_put,
+        proxy_patch,
         proxy_delete,
     ),
     components(schemas(CreateInstanceRequest, RemoteInstanceResponse,))
@@ -1145,6 +1213,160 @@ mod tests {
         .expect("request builds");
         assert!(req.headers().get("content-type").is_none());
         assert_eq!(req.url().query(), Some("page=2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4795: PATCH relay
+    // -----------------------------------------------------------------------
+
+    /// The relay used to answer `405 Method Not Allowed` for PATCH, so the web
+    /// UI could not forward a partial update (repository settings edits,
+    /// chunked-upload session updates) to a remote instance. Drive the real
+    /// router with a PATCH and a wiremock upstream, asserting the method, body,
+    /// query string and content-type reach the remote and its response comes
+    /// back.
+    #[tokio::test]
+    async fn test_relay_patch_forwards_partial_update() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::matchers::{body_bytes, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repositories/repo-1"))
+            .and(query_param("force", "true"))
+            .and(header("authorization", "Bearer peer-key"))
+            .and(header("content-type", "application/json"))
+            .and(body_bytes(r#"{"description":"updated"}"#))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(
+                        r#"{"id":"repo-1","description":"updated"}"#,
+                        "application/json",
+                    )
+                    .insert_header("etag", "\"v2\""),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let instance = RemoteInstanceService::create(
+            &fixture.pool,
+            fixture.user_id,
+            "peer",
+            &upstream.uri(),
+            "peer-key",
+        )
+        .await
+        .expect("create remote instance");
+
+        let app = tdh::router_with_auth_ext(
+            router(),
+            fixture.state.clone(),
+            tdh::make_auth(fixture.user_id, &fixture.username),
+        );
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/{}/proxy/api/v1/repositories/repo-1?force=true",
+                instance.id
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"description":"updated"}"#))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("router handles PATCH");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response.headers().get("etag").and_then(|v| v.to_str().ok()),
+            Some("\"v2\"")
+        );
+        // Test-only: drain the streamed body to assert it was relayed intact.
+        #[allow(clippy::disallowed_methods)]
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        assert_eq!(&body[..], br#"{"id":"repo-1","description":"updated"}"#);
+        upstream.verify().await;
+    }
+
+    /// #4795: PATCH goes through the same guards as the other verbs. A path
+    /// outside the relay allow-list, a relay-of-relay path and another user's
+    /// instance are all refused before anything reaches the upstream.
+    #[tokio::test]
+    async fn test_relay_patch_keeps_path_and_owner_guards() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let instance = RemoteInstanceService::create(
+            &fixture.pool,
+            fixture.user_id,
+            "peer",
+            &upstream.uri(),
+            "peer-key",
+        )
+        .await
+        .expect("create remote instance");
+        let (other_id, other_name) = tdh::create_user(&fixture.pool).await;
+
+        let patch = |auth: AuthExtension, uri: String| {
+            let app = tdh::router_with_auth_ext(router(), fixture.state.clone(), auth);
+            let req = axum::http::Request::builder()
+                .method("PATCH")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"description":"x"}"#))
+                .expect("build request");
+            async move { app.oneshot(req).await.expect("router").status() }
+        };
+        let owner = tdh::make_auth(fixture.user_id, &fixture.username);
+
+        for sub in [
+            "admin/settings",
+            "api/v1/instances/00000000-0000-0000-0000-000000000000",
+            "api/../admin",
+        ] {
+            assert_eq!(
+                patch(owner.clone(), format!("/{}/proxy/{sub}", instance.id)).await,
+                axum::http::StatusCode::BAD_REQUEST,
+                "PATCH to {sub} must be refused"
+            );
+        }
+        assert_eq!(
+            patch(
+                tdh::make_auth(other_id, &other_name),
+                format!("/{}/proxy/api/v1/repositories/r", instance.id)
+            )
+            .await,
+            axum::http::StatusCode::NOT_FOUND,
+            "another user's instance must not be relayable"
+        );
+
+        upstream.verify().await;
+        tdh::cleanup_user(&fixture.pool, other_id).await;
     }
 
     #[tokio::test]

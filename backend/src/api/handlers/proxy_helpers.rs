@@ -44,8 +44,29 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub const DEFAULT_PROXY_METADATA_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Env override for [`DEFAULT_PROXY_METADATA_BUDGET_BYTES`]. A blank,
-/// non-numeric, or zero value falls back to the default.
+/// non-numeric, or zero value falls back to the default; a value above
+/// [`MAX_PROXY_METADATA_BUDGET_BYTES`] is clamped to it. Either case logs a
+/// warning at startup naming the configured and effective values (#4881).
 pub const PROXY_METADATA_BUDGET_BYTES_ENV: &str = "AK_PROXY_METADATA_BUDGET_BYTES";
+
+/// Accounting granularity of every [`ProxyMetadataBudget`]: the semaphore
+/// counts one permit per 4 KiB, and a reservation is rounded UP to whole
+/// units (#4881). Counting bytes made the permit count bounded by the `u32`
+/// that `acquire_many` takes, which silently clamped any budget above
+/// 4 GiB. In 4 KiB units the semaphore can hold a budget as large as `usize`
+/// can express, and one reservation can hold up to 16 TiB.
+pub const PROXY_METADATA_BUDGET_UNIT_BYTES: usize = 4 * 1024;
+
+/// Largest budget [`ProxyMetadataBudget`] can represent: tokio's permit
+/// ceiling in [`PROXY_METADATA_BUDGET_UNIT_BYTES`] units, which on a 64-bit
+/// target saturates at `usize::MAX`.
+pub const MAX_PROXY_METADATA_BUDGET_BYTES: usize =
+    Semaphore::MAX_PERMITS.saturating_mul(PROXY_METADATA_BUDGET_UNIT_BYTES);
+
+/// Whole budget units covering `bytes`, rounded up.
+fn budget_units(bytes: usize) -> usize {
+    bytes.div_ceil(PROXY_METADATA_BUDGET_UNIT_BYTES)
+}
 
 /// A process-wide byte budget bounding the TOTAL memory the *buffered*
 /// proxy-metadata path may hold resident at once, independent of request
@@ -61,7 +82,7 @@ pub const PROXY_METADATA_BUDGET_BYTES_ENV: &str = "AK_PROXY_METADATA_BUDGET_BYTE
 /// responses each buffered independently.
 ///
 /// This budget caps that sum: each buffered fetch reserves permits (one per
-/// byte, up to the cap) BEFORE it buffers and releases them once the buffered
+/// [`PROXY_METADATA_BUDGET_UNIT_BYTES`], up to the cap) BEFORE it buffers and releases them once the buffered
 /// body has been handed to the response writer, so total concurrent buffering
 /// can never exceed `total_bytes`. Once the budget is exhausted, further
 /// requests await a reservation (bounded queueing) instead of admitting
@@ -74,15 +95,15 @@ pub struct ProxyMetadataBudget {
 }
 
 impl ProxyMetadataBudget {
-    /// Build a budget of `total_bytes`, clamped to `[1, u32::MAX]` (and to
-    /// [`Semaphore::MAX_PERMITS`]). A single reservation is always `<=` the
-    /// per-request cap, far below `u32::MAX`, so it stays inside the acquirable
-    /// range.
+    /// Build a budget of `total_bytes`, clamped to
+    /// `[1, MAX_PROXY_METADATA_BUDGET_BYTES]`. The semaphore holds the total
+    /// in [`PROXY_METADATA_BUDGET_UNIT_BYTES`] units, rounded up, so the
+    /// byte-facing methods keep byte semantics while the permit count stays
+    /// inside tokio's limits for any budget (#4881).
     pub fn new(total_bytes: usize) -> Self {
-        let ceiling = (u32::MAX as usize).min(Semaphore::MAX_PERMITS);
-        let total = total_bytes.clamp(1, ceiling);
+        let total = total_bytes.clamp(1, MAX_PROXY_METADATA_BUDGET_BYTES);
         Self {
-            sem: Arc::new(Semaphore::new(total)),
+            sem: Arc::new(Semaphore::new(budget_units(total))),
             total,
         }
     }
@@ -92,16 +113,23 @@ impl ProxyMetadataBudget {
         self.total
     }
 
-    /// Currently unreserved bytes (observability / test helper).
+    /// Currently unreserved bytes (observability / test helper). Counted in
+    /// whole units, so never more than [`Self::total_bytes`].
     pub fn available_bytes(&self) -> usize {
-        self.sem.available_permits()
+        self.sem
+            .available_permits()
+            .saturating_mul(PROXY_METADATA_BUDGET_UNIT_BYTES)
+            .min(self.total)
     }
 
     fn permits_for(&self, bytes: usize) -> u32 {
         // A single request can reserve at most the whole budget, so an oversized
         // request degrades to "hold the whole budget" rather than deadlocking on
-        // a permit count the semaphore can never satisfy.
-        bytes.clamp(1, self.total) as u32
+        // a permit count the semaphore can never satisfy. One `acquire_many`
+        // takes at most `u32::MAX` units (16 TiB); a budget larger than that
+        // still satisfies such a request, it just leaves the rest free.
+        let ceiling = budget_units(self.total).min(u32::MAX as usize);
+        budget_units(bytes).clamp(1, ceiling) as u32
     }
 
     /// Reserve `bytes` of the budget, awaiting when it is exhausted. The
@@ -131,13 +159,53 @@ impl ProxyMetadataBudget {
 pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
     static BUDGET: OnceLock<ProxyMetadataBudget> = OnceLock::new();
     BUDGET.get_or_init(|| {
-        let total = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PROXY_METADATA_BUDGET_BYTES);
+        let configured = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV).ok();
+        let (total, adjustment) = resolve_proxy_metadata_budget_bytes(configured.as_deref());
+        if let Some(reason) = adjustment {
+            tracing::warn!(
+                env = PROXY_METADATA_BUDGET_BYTES_ENV,
+                configured = configured.as_deref().unwrap_or_default(),
+                effective_bytes = total,
+                max_bytes = MAX_PROXY_METADATA_BUDGET_BYTES,
+                "{PROXY_METADATA_BUDGET_BYTES_ENV} {reason}; using {total} bytes"
+            );
+        }
         ProxyMetadataBudget::new(total)
     })
+}
+
+/// Resolve [`PROXY_METADATA_BUDGET_BYTES_ENV`] to the effective budget in
+/// bytes, plus why the configured value was not taken as is (#4881): `None`
+/// when it was unset or used verbatim, otherwise a reason fit for a warning.
+pub fn resolve_proxy_metadata_budget_bytes(
+    configured: Option<&str>,
+) -> (usize, Option<&'static str>) {
+    let Some(raw) = configured else {
+        return (DEFAULT_PROXY_METADATA_BUDGET_BYTES, None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+            Some("is blank, falling back to the default"),
+        );
+    }
+    // Parse wide so a value past `usize` is reported as clamped, not as junk.
+    match raw.parse::<u128>() {
+        Err(_) => (
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+            Some("is not a byte count, falling back to the default"),
+        ),
+        Ok(0) => (
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+            Some("is zero, falling back to the default"),
+        ),
+        Ok(v) if v > MAX_PROXY_METADATA_BUDGET_BYTES as u128 => (
+            MAX_PROXY_METADATA_BUDGET_BYTES,
+            Some("exceeds the largest representable budget, clamping"),
+        ),
+        Ok(v) => (v as usize, None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2410,6 +2478,13 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded(
 /// [`proxy_fetch_streaming_with_format`] for the reading a new call site owes
 /// before it passes a format. The conda CEP-16 shard proxy passes `Conda` for
 /// `{subdir}/shards/<sha256>.msgpack.zst`.
+///
+/// `check` is the caller's identity check on the body (#4829): a fetched body
+/// that fails it is returned but never committed to the proxy cache, and a
+/// cached one that fails it is evicted and fetched again. See
+/// [`ProxyService::fetch_artifact_with_cache_path_capped_checked`]. An
+/// immutable classification without such a check pins whatever the upstream
+/// answered first.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_capped_with_cache_key_encoded_format(
     proxy_service: &ProxyService,
@@ -2420,10 +2495,11 @@ pub async fn proxy_fetch_capped_with_cache_key_encoded_format(
     cache_path: &str,
     max: usize,
     format: RepositoryFormat,
+    check: &crate::services::proxy_service::CachedBodyCheck,
 ) -> Result<crate::services::proxy_service::CachedBody, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     proxy_service
-        .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
+        .fetch_artifact_with_cache_path_capped_checked(&repo, fetch_path, cache_path, max, check)
         .await
         .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
 }
@@ -3428,6 +3504,9 @@ fn is_quarantine_block(e: &crate::error::AppError) -> bool {
 /// `helm::download_chart_via_index` and `pypi::serve_file`.
 pub(crate) fn is_member_policy_block_response(resp: &Response) -> bool {
     matches!(resp.status(), StatusCode::CONFLICT | StatusCode::FORBIDDEN)
+        // #4323: a member whose stored bytes failed verification holds the
+        // artifact; falling through would serve another member's bytes.
+        || crate::storage::verify::is_integrity_failure(resp)
 }
 
 /// Which member served a virtual download, and so which statistics table (if
@@ -5484,17 +5563,36 @@ pub(crate) struct LocalArtifactRow {
     pub size_bytes: i64,
     pub quarantine_status: Option<String>,
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recorded SHA-256 and path, for serve-time verification (#4323). A query
+    /// that does not select them reads as empty, and the serve is unverified.
+    #[sqlx(default)]
+    pub checksum_sha256: String,
+    #[sqlx(default)]
+    pub path: String,
 }
 
-/// Check quarantine status on a fetched artifact row, mapping errors to Response.
-#[allow(clippy::result_large_err)]
-pub(crate) fn check_quarantine_row(row: &LocalArtifactRow) -> Result<(), Response> {
-    crate::services::quarantine_service::check_download_allowed(
+/// Check quarantine status on a fetched artifact row of `repo_id`, mapping
+/// errors to Response. A scan-policy hold answers the policy 403, not the
+/// quarantine 409 (#4510, [`refine_hold_refusal`]).
+///
+/// [`refine_hold_refusal`]: crate::services::quarantine_service::refine_hold_refusal
+pub(crate) async fn check_quarantine_row(
+    db: &PgPool,
+    row: &LocalArtifactRow,
+    repo_id: Uuid,
+) -> Result<(), Response> {
+    if let Err(refusal) = crate::services::quarantine_service::check_download_allowed(
         row.quarantine_status.as_deref(),
         row.quarantine_until,
         chrono::Utc::now(),
-    )
-    .map_err(|e| e.into_response())
+    ) {
+        return Err(crate::services::quarantine_service::refine_hold_refusal(
+            db, row.id, repo_id, refusal,
+        )
+        .await
+        .into_response());
+    }
+    Ok(())
 }
 
 /// Selector for the canonical local-artifact lookup. Each variant maps to a
@@ -5521,19 +5619,19 @@ impl LocalLookup<'_> {
     pub(crate) fn select_sql(&self) -> &'static str {
         match self {
             LocalLookup::Path(_) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
                  FROM artifacts \
                  WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersion(_, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersionSuffix(_, _, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE $4 AND is_deleted = false \
                  LIMIT 1"
@@ -5620,7 +5718,8 @@ async fn local_lookup_artifact(
     Response,
 > {
     let artifact = lookup.fetch_row(db, repo_id).await?;
-    check_quarantine_row(&artifact)?;
+    // #4510: a scan-policy hold answers the policy 403, not the 409.
+    check_quarantine_row(db, &artifact, repo_id).await?;
     crate::services::quarantine_service::enforce_scan_policy_gate(db, artifact.id, repo_id)
         .await
         .map_err(|e| e.into_response())?;
@@ -5635,13 +5734,22 @@ async fn read_local_content(
     artifact: &LocalArtifactRow,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<Bytes, Response> {
-    match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => Ok(bytes),
+    let bytes = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
         Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await
+            coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await?
         }
-        Err(e) => Err(map_storage_err(e)),
-    }
+        Err(e) => return Err(map_storage_err(e)),
+    };
+    // #4323: never serve stored bytes that do not match their record.
+    crate::storage::verify::verify_stored_bytes(
+        &bytes,
+        &artifact.checksum_sha256,
+        &artifact.path,
+        artifact.size_bytes,
+        || artifact.path.clone(),
+    )?;
+    Ok(bytes)
 }
 
 /// Streaming sibling of [`read_local_content`]: open the artifact body as a
@@ -5657,6 +5765,18 @@ async fn read_local_stream(
     artifact: &LocalArtifactRow,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<StreamingFetchResult, Response> {
+    open_local_stream(db, artifact, storage, true).await
+}
+
+/// [`read_local_stream`] with serve-time verification optional. A HEAD
+/// answered from the row passes `verify = false`: it never polls the body, and
+/// verifying would read up to `VERIFY_BEFORE_HEADERS_MAX_BYTES` of it (#4323).
+async fn open_local_stream(
+    db: &PgPool,
+    artifact: &LocalArtifactRow,
+    storage: &dyn crate::storage::StorageBackend,
+    verify: bool,
+) -> Result<StreamingFetchResult, Response> {
     let body = match storage.get_stream(&artifact.storage_key).await {
         Ok(stream) => stream,
         Err(crate::error::AppError::NotFound(_)) => {
@@ -5666,6 +5786,21 @@ async fn read_local_stream(
             Box::pin(futures::stream::once(async move { Ok(bytes) }))
         }
         Err(e) => return Err(map_storage_err(e)),
+    };
+    // #4323: verify against the record (a 502 for a small object, see
+    // `verify_stored_body`); terminal for virtual resolution via
+    // `is_member_policy_block_response`.
+    let body = if verify {
+        crate::storage::verify::verify_stored_body(
+            body,
+            &artifact.checksum_sha256,
+            &artifact.path,
+            artifact.size_bytes,
+            || artifact.path.clone(),
+        )
+        .await?
+    } else {
+        body
     };
     Ok(StreamingFetchResult {
         commit_sha: None,
@@ -5955,7 +6090,7 @@ pub async fn local_fetch_or_redirect(
     // artifact into memory just to answer a probe. Status parity with GET is
     // preserved: a storage miss still errors here exactly as it would for a GET.
     if ctx.is_head {
-        let result = read_local_stream(db, &artifact, &*storage).await?;
+        let result = open_local_stream(db, &artifact, &*storage, false).await?;
         return stream_fetch_result(result, &artifact.content_type, None);
     }
 
@@ -8376,8 +8511,9 @@ pub(crate) fn age_gate_repo_type_from_str(
 
 /// Map a `repositories.format` string onto the age-gate format alias space:
 /// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
-/// Go gates as Go, VS Code gates as VS Code, Cargo gates as Cargo, and
-/// everything else as `Generic` (not in the enforceable matrix).
+/// Go gates as Go, VS Code gates as VS Code, Cargo gates as Cargo, Maven and
+/// Gradle gate as Maven, and everything else as `Generic` (not in the
+/// enforceable matrix).
 ///
 /// Every format carrying an entry in the age-gate capability registry
 /// (`crate::formats::age_gate_spec`) must have an arm here. A format that
@@ -8397,6 +8533,8 @@ pub(crate) fn age_gate_format_from_str(
         "go" => RepositoryFormat::Go,
         "vscode" => RepositoryFormat::Vscode,
         "cargo" => RepositoryFormat::Cargo,
+        // #4702: Gradle repositories gate as Maven (same layout and handler).
+        "maven" | "gradle" => RepositoryFormat::Maven,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -9329,6 +9467,9 @@ pub(crate) async fn proxy_scan_and_record(
             verdict.scanner_version.as_deref(),
             Some(repo_id),
             verdict.components_cataloged,
+            expected
+                .map(crate::services::scanner_service::ExpectedComponent::pin_identity)
+                .as_deref(),
         )
         .await
     {
@@ -9416,6 +9557,48 @@ pub(crate) enum ProxyScanIdentity {
     Unestablished,
     /// This format does not supply a coordinate. Pre-#3003 behavior, unchanged.
     NotApplicable,
+}
+
+/// Whether a stored proxy verdict, recorded with `stored_pin` (the
+/// [`pin_identity`](crate::services::scanner_service::ExpectedComponent::pin_identity)
+/// it was graded as, `None` for none), may stand for a request with
+/// `identity` (#4952).
+///
+/// For most formats the bytes name the coordinate they are served as, so one
+/// verdict per digest is right and nothing changes. A Composer, Conan, Go,
+/// Debian, RPM or Alpine pin is built from the REQUEST (a version or
+/// reference the bytes do not carry, the release the repository names), so
+/// byte-identical files requested as two coordinates grade differently:
+///
+/// * a request with such a pin reuses only a verdict graded as exactly that
+///   pin. A blocking verdict graded with no pin at all still stands (what
+///   the bytes contain is vulnerable whatever they are requested as);
+///   anything else is not this request's verdict, and the gate scans again
+///   as for a first pull;
+/// * a request whose identity is not established cannot be scanned, so it
+///   does not reuse a CLEAN verdict graded as such a pin (a clean grade on
+///   one release says nothing about an undetermined one); a blocking verdict
+///   still blocks it.
+pub(crate) fn stored_verdict_pertains(
+    stored_pin: Option<&str>,
+    verdict: &str,
+    identity: &ProxyScanIdentity,
+) -> bool {
+    use crate::services::proxy_scan_service::verdict_blocks;
+    use crate::services::scanner_service::ExpectedComponent;
+    match identity {
+        ProxyScanIdentity::Established(pin) if pin.ecosystem.is_request_pinned() => {
+            match stored_pin {
+                Some(stored) => stored == pin.pin_identity(),
+                None => verdict_blocks(verdict),
+            }
+        }
+        ProxyScanIdentity::Established(_) | ProxyScanIdentity::NotApplicable => true,
+        ProxyScanIdentity::Unestablished => {
+            verdict_blocks(verdict)
+                || !stored_pin.is_some_and(ExpectedComponent::pin_identity_is_request_pinned)
+        }
+    }
 }
 
 /// What a served proxy pull's `X-AK-Scan` header reports.
@@ -9585,6 +9768,19 @@ pub(crate) async fn gate_proxy_scan_serve(
     )
     .await;
     record_proxy_scan_outcome(&outcome);
+    // #4777: a refused pull (403 scan_blocked) leaves an audit trail with
+    // who asked, from where, and for which digest; aggregated per minute.
+    if matches!(&outcome, ProxyScanServeOutcome::Deny(resp) if resp.status() == StatusCode::FORBIDDEN)
+    {
+        crate::services::audit_service::record_proxy_scan_blocked(
+            &state.db,
+            crate::services::audit_service::ProxyScanBlockEvent {
+                repository_id: repo_id,
+                path: filename.to_string(),
+                checksum_sha256: digest.to_string(),
+            },
+        );
+    }
     outcome
 }
 
@@ -9625,11 +9821,24 @@ async fn decide_proxy_scan_serve(
     use crate::services::proxy_scan_service::{decide_serve, ProxyScanService, ServeDecision};
 
     let pss = ProxyScanService::new(state.db.clone());
+    // #4952: a verdict graded as another coordinate than this request's is
+    // not this request's verdict; see [`stored_verdict_pertains`].
     let row = pss
-        .lookup_verdict(digest, PROXY_SCAN_TYPE)
+        .lookup_verdict_with_pin(digest, PROXY_SCAN_TYPE)
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .and_then(|(row, pin)| {
+            let pertains = stored_verdict_pertains(pin.as_deref(), &row.verdict, &identity);
+            if !pertains {
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    stored_pin = ?pin,
+                    "stored proxy verdict was graded as another coordinate; not reused"
+                );
+            }
+            pertains.then_some(row)
+        });
     // #2976: compare the verdict's stored provenance against the LIVE
     // CVE-scanner version (VersionCache-backed — a memory read on the hot
     // path, never a per-download subprocess). Only probed when a row exists,
@@ -10789,6 +10998,102 @@ mod scanned_proxy_file_tests {
         fx.teardown().await;
     }
 
+    /// #4777: a refused pull leaves one `PROXY_SCAN_BLOCKED` audit row naming
+    /// the principal, repository, path and digest; a retry burst inside the
+    /// aggregation window adds no further row (its count goes into the
+    /// window's summary row a minute later).
+    #[tokio::test]
+    async fn blocked_pull_is_audited_once_per_window_4777() {
+        let bytes = format!("fake-4777-vuln-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-4777-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let mut req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        req.ctx = Some(&ctx);
+        let username = fx.username.clone();
+        let statuses =
+            crate::api::middleware::request_span::with_request_span(tracing::Span::none(), async {
+                crate::api::middleware::request_span::record_user(&username);
+                let mut out = Vec::new();
+                for _ in 0..5 {
+                    let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+                        .await
+                        .unwrap_err();
+                    out.push(resp.status());
+                }
+                out
+            })
+            .await;
+        let rows_for = |pool: PgPool, digest: String, repo: Uuid| async move {
+            sqlx::query_as::<_, (Option<Uuid>, serde_json::Value)>(
+                "SELECT user_id, details FROM audit_log \
+                  WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1 \
+                    AND details->>'checksum_sha256' = $2",
+            )
+            .bind(repo)
+            .bind(digest)
+            .fetch_all(&pool)
+            .await
+            .expect("audit rows")
+        };
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = rows_for(fx.pool.clone(), digest.clone(), fx.repo_id).await;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Give a (wrong) second write the same chance to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let settled = rows_for(fx.pool.clone(), digest.clone(), fx.repo_id).await;
+        let _ = sqlx::query(
+            "DELETE FROM audit_log WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await;
+        let user_id = fx.user_id;
+        let repo_key = fx.repo_key.clone();
+        fx.teardown().await;
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::FORBIDDEN),
+            "{statuses:?}"
+        );
+        assert_eq!(settled.len(), 1, "one row for the burst, got {settled:?}");
+        let (row_user, details) = &settled[0];
+        assert_eq!(*row_user, Some(user_id));
+        assert_eq!(details["principal"], serde_json::json!(username));
+        assert_eq!(details["repository"], serde_json::json!(repo_key));
+        assert_eq!(details["path"], "pkg-1.0.fake");
+        assert_eq!(details["verdict"], "vulnerable");
+        assert_eq!(details["max_severity"], "critical");
+        assert_eq!(details["attempts"], 1);
+        assert_eq!(details["aggregated"], false);
+        assert_eq!(rows.len(), 1);
+    }
+
     /// A cached vulnerable verdict for the content digest blocks with the
     /// neutral 403, before any scan.
     #[tokio::test]
@@ -11494,6 +11799,244 @@ mod tests {
         .await
     }
 
+    /// #4952: one gate decision for `digest` under fail-open with `identity`.
+    async fn gate_reuse_4952(
+        state: &crate::api::SharedState,
+        digest: &str,
+        identity: ProxyScanIdentity,
+    ) -> &'static str {
+        let repo_id = Uuid::new_v4();
+        let bytes = Bytes::from_static(b"stub content");
+        let synthetic =
+            proxy_rescan_synthetic_artifact(repo_id, "x/pkg.zip", digest, bytes.len() as i64, None);
+        match gate_proxy_scan_serve(
+            state,
+            repo_id,
+            "pkg.zip",
+            digest,
+            synthetic,
+            &bytes,
+            crate::services::proxy_scan_service::ProxyScanAction::FailOpen,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+            identity,
+            ProxyScanMode::File,
+        )
+        .await
+        {
+            ProxyScanServeOutcome::Serve(served) => served.header_value(),
+            ProxyScanServeOutcome::Deny(resp) if resp.status() == StatusCode::FORBIDDEN => "403",
+            ProxyScanServeOutcome::Deny(_) => "423",
+        }
+    }
+
+    /// #4952: proxy verdicts are stored per content digest, but a Composer,
+    /// Conan or OS package pin is built from the request (a version the dist
+    /// does not declare, the release the repository names), so byte-identical
+    /// files requested as two coordinates grade differently. A stored verdict
+    /// stands only for the coordinate it was graded as: graded as another one
+    /// it is not reused (fail-open serves the pull pending and scans it, as
+    /// for a first pull), and a pull whose identity is not established does
+    /// not inherit a clean verdict graded on some release.
+    #[tokio::test]
+    async fn a_verdict_graded_as_another_coordinate_is_not_reused_4952() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let pss = ProxyScanService::new(fx.pool.clone());
+        let seed = |digest: String, verdict: &'static str, pin: Option<String>| {
+            let pss = &pss;
+            async move {
+                let (findings, critical) = if verdict == "vulnerable" {
+                    (1, 1)
+                } else {
+                    (0, 0)
+                };
+                pss.record_verdict_with_catalog(
+                    &digest,
+                    PROXY_SCAN_TYPE,
+                    verdict,
+                    findings,
+                    critical,
+                    0,
+                    0,
+                    0,
+                    (verdict == "vulnerable").then_some("critical"),
+                    Some("grype-test"),
+                    None,
+                    Some(1),
+                    pin.as_deref(),
+                )
+                .await
+                .expect("seed verdict");
+            }
+        };
+        let composer = |version: &str| {
+            ExpectedComponent::coordinate_pin(ComponentEcosystem::Composer, "dtf/pkg", version)
+                .expect("pinnable")
+        };
+        let deb = |release: &str| {
+            ExpectedComponent::os_package(
+                ComponentEcosystem::Debian,
+                "libssl3",
+                "3.0.11-1",
+                OsPackageContext {
+                    release: OsRelease::new("debian", release).expect("release"),
+                    arch: "amd64".to_string(),
+                    source: Some("openssl".to_string()),
+                },
+            )
+            .expect("pinnable")
+        };
+        let established = |pin: &ExpectedComponent| ProxyScanIdentity::Established(pin.clone());
+        let digests: Vec<String> = (0..6)
+            .map(|_| format!("{:0>64}", Uuid::new_v4().simple()))
+            .collect();
+        let state = &fx.state;
+
+        // Graded clean as 2.0.0: that is the verdict of 2.0.0 only.
+        let d = digests[0].clone();
+        seed(d.clone(), "clean", Some(composer("2.0.0").pin_identity())).await;
+        assert_eq!(
+            gate_reuse_4952(state, &d, established(&composer("2.0.0"))).await,
+            "clean"
+        );
+        assert_eq!(
+            gate_reuse_4952(state, &d, established(&composer("1.0.0"))).await,
+            "pending",
+            "a clean verdict graded as 2.0.0 must not serve 1.0.0 as clean"
+        );
+
+        // The same .deb graded clean on Debian 12 is not clean on Debian 13,
+        // nor on a release that could not be determined.
+        let d = digests[1].clone();
+        seed(d.clone(), "clean", Some(deb("12").pin_identity())).await;
+        assert_eq!(
+            gate_reuse_4952(state, &d, established(&deb("12"))).await,
+            "clean"
+        );
+        assert_eq!(
+            gate_reuse_4952(state, &d, established(&deb("13"))).await,
+            "pending"
+        );
+        assert_eq!(
+            gate_reuse_4952(state, &d, ProxyScanIdentity::Unestablished).await,
+            "pending"
+        );
+
+        // A clean grade without a pin (the rescan endpoint) graded no
+        // coordinate at all.
+        let d = digests[2].clone();
+        seed(d.clone(), "clean", None).await;
+        assert_eq!(
+            gate_reuse_4952(state, &d, established(&composer("1.0.0"))).await,
+            "pending"
+        );
+
+        // What the bytes contain is vulnerable whatever they are requested as.
+        let d = digests[3].clone();
+        seed(d.clone(), "vulnerable", None).await;
+        assert_eq!(
+            gate_reuse_4952(state, &d, established(&composer("1.0.0"))).await,
+            "403"
+        );
+        let d = digests[4].clone();
+        seed(d.clone(), "vulnerable", Some(deb("12").pin_identity())).await;
+        assert_eq!(
+            gate_reuse_4952(state, &d, ProxyScanIdentity::Unestablished).await,
+            "403"
+        );
+
+        // A format whose bytes carry their coordinate keeps one verdict per
+        // digest, rows from before #4952 included.
+        let d = digests[5].clone();
+        seed(d.clone(), "clean", None).await;
+        let npm = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.21");
+        assert_eq!(gate_reuse_4952(state, &d, established(&npm)).await, "clean");
+        assert_eq!(
+            gate_reuse_4952(state, &d, ProxyScanIdentity::NotApplicable).await,
+            "clean"
+        );
+
+        for digest in &digests {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn stored_verdict_pertains_only_to_its_own_request_pin_4952() {
+        use crate::services::scanner_service::{ComponentEcosystem, ExpectedComponent};
+        let conan = |v: &str| {
+            ProxyScanIdentity::Established(ExpectedComponent::new(
+                ComponentEcosystem::Conan,
+                "zlib",
+                v,
+            ))
+        };
+        let a = "conan|zlib|1.2.11";
+        assert!(stored_verdict_pertains(Some(a), "clean", &conan("1.2.11")));
+        assert!(!stored_verdict_pertains(Some(a), "clean", &conan("1.2.13")));
+        assert!(!stored_verdict_pertains(
+            Some(a),
+            "vulnerable",
+            &conan("1.2.13")
+        ));
+        assert!(!stored_verdict_pertains(None, "clean", &conan("1.2.13")));
+        assert!(!stored_verdict_pertains(None, "error", &conan("1.2.13")));
+        assert!(stored_verdict_pertains(
+            None,
+            "vulnerable",
+            &conan("1.2.13")
+        ));
+        assert!(!stored_verdict_pertains(
+            Some(a),
+            "clean",
+            &ProxyScanIdentity::Unestablished
+        ));
+        assert!(stored_verdict_pertains(
+            Some(a),
+            "vulnerable",
+            &ProxyScanIdentity::Unestablished
+        ));
+        assert!(stored_verdict_pertains(
+            None,
+            "clean",
+            &ProxyScanIdentity::Unestablished
+        ));
+        assert!(stored_verdict_pertains(
+            Some("npm|lodash|4.17.21"),
+            "clean",
+            &ProxyScanIdentity::Unestablished
+        ));
+        assert!(stored_verdict_pertains(
+            Some(a),
+            "clean",
+            &ProxyScanIdentity::NotApplicable
+        ));
+        for eco in ["go", "composer", "conan", "debian", "rpm", "alpine"] {
+            assert!(
+                ExpectedComponent::pin_identity_is_request_pinned(&format!("{eco}|x|1")),
+                "{eco}"
+            );
+        }
+        for eco in [
+            "npm", "python", "rubygems", "cargo", "nuget", "conda", "maven", "",
+        ] {
+            assert!(
+                !ExpectedComponent::pin_identity_is_request_pinned(&format!("{eco}|x|1")),
+                "{eco}"
+            );
+        }
+    }
+
     /// NoScanner arm: fail-closed still 423s and fail-open still serves
     /// pending, exactly as when the gate saw `None` pre-#3455.
     #[tokio::test]
@@ -11980,6 +12523,102 @@ mod tests {
         );
     }
 
+    // ── Budget accounting in fixed units (#4881) ─────────────────────
+    //
+    // Permits used to be one per byte, so the semaphore (and the `u32` that
+    // `acquire_many` takes) silently clamped any configured budget to
+    // 4 GiB, and the conda merge gate sized its slots from the clamped
+    // total. These pin the unit-based accounting and the startup parse.
+
+    #[test]
+    fn proxy_metadata_budget_represents_more_than_four_gib_4881() {
+        let configured: usize = 32 * 1024 * 1024 * 1024;
+        let budget = ProxyMetadataBudget::new(configured);
+        assert_eq!(budget.total_bytes(), 34_359_738_368);
+        assert_eq!(budget.available_bytes(), 34_359_738_368);
+        // Five 4 GiB reservations fit at once: more than the old ceiling.
+        let held: Vec<_> = (0..5)
+            .map(|_| {
+                budget
+                    .try_reserve(4 * 1024 * 1024 * 1024)
+                    .expect("a 32 GiB budget admits five 4 GiB reservations")
+            })
+            .collect();
+        assert_eq!(budget.available_bytes(), 12 * 1024 * 1024 * 1024);
+        drop(held);
+        assert_eq!(budget.available_bytes(), configured);
+    }
+
+    #[test]
+    fn proxy_metadata_budget_rounds_reservations_up_to_whole_units_4881() {
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        assert_eq!(U, 4096);
+        let budget = ProxyMetadataBudget::new(10 * U);
+
+        let one_byte = budget.try_reserve(1).expect("fits");
+        assert_eq!(budget.available_bytes(), 9 * U, "1 byte holds one unit");
+        let exact = budget.try_reserve(2 * U).expect("fits");
+        assert_eq!(
+            budget.available_bytes(),
+            7 * U,
+            "an exact multiple is not padded"
+        );
+        let over = budget.try_reserve(2 * U + 1).expect("fits");
+        assert_eq!(budget.available_bytes(), 4 * U, "one byte over rounds up");
+        let zero = budget.try_reserve(0).expect("fits");
+        assert_eq!(
+            budget.available_bytes(),
+            3 * U,
+            "an empty reservation holds one unit"
+        );
+        drop((one_byte, exact, over, zero));
+        assert_eq!(budget.available_bytes(), 10 * U);
+
+        // A total that is not a unit multiple keeps its byte value and never
+        // reports more available than it holds.
+        let odd = ProxyMetadataBudget::new(U + 1);
+        assert_eq!(odd.total_bytes(), U + 1);
+        assert_eq!(odd.available_bytes(), U + 1);
+        let p = odd.try_reserve(1).expect("fits");
+        assert_eq!(odd.available_bytes(), U);
+        drop(p);
+        assert_eq!(odd.available_bytes(), U + 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_metadata_budget_oversized_reservation_holds_whole_large_budget_4881() {
+        // The "hold the whole budget, never deadlock" invariant must survive
+        // budgets past the old 4 GiB ceiling.
+        let budget = Arc::new(ProxyMetadataBudget::new(32 * 1024 * 1024 * 1024));
+        let all = tokio::time::timeout(Duration::from_secs(5), budget.reserve(usize::MAX))
+            .await
+            .expect("an oversized reservation is satisfiable, not a deadlock");
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(1).is_none());
+        drop(all);
+        assert_eq!(budget.available_bytes(), 32 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn proxy_metadata_budget_env_resolution_reports_adjustments_4881() {
+        let default = DEFAULT_PROXY_METADATA_BUDGET_BYTES;
+        assert_eq!(resolve_proxy_metadata_budget_bytes(None), (default, None));
+        assert_eq!(
+            resolve_proxy_metadata_budget_bytes(Some(" 34359738368 ")),
+            (34_359_738_368, None),
+            "32 GiB is taken verbatim"
+        );
+        for fallback in ["", "  ", "lots", "-5", "1.5", "0"] {
+            let (bytes, reason) = resolve_proxy_metadata_budget_bytes(Some(fallback));
+            assert_eq!(bytes, default, "{fallback:?} falls back to the default");
+            assert!(reason.is_some(), "{fallback:?} must be reported");
+        }
+        let (bytes, reason) =
+            resolve_proxy_metadata_budget_bytes(Some("340282366920938463463374607431768211455"));
+        assert_eq!(bytes, MAX_PROXY_METADATA_BUDGET_BYTES);
+        assert!(reason.unwrap().contains("clamping"));
+    }
+
     // ── Per-family metadata sub-budgets (#3914) ─────────────────────
 
     fn leaked_sub_budget(bytes: usize) -> &'static MetadataSubBudget {
@@ -12057,21 +12696,22 @@ mod tests {
     /// so, and leaves the rest of the shared budget to other formats.
     #[tokio::test]
     async fn saturated_sub_budget_sheds_family_but_admits_other_formats() {
-        let shared = ProxyMetadataBudget::new(1000);
-        let sub = leaked_sub_budget(250);
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let shared = ProxyMetadataBudget::new(1000 * U);
+        let sub = leaked_sub_budget(250 * U);
 
-        let first = reserve_metadata_budget_in(&shared, Some(sub), 250, None)
+        let first = reserve_metadata_budget_in(&shared, Some(sub), 250 * U, None)
             .await
             .unwrap_or_else(|_| panic!("the family's first reservation fits its share"));
         assert_eq!(sub.saturation(), 1.0);
         assert_eq!(
             shared.available_bytes(),
-            750,
+            750 * U,
             "family bytes count against the shared total"
         );
 
         let shed =
-            reserve_metadata_budget_in(&shared, Some(sub), 10, Some(Duration::from_millis(20)))
+            reserve_metadata_budget_in(&shared, Some(sub), 10 * U, Some(Duration::from_millis(20)))
                 .await;
         let Err(response) = shed else {
             panic!("a saturated family sub-budget must shed")
@@ -12079,13 +12719,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             shared.available_bytes(),
-            750,
+            750 * U,
             "the shed reservation held nothing"
         );
 
-        let npm = reserve_metadata_budget_in(&shared, None, 750, Some(Duration::from_millis(20)))
-            .await
-            .unwrap_or_else(|_| panic!("other formats keep the rest of the shared budget"));
+        let npm =
+            reserve_metadata_budget_in(&shared, None, 750 * U, Some(Duration::from_millis(20)))
+                .await
+                .unwrap_or_else(|_| panic!("other formats keep the rest of the shared budget"));
         assert_eq!(shared.available_bytes(), 0);
 
         drop(first);
@@ -12094,9 +12735,9 @@ mod tests {
             0.0,
             "dropping the permit releases the family share"
         );
-        assert_eq!(shared.available_bytes(), 250);
+        assert_eq!(shared.available_bytes(), 250 * U);
         drop(npm);
-        assert_eq!(shared.available_bytes(), 1000);
+        assert_eq!(shared.available_bytes(), 1000 * U);
     }
 
     /// The family share is queued on first, so when the SHARED budget is
@@ -12104,26 +12745,27 @@ mod tests {
     /// family slice back rather than leaking it.
     #[tokio::test]
     async fn family_reservation_releases_its_share_when_the_shared_budget_sheds() {
-        let shared = ProxyMetadataBudget::new(100);
-        let sub = leaked_sub_budget(100);
-        let hog = shared.try_reserve(100).expect("fresh budget");
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let shared = ProxyMetadataBudget::new(100 * U);
+        let sub = leaked_sub_budget(100 * U);
+        let hog = shared.try_reserve(100 * U).expect("fresh budget");
 
         let shed =
-            reserve_metadata_budget_in(&shared, Some(sub), 40, Some(Duration::from_millis(20)))
+            reserve_metadata_budget_in(&shared, Some(sub), 40 * U, Some(Duration::from_millis(20)))
                 .await;
         assert!(
             shed.is_err(),
             "a saturated shared budget still sheds a family read"
         );
-        assert_eq!(sub.budget().available_bytes(), 100);
+        assert_eq!(sub.budget().available_bytes(), 100 * U);
         assert_eq!(sub.saturation(), 0.0);
         drop(hog);
 
-        let permit = reserve_metadata_budget_in(&shared, Some(sub), 40, None)
+        let permit = reserve_metadata_budget_in(&shared, Some(sub), 40 * U, None)
             .await
             .unwrap_or_else(|_| panic!("unbounded reservation succeeds once free"));
-        assert_eq!(sub.budget().available_bytes(), 60);
-        assert_eq!(shared.available_bytes(), 60);
+        assert_eq!(sub.budget().available_bytes(), 60 * U);
+        assert_eq!(shared.available_bytes(), 60 * U);
         drop(permit);
     }
 
@@ -12156,14 +12798,15 @@ mod tests {
                 })
         };
         metrics::with_local_recorder(&recorder, || {
-            let sub = leaked_sub_budget(100);
+            const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+            let sub = leaked_sub_budget(100 * U);
             sub.record_saturation();
             assert_eq!(gauge(), Some(0.0));
-            let shared = ProxyMetadataBudget::new(1000);
+            let shared = ProxyMetadataBudget::new(1000 * U);
             let permit = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap()
-                .block_on(reserve_metadata_budget_in(&shared, Some(sub), 25, None))
+                .block_on(reserve_metadata_budget_in(&shared, Some(sub), 25 * U, None))
                 .unwrap_or_else(|_| panic!("fits"));
             assert_eq!(gauge(), Some(0.25));
             drop(permit);
@@ -12192,21 +12835,22 @@ mod tests {
     /// index still relies on this.
     #[tokio::test]
     async fn budgeted_body_holds_budget_until_body_dropped() {
-        let budget = ProxyMetadataBudget::new(4096);
-        let permit = budget.reserve(1000).await;
-        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+        const U: usize = PROXY_METADATA_BUDGET_UNIT_BYTES;
+        let budget = ProxyMetadataBudget::new(4 * U);
+        let permit = budget.reserve(U).await;
+        assert_eq!(budget.available_bytes(), 3 * U, "reservation debited");
 
         let body = budgeted_body(Bytes::from_static(b"metadata-bytes"), permit);
         assert_eq!(
             budget.available_bytes(),
-            3096,
+            3 * U,
             "budget stays debited while the body is alive"
         );
 
         drop(body);
         assert_eq!(
             budget.available_bytes(),
-            4096,
+            4 * U,
             "budget is released once the body is dropped"
         );
     }
@@ -21251,6 +21895,7 @@ mod tests {
             RepositoryFormat::Go,
             RepositoryFormat::Vscode,
             RepositoryFormat::Cargo,
+            RepositoryFormat::Maven,
         ] {
             let spec = crate::formats::age_gate_spec(&canonical)
                 .expect("format must carry an age-gate capability spec");
@@ -21262,6 +21907,9 @@ mod tests {
                 "capability-registry format {canonical:?} must map back from its wire label"
             );
         }
+        // #4702: a Gradle repository is served by the Maven handler and must
+        // not fall through to the ungated `Generic`.
+        assert_eq!(age_gate_format_from_str("gradle"), RepositoryFormat::Maven);
     }
 
     #[test]
@@ -22919,10 +23567,11 @@ mod scan_on_upload_coverage_tests {
     ];
 
     /// The `oci_blobs` writers of a `docker push`: monolithic upload, chunked
-    /// completion and cross-repository mount.
+    /// completion (run on its own task by `handle_complete_upload` since #4902)
+    /// and cross-repository mount.
     const ISSUE_4422_OCI_BLOB_HANDLERS: &[&str] = &[
         "handle_start_upload",
-        "handle_complete_upload",
+        "complete_claimed_oci_upload",
         "try_mount_blob",
     ];
 
@@ -23116,6 +23765,12 @@ mod proxy_download_recording_tests {
         ("pub_registry.rs", include_str!("pub_registry.rs")),
         ("puppet.rs", include_str!("puppet.rs")),
         ("pypi.rs", include_str!("pypi.rs")),
+        // #4097: the archive formats' shared scan-on-proxy half (its over-cap
+        // stream).
+        (
+            "proxy_scan_archive.rs",
+            include_str!("proxy_scan_archive.rs"),
+        ),
         ("rpm.rs", include_str!("rpm.rs")),
         ("rubygems.rs", include_str!("rubygems.rs")),
         ("sbt.rs", include_str!("sbt.rs")),
@@ -23705,6 +24360,228 @@ mod proxy_download_recording_tests {
             (
                 "nuget.rs",
                 "serve_scanned_nupkg",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4103: Go module zips, the Remote arm and the Virtual walk.
+            ("goproxy.rs", "download_zip", "serve_scanned_go_zip(", 1),
+            (
+                "goproxy.rs",
+                "download_zip",
+                "serve_scanned_virtual_go_zip(",
+                1,
+            ),
+            (
+                "goproxy.rs",
+                "serve_scanned_virtual_go_zip",
+                "serve_scanned_go_zip(",
+                1,
+            ),
+            (
+                "goproxy.rs",
+                "serve_scanned_go_zip",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4104: RubyGems `.gem` downloads, Remote and Virtual (both arms
+            // of `proxy_scan_archive::serve_scanned_package_download` call the
+            // one `serve_scanned_gem` closure).
+            (
+                "rubygems.rs",
+                "download_gem",
+                "serve_scanned_gem_download(",
+                1,
+            ),
+            (
+                "rubygems.rs",
+                "serve_scanned_gem_download",
+                "serve_scanned_gem(",
+                1,
+            ),
+            (
+                "rubygems.rs",
+                "serve_scanned_gem",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4105: Composer dist archives, Remote and Virtual.
+            (
+                "composer.rs",
+                "download_archive",
+                "serve_scanned_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "download_archive",
+                "serve_scanned_virtual_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "serve_scanned_virtual_composer_dist",
+                "serve_scanned_composer_dist(",
+                1,
+            ),
+            (
+                "composer.rs",
+                "serve_scanned_composer_dist",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4107: Pub package archives, Remote and Virtual.
+            (
+                "pub_registry.rs",
+                "download_archive",
+                "serve_scanned_pub_download(",
+                1,
+            ),
+            (
+                "pub_registry.rs",
+                "serve_scanned_pub_download",
+                "serve_scanned_pub_archive(",
+                1,
+            ),
+            (
+                "pub_registry.rs",
+                "serve_scanned_pub_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4108: Conan recipe and package archives, Remote and Virtual.
+            (
+                "conan.rs",
+                "recipe_file_download",
+                "serve_scanned_conan_file_download(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "package_file_download",
+                "serve_scanned_conan_file_download(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "serve_scanned_conan_file_download",
+                "serve_scanned_conan_archive(",
+                1,
+            ),
+            (
+                "conan.rs",
+                "serve_scanned_conan_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4109: CocoaPods pod archives, Remote and Virtual.
+            (
+                "cocoapods.rs",
+                "download_pod",
+                "serve_scanned_pod_download(",
+                1,
+            ),
+            (
+                "cocoapods.rs",
+                "serve_scanned_pod_download",
+                "serve_scanned_pod_archive(",
+                1,
+            ),
+            (
+                "cocoapods.rs",
+                "serve_scanned_pod_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4110: Swift source archives, Remote and Virtual.
+            (
+                "swift.rs",
+                "download_archive",
+                "serve_scanned_swift_download(",
+                1,
+            ),
+            (
+                "swift.rs",
+                "serve_scanned_swift_download",
+                "serve_scanned_swift_archive(",
+                1,
+            ),
+            (
+                "swift.rs",
+                "serve_scanned_swift_archive",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4111: Debian packages on the pool, `dists/` and flat routes,
+            // Remote and Virtual.
+            (
+                "debian.rs",
+                "pool_download",
+                "serve_scanned_deb_download(",
+                1,
+            ),
+            (
+                "debian.rs",
+                "dists_proxy_catchall",
+                "serve_scanned_deb_download(",
+                1,
+            ),
+            ("debian.rs", "flat_remote", "serve_scanned_deb_download(", 1),
+            (
+                "debian.rs",
+                "flat_virtual",
+                "serve_scanned_deb_download(",
+                1,
+            ),
+            (
+                "debian.rs",
+                "serve_scanned_deb_download",
+                "serve_scanned_deb(",
+                1,
+            ),
+            (
+                "debian.rs",
+                "serve_scanned_deb",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4112: RPM packages on the `/packages/` route and the
+            // catch-all, Remote and Virtual.
+            (
+                "rpm.rs",
+                "download_package",
+                "serve_scanned_rpm_download(",
+                1,
+            ),
+            ("rpm.rs", "upstream_proxy", "serve_scanned_rpm_download(", 2),
+            (
+                "rpm.rs",
+                "serve_scanned_rpm_download",
+                "serve_scanned_rpm(",
+                1,
+            ),
+            (
+                "rpm.rs",
+                "serve_scanned_rpm",
+                "serve_scanned_proxy_file(",
+                1,
+            ),
+            // #4113: Alpine packages, Remote and Virtual, and the Remote's
+            // re-fetch when a cached row's blob is unreadable.
+            (
+                "alpine.rs",
+                "download_package",
+                "serve_scanned_apk_download(",
+                2,
+            ),
+            (
+                "alpine.rs",
+                "serve_scanned_apk_download",
+                "serve_scanned_apk(",
+                1,
+            ),
+            (
+                "alpine.rs",
+                "serve_scanned_apk",
                 "serve_scanned_proxy_file(",
                 1,
             ),
@@ -24417,7 +25294,9 @@ mod virtual_winner_recording_tests_3844 {
         )
         .bind(local_id)
         .bind(&path)
-        .bind(format!("{:0>64}", "3844"))
+        // The real digest of the seeded bytes: the hosted fetch verifies it
+        // (#4323).
+        .bind(crate::services::artifact_service::ArtifactService::calculate_sha256(b"hosted"))
         .bind(&storage_key)
         .fetch_one(&pool)
         .await

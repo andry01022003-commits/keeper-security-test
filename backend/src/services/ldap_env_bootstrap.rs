@@ -1151,6 +1151,125 @@ mod tests {
         assert!(row3.use_starttls);
     }
 
+    /// A boot without LDAP_* disables the provider the env bootstrap manages
+    /// and leaves an admin-created provider alone (#4857).
+    #[tokio::test]
+    async fn test_env_less_boot_disables_only_the_env_managed_provider() {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = &iso.pool;
+
+        let env_id = match reconcile_ldap_from_env(pool, base_env()).await.unwrap() {
+            LdapEnvOutcome::Created { id, .. } => id,
+            other => panic!("expected create, got {other:?}"),
+        };
+        let (row, rec) = stored(pool, env_id).await;
+        assert!(row.is_enabled, "the env-created provider starts enabled");
+        assert!(
+            rec.is_some_and(|r| !r.is_empty()),
+            "the env bootstrap records ownership"
+        );
+
+        let mut admin_req = base_env();
+        admin_req.name = "corp-admin".into();
+        let admin_id = AuthConfigService::create_ldap(pool, admin_req)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(stored(pool, admin_id).await.1, None);
+
+        // Boot without LDAP_*.
+        let disabled = AuthConfigService::disable_env_managed_ldap(pool)
+            .await
+            .unwrap();
+        assert_eq!(disabled, vec![base_env().name]);
+        assert!(
+            !stored(pool, env_id).await.0.is_enabled,
+            "the env-managed provider must not outlive its LDAP_* variables"
+        );
+        assert!(
+            stored(pool, admin_id).await.0.is_enabled,
+            "an admin-created provider is never disabled by the env bootstrap"
+        );
+
+        // A second env-less boot is a no-op.
+        assert!(AuthConfigService::disable_env_managed_ldap(pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// An admin who re-enables an env-seeded provider (toggle or update)
+    /// takes ownership, so the next env-less boot leaves it enabled; a boot
+    /// with LDAP_* records env ownership again (#4857).
+    #[tokio::test]
+    async fn test_admin_reenable_takes_ownership_from_the_env_bootstrap() {
+        use crate::services::auth_config_service::ToggleRequest;
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = &iso.pool;
+
+        let id = match reconcile_ldap_from_env(pool, base_env()).await.unwrap() {
+            LdapEnvOutcome::Created { id, .. } => id,
+            other => panic!("expected create, got {other:?}"),
+        };
+        AuthConfigService::disable_env_managed_ldap(pool)
+            .await
+            .unwrap();
+        assert!(!stored(pool, id).await.0.is_enabled);
+
+        // Admin toggle on: ownership released, env-less boot keeps it on.
+        AuthConfigService::toggle_ldap(pool, id, ToggleRequest { enabled: true })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(pool, id).await.1,
+            None,
+            "toggle-on releases ownership"
+        );
+        assert!(AuthConfigService::disable_env_managed_ldap(pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(stored(pool, id).await.0.is_enabled);
+
+        // A boot with LDAP_* manages it again; the env-less boot after that
+        // disables it.
+        reconcile_ldap_from_env(pool, base_env()).await.unwrap();
+        assert!(stored(pool, id).await.1.is_some_and(|r| !r.is_empty()));
+        assert_eq!(
+            AuthConfigService::disable_env_managed_ldap(pool)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Admin update with is_enabled = true also takes ownership.
+        AuthConfigService::update_ldap(
+            pool,
+            id,
+            crate::services::auth_config_service::UpdateLdapConfigRequest {
+                is_enabled: Some(true),
+                ..empty_update()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored(pool, id).await.1,
+            None,
+            "update-enable releases ownership"
+        );
+        assert!(AuthConfigService::disable_env_managed_ldap(pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(stored(pool, id).await.0.is_enabled);
+    }
+
     fn empty_update() -> crate::services::auth_config_service::UpdateLdapConfigRequest {
         crate::services::auth_config_service::UpdateLdapConfigRequest {
             name: None,
