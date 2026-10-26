@@ -2177,8 +2177,9 @@ async fn streamed_repodata_response(
 /// Whether a failed probe for an optional upstream document means the upstream
 /// does not publish it (#4929).
 ///
-/// Used for the compressed `repodata.json` candidates and for a remote
-/// `repodata.json.sig`: S3 buckets without list permission answer 403 for a key
+/// Used for the compressed `repodata.json` candidates (the plain route, the
+/// virtual members and the shard synthesis), the upstream CEP-16 shard index
+/// and a remote `repodata.json.sig`: S3 buckets without list permission answer 403 for a key
 /// that does not exist, and some upstreams answer 401, so treating those as
 /// "not published" lets a channel that only ships the plain `.json` keep
 /// working. The upstream status survives the proxy-error mapping in the
@@ -3298,8 +3299,9 @@ impl<T> UpstreamShardIndex<T> {
 /// Fetch and decode `{subdir}/repodata_shards.msgpack.zst` from a remote
 /// repository's upstream through the proxy cache (capped and budgeted, like a
 /// virtual member's repodata). [`UpstreamShardIndex::NotPublished`]: the
-/// upstream answers 404, i.e. it does not publish CEP-16 for this subdir
-/// (negative-cached by the proxy); [`UpstreamShardIndex::TooLarge`]: its index
+/// upstream answers 404 (negative-cached by the proxy), or refuses the
+/// optional index with 401/403 (#4929), i.e. it does not publish CEP-16 for
+/// this subdir; [`UpstreamShardIndex::TooLarge`]: its index
 /// is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`] (#4612, logged). Any other failure is reported
 /// as that repository's [`virtual_merge::MemberFailure`], so the virtual merge
 /// can apply its member-failure policy to it.
@@ -3355,7 +3357,10 @@ where
             );
             return Ok(UpstreamShardIndex::TooLarge);
         }
-        Err(response) if response.status() == StatusCode::NOT_FOUND => {
+        // The index is optional: an upstream that refuses it with 401/403
+        // (an S3 bucket without list permission answers 403 for a missing
+        // key) publishes none this channel can use, like a 404 (#4929).
+        Err(response) if optional_probe_is_absent(&response) => {
             return Ok(UpstreamShardIndex::NotPublished)
         }
         Err(response) => {
