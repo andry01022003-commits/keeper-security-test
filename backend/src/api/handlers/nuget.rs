@@ -1010,13 +1010,14 @@ async fn proxy_v3_search(
             urlencoding::encode(query_term),
             prerelease
         );
-        let entries = fetch_v2_entries(
+        let entries = fetch_v2_entries_capped(
             proxy,
             fetch_repo_id,
             fetch_repo_key,
             upstream_url,
             &base,
             &odata,
+            Some(MAX_V2_SEARCH_ENTRIES),
         )
         .await?;
         return Ok(search_from_v2_entries_paged(
@@ -1550,8 +1551,10 @@ fn merge_upstream_search_data_with_prerelease(
             // contributed by a later member.
             merge_search_result_versions(&mut data[index], entry, prerelease);
         } else {
+            // The page is full: a new id is dropped, but keep scanning, since
+            // a later entry may still be a duplicate whose versions merge.
             if data.len() >= take {
-                break;
+                continue;
             }
             data.push(entry.clone());
             added += 1;
@@ -1777,6 +1780,29 @@ async fn fetch_v2_entries(
     base: &str,
     odata: &str,
 ) -> Result<Vec<V2Entry>, Response> {
+    fetch_v2_entries_capped(proxy, repo_id, repo_key, upstream_url, base, odata, None).await
+}
+
+/// Most rows an unpaged V2 `Search()` walk keeps (#4976). The V3 search
+/// projection sends no `$top`, since V2 rows are versions and V3 pages
+/// packages, so without this cap the walk is bounded only by
+/// [`MAX_V2_UPSTREAM_PAGES`] times the per-page byte ceiling, and an upstream
+/// serving very dense pages could make one search hold and group a very large
+/// row set. 2000 rows is 20 pages at the common page size of 100.
+const MAX_V2_SEARCH_ENTRIES: usize = 2000;
+
+/// [`fetch_v2_entries`] with an extra local row cap that is never sent
+/// upstream. The effective limit is the smaller of `max_entries` and the
+/// query's own `$top`.
+async fn fetch_v2_entries_capped(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    base: &str,
+    odata: &str,
+    max_entries: Option<usize>,
+) -> Result<Vec<V2Entry>, Response> {
     let first_url = format!("{}/{}", base.trim_end_matches('/'), odata);
     let mut next_url = Some(first_url);
     let mut entries = Vec::new();
@@ -1784,7 +1810,10 @@ async fn fetch_v2_entries(
     // Paging is not a stable snapshot: an upstream that changes between pages
     // can repeat a row, so keep the first copy of each (id, version).
     let mut seen_entries = std::collections::HashSet::new();
-    let entry_limit = v2_odata_top_limit(odata);
+    let entry_limit = match (v2_odata_top_limit(odata), max_entries) {
+        (Some(top), Some(cap)) => Some(top.min(cap)),
+        (top, cap) => top.or(cap),
+    };
     if entry_limit == Some(0) {
         return Ok(entries);
     }
@@ -2038,6 +2067,7 @@ fn search_from_v2_entries(
     search_from_v2_entries_paged(entries, ak_base, client_repo_key, prerelease, 0, i64::MAX)
 }
 
+/// Answer one V2 OData verb from a V3 upstream (#4122).
 ///
 /// The three verbs a Chocolatey / `nuget.exe` client issues map onto V3
 /// documents: `FindPackagesById()` and `Packages(Id=,Version=)` onto the flat
@@ -3192,10 +3222,13 @@ async fn search_packages(
     }
 
     // Virtual repo: merge each remote member's upstream results into the local
-    // ones, deduped case-insensitively by package id with local entries
-    // winning. `totalHits` takes the max of the local and upstream totals —
-    // the true merged total is unknowable without enumerating both corpora,
-    // and max never double-counts a package present on both sides.
+    // ones, deduped case-insensitively by package id. The first source to list
+    // an id keeps its entry and its copy of any version listed twice; versions
+    // only a later member has are added, and the root `version` is recomputed
+    // over the union (#4976). `totalHits` takes the max of the local and
+    // upstream totals: the true merged total is unknowable without enumerating
+    // both corpora, and max never double-counts a package present on both
+    // sides.
     if repo.repo_type == RepositoryType::Virtual {
         if let Some(proxy) = &state.proxy_service {
             for member in &members {
@@ -5970,6 +6003,31 @@ mod tests {
 
         merge_upstream_search_data_with_prerelease(&mut data, &upstream, 1, true);
         assert_eq!(data[0]["version"], "1.77.0-rc.1");
+    }
+
+    /// A full page drops new ids but must keep scanning: a duplicate listed
+    /// after a dropped id still merges its versions (#4976).
+    #[test]
+    fn test_merge_upstream_search_data_merges_duplicates_after_a_dropped_id() {
+        let mut data = vec![serde_json::json!({
+            "id": "Inoa.Cli",
+            "version": "1.15.1",
+            "versions": [{"version": "1.15.1"}]
+        })];
+        let upstream = serde_json::json!({
+            "data": [
+                {"id": "Other.Pkg", "version": "9.0.0"},
+                {"id": "inoa.cli", "version": "1.77.0", "versions": [{"version": "1.77.0"}]}
+            ]
+        });
+        let added = merge_upstream_search_data_with_prerelease(&mut data, &upstream, 1, false);
+        assert_eq!(added, 0);
+        assert_eq!(data.len(), 1, "take stays the page bound");
+        assert_eq!(
+            data[0]["id"], "Inoa.Cli",
+            "the first source keeps its entry"
+        );
+        assert_eq!(data[0]["version"], "1.77.0");
     }
 
     #[test]
@@ -9726,6 +9784,42 @@ mod virtual_federation_tests {
             .filter_map(|item| item["version"].as_str())
             .collect();
         assert_eq!(versions, ["1.15.1", "1.76.2", "1.77.0", "1.77.0-rc.1"]);
+    }
+
+    /// The unpaged V2 Search() walk keeps at most `MAX_V2_SEARCH_ENTRIES`
+    /// rows, however many one upstream page carries (#4976).
+    #[tokio::test]
+    async fn virtual_v3_search_caps_rows_read_from_a_v2_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let versions: Vec<String> = (0..super::MAX_V2_SEARCH_ENTRIES + 50)
+            .map(|i| format!("1.0.{i}"))
+            .collect();
+        let version_refs: Vec<&str> = versions.iter().map(String::as_str).collect();
+        let upstream = v2_search_upstream("Dense.Pkg", &version_refs).await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v3/search?q=Dense.Pkg", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            document["data"][0]["versions"].as_array().unwrap().len(),
+            super::MAX_V2_SEARCH_ENTRIES
+        );
     }
 
     /// A V2 upstream that exposes the second page through an Atom continuation
