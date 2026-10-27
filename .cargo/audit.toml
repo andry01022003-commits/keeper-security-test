@@ -58,4 +58,36 @@ ignore = [
     # at >= 0.7.6. Remove once `cargo tree -i crypto-bigint@0.5.5` prints
     # nothing (#4940).
     "RUSTSEC-2026-0387",
+
+    # zstd 0.13 / zstd-safe 7 batch from 2026-10-16. RUSTSEC-2026-0391 (zstd
+    # stream::raw/read/write `with_context` reuses a context without resetting
+    # it; patched in >= 0.14.3), RUSTSEC-2026-0398 (zstd-safe
+    # `Seekable::decompress`; >= 8.2.0) and RUSTSEC-2026-0403 (zstd-safe
+    # `DCtx::decompress_stream` commits output positions after a failed legacy
+    # frame; >= 8.2.0). Our direct zstd, the one under zip 9 and the one under
+    # async-compression (0.4.49 / compression-codecs 0.4.44) are 0.14.3 with
+    # zstd-safe 8.2.0. The ONLY remaining pre-fix copy is zstd 0.13.3 with
+    # zstd-safe 7.2.4, required by rattler_package_streaming 0.27.15 (0.27.16
+    # moves to zstd 0.14 but pins rattler_conda_types 0.58, a breaking bump)
+    # and wasmtime-internal-cache 36 (every 36.x requires zstd 0.13). None of
+    # the affected functions is reachable through them:
+    # - 0391: nothing calls `with_context` on zstd 0.13 (the backend uses
+    #   rattler only through `seek::stream_conda_info` and
+    #   `seek::read_package_file_content`, which decode with
+    #   `zstd::stream::read::Decoder::new`; wasmtime's cache uses
+    #   `zstd::decode_all` / `encode_all`).
+    # - 0398: zstd-safe 7.2.4 is built with features `std` and `zstdmt` only,
+    #   so the `seekable` module is not compiled in.
+    # - 0403: the advisory states the read decoder, `decode_all` and the bulk
+    #   API are not affected, and those are the only decode paths the two
+    #   dependents use (zstd-sys does have `legacy` enabled, through the zstd
+    #   0.14 default features, so this rests on the call sites, not the
+    #   feature set).
+    # cargo-audit ignores by id, so this also covers the 0.14 copy: keep it at
+    # >= 0.14.3. Remove these three once `cargo tree -i zstd@0.13.3` prints
+    # nothing (rattler_package_streaming >= 0.27.16 and a wasmtime on zstd
+    # 0.14).
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]
