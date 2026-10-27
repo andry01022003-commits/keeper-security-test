@@ -58,4 +58,33 @@ ignore = [
     # at >= 0.7.6. Remove once `cargo tree -i crypto-bigint@0.5.5` prints
     # nothing (#4940).
     "RUSTSEC-2026-0387",
+
+    # zstd / zstd-safe advisories of 2026-10-16 (RUSTSEC-2026-0391 zstd
+    # `with_context` reuses a context without resetting it; -0398 zstd-safe
+    # `Seekable::decompress`; -0403 zstd-safe `DCtx::decompress_stream` after
+    # a failed legacy frame; patched in zstd >= 0.14.3 and zstd-safe >=
+    # 8.2.0). Release-line narrowing of main's #5023: the direct zstd, zip and
+    # async-compression (0.4.49 / compression-codecs 0.4.44) are on zstd
+    # 0.14.3 / zstd-safe 8.2.0, but main's rattler_package_streaming 0.27.16
+    # needs rattler_conda_types 0.58, a breaking bump this line does not take.
+    # So zstd 0.13.3 / zstd-safe 7.2.4 stay, under rattler_package_streaming
+    # 0.27.15 and wasmtime-internal-cache 36. Neither reaches the affected
+    # functions:
+    # - 0391: nothing calls `with_context` on zstd 0.13.
+    # - 0398: zstd-safe 7.2.4 is built with `std` and `zstdmt` only, so the
+    #   `seekable` module is not compiled in.
+    # - 0403: the advisory lists the read decoder, `decode_all` and the bulk
+    #   API as not affected. The backend calls rattler only through
+    #   `seek::stream_conda_info` and `seek::read_package_file_content`,
+    #   which decode with `zstd::stream::read::Decoder`; wasmtime's cache uses
+    #   `decode_all` / `encode_all` and only runs with a configured
+    #   compilation cache, which wasm_runtime.rs never sets. (zstd-sys does
+    #   have `legacy` enabled through zstd 0.14's defaults, so this rests on
+    #   the call sites, not the feature set.)
+    # cargo-audit ignores by id, so this also covers the 0.14 copy: keep it at
+    # >= 0.14.3. Remove these three once `cargo tree -i zstd@0.13.3` prints
+    # nothing.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]
