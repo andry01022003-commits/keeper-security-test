@@ -1873,13 +1873,18 @@ impl ScanWorkspace {
     /// carry the ISO9660 volume descriptor, detected by magic and never by
     /// the `.iso` extension.
     ///
-    /// A name [`Self::is_archive`] recognises keeps the archive path even
-    /// when the bytes are also ISO9660 (a polyglot), and so does a pinned
-    /// scan: an image cannot stand in for the package its name or pin says
-    /// it is. The orchestrator uses the same predicate to decide that the
-    /// upload expects a catalog, so staging and grading never disagree.
+    /// A name [`Self::is_archive`] recognises, or a package file the engines
+    /// catalog as it is staged ([`ISO_EXCLUDED_PACKAGE_SUFFIXES`]: `.deb`,
+    /// `.rpm` and their variants), keeps its own path even when the bytes are
+    /// also ISO9660 (a polyglot), and so does a pinned scan: an image cannot
+    /// stand in for the package its name or pin says it is. The orchestrator
+    /// uses the same predicate to decide that the upload expects a catalog,
+    /// so staging and grading never disagree.
     pub(crate) fn stages_iso_rootfs(filename: &str, content: &[u8], pinned: bool) -> bool {
-        !pinned && !Self::is_archive(filename) && crate::services::iso_rootfs::is_iso9660(content)
+        !pinned
+            && !Self::is_archive(filename)
+            && !is_iso_excluded_package_file(filename)
+            && crate::services::iso_rootfs::is_iso9660(content)
     }
 
     /// Stage an ISO9660 image's rootfs package database into `workspace`
@@ -2780,6 +2785,19 @@ pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) ->
         "generic" => generic_archive_expects_catalog(&lower),
         _ => false,
     }
+}
+
+/// Package files that are not archives the scan workspace unpacks but that
+/// the engines catalog as staged (Debian and RPM packages). Their bytes can
+/// carry an ISO9660 volume descriptor at byte 32769 like any other payload,
+/// so they are never routed to the ISO rootfs path (#1966).
+const ISO_EXCLUDED_PACKAGE_SUFFIXES: &[&str] = &[".deb", ".udeb", ".ddeb", ".rpm"];
+
+fn is_iso_excluded_package_file(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    ISO_EXCLUDED_PACKAGE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 /// Whether this upload expects a catalog: [`format_expects_catalog`] for its
@@ -11728,7 +11746,14 @@ mod tests {
             !ScanWorkspace::stages_iso_rootfs("debian-live-12.iso", b"not an image", false),
             "the .iso name alone must not select the ISO path"
         );
-        for archive in ["pkg-1.0.tar.gz", "lib-1.0.jar", "tool-1.0-py3-none-any.whl"] {
+        for archive in [
+            "pkg-1.0.tar.gz",
+            "lib-1.0.jar",
+            "tool-1.0-py3-none-any.whl",
+            "openssl_3.0.11-1_amd64.deb",
+            "openssl-3.0.7-24.el9.x86_64.rpm",
+            "OPENSSL.RPM",
+        ] {
             assert!(
                 !ScanWorkspace::stages_iso_rootfs(archive, &iso, false),
                 "{archive} keeps the archive path"
@@ -30502,8 +30527,13 @@ tonic-build = "0.12"
             );
             assert_eq!(
                 score.grade, "A",
-                "a generic image does not floor the grade (#4154)"
+                "a generic image does not floor the legacy grade letter (#4154)"
             );
+            // #4336: an image whose rootfs was not inventoried is not rated,
+            // and is counted as uncataloged in the coverage.
+            assert_eq!(score.grade_status.as_deref(), Some("unrated"));
+            assert_eq!(score.rated_grade, None);
+            assert_eq!(score.uncataloged_count, Some(1));
 
             finish(fx).await;
         }

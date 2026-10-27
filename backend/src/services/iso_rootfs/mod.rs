@@ -116,6 +116,12 @@ const UNSQUASHFS_QUEUE_MIB: &str = "32";
 /// Longest stderr kept from an `unsquashfs` child.
 const MAX_STDERR_BYTES: u64 = 64 * 1024;
 
+/// Longest `unsquashfs -lls` line read. A real line is a mode, an owner, a
+/// size, a date and a path (plus a symlink target), well under 8 KiB; a
+/// longer one comes from a crafted image and refuses it, so the listing
+/// never buffers more than this per line.
+const MAX_LISTING_LINE_BYTES: u64 = 64 * 1024;
+
 /// Ceilings and timeouts for one ISO rootfs staging.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IsoLimits {
@@ -253,6 +259,7 @@ async fn extract_package_db(
             max_bytes: limits.max_bytes,
             max_entries: limits.max_entries,
             label: "ISO rootfs image",
+            reject_special_files: true,
         },
     )
     .await
@@ -274,6 +281,10 @@ async fn extract_package_db(
 struct Listed {
     entries: u64,
     bytes: u64,
+    /// Device nodes, FIFOs and sockets listed. A package database holds
+    /// none, and an engine opening one could block or read a device, so any
+    /// refuses the image before extraction.
+    special: u64,
 }
 
 impl Listed {
@@ -296,6 +307,9 @@ impl Listed {
             return;
         }
         self.entries += 1;
+        if "cbps".contains(kind) {
+            self.special += 1;
+        }
         if kind == '-' {
             let size = fields.nth(1).and_then(|s| s.parse::<u64>().ok());
             self.bytes = self.bytes.saturating_add(size.unwrap_or(u64::MAX));
@@ -331,11 +345,34 @@ async fn list_declared(
 
     let run = async {
         let mut listed = Listed::default();
-        let mut lines = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
+        let mut buf: Vec<u8> = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    listed.add_line(&line);
+            buf.clear();
+            match (&mut reader)
+                .take(MAX_LISTING_LINE_BYTES + 1)
+                .read_until(b'\n', &mut buf)
+                .await
+            {
+                Ok(0) => break,
+                Ok(_) => {
+                    if buf.len() as u64 > MAX_LISTING_LINE_BYTES {
+                        return Err(format!(
+                            "a squashfs listing line is longer than {} bytes",
+                            MAX_LISTING_LINE_BYTES
+                        ));
+                    }
+                    // Non-UTF-8 names: the listing cannot be trusted line by line.
+                    let Ok(line) = std::str::from_utf8(&buf) else {
+                        return Err("unreadable squashfs listing: not UTF-8".to_string());
+                    };
+                    listed.add_line(line);
+                    if listed.special > 0 {
+                        return Err(
+                            "the package-database paths hold a device node, FIFO or socket"
+                                .to_string(),
+                        );
+                    }
                     if listed.entries > limits.max_entries {
                         return Err(format!(
                             "the package-database paths hold more than {} entries; refusing to extract suspected decompression bomb",
@@ -349,8 +386,6 @@ async fn list_declared(
                         ));
                     }
                 }
-                Ok(None) => break,
-                // Non-UTF-8 names: the listing cannot be trusted line by line.
                 Err(e) => return Err(format!("unreadable squashfs listing: {}", e)),
             }
         }

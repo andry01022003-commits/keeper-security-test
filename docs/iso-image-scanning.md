@@ -12,8 +12,9 @@ An upload is treated as an ISO when its bytes carry the ISO9660 volume
 descriptor (`CD001` at byte 32769). The `.iso` extension is neither required
 nor trusted, and hybrid images (an MBR or GPT at offset 0, which every modern
 live medium has) are detected. A file whose name is a known archive type
-(`.tar.gz`, `.jar`, `.whl`, ...) keeps the archive path even if its bytes are
-also ISO9660, and so does a pinned scan.
+(`.tar.gz`, `.jar`, `.whl`, ...) or a Debian or RPM package (`.deb`, `.udeb`,
+`.ddeb`, `.rpm`) keeps its own path even if its bytes are also ISO9660, and
+so does a pinned scan.
 
 The scanner looks for the embedded root filesystem image at these paths:
 
@@ -60,14 +61,18 @@ when:
   multi-extent (over 4 GiB), zisofs-compressed or symlinked file;
 - the squashfs image is corrupt, or `unsquashfs` is not installed;
 - the extraction would exceed the limits below;
-- a symlink in the package database points outside the extracted tree;
+- a symlink in the package database points outside the extracted tree, or
+  the package database holds a device node, FIFO or socket;
 - the root filesystem holds no dpkg, rpm or apk database (for example older
   Fedora media, whose `squashfs.img` carries an ext4 `rootfs.img`, which is
   not mounted or read).
 
-In a generic repository an ISO is not package-shaped, so a `not_cataloged`
-ISO flags the repository without flooring its grade letter, like a plain
-generic `.zip` (#4154).
+An ISO is not package-shaped, so a `not_cataloged` ISO does not floor the
+legacy grade letter, like a plain generic `.zip` (#4154). Its scan reads
+`unrated` with the reason, and it counts as uncataloged in the repository's
+coverage: the repository's grade status is `incomplete` when other artifacts
+were assessed, and `unrated` when the ISO is the only one (see
+[Grade status](security/grade-status.md)).
 
 ## Limits
 

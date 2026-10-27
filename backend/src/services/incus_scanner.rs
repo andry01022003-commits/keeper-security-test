@@ -411,6 +411,11 @@ pub(crate) struct TreeLimits {
     pub max_bytes: u64,
     pub max_entries: u64,
     pub label: &'static str,
+    /// Refuse device nodes, FIFOs and sockets. The ISO rootfs path sets it:
+    /// a package database holds none, and an engine opening one could block
+    /// or read a device. The Incus path keeps a full rootfs, whose `/dev`
+    /// entries the non-root extractor already skips.
+    pub reject_special_files: bool,
 }
 
 impl TreeLimits {
@@ -421,6 +426,7 @@ impl TreeLimits {
             max_bytes: max_extracted_bytes(),
             max_entries: MAX_EXTRACTED_ENTRIES,
             label: "Incus archive",
+            reject_special_files: false,
         }
     }
 }
@@ -917,6 +923,12 @@ impl IncusScanner {
                             limits.label, max_bytes
                         )));
                     }
+                } else if limits.reject_special_files {
+                    return Err(AppError::Internal(format!(
+                        "{} contains {}, which is not a file, directory or symlink; refusing extraction",
+                        limits.label,
+                        path.display()
+                    )));
                 }
             }
         }

@@ -521,6 +521,7 @@ enum Node<'a> {
     /// A sparse file of the given length.
     Sparse(&'a str, u64),
     Link(&'a str, &'a str),
+    Fifo(&'a str),
 }
 
 fn build_squashfs(nodes: &[Node<'_>]) -> Vec<u8> {
@@ -529,7 +530,7 @@ fn build_squashfs(nodes: &[Node<'_>]) -> Vec<u8> {
     std::fs::create_dir_all(&src).unwrap();
     for node in nodes {
         let path = match node {
-            Node::File(p, _) | Node::Sparse(p, _) | Node::Link(p, _) => *p,
+            Node::File(p, _) | Node::Sparse(p, _) | Node::Link(p, _) | Node::Fifo(p) => *p,
         };
         let full = src.join(path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -537,6 +538,11 @@ fn build_squashfs(nodes: &[Node<'_>]) -> Vec<u8> {
             Node::File(_, data) => std::fs::write(&full, data).unwrap(),
             Node::Sparse(_, len) => std::fs::File::create(&full).unwrap().set_len(*len).unwrap(),
             Node::Link(_, target) => std::os::unix::fs::symlink(target, &full).unwrap(),
+            Node::Fifo(_) => assert!(std::process::Command::new("mkfifo")
+                .arg(&full)
+                .status()
+                .expect("mkfifo must run")
+                .success()),
         }
     }
     let img = staging.path().join("img.squashfs");
@@ -830,6 +836,78 @@ fn stub_iso() -> Bytes {
     iso_of(squashfs_payload())
 }
 
+/// A FIFO (or device node) in the package database refuses the image at the
+/// listing, before anything is written: an engine opening a FIFO named like
+/// a package database would block until the scan's budget ran out.
+#[tokio::test]
+async fn special_files_in_the_package_database_refuse_the_image() {
+    if !squashfs_tools_available() {
+        return;
+    }
+    let rootfs = build_squashfs(&[
+        Node::File("etc/os-release", OS_RELEASE),
+        Node::File("lib/apk/db/installed", b"P:musl\nV:1.2.4-r2\n\n"),
+        Node::Fifo("var/lib/dpkg/status"),
+    ]);
+    let ws = tempfile::tempdir().unwrap();
+    let staged = stage_iso_rootfs(ws.path(), &iso_of(rootfs), small_limits())
+        .await
+        .unwrap();
+    assert_unscannable(&staged, "device node, FIFO or socket");
+    assert_eq!(names_under(ws.path()), Vec::<String>::new());
+}
+
+/// The post-extraction guard refuses a FIFO too, should one get past the
+/// listing.
+#[tokio::test]
+async fn the_guard_refuses_special_files() {
+    use crate::services::incus_scanner::{guard_extracted_tree, TreeLimits};
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join("var/lib/dpkg")).unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(ws.path().join("var/lib/dpkg/status"))
+        .status()
+        .expect("mkfifo must run")
+        .success());
+    let err = guard_extracted_tree(
+        ws.path(),
+        TreeLimits {
+            max_bytes: 1 << 20,
+            max_entries: 100,
+            label: "ISO rootfs image",
+            reject_special_files: true,
+        },
+    )
+    .await
+    .expect_err("a FIFO must be refused");
+    assert!(
+        err.to_string().contains("not a file, directory or symlink"),
+        "{err}"
+    );
+}
+
+/// A listing line longer than [`MAX_LISTING_LINE_BYTES`] refuses the image
+/// without buffering the rest of it.
+#[tokio::test]
+async fn an_overlong_listing_line_refuses_the_image() {
+    let tools = tempfile::tempdir().unwrap();
+    let program = fake_program(
+        tools.path(),
+        "head -c 200000 /dev/zero | tr '\\0' a; exit 0",
+    );
+    let ws = tempfile::tempdir().unwrap();
+    let staged = stage_with(
+        program.to_str().unwrap(),
+        ws.path(),
+        &stub_iso(),
+        small_limits(),
+    )
+    .await
+    .unwrap();
+    assert_unscannable(&staged, "listing line is longer than");
+    assert_eq!(names_under(ws.path()), Vec::<String>::new());
+}
+
 /// An extractor that never finishes is killed at the timeout; the worker is
 /// not pinned and the image is unscannable.
 #[tokio::test]
@@ -923,7 +1001,8 @@ fn listing_lines_are_accounted_conservatively() {
         l,
         Listed {
             entries: 4,
-            bytes: 93
+            bytes: 93,
+            special: 1,
         }
     );
     l.add_line("-rw-r--r-- root/root  huge 2026-10-24 16:31 squashfs-root/x");
