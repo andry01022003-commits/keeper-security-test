@@ -13088,7 +13088,7 @@ pub async fn get_egress_proxy(
         (status = 200, description = "Upstream reachable"),
         (status = 400, description = "Repository is not remote or has no upstream URL"),
         (status = 401, description = "Authentication required"),
-        (status = 404, description = "Repository not found"),
+        (status = 404, description = "Repository not found, or the repository's upstream filter refuses the upstream root (nothing is sent)"),
         (status = 502, description = "Upstream unreachable"),
     )
 )]
@@ -13109,6 +13109,20 @@ pub async fn test_upstream(
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         AppError::Validation("Repository has no upstream URL configured".to_string())
     })?;
+
+    // #840: the probe is upstream contact like any other fetch, so the
+    // repository's upstream filter gates it. The probe requests the upstream
+    // root, whose subject is the empty path: a filter that lists only
+    // `include_patterns` for package paths therefore refuses it (404, nothing
+    // sent) unless a pattern admits `^$`/`.*`.
+    crate::services::upstream_filter::ensure_upstream_allowed(
+        &state.db,
+        repo.id,
+        &key,
+        upstream_url,
+        "",
+    )
+    .await?;
 
     let client = crate::services::http_client::base_client_builder()
         .timeout(Duration::from_secs(15))
@@ -13443,9 +13457,12 @@ pub async fn get_upstream_filter(
 ///   `files.pythonhosted.org`, cargo `dl` hosts, NuGet service URLs): the full
 ///   absolute URL, unless it lies under the upstream URL.
 ///
-/// Not filtered in this version: npm `/-/` passthroughs (search, attestations,
-/// ping) and npm audit, curation upstream sync, change feeds, and the admin
-/// `test-upstream` probe.
+/// Not filtered: the npm upstream change feed (a single global subscription
+/// that is not a per-repository upstream fetch, so it has no subject).
+///
+/// The curation upstream sync (RPM/Debian index walks and the PyPI attestation
+/// enrichment) and the admin `test-upstream` probe apply the filter too, since
+/// 1.12.0 (#840).
 ///
 /// A proxy-cache entry for a refused path is served only while it is fresh:
 /// once it expires it is neither revalidated nor served stale, and answers 404
@@ -35998,6 +36015,82 @@ mod content_encoding_forwarding_tests {
             exported_upstream_client_spans(&exported, "HEAD"),
             vec![("HEAD".to_string(), upstream, 204)],
             "one CLIENT span for the probe, with an integer status"
+        );
+    }
+
+    /// #840: the `test-upstream` probe is upstream contact, so the Remote's
+    /// upstream filter gates it. The probe requests the upstream root (subject:
+    /// the empty path), which an include-only filter for package paths refuses:
+    /// the probe answers 404 and the mock receives nothing. The unfiltered
+    /// control at the top proves the mock is reachable — a probe that simply
+    /// never sent would fail it.
+    #[tokio::test]
+    async fn test_test_upstream_honours_the_upstream_filter_840() {
+        use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/probe"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let upstream = format!("{}/probe", server.uri());
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+
+        let probe = || {
+            let state = fx.state.clone();
+            let user_id = fx.user_id;
+            let username = fx.username.clone();
+            let repo_key = fx.repo_key.clone();
+            async move {
+                super::test_upstream(
+                    axum::extract::State(state),
+                    Extension(Some(tdh::admin_auth(user_id, &username))),
+                    axum::extract::Path(repo_key),
+                )
+                .await
+            }
+        };
+
+        // Control: with no filter the probe reaches the mock.
+        let open = probe().await;
+        assert!(
+            open.is_ok(),
+            "an unfiltered probe must reach the mock: {open:?}"
+        );
+
+        save_upstream_filter(
+            &fx.pool,
+            fx.repo_id,
+            &UpstreamFilter {
+                include_patterns: vec!["^com/acme/".to_string()],
+                exclude_patterns: vec![],
+            },
+        )
+        .await
+        .expect("save filter");
+        let before = server.received_requests().await.unwrap_or_default().len();
+        let refused = probe().await;
+        let after = server.received_requests().await.unwrap_or_default().len();
+        fx.teardown().await;
+
+        match refused {
+            Err(AppError::NotFound(msg)) => {
+                assert!(msg.contains("upstream filter"), "{msg}");
+            }
+            other => panic!("a probe refused by the filter must be NotFound, got {other:?}"),
+        }
+        assert_eq!(
+            after, before,
+            "a probe refused by the upstream filter must not contact the upstream"
         );
     }
 }
