@@ -91,8 +91,8 @@ use serde_json::json;
 
 use crate::api::extractors::request_base_url_from_request;
 use crate::api::middleware::auth::{
-    extract_visibility_token, extracted_basic_credentials, is_browser_request,
-    service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
+    extract_ticket_from_query, extract_visibility_token, extracted_basic_credentials,
+    is_browser_request, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
 };
 use crate::api::middleware::oci_errors::{is_oci_v2_path, oci_unauthorized_response};
 use crate::services::auth_service::AuthService;
@@ -392,9 +392,15 @@ pub async fn guest_access_guard(
     // the passthrough: exactly one directory bind and one LOGIN_FAILED row per
     // rejected request (#4933). Management and OCI requests are still answered
     // here, so they never bind.
+    //
+    // Not when the request also carries a `?ticket=`: the route would accept
+    // the ticket in place of the rejected credential, and with guest access
+    // off a ticket alone does not open this guard. Such a request is answered
+    // here, exactly as it would be without the Basic header.
     if matches!(outcome, AuthOutcome::InvalidCredential)
         && defers_to_package_route(path)
         && extracted_basic_credentials(extracted).is_some()
+        && extract_ticket_from_query(request.uri().query()).is_none()
     {
         return next.run(request).await;
     }
@@ -1671,5 +1677,46 @@ mod tests {
         };
         let n = public_repository_count(&pool).await.expect("count");
         assert!(n >= 0);
+    }
+
+    /// #4933: deferring a rejected Basic credential to a package route must
+    /// not let a `?ticket=` through the guard. With guest access off a ticket
+    /// alone is refused here; adding an unresolvable Basic header must not
+    /// change that, while the same header without a ticket is still handed to
+    /// the route (which owns the directory passthrough).
+    #[tokio::test]
+    async fn guard_answers_rejected_basic_with_ticket_itself_4933() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let app = Router::new()
+            .route("/pypi/private/simple/pkg/", get(|| async { "package" }))
+            .layer(from_fn_with_state(disabled_state(pool), guest_access_guard));
+        let username = format!("guard-ticket-{}", uuid::Uuid::new_v4().simple());
+        let send = |uri: &'static str, with_basic: bool| {
+            let app = app.clone();
+            let mut req = Request::builder().uri(uri);
+            if with_basic {
+                req = req.header(AUTHORIZATION, basic_header(&username, "not-a-password"));
+            }
+            async move { app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap() }
+        };
+
+        let ticket_only = send("/pypi/private/simple/pkg/?ticket=abc123", false).await;
+        let deferred = send("/pypi/private/simple/pkg/", true).await;
+        let basic_and_ticket = send("/pypi/private/simple/pkg/?ticket=abc123", true).await;
+
+        assert_eq!(ticket_only.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            deferred.status(),
+            StatusCode::OK,
+            "a rejected Basic credential on a package route is the route's to answer"
+        );
+        assert_eq!(
+            basic_and_ticket.status(),
+            StatusCode::UNAUTHORIZED,
+            "a rejected Basic credential must not carry a ticket past the guard"
+        );
     }
 }
