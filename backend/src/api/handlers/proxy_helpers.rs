@@ -24414,12 +24414,12 @@ mod proxy_download_recording_tests {
             (
                 "composer.rs",
                 "download_archive",
-                "serve_scanned_virtual_composer_dist(",
+                "serve_virtual_composer_dist(",
                 1,
             ),
             (
                 "composer.rs",
-                "serve_scanned_virtual_composer_dist",
+                "serve_virtual_composer_dist",
                 "serve_scanned_composer_dist(",
                 1,
             ),
