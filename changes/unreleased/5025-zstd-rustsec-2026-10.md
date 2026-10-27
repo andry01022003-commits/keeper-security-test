@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5025]
+---
+- **Update zstd to 0.14.3** (#5025). `zstd` moves from 0.14.2 to 0.14.3 and the async compression codecs (`async-compression` 0.4.49, `compression-codecs` 0.4.44) move onto the same zstd 0.14 / `zstd-safe` 8.2 stack, picking up the upstream fixes for RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403. An older zstd 0.13 copy stays in the tree through `rattler_package_streaming` and `wasmtime`; the affected functions are not reachable through either, and the advisories are ignored in `.cargo/audit.toml` until those crates move to zstd 0.14. Lockfile-only; no behaviour change.
