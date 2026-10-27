@@ -45836,7 +45836,7 @@ mod token_exchange_bearer_api_token_4903 {
         let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
         let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-        let (api_token, _id) = auth
+        let (api_token, token_id) = auth
             .generate_api_token(
                 user_id,
                 "renovate-bearer",
@@ -45875,6 +45875,19 @@ mod token_exchange_bearer_api_token_4903 {
         // A bearer that is neither a JWT nor an API token is still refused.
         let rejected = call_token_endpoint(state.clone(), bearer_headers("not-a-token")).await;
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        // A revoked API token is refused in the Bearer slot exactly as in the
+        // Basic slot: the same validator runs, and revocation is honoured even
+        // though the successful exchange above cached the validation.
+        auth.revoke_api_token(token_id, user_id)
+            .await
+            .expect("revoke API token");
+        let revoked = call_token_endpoint(state.clone(), bearer_headers(&api_token)).await;
+        assert_eq!(
+            revoked.status(),
+            StatusCode::UNAUTHORIZED,
+            "a revoked API token must not exchange through the Bearer slot"
+        );
 
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&storage);
