@@ -3207,6 +3207,137 @@ mod tests {
         assert_eq!(stored["revision"], 2);
     }
 
+    /// #4916: a label document replicated to a peer arrives byte for byte.
+    /// The source's stored JSON is what the sync worker sends; the peer must
+    /// store exactly those bytes (same sha256 and size) with the same label
+    /// map and revision, and a later move must replace it the same way.
+    #[tokio::test]
+    async fn replicated_label_document_round_trips_byte_exact_4916() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(source) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let Some(peer) = tdh::Fixture::setup("local", "protobuf").await else {
+            source.teardown().await;
+            return;
+        };
+        let repo = source.repo_info("local", None);
+        let module = "acme/roundtrip";
+        let label_path = build_label_path(module);
+        let row_sql = "SELECT a.storage_key, a.size_bytes, a.checksum_sha256, am.metadata \
+                       FROM artifacts a JOIN artifact_metadata am ON am.artifact_id = a.id \
+                       WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false";
+        let mut labels = serde_json::Map::new();
+        let mut rounds = Vec::new();
+        for (revision, commit) in [(1, "commit-a"), (2, "commit-b")] {
+            labels.insert("main".to_string(), serde_json::json!(commit));
+            labels.insert(format!("v{revision}"), serde_json::json!(commit));
+            save_label_index(
+                &source.state,
+                &repo,
+                module,
+                &labels,
+                source.user_id,
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("label move");
+            let (key, size, sha, metadata): (String, i64, String, serde_json::Value) =
+                sqlx::query_as(row_sql)
+                    .bind(source.repo_id)
+                    .bind(&label_path)
+                    .fetch_one(&source.pool)
+                    .await
+                    .expect("source label row");
+            let sent = tokio::fs::read(source.storage_dir.join(&key))
+                .await
+                .expect("source label document");
+
+            // What the sync worker sends: the stored bytes, their sha256, and
+            // the `protobuf` metadata document.
+            let (status, body) = peer
+                .chunked_upload_as(
+                    tdh::admin_auth(peer.user_id, &peer.username),
+                    &label_path,
+                    &sent,
+                    serde_json::json!({
+                        "artifact_name": module,
+                        "artifact_version": "_labels",
+                        "artifact_metadata_format": "protobuf",
+                        "artifact_metadata": metadata,
+                    }),
+                    true,
+                )
+                .await;
+            let (peer_key, peer_size, peer_sha, peer_metadata): (
+                String,
+                i64,
+                String,
+                serde_json::Value,
+            ) = sqlx::query_as(row_sql)
+                .bind(peer.repo_id)
+                .bind(&label_path)
+                .fetch_one(&peer.pool)
+                .await
+                .expect("peer label row");
+            let received = tokio::fs::read(peer.storage_dir.join(&peer_key))
+                .await
+                .expect("peer label document");
+            rounds.push((
+                revision,
+                status,
+                body,
+                sent,
+                size,
+                sha,
+                metadata,
+                received,
+                peer_size,
+                peer_sha,
+                peer_metadata,
+            ));
+        }
+        sqlx::query("DELETE FROM upload_sessions WHERE repository_id = $1")
+            .bind(peer.repo_id)
+            .execute(&peer.pool)
+            .await
+            .ok();
+        source.teardown().await;
+        peer.teardown().await;
+
+        for (
+            revision,
+            status,
+            body,
+            sent,
+            size,
+            sha,
+            metadata,
+            received,
+            peer_size,
+            peer_sha,
+            peer_metadata,
+        ) in rounds
+        {
+            assert!(
+                status.is_success(),
+                "revision {revision}: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(received, sent, "revision {revision}: bytes must match");
+            assert_eq!(peer_size, size);
+            assert_eq!(peer_size, sent.len() as i64);
+            assert_eq!(peer_sha.trim(), sha.trim());
+            assert_eq!(peer_sha.trim(), format!("{:x}", Sha256::digest(&sent)));
+            assert_eq!(peer_metadata, metadata);
+            assert_eq!(peer_metadata["revision"], revision);
+            let doc: serde_json::Value = serde_json::from_slice(&received).unwrap();
+            assert_eq!(doc["labels"], peer_metadata["labels"]);
+        }
+    }
+
     /// #4921: a pushed commit must be accepted by the receiving peer. The
     /// sync worker sends the row's `checksum_sha256` with the stored bundle,
     /// and the peer's upload session verifies the bytes against it; before
