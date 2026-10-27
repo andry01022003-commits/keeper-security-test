@@ -3305,6 +3305,17 @@ impl AuthService {
         // Sync or create the user based on federated credentials
         let user = self.sync_federated_user(provider, &credentials).await?;
 
+        // No caller may receive tokens for a deactivated account. CI and LDAP
+        // keep `is_active` across a federated sync (an admin disable is a kill
+        // switch, not something a successful login may undo); the other
+        // providers still reactivate on login at their identity provider.
+        if !user.is_active {
+            return Err(AppError::Authentication(
+                "This account has been deactivated. Ask an administrator to reactivate it."
+                    .to_string(),
+            ));
+        }
+
         // Update last login. Throttled to at most once per 5 minutes per user
         // (display-only field, #2107) to avoid needless WAL churn on re-auth.
         sqlx::query!(
@@ -3571,11 +3582,16 @@ impl AuthService {
             // A CI service account keeps its `is_active` (#4031): it is
             // deactivated when its identity mapping is deleted, or by an
             // administrator as a kill switch, and a pipeline exchange must
-            // never switch it back on. Other federated accounts are
-            // reactivated by a successful login at their identity provider,
-            // as before.
-            sqlx::query_as!(
-                User,
+            // never switch it back on. An LDAP account keeps it for the same
+            // reason (#4933): a successful directory bind on the web LDAP
+            // login must not quietly undo an admin disable. Other federated
+            // accounts are reactivated by a successful login at their
+            // identity provider, as before.
+            // Runtime query (not `query_as!`) so this change does not need a
+            // `.sqlx` cache regeneration for the shared database. The column
+            // list and `sqlx::Type` mapping on `AuthProvider` keep it aligned
+            // with the other `User` reads.
+            sqlx::query_as::<_, User>(
                 r#"
                 UPDATE users
                 SET
@@ -3583,23 +3599,23 @@ impl AuthService {
                     email = $3,
                     display_name = $4,
                     is_admin = COALESCE($5, is_admin),
-                    is_active = CASE WHEN auth_provider = 'ci' THEN is_active ELSE true END,
+                    is_active = CASE WHEN auth_provider IN ('ci', 'ldap') THEN is_active ELSE true END,
                     updated_at = NOW()
                 WHERE id = $1
                 RETURNING
                     id, username, email, password_hash, display_name,
-                    auth_provider as "auth_provider: AuthProvider",
+                    auth_provider,
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     failed_login_attempts, locked_until, last_failed_login_at,
                     password_changed_at, last_login_at, created_at, updated_at
                 "#,
-                existing.id,
-                credentials.username,
-                credentials.email,
-                credentials.display_name,
-                role_mapping.is_admin
             )
+            .bind(existing.id)
+            .bind(&credentials.username)
+            .bind(&credentials.email)
+            .bind(credentials.display_name.as_deref())
+            .bind(role_mapping.is_admin)
             .fetch_one(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
@@ -7344,6 +7360,69 @@ mod tests {
             .execute(&pool)
             .await;
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_ldap_web_login_keeps_admin_deactivation_4933() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let username = format!("ldap_disabled_{suffix}");
+        let external_id = format!("uid={username},ou=people,dc=example,dc=com");
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, auth_provider, external_id, is_active, \
+             is_admin, is_service_account, must_change_password) \
+             VALUES ($1, $2, $3, 'ldap'::auth_provider, $4, false, false, false, false)",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(&external_id)
+        .execute(&pool)
+        .await
+        .expect("insert deactivated LDAP user");
+
+        let creds = FederatedCredentials {
+            external_id,
+            username: username.clone(),
+            email: format!("{username}@test.local"),
+            display_name: Some("Deactivated LDAP User".to_string()),
+            groups: Vec::new(),
+            required_admin_group: None,
+            auto_create_users: true,
+        };
+
+        let result = service
+            .authenticate_federated(AuthProvider::Ldap, creds)
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Authentication(_))),
+            "a deactivated LDAP account must not receive web-login tokens"
+        );
+
+        let is_active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read user after login attempt");
+        assert!(
+            !is_active,
+            "a successful directory bind must not undo an admin deactivation"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await;
     }
