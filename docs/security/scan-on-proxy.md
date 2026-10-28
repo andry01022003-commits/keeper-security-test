@@ -91,6 +91,13 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
+**Duplicate entry paths.** A package archive in which two files share one path
+(after `./` and empty path components are dropped), in the archive itself or,
+for a conda `.conda`, across its payload tars, is inconclusive before any of
+the checks above run. The metadata check reads one copy of a manifest and the
+scan workspace unpacks the other, so neither can be vouched for. Published
+packages do not carry repeated paths.
+
 **Archive formats graded on their contents (Go, Composer, Conan, CocoaPods, Swift).** The gate
 takes the coordinate from the request and checks it against the archive
 first, as for every format: a Go module zip must hold only
