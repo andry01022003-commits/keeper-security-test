@@ -475,6 +475,26 @@ impl ProxyScanService {
         Ok(row)
     }
 
+    /// The stored verdict for `(checksum_sha256, scan_type)` and the number of
+    /// components it was graded on (`components_cataloged`, `None` when not
+    /// recorded), for the rescan's replacement rule (#3396). Runtime query
+    /// (no macro) so this adds no offline sqlx data.
+    pub async fn lookup_verdict_catalog(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Option<(String, Option<i32>)>> {
+        sqlx::query_as::<_, (String, Option<i32>)>(
+            "SELECT verdict, components_cataloged FROM proxy_scan_results \
+             WHERE checksum_sha256 = $1 AND scan_type = $2",
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     /// Upsert a verdict keyed on `(checksum_sha256, scan_type)`. A newer scan of
     /// the same bytes (e.g. against a bumped CVE-DB) replaces the prior row.
     /// Leaves `components_cataloged` as it was; the inline gate records through

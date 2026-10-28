@@ -9122,6 +9122,11 @@ pub(crate) enum ProxyScanMode {
     /// The bytes ARE the scannable unit (a PyPI wheel, an npm tarball):
     /// file/archive scan over the synthetic artifact. Pre-#3003-PR-2 behavior.
     File,
+    /// [`Self::File`] for a cached package archive or image manifest that is
+    /// rescanned with no coordinate to pin (#3396): the CVE engine must
+    /// catalog SOMETHING before a zero-finding scan is trusted as `clean` (see
+    /// [`proxy_rescan_requires_catalog`](crate::services::scanner_service::proxy_rescan_requires_catalog)).
+    FileRequiringCatalog,
     /// The bytes are an OCI IMAGE MANIFEST: the scannable unit is the whole
     /// image (config + layers). The scan stages any missing blobs from
     /// upstream into local storage (bounded by the shared byte cap) and runs
@@ -9239,7 +9244,9 @@ async fn run_scan_within_budget<T, E>(
 /// passes one in explicitly.
 pub(crate) fn proxy_scan_mode_budget(mode: &ProxyScanMode) -> std::time::Duration {
     match mode {
-        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        ProxyScanMode::File | ProxyScanMode::FileRequiringCatalog => {
+            crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET
+        }
         ProxyScanMode::OciImage(_) => {
             crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
         }
@@ -9269,6 +9276,75 @@ pub(crate) async fn proxy_scan_and_record(
     budget: std::time::Duration,
 ) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
 {
+    scan_and_record(
+        state, repo_id, digest, synthetic, bytes, expected, mode, budget, false,
+    )
+    .await
+}
+
+/// [`proxy_scan_and_record`] for the on-demand rescan of cached bytes (#3396).
+///
+/// A rescan has no request coordinate, so it never pins. It records its
+/// verdict exactly as an inline scan would, with one exception: a `clean`
+/// result does not replace a stored `vulnerable` verdict for the same digest
+/// when the engine cataloged fewer components than that verdict was graded
+/// on (see [`rescan_may_replace_stored_verdict`]). Such a rescan saw less of
+/// the package than the scan it would overrule, so it is inconclusive
+/// ([`ProxyScanInconclusive::ScanFailed`]) and the stored verdict, inventory
+/// and findings are left as they are.
+pub(crate) async fn proxy_rescan_and_record(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    mode: &ProxyScanMode,
+    budget: std::time::Duration,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    scan_and_record(
+        state, repo_id, digest, synthetic, bytes, None, mode, budget, true,
+    )
+    .await
+}
+
+/// Whether a rescan verdict `new` may replace the stored verdict for the same
+/// digest (#3396), given the stored row's `(verdict, components_cataloged)`
+/// when one exists.
+///
+/// A `vulnerable` verdict is replaced by a `clean` one only when the rescan
+/// cataloged at least as many components as the stored verdict was graded
+/// on. Every other replacement (no stored row, a stored `clean`, a rescan
+/// that finds vulnerabilities, a stored verdict with no recorded catalog
+/// size) is allowed, as before. A rescan that reported no catalog counts as
+/// having cataloged nothing.
+pub(crate) fn rescan_may_replace_stored_verdict(
+    stored: Option<(&str, Option<i32>)>,
+    new: &crate::services::scanner_service::ProxyScanVerdict,
+) -> bool {
+    use crate::services::proxy_scan_service::{verdict_blocks, VERDICT_CLEAN};
+    let Some((stored_verdict, stored_cataloged)) = stored else {
+        return true;
+    };
+    if new.verdict_token() != VERDICT_CLEAN || !verdict_blocks(stored_verdict) {
+        return true;
+    }
+    new.components_cataloged.unwrap_or(0) >= stored_cataloged.unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_and_record(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    mode: &ProxyScanMode,
+    budget: std::time::Duration,
+    rescan: bool,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
     let scanner = state
         .scanner_service
         .as_ref()
@@ -9279,6 +9355,11 @@ pub(crate) async fn proxy_scan_and_record(
             ProxyScanMode::File => {
                 scanner
                     .scan_content_expecting(synthetic, bytes, expected)
+                    .await
+            }
+            ProxyScanMode::FileRequiringCatalog => {
+                scanner
+                    .scan_content_requiring_catalog(synthetic, bytes)
                     .await
             }
             ProxyScanMode::OciImage(ctx) => {
@@ -9306,6 +9387,31 @@ pub(crate) async fn proxy_scan_and_record(
     };
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    if rescan {
+        // #3396: see `rescan_may_replace_stored_verdict`. An unreadable
+        // stored row cannot be compared, so it is inconclusive too.
+        let stored = match pss.lookup_verdict_catalog(digest, PROXY_SCAN_TYPE).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, error = %e,
+                    "proxy rescan: could not read the stored verdict; leaving it unchanged"
+                );
+                return Err(ProxyScanInconclusive::ScanFailed);
+            }
+        };
+        let stored_ref = stored.as_ref().map(|(v, c)| (v.as_str(), *c));
+        if !rescan_may_replace_stored_verdict(stored_ref, &verdict) {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                stored_components = ?stored_ref.and_then(|(_, c)| c),
+                rescan_components = ?verdict.components_cataloged,
+                "proxy rescan cataloged fewer components than the stored vulnerable \
+                 verdict was graded on; inconclusive, stored verdict unchanged"
+            );
+            return Err(ProxyScanInconclusive::ScanFailed);
+        }
+    }
     // #4594: the cataloged-component count is written with the verdict, so
     // the proxy-scans view can say when a verdict was graded on file
     // contents only.
@@ -11169,6 +11275,82 @@ mod tests {
     use axum::http::StatusCode;
 
     // ── #3396: rescan of already-cached bytes ──
+
+    /// A rescan replaces a stored `vulnerable` verdict with `clean` only when
+    /// it cataloged at least as many components as that verdict was graded
+    /// on; every other replacement stands.
+    #[test]
+    fn rescan_replaces_a_vulnerable_verdict_only_with_an_equal_or_larger_catalog() {
+        use crate::services::scanner_service::aggregate_proxy_verdict;
+        let clean = |cataloged: Option<i32>| {
+            let mut v = aggregate_proxy_verdict(&[], Some("grype-test".to_string()));
+            v.components_cataloged = cataloged;
+            v
+        };
+        let vulnerable = {
+            let mut v = aggregate_proxy_verdict(
+                &[crate::models::security::RawFinding {
+                    severity: crate::models::security::Severity::High,
+                    title: "CVE-2026-3396 test".to_string(),
+                    description: None,
+                    cve_id: Some("CVE-2026-3396".to_string()),
+                    affected_component: Some("x".to_string()),
+                    affected_version: Some("1.0".to_string()),
+                    fixed_version: None,
+                    source: Some("grype".to_string()),
+                    source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
+                }],
+                Some("grype-test".to_string()),
+            );
+            v.components_cataloged = Some(0);
+            v
+        };
+        assert_eq!(clean(None).verdict_token(), "clean");
+        assert_eq!(vulnerable.verdict_token(), "vulnerable");
+
+        // Fewer components than the stored vulnerable verdict: kept.
+        assert!(!rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(1))),
+            &clean(Some(0))
+        ));
+        assert!(!rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(1))),
+            &clean(None)
+        ));
+        assert!(!rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(12))),
+            &clean(Some(3))
+        ));
+        // As many or more: replaced.
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(3))),
+            &clean(Some(3))
+        ));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(0))),
+            &clean(Some(0))
+        ));
+        // Nothing to overrule, or nothing to compare against.
+        assert!(rescan_may_replace_stored_verdict(None, &clean(Some(0))));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("clean", Some(5))),
+            &clean(Some(0))
+        ));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", None)),
+            &clean(Some(0))
+        ));
+        // A rescan that finds vulnerabilities is recorded whatever it saw.
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(5))),
+            &vulnerable
+        ));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("clean", Some(5))),
+            &vulnerable
+        ));
+    }
 
     /// Scanner applicability and archive extraction are driven by the
     /// FILENAME, so a rescan that derives the wrong one does not fail — it

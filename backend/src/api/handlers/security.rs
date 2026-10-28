@@ -2949,7 +2949,9 @@ pub struct ProxyRescanResponse {
             with `Retry-After` naming the remaining cooldown in whole seconds.", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "Rescan could not produce a verdict: \
             `NO_SCANNER_CONFIGURED` (no scanner is configured for this instance), \
-            `RESCAN_SCAN_FAILED` (the scan ran and errored), or \
+            `RESCAN_SCAN_FAILED` (the scan ran and errored, cataloged nothing \
+            gradeable in an object it could not pin, or cataloged fewer \
+            components than a stored vulnerable verdict was graded on), or \
             `RESCAN_BUDGET_EXCEEDED` (the scan did not finish inside its budget). \
             `Retry-After` is set only when cooldown time actually remains. \
             The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
@@ -3044,6 +3046,19 @@ async fn rescan_proxy_cached_path(
     // inventing one would let a rescan record a `clean` verdict against an
     // identity the engine never graded (#3003). Passing `None` runs the same
     // code without the expected-component assertion.
+    //
+    // Without that assertion, an object the inline gate grades only through a
+    // pin or a staged image (see `proxy_rescan_requires_catalog`) is scanned in
+    // `FileRequiringCatalog` mode: a zero-finding scan in which the engine
+    // cataloged nothing is inconclusive and the stored verdict stands.
+    let mode = if crate::services::scanner_service::proxy_rescan_requires_catalog(
+        repo.format.handler_key(),
+        &path,
+    ) {
+        crate::api::handlers::proxy_helpers::ProxyScanMode::FileRequiringCatalog
+    } else {
+        crate::api::handlers::proxy_helpers::ProxyScanMode::File
+    };
     // Rescan-specific budget (#3455): this request's only waiting party is
     // the operator who asked for it, not a client `pip install`, so it gets
     // a budget wider than the inline gate's 30s file budget -- derived from
@@ -3054,15 +3069,11 @@ async fn rescan_proxy_cached_path(
     let budget = crate::services::scanner_service::proxy_rescan_budget(
         state.config.global_request_timeout_secs,
     );
-    let verdict = match crate::api::handlers::proxy_helpers::proxy_scan_and_record(
-        &state,
-        repo.id,
-        &digest,
-        &synthetic,
-        &bytes,
-        None,
-        &crate::api::handlers::proxy_helpers::ProxyScanMode::File,
-        budget,
+    // A `clean` result does not replace a stored `vulnerable` verdict graded
+    // on more components than this rescan cataloged (see
+    // `rescan_may_replace_stored_verdict`); that is inconclusive too.
+    let verdict = match crate::api::handlers::proxy_helpers::proxy_rescan_and_record(
+        &state, repo.id, &digest, &synthetic, &bytes, &mode, budget,
     )
     .await
     {
@@ -4049,16 +4060,37 @@ mod tests {
         path: &str,
         mutate: impl FnOnce(&mut crate::config::Config),
     ) -> SharedState {
-        use crate::api::handlers::test_db_helpers as tdh;
         use crate::services::scanner_service::test_helpers::VersionedCveScanner;
 
-        let storage_path = fx.dir.to_string_lossy().to_string();
         let scanner = std::sync::Arc::new(VersionedCveScanner::new(Some("grype-test"), rescan))
             as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+        scanner_state_with(
+            fx,
+            vec![scanner],
+            path,
+            bytes::Bytes::from_static(b"stub cached bytes"),
+            mutate,
+        )
+        .await
+    }
+
+    /// [`scanner_state_for`] with the scanners and the cached bytes chosen by
+    /// the caller. A test that asserts on the verdict row must cache bytes of
+    /// its own: the row is keyed on their digest, instance-wide.
+    async fn scanner_state_with(
+        fx: &ProxyScanFixture,
+        scanners: Vec<std::sync::Arc<dyn crate::services::scanner_service::Scanner>>,
+        path: &str,
+        content: bytes::Bytes,
+        mutate: impl FnOnce(&mut crate::config::Config),
+    ) -> SharedState {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let storage_path = fx.dir.to_string_lossy().to_string();
         let mut state = tdh::build_state_with(fx.pool.clone(), &storage_path, mutate);
         let svc = crate::services::scanner_service::ScannerService::new_for_test_with_scanners(
             fx.pool.clone(),
-            vec![scanner],
+            scanners,
             state.storage.clone(),
             state.storage_registry.clone(),
             storage_path.clone(),
@@ -4072,7 +4104,7 @@ mod tests {
             .storage
             .put(
                 &format!("proxy-cache/{}/{}/__content__", fx.repo_id, path),
-                bytes::Bytes::from_static(b"stub cached bytes"),
+                content,
             )
             .await
             .expect("seed cached bytes in storage");
@@ -4412,6 +4444,384 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #3396: what a rescan may record over a stored verdict -- DB-backed
+    // -----------------------------------------------------------------------
+
+    /// Seed a cached object at `path` holding `content`, and the verdict the
+    /// inline gate recorded for it. Returns the content digest.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_cached_verdict_3396(
+        fx: &ProxyScanFixture,
+        path: &str,
+        content: &bytes::Bytes,
+        content_type: Option<&str>,
+        verdict: &str,
+        components_cataloged: Option<i32>,
+    ) -> String {
+        let digest = crate::api::handlers::proxy_helpers::sha256_hex(content);
+        seed_cached_path(
+            &fx.pool,
+            fx.repo_id,
+            path,
+            Some(&digest),
+            chrono::Utc::now(),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE proxy_cache_artifacts SET content_type = $3, size_bytes = $4 \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .bind(content_type)
+        .bind(content.len() as i64)
+        .execute(&fx.pool)
+        .await
+        .expect("set cached content type");
+        let vulnerable = verdict == PROXY_STATE_VULNERABLE;
+        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+            .record_verdict_with_catalog(
+                &digest,
+                crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                verdict,
+                i32::from(vulnerable),
+                i32::from(vulnerable),
+                0,
+                0,
+                0,
+                vulnerable.then_some("critical"),
+                Some("grype-test"),
+                Some(fx.repo_id),
+                components_cataloged,
+            )
+            .await
+            .expect("seed the stored verdict");
+        digest
+    }
+
+    /// The stored verdict token for `digest`.
+    async fn stored_verdict_3396(pool: &PgPool, digest: &str) -> String {
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .lookup_verdict(digest, crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+            .await
+            .expect("read the stored verdict")
+            .expect("a stored verdict")
+            .verdict
+    }
+
+    /// What the proxy gate does with a pull of `content` under `action`:
+    /// the `X-AK-Scan` value it serves with, or the refusal status.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_pull_3396(
+        state: &SharedState,
+        fx: &ProxyScanFixture,
+        filename: &str,
+        version: Option<&str>,
+        digest: &str,
+        content: &bytes::Bytes,
+        action: crate::services::proxy_scan_service::ProxyScanAction,
+        identity: crate::api::handlers::proxy_helpers::ProxyScanIdentity,
+    ) -> String {
+        use crate::api::handlers::proxy_helpers::{
+            gate_proxy_scan_serve, proxy_synthetic_artifact, ProxyScanMode, ProxyScanServeOutcome,
+        };
+        let synthetic = proxy_synthetic_artifact(
+            fx.repo_id,
+            filename,
+            digest,
+            content.len() as i64,
+            version.map(str::to_string),
+            "application/octet-stream",
+        );
+        match gate_proxy_scan_serve(
+            state,
+            fx.repo_id,
+            filename,
+            digest,
+            synthetic,
+            content,
+            action,
+            crate::services::proxy_scan_service::ProxySeverityGate::Threshold(
+                crate::models::security::Severity::High,
+            ),
+            identity,
+            ProxyScanMode::File,
+        )
+        .await
+        {
+            ProxyScanServeOutcome::Serve(served) => served.header_value().to_string(),
+            ProxyScanServeOutcome::Deny(resp) => resp.status().as_u16().to_string(),
+        }
+    }
+
+    /// #3396: a fail_closed npm remote holds a `vulnerable` verdict for a
+    /// tarball. A rescan of that tarball cannot pin it, and the engine
+    /// catalogs nothing and finds nothing. The rescan is inconclusive (503
+    /// `RESCAN_SCAN_FAILED`), the stored verdict stays `vulnerable`, and the
+    /// next fail_closed pull of the tarball is still refused (403).
+    #[tokio::test]
+    async fn rescan_that_catalogs_nothing_keeps_a_vulnerable_npm_verdict_3396() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{ComponentEcosystem, ExpectedComponent};
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "npm").await;
+        let path = "minimist/-/minimist-1.2.5.tgz";
+        let content = bytes::Bytes::from(format!("npm tarball {}", Uuid::new_v4()));
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "minimist", "1.2.5");
+        let digest = seed_cached_verdict_3396(
+            &fx,
+            path,
+            &content,
+            Some("application/octet-stream"),
+            PROXY_STATE_VULNERABLE,
+            Some(1),
+        )
+        .await;
+        let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+            Some("grype-test"),
+            MockCveRescan::CatalogedNothing,
+        )) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+        let state = scanner_state_with(&fx, vec![scanner], path, content.clone(), |_| {}).await;
+
+        let resp = call_rescan(state.clone(), &fx, path)
+            .await
+            .expect("a rescan answers with a built response");
+        let status = resp.status();
+        let body = json_body(resp).await;
+        let stored = stored_verdict_3396(&pool, &digest).await;
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "minimist-1.2.5.tgz",
+            Some("1.2.5"),
+            &digest,
+            &content,
+            crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+            crate::api::handlers::proxy_helpers::ProxyScanIdentity::Established(pin),
+        )
+        .await;
+
+        release_rescan_slot(fx.repo_id);
+        fx.cleanup(&[digest]).await;
+
+        assert_eq!(
+            pull, "403",
+            "a fail_closed pull of the tarball must still be refused after the rescan"
+        );
+        assert_eq!(
+            stored, PROXY_STATE_VULNERABLE,
+            "the stored verdict must stand"
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert_eq!(body["code"], serde_json::json!("RESCAN_SCAN_FAILED"));
+    }
+
+    /// #3396, for an object outside the catalog-requiring set (a wheel): a
+    /// rescan that grades `clean` on fewer components than the stored
+    /// `vulnerable` verdict was graded on is inconclusive and the verdict
+    /// stands. One that cataloged as many components replaces it.
+    #[tokio::test]
+    async fn rescan_with_a_smaller_catalog_keeps_a_vulnerable_verdict_3396() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let scanner = || {
+            std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::Cataloged("pkg", "1.0"),
+            )) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>
+        };
+
+        // Graded vulnerable on three components; the rescan catalogs one.
+        let path = "packages/pkg/pkg-1.0-py3-none-any.whl";
+        let content = bytes::Bytes::from(format!("wheel {}", Uuid::new_v4()));
+        let digest =
+            seed_cached_verdict_3396(&fx, path, &content, None, PROXY_STATE_VULNERABLE, Some(3))
+                .await;
+        let state = scanner_state_with(&fx, vec![scanner()], path, content.clone(), |_| {}).await;
+        let resp = call_rescan(state.clone(), &fx, path)
+            .await
+            .expect("a rescan answers with a built response");
+        let status = resp.status();
+        let body = json_body(resp).await;
+        let stored = stored_verdict_3396(&pool, &digest).await;
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0-py3-none-any.whl",
+            None,
+            &digest,
+            &content,
+            crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+            crate::api::handlers::proxy_helpers::ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        release_rescan_slot(fx.repo_id);
+
+        // Graded vulnerable on one component; the rescan catalogs one too.
+        let path_b = "packages/pkg/pkg-1.0-py2.py3-none-any.whl";
+        let content_b = bytes::Bytes::from(format!("wheel {}", Uuid::new_v4()));
+        let digest_b = seed_cached_verdict_3396(
+            &fx,
+            path_b,
+            &content_b,
+            None,
+            PROXY_STATE_VULNERABLE,
+            Some(1),
+        )
+        .await;
+        let state_b =
+            scanner_state_with(&fx, vec![scanner()], path_b, content_b.clone(), |_| {}).await;
+        let resp_b = call_rescan(state_b, &fx, path_b)
+            .await
+            .expect("a rescan answers with a built response");
+        let status_b = resp_b.status();
+        let stored_b = stored_verdict_3396(&pool, &digest_b).await;
+
+        release_rescan_slot(fx.repo_id);
+        fx.cleanup(&[digest, digest_b]).await;
+
+        assert_eq!(
+            stored, PROXY_STATE_VULNERABLE,
+            "the stored verdict must stand"
+        );
+        assert_eq!(pull, "403");
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert_eq!(body["code"], serde_json::json!("RESCAN_SCAN_FAILED"));
+        assert_eq!(status_b, axum::http::StatusCode::OK);
+        assert_eq!(stored_b, PROXY_STATE_CLEAN);
+    }
+
+    /// A CVE-authoritative scanner that does not apply to the rescanned
+    /// object, as the bundled engine does not apply to a manifest it cannot
+    /// build an image reference for.
+    struct InapplicableCveScanner;
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for InapplicableCveScanner {
+        fn name(&self) -> &str {
+            "inapplicable-cve-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        fn is_applicable(&self, _: &crate::models::artifact::Artifact) -> bool {
+            false
+        }
+        async fn version(&self) -> Option<String> {
+            Some("grype-test".to_string())
+        }
+        async fn scan(
+            &self,
+            _: &crate::models::artifact::Artifact,
+            _: Option<&crate::models::artifact::ArtifactMetadata>,
+            _: &bytes::Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            unreachable!("not applicable")
+        }
+    }
+
+    /// #3396, OCI: the rescan scans a cached image manifest as a file, where
+    /// the CVE engine does not apply and only a supplementary scanner runs.
+    /// That grades nothing, so it must not replace the image's `vulnerable`
+    /// verdict, which the next pull reuses.
+    #[tokio::test]
+    async fn rescan_of_an_image_manifest_keeps_a_vulnerable_image_verdict_3396() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::VersionedSupplementaryScanner;
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "docker").await;
+        let path = "v2/library/alpine/manifests/3.10";
+        let content = bytes::Bytes::from(format!(
+            "{{\"schemaVersion\":2,\"annotations\":{{\"t\":\"{}\"}}}}",
+            Uuid::new_v4()
+        ));
+        let digest = seed_cached_verdict_3396(
+            &fx,
+            path,
+            &content,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            PROXY_STATE_VULNERABLE,
+            Some(14),
+        )
+        .await;
+        let scanners: Vec<std::sync::Arc<dyn crate::services::scanner_service::Scanner>> = vec![
+            std::sync::Arc::new(VersionedSupplementaryScanner {
+                version: Some("trivy-test"),
+            }),
+            std::sync::Arc::new(InapplicableCveScanner),
+        ];
+        let state = scanner_state_with(&fx, scanners, path, content.clone(), |_| {}).await;
+
+        let resp = call_rescan(state.clone(), &fx, path)
+            .await
+            .expect("a rescan answers with a built response");
+        let status = resp.status();
+        let body = json_body(resp).await;
+        let stored = stored_verdict_3396(&pool, &digest).await;
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "3.10",
+            None,
+            &digest,
+            &content,
+            crate::services::proxy_scan_service::ProxyScanAction::FailOpen,
+            crate::api::handlers::proxy_helpers::ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+
+        release_rescan_slot(fx.repo_id);
+        fx.cleanup(&[digest]).await;
+
+        assert_eq!(pull, "403", "the next pull must still be refused");
+        assert_eq!(
+            stored, PROXY_STATE_VULNERABLE,
+            "the stored verdict must stand"
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert_eq!(body["code"], serde_json::json!("RESCAN_SCAN_FAILED"));
+    }
+
+    // -----------------------------------------------------------------------
     // Proxy scan visibility -- DB-backed
     // -----------------------------------------------------------------------
 
@@ -4429,9 +4839,14 @@ mod tests {
 
     impl ProxyScanFixture {
         async fn new(pool: PgPool) -> Self {
+            Self::with_format(pool, "pypi").await
+        }
+
+        /// A fresh Remote repository of `format`, with a member user.
+        async fn with_format(pool: PgPool, format: &str) -> Self {
             use crate::api::handlers::test_db_helpers as tdh;
             let (user_id, username) = tdh::create_user(&pool).await;
-            let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+            let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", format).await;
             tdh::grant_repo_access(&pool, repo_id, user_id).await;
             Self {
                 pool,
