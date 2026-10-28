@@ -4821,6 +4821,244 @@ mod tests {
         assert_eq!(body["code"], serde_json::json!("RESCAN_SCAN_FAILED"));
     }
 
+    /// Part of #3396: a stored `clean` verdict with no findings that cataloged
+    /// nothing (recorded as `0`, as a rescan in a repository of another
+    /// format leaves it, or not recorded at all) is not reused by a
+    /// fail_closed pull of the same bytes, whatever its identity: an npm pull
+    /// is scanned through its pin and refused (403), a pull with no
+    /// coordinate is scanned (403 here), and an unestablished one is withheld
+    /// (423). Fail-open keeps reusing it without scanning.
+    #[tokio::test]
+    async fn fail_closed_pull_does_not_reuse_a_clean_that_graded_nothing_3396() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{ComponentEcosystem, ExpectedComponent};
+        use std::sync::atomic::Ordering;
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "npm").await;
+        let npm = || ExpectedComponent::new(ComponentEcosystem::Npm, "minimist", "1.2.5");
+        let cases: Vec<(&str, Option<i32>, ProxyScanIdentity, &str)> = vec![
+            (
+                "minimist-1.2.5.tgz",
+                Some(0),
+                ProxyScanIdentity::Established(npm()),
+                "403",
+            ),
+            (
+                "minimist-1.2.5.tgz",
+                None,
+                ProxyScanIdentity::Established(npm()),
+                "403",
+            ),
+            ("blob.bin", Some(0), ProxyScanIdentity::NotApplicable, "403"),
+            ("boot.iso", Some(0), ProxyScanIdentity::Unestablished, "423"),
+        ];
+        let mut digests = Vec::new();
+        let mut outcomes = Vec::new();
+        for (n, (filename, cataloged, identity, want_closed)) in cases.into_iter().enumerate() {
+            let path = format!("files/{n}/{filename}");
+            let content = bytes::Bytes::from(format!("{filename} {}", Uuid::new_v4()));
+            let digest =
+                seed_cached_verdict_3396(&fx, &path, &content, None, PROXY_STATE_CLEAN, cataloged)
+                    .await;
+            let (scanner, scans) = VersionedCveScanner::counting(
+                Some("grype-test"),
+                MockCveRescan::CatalogedVulnerable("minimist", "1.2.5"),
+            );
+            let scanner = std::sync::Arc::new(scanner)
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state =
+                scanner_state_with(&fx, vec![scanner], &path, content.clone(), |_| {}).await;
+            let open_identity = match &identity {
+                ProxyScanIdentity::Established(e) => ProxyScanIdentity::Established(e.clone()),
+                ProxyScanIdentity::NotApplicable => ProxyScanIdentity::NotApplicable,
+                ProxyScanIdentity::Unestablished => ProxyScanIdentity::Unestablished,
+            };
+            let version = filename.ends_with(".tgz").then_some("1.2.5");
+            let open = gate_pull_3396(
+                &state,
+                &fx,
+                filename,
+                version,
+                &digest,
+                &content,
+                ProxyScanAction::FailOpen,
+                open_identity,
+            )
+            .await;
+            let scans_after_open = scans.load(Ordering::SeqCst);
+            let closed = gate_pull_3396(
+                &state,
+                &fx,
+                filename,
+                version,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                identity,
+            )
+            .await;
+            outcomes.push((
+                filename,
+                cataloged,
+                open,
+                scans_after_open,
+                closed,
+                want_closed,
+            ));
+            digests.push(digest);
+        }
+
+        fx.cleanup(&digests).await;
+
+        for (filename, cataloged, open, scans_after_open, closed, want_closed) in outcomes {
+            assert_eq!(
+                (open.as_str(), scans_after_open),
+                ("clean", 0),
+                "{filename} cataloged {cataloged:?}: fail-open reuses the stored verdict"
+            );
+            assert_eq!(
+                closed, want_closed,
+                "{filename} cataloged {cataloged:?}: fail_closed must not be served from a \
+                 clean verdict that graded nothing"
+            );
+        }
+    }
+
+    /// Part of #3396, the boundary of the rule above: under fail_closed a
+    /// `clean` verdict that cataloged components is still reused, without
+    /// scanning.
+    #[tokio::test]
+    async fn fail_closed_pull_still_reuses_a_cataloged_clean_3396() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{ComponentEcosystem, ExpectedComponent};
+        use std::sync::atomic::Ordering;
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "npm").await;
+        let path = "minimist/-/minimist-1.2.5.tgz";
+        let content = bytes::Bytes::from(format!("npm tarball {}", Uuid::new_v4()));
+        let digest =
+            seed_cached_verdict_3396(&fx, path, &content, None, PROXY_STATE_CLEAN, Some(1)).await;
+        let (scanner, scans) = VersionedCveScanner::counting(
+            Some("grype-test"),
+            MockCveRescan::CatalogedVulnerable("minimist", "1.2.5"),
+        );
+        let scanner = std::sync::Arc::new(scanner)
+            as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+        let state = scanner_state_with(&fx, vec![scanner], path, content.clone(), |_| {}).await;
+        let served = gate_pull_3396(
+            &state,
+            &fx,
+            "minimist-1.2.5.tgz",
+            Some("1.2.5"),
+            &digest,
+            &content,
+            crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+            ProxyScanIdentity::Established(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "minimist",
+                "1.2.5",
+            )),
+        )
+        .await;
+        let scans = scans.load(Ordering::SeqCst);
+
+        fx.cleanup(&[digest]).await;
+
+        assert_eq!(
+            (served.as_str(), scans),
+            ("clean", 0),
+            "a clean verdict graded on cataloged components is still reused"
+        );
+    }
+
+    /// Part of #3396: a rescan in a `generic` Remote, a format that does not
+    /// gate its downloads, in which the engine catalogs nothing and finds
+    /// nothing is inconclusive (503 `RESCAN_SCAN_FAILED`) and records no
+    /// verdict for the digest. The file name does not matter: the same
+    /// package bytes cached as a `.nupkg` or as a plain `.bin` are refused
+    /// alike, since such a repository caches any bytes under any name.
+    #[tokio::test]
+    async fn generic_rescan_that_catalogs_nothing_records_nothing_3396() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "generic").await;
+        let mut digests = Vec::new();
+        let mut outcomes = Vec::new();
+        for path in ["pkgs/newtonsoft.json.12.0.1.nupkg", "files/blob.bin"] {
+            let content = bytes::Bytes::from(format!("nupkg {}", Uuid::new_v4()));
+            let digest = crate::api::handlers::proxy_helpers::sha256_hex(&content);
+            seed_cached_path(&pool, fx.repo_id, path, Some(&digest), chrono::Utc::now()).await;
+            let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::CatalogedNothing,
+            ))
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state = scanner_state_with(&fx, vec![scanner], path, content.clone(), |_| {}).await;
+
+            let resp = call_rescan(state, &fx, path)
+                .await
+                .expect("a rescan answers with a built response");
+            let status = resp.status();
+            let body = json_body(resp).await;
+            let stored = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+                .lookup_verdict(
+                    &digest,
+                    crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                )
+                .await
+                .expect("read the stored verdict");
+            release_rescan_slot(fx.repo_id);
+            outcomes.push((path, status, body, stored.map(|r| r.verdict)));
+            digests.push(digest);
+        }
+
+        fx.cleanup(&digests).await;
+
+        for (path, status, body, stored) in outcomes {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {body}"
+            );
+            assert_eq!(
+                body["code"],
+                serde_json::json!("RESCAN_SCAN_FAILED"),
+                "{path}"
+            );
+            assert!(
+                stored.is_none(),
+                "{path}: an inconclusive rescan records no verdict: {stored:?}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Proxy scan visibility -- DB-backed
     // -----------------------------------------------------------------------

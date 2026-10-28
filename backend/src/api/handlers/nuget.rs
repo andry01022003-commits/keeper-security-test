@@ -13266,7 +13266,7 @@ mod scan_on_proxy_tests {
                     let scans = if vulnerable == Some(false) {
                         let (scanner, scans) = VersionedCveScanner::counting(
                             Some("grype-4328-test"),
-                            MockCveRescan::Clean,
+                            MockCveRescan::Cataloged(ID, VERSION),
                         );
                         state = tdh::build_scan_state_with_leaf_scanners(
                             &fx,

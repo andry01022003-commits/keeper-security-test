@@ -21885,10 +21885,13 @@ mod scan_on_proxy_tests {
                 assert_eq!(again, StatusCode::OK);
                 assert_eq!(stored.as_deref(), Some("clean"));
             }
+            // A vulnerable verdict is reused. A clean one that cataloged
+            // nothing is not, under fail_closed (part of #3396): the second
+            // pull is scanned again.
             assert_eq!(
                 scans.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "the second pull reuses the stored verdict"
+                if vulnerable { 1 } else { 2 },
+                "the second pull reuses only a verdict that graded something"
             );
         }
     }
@@ -21946,8 +21949,9 @@ mod scan_on_proxy_tests {
     /// contents, stored with `components_cataloged = 0` and reused. Under
     /// fail-closed the first pull is scanned inline and served `clean`; under
     /// fail-open it is served `pending`, the background scan records the same
-    /// verdict, and the next pull is `clean`. Either way the scanner runs
-    /// once. Before #4594 both stayed inconclusive: 423 forever, or `pending`
+    /// verdict, and the next pull is `clean` without a scan. Under fail-closed
+    /// the next pull is scanned again, since the verdict cataloged nothing
+    /// (part of #3396). Before #4594 both stayed inconclusive: 423 forever, or `pending`
     /// forever with nothing recorded.
     #[tokio::test]
     async fn remote_nothing_cataloged_is_clean_on_contents_4594() {
@@ -21996,10 +22000,13 @@ mod scan_on_proxy_tests {
             assert_eq!(second, StatusCode::OK, "{action}");
             assert_eq!(second_headers["X-AK-Scan"], "clean", "{action}");
             assert_eq!(&second_body[..], &bytes[..]);
+            // Part of #3396: a clean verdict that cataloged nothing is not
+            // reused under fail_closed, so its second pull is scanned again;
+            // fail-open reuses it.
             assert_eq!(
                 scans.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "{action}: the second pull reuses the stored verdict"
+                if action == "fail_closed" { 2 } else { 1 },
+                "{action}: only fail-open reuses a verdict that cataloged nothing"
             );
             assert_eq!(view["state"], "clean", "{action}: {view}");
             assert_eq!(view["components_cataloged"], 0, "{action}: {view}");
