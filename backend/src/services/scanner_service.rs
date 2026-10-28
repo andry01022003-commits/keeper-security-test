@@ -3847,7 +3847,7 @@ fn unpack_conda<R: std::io::Read + std::io::Seek>(
 /// to a root component are not payload: `pkg-../x.tar.zst` stays two
 /// components deep (`pkg-..` is an ordinary name, not a traversal) and
 /// `../pkg-x.tar.zst` climbs above the root, so both are skipped.
-fn is_conda_payload_member(name: &Path) -> bool {
+pub(crate) fn is_conda_payload_member(name: &Path) -> bool {
     let mut components = name.components();
     let Some(std::path::Component::Normal(leaf)) = components.next() else {
         return false;

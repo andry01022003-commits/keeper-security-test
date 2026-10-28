@@ -1100,6 +1100,29 @@ pub(crate) mod test_support {
 
     pub(crate) type CaseFn = fn(&str) -> ArchiveCase;
 
+    /// An [`ArchiveKind`](super::ArchiveKind)'s own identity for `bytes`
+    /// served as `filename`, and the one the gate acts on
+    /// ([`proxy_helpers::gate_identity`](crate::api::handlers::proxy_helpers::gate_identity)).
+    pub(crate) fn archive_identities<K: super::ArchiveKind>(
+        kind: K,
+        format: crate::models::repository::RepositoryFormat,
+        filename: &str,
+        bytes: &[u8],
+    ) -> (
+        crate::api::handlers::proxy_helpers::ProxyScanIdentity,
+        crate::api::handlers::proxy_helpers::ProxyScanIdentity,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy =
+            tdh::build_proxy_service_with_fs(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let file = super::ScannedArchive {
+            proxy: &proxy,
+            kind,
+            disposition: None,
+        };
+        crate::api::handlers::proxy_helpers::identities_for_test(&file, format, filename, bytes)
+    }
+
     /// A Remote repository and a Virtual over a second Remote member, both
     /// proxying one mock upstream (non-loopback, so a dist URL the upstream
     /// names passes the SSRF guard), each with scan-on-proxy at `action`.

@@ -5346,3 +5346,49 @@ mod serve_key_4365_tests {
         }
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_dist_with_two_composer_json_entries_is_not_established() {
+        let good: &[u8] = br#"{"name":"acme/demo"}"#;
+        let other: &[u8] = br#"{"name":"acme/other"}"#;
+        let kind = || ComposerDist {
+            full_name: "acme/demo",
+            version: "1.0.0",
+        };
+        let check = |bytes: &[u8]| {
+            archive_identities(kind(), DupFormat::Composer, "acme-demo-1.0.0.zip", bytes)
+        };
+        let normalised = zip_with(&[
+            ("composer.json", good),
+            ("src/A.php", b""),
+            ("./composer.json", other),
+        ]);
+        let repeated = zip_with(&[("composer.json", other), ("composer.json", good)]);
+        for dup in [normalised, repeated] {
+            let (own, gate) = check(&dup);
+            assert!(matches!(own, ProxyScanIdentity::Established(_)));
+            assert!(unestablished(&gate));
+        }
+        let single = zip_with(&[("composer.json", good), ("src/A.php", b"")]);
+        assert!(matches!(
+            check(&single).1,
+            ProxyScanIdentity::Established(_)
+        ));
+    }
+}

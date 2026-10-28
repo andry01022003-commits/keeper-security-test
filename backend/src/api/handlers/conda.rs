@@ -26423,3 +26423,85 @@ mod package_gate_router_tests {
         );
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_package_with_two_index_json_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let file = CondaScannedPackage {
+            proxy: &proxy,
+            upstream_url: "http://upstream.invalid",
+        };
+        let good: &[u8] = br#"{"name":"demo","version":"1.0.0"}"#;
+        let other: &[u8] = br#"{"name":"other","version":"9.9.9"}"#;
+        let v1 = "demo-1.0.0-0.tar.bz2";
+        let v2 = "demo-1.0.0-0.conda";
+        let check =
+            |name: &str, bytes: &[u8]| identities_for_test(&file, DupFormat::Conda, name, bytes);
+
+        let dup_v1 = tar_bz2_with(&[
+            ("info/index.json", good),
+            ("lib/x.py", b""),
+            ("info/index.json", other),
+        ]);
+        let (own, gate) = check(v1, &dup_v1);
+        assert!(established(&own), "the reader takes the first copy");
+        assert!(unestablished(&gate));
+
+        // v2: the pkg payload carries `info/index.json` too; the extractor
+        // unpacks it over the info payload's.
+        let info = tar_zst_with(&[("info/index.json", good)]);
+        let shadowing_pkg = tar_zst_with(&[("info/index.json", other), ("lib/x.py", b"")]);
+        let dup_v2 = zip_with(&[
+            ("metadata.json", b"{}"),
+            ("info-demo-1.0.0-0.tar.zst", &info),
+            ("pkg-demo-1.0.0-0.tar.zst", &shadowing_pkg),
+        ]);
+        let (own, gate) = check(v2, &dup_v2);
+        assert!(established(&own));
+        assert!(unestablished(&gate));
+
+        let ok_v1 = tar_bz2_with(&[("info/index.json", good), ("lib/x.py", b"")]);
+        assert!(established(&check(v1, &ok_v1).1));
+        let pkg = tar_zst_with(&[("lib/x.py", b"")]);
+        let ok_v2 = zip_with(&[
+            ("metadata.json", b"{}"),
+            ("info-demo-1.0.0-0.tar.zst", &info),
+            ("pkg-demo-1.0.0-0.tar.zst", &pkg),
+        ]);
+        assert!(established(&check(v2, &ok_v2).1));
+    }
+}
