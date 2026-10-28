@@ -2719,7 +2719,21 @@ pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> boo
 /// Everything else (a wheel, a Maven jar, a VS Code extension, a layer blob)
 /// catalogs itself or is graded on its contents inline too, and keeps the
 /// rescan behavior it had.
+///
+/// The exception is a repository whose format does not gate its downloads
+/// (`generic`, Helm and the other formats outside
+/// [`crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS`]). Its rescans require
+/// a catalog for every object (part of #3396). Verdicts are keyed per content
+/// digest and shared by every repository, so such a repository's verdict
+/// matters only where other repositories serve the same bytes, and there it
+/// must be a grade. Such a repository can cache any bytes under any name,
+/// so the file name cannot tell a package archive from a plain file. A
+/// rescan there that catalogs nothing and finds nothing is therefore
+/// inconclusive and records nothing.
 pub(crate) fn proxy_rescan_requires_catalog(handler_key: &str, cache_path: &str) -> bool {
+    if !crate::formats::handler_enforces_scan_on_proxy(handler_key) {
+        return true;
+    }
     let filename = cache_path
         .rsplit('/')
         .find(|seg| !seg.is_empty())
@@ -15023,7 +15037,6 @@ mod tests {
                 "commons-collections/commons-collections/3.2.1/commons-collections-3.2.1.jar",
             ),
             ("vscode", "ms-python.python-2024.1.0.vsix"),
-            ("generic", "blob.bin"),
             ("cargo", "notes.txt"),
             ("go", "golang.org/x/text/@v/v0.3.0.mod"),
             ("debian", "dists/bookworm/main/binary-amd64/Packages.gz"),
@@ -15032,6 +15045,23 @@ mod tests {
             assert!(
                 !proxy_rescan_requires_catalog(handler_key, path),
                 "{handler_key}/{path} keeps the prior rescan behavior"
+            );
+        }
+
+        // Part of #3396: a repository that does not gate its downloads
+        // requires a catalog for every object, whatever its name, since its
+        // verdict is read only by the repositories that do.
+        for (handler_key, path) in [
+            ("generic", "blob.bin"),
+            ("generic", "minimist-1.2.5.tgz"),
+            ("generic", "Newtonsoft.Json.12.0.1.nupkg"),
+            ("generic", "images/boot.iso"),
+            ("generic", "numpy-1.26.4-py312_0.conda"),
+            ("helm", "charts/nginx-1.0.0.tgz"),
+        ] {
+            assert!(
+                proxy_rescan_requires_catalog(handler_key, path),
+                "{handler_key}/{path}: a repository that does not gate downloads requires a catalog"
             );
         }
     }

@@ -18460,7 +18460,7 @@ mod proxy_scan_block_tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
 
         ProxyScanService::new(fx.pool.clone())
-            .record_verdict(
+            .record_verdict_with_catalog(
                 &digest,
                 "grype",
                 "clean",
@@ -18472,6 +18472,12 @@ mod proxy_scan_block_tests {
                 None,
                 Some("grype-0.99.0-test"),
                 Some(fx.repo_id),
+                // Graded as the coordinate the request names, as the inline
+                // gate records it: these bytes cannot establish an identity
+                // of their own, and an unestablished pull does not reuse a
+                // clean verdict recorded with no pin (part of #3396).
+                Some(1),
+                Some("npm|verified-widget|3.2.1"),
             )
             .await
             .expect("seed clean verdict");

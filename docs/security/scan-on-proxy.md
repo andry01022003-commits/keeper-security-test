@@ -312,8 +312,9 @@ or a `clean` one graded without a coordinate (the rescan endpoint), is not
 reused, and the bytes are scanned again as for a first pull; a `vulnerable`
 verdict graded without a coordinate still blocks. A pull whose identity
 cannot be established (for example an OS package whose release cannot be
-determined) never inherits a `clean` verdict graded as another coordinate,
-and is still refused by a stored `vulnerable` one (#4952).
+determined) never inherits a `clean` verdict graded as another coordinate or
+graded without one, and is still refused by a stored `vulnerable` one
+(#4952).
 
 Each verdict also records `components_cataloged`: how many distinct
 components the scanner cataloged when it graded the bytes (migration 287).
@@ -321,6 +322,17 @@ components the scanner cataloged when it graded the bytes (migration 287).
 `clean` or `vulnerable` item. `0` means the verdict was graded on the file
 contents only (see the conda rule above); `null` means the scanner reported no
 catalog, or the verdict was recorded before 1.11.0.
+
+A `fail_closed` repository does not reuse a `clean` verdict that has no
+findings, cataloged no components (`0` or `null`) and was recorded without a
+coordinate. Verdicts are shared by every repository that serves the same
+bytes, and such a verdict says only that a scan saw nothing it could grade.
+The bytes are scanned again as for a first pull, and a pull whose identity
+cannot be established is withheld (`423`). A `clean` verdict recorded with a
+coordinate, such as a conda package graded on its contents, is reused as
+before. A rescan in a repository whose format does not scan on proxy (for
+example `generic`) in which the scanner catalogs nothing and finds nothing is
+inconclusive: it answers `503` and records no verdict.
 
 ## Virtual repositories
 
