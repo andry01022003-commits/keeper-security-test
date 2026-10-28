@@ -2948,7 +2948,7 @@ const DEFAULT_MAX_SCAN_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Maximum number of archive entries extracted into a scan workspace. Bounds
 /// inode-exhaustion bombs (millions of tiny files).
-const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
+pub(crate) const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
 
 /// Env var overriding the extracted-tree byte ceiling. The value is a plain
 /// decimal byte count (e.g. `4294967296` for 4 GiB).
@@ -2971,7 +2971,7 @@ fn positive_env_or(name: &str, default: u64) -> u64 {
 /// [`MAX_SCAN_EXTRACTED_BYTES_ENV`] over [`DEFAULT_MAX_SCAN_EXTRACTED_BYTES`].
 /// A blank, non-numeric, or zero override is treated as "unset" (a zero cap
 /// would reject every archive).
-fn max_scan_extracted_bytes() -> u64 {
+pub(crate) fn max_scan_extracted_bytes() -> u64 {
     positive_env_or(
         MAX_SCAN_EXTRACTED_BYTES_ENV,
         DEFAULT_MAX_SCAN_EXTRACTED_BYTES,
@@ -3364,7 +3364,7 @@ fn unpack_conda<R: std::io::Read + std::io::Seek>(
 /// to a root component are not payload: `pkg-../x.tar.zst` stays two
 /// components deep (`pkg-..` is an ordinary name, not a traversal) and
 /// `../pkg-x.tar.zst` climbs above the root, so both are skipped.
-fn is_conda_payload_member(name: &Path) -> bool {
+pub(crate) fn is_conda_payload_member(name: &Path) -> bool {
     let mut components = name.components();
     let Some(std::path::Component::Normal(leaf)) = components.next() else {
         return false;

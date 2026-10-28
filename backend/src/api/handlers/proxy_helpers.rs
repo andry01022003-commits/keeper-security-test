@@ -10125,7 +10125,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     file.after_buffered_fetch(state, req, &bytes, &digest)
         .await?;
 
-    let identity = file.identity(req, &bytes, &digest);
+    let identity = gate_identity(file, req, &bytes, &digest);
     let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
     match gate_proxy_scan_serve(
         state,
@@ -10158,6 +10158,62 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
             Ok(resp)
         }
     }
+}
+
+/// The identity the gate acts on for `bytes`: the format's own
+/// [`ScannedProxyFile::identity`], unless the bytes are an archive with two
+/// entries at one path. The format readers take the first such entry and the
+/// scan extractor keeps the last, so neither copy can be vouched for: the
+/// identity is [`ProxyScanIdentity::Unestablished`], inconclusive exactly like
+/// an archive that does not read as its format (fail-closed withholds it,
+/// fail-open serves it `pending`, and nothing is scanned or recorded).
+pub(crate) fn gate_identity<F: ScannedProxyFile>(
+    file: &F,
+    req: &ScannedProxyRequest<'_>,
+    bytes: &Bytes,
+    digest: &str,
+) -> ProxyScanIdentity {
+    if let Some(entry) =
+        crate::services::archive_entry_paths::duplicated_entry_path(req.filename, bytes)
+    {
+        tracing::warn!(
+            repo_id = %req.repo_id, file = %req.filename, digest = %digest,
+            entry = %entry, format = F::LABEL,
+            "proxied archive has more than one entry at the same path; its identity is not established"
+        );
+        return ProxyScanIdentity::Unestablished;
+    }
+    file.identity(req, bytes, digest)
+}
+
+/// Test seam for the per-format duplicate-entry suites: `file`'s own identity
+/// for `bytes` served as `filename`, and the one [`gate_identity`] acts on.
+#[cfg(test)]
+pub(crate) fn identities_for_test<F: ScannedProxyFile>(
+    file: &F,
+    format: RepositoryFormat,
+    filename: &str,
+    bytes: &[u8],
+) -> (ProxyScanIdentity, ProxyScanIdentity) {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    let bytes = Bytes::copy_from_slice(bytes);
+    let digest = sha256_hex(&bytes);
+    let req = ScannedProxyRequest {
+        repo_id: Uuid::nil(),
+        repo_key: "remote",
+        fetch_base: "http://upstream.invalid",
+        format,
+        source_path: filename,
+        cache_path: filename,
+        filename,
+        action: ProxyScanAction::FailClosed,
+        severity_gate: ProxySeverityGate::BlockOnAny,
+        ctx: None,
+    };
+    (
+        file.identity(&req, &bytes, &digest),
+        gate_identity(file, &req, &bytes, &digest),
+    )
 }
 
 /// The over-cap branch of [`serve_scanned_proxy_file`]: the object is too
