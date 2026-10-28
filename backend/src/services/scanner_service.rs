@@ -2339,6 +2339,39 @@ pub(crate) fn proxy_rescan_requires_catalog(handler_key: &str, cache_path: &str)
     handler_key == "oci" && cache_path.contains("/manifests/")
 }
 
+/// [`proxy_rescan_requires_catalog`], plus the conda rule that needs the
+/// bytes (part of #3396): in a conda repository a rescan of a cached object
+/// that is not the conda package its file name says it is (a name that does
+/// not parse, or bytes whose `info/index.json` disagrees or cannot be read)
+/// requires a catalog too.
+///
+/// The download gate never scans such an object (its identity is not
+/// established), and a fail-closed conda pull reuses a clean verdict that
+/// cataloged nothing when a conda repository wrote it
+/// ([`crate::api::handlers::proxy_helpers::conda_wrote_this_empty_grade`]).
+/// So a conda repository writes a verdict that cataloged nothing only for
+/// bytes scanned as the package they declare, the same scan the gate runs.
+pub(crate) fn proxy_rescan_requires_catalog_for(
+    handler_key: &str,
+    cache_path: &str,
+    bytes: &Bytes,
+) -> bool {
+    if proxy_rescan_requires_catalog(handler_key, cache_path) {
+        return true;
+    }
+    if !matches!(handler_key, "conda" | "conda_native") {
+        return false;
+    }
+    let filename = cache_path
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(cache_path);
+    let pin = crate::formats::conda_native::CondaNativeHandler::parse_package_filename(filename)
+        .ok()
+        .and_then(|(name, version, _)| hosted_upload_pin("conda", filename, &name, Some(&version)));
+    !pin.is_some_and(|pin| pin_agrees_with_content(bytes, &pin, filename))
+}
+
 /// Whether a hosted artifact of `filename` in a `repository_format`
 /// repository is a PACKAGE ARCHIVE whose contents a cataloging scanner is
 /// expected to enumerate (#4036).

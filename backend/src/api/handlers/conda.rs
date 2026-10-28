@@ -21885,13 +21885,13 @@ mod scan_on_proxy_tests {
                 assert_eq!(again, StatusCode::OK);
                 assert_eq!(stored.as_deref(), Some("clean"));
             }
-            // A vulnerable verdict is reused. A clean one that cataloged
-            // nothing is not, under fail_closed (part of #3396): the second
-            // pull is scanned again.
+            // Either verdict is reused. A clean one that cataloged nothing
+            // is reused under fail_closed because this conda repository
+            // recorded it (part of #3396).
             assert_eq!(
                 scans.load(std::sync::atomic::Ordering::SeqCst),
-                if vulnerable { 1 } else { 2 },
-                "the second pull reuses only a verdict that graded something"
+                1,
+                "the second pull reuses the stored verdict"
             );
         }
     }
@@ -21949,10 +21949,10 @@ mod scan_on_proxy_tests {
     /// contents, stored with `components_cataloged = 0` and reused. Under
     /// fail-closed the first pull is scanned inline and served `clean`; under
     /// fail-open it is served `pending`, the background scan records the same
-    /// verdict, and the next pull is `clean` without a scan. Under fail-closed
-    /// the next pull is scanned again, since the verdict cataloged nothing
-    /// (part of #3396). Before #4594 both stayed inconclusive: 423 forever, or `pending`
-    /// forever with nothing recorded.
+    /// verdict, and the next pull is `clean`. Either way the scanner runs
+    /// once: a conda repository recorded the verdict, so fail-closed reuses it
+    /// although it cataloged nothing (part of #3396). Before #4594 both stayed
+    /// inconclusive: 423 forever, or `pending` forever with nothing recorded.
     #[tokio::test]
     async fn remote_nothing_cataloged_is_clean_on_contents_4594() {
         for (action, file, version) in [
@@ -22000,16 +22000,202 @@ mod scan_on_proxy_tests {
             assert_eq!(second, StatusCode::OK, "{action}");
             assert_eq!(second_headers["X-AK-Scan"], "clean", "{action}");
             assert_eq!(&second_body[..], &bytes[..]);
-            // Part of #3396: a clean verdict that cataloged nothing is not
-            // reused under fail_closed, so its second pull is scanned again;
-            // fail-open reuses it.
             assert_eq!(
                 scans.load(std::sync::atomic::Ordering::SeqCst),
-                if action == "fail_closed" { 2 } else { 1 },
-                "{action}: only fail-open reuses a verdict that cataloged nothing"
+                1,
+                "{action}: the second pull reuses the stored verdict"
             );
             assert_eq!(view["state"], "clean", "{action}: {view}");
             assert_eq!(view["components_cataloged"], 0, "{action}: {view}");
+        }
+    }
+
+    /// Part of #3396 (1.11.x): a conda package whose scan catalogs nothing
+    /// (a data package such as `tzdata`) is scanned on its first fail-closed
+    /// pull only. The clean verdict records the conda repository that wrote
+    /// it, and later fail-closed pulls reuse it.
+    #[tokio::test]
+    async fn remote_fail_closed_reuses_an_empty_catalog_clean_a_conda_repo_recorded_3396() {
+        const PULLS: usize = 5;
+        let file = "tzdata-2026c-h151e31d_0.conda";
+        let bytes = conda_v2("tzdata", "2026c");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let (scanner, scans) =
+            VersionedCveScanner::counting(Some("grype-4585-test"), MockCveRescan::CatalogedNothing);
+        let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", None).await;
+        let digest = digest_of(&bytes);
+
+        let mut served = Vec::new();
+        for _ in 0..PULLS {
+            let (status, body, headers) = rig.get(&format!("noarch/{file}")).await;
+            served.push((status, headers["X-AK-Scan"].clone(), body == bytes));
+        }
+        let stored: Option<(String, Option<i32>, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT verdict, components_cataloged, repository_id FROM proxy_scan_results \
+             WHERE checksum_sha256 = $1 AND scan_type = 'grype'",
+        )
+        .bind(&digest)
+        .fetch_optional(&rig.fx.pool)
+        .await
+        .unwrap();
+        let repo_id = rig.fx.repo_id;
+        rig.teardown(std::slice::from_ref(&digest)).await;
+
+        let scanned = scans.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!("{PULLS} fail_closed pulls of an empty-catalog conda package: {scanned} scans");
+        for (status, header, same) in served {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(header, "clean");
+            assert!(same, "the package bytes are served");
+        }
+        assert_eq!(stored, Some(("clean".to_string(), Some(0), Some(repo_id))));
+        assert_eq!(scanned, 1, "only the first fail-closed pull scans");
+    }
+
+    /// Part of #3396 (1.11.x): a fail-closed conda pull reuses a stored clean
+    /// verdict that cataloged nothing only when a conda repository (any conda
+    /// repository) wrote it. One written from a generic Remote, from another
+    /// gated format, or by no known repository is scanned as a first pull
+    /// (here the scan grades the package vulnerable: 403).
+    #[tokio::test]
+    async fn remote_fail_closed_reuses_an_empty_catalog_clean_only_from_a_conda_writer_3396() {
+        for writer in ["conda", "generic", "pypi", "none"] {
+            let file = "tzdata-2026c-h151e31d_0.conda";
+            let bytes = conda_v2("tzdata", "2026c");
+            let server = MockServer::start().await;
+            mount_package(&server, file, &bytes).await;
+            let (scanner, scans) =
+                VersionedCveScanner::counting(Some("grype-4585-test"), MockCveRescan::Vulnerable);
+            let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await
+            else {
+                return;
+            };
+            configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", None).await;
+            let digest = digest_of(&bytes);
+            // The writer is another repository, never the one pulled from.
+            let writer_repo = match writer {
+                "none" => None,
+                format => Some(tdh::create_repo(&rig.fx.pool, "remote", format).await),
+            };
+            crate::services::proxy_scan_service::ProxyScanService::new(rig.fx.pool.clone())
+                .record_verdict_with_catalog(
+                    &digest,
+                    "grype",
+                    "clean",
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    Some("grype-4585-test"),
+                    writer_repo.as_ref().map(|(id, _, _)| *id),
+                    Some(0),
+                )
+                .await
+                .expect("seed verdict");
+
+            let (status, body, headers) = rig.get(&format!("noarch/{file}")).await;
+            let scanned = scans.load(std::sync::atomic::Ordering::SeqCst);
+            let pool = rig.fx.pool.clone();
+            rig.teardown(std::slice::from_ref(&digest)).await;
+            if let Some((id, _, dir)) = writer_repo {
+                tdh::cleanup_member_repo(&pool, id, &dir).await;
+            }
+
+            if writer == "conda" {
+                assert_eq!(status, StatusCode::OK, "{writer}");
+                assert_eq!(headers["X-AK-Scan"], "clean", "{writer}");
+                assert_eq!(scanned, 0, "{writer}: the stored verdict is reused");
+            } else {
+                assert_scan_blocked(status, &body, &headers, file);
+                assert_eq!(scanned, 1, "{writer}: scanned as a first pull");
+            }
+        }
+    }
+
+    /// Part of #3396 (1.11.x): a rescan in a conda repository of a cached
+    /// object that is not the package its name says it is records nothing
+    /// when it catalogs nothing (503), so it cannot leave an empty-catalog
+    /// clean verdict that a conda pull of those bytes would reuse. The
+    /// package itself still rescans `clean` and the verdict names the conda
+    /// repository.
+    #[tokio::test]
+    async fn conda_rescan_of_an_object_that_is_not_its_name_requires_a_catalog_3396() {
+        for (file, bytes, want) in [
+            (
+                "requests-2.31.0-pyhd8ed1ab_0.conda",
+                conda_v2("evil", "6.6.6"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "tzdata-2026c-h151e31d_0.conda",
+                conda_v2("tzdata", "2026c"),
+                StatusCode::OK,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            mount_package(&server, file, &bytes).await;
+            let (scanner, _scans) = VersionedCveScanner::counting(
+                Some("grype-4585-test"),
+                MockCveRescan::CatalogedNothing,
+            );
+            let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await
+            else {
+                return;
+            };
+            // Fail-open caches the object either way; record-nothing for the
+            // mismatched one, a clean verdict for the package.
+            configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_open", None).await;
+            let digest = digest_of(&bytes);
+            let (pulled, _, _) = rig.get(&format!("noarch/{file}")).await;
+            let _ = await_stored_verdict(&rig.fx.pool, &digest).await;
+            tdh::drop_proxy_verdicts(&rig.fx.pool, std::slice::from_ref(&digest)).await;
+
+            let app = tdh::router_with_auth(
+                crate::api::handlers::security::repo_security_router(),
+                rig.state.clone(),
+                tdh::admin_auth(rig.fx.user_id, "admin-3396"),
+            );
+            let (status, body) = tdh::send(
+                app,
+                tdh::post(
+                    format!("/{}/security/proxy-scans/rescan", rig.fx.repo_key),
+                    "application/json",
+                    Bytes::from(
+                        serde_json::json!({ "path": format!("noarch/{file}") }).to_string(),
+                    ),
+                ),
+            )
+            .await;
+            let stored: Option<(String, Option<i32>, Option<uuid::Uuid>)> = sqlx::query_as(
+                "SELECT verdict, components_cataloged, repository_id FROM proxy_scan_results \
+                 WHERE checksum_sha256 = $1 AND scan_type = 'grype'",
+            )
+            .bind(&digest)
+            .fetch_optional(&rig.fx.pool)
+            .await
+            .unwrap();
+            let repo_id = rig.fx.repo_id;
+            rig.teardown(std::slice::from_ref(&digest)).await;
+
+            assert_eq!(pulled, StatusCode::OK, "{file}");
+            assert_eq!(status, want, "{file}: {}", String::from_utf8_lossy(&body));
+            if want == StatusCode::OK {
+                assert_eq!(
+                    stored,
+                    Some(("clean".to_string(), Some(0), Some(repo_id))),
+                    "{file}"
+                );
+            } else {
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["code"], "RESCAN_SCAN_FAILED", "{file}");
+                assert_eq!(stored, None, "{file}: nothing recorded");
+            }
         }
     }
 

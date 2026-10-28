@@ -37,6 +37,19 @@ pub struct ProxyScanRow {
     pub scanned_at: DateTime<Utc>,
 }
 
+/// A stored verdict as the inline gate reads it
+/// ([`ProxyScanService::lookup_verdict_with_catalog`]).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GateVerdictRow {
+    #[sqlx(flatten)]
+    pub row: ProxyScanRow,
+    /// Components the verdict was graded on; `None` when not recorded.
+    pub components_cataloged: Option<i32>,
+    /// The `repository_format` label of the repository that last wrote the
+    /// verdict; `None` when the row names none or it no longer exists.
+    pub writer_format: Option<String>,
+}
+
 /// The three terminal verdicts stored in `proxy_scan_results.verdict`.
 pub const VERDICT_CLEAN: &str = "clean";
 pub const VERDICT_VULNERABLE: &str = "vulnerable";
@@ -477,26 +490,24 @@ impl ProxyScanService {
 
     /// [`lookup_verdict`](Self::lookup_verdict) plus the number of components
     /// the verdict was graded on (`components_cataloged`, `None` when not
-    /// recorded), in one read, for the inline gate's reuse decision (#3396).
+    /// recorded) and the format of the repository that last wrote it, in one
+    /// read, for the inline gate's reuse decision (#3396). The writer's format
+    /// is `None` when the row names no repository or that repository is gone.
     /// Runtime query (no macro) so this adds no offline sqlx data.
     pub async fn lookup_verdict_with_catalog(
         &self,
         checksum_sha256: &str,
         scan_type: &str,
-    ) -> Result<Option<(ProxyScanRow, Option<i32>)>> {
-        #[derive(sqlx::FromRow)]
-        struct CatalogedRow {
-            #[sqlx(flatten)]
-            row: ProxyScanRow,
-            components_cataloged: Option<i32>,
-        }
-        let row = sqlx::query_as::<_, CatalogedRow>(
+    ) -> Result<Option<GateVerdictRow>> {
+        let row = sqlx::query_as::<_, GateVerdictRow>(
             r#"
-            SELECT checksum_sha256, scan_type, verdict,
-                   findings_count, critical_count, high_count, medium_count, low_count,
-                   max_severity, scanner_version, scanned_at, components_cataloged
-            FROM proxy_scan_results
-            WHERE checksum_sha256 = $1 AND scan_type = $2
+            SELECT p.checksum_sha256, p.scan_type, p.verdict,
+                   p.findings_count, p.critical_count, p.high_count, p.medium_count,
+                   p.low_count, p.max_severity, p.scanner_version, p.scanned_at,
+                   p.components_cataloged, r.format::text AS writer_format
+            FROM proxy_scan_results p
+            LEFT JOIN repositories r ON r.id = p.repository_id
+            WHERE p.checksum_sha256 = $1 AND p.scan_type = $2
             "#,
         )
         .bind(checksum_sha256)
@@ -504,7 +515,7 @@ impl ProxyScanService {
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(row.map(|r| (r.row, r.components_cataloged)))
+        Ok(row)
     }
 
     /// The stored verdict for `(checksum_sha256, scan_type)` and the number of
