@@ -19098,6 +19098,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "verified",
+                "3.2.1",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
@@ -19303,6 +19313,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "sameversion",
+                "1.0.0",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let state = scan_state_with_live_scanner(
@@ -19806,6 +19826,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "probenoneopen",
+                "1.0.0",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let state = scan_state_with_live_scanner(

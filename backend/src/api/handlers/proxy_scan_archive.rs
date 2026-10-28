@@ -1086,9 +1086,9 @@ pub(crate) mod test_support {
         pub recorded_path: String,
         /// The `file` a 403 / 423 body names.
         pub file: String,
-        /// The pin the gate grades this file as, for a format whose pin
-        /// comes from the request (#4952): a seeded verdict records it, as a
-        /// verdict the gate graded would. `None` for the other formats.
+        /// The pin the gate grades this file as (#4952, #3396): a seeded
+        /// verdict records it, as a verdict the gate graded would. `None` for
+        /// a format the gate grades on contents, with no pin.
         pub pin: Option<crate::services::scanner_service::ExpectedComponent>,
     }
 
