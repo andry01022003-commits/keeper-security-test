@@ -2287,6 +2287,44 @@ pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> boo
         .is_some()
 }
 
+/// Whether an on-demand rescan (#3396) of the object cached at `cache_path`
+/// in a repository with `handler_key` must see the CVE engine catalog
+/// SOMETHING before a zero-finding result may be recorded as `clean`.
+///
+/// A rescan has no request coordinate, so it cannot pin (see its caller). The
+/// inline gate grades these objects only through a pin or a staged image, and
+/// without one the engine has nothing to grade:
+///
+/// * the package archives [`pinned_ecosystem`] names and the engine catalogs
+///   as themselves once pinned: an npm tarball, a PyPI sdist, a `.gem`, a
+///   `.crate`, a `.nupkg`;
+/// * an OCI image manifest, which the inline gate grades as the image it
+///   describes, never as the manifest document a file scan sees.
+///
+/// For those, a scan in which the engine cataloged nothing and found nothing
+/// is inconclusive and the stored verdict stands, the same rule the inline
+/// gate applies once it has pinned or staged.
+///
+/// Conda is the one pinned ecosystem left out: the engine never catalogs a
+/// conda package as itself, and an empty catalog over a completed scan is the
+/// normal result there (#4594), graded on its findings exactly as the inline
+/// gate grades it ([`ComponentEcosystem::engine_catalogs_the_package`]).
+/// Everything else (a wheel, a Maven jar, a VS Code extension, a layer blob)
+/// catalogs itself or is graded on its contents inline too, and keeps the
+/// rescan behavior it had.
+pub(crate) fn proxy_rescan_requires_catalog(handler_key: &str, cache_path: &str) -> bool {
+    let filename = cache_path
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(cache_path);
+    if pinned_ecosystem(handler_key, filename)
+        .is_some_and(ComponentEcosystem::engine_catalogs_the_package)
+    {
+        return true;
+    }
+    handler_key == "oci" && cache_path.contains("/manifests/")
+}
+
 /// Whether a hosted artifact of `filename` in a `repository_format`
 /// repository is a PACKAGE ARCHIVE whose contents a cataloging scanner is
 /// expected to enumerate (#4036).
@@ -4105,8 +4143,12 @@ pub struct ScanTarget<'a> {
     /// [`run_inline_proxy_scanners_target`] treats "no catalog reported"
     /// (`None`) and "cataloged nothing" (`Some(empty)`) both as INCONCLUSIVE,
     /// so the caller's fail-closed branch withholds (423) instead of serving
-    /// a false clean. `false` (hosted upload scans, file formats, unit tests)
-    /// keeps prior behavior exactly.
+    /// a false clean. The on-demand rescan of a cached package archive or
+    /// image manifest sets it too (see
+    /// [`ScannerService::scan_content_requiring_catalog`]): it has no
+    /// coordinate to pin, so this is the only form of the gate it can apply.
+    /// `false` (hosted upload scans, inline file formats, unit tests) keeps
+    /// prior behavior exactly.
     pub require_nonempty_catalog: bool,
 }
 
@@ -4930,7 +4972,10 @@ async fn run_inline_proxy_scanners_target(
     // expected-component gate above, a `None` catalog is NOT "keep prior
     // behavior" here: the OCI callers only set this flag on the inline proxy
     // gate, where "the engine could not report what it graded" must fail
-    // closed, not serve clean.
+    // closed, not serve clean. The on-demand rescan of a cached package
+    // archive or image manifest sets it for the same reason (#3396): it
+    // cannot pin, so a zero-finding scan in which the engine cataloged
+    // nothing is inconclusive and the stored verdict stands.
     if target.require_nonempty_catalog
         && findings.is_empty()
         && !cve_cataloged.as_ref().is_some_and(|c| !c.is_empty())
@@ -4939,12 +4984,13 @@ async fn run_inline_proxy_scanners_target(
             artifact = %synthetic.name,
             catalog_reported = cve_cataloged.is_some(),
             "inline proxy scan: CVE engine cataloged no components for the served \
-             image; zero findings does not mean clean -> inconclusive"
+             image or rescanned object; zero findings does not mean clean \
+             -> inconclusive"
         );
         return Err(AppError::Internal(
             "CVE-authoritative scanner cataloged no gradeable component for the \
-             served image; verdict inconclusive (a zero-finding scan of nothing \
-             is not a clean verdict)"
+             served image or rescanned object; verdict inconclusive (a \
+             zero-finding scan of nothing is not a clean verdict)"
                 .to_string(),
         ));
     }
@@ -8187,6 +8233,34 @@ impl ScannerService {
             manifest_body: None,
             expected_component: expected,
             require_nonempty_catalog: false,
+        };
+        run_inline_proxy_scanners_target(&self.scanners, &target, content).await
+    }
+
+    /// [`ScannerService::scan_content`] for bytes that cannot be pinned but
+    /// must not grade `clean` on an empty catalog: the on-demand rescan of a
+    /// cached package archive or image manifest (#3396, see
+    /// [`proxy_rescan_requires_catalog`]).
+    ///
+    /// Sets [`ScanTarget::require_nonempty_catalog`], so a zero-finding scan
+    /// in which the CVE engine cataloged nothing is inconclusive rather than
+    /// `clean`. A scan WITH findings is graded on them exactly as before.
+    pub async fn scan_content_requiring_catalog(
+        &self,
+        synthetic: &Artifact,
+        content: &Bytes,
+    ) -> Result<ProxyScanVerdict> {
+        let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
+
+        let target = ScanTarget {
+            artifact: synthetic,
+            repository_key: "",
+            repository_type: "",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: true,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -13678,6 +13752,55 @@ mod tests {
                 format_expects_pin(f, filename),
                 hosted_upload_pin(f, filename, "widget", Some("1.0")).is_some(),
                 "{f}/{filename}"
+            );
+        }
+    }
+
+    /// #3396: a rescan requires a catalog for exactly the objects the inline
+    /// gate grades through a pin or a staged image. Conda is pinned but graded
+    /// on its contents (#4594), and everything else either catalogs itself or
+    /// is graded on its contents inline too, so neither changes.
+    #[test]
+    fn test_proxy_rescan_requires_catalog_tracks_the_unpinnable_archives() {
+        for (handler_key, path) in [
+            // Pinned per artifact for PyPI, per extension for the rest
+            // (#3003, #3603).
+            ("npm", "minimist/-/minimist-1.2.5.tgz"),
+            ("pypi", "packages/PyYAML-5.3.1.tar.gz"),
+            ("pypi", "PyYAML-5.3.1.zip"),
+            ("rubygems", "gems/rack-2.0.7.gem"),
+            ("cargo", "smallvec/smallvec-1.6.0.crate"),
+            ("nuget", "Newtonsoft.Json.12.0.1.nupkg"),
+            // Graded as the image it describes, not as a JSON document.
+            ("oci", "v2/library/alpine/manifests/3.10"),
+            ("oci", "v2/library/alpine/manifests/sha256:0123"),
+        ] {
+            assert!(
+                proxy_rescan_requires_catalog(handler_key, path),
+                "{handler_key}/{path} cannot be graded without a pin or an image"
+            );
+        }
+
+        // #4594: conda is pinned but graded on its contents. A wheel and a jar
+        // catalog themselves, an OCI layer blob is graded on its contents,
+        // and a blob in a pinned format is not a package.
+        for (handler_key, path) in [
+            ("conda", "numpy-1.26.4-py312_0.conda"),
+            ("conda", "numpy-1.26.4-py312_0.tar.bz2"),
+            ("conda_native", "numpy-1.26.4-py312_0.conda"),
+            ("pypi", "packages/PyYAML-5.3.1-py3-none-any.whl"),
+            (
+                "maven",
+                "commons-collections/commons-collections/3.2.1/commons-collections-3.2.1.jar",
+            ),
+            ("vscode", "ms-python.python-2024.1.0.vsix"),
+            ("generic", "blob.bin"),
+            ("cargo", "notes.txt"),
+            ("oci", "v2/library/alpine/blobs/sha256:0123"),
+        ] {
+            assert!(
+                !proxy_rescan_requires_catalog(handler_key, path),
+                "{handler_key}/{path} keeps the prior rescan behavior"
             );
         }
     }
@@ -25221,6 +25344,96 @@ tonic-build = "0.12"
                 "callers that do not require a catalog keep the prior behavior exactly"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3396: the on-demand rescan of a cached package archive. It has no
+    // coordinate to pin, so it requires a catalog instead (the OCI form of
+    // the gate above): a zero-finding scan in which the engine cataloged
+    // nothing is inconclusive, never `clean`.
+    // -----------------------------------------------------------------------
+
+    fn rescanned_npm_tarball() -> Artifact {
+        test_helpers::make_test_artifact(
+            "minimist-1.2.5.tgz",
+            "application/octet-stream",
+            "minimist-1.2.5.tgz",
+        )
+    }
+
+    /// The engine ran `Ok` over an unpinned npm tarball, cataloged nothing
+    /// and found nothing. That is not `clean`; it is inconclusive, so the
+    /// stored verdict stands.
+    #[tokio::test]
+    async fn test_proxy_rescan_empty_catalog_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = rescanned_npm_tarball();
+        let target = require_catalog_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "a rescan that cataloged nothing must not record clean"
+        );
+    }
+
+    /// A rescan WITH findings still grades on them: requiring a catalog only
+    /// guards the false-clean direction, so an operator's rescan can still
+    /// record `vulnerable` for an archive cached before inventory recording.
+    #[tokio::test]
+    async fn test_proxy_rescan_findings_grade_vulnerable_without_catalog() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CveAuthoritativeScanner {
+            outcome: CveOutcome::Critical,
+        })];
+        let artifact = rescanned_npm_tarball();
+        let target = require_catalog_target(&artifact);
+        let verdict = run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+            .await
+            .expect("findings must yield a vulnerable verdict, not inconclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 1);
+    }
+
+    /// `ScannerService::scan_content_requiring_catalog`: the seam the rescan
+    /// endpoint reaches through `ProxyScanMode::FileRequiringCatalog`. It
+    /// must set the catalog requirement, so the same empty-catalog scan that
+    /// `scan_content` grades `clean` is inconclusive here. Skips cleanly when
+    /// DATABASE_URL is unset.
+    #[tokio::test]
+    async fn test_scan_content_requiring_catalog_through_service() {
+        use std::sync::Arc;
+
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("remote", "npm").await
+        else {
+            return;
+        };
+        let mut svc = scanner_for_fixture(&fx);
+        svc.scanners = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = rescanned_npm_tarball();
+        let unpinned = svc.scan_content(&artifact, &Bytes::new()).await;
+        let requiring = svc
+            .scan_content_requiring_catalog(&artifact, &Bytes::new())
+            .await;
+
+        fx.teardown().await;
+
+        assert!(
+            unpinned.is_ok(),
+            "scan_content keeps the prior behavior for callers that do not require a catalog"
+        );
+        assert!(
+            requiring.is_err(),
+            "scan_content_requiring_catalog must not grade an empty catalog clean"
+        );
     }
 
     /// The #2954 gate still outranks the #3003 one: a Grype ERROR is
