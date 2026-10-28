@@ -66,6 +66,13 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
+**Duplicate entry paths.** A package archive in which two files share one path
+(after `./` and empty path components are dropped), in the archive itself or,
+for a conda `.conda`, across its payload tars, is inconclusive before any of
+the checks above run. The metadata check reads one copy of a manifest and the
+scan workspace unpacks the other, so neither can be vouched for. Published
+packages do not carry repeated paths.
+
 **Packages the scanner does not catalog as themselves (conda).** For npm,
 PyPI, RubyGems, Cargo, NuGet and Maven the scanner catalogs the package itself
 (through the pin the gate writes, or the archive's own metadata), so a scan

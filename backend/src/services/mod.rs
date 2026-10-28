@@ -1,5 +1,6 @@
 //! Business logic services.
 
+pub mod archive_entry_paths;
 pub mod artifact_label_service;
 pub mod artifact_metadata;
 pub mod artifact_origin;
