@@ -3051,9 +3051,10 @@ async fn rescan_proxy_cached_path(
     // pin or a staged image (see `proxy_rescan_requires_catalog`) is scanned in
     // `FileRequiringCatalog` mode: a zero-finding scan in which the engine
     // cataloged nothing is inconclusive and the stored verdict stands.
-    let mode = if crate::services::scanner_service::proxy_rescan_requires_catalog(
+    let mode = if crate::services::scanner_service::proxy_rescan_requires_catalog_for(
         repo.format.handler_key(),
         &path,
+        &bytes,
     ) {
         crate::api::handlers::proxy_helpers::ProxyScanMode::FileRequiringCatalog
     } else {

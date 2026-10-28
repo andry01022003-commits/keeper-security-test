@@ -9533,8 +9533,9 @@ pub(crate) enum ProxyScanIdentity {
 /// record-only keep reusing it, as before.
 ///
 /// The cost falls on the bytes whose own grade legitimately catalogs nothing
-/// (a conda package with no Python or recognised binary content, a file with
-/// no coordinate): each fail-closed pull of them is scanned again.
+/// (a file with no coordinate): each fail-closed pull of them is scanned
+/// again. A conda package is the exception, see
+/// [`conda_wrote_this_empty_grade`].
 pub(crate) fn stored_clean_graded_nothing(
     row: &crate::services::proxy_scan_service::ProxyScanRow,
     components_cataloged: Option<i32>,
@@ -9542,6 +9543,40 @@ pub(crate) fn stored_clean_graded_nothing(
     row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN
         && row.findings_count == 0
         && components_cataloged.unwrap_or(0) <= 0
+}
+
+/// Whether a conda request may reuse a stored clean verdict that graded
+/// nothing ([`stored_clean_graded_nothing`]) because a conda repository wrote
+/// it. Part of #3396.
+///
+/// The conda gate grades a package on its contents and a package with no
+/// Python or recognised binary content (`tzdata`, a noarch data package)
+/// legitimately catalogs nothing, so without this every fail-closed pull of
+/// one would be scanned again. The row records the repository that last
+/// wrote it, and a conda repository writes a verdict only by scanning the
+/// bytes as the conda package their own `info/index.json` says they are: the
+/// gate scans only a request whose identity it established, and a rescan in
+/// a conda repository requires a catalog for any other cached path (see
+/// [`crate::services::scanner_service::proxy_rescan_requires_catalog`]). That
+/// is the scan this request would run. A row written from any other format
+/// (a generic Remote's rescan, for example) is still not reused, and neither
+/// is one whose writer is unknown.
+pub(crate) fn conda_wrote_this_empty_grade(
+    identity: &ProxyScanIdentity,
+    writer_format: Option<&str>,
+) -> bool {
+    let conda_request = matches!(
+        identity,
+        ProxyScanIdentity::Established(e)
+            if e.ecosystem == crate::services::scanner_service::ComponentEcosystem::Conda
+    );
+    conda_request
+        && writer_format.is_some_and(|label| {
+            crate::models::repository::RepositoryFormat::ALL
+                .iter()
+                .find(|f| f.as_key() == label)
+                .is_some_and(|f| matches!(f.handler_key(), "conda" | "conda_native"))
+        })
 }
 
 /// What a served proxy pull's `X-AK-Scan` header reports.
@@ -9753,22 +9788,29 @@ async fn decide_proxy_scan_serve(
     let pss = ProxyScanService::new(state.db.clone());
     // Under fail-closed a clean verdict that graded nothing is not reused; see
     // [`stored_clean_graded_nothing`] (part of #3396).
+    // A conda request still reuses one that a conda repository wrote; see
+    // [`conda_wrote_this_empty_grade`].
     let row = pss
         .lookup_verdict_with_catalog(digest, PROXY_SCAN_TYPE)
         .await
         .ok()
         .flatten()
-        .and_then(|(row, cataloged)| {
-            if action.is_fail_closed() && stored_clean_graded_nothing(&row, cataloged) {
+        .and_then(|stored| {
+            let cataloged = stored.components_cataloged;
+            if action.is_fail_closed()
+                && stored_clean_graded_nothing(&stored.row, cataloged)
+                && !conda_wrote_this_empty_grade(&identity, stored.writer_format.as_deref())
+            {
                 tracing::info!(
                     repo_id = %repo_id, file = %filename, digest = %digest,
                     components_cataloged = ?cataloged,
+                    writer_format = ?stored.writer_format,
                     "stored clean proxy verdict graded no components; \
                      not reused under fail-closed, scanning"
                 );
                 return None;
             }
-            Some(row)
+            Some(stored.row)
         });
     // #2976: compare the verdict's stored provenance against the LIVE
     // CVE-scanner version (VersionCache-backed — a memory read on the hot
