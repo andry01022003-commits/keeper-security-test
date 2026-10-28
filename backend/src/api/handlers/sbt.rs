@@ -1376,6 +1376,16 @@ mod scan_on_proxy_tests {
             tdh::seed_proxy_verdict(&fx.pool, &good, fx.repo_id, false).await,
             tdh::seed_proxy_verdict(&fx.pool, descriptor.as_bytes(), fx.repo_id, true).await,
         ];
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digests[1],
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Maven,
+                "org.acme:widget_2.13",
+                "1.0",
+            ),
+        )
+        .await;
         let pull = |route: &str| {
             tdh::send_with_headers(
                 tdh::router_anon(super::router(), state.clone()),
