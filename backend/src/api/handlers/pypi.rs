@@ -19270,7 +19270,7 @@ mod tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
 
         ProxyScanService::new(fx.pool.clone())
-            .record_verdict(
+            .record_verdict_with_catalog(
                 &digest,
                 "grype",
                 "clean",
@@ -19282,6 +19282,7 @@ mod tests {
                 None,
                 Some("grype-0.84.0-test"),
                 Some(fx.repo_id),
+                Some(1),
             )
             .await
             .expect("seed clean verdict");
@@ -19393,8 +19394,10 @@ mod tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
-        let (cve, scans) =
-            VersionedCveScanner::counting(Some("grype-0.84.0+db-2026-09-17"), MockCveRescan::Clean);
+        let (cve, scans) = VersionedCveScanner::counting(
+            Some("grype-0.84.0+db-2026-09-17"),
+            MockCveRescan::Cataloged("reuseclean", "1.0.0"),
+        );
         let state = scan_state_with_supplementary_and_cve(&fx, &storage_path, cve);
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();

@@ -9518,6 +9518,32 @@ pub(crate) enum ProxyScanIdentity {
     NotApplicable,
 }
 
+/// Whether a stored proxy verdict graded nothing: `clean` with no findings
+/// and no component cataloged (`components_cataloged` `0`, or `None` when the
+/// row predates that column or the writer reported no catalog). Part of
+/// #3396.
+///
+/// Verdicts are keyed per content digest and shared by every repository that
+/// serves those bytes. A row like this says only that a scan ran and saw
+/// nothing it could grade, for example an on-demand rescan run from a
+/// repository whose format does not catalog these bytes. Under fail-closed it
+/// is therefore not reused for any request: the gate scans as for a first
+/// pull, which grades an established coordinate, withholds an unestablished
+/// one (423), and scans a format without a coordinate. Fail-open and
+/// record-only keep reusing it, as before.
+///
+/// The cost falls on the bytes whose own grade legitimately catalogs nothing
+/// (a conda package with no Python or recognised binary content, a file with
+/// no coordinate): each fail-closed pull of them is scanned again.
+pub(crate) fn stored_clean_graded_nothing(
+    row: &crate::services::proxy_scan_service::ProxyScanRow,
+    components_cataloged: Option<i32>,
+) -> bool {
+    row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN
+        && row.findings_count == 0
+        && components_cataloged.unwrap_or(0) <= 0
+}
+
 /// What a served proxy pull's `X-AK-Scan` header reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProxyScanServed {
@@ -9725,11 +9751,25 @@ async fn decide_proxy_scan_serve(
     use crate::services::proxy_scan_service::{decide_serve, ProxyScanService, ServeDecision};
 
     let pss = ProxyScanService::new(state.db.clone());
+    // Under fail-closed a clean verdict that graded nothing is not reused; see
+    // [`stored_clean_graded_nothing`] (part of #3396).
     let row = pss
-        .lookup_verdict(digest, PROXY_SCAN_TYPE)
+        .lookup_verdict_with_catalog(digest, PROXY_SCAN_TYPE)
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .and_then(|(row, cataloged)| {
+            if action.is_fail_closed() && stored_clean_graded_nothing(&row, cataloged) {
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    components_cataloged = ?cataloged,
+                    "stored clean proxy verdict graded no components; \
+                     not reused under fail-closed, scanning"
+                );
+                return None;
+            }
+            Some(row)
+        });
     // #2976: compare the verdict's stored provenance against the LIVE
     // CVE-scanner version (VersionCache-backed — a memory read on the hot
     // path, never a per-download subprocess). Only probed when a row exists,

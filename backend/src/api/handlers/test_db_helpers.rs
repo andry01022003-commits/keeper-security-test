@@ -2721,7 +2721,7 @@ pub async fn seed_proxy_verdict(
         ("clean", 0, None)
     };
     crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
-        .record_verdict(
+        .record_verdict_with_catalog(
             &digest,
             "grype",
             verdict,
@@ -2733,6 +2733,9 @@ pub async fn seed_proxy_verdict(
             severity,
             Some("grype-0.99.0-test"),
             Some(repo_id),
+            // The gate records what it cataloged; a clean verdict that
+            // cataloged nothing is not reused under fail-closed (#3396).
+            Some(1),
         )
         .await
         .expect("seed proxy scan verdict");
