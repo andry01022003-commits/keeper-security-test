@@ -2101,6 +2101,7 @@ impl AuthService {
     /// [`AuthService::generate_tokens_with_scope_capped`]) and an optional
     /// access-token TTL replacing the configured one (see
     /// [`AuthService::generate_tokens_with_scope_ttl`]).
+    #[allow(clippy::too_many_arguments)]
     fn generate_token_pair_capped(
         &self,
         user: &User,

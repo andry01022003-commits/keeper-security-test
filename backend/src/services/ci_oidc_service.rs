@@ -3122,7 +3122,7 @@ mod tests {
         assert_eq!(svc.get(created.id).await.unwrap().token_ttl_secs, 900);
 
         for bad in [0, 59, 3601, 86_400, -1] {
-            let err = svc.create(create(Some(bad))).await.err().expect("refused");
+            let err = svc.create(create(Some(bad))).await.expect_err("refused");
             assert!(
                 matches!(err, crate::error::AppError::Validation(_)),
                 "{bad}"
