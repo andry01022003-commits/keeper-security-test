@@ -375,6 +375,49 @@ Files stored in the repository itself (an `artifacts` row) are still served
 from storage behind the repository's download gate. Formats that do not
 enforce scan-on-proxy, and repositories with it off, are unaffected.
 
+## The artifacts routes
+
+The repository `artifacts` routes behave the same for every enforced format.
+The formats gated in 1.12.0 (Go, RubyGems, Composer, Pub, Conan, CocoaPods and
+Swift) follow the rules the earlier formats (npm, PyPI, Maven, NuGet, Cargo
+and the rest of the [coverage table](#coverage)) already did. For a Remote
+repository that scans on proxy:
+
+| Route | What it returns | Gate |
+| --- | --- | --- |
+| `GET /api/v1/repositories/{key}/artifacts` | The files the proxy cache holds, rebuilt from the proxy-cache catalog: path, size, when it was cached, download count. Each item has a synthetic id and `analyzable: false`. | None. It serves no bytes and does not read verdicts, so a cached file is listed whatever its verdict. |
+| `GET /api/v1/repositories/{key}/artifacts/*path` | The metadata (JSON) of an `artifacts` row at that path; `404` when there is none. It never reads the proxy cache or the upstream. | None. It serves no bytes. |
+| `GET /api/v1/repositories/{key}/download/*path` | A file the cache or the upstream would supply: `403` `scan_on_proxy_route_required` (see [The generic download route](#the-generic-download-route)). An `artifacts` row: its bytes from storage. | Refuses proxied files; serves rows without a scan. |
+| The format route (`/go/{key}/...`, `/gems/{key}/...`, ...) | An `artifacts` row: its bytes from storage. Otherwise the file through the gate. | Gates proxied files; serves rows without a scan. |
+
+The reasoning:
+
+- The listing and the metadata route are catalogs, not downloads. The web UI
+  lists a Remote's cached files through the first route and downloads one
+  through the generic download route, which refuses it for a scanning
+  Remote; a client pulls it through the format route, which gates it.
+- The gate grades bytes against the coordinate a format route parses from its
+  own request (#3003), so only the format route can run it. The generic route
+  has no such parser and refuses instead of serving unscanned.
+- An `artifacts` row in a Remote repository (from replication, or recorded
+  before proxied content stopped being stored as rows) is content the
+  repository holds, not a proxied fetch. The format route and the generic
+  download route both serve it from storage, without a scan. See
+  [Known gaps](#known-gaps).
+
+For a Virtual repository, `GET .../artifacts/*path` serves a member's bytes
+through the member walk, so it takes the same refusal as the generic download
+route: `403` when a Remote member the caller may read scans under the
+stricter-of-two rule (see [Virtual repositories](#virtual-repositories)). The
+listing aggregates the `artifacts` rows of the members the caller may see and
+serves no bytes.
+
+A unit test in `api/handlers/repositories.rs`
+(`generic_route_checks_exactly_the_enforced_formats_4442`) pins the generic
+route's refusal to exactly the formats `GET /api/v1/formats` reports as
+`enforced`, and names each 1.12.0 format, so a format cannot adopt the gate
+without the generic route refusing it too.
+
 ## Coverage
 
 `enforced`: the format's Remote and Virtual download paths run the gate on the
@@ -515,6 +558,13 @@ have no core proxy path to gate.
   `artifacts` row a Remote repository holds for a package path (from
   replication or a publish into the remote) is served from storage without
   the gate.
+- **Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift rows in a Remote
+  repository.** As for Debian, RPM and Alpine, an `artifacts` row a Remote
+  repository holds for a package (from replication, or recorded before
+  proxied content stopped being stored as rows) is served from storage
+  without the gate, on the format route and on the generic download route.
+  Only a path with no row is fetched through the gate. See
+  [The artifacts routes](#the-artifacts-routes).
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.
