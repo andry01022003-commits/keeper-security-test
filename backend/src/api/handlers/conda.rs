@@ -23250,6 +23250,16 @@ mod scan_on_proxy_tests {
             configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_open", Some("high")).await;
             let digest = digest_of(&bytes);
             seed_verdict(&rig.fx.pool, &digest, severity).await;
+            tdh::pin_proxy_verdict(
+                &rig.fx.pool,
+                &digest,
+                &crate::services::scanner_service::ExpectedComponent::new(
+                    crate::services::scanner_service::ComponentEcosystem::Conda,
+                    &name,
+                    &version,
+                ),
+            )
+            .await;
 
             let (status, served, headers) = rig.get(&format!("noarch/{file}")).await;
             rig.teardown(std::slice::from_ref(&digest)).await;
@@ -23783,6 +23793,16 @@ mod scan_on_proxy_tests {
         let v = rig.virtual_key.clone();
         let digest = digest_of(&clean_bytes);
         seed_verdict(&rig.pool, &digest, None).await;
+        tdh::pin_proxy_verdict(
+            &rig.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Conda,
+                "tzdata",
+                "2025b",
+            ),
+        )
+        .await;
         configure_scan(&rig.pool, rig.remote_id, "fail_open", None).await;
 
         let (status, served, headers) = rig.get(format!("/{v}/noarch/{clean}")).await;
