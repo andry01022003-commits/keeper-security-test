@@ -23454,6 +23454,13 @@ mod tests {
         let repo = wiremock_remote_repo("traced-fetch", &server.uri(), tmp.to_str().unwrap());
 
         let exported = ExportedSpans::default();
+        // #4930: while only one dispatcher is registered, tracing-core caches a
+        // callsite's interest from whichever thread hits it first. A parallel
+        // `cargo test` thread with no subscriber then caches `proxy_fetch` as
+        // "never" and this test sees no phase span. Keeping a second
+        // dispatcher alive makes every rebuild ask all live dispatchers,
+        // including this one, so the result no longer depends on test order.
+        let _every_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
         let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
         let request = axum::http::Request::builder().uri("/x").body(()).unwrap();
         let span = crate::api::middleware::tracing::make_http_request_span(&request, &[]);
