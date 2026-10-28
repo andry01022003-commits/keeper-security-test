@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
+## [1.11.8] - 2026-10-28
+
+### Fixed
+
+- **A proxy rescan that cannot grade a package archive leaves the stored verdict unchanged** (#3396, #5030). `POST /api/v1/repositories/{key}/security/proxy-scans/rescan` has no request coordinate to pin, so for the objects the download gate grades only through a pin or a staged image (npm tarballs, PyPI sdists, gems, crates, NuGet packages and OCI image manifests) a rescan whose scanner cataloged no components is now inconclusive: it answers 503 `RESCAN_SCAN_FAILED` and keeps the stored verdict, instead of recording `clean`. For every format, a rescan that finds no vulnerabilities no longer replaces a stored `vulnerable` verdict when it cataloged fewer components than that verdict was graded on; that is inconclusive too.
+
+- **Accept an API token presented as a Bearer credential at `/v2/token`, so Renovate and other clients that configure a bare token can list Docker tags** (#4903, #4977). The exchange previously recognized only JWTs in that slot and answered 401, which surfaced as a failed `tags/list` request.
+
+- **LDAP web login keeps an administrator's deactivation of an account** (#4933, #5029). A successful directory bind on the web LDAP login used to set a deactivated account active again. LDAP accounts now keep `is_active` across a federated login, the login of a deactivated account is refused, and an administrator must reactivate the account explicitly.
+
+- **NuGet V3 search now aggregates package versions across virtual repository members and reports the latest stable SemVer** (#4976, #4979). A virtual NuGet repository combining multiple V2 remotes previously kept whichever member's result arrived first and applied V3 package paging to V2 version rows before grouping, so search could show an arbitrary older version and omit versions from other members. Search now groups version rows before paging, merges duplicate package IDs and their version lists, recalculates the root version with the requested prerelease policy, and preserves the available version entries.
+
+- **Chunked uploads honour the repository's upload quarantine hold** (#5003). An artifact committed through `PUT /api/v1/uploads/{id}/complete` into a hosted repository with the upload quarantine enabled is now held, as an artifact uploaded through the format's native route is.
+
+- **Chunked uploads apply the storage quota unless the session is a trusted replication session** (#5003). The quota check when a chunked upload session is created and the quota admission when it completes now exempt a session only when it is a replication session of an administrator or service account, as other replication-specific behaviour on the chunked upload path already required.
+
+- **A repository's security score no longer goes stale when two of its scans finish at the same time** (#5006, #5007). Each score recalculation read the repository in its own snapshot with no coordination, so when two scans completed together one recalculation could store a score computed before the other scan had committed, and the other failed with a serialization error that nothing retried. The grade and severity counts then ignored the finished scan until the next scan in that repository, which could show as a false F. Recalculations of one repository now run one at a time under a database advisory lock and are retried on a serialization failure, so the stored score always includes every completed scan. This covers every path that recalculates a score: scan completion, finding triage, SBOM ingest and external findings ingest.
+
+### Security
+
+- **Update zstd to 0.14.3** (#5023). `zstd` moves from 0.14.2 to 0.14.3 and the async compression codecs (`async-compression` 0.4.49, `compression-codecs` 0.4.44) move onto the same zstd 0.14 / `zstd-safe` 8.2 stack, picking up the upstream fixes for RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403. An older zstd 0.13 copy stays in the tree through `rattler_package_streaming` and wasmtime's compilation cache; the affected functions are not reachable through either, and the advisories are ignored in `.cargo/audit.toml` until those crates move to zstd 0.14. Lockfile-only; no behaviour change.
+
 ## [1.11.7] - 2026-10-24
 
 ### Fixed
