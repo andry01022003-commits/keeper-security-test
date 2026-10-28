@@ -208,7 +208,10 @@ async fn stage_with(
     }
 
     let staged = workspace.join(STAGED_IMAGE_NAME);
-    tokio::fs::write(&staged, &image).await.map_err(|e| {
+    // `image` is passed by value: `tokio::fs::write` takes an owned `Bytes`
+    // as it is, but copies a borrowed buffer into a new `Vec` first, which
+    // for a multi-GiB rootfs would double the scan's memory.
+    tokio::fs::write(&staged, image).await.map_err(|e| {
         AppError::Internal(format!(
             "Failed to write the ISO rootfs image to the scan workspace: {}",
             e

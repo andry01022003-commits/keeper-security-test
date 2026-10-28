@@ -14,7 +14,10 @@ nor trusted, and hybrid images (an MBR or GPT at offset 0, which every modern
 live medium has) are detected. A file whose name is a known archive type
 (`.tar.gz`, `.jar`, `.whl`, ...) or a Debian or RPM package (`.deb`, `.udeb`,
 `.ddeb`, `.rpm`) keeps its own path even if its bytes are also ISO9660, and
-so does a pinned scan.
+so does a pinned scan. So does a file whose bytes start with the magic of an
+executable (ELF, PE, Mach-O) or of another package or compressed format
+(zip, gzip, xz, zstd, bzip2, `ar`, RPM), whatever its name: no ISO medium
+starts that way.
 
 The scanner looks for the embedded root filesystem image at these paths:
 

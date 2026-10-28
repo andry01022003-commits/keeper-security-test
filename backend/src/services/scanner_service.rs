@@ -1877,13 +1877,19 @@ impl ScanWorkspace {
     /// catalog as it is staged ([`ISO_EXCLUDED_PACKAGE_SUFFIXES`]: `.deb`,
     /// `.rpm` and their variants), keeps its own path even when the bytes are
     /// also ISO9660 (a polyglot), and so does a pinned scan: an image cannot
-    /// stand in for the package its name or pin says it is. The orchestrator
-    /// uses the same predicate to decide that the upload expects a catalog,
-    /// so staging and grading never disagree.
+    /// stand in for the package its name or pin says it is. Bytes that start
+    /// with the magic of another format the engines catalog as staged
+    /// ([`starts_with_non_iso_magic`]: executables, zip, gzip and other
+    /// compressed streams, `ar`, RPM) keep their path too, whatever the
+    /// name: an executable or package carrying a volume descriptor at byte
+    /// 32769 must not have its own inventory replaced by an embedded image's.
+    /// The orchestrator uses the same predicate to decide that the upload
+    /// expects a catalog, so staging and grading never disagree.
     pub(crate) fn stages_iso_rootfs(filename: &str, content: &[u8], pinned: bool) -> bool {
         !pinned
             && !Self::is_archive(filename)
             && !is_iso_excluded_package_file(filename)
+            && !starts_with_non_iso_magic(content)
             && crate::services::iso_rootfs::is_iso9660(content)
     }
 
@@ -2792,6 +2798,33 @@ pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) ->
 /// carry an ISO9660 volume descriptor at byte 32769 like any other payload,
 /// so they are never routed to the ISO rootfs path (#1966).
 const ISO_EXCLUDED_PACKAGE_SUFFIXES: &[&str] = &[".deb", ".udeb", ".ddeb", ".rpm"];
+
+/// Leading magic of formats the engines catalog as they are staged (or that
+/// the scan workspace unpacks), none of which an ISO9660 medium starts with:
+/// a hybrid image starts with MBR boot code or a GPT protective MBR, a plain
+/// one with zeros (#1966, [`ScanWorkspace::stages_iso_rootfs`]).
+const NON_ISO_LEADING_MAGIC: &[&[u8]] = &[
+    b"\x7fELF",          // ELF executable or shared object
+    b"MZ",               // PE / COFF executable
+    b"\xfe\xed\xfa\xce", // Mach-O 32-bit
+    b"\xfe\xed\xfa\xcf", // Mach-O 64-bit
+    b"\xce\xfa\xed\xfe", // Mach-O 32-bit, little-endian
+    b"\xcf\xfa\xed\xfe", // Mach-O 64-bit, little-endian
+    b"\xca\xfe\xba\xbe", // Mach-O universal binary or Java class
+    b"PK\x03\x04",       // zip (jar, war, apk, whl, nupkg, ...)
+    b"\x1f\x8b",         // gzip (tar.gz, Alpine apk, ...)
+    b"\xfd7zXZ\x00",     // xz
+    b"\x28\xb5\x2f\xfd", // zstd
+    b"BZh",              // bzip2
+    b"!<arch>\n",        // ar (Debian packages)
+    b"\xed\xab\xee\xdb", // RPM lead
+];
+
+fn starts_with_non_iso_magic(content: &[u8]) -> bool {
+    NON_ISO_LEADING_MAGIC
+        .iter()
+        .any(|magic| content.starts_with(magic))
+}
 
 fn is_iso_excluded_package_file(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
@@ -11763,6 +11796,30 @@ mod tests {
             !ScanWorkspace::stages_iso_rootfs("debian-live-12.iso", &iso, true),
             "a pinned scan keeps its pin"
         );
+        // A polyglot whose leading bytes are another catalogable format (an
+        // executable, a zip, a gzip stream, an ar or RPM package) keeps its
+        // own path even with an ISO9660 volume descriptor at byte 32769 and
+        // a name the archive path does not know.
+        for magic in [
+            &b"\x7fELF"[..],
+            b"MZ",
+            b"\xcf\xfa\xed\xfe",
+            b"PK\x03\x04",
+            b"\x1f\x8b",
+            b"!<arch>\n",
+            b"\xed\xab\xee\xdb",
+        ] {
+            let mut polyglot = iso.clone();
+            polyglot[..magic.len()].copy_from_slice(magic);
+            assert!(
+                crate::services::iso_rootfs::is_iso9660(&polyglot),
+                "the polyglot keeps its volume descriptor"
+            );
+            assert!(
+                !ScanWorkspace::stages_iso_rootfs("mytool", &polyglot, false),
+                "leading magic {magic:?} keeps its own path"
+            );
+        }
     }
 
     /// #1966: an ISO9660 upload expects a catalog in any repository format,
