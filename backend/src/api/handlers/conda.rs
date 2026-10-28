@@ -15941,6 +15941,49 @@ mod tests {
         assert_eq!(plain_hits, 1, "the plain document is the fallback");
     }
 
+    /// #4929: an upstream that answers a plain 401 (no Bearer challenge) for
+    /// the compressed encodings it does not publish reaches the client code as
+    /// a `Storage` error rather than a `BadGateway`. It must fall back to the
+    /// plain `repodata.json` exactly like a 403.
+    #[tokio::test]
+    async fn plain_repodata_falls_back_to_upstream_json_on_plain_401_4929() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        for path in ["/noarch/repodata.json.zst", "/noarch/repodata.json.bz2"] {
+            Mock::given(method("GET"))
+                .and(wm_path(path))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(REPODATA_4180))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let app = tdh::router_anon(router(), state);
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/noarch/repodata.json"))).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a plain 401 on a compressed probe means the encoding is absent: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), REPODATA_4180);
+    }
+
     /// #4929: a remote channel that publishes `repodata.json.sig` signs
     /// upstream's plain `.json`. The plain route must serve those exact bytes,
     /// not decode a different `.zst`, or the proxied signature cannot verify.
