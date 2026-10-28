@@ -12827,6 +12827,16 @@ mod scan_on_proxy_tests {
         let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
         tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
         let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, false).await;
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::NuGet,
+                ID,
+                VERSION,
+            ),
+        )
+        .await;
 
         for pulls in 1..=2 {
             let (status, body, headers) = pull_anon(&state, &fx.repo_key, FLAT).await;
@@ -13085,6 +13095,16 @@ mod scan_on_proxy_tests {
             let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
             tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
             let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, vulnerable).await;
+            tdh::pin_proxy_verdict(
+                &fx.pool,
+                &digest,
+                &crate::services::scanner_service::ExpectedComponent::new(
+                    crate::services::scanner_service::ComponentEcosystem::NuGet,
+                    ID,
+                    VERSION,
+                ),
+            )
+            .await;
             let row = seed_blobless_row(&fx, "no-recorded-digest").await;
 
             for pull in ["cold", "warm"] {
